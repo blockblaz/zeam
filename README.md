@@ -12,7 +12,7 @@ bit harder to incrementally implement on the current Beacon Chain.
 ## Client Development
 
 As is the ethos of ethereum community, beam protocol and specs will be developed in open. Zeam will not only
-translate those specs to an production grade zig client but also actively contribute to development of those
+translate those specs to a production grade zig client but also actively contribute to development of those
 specs.
 
 We also will collaborate actively with other Beam clients and collectively will push the protocol to maturity
@@ -26,7 +26,7 @@ Zig despite being relatively new is an upcoming ecosystem stack for ethereum pro
 the stack towards maturity via our modular client approach as well as independent libraries development and
 contribution.
 
-Please reach out to us if you are actively enagaged in developing a library in the ecosystem that you may think
+Please reach out to us if you are actively engaged in developing a library in the ecosystem that you may think
 we can use and/or contribute to.
 
 ### Zeam community
