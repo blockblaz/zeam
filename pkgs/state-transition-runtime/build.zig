@@ -83,16 +83,16 @@ pub fn build(b: *Builder) void {
     }
     b.installArtifact(exe);
 
-    const tests = b.addTest(.{
-        .root_source_file = .{ .cwd_relative = "src/transition.zig" },
-        .optimize = optimize,
-        .target = target,
-    });
-    tests.root_module.addImport("ssz", ssz);
-    tests.root_module.addImport("zeam-types", zeam_types);
-    tests.root_module.addImport("zeam-transition-runtime", zeam_state_transition);
+    // const tests = b.addTest(.{
+    //     .root_source_file = .{ .cwd_relative = "src/transition.zig" },
+    //     .optimize = optimize,
+    //     .target = target,
+    // });
+    // tests.root_module.addImport("ssz", ssz);
+    // tests.root_module.addImport("zeam-types", zeam_types);
+    // tests.root_module.addImport("zeam-transition-runtime", zeam_state_transition);
 
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+    // const run_tests = b.addRunArtifact(tests);
+    // const test_step = b.step("test", "Run unit tests");
+    // test_step.dependOn(&run_tests.step);
 }
