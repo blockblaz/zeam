@@ -1,9 +1,11 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
+const zkvm = @import("zkvm");
 const ssz = @import("ssz");
 const types = @import("zeam-types");
 const state_transition = @import("zeam-state-transition");
+
+var fixed_mem = [_]u8{0} ** (256 * 1024 * 1024);
 
 const Inputs = struct {
     state_root: []const u8,
@@ -17,7 +19,8 @@ const Witnesses = struct {
 
 // implements risv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
-pub fn main() noreturn {
+export fn main() noreturn {
+    zkvm.io.print_str("running block transition function\n");
     // access inputs and witnesses from zkvm
     const inputs = Inputs{
         .state_root = &[_]u8{},
@@ -30,18 +33,31 @@ pub fn main() noreturn {
     };
     _ = witnesses;
 
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
+    const allocator = fixed_allocator.allocator();
+
     // TODO: construct state and block from witnesses and validate stateroot and block root
     // use the ssz deserialized state and block to apply state transition
 
-    const state = types.BeamState{};
-    const block = types.SignedBeamBlock{};
+    var state: types.BeamState = undefined;
+    const block: types.SignedBeamBlock = undefined;
 
     // get some allocator
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &state, block);
+    state_transition.apply_transition(allocator, &state, block) catch @panic("error running transition function");
 
     // verify the block.state_root is ssz hash tree root of state
     // this completes our zkvm proving
+
+    zkvm.halt(0);
+}
+
+pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+    zkvm.io.print_str("PANIC: ");
+    zkvm.io.print_str(msg);
+    zkvm.io.print_str("\n");
+    zkvm.halt(1);
+    while (true) {}
 }
 
 test "ssz import" {

@@ -1,0 +1,16 @@
+pub const syscalls = enum {
+    reserved_0,
+    input,
+    output,
+    poseidon_gl,
+    affine_256,
+    ec_add,
+    ec_double,
+    keccakf,
+    mod_256,
+    halt,
+    poseidon2_gl,
+    native_hash,
+    commit_public,
+    invert_gl,
+};
