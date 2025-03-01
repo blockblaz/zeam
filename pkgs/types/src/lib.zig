@@ -50,6 +50,7 @@ pub const ZkVm = enum {
 pub const BeamSTFProof = struct {
     zk_vm: ZkVm,
     proof: []u8,
+    publics: []u8,
 };
 
 pub const GenesisSpec = struct { genesis_time: u64 };
