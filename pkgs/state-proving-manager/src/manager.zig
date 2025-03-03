@@ -10,7 +10,7 @@ pub const ZKVMContext = struct {
 };
 
 pub const zkvm_configs: []ZKVMContext = .{
-    .{ .program_path = "dist/powdr/zeam-stf.asm", .output_dir = "out", .backend = "plonky3" },
+    .{ .program_path = "dist/zeam-stf-powdr.asm", .output_dir = "out", .backend = "plonky3" },
 };
 
 const StateTransitionOpts = struct {
@@ -27,7 +27,7 @@ pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, 
         opts.zk_vm.program_path,
     }, allocator);
     defer dryrun_process.deinit();
-    try dryrun_process.env_map.?.put("RUSTi_LOG", "debug");
+    try dryrun_process.env_map.?.put("RUST_LOG", "debug");
 
     dryrun_process.stdout_behavior = .Pipe;
     try dryrun_process.spawn();
