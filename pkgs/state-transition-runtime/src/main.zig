@@ -36,11 +36,21 @@ export fn main() noreturn {
     var fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
     const allocator = fixed_allocator.allocator();
 
-    // TODO: construct state and block from witnesses and validate stateroot and block root
-    // use the ssz deserialized state and block to apply state transition
+    // Temporary interface: get bytes as u32 and turn it into a byte slice
+    const serialized_block_len = zkvm.io.read_data_len(0);
+    var serialized_block_u32 = allocator.alloc(u32, serialized_block_len) catch @panic("allocating u32 serialized block slice");
+    defer allocator.free(serialized_block_u32);
+    zkvm.io.read_slice(0, &serialized_block_u32);
+    var serialized_block_bytes = allocator.alloc(u8, serialized_block_len) catch @panic("allocating serialized block slice");
+    defer allocator.free(serialized_block_bytes);
+    for (serialized_block_u32, 0..) |word, i| {
+        serialized_block_bytes[i] = @truncate(word);
+    }
 
     var state: types.BeamState = undefined;
-    const block: types.SignedBeamBlock = undefined;
+    var block: types.SignedBeamBlock = undefined;
+
+    ssz.deserialize(types.SignedBeamBlock, serialized_block_bytes, &block, allocator) catch @panic("error deserializing block");
 
     // get some allocator
     // apply the state transition to modify the state
@@ -48,6 +58,8 @@ export fn main() noreturn {
 
     // verify the block.state_root is ssz hash tree root of state
     // this completes our zkvm proving
+    var root_hash: [32]u8 = undefined;
+    ssz.hashTreeRoot(types.BeamState, state, &root_hash, allocator) catch @panic("error hashing the root state");
 
     zkvm.halt(0);
 }
@@ -58,14 +70,4 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     zkvm.io.print_str("\n");
     zkvm.halt(1);
     while (true) {}
-}
-
-test "ssz import" {
-    const data: u16 = 0x5566;
-    const serialized_data = [_]u8{ 0x66, 0x55 };
-    var list = std.ArrayList(u8).init(std.testing.allocator);
-    defer list.deinit();
-
-    try ssz.serialize(u16, data, &list);
-    try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }
