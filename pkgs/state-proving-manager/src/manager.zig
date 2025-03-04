@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types");
+const ssz = @import("ssz");
 const state_transition = @import("state-transition");
 const allocator = std.heap.page_allocator;
 
@@ -17,13 +18,21 @@ const StateTransitionOpts = struct {
     zk_vm: ZKVMContext,
 };
 
-pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts) types.BeamSTFProof {
+pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts) !types.BeamSTFProof {
     var publics = std.ArrayList(u8).init(allocator);
+
+    var serialized = try std.ArrayList(u8).init(allocator);
+    defer serialized.deinit();
+    try ssz.serialize(types.SignedBeamBlock, block, serialized);
+
+    var input = try std.fmt.allocPrint(allocator, "{any}", .{serialized});
 
     // Run the executable without proving, in order to recover the publics
     var dryrun_process = std.process.Child.init(&[_][]const u8{
         "powdr-rs",
         "execute",
+        "-i",
+        input[1 .. input.len - 1],
         opts.zk_vm.program_path,
     }, allocator);
     defer dryrun_process.deinit();
