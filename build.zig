@@ -19,7 +19,7 @@ pub fn build(b: *Builder) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     // add ssz
-    const ssz = b.dependency("ssz.zig", .{
+    const ssz = b.dependency("ssz", .{
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
@@ -97,12 +97,12 @@ pub fn build(b: *Builder) !void {
 }
 
 fn build_zkvm_targets(b: *Builder) !void {
-    const target_query = .{ .cpu_arch = .riscv32, .os_tag = .freestanding, .abi = .none, .cpu_model = .{ .explicit = &std.Target.riscv.cpu.generic_rv32 } };
+    const target_query = try std.Build.parseTargetQuery(.{ .arch_os_abi = "riscv32-freestanding-none", .cpu_features = "generic_rv32" });
     const target = b.resolveTargetQuery(target_query);
     const optimize = .ReleaseFast;
 
     // add ssz
-    const ssz = b.dependency("ssz.zig", .{
+    const ssz = b.dependency("ssz", .{
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");

@@ -1,10 +1,11 @@
 .{
-    .name = "zeam",
+    .name = .zeam,
+    .fingerprint = 0x243fd12cf3aff803,
     .version = "0.0.0",
     .dependencies = .{
-        .@"ssz.zig" = .{
-            .url = "https://github.com/blockblaz/ssz.zig/archive/refs/tags/v0.0.3.tar.gz",
-            .hash = "12205edd9484a4d1988afcf29010cd04102ea81da3d0ddf7244c55a75258aa844201",
+        .ssz = .{
+            .url = "https://github.com/blockblaz/ssz.zig/archive/2062f65.tar.gz",
+            .hash = "ssz-0.0.3-Lfwd6zRWAQDaIlVuvtRmvX9JDLfPOKs9rXVjHirsbFul",
         },
     },
     .paths = .{""},

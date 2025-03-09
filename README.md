@@ -57,6 +57,18 @@ Please join us on our community to take part in conversations around Beam Protoc
 Zeam will welcome opensource contributions that meaningfully further the development of Zeam client. Keep Watching
 out for this space for annoucements on the same or reach out to us via our [community telegram group](https://t.me/zeamETH)
 
+### Build instructions
+
+Zeam requires zig version 0.14.0 to build.
+
+In order to build the transition functions (one for each supported zkvm), as well as the whole client, type:
+
+```
+> zig build
+```
+
+at the root of the repository.
+
 ### Reporting Issues
 
 Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH).
