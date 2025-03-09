@@ -23,6 +23,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
+    const zigcli = b.dependency("zigcli", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // add zeam-params
     const params = b.addModule("zeam-params", .{
@@ -76,6 +80,7 @@ pub fn build(b: *Builder) !void {
     });
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
+    cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("zeam-types", zeam_types);
     cli_exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("zeam-state-proving-manager", zeam_state_proving_manager);

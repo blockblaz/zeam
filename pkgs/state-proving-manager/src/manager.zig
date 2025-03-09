@@ -7,15 +7,21 @@ const allocator = std.heap.page_allocator;
 pub const ZKVMContext = struct {
     program_path: []const u8,
     output_dir: []const u8,
-    backend: []const u8,
+    backend: ?[]const u8 = null,
 };
 
 pub const zkvm_configs: []ZKVMContext = .{
     .{ .program_path = "dist/zeam-stf-powdr.asm", .output_dir = "out", .backend = "plonky3" },
+    .{ .program_path = "zig-out/bin/zeam-stf-ceno", .output_dir = "out" },
 };
 
 const StateTransitionOpts = struct {
     zk_vm: ZKVMContext,
+};
+
+pub const available_zkvms = enum(zkvm_configs) {
+    Powdr = zkvm_configs[0],
+    Ceno = zkvm_configs[1],
 };
 
 pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts) !types.BeamSTFProof {
@@ -23,7 +29,11 @@ pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, 
 
     var serialized = try std.ArrayList(u8).init(allocator);
     defer serialized.deinit();
-    try ssz.serialize(types.SignedBeamBlock, block, serialized);
+    const prover_input = types.BeamSTFProverInput{
+        .state = state,
+        .block = block,
+    };
+    try ssz.serialize(types.BeamSTFProverInput, prover_input, serialized);
 
     var input = try std.fmt.allocPrint(allocator, "{any}", .{serialized});
 
@@ -109,7 +119,8 @@ pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, 
     };
 }
 
-pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void {
+// TODO state_root and block_root are currently ignored, that can't be right
+pub fn verify_transition(stf_proof: types.BeamSTFProof, _: types.Bytes32, _: types.Bytes32, opts: StateTransitionOpts) !void {
     // TODO deserialize proof and set it as parameters
 
     var process = std.process.Child.init(&[_][]const u8{

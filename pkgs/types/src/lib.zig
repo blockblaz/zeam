@@ -47,6 +47,11 @@ pub const ZkVm = enum {
     sp1,
 };
 
+pub const BeamSTFProverInput = struct {
+    state: BeamState,
+    block: SignedBeamBlock,
+};
+
 pub const BeamSTFProof = struct {
     zk_vm: ZkVm,
     proof: []u8,

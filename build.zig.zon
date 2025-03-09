@@ -7,6 +7,10 @@
             .url = "https://github.com/blockblaz/ssz.zig/archive/2062f65.tar.gz",
             .hash = "ssz-0.0.3-Lfwd6zRWAQDaIlVuvtRmvX9JDLfPOKs9rXVjHirsbFul",
         },
+        .zigcli = .{
+            .url = "https://github.com/jiacai2050/zigcli/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "1220d88560a67e3044f6358f03b0aa3102a53134f745c69d7e0cefac21e7febbd8b5",
+        },
     },
     .paths = .{""},
 }
