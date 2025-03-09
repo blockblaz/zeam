@@ -27,3 +27,13 @@ pub fn print_str(str: []const u8) void {
         }
     }
 }
+
+pub fn read_data_len(_: u32) usize {
+    // TODO flesh out when ceno proving is enabled
+    @panic("not implemented");
+}
+
+pub fn read_slice(_: u32, _: []u32) void {
+    // TODO flesh out when ceno proving is enabled
+    @panic("not implemented");
+}
