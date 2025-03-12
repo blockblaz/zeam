@@ -173,7 +173,7 @@ test "ssz import" {
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }
 
-test "mock chain util" {
+test "apply transition on mocked chain" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
@@ -203,89 +203,52 @@ test "mock chain util" {
     std.debug.print("final post state root: {s}\n", .{std.fmt.fmtSliceHexLower(&post_state_root)});
 }
 
-test "genesis and state transition" {
+test "mock genesis and block production" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
     };
 
-    // 2. generate genesis state
-    var test_genesis = try utils.genGenesisState(std.testing.allocator, test_config);
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
 
+    const mock_chain = try genMockChain(allocator, 2, test_config);
+
+    // check genesis state root
     var test_genesis_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, test_genesis, &test_genesis_root, std.testing.allocator);
-
+    try ssz.hashTreeRoot(types.BeamState, mock_chain.genesis_state, &test_genesis_root, std.testing.allocator);
     var expected_root: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(expected_root[0..], "0d2ea8d3f6846e408db07fd6970d131533a7062ed973c8c4d4d64de8adad1bff");
-
     try std.testing.expect(std.mem.eql(u8, &test_genesis_root, &expected_root));
-    std.debug.print("test_genesis: {any} {s}\n", .{ test_genesis, std.fmt.fmtSliceHexLower(&test_genesis_root) });
 
-    // 3. generate genesis block
-    const test_genesis_block = try utils.genGenesisBlock(std.testing.allocator, test_genesis);
+    // check genesis block root & check genesis root matches to genesis block state root
     var test_genesis_block_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlock, test_genesis_block, &test_genesis_block_root, std.testing.allocator);
-
+    try ssz.hashTreeRoot(types.BeamBlock, mock_chain.blocks[0].message, &test_genesis_block_root, std.testing.allocator);
+    try std.testing.expect(std.mem.eql(u8, &test_genesis_root, &mock_chain.blocks[0].message.state_root));
     var expected_genesis_block_root: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(expected_genesis_block_root[0..], "5d476554c248a6f59082aabf1bf9cde041e7f9e0cf43990a22f42246dcfc1007");
-
-    try std.testing.expect(std.mem.eql(u8, &test_genesis_root, &test_genesis_block.state_root));
     try std.testing.expect(std.mem.eql(u8, &test_genesis_block_root, &expected_genesis_block_root));
-    std.debug.print("test_genesis: {any} {s} {s}\n", .{ test_genesis_block, std.fmt.fmtSliceHexLower(&test_genesis_block.state_root), std.fmt.fmtSliceHexLower(&test_genesis_block_root) });
 
-    // 4. assemble a new block with zero state root
-    var block1_state_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(block1_state_root[0..], utils.ZERO_HASH_HEX);
-
-    var block1 = types.BeamBlock{
-        .slot = 1,
-        .proposer_index = 1,
-        .parent_root = test_genesis_block_root,
-        .state_root = block1_state_root,
-        .body = types.BeamBlockBody{},
-    };
-
-    // 5. clone genesis and get the prestate for the block
-    // TODO clone
-    try process_slots(std.testing.allocator, &test_genesis, block1.slot);
-
-    // 6. apply the block to the genesis and get & fill the post state root for the block
-    try process_block(std.testing.allocator, &test_genesis, block1);
-    try ssz.hashTreeRoot(types.BeamState, test_genesis, &block1_state_root, std.testing.allocator);
-    block1.state_root = block1_state_root;
-
+    // check produced block 1 state root
     var expected_block1_state_root: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(expected_block1_state_root[0..], "f77aaa703c400ccaffa8e674316713b044fcc3d94ec5764b00ce7edc138e7c95");
-    try std.testing.expect(std.mem.eql(u8, &expected_block1_state_root, &block1_state_root));
+    try std.testing.expect(std.mem.eql(u8, &expected_block1_state_root, &mock_chain.blocks[1].message.state_root));
 
-    // 7. (optional for current test) calc final block1 root which could be used in signing the beam block
+    // 7. check block 1 root
     var block1_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlock, block1, &block1_root, std.testing.allocator);
-
+    try ssz.hashTreeRoot(types.BeamBlock, mock_chain.blocks[1].message, &block1_root, std.testing.allocator);
     var expected_block1_root: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(expected_block1_root[0..], "5b0c264e75ce2fae8ec3c2e0c1debb81e023e62df737469be61acdb37b7ff9a3");
     try std.testing.expect(std.mem.eql(u8, &block1_root, &expected_block1_root));
 
-    std.debug.print("post test_genesis: {any}, block1: {any} block1stateroot: {s} block1 root: {s}\n", .{ test_genesis, block1, std.fmt.fmtSliceHexLower(&block1_state_root), std.fmt.fmtSliceHexLower(&block1_root) });
-
-    // 8. form a signed beam block
-    // TODO: real signatures once integrated
-    var signature: [48]u8 = undefined;
-    _ = try std.fmt.hexToBytes(signature[0..], utils.ZERO_HASH_48HEX);
-
-    const signed_block1 = types.SignedBeamBlock{
-        .message = block1,
-        .signature = signature,
-    };
-
-    // 9. run state transition
+    // 9. run and check state transition
     // TODO: the previous process block should have been run on cloned state so we have the original pre
     // state here to run the state transition. for now regen same genesis state
     var state = try utils.genGenesisState(std.testing.allocator, test_config);
-    try apply_transition(std.testing.allocator, &state, signed_block1);
+    try apply_transition(std.testing.allocator, &state, mock_chain.blocks[1]);
     var post_state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state, &post_state_root, std.testing.allocator);
 
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &expected_block1_state_root));
-    std.debug.print("post state transition: {any}, signed_block1: {any} post_state_root: {s}\n", .{ test_genesis, signed_block1, std.fmt.fmtSliceHexLower(&post_state_root) });
 }
