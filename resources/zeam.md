@@ -28,7 +28,7 @@ all other moving parts of a Beacon like POS protocol.
 
  - Only very basic state transition 
     - empty epoch transition
-    - only block's parent_root matched against state's `lastest_block_header` hash tree root
+    - only block's parent_root matched against state's `latest_block_header` hash tree root
     - Round robin shuffling based on a fixed user provided node id
     - Very primive genesis state
 

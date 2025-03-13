@@ -7,44 +7,50 @@ const state_transition = @import("@zeam/state-transition");
 
 var fixed_mem = [_]u8{0} ** (256 * 1024 * 1024);
 
-const Inputs = struct {
-    state_root: []const u8,
-    block_root: []const u8,
-};
-
-const Witnesses = struct {
-    state: []const u8,
-    block: []const u8,
-};
+const __powdr_prover_data_start: [*]const u8 = @ptrFromInt(0x10000000);
+// this is hardcoded for now, because the compiler seems unable to see
+// linker script symbols.
+// extern const _powdr_prover_data_start: [*]const u8;
+// extern const __powdr_prover_data_end: [*]const u8;
 
 // implements risv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
 export fn main() noreturn {
     zkvm.io.print_str("running block transition function\n");
-    // access inputs and witnesses from zkvm
-    const inputs = Inputs{
-        .state_root = &[_]u8{},
-        .block_root = &[_]u8{},
-    };
-    _ = inputs;
-    const witnesses = Witnesses{
-        .state = &[_]u8{},
-        .block = &[_]u8{},
-    };
-    _ = witnesses;
+
+    var prover_input: types.BeamSTFProverInput = undefined;
 
     var fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
     const allocator = fixed_allocator.allocator();
 
-    // TODO: construct state and block from witnesses and validate stateroot and block root
-    // use the ssz deserialized state and block to apply state transition
+    // Get input from memory and deserialize it
+    // TODO(gballet) move that to powdr-specific code when
+    // another zkvm is being used that uses a different way
+    // of passing data to guests.
+    const total_input_len = std.mem.bytesToValue(u32, __powdr_prover_data_start[2048..2052]);
+    const total_input: []const u8 = __powdr_prover_data_start[2052 .. 2052 + total_input_len];
+    const input_len = std.mem.bytesAsValue(u32, total_input[0..4]);
+    const input = total_input[4 .. 4 + input_len.*];
+    // TODO(gballet) figure out why printing this string is necessary.
+    // It might be worth commenting it once the powdr rebase has been
+    // completed.
+    var input_dump: [2048]u8 = undefined;
+    _ = std.fmt.bufPrint(input_dump[0..], "serialized input={any} len={}\n", .{ input[0..], input_len.* }) catch @panic("error allocating string to dump serialized input");
+    // Uncomment when debugging
+    // zkvm.io.print_str(input_dump_str);
+    ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
+    // Uncomment when debugging
+    // input_dump_str = std.fmt.bufPrint(input_dump[0..], "deserialized input={any}\n", .{prover_input}) catch @panic("error allocating string to dump deserialized input");
+    // zkvm.io.print_str(input_dump_str);
 
-    var state: types.BeamState = undefined;
-    const block: types.SignedBeamBlock = undefined;
-
-    // get some allocator
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &state, block) catch @panic("error running transition function");
+    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block) catch |e| {
+        var buf: [256]u8 = undefined;
+        const errstr = std.fmt.bufPrint(buf[0..], "error running transition function: {any}", .{e}) catch @panic("error running transition function and error coud not be printed");
+        @panic(errstr);
+    };
+
+    zkvm.io.print_str("state transition completed\n");
 
     // verify the block.state_root is ssz hash tree root of state
     // this completes our zkvm proving

@@ -40,7 +40,7 @@ pub const SignedBeamBlock = struct {
 pub const BeamState = struct {
     genesis_time: u64,
     slot: u64,
-    lastest_block_header: BeamBlockHeader,
+    latest_block_header: BeamBlockHeader,
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
@@ -51,12 +51,17 @@ pub const ZkVm = enum {
 };
 
 pub const BeamSTFProof = struct {
-    zk_vm: ZkVm,
-    proof: []u8,
+    // zk_vm: ZkVm,
+    // proof: []u8,
 };
 
 pub const GenesisSpec = struct { genesis_time: u64 };
 pub const ChainSpec = struct { preset: params.Preset, name: []u8 };
+
+pub const BeamSTFProverInput = struct {
+    state: BeamState,
+    block: SignedBeamBlock,
+};
 
 test "ssz import" {
     const data: u16 = 0x5566;

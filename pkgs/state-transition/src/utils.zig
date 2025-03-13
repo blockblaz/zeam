@@ -98,7 +98,7 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
     const state = types.BeamState{
         .genesis_time = genesis.genesis_time,
         .slot = 0,
-        .lastest_block_header = try blockToLatestBlockHeader(allocator, genesis_latest_block),
+        .latest_block_header = try blockToLatestBlockHeader(allocator, genesis_latest_block),
     };
 
     return state;

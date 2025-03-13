@@ -59,15 +59,27 @@ out for this space for annoucements on the same or reach out to us via our [comm
 
 ### Build instructions
 
-Zeam requires zig version 0.14.0 to build.
+
+#### Prerequisites
+
+ - Zeam requires zig version 0.14.0 to build.
+ - Zeam requires Rust 1.85+ to be able to build the rust connections to various zkvms
+
+#### Build
 
 In order to build the transition functions (one for each supported zkvm), as well as the whole client, type:
 
 ```
-> zig build
+> zig build -Doptimize=ReleaseFast
 ```
 
 at the root of the repository.
+
+#### Running the prover demo
+
+```
+> zig build -Doptimize=ReleaseFast install run -- prove
+```
 
 ### Reporting Issues
 

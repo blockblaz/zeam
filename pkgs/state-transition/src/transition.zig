@@ -16,13 +16,13 @@ pub const utils = @import("./utils.zig");
 pub fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 
     // update state root in latest block header if its zero hash
-    // i.e. just after processing the lastest block of latest block header
+    // i.e. just after processing the latest block of latest block header
     // this completes latest block header for parentRoot checks of new block
 
-    if (std.mem.eql(u8, &state.lastest_block_header.state_root, &utils.ZERO_HASH)) {
+    if (std.mem.eql(u8, &state.latest_block_header.state_root, &utils.ZERO_HASH)) {
         var prev_state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamState, state.*, &prev_state_root, allocator);
-        state.lastest_block_header.state_root = prev_state_root;
+        state.latest_block_header.state_root = prev_state_root;
     }
 }
 
@@ -46,12 +46,12 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     }
 
     var head_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlockHeader, state.lastest_block_header, &head_root, allocator);
+    try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &head_root, allocator);
     if (!std.mem.eql(u8, &head_root, &block.parent_root)) {
         return StateTransitionError.InvalidParentRoot;
     }
 
-    state.lastest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
+    state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
@@ -64,6 +64,7 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
     _ = signedBlock;
 }
 
+// TODO(gballet) check if beam block needs to be a pointer
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock) !void {
     // verify the proposer and attestation signatures on signed block
     try verify_signatures(signedBlock);
