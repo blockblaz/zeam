@@ -8,7 +8,7 @@ const zkvmTarget = struct {
 };
 
 const zkvm_targets: []const zkvmTarget = &.{
-    .{ .name = "powdr", .set_pie = true },
+    .{ .name = "powdr", .set_pie = true, .build_glue = true },
     .{ .name = "ceno", .set_pie = false },
 };
 
@@ -93,6 +93,23 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
+    for (zkvm_targets) |zkvm_target| {
+        if (zkvm_target.build_glue) {
+            const zkvm_host_cmd = b.addSystemCommand(&.{
+                "cargo",
+                "+nightly",
+                "-C",
+                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
+                "-Z",
+                "unstable-options",
+                "build",
+                "--release",
+            });
+            cli_exe.step.dependOn(&zkvm_host_cmd.step);
+            cli_exe.addLibraryPath(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/host/target/release/", .{zkvm_target.name})));
+            cli_exe.linkSystemLibrary("zeam_prover_host_powdr");
+        }
+    }
     b.installArtifact(cli_exe);
 
     const tests = b.addTest(.{
@@ -169,15 +186,5 @@ fn build_zkvm_targets(b: *Builder) !void {
         }
         exe.setLinkerScript(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/{s}.ld", .{ zkvm_target.name, zkvm_target.name })));
         b.installArtifact(exe);
-
-        // build the library connecting to the zkvm
-        if (zkvm_target.build_glue) {
-            _ = b.addSystemCommand(&.{
-                "cargo",
-                "-C",
-                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
-                "build",
-            });
-        }
     }
 }
