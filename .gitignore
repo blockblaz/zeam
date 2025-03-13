@@ -3,3 +3,4 @@ main*
 zig-cache/
 .zig-cache/
 zig-out/
+target
