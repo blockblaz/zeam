@@ -23,6 +23,14 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
+    const zigcli = b.dependency("zigcli", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const xev = b.dependency("xev", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("xev");
 
     // add zeam-params
     const params = b.addModule("zeam-params", .{
@@ -52,13 +60,6 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
 
-    // add beam node
-    const zeam_beam_node = b.addModule("zeam-node", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/node/src/node.zig"),
-    });
-
     const st_lib = b.addStaticLibrary(.{
         .name = "zeam-state-transition",
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
@@ -66,6 +67,14 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     b.installArtifact(st_lib);
+
+    // add beam node
+    const zeam_beam_node = b.addModule("zeam-node", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/node/src/lib.zig"),
+    });
+    zeam_beam_node.addImport("xev", xev);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -76,6 +85,8 @@ pub fn build(b: *Builder) !void {
     });
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
+    cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("zeam-types", zeam_types);
     cli_exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("zeam-state-proving-manager", zeam_state_proving_manager);

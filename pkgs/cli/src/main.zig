@@ -1,9 +1,27 @@
 const std = @import("std");
+const simargs = @import("simargs");
+
 const types = @import("zeam-types");
+const nodeLib = @import("zeam-node");
+const Clock = nodeLib.Clock;
+
+const ZeamArgs = struct {
+    genesis: ?u64,
+
+    pub const __messages__ = .{
+        .genesis = "genesis time",
+    };
+};
 
 pub fn main() !void {
-    // Random action to confirm that module imports are working.
-    // Replace with real code.
-    const slot: types.Slot = undefined;
-    std.debug.print("slot={any}", .{slot});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const opts = try simargs.parse(gpa.allocator(), ZeamArgs, "", "0.0.0");
+    const genesis = opts.args.genesis orelse 1234;
+    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+
+    var clock = try Clock.init(genesis);
+    std.debug.print("clock {any}\n", .{clock});
+
+    clock.start();
+    try clock.run();
 }
