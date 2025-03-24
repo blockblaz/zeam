@@ -2,12 +2,15 @@ const std = @import("std");
 const xev = @import("xev");
 
 const params = @import("zeam-params");
-const SECONDS_PER_SLOT = params.SECONDS_PER_SLOT;
+const SECONDS_PER_SLOT_MS: isize = params.SECONDS_PER_SLOT * std.time.ms_per_s;
 
 const utils = @import("./utils.zig");
+const CLOCK_DISPARITY_MS: isize = 100;
 
 pub const Clock = struct {
-    genesis_time: usize,
+    genesis_time_ms: isize,
+    current_slot_time_ms: isize,
+    current_slot: isize,
     events: utils.EventLoop,
 
     timer: xev.Timer,
@@ -22,22 +25,37 @@ pub const Clock = struct {
         const timer = try xev.Timer.init();
         const c: xev.Completion = undefined;
 
+        const genesis_time_ms: isize = @intCast(genesis_time * std.time.ms_per_s);
+        const current_slot = @divFloor(@as(isize, @intCast(std.time.milliTimestamp())) + CLOCK_DISPARITY_MS - genesis_time_ms, SECONDS_PER_SLOT_MS);
+        const current_slot_time_ms = genesis_time_ms + current_slot * SECONDS_PER_SLOT_MS;
+
         return Self{
-            .genesis_time = genesis_time,
+            .genesis_time_ms = genesis_time_ms,
+            .current_slot_time_ms = current_slot_time_ms,
+            .current_slot = current_slot,
             .events = events,
             .timer = timer,
             .c = c,
         };
     }
 
-    pub fn start(self: *Self) void {
-        self.timer.run(&self.events.loop, &self.c, 1000, void, null, timerCallback);
+    pub fn tickSlot(self: *Self) void {
+        const time_now_ms: isize = @intCast(std.time.milliTimestamp());
+        while (self.current_slot_time_ms + SECONDS_PER_SLOT_MS < time_now_ms + CLOCK_DISPARITY_MS) {
+            self.current_slot_time_ms += SECONDS_PER_SLOT_MS;
+            self.current_slot += 1;
+        }
+
+        const next_slot_time_ms: isize = self.current_slot_time_ms + SECONDS_PER_SLOT_MS;
+        const time_to_next_slot_ms: usize = @intCast(next_slot_time_ms - time_now_ms);
+
+        self.timer.run(&self.events.loop, &self.c, time_to_next_slot_ms, void, null, timerCallback);
     }
 
     pub fn run(self: *Self) !void {
         while (true) {
+            self.tickSlot();
             try self.events.run(.until_done);
-            self.start();
         }
     }
 };

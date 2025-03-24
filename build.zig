@@ -32,7 +32,7 @@ pub fn build(b: *Builder) !void {
     }).module("xev");
 
     // add zeam-params
-    const params = b.addModule("zeam-params", .{
+    const zeam_params = b.addModule("zeam-params", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
@@ -74,6 +74,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/node/src/lib.zig"),
     });
     zeam_beam_node.addImport("xev", xev);
+    zeam_beam_node.addImport("zeam-params", zeam_params);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -90,7 +91,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("zeam-state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("zeam-node", zeam_beam_node);
-    cli_exe.root_module.addImport("zeam-params", params);
+    cli_exe.root_module.addImport("zeam-params", zeam_params);
     b.installArtifact(cli_exe);
 
     const tests = b.addTest(.{

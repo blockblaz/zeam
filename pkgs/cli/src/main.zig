@@ -26,7 +26,6 @@ pub fn main() !void {
             var clock = try Clock.init(genesis);
             std.debug.print("clock {any}\n", .{clock});
 
-            clock.start();
             try clock.run();
         },
     }
