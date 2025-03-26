@@ -2,8 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
 
-const params = @import("zeam-params");
-const types = @import("zeam-types");
+const params = @import("@zeam/params");
+const types = @import("@zeam/types");
 
 const configs = @import("./configs/mainnet.zig");
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const ssz = @import("ssz");
-const params = @import("zeam-params");
+const params = @import("@zeam/params");
 
 // just dummy type right now to test imports
 pub const Bytes32 = [32]u8;

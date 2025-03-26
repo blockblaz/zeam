@@ -1,6 +1,6 @@
 const std = @import("std");
-const configs = @import("zeam-configs");
-const types = @import("zeam-types");
+const configs = @import("@zeam/configs");
+const types = @import("@zeam/types");
 
 pub const forkchoice = @import("./forkchoice.zig");
 

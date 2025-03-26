@@ -1,8 +1,8 @@
 const std = @import("std");
 const simargs = @import("simargs");
 
-const types = @import("zeam-types");
-const nodeLib = @import("zeam-node");
+const types = @import("@zeam/types");
+const nodeLib = @import("@zeam/node");
 const Clock = nodeLib.Clock;
 
 const ZeamArgs = struct {

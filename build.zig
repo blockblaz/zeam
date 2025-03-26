@@ -32,28 +32,28 @@ pub fn build(b: *Builder) !void {
     }).module("xev");
 
     // add zeam-params
-    const zeam_params = b.addModule("zeam-params", .{
+    const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
 
     // add zeam-types
-    const zeam_types = b.addModule("zeam-types", .{
+    const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // add zeam-state-transition
-    const zeam_state_transition = b.addModule("zeam-state-transition", .{
+    const zeam_state_transition = b.addModule("@zeam/state-transition", .{
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // add state proving manager
-    const zeam_state_proving_manager = b.addModule("zeam-state-proving-manager", .{
+    const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
         .root_source_file = b.path("pkgs/state-proving-manager/src/manager.zig"),
         .target = target,
         .optimize = optimize,
@@ -68,13 +68,13 @@ pub fn build(b: *Builder) !void {
     b.installArtifact(st_lib);
 
     // add beam node
-    const zeam_beam_node = b.addModule("zeam-node", .{
+    const zeam_beam_node = b.addModule("@zeam/node", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/node/src/lib.zig"),
     });
     zeam_beam_node.addImport("xev", xev);
-    zeam_beam_node.addImport("zeam-params", zeam_params);
+    zeam_beam_node.addImport("@zeam/params", zeam_params);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -87,11 +87,11 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("xev", xev);
-    cli_exe.root_module.addImport("zeam-types", zeam_types);
-    cli_exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
-    cli_exe.root_module.addImport("zeam-state-proving-manager", zeam_state_proving_manager);
-    cli_exe.root_module.addImport("zeam-node", zeam_beam_node);
-    cli_exe.root_module.addImport("zeam-params", zeam_params);
+    cli_exe.root_module.addImport("@zeam/types", zeam_types);
+    cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
+    cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
+    cli_exe.root_module.addImport("@zeam/params", zeam_params);
     b.installArtifact(cli_exe);
 
     const tests = b.addTest(.{
@@ -100,7 +100,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     tests.root_module.addImport("ssz", ssz);
-    tests.root_module.addImport("zeam-types", zeam_types);
+    tests.root_module.addImport("@zeam/types", zeam_types);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -119,26 +119,26 @@ fn build_zkvm_targets(b: *Builder) !void {
     }).module("ssz.zig");
 
     // add zeam-params
-    const params = b.addModule("zeam-params", .{
+    const params = b.addModule("@zeam/params", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
 
     // add zeam-types
-    const zeam_types = b.addModule("zeam-types", .{
+    const zeam_types = b.addModule("@zeam/types", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
     });
 
     // add state transition
-    const zeam_state_transition = b.addModule("zeam-state-transition", .{
+    const zeam_state_transition = b.addModule("@zeam/state-transition", .{
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zeam_state_transition.addImport("zeam-types", zeam_types);
+    zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
 
     for (zkvm_targets) |zkvm_target| {
@@ -160,8 +160,8 @@ fn build_zkvm_targets(b: *Builder) !void {
         });
         // addimport to root module is even required afer declaring it in mod
         exe.root_module.addImport("ssz", ssz);
-        exe.root_module.addImport("zeam-types", zeam_types);
-        exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
+        exe.root_module.addImport("@zeam/types", zeam_types);
+        exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
         exe.root_module.addImport("params", params);
         var start_s_path: [256]u8 = undefined;

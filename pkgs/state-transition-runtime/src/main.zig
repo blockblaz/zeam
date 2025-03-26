@@ -2,8 +2,8 @@ const std = @import("std");
 
 const zkvm = @import("zkvm");
 const ssz = @import("ssz");
-const types = @import("zeam-types");
-const state_transition = @import("zeam-state-transition");
+const types = @import("@zeam/types");
+const state_transition = @import("@zeam/state-transition");
 
 var fixed_mem = [_]u8{0} ** (256 * 1024 * 1024);
 

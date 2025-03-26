@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const params = @import("zeam-params");
-const types = @import("zeam-types");
-const configs = @import("zeam-configs");
+const params = @import("@zeam/params");
+const types = @import("@zeam/types");
+const configs = @import("@zeam/configs");
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");

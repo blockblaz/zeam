@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const types = @import("zeam-types");
+const types = @import("@zeam/types");
 const ssz = @import("ssz");
 
 pub const ZERO_HASH_HEX = "0000000000000000000000000000000000000000000000000000000000000000";

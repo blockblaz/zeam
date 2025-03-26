@@ -1,7 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 
-const params = @import("zeam-params");
+const params = @import("@zeam/params");
 const SECONDS_PER_SLOT_MS: isize = params.SECONDS_PER_SLOT * std.time.ms_per_s;
 
 const utils = @import("./utils.zig");
