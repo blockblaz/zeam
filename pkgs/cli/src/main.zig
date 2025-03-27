@@ -59,7 +59,11 @@ pub fn main() !void {
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
             const options = stateProvingManager.StateTransitionOpts{
-                .zk_vm = stateProvingManager.zkvm_configs[0],
+                // .powdr = .{
+                //     .program_path = "zig-out/bin/zeam-stf-powdr",
+                //     .output_dir = "out",
+                // },
+                .risc0 = .{ .program_path = "zig-out/bin/zeam-stf-risc0" },
             };
 
             // generate a mock chain with 2 blocks including genesis i.e. 1 block on top of genesis
