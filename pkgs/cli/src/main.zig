@@ -80,7 +80,11 @@ pub fn main() !void {
             };
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
             const options = stateProvingManager.StateTransitionOpts{
-                .zk_vm = stateProvingManager.zkvm_configs[0],
+                // .powdr = .{
+                //     .program_path = "zig-out/bin/zeam-stf-powdr",
+                //     .output_dir = "out",
+                // },
+                .risc0 = .{ .program_path = "zig-out/bin/zeam-stf-risc0" },
             };
 
             _ = try stateProvingManager.prove_transition(state, block, options, allocator);
