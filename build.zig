@@ -3,7 +3,8 @@ const Builder = std.Build;
 
 const zkvmTarget = struct {
     name: []const u8,
-    set_pie: bool,
+    set_pie: bool = false,
+    build_glue: bool = false,
 };
 
 const zkvm_targets: []const zkvmTarget = &.{
@@ -130,12 +131,10 @@ fn build_zkvm_targets(b: *Builder) !void {
     zeam_state_transition.addImport("ssz", ssz);
 
     for (zkvm_targets) |zkvm_target| {
-        var module_root_path: [256]u8 = undefined;
-        _ = try std.fmt.bufPrintZ(&module_root_path, "pkgs/state-transition-runtime/src/{s}/lib.zig", .{zkvm_target.name});
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
             .target = target,
-            .root_source_file = b.path(&module_root_path),
+            .root_source_file = b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/lib.zig", .{zkvm_target.name})),
         });
 
         // target has to be riscv5 runtime provable/verifiable on zkVMs
@@ -152,13 +151,21 @@ fn build_zkvm_targets(b: *Builder) !void {
         exe.root_module.addImport("zeam-state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
         exe.root_module.addImport("params", params);
-        var start_s_path: [256]u8 = undefined;
-        exe.addAssemblyFile(b.path(try std.fmt.bufPrint(&start_s_path, "pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));
+        exe.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));
         if (zkvm_target.set_pie) {
             exe.pie = true;
         }
-        var linker_script_path: [256]u8 = undefined;
-        exe.setLinkerScript(b.path(try std.fmt.bufPrint(&linker_script_path, "pkgs/state-transition-runtime/src/{s}/{s}.ld", .{ zkvm_target.name, zkvm_target.name })));
+        exe.setLinkerScript(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/{s}.ld", .{ zkvm_target.name, zkvm_target.name })));
         b.installArtifact(exe);
+
+        // build the library connecting to the zkvm
+        if (zkvm_target.build_glue) {
+            _ = b.addSystemCommand(&.{
+                "cargo",
+                "-C",
+                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
+                "build",
+            });
+        }
     }
 }
