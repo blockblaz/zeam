@@ -1,16 +1,27 @@
 const std = @import("std");
+const json = std.json;
+
 const simargs = @import("simargs");
 
 const types = @import("@zeam/types");
 const nodeLib = @import("@zeam/node");
 const Clock = nodeLib.Clock;
 const stateProvingManager = @import("@zeam/state-proving-manager");
+const BeamNode = nodeLib.BeamNode;
+
+const configs = @import("@zeam/configs");
+const ChainConfig = configs.ChainConfig;
+const Chain = configs.Chain;
+const ChainOptions = configs.ChainOptions;
+
+const utilsLib = @import("@zeam/utils");
 
 const ZeamArgs = struct {
     genesis: ?u64,
 
     __commands__: union(enum) {
         clock: struct {},
+        beam: struct {},
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
 
@@ -38,7 +49,7 @@ pub fn main() !void {
 
     switch (opts.args.__commands__) {
         .clock => {
-            var clock = try Clock.init(genesis);
+            var clock = try Clock.init(gpa.allocator(), genesis);
             std.debug.print("clock {any}\n", .{clock});
 
             try clock.run();
@@ -71,6 +82,20 @@ pub fn main() !void {
             };
 
             _ = try stateProvingManager.prove_transition(state, block, options, allocator);
+        },
+        .beam => {
+            // some base mainnet spec would be loaded to build this up
+            const chain_spec =
+                \\{"preset": "mainnet", "name": "beamdev"}
+            ;
+            const options = json.ParseOptions{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_if_needed,
+            };
+            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
+            chain_options.genesis_time = genesis;
+            const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+            std.debug.print("chainoptionsinfo={any}\n", .{chain_config});
         },
     }
 }

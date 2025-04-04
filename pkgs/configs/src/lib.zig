@@ -5,6 +5,9 @@ const json = std.json;
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 
+const utils = @import("@zeam/utils");
+pub const ChainOptions = utils.Partial(utils.Mix(types.GenesisSpec, types.ChainSpec));
+
 const configs = @import("./configs/mainnet.zig");
 
 pub const Chain = enum { custom };
@@ -17,22 +20,17 @@ pub const ChainConfig = struct {
     const Self = @This();
 
     // for custom chains
-    pub fn init(allocator: Allocator, chainId: Chain, chainOptsOrNull: ?[]const u8) !Self {
+    pub fn init(chainId: Chain, chainOptsOrNull: ?ChainOptions) !Self {
         switch (chainId) {
             .custom => {
                 if (chainOptsOrNull) |*chainOpts| {
-                    const options = json.ParseOptions{
-                        .ignore_unknown_fields = true,
-                        .allocate = .alloc_if_needed,
-                    };
-
-                    const genesis = (try json.parseFromSlice(types.GenesisSpec, allocator, chainOpts.*, options));
-                    const spec = (try json.parseFromSlice(types.ChainSpec, allocator, chainOpts.*, options));
+                    const genesis = utils.Cast(types.GenesisSpec, chainOpts);
+                    const spec = utils.Cast(types.ChainSpec, chainOpts);
 
                     return Self{
                         .id = chainId,
-                        .genesis = genesis.value,
-                        .spec = spec.value,
+                        .genesis = genesis,
+                        .spec = spec,
                     };
                 } else {
                     return ChainConfigError.InvalidChainSpec;
@@ -54,6 +52,13 @@ test "custom dev chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
 
-    const dev_config = try ChainConfig.init(arena_allocator.allocator(), Chain.custom, dev_spec);
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const dev_options = (try json.parseFromSlice(ChainOptions, arena_allocator.allocator(), dev_spec, options));
+
+    const dev_config = try ChainConfig.init(Chain.custom, dev_options);
     std.debug.print("dev config = {any}\n", .{dev_config});
+    std.debug.print("chainoptions = {any}\n", .{ChainOptions{}});
 }

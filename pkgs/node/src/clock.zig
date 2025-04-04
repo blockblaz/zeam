@@ -1,4 +1,6 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const xev = @import("xev");
 
 const params = @import("@zeam/params");
@@ -12,6 +14,7 @@ pub const Clock = struct {
     current_slot_time_ms: isize,
     current_slot: isize,
     events: utils.EventLoop,
+    on_slot_cbs: std.ArrayList(*const fn (ud: ?*anyopaque, slot: isize) void),
 
     timer: xev.Timer,
     c: xev.Completion,
@@ -19,6 +22,7 @@ pub const Clock = struct {
     const Self = @This();
 
     pub fn init(
+        allocator: Allocator,
         genesis_time: usize,
     ) !Self {
         const events = try utils.EventLoop.init();
@@ -29,14 +33,7 @@ pub const Clock = struct {
         const current_slot = @divFloor(@as(isize, @intCast(std.time.milliTimestamp())) + CLOCK_DISPARITY_MS - genesis_time_ms, SECONDS_PER_SLOT_MS);
         const current_slot_time_ms = genesis_time_ms + current_slot * SECONDS_PER_SLOT_MS;
 
-        return Self{
-            .genesis_time_ms = genesis_time_ms,
-            .current_slot_time_ms = current_slot_time_ms,
-            .current_slot = current_slot,
-            .events = events,
-            .timer = timer,
-            .c = c,
-        };
+        return Self{ .genesis_time_ms = genesis_time_ms, .current_slot_time_ms = current_slot_time_ms, .current_slot = current_slot, .events = events, .timer = timer, .c = c, .on_slot_cbs = std.ArrayList(*const fn (ud: ?*anyopaque, slot: isize) void).init(allocator) };
     }
 
     pub fn tickSlot(self: *Self) void {
@@ -58,6 +55,8 @@ pub const Clock = struct {
             try self.events.run(.until_done);
         }
     }
+
+    pub fn onSlot() void {}
 };
 
 fn timerCallback(

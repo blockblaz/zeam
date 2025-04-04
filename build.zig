@@ -31,6 +31,13 @@ pub fn build(b: *Builder) !void {
     }).module("xev");
 
     // add zeam-params
+    const zeam_utils = b.addModule("@zeam/utils", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/utils/src/lib.zig"),
+    });
+
+    // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
         .optimize = optimize,
@@ -43,6 +50,17 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_types.addImport("@zeam/params", zeam_params);
+
+    // add zeam-types
+    const zeam_configs = b.addModule("@zeam/configs", .{
+        .root_source_file = b.path("pkgs/configs/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_configs.addImport("@zeam/utils", zeam_utils);
+    zeam_configs.addImport("@zeam/types", zeam_types);
+    zeam_configs.addImport("@zeam/params", zeam_params);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -79,6 +97,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_beam_node.addImport("xev", xev);
     zeam_beam_node.addImport("@zeam/params", zeam_params);
+    zeam_beam_node.addImport("@zeam/configs", zeam_configs);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -91,29 +110,13 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("xev", xev);
+    cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);
+    cli_exe.root_module.addImport("@zeam/configs", zeam_configs);
     cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
-    cli_exe.root_module.addImport("@zeam/params", zeam_params);
-    for (zkvm_targets) |zkvm_target| {
-        if (zkvm_target.build_glue) {
-            const zkvm_host_cmd = b.addSystemCommand(&.{
-                "cargo",
-                "+nightly",
-                "-C",
-                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
-                "-Z",
-                "unstable-options",
-                "build",
-                "--release",
-            });
-            cli_exe.step.dependOn(&zkvm_host_cmd.step);
-            cli_exe.addObjectFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/host/target/release/libzeam_prover_host_{s}.a", .{ zkvm_target.name, zkvm_target.name })));
-        }
-    }
-    cli_exe.linkLibC(); // for rust static libs to link
-    cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     b.installArtifact(cli_exe);
 
     const run_prover = b.addRunArtifact(cli_exe);
@@ -151,7 +154,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
     }).module("ssz.zig");
 
     // add zeam-params
-    const params = b.addModule("@zeam/params", .{
+    const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
@@ -163,6 +166,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
     });
+    zeam_types.addImport("@zeam/params", zeam_params);
 
     // add state transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -190,10 +194,10 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
         });
         // addimport to root module is even required afer declaring it in mod
         exe.root_module.addImport("ssz", ssz);
+        exe.root_module.addImport("@zeam/params", zeam_params);
         exe.root_module.addImport("@zeam/types", zeam_types);
         exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
-        exe.root_module.addImport("params", params);
         exe.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));
         if (zkvm_target.set_pie) {
             exe.pie = true;
