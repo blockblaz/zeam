@@ -1,12 +1,15 @@
 const std = @import("std");
-const types = @import("types");
+const Allocator = std.mem.Allocator;
+
+const types = @import("@zeam/types");
+const configs = @import("@zeam/configs");
 
 pub const ProtoNode = struct {
     slot: types.Slot,
     blockRoot: types.RootHex,
     parentRoot: types.RootHex,
     stateRoot: types.RootHex,
-    targetRoot: types.targetRoot,
+    targetRoot: types.RootHex,
     timeliness: bool,
 
     parent: ?usize,
@@ -16,11 +19,18 @@ pub const ProtoNode = struct {
 };
 
 pub const ProtoArray = struct {
-    nodes: []ProtoNode,
+    nodes: std.ArrayList(ProtoNode),
     indices: std.StringHashMap(usize),
 
     const Self = @This();
-    pub fn init() !Self {}
+    pub fn init(allocator: Allocator) !Self {
+        const nodes = std.ArrayList(ProtoNode).init(allocator);
+        const indices = std.StringHashMap(usize).init(allocator);
+        return Self{
+            .nodes = nodes,
+            .indices = indices,
+        };
+    }
 
     pub fn onBlock(block: ProtoNode, currentSlot: types.Slot) !void {
         _ = block;
@@ -35,9 +45,18 @@ const OnBlockOpts = struct {
 
 pub const ForkChoice = struct {
     blockTree: ProtoArray,
+    anchorState: types.BeamState,
+    config: configs.ChainConfig,
 
     const Self = @This();
-    pub fn init() !Self {}
+    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
+        const block_tree = try ProtoArray.init(allocator);
+        return Self{
+            .blockTree = block_tree,
+            .anchorState = anchorState,
+            .config = config,
+        };
+    }
     pub fn onBlock(block: types.BeaconBlock, state: types.BeaconState, opts: OnBlockOpts) !void {
         _ = block;
         _ = state;

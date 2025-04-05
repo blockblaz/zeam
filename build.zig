@@ -97,6 +97,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_beam_node.addImport("xev", xev);
     zeam_beam_node.addImport("@zeam/params", zeam_params);
+    zeam_beam_node.addImport("@zeam/types", zeam_types);
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
 
     // Add the cli executable

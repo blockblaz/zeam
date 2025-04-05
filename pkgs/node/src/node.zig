@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
@@ -12,7 +13,7 @@ const LevelDB = struct {};
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: ?types.BeamChain,
+    anchorState: types.BeamState,
     db: LevelDB,
 };
 
@@ -21,13 +22,17 @@ pub const BeamNode = struct {
     chain: chainFactory.BeamChain,
 
     const Self = @This();
-    pub fn init(opts: NodeOpts) !Self {
-        const clock = try clockFactory.Clock.init(opts.config);
-        const chain = try chainFactory.BeamChain.init(opts.config, opts.anchorState);
+    pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
+        const clock = try clockFactory.Clock.init(allocator, opts.config.genesis.genesis_time);
+        const chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
 
         return Self{
-            clock,
-            chain,
+            .clock = clock,
+            .chain = chain,
         };
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.clock.run();
     }
 };

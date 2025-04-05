@@ -16,6 +16,8 @@ const ChainOptions = configs.ChainOptions;
 
 const utilsLib = @import("@zeam/utils");
 
+const SftFactory = @import("@zeam/state-transition");
+
 const ZeamArgs = struct {
     genesis: ?u64,
 
@@ -95,7 +97,11 @@ pub fn main() !void {
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
             chain_options.genesis_time = genesis;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            std.debug.print("chainoptionsinfo={any}\n", .{chain_config});
+            const anchorState = try SftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
+            var beam_node = try BeamNode.init(gpa.allocator(), .{ .config = chain_config, .anchorState = anchorState, .db = .{} });
+            std.debug.print("chainoptionsinfo={any}\n", .{beam_node});
+
+            try beam_node.run();
         },
     }
 }
