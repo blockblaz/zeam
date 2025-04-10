@@ -117,6 +117,24 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
+    for (zkvm_targets) |zkvm_target| {
+        if (zkvm_target.build_glue) {
+            const zkvm_host_cmd = b.addSystemCommand(&.{
+                "cargo",
+                "+nightly",
+                "-C",
+                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
+                "-Z",
+                "unstable-options",
+                "build",
+                "--release",
+            });
+            cli_exe.step.dependOn(&zkvm_host_cmd.step);
+            cli_exe.addObjectFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/host/target/release/libzeam_prover_host_{s}.a", .{ zkvm_target.name, zkvm_target.name })));
+        }
+    }
+    cli_exe.linkLibC(); // for rust static libs to link
+    cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     b.installArtifact(cli_exe);
 
     const run_prover = b.addRunArtifact(cli_exe);

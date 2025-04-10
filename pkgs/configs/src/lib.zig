@@ -6,7 +6,7 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 
 const utils = @import("@zeam/utils");
-pub const ChainOptions = utils.Partial(utils.Mix(types.GenesisSpec, types.ChainSpec));
+pub const ChainOptions = utils.Partial(utils.MixIn(types.GenesisSpec, types.ChainSpec));
 
 const configs = @import("./configs/mainnet.zig");
 

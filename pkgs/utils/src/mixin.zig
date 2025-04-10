@@ -21,7 +21,7 @@ fn indexByName(comptime fields: []const std.builtin.Type.StructField, name: []co
 }
 
 /// Mixes fields from structure extend into structure super
-pub fn Mix(comptime Super: type, comptime Extend: type) type {
+pub fn MixIn(comptime Super: type, comptime Extend: type) type {
     const superInfo = ensure(Super, .@"struct") orelse @panic("Super type must be a struct");
     const extendInfo = ensure(Extend, .@"struct") orelse @panic("Extend type must be a struct");
 
@@ -61,17 +61,17 @@ pub fn Mix(comptime Super: type, comptime Extend: type) type {
     });
 }
 
-test "mix" {
+test "mixin" {
     const Type1 = struct {
         a: u8 = 'c',
         z: [3]i32 = [_]i32{ 1, 2, 3 },
     };
     const Type2 = struct { b: isize = 42, a: i32 = 0 };
 
-    const Mixed = Mix(Type1, Type2);
+    const Mixed = MixIn(Type1, Type2);
     const mixed = Mixed{};
 
-    std.debug.print("mix={any}\n", .{mixed});
+    std.debug.print("mixin={any}\n", .{mixed});
     try std.testing.expectEqual(mixed.a, 0);
     try std.testing.expectEqual(mixed.z.len, 3);
     try std.testing.expectEqual(mixed.b, 42);
