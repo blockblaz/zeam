@@ -86,11 +86,15 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
 
 // TODO(gballet) check if beam block needs to be a pointer
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock) !void {
+    const block = signedBlock.message;
+    if (block.slot <= state.slot) {
+        return StateTransitionError.InvalidPreState;
+    }
+
     // verify the proposer and attestation signatures on signed block
     try verify_signatures(signedBlock);
 
     // prepare the pre state for this block slot
-    const block = signedBlock.message;
     try process_slots(allocator, state, block.slot);
 
     // process the block

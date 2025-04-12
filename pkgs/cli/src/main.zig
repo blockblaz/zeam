@@ -57,33 +57,30 @@ pub fn main() !void {
             try clock.run();
         },
         .prove => |provecmd| {
-            const state = types.BeamState{
-                .genesis_time = 0,
-                .slot = 0,
-                .latest_block_header = .{
-                    .slot = 0,
-                    .proposer_index = 0,
-                    .parent_root = [_]u8{0} ** 32,
-                    .state_root = [_]u8{0} ** 32,
-                    .body_root = [_]u8{0} ** 32,
-                },
-            };
-            const block = types.SignedBeamBlock{
-                .message = .{
-                    .slot = 0,
-                    .proposer_index = 0,
-                    .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
-                    .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-                    .body = .{ .execution_payload_header = .{ .timestamp = 0 } },
-                },
-                .signature = [_]u8{0} ** 48,
-            };
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
             const options = stateProvingManager.StateTransitionOpts{
                 .zk_vm = stateProvingManager.zkvm_configs[0],
             };
 
-            _ = try stateProvingManager.prove_transition(state, block, options, allocator);
+            // generate a mock chain with 2 blocks including genesis i.e. 1 block on top of genesis
+            const mock_config = types.GenesisSpec{
+                .genesis_time = 0,
+            };
+            const mock_chain = try sftFactory.genMockChain(allocator, 2, mock_config);
+
+            // starting beam state
+            var beam_state = mock_chain.genesis_state;
+            // block 0 is genesis so we have to apply block 1 onwards
+            for (1..mock_chain.blocks.len) |i| {
+                // this is a signed block
+                const block1 = mock_chain.blocks[i];
+                std.debug.print("block {d}: {any}", .{ i, block1 });
+                std.debug.print("\nprestate slot blockslot={d} stateslot={d}", .{ block1.message.slot, beam_state.slot });
+
+                _ = try stateProvingManager.prove_transition(beam_state, block1, options, allocator);
+                // transition beam state for the next block
+                try sftFactory.apply_transition(allocator, &beam_state, block1);
+            }
         },
         .beam => {
             // some base mainnet spec would be loaded to build this up
