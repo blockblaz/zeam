@@ -17,7 +17,8 @@ pub const Clock = struct {
     current_slot: isize,
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
-    on_slot_cbs: std.ArrayList(OnSlotCbWrapper),
+    on_slot_cbs: std.ArrayList(*OnSlotCbWrapper),
+    on_slot_cs: std.ArrayList(*xev.Completion),
 
     timer: xev.Timer,
     c: xev.Completion,
@@ -43,7 +44,8 @@ pub const Clock = struct {
             .events = events,
             .timer = timer,
             .c = c,
-            .on_slot_cbs = std.ArrayList(OnSlotCbWrapper).init(allocator),
+            .on_slot_cbs = std.ArrayList(*OnSlotCbWrapper).init(allocator),
+            .on_slot_cs = std.ArrayList(*xev.Completion).init(allocator),
         };
     }
 
@@ -57,36 +59,45 @@ pub const Clock = struct {
         const next_slot_time_ms: isize = self.current_slot_time_ms + SECONDS_PER_SLOT_MS;
         const time_to_next_slot_ms: usize = @intCast(next_slot_time_ms - time_now_ms);
 
-        self.timer.run(&self.events.loop, &self.c, time_to_next_slot_ms, void, null, timerCallback);
-        // for(self.on_slot_cbs.items)|cb|{
-        //     var c: xev.Completion = undefined;
-        //     self.timer.run(&self.events.loop, &c, time_to_next_slot_ms, void, null, struct{
-        //         callback:
-        //     })
-        // }
+        for (0..self.on_slot_cbs.items.len) |i| {
+            const cbWrapper = self.on_slot_cbs.items[i];
+            const c = self.on_slot_cs.items[i];
+            cbWrapper.slot = self.current_slot + 1;
+
+            self.timer.run(
+                &self.events.loop,
+                c,
+                time_to_next_slot_ms,
+                OnSlotCbWrapper,
+                cbWrapper,
+                (struct {
+                    fn callback(
+                        ud: ?*OnSlotCbWrapper,
+                        _: *xev.Loop,
+                        _: *xev.Completion,
+                        r: xev.Timer.RunError!void,
+                    ) xev.CallbackAction {
+                        _ = r catch unreachable;
+                        if (ud) |cb_wrapper| {
+                            _ = cb_wrapper.onSlot() catch void;
+                        }
+                        return .disarm;
+                    }
+                }).callback,
+            );
+        }
     }
 
     pub fn run(self: *Self) !void {
         while (true) {
             self.tickSlot();
             try self.events.run(.until_done);
-            for (self.on_slot_cbs.items) |cb| {
-                try cb.onSlot(self.current_slot + 1);
-            }
         }
     }
 
-    pub fn subscribeOnSlot(self: *Self, cb: OnSlotCbWrapper) !void {
+    pub fn subscribeOnSlot(self: *Self, cb: *OnSlotCbWrapper) !void {
         try self.on_slot_cbs.append(cb);
+        var c: xev.Completion = undefined;
+        try self.on_slot_cs.append(&c);
     }
 };
-
-fn timerCallback(
-    _: ?*void,
-    _: *xev.Loop,
-    _: *xev.Completion,
-    result: xev.Timer.RunError!void,
-) xev.CallbackAction {
-    _ = result catch unreachable;
-    return .disarm;
-}
