@@ -4,6 +4,9 @@ const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 
+const utils = @import("./utils.zig");
+const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+
 pub const fcFactory = @import("./forkchoice.zig");
 
 pub const BeamChain = struct {
@@ -16,6 +19,24 @@ pub const BeamChain = struct {
         return Self{
             .config = config,
             .forkChoice = fork_choice,
+        };
+    }
+
+    fn onSlot(ptr: *anyopaque, slot: isize) !void {
+        // demonstrate how to call retrive this struct
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.printSlot(slot);
+    }
+
+    fn printSlot(self: *Self, slot: isize) void {
+        _ = self;
+        std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
+    }
+
+    pub fn onSlotWrapper(self: *Self) OnSlotCbWrapper {
+        return .{
+            .ptr = self,
+            .onSlotCb = onSlot,
         };
     }
 };
