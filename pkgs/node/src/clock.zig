@@ -7,6 +7,8 @@ const params = @import("@zeam/params");
 const SECONDS_PER_SLOT_MS: isize = params.SECONDS_PER_SLOT * std.time.ms_per_s;
 
 const utils = @import("./utils.zig");
+const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+
 const CLOCK_DISPARITY_MS: isize = 100;
 
 pub const Clock = struct {
@@ -14,7 +16,8 @@ pub const Clock = struct {
     current_slot_time_ms: isize,
     current_slot: isize,
     events: utils.EventLoop,
-    on_slot_cbs: std.ArrayList(*const fn (ud: ?*anyopaque, slot: isize) void),
+    // track those who subscribed for on slot callbacks
+    on_slot_cbs: std.ArrayList(OnSlotCbWrapper),
 
     timer: xev.Timer,
     c: xev.Completion,
@@ -40,7 +43,7 @@ pub const Clock = struct {
             .events = events,
             .timer = timer,
             .c = c,
-            .on_slot_cbs = std.ArrayList(*const fn (ud: ?*anyopaque, slot: isize) void).init(allocator),
+            .on_slot_cbs = std.ArrayList(OnSlotCbWrapper).init(allocator),
         };
     }
 
@@ -55,16 +58,27 @@ pub const Clock = struct {
         const time_to_next_slot_ms: usize = @intCast(next_slot_time_ms - time_now_ms);
 
         self.timer.run(&self.events.loop, &self.c, time_to_next_slot_ms, void, null, timerCallback);
+        // for(self.on_slot_cbs.items)|cb|{
+        //     var c: xev.Completion = undefined;
+        //     self.timer.run(&self.events.loop, &c, time_to_next_slot_ms, void, null, struct{
+        //         callback:
+        //     })
+        // }
     }
 
     pub fn run(self: *Self) !void {
         while (true) {
             self.tickSlot();
             try self.events.run(.until_done);
+            for (self.on_slot_cbs.items) |cb| {
+                try cb.onSlot(self.current_slot + 1);
+            }
         }
     }
 
-    pub fn onSlot() void {}
+    pub fn subscribeOnSlot(self: *Self, cb: OnSlotCbWrapper) !void {
+        try self.on_slot_cbs.append(cb);
+    }
 };
 
 fn timerCallback(
