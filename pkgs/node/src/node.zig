@@ -25,7 +25,7 @@ pub const BeamNode = struct {
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
         var clock = try clockFactory.Clock.init(allocator, opts.config.genesis.genesis_time);
         var chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
-        const chainOnSlot = chain.onSlotWrapper();
+        const chainOnSlot = chain.getOnSlotCbWrapper();
         try clock.subscribeOnSlot(chainOnSlot);
 
         return Self{
