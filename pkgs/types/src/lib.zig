@@ -97,7 +97,7 @@ test "ssz seralize/deserialize signed beam block" {
     try ssz.serialize(BeamBlock, signed_block.message, &serialized_block);
 
     var deserialized_block: BeamBlock = undefined;
-    std.debug.print("serialized_block={any}\n", .{serialized_block.items});
+    std.debug.print("serialized_block({d})={any}\n", .{ serialized_block.items.len, serialized_block.items });
     try ssz.deserialize(BeamBlock, serialized_block.items[0..], &deserialized_block, std.testing.allocator);
     std.debug.print("deserialized_block={any}\n", .{deserialized_block});
 
@@ -105,7 +105,7 @@ test "ssz seralize/deserialize signed beam block" {
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
     try ssz.serialize(SignedBeamBlock, signed_block, &serialized_signed_block);
-    std.debug.print("serialized_signed_block={any}\n", .{serialized_signed_block.items});
+    std.debug.print("serialized_signed_block({d})={any}\n", .{ serialized_signed_block.items.len, serialized_signed_block.items });
 
     var deserialized_signed_block: SignedBeamBlock = undefined;
     try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
