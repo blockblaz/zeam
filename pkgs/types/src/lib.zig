@@ -91,7 +91,7 @@ test "ssz seralize/deseriale signed beam block" {
         .signature = [_]u8{3} ** 48,
     };
 
-    // check block serialization/deserialization
+    // 1. check BeamBlock serialization/deserialization
     var serialized_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_block.deinit();
     try ssz.serialize(BeamBlock, block.message, &serialized_block);
@@ -101,6 +101,7 @@ test "ssz seralize/deseriale signed beam block" {
     try ssz.deserialize(BeamBlock, serialized_block.items[0..], &deserialized_block, std.testing.allocator);
     std.debug.print("deserialized_block={any}\n", .{deserialized_block});
 
+    // 2. check SignedBeamBlock serialization/deserialization
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
     try ssz.serialize(SignedBeamBlock, block, &serialized_signed_block);
