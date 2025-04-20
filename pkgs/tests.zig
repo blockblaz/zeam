@@ -4,9 +4,11 @@ comptime {
     // _ = @import("state-proving-manager/src/manager.zig");
     // uncomment after rebase / fixing preset issue
     // _ = @import("params/src/lib.zig");
-    _ = @import("cli/src/main.zig");
+    // _ = @import("cli/src/main.zig");
     // uncomment after rebase / fixing preset issue
     // _ = @import("types/src/lib.zig");
-    _ = @import("./node/src/node.zig");
-    _ = @import("./node/src/forkchoice.zig");
+    // _ = @import("./node/src/node.zig");
+    // _ = @import("./node/src/forkchoice.zig");
+    // _ = @import("./types/src/lib.zig");
+    // _ = @import("./node/src/node.zig");
 }

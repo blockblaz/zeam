@@ -22,7 +22,10 @@ pub const BeamBlockHeader = struct {
 };
 
 // empty block body
-pub const BeamBlockBody = struct {};
+pub const BeamBlockBody = struct {
+    // something to avoid having empty body
+    slot: Slot,
+};
 
 pub const BeamBlock = struct {
     slot: Slot,
@@ -72,4 +75,38 @@ test "ssz import" {
 
     try ssz.serialize(u16, data, &list);
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
+}
+
+test "ssz seralize/deseriale signed beam block" {
+    const block = SignedBeamBlock{
+        .message = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
+            .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
+            .body = .{
+                .slot = 9,
+            },
+        },
+        .signature = [_]u8{3} ** 48,
+    };
+
+    // check block serialization/deserialization
+    var serialized_block = std.ArrayList(u8).init(std.testing.allocator);
+    defer serialized_block.deinit();
+    try ssz.serialize(BeamBlock, block.message, &serialized_block);
+
+    var deserialized_block: BeamBlock = undefined;
+    std.debug.print("serialized_block={any}\n", .{serialized_block.items});
+    try ssz.deserialize(BeamBlock, serialized_block.items[0..], &deserialized_block, std.testing.allocator);
+    std.debug.print("deserialized_block={any}\n", .{deserialized_block});
+
+    var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
+    defer serialized_signed_block.deinit();
+    try ssz.serialize(SignedBeamBlock, block, &serialized_signed_block);
+    std.debug.print("serialized_signed_block={any}\n", .{serialized_signed_block.items});
+
+    var deserialized_signed_block: SignedBeamBlock = undefined;
+    try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
+    std.debug.print("deserialized_signed_block={any}\n", .{deserialized_signed_block});
 }

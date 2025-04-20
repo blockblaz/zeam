@@ -50,6 +50,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_types.addImport("ssz", ssz);
     zeam_types.addImport("@zeam/params", zeam_params);
 
     // add zeam-types
