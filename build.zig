@@ -187,21 +187,23 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
     });
     zeam_types.addImport("@zeam/params", zeam_params);
 
-    // add state transition
-    const zeam_state_transition = b.addModule("@zeam/state-transition", .{
-        .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    zeam_state_transition.addImport("@zeam/types", zeam_types);
-    zeam_state_transition.addImport("ssz", ssz);
-
     for (zkvm_targets) |zkvm_target| {
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
             .target = target,
             .root_source_file = b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/lib.zig", .{zkvm_target.name})),
         });
+
+        // add state transition, create a new module for each zkvm since
+        // that module depends on the zkvm module.
+        const zeam_state_transition = b.addModule("@zeam/state-transition", .{
+            .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        zeam_state_transition.addImport("@zeam/types", zeam_types);
+        zeam_state_transition.addImport("ssz", ssz);
+        zeam_state_transition.addImport("zkvm", zkvm_module);
 
         // target has to be riscv5 runtime provable/verifiable on zkVMs
         var exec_name: [256]u8 = undefined;

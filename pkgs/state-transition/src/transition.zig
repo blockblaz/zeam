@@ -1,10 +1,19 @@
 const ssz = @import("ssz");
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-
 const types = @import("@zeam/types");
-
 pub const utils = @import("./utils.zig");
+
+fn log(comptime fmt: []const u8, args: anytype) !void {
+    if (builtin.target.os.tag == .freestanding) {
+        const io = @import("zkvm").io;
+        var buf: [512]u8 = undefined;
+        io.print_str(try std.fmt.bufPrint(buf[0..], fmt, args));
+    } else {
+        std.debug.print(fmt, args);
+    }
+}
 
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
@@ -42,12 +51,14 @@ pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.
 fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
     // very basic process block header
     if (state.slot != block.slot) {
+        log("state slot={} block slot={}", .{ state.slot, block.slot }) catch @panic("error printing invalid block slot");
         return StateTransitionError.InvalidPreState;
     }
 
     var head_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &head_root, allocator);
     if (!std.mem.eql(u8, &head_root, &block.parent_root)) {
+        log("state root={any} block root={any}", .{ head_root, block.parent_root }) catch @panic("error printing invalid parent root");
         return StateTransitionError.InvalidParentRoot;
     }
 
@@ -80,6 +91,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     var state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
     if (!std.mem.eql(u8, &state_root, &block.state_root)) {
+        log("state root={any} block root={any}", .{ state_root, block.state_root }) catch @panic("error printing invalid block root");
         return StateTransitionError.InvalidPostState;
     }
 }
