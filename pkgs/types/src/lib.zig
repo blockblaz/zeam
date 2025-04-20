@@ -77,7 +77,7 @@ test "ssz import" {
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }
 
-test "ssz seralize/deseriale signed beam block" {
+test "ssz seralize/deserialize signed beam block" {
     const signed_block = SignedBeamBlock{
         .message = .{
             .slot = 0,
