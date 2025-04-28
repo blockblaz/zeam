@@ -4,8 +4,8 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
 
-pub const utils = @import("./utils.zig");
-pub const genGenesisState = utils.genGenesisState;
+const utils = @import("./utils.zig");
+pub usingnamespace utils;
 
 const transition = @import("./transition.zig");
 pub const process_slots = transition.process_slot;

@@ -103,3 +103,18 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
 
     return state;
 }
+
+pub fn genStateBlockHeader(allocator: Allocator, state: types.BeamState) !types.BeamBlockHeader {
+    // check does it need cloning?
+    var block = state.latest_block_header;
+    var state_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(
+        types.BeamState,
+        state,
+        &state_root,
+        allocator,
+    );
+    block.state_root = state_root;
+
+    return block;
+}

@@ -1,17 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const utils = @import("@zeam/utils");
-const ssz = @import("ssz");
+const stf = @import("@zeam/state-transition");
 
 pub const ProtoBlock = struct {
     slot: types.Slot,
-    blockRoot: types.RootHex,
-    parentRoot: types.RootHex,
-    stateRoot: types.RootHex,
-    targetRoot: types.RootHex,
+    // we can keep these in hex not hex strings because stringhashmap just relies on []
+    blockRoot: types.Root,
+    parentRoot: types.Root,
+    stateRoot: types.Root,
+    targetRoot: types.Root,
     timeliness: bool,
 };
 const ProtoMeta = struct {
@@ -52,6 +54,9 @@ pub const ProtoArray = struct {
             .weight = weight,
             // bestChild and bestDescendant are left null
         });
+        const node_index = self.nodes.items.len;
+        self.nodes.append(node);
+        self.indices.set(node_index, node.blockRoot);
     }
 
     fn getNode(self: Self, blockRoot: []u8) ?ProtoNode {
@@ -83,7 +88,7 @@ const OnBlockOpts = struct {
 pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
     finalizedSlot: types.Slot,
-    finalizedRoot: types.Bytes32,
+    finalizedRoot: types.Root,
 };
 
 pub const ForkChoice = struct {
@@ -96,9 +101,19 @@ pub const ForkChoice = struct {
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
         const proto_array = try ProtoArray.init(allocator);
+        const finalized_header = try stf.genStateBlockHeader(allocator, anchorState);
+        var finalized_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            types.BeamBlockHeader,
+            finalized_header,
+            &finalized_root,
+            allocator,
+        );
+
         const fc_store = ForkChoiceStore{
             .currentSlot = anchorState.slot,
-            .finalizadSlot = anchorState.slot,
+            .finalizedSlot = anchorState.slot,
+            .finalizedRoot = finalized_root,
         };
 
         return Self{
@@ -140,6 +155,15 @@ pub const ForkChoice = struct {
         }
 
         return false;
+    }
+
+    pub fn tickSlot(self: Self, currentSlot: types.Slot) void {
+        if (self.fcStore.currentSlot >= currentSlot) {
+            return;
+        }
+
+        self.fcStore.currentSlot = currentSlot;
+        // reset attestations or process checkpoints as prespscribed in the specs
     }
 
     pub fn onBlock(self: Self, block: types.BeaconBlock, state: types.BeaconState, opts: OnBlockOpts) !void {
