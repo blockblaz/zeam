@@ -11,6 +11,7 @@ const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
     blocks: []types.SignedBeamBlock,
+    blockRoots: []types.Root,
 };
 
 pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
@@ -20,6 +21,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     const genesis_state = try utils.genGenesisState(allocator, genesis_config);
     var blockList = std.ArrayList(types.SignedBeamBlock).init(allocator);
+    var blockRootList = std.ArrayList(types.Root).init(allocator);
 
     // figure out a way to clone genesis_state
     var beam_state = try utils.genGenesisState(allocator, genesis_config);
@@ -31,7 +33,11 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         .message = genesis_block,
         .signature = gen_signature,
     };
+    var block_root: types.Root = undefined;
+    try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, std.testing.allocator);
+
     try blockList.append(gen_signed_block);
+    try blockRootList.append(block_root);
 
     var prev_block = genesis_block;
     for (1..numBlocks) |slot| {
@@ -57,6 +63,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // extract the post state root
         try ssz.hashTreeRoot(types.BeamState, beam_state, &state_root, allocator);
         block.state_root = state_root;
+        try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, std.testing.allocator);
 
         // generate the signed beam block and add to block list
         var signature: [48]u8 = undefined;
@@ -66,6 +73,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .signature = signature,
         };
         try blockList.append(signed_block);
+        try blockRootList.append(block_root);
+
         // now we are ready for next round as the beam_state is not this blocks post state
         prev_block = block;
     }
@@ -74,5 +83,6 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         .genesis_config = genesis_config,
         .genesis_state = genesis_state,
         .blocks = blockList.items,
+        .blockRoots = blockRootList.items,
     };
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 
 const ssz = @import("ssz");
@@ -29,34 +30,56 @@ pub const ProtoArray = struct {
     indices: std.StringHashMap(usize),
 
     const Self = @This();
-    pub fn init(allocator: Allocator) !Self {
+    pub fn init(allocator: Allocator, anchorBlock: ProtoBlock) !Self {
         const nodes = std.ArrayList(ProtoNode).init(allocator);
         const indices = std.StringHashMap(usize).init(allocator);
-        return Self{
+
+        var proto_array = Self{
             .nodes = nodes,
             .indices = indices,
         };
+        try proto_array.onBlock(anchorBlock, anchorBlock.slot);
+        return proto_array;
     }
 
-    pub fn onBlock(self: Self, block: ProtoBlock, currentSlot: types.Slot) !void {
+    pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot) !void {
         // currentSlot might be needed in future for finding the viable head
         _ = currentSlot;
-        const node_or_null = self.indices.get(block.blockRoot);
-        if (node_or_null) {
+        const node_or_null = self.indices.get(block.blockRoot[0..]);
+        if (node_or_null) |node| {
+            _ = node;
             return;
         }
 
-        const parent = self.indices.get(block.parentRoot);
-        const weight = if (block.timeliness) 1 else 0;
+        const parent = self.indices.get(block.parentRoot[0..]);
+        var weight: usize = undefined;
+        if (block.timeliness) {
+            weight = 1;
+        } else {
+            weight = 0;
+        }
 
-        const node = utils.Extend(ProtoNode, block, .{
+        // TODO extend is not working so copy data for now
+        // const node = utils.Extend(ProtoNode, block, .{
+        //     .parent = parent,
+        //     .weight = weight,
+        //     // bestChild and bestDescendant are left null
+        // });
+        const node = ProtoNode{
+            .slot = block.slot,
+            .blockRoot = block.blockRoot,
+            .parentRoot = block.parentRoot,
+            .stateRoot = block.stateRoot,
+            .targetRoot = block.targetRoot,
+            .timeliness = block.timeliness,
             .parent = parent,
             .weight = weight,
-            // bestChild and bestDescendant are left null
-        });
+            .bestChild = null,
+            .bestDescendant = null,
+        };
         const node_index = self.nodes.items.len;
-        self.nodes.append(node);
-        self.indices.set(node_index, node.blockRoot);
+        try self.nodes.append(node);
+        try self.indices.put(node.blockRoot[0..], node_index);
     }
 
     fn getNode(self: Self, blockRoot: []u8) ?ProtoNode {
@@ -100,7 +123,6 @@ pub const ForkChoice = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
-        const proto_array = try ProtoArray.init(allocator);
         const finalized_header = try stf.genStateBlockHeader(allocator, anchorState);
         var finalized_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
@@ -109,6 +131,16 @@ pub const ForkChoice = struct {
             &finalized_root,
             allocator,
         );
+
+        const anchor_block = ProtoBlock{
+            .slot = anchorState.slot,
+            .blockRoot = finalized_root,
+            .parentRoot = finalized_header.parent_root,
+            .stateRoot = finalized_header.state_root,
+            .targetRoot = finalized_root,
+            .timeliness = true,
+        };
+        const proto_array = try ProtoArray.init(allocator, anchor_block);
 
         const fc_store = ForkChoiceStore{
             .currentSlot = anchorState.slot,
@@ -157,7 +189,7 @@ pub const ForkChoice = struct {
         return false;
     }
 
-    pub fn tickSlot(self: Self, currentSlot: types.Slot) void {
+    pub fn tickSlot(self: *Self, currentSlot: types.Slot) void {
         if (self.fcStore.currentSlot >= currentSlot) {
             return;
         }
@@ -166,7 +198,7 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prespscribed in the specs
     }
 
-    pub fn onBlock(self: Self, block: types.BeaconBlock, state: types.BeaconState, opts: OnBlockOpts) !void {
+    pub fn onBlock(self: *Self, block: types.BeaconBlock, state: types.BeaconState, opts: OnBlockOpts) !void {
         _ = state;
 
         const parent_root = block.parentRoot;
@@ -210,3 +242,35 @@ pub const ForkChoice = struct {
 };
 
 const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant };
+
+test "forkchoice block tree" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const fork_choice = try ForkChoice.init(allocator, chain_config, beam_state);
+
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalizedRoot, &mock_chain.blockRoots[0]));
+    try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalizedRoot, &fork_choice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
+
+    // std.debug.print("protoArray={any}", .{fork_choice.protoArray.nodes.items});
+
+    // for (1..mock_chain.blocks.len) |i| {
+    //     _ = i;
+    // }
+}
