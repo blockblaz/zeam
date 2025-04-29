@@ -53,6 +53,11 @@ pub const ZkVm = enum {
 pub const BeamSTFProof = struct {
     // zk_vm: ZkVm,
     // proof: []u8,
+    verification_key: []const u8,
+    params: ?[]const u8, // wtf is that?
+    pil_file: []const u8,
+    proof: []const u8,
+    publics: []const u8, // string-serialized publics
 };
 
 pub const GenesisSpec = struct { genesis_time: u64 };

@@ -80,3 +80,52 @@ pub extern "C" fn powdr_prove(
     // println!("proving starting");
     session.prove();
 }
+
+#[no_mangle]
+pub extern "C" fn powdr_verify(
+    proof_ptr: *const u8,
+    proof_len: usize,
+    publics_ptr: *const u8,
+    publics_len: usize,
+    binary_path: *const u8,
+    binary_path_len: usize,
+) -> bool {
+    let proof = unsafe {
+        if !proof_ptr.is_null() {
+            std::slice::from_raw_parts(proof_ptr, proof_len)
+        } else {
+            &[]
+        }
+    };
+    let publics_slice = unsafe {
+        if !publics_ptr.is_null() {
+            std::slice::from_raw_parts(publics_ptr, publics_len)
+        } else {
+            &[]
+        }
+    };
+
+    let binary_path_slice = unsafe {
+        if !binary_path.is_null() {
+            std::slice::from_raw_parts(binary_path, binary_path_len)
+        } else {
+            &[]
+        }
+    };
+    let binary_path = std::str::from_utf8(binary_path_slice).unwrap();
+    let binary = Path::new(binary_path);
+    if !binary.exists() {
+        panic!("path does not exist");
+    }
+
+    let publics = split_inputs(publics_slice.as_str());
+
+    let mut session = Session::builder()
+        .guest_path(binary_path)
+        .out_path(result_path)
+        .chunk_size_log2(18)
+        .build()
+        .write_bytes(byte_slice.to_vec());
+
+    return session.verify();
+}

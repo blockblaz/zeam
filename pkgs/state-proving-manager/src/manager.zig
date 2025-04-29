@@ -11,6 +11,7 @@ pub const ZKVMContext = struct {
 };
 
 extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) void;
+extern fn powdr_verify(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) bool;
 
 pub const zkvm_configs: []const ZKVMContext = &.{
     .{ .program_path = "zig-out/bin/zeam-stf-powdr", .output_dir = "out", .backend = "plonky3" },
@@ -41,4 +42,9 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
     _ = state_root;
     _ = block_root;
     _ = opts;
+
+    const verified = powdr_verify(zkvm_configs[0].output_dir.ptr, zkvm_configs[0].output_dir.len);
+    if (!verified) {
+        return error.ProofDidNotVerify;
+    }
 }
