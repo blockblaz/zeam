@@ -82,20 +82,29 @@ pub const ProtoArray = struct {
         try self.indices.put(node.blockRoot[0..], node_index);
     }
 
-    fn getNode(self: Self, blockRoot: []u8) ?ProtoNode {
-        const block_index = self.indices.get(blockRoot);
+    fn getNode(self: Self, blockRoot: types.Root) ?ProtoNode {
+        const block_index = self.indices.get(blockRoot[0..]);
         if (block_index) |blkidx| {
-            const node = self.nodes.get(blkidx);
+            const node = self.nodes.items[blkidx];
             return node;
         } else {
             return null;
         }
     }
 
-    pub fn getBlock(self: Self, blockRoot: []u8) ?ProtoBlock {
+    pub fn getBlock(self: Self, blockRoot: types.Root) ?ProtoBlock {
         const nodeOrNull = self.getNode(blockRoot);
         if (nodeOrNull) |node| {
-            const block = utils.Cast(ProtoBlock, node);
+            // TODO cast doesn't seem to be working find resolution
+            // const block = utils.Cast(ProtoBlock, node);
+            const block = ProtoBlock{
+                .slot = node.slot,
+                .blockRoot = node.blockRoot,
+                .parentRoot = node.parentRoot,
+                .stateRoot = node.stateRoot,
+                .targetRoot = node.targetRoot,
+                .timeliness = node.timeliness,
+            };
             return block;
         } else {
             return null;
@@ -163,23 +172,23 @@ pub const ForkChoice = struct {
         return true;
     }
 
-    fn isFinalizedDescendant(self: Self, blockRoot: []u8) bool {
-        const finalized_slot = self.fcStore.finalizadSlot;
+    fn isFinalizedDescendant(self: Self, blockRoot: types.Root) bool {
+        const finalized_slot = self.fcStore.finalizedSlot;
         const finalized_root = self.fcStore.finalizedRoot;
 
-        var searched_idx_or_null = self.indices.get(blockRoot);
+        var searched_idx_or_null = self.protoArray.indices.get(blockRoot[0..]);
 
         while (searched_idx_or_null) |searched_idx| {
-            const searched_node_or_null = self.protoArray[searched_idx];
+            const searched_node_or_null: ?ProtoNode = self.protoArray.nodes.items[searched_idx];
             if (searched_node_or_null) |searched_node| {
                 if (searched_node.slot <= finalized_slot) {
-                    if (std.mem.eql(searched_node.blockRoot, finalized_root)) {
+                    if (std.mem.eql(u8, searched_node.blockRoot[0..], finalized_root[0..])) {
                         return true;
                     } else {
                         return false;
                     }
                 } else {
-                    searched_idx_or_null = self.indices.get(searched_node.parent);
+                    searched_idx_or_null = searched_node.parent;
                 }
             } else {
                 break;
@@ -198,10 +207,10 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prespscribed in the specs
     }
 
-    pub fn onBlock(self: *Self, block: types.BeaconBlock, state: types.BeaconState, opts: OnBlockOpts) !void {
+    pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !void {
         _ = state;
 
-        const parent_root = block.parentRoot;
+        const parent_root = block.parent_root;
         const slot = block.slot;
 
         const parent_block_or_null = self.protoArray.getBlock(parent_root);
@@ -211,7 +220,7 @@ pub const ForkChoice = struct {
 
             if (slot > self.fcStore.currentSlot) {
                 return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.finalizadSlot) {
+            } else if (slot < self.fcStore.finalizedSlot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -228,7 +237,7 @@ pub const ForkChoice = struct {
                 .slot = slot,
                 .blockRoot = block_root,
                 .parentRoot = parent_root,
-                .stateRoot = block.stateRoot,
+                .stateRoot = block.state_root,
                 // depends on the finalization gadget
                 .targetRoot = block_root,
                 .timeliness = is_timely,
@@ -259,8 +268,8 @@ test "forkchoice block tree" {
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
     const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
-    const beam_state = mock_chain.genesis_state;
-    const fork_choice = try ForkChoice.init(allocator, chain_config, beam_state);
+    var beam_state = mock_chain.genesis_state;
+    var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state);
 
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalizedRoot, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
@@ -268,9 +277,11 @@ test "forkchoice block tree" {
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
-    // std.debug.print("protoArray={any}", .{fork_choice.protoArray.nodes.items});
+    for (1..mock_chain.blocks.len) |i| {
+        // get the block post state
+        const block = mock_chain.blocks[i];
+        try stf.apply_transition(allocator, &beam_state, block);
 
-    // for (1..mock_chain.blocks.len) |i| {
-    //     _ = i;
-    // }
+        try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+    }
 }
