@@ -104,3 +104,36 @@ test "mock genesis and block production" {
 
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &expected_block1_state_root));
 }
+
+test "genStateBlockHeader" {
+    // 1. setup genesis config
+    const test_config = types.GenesisSpec{
+        .genesis_time = 1234,
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try genMockChain(allocator, 2, test_config);
+
+    var beam_state = mock_chain.genesis_state;
+    for (0..mock_chain.blocks.len) |i| {
+        // get applied block
+        const applied_block = mock_chain.blocks[i];
+        var applied_block_root: types.Root = undefined;
+        try ssz.hashTreeRoot(types.BeamBlock, applied_block.message, &applied_block_root, allocator);
+
+        const state_block_header = try utils.genStateBlockHeader(allocator, beam_state);
+        var state_block_header_root: types.Root = undefined;
+        try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &state_block_header_root, allocator);
+
+        try std.testing.expect(std.mem.eql(u8, &applied_block_root, &state_block_header_root));
+
+        if (i < mock_chain.blocks.len - 1) {
+            // apply the next block
+            const block = mock_chain.blocks[i + 1];
+            try apply_transition(allocator, &beam_state, block);
+        }
+    }
+}
