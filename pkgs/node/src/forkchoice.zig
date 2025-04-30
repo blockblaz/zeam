@@ -27,12 +27,13 @@ pub const ProtoNode = utils.MixIn(ProtoBlock, ProtoMeta);
 
 pub const ProtoArray = struct {
     nodes: std.ArrayList(ProtoNode),
-    indices: std.StringHashMap(usize),
+    // seems like doesn't create
+    indices: std.AutoHashMap(types.Root, usize),
 
     const Self = @This();
     pub fn init(allocator: Allocator, anchorBlock: ProtoBlock) !Self {
         const nodes = std.ArrayList(ProtoNode).init(allocator);
-        const indices = std.StringHashMap(usize).init(allocator);
+        const indices = std.AutoHashMap(types.Root, usize).init(allocator);
 
         var proto_array = Self{
             .nodes = nodes,
@@ -45,13 +46,13 @@ pub const ProtoArray = struct {
     pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot) !void {
         // currentSlot might be needed in future for finding the viable head
         _ = currentSlot;
-        const node_or_null = self.indices.get(block.blockRoot[0..]);
+        const node_or_null = self.indices.get(block.blockRoot);
         if (node_or_null) |node| {
             _ = node;
             return;
         }
 
-        const parent = self.indices.get(block.parentRoot[0..]);
+        const parent = self.indices.get(block.parentRoot);
         var weight: usize = undefined;
         if (block.timeliness) {
             weight = 1;
@@ -79,11 +80,16 @@ pub const ProtoArray = struct {
         };
         const node_index = self.nodes.items.len;
         try self.nodes.append(node);
-        try self.indices.put(node.blockRoot[0..], node_index);
+        try self.indices.put(node.blockRoot, node_index);
+        // const searched_idx = self.indices.get(node.blockRoot[0..]);
+        // std.debug.print("searched_idx={any}\n", .{searched_idx});
     }
 
-    fn getNode(self: Self, blockRoot: types.Root) ?ProtoNode {
-        const block_index = self.indices.get(blockRoot[0..]);
+    fn getNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
+        std.debug.print("getNode blockRoot{any}\n", .{blockRoot});
+
+        const block_index = self.indices.get(blockRoot);
+        std.debug.print("getNode block_index={any} blockRoot{any}\n", .{ block_index, blockRoot });
         if (block_index) |blkidx| {
             const node = self.nodes.items[blkidx];
             return node;
@@ -92,7 +98,7 @@ pub const ProtoArray = struct {
         }
     }
 
-    pub fn getBlock(self: Self, blockRoot: types.Root) ?ProtoBlock {
+    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
         const nodeOrNull = self.getNode(blockRoot);
         if (nodeOrNull) |node| {
             // TODO cast doesn't seem to be working find resolution
@@ -166,17 +172,17 @@ pub const ForkChoice = struct {
         };
     }
 
-    fn isBlockTimely(self: Self, blockDelayMs: usize) bool {
+    fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
         _ = self;
         _ = blockDelayMs;
         return true;
     }
 
-    fn isFinalizedDescendant(self: Self, blockRoot: types.Root) bool {
+    fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
         const finalized_slot = self.fcStore.finalizedSlot;
         const finalized_root = self.fcStore.finalizedRoot;
 
-        var searched_idx_or_null = self.protoArray.indices.get(blockRoot[0..]);
+        var searched_idx_or_null = self.protoArray.indices.get(blockRoot);
 
         while (searched_idx_or_null) |searched_idx| {
             const searched_node_or_null: ?ProtoNode = self.protoArray.nodes.items[searched_idx];
@@ -214,6 +220,7 @@ pub const ForkChoice = struct {
         const slot = block.slot;
 
         const parent_block_or_null = self.protoArray.getBlock(parent_root);
+        std.debug.print("fc onBlock parent_root={any} parent_block_or_null={any} protArray{any}", .{ parent_root, parent_block_or_null, self.protoArray.indices });
         if (parent_block_or_null) |parent_block| {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
