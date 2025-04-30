@@ -81,15 +81,10 @@ pub const ProtoArray = struct {
         const node_index = self.nodes.items.len;
         try self.nodes.append(node);
         try self.indices.put(node.blockRoot, node_index);
-        // const searched_idx = self.indices.get(node.blockRoot[0..]);
-        // std.debug.print("searched_idx={any}\n", .{searched_idx});
     }
 
     fn getNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
-        std.debug.print("getNode blockRoot{any}\n", .{blockRoot});
-
         const block_index = self.indices.get(blockRoot);
-        std.debug.print("getNode block_index={any} blockRoot{any}\n", .{ block_index, blockRoot });
         if (block_index) |blkidx| {
             const node = self.nodes.items[blkidx];
             return node;
@@ -220,7 +215,6 @@ pub const ForkChoice = struct {
         const slot = block.slot;
 
         const parent_block_or_null = self.protoArray.getBlock(parent_root);
-        std.debug.print("fc onBlock parent_root={any} parent_block_or_null={any} protArray{any}", .{ parent_root, parent_block_or_null, self.protoArray.indices });
         if (parent_block_or_null) |parent_block| {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
@@ -289,6 +283,16 @@ test "forkchoice block tree" {
         const block = mock_chain.blocks[i];
         try stf.apply_transition(allocator, &beam_state, block);
 
+        // shouldn't accept a future slot
+        const current_slot = block.message.slot;
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+
+        fork_choice.tickSlot(current_slot);
         try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
+        try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
+
+        const searched_idx = fork_choice.protoArray.indices.get(mock_chain.blockRoots[i]);
+        try std.testing.expect(searched_idx == i);
     }
 }

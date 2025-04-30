@@ -63,7 +63,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // extract the post state root
         try ssz.hashTreeRoot(types.BeamState, beam_state, &state_root, allocator);
         block.state_root = state_root;
-        try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, std.testing.allocator);
+        try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, std.testing.allocator);
 
         // generate the signed beam block and add to block list
         var signature: [48]u8 = undefined;
