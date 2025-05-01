@@ -27,7 +27,6 @@ pub const ProtoNode = utils.MixIn(ProtoBlock, ProtoMeta);
 
 pub const ProtoArray = struct {
     nodes: std.ArrayList(ProtoNode),
-    // seems like doesn't create
     indices: std.AutoHashMap(types.Root, usize),
 
     const Self = @This();
@@ -205,7 +204,7 @@ pub const ForkChoice = struct {
         }
 
         self.fcStore.currentSlot = currentSlot;
-        // reset attestations or process checkpoints as prespscribed in the specs
+        // reset attestations or process checkpoints as prescribed in the specs
     }
 
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !void {
