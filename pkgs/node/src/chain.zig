@@ -35,9 +35,9 @@ pub const BeamChain = struct {
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
 
-    pub fn getOnSlotCbWrapper(self: *Self) *OnSlotCbWrapper {
+    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
         // need a stable pointer across threads
-        const cb_ptr = self.allocator.create(OnSlotCbWrapper) catch @panic("mem alloc failed");
+        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
         cb_ptr.* = .{
             .ptr = self,
             .onSlotCb = onSlot,

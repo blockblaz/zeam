@@ -36,6 +36,7 @@ pub const OnSlotCbWrapper = struct {
     ptr: *anyopaque,
     onSlotCb: OnSlotCbType,
     slot: isize = 0,
+    c: xev.Completion = undefined,
 
     pub fn onSlot(self: OnSlotCbWrapper) !void {
         return self.onSlotCb(self.ptr, self.slot);
