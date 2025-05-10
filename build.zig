@@ -160,6 +160,7 @@ pub fn build(b: *Builder) !void {
     });
     tests.root_module.addImport("ssz", ssz);
     tests.root_module.addImport("@zeam/utils", zeam_utils);
+    tests.root_module.addImport("@zeam/params", zeam_params);
     tests.root_module.addImport("@zeam/types", zeam_types);
     tests.root_module.addImport("@zeam/configs", zeam_configs);
     tests.root_module.addImport("@zeam/state-transition", zeam_state_transition);

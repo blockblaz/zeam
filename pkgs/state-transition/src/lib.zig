@@ -52,7 +52,6 @@ test "apply transition on mocked chain" {
     var post_state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.state_root));
-    std.debug.print("final post state root: {s}\n", .{std.fmt.fmtSliceHexLower(&post_state_root)});
 }
 
 test "mock genesis and block production" {
@@ -84,14 +83,14 @@ test "mock genesis and block production" {
 
     // check produced block 1 state root
     var expected_block1_state_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_block1_state_root[0..], "f77aaa703c400ccaffa8e674316713b044fcc3d94ec5764b00ce7edc138e7c95");
+    _ = try std.fmt.hexToBytes(expected_block1_state_root[0..], "993a459ace700aaeacf2fd3ec20b0f9efd3acae93ff904c5adbc1997b025ea97");
     try std.testing.expect(std.mem.eql(u8, &expected_block1_state_root, &mock_chain.blocks[1].message.state_root));
 
     // 7. check block 1 root
     var block1_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamBlock, mock_chain.blocks[1].message, &block1_root, std.testing.allocator);
     var expected_block1_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_block1_root[0..], "5b0c264e75ce2fae8ec3c2e0c1debb81e023e62df737469be61acdb37b7ff9a3");
+    _ = try std.fmt.hexToBytes(expected_block1_root[0..], "4851312e74b73c99581772286a853ee8fc6a9d2fde00c2bd21e9c7b966a6c238");
     try std.testing.expect(std.mem.eql(u8, &block1_root, &expected_block1_root));
 
     // 9. run and check state transition
