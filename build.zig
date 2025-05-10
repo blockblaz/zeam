@@ -50,6 +50,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_types.addImport("ssz", ssz);
     zeam_types.addImport("@zeam/params", zeam_params);
 
     // add zeam-types
@@ -68,6 +69,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
 
@@ -158,6 +160,7 @@ pub fn build(b: *Builder) !void {
     });
     tests.root_module.addImport("ssz", ssz);
     tests.root_module.addImport("@zeam/utils", zeam_utils);
+    tests.root_module.addImport("@zeam/params", zeam_params);
     tests.root_module.addImport("@zeam/types", zeam_types);
     tests.root_module.addImport("@zeam/configs", zeam_configs);
     tests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
@@ -207,6 +210,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
             .target = target,
             .optimize = optimize,
         });
+        zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);
         zeam_state_transition.addImport("zkvm", zkvm_module);

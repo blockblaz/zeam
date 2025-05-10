@@ -69,7 +69,7 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .proposer_index = 0,
         .parent_root = parent_root,
         .state_root = state_root,
-        .body = types.BeamBlockBody{},
+        .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = 0 } },
     };
 
     return genesis_latest_block;
@@ -87,7 +87,7 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
         .proposer_index = 0,
         .parent_root = parent_root,
         .state_root = state_root,
-        .body = types.BeamBlockBody{},
+        .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = 0 } },
     };
 
     return genesis_latest_block;

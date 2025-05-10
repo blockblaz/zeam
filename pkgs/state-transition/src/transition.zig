@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 pub const utils = @import("./utils.zig");
+const params = @import("@zeam/params");
 
 fn log(comptime fmt: []const u8, args: anytype) !void {
     if (builtin.target.os.tag == .freestanding) {
@@ -65,9 +66,17 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
 }
 
+fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBlock) !void {
+    const expected_timestamp = state.genesis_time + block.slot * params.SECONDS_PER_SLOT;
+    if (expected_timestamp != block.body.execution_payload_header.timestamp) {
+        return StateTransitionError.InvalidExecutionPayloadHeaderTimestamp;
+    }
+}
+
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
     // start block processing
     try process_block_header(allocator, state, block);
+    try process_execution_payload_header(state, block);
 }
 
 // fill this up when we have signature scheme
@@ -100,4 +109,5 @@ pub const StateTransitionError = error{
     InvalidParentRoot,
     InvalidPreState,
     InvalidPostState,
+    InvalidExecutionPayloadHeaderTimestamp,
 };
