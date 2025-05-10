@@ -69,6 +69,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
 
@@ -208,6 +209,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
             .target = target,
             .optimize = optimize,
         });
+        zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);
         zeam_state_transition.addImport("zkvm", zkvm_module);

@@ -6,6 +6,7 @@ const types = @import("@zeam/types");
 
 pub const utils = @import("./utils.zig");
 const transition = @import("./transition.zig");
+const params = @import("@zeam/params");
 
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
@@ -46,13 +47,14 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         var state_root: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(state_root[0..], utils.ZERO_HASH_HEX);
+        const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
 
         var block = types.BeamBlock{
             .slot = slot,
             .proposer_index = 1,
             .parent_root = parent_root,
             .state_root = state_root,
-            .body = types.BeamBlockBody{},
+            .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = timestamp } },
         };
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
