@@ -46,7 +46,7 @@ const ChainConfigError = error{
 
 test "custom dev chain" {
     const dev_spec =
-        \\{"preset": "mainnet", "name": "devchain1", "genesis_time": 1244}
+        \\{"preset": "mainnet", "name": "devchain1", "genesis_time": 1244, "num_validators": 4}
     ;
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);

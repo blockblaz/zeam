@@ -18,6 +18,7 @@ const MockChainData = struct {
 pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
     const genesis_config = from_genesis orelse types.GenesisSpec{
         .genesis_time = 1234,
+        .num_validators = 4,
     };
 
     const genesis_state = try utils.genGenesisState(allocator, genesis_config);
