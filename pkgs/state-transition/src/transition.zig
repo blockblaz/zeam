@@ -59,7 +59,7 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     var head_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &head_root, allocator);
     if (!std.mem.eql(u8, &head_root, &block.parent_root)) {
-        log("state root={any} block root={any}", .{ head_root, block.parent_root }) catch @panic("error printing invalid parent root");
+        log("calculated latest block root={any} != block parent root={any}\n", .{ head_root, block.parent_root }) catch @panic("error printing invalid parent root");
         return StateTransitionError.InvalidParentRoot;
     }
 
