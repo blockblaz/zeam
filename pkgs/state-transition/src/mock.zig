@@ -55,7 +55,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .proposer_index = 1,
             .parent_root = parent_root,
             .state_root = state_root,
-            .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = timestamp } },
+            .body = types.BeamBlockBody{
+                .execution_payload_header = .{ .timestamp = timestamp },
+                .votes = &[_]types.Mini3SFVote{},
+            },
         };
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state

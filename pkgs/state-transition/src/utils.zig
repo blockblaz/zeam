@@ -69,7 +69,11 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .proposer_index = 0,
         .parent_root = parent_root,
         .state_root = state_root,
-        .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = 0 } },
+        .body = types.BeamBlockBody{
+            .execution_payload_header = .{ .timestamp = 0 },
+            // 3sf mini
+            .votes = &[_]types.Mini3SFVote{},
+        },
     };
 
     return genesis_latest_block;
@@ -99,8 +103,18 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
 
 pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.BeamState {
     const genesis_latest_block = try genGenesisLatestBlock();
-    var historical_block_hashes = [_]types.Root{ZERO_HASH};
-    var justified_slots = [_]u8{1};
+    var parent_root: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(parent_root[0..], ZERO_HASH_HEX);
+
+    // historical hashes and justified slots are slices so we need to alloc them
+    // for them to exist outside this fn scope
+    var historical_hashes_array = std.ArrayList(types.Root).init(allocator);
+    try historical_hashes_array.append(parent_root);
+
+    // add slot0 = genesis justified
+    var justified_slots_array = std.ArrayList(u8).init(allocator);
+    try justified_slots_array.append(1);
+
     const state = types.BeamState{
         .config = .{ .num_validators = genesis.num_validators },
         .genesis_time = genesis.genesis_time,
@@ -109,8 +123,8 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
         // mini3sf
         .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
         .lastest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .historical_block_hashes = &historical_block_hashes,
-        .justified_slots = &justified_slots,
+        .historical_block_hashes = historical_hashes_array.items,
+        .justified_slots = justified_slots_array.items,
         // justifications map is empty
         .justifications_roots = &[_]types.Root{},
         .justifications_validators = &[_]u8{},

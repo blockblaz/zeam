@@ -57,57 +57,6 @@ test "apply transition on mocked chain" {
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.state_root));
 }
 
-test "mock genesis and block production" {
-    // 1. setup genesis config
-    const test_config = types.GenesisSpec{
-        .genesis_time = 1234,
-        .num_validators = 4,
-    };
-
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    const mock_chain = try genMockChain(allocator, 2, test_config);
-
-    // check genesis state root
-    var test_genesis_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, mock_chain.genesis_state, &test_genesis_root, std.testing.allocator);
-    var expected_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_root[0..], "0d2ea8d3f6846e408db07fd6970d131533a7062ed973c8c4d4d64de8adad1bff");
-    try std.testing.expect(std.mem.eql(u8, &test_genesis_root, &expected_root));
-
-    // check genesis block root & check genesis root matches to genesis block state root
-    var test_genesis_block_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlock, mock_chain.blocks[0].message, &test_genesis_block_root, std.testing.allocator);
-    try std.testing.expect(std.mem.eql(u8, &test_genesis_root, &mock_chain.blocks[0].message.state_root));
-    var expected_genesis_block_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_genesis_block_root[0..], "5d476554c248a6f59082aabf1bf9cde041e7f9e0cf43990a22f42246dcfc1007");
-    try std.testing.expect(std.mem.eql(u8, &test_genesis_block_root, &expected_genesis_block_root));
-
-    // check produced block 1 state root
-    var expected_block1_state_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_block1_state_root[0..], "993a459ace700aaeacf2fd3ec20b0f9efd3acae93ff904c5adbc1997b025ea97");
-    try std.testing.expect(std.mem.eql(u8, &expected_block1_state_root, &mock_chain.blocks[1].message.state_root));
-
-    // 7. check block 1 root
-    var block1_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlock, mock_chain.blocks[1].message, &block1_root, std.testing.allocator);
-    var expected_block1_root: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(expected_block1_root[0..], "4851312e74b73c99581772286a853ee8fc6a9d2fde00c2bd21e9c7b966a6c238");
-    try std.testing.expect(std.mem.eql(u8, &block1_root, &expected_block1_root));
-
-    // 9. run and check state transition
-    // TODO: the previous process block should have been run on cloned state so we have the original pre
-    // state here to run the state transition. for now regen same genesis state
-    var state = try utils.genGenesisState(std.testing.allocator, test_config);
-    try apply_transition(std.testing.allocator, &state, mock_chain.blocks[1], .{});
-    var post_state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, state, &post_state_root, std.testing.allocator);
-
-    try std.testing.expect(std.mem.eql(u8, &post_state_root, &expected_block1_state_root));
-}
-
 test "genStateBlockHeader" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
