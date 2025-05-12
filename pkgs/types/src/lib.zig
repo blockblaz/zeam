@@ -119,7 +119,7 @@ pub const BeamSTFProof = struct {
     proof: []const u8,
 };
 
-pub const GenesisSpec = struct { genesis_time: u64 };
+pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
 pub const ChainSpec = struct { preset: params.Preset, name: []u8 };
 
 pub const BeamSTFProverInput = struct {
@@ -160,6 +160,15 @@ test "ssz seralize/deserialize signed beam block" {
     try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.state_root, &deserialized_signed_block.message.state_root));
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.parent_root, &deserialized_signed_block.message.parent_root));
+
+    // successful merklization
+    // var block_root: [32]u8 = undefined;
+    // try ssz.hashTreeRoot(
+    //     SignedBeamBlock,
+    //     signed_block,
+    //     &block_root,
+    //     std.testing.allocator,
+    // );
 }
 
 test "ssz seralize/deserialize signed beam state" {
@@ -197,7 +206,6 @@ test "ssz seralize/deserialize signed beam state" {
     var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_state.deinit();
     try ssz.serialize(BeamState, state, &serialized_state);
-    std.debug.print("beamstate={any} \n", .{serialized_state});
 
     // we need to use arena allocator because deserialization allocs without providing for
     // a way to deinit, this needs to be probably addressed in ssz
@@ -206,6 +214,14 @@ test "ssz seralize/deserialize signed beam state" {
 
     var deserialized_state: BeamState = undefined;
     try ssz.deserialize(BeamState, serialized_state.items[0..], &deserialized_state, arena_allocator.allocator());
+    try std.testing.expect(std.mem.eql(u8, state.justifications_validators[0..], deserialized_state.justifications_validators[0..]));
 
-    std.debug.print("deserialized_state={any} \n", .{deserialized_state});
+    // successful merklization
+    var state_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(
+        BeamState,
+        state,
+        &state_root,
+        std.testing.allocator,
+    );
 }

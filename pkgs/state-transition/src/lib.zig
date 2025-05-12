@@ -31,6 +31,7 @@ test "apply transition on mocked chain" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
+        .num_validators = 4,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -60,6 +61,7 @@ test "mock genesis and block production" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
+        .num_validators = 4,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -110,6 +112,7 @@ test "genStateBlockHeader" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
+        .num_validators = 4,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
