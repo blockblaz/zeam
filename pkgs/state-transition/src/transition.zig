@@ -96,6 +96,8 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
+    std.debug.print("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state });
+
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
     // prep the justifications map
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
@@ -107,8 +109,20 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         }
     }
 
-    // 3sf
-    try historical_block_hashes.append(block.parent_root);
+    // self injected handling to make sure we can still have genesis block at 0
+    // otherwise we need genesis block at 1 because genesis state need to have justified slots
+    // historical hashes set which we can't do with genesis block since it becomes cyclic
+    // dependancy because of block stateroot requirement
+    if (state.slot == 1) {
+        // parent is genesis
+        justified_slots.items[0] = 1;
+        historical_block_hashes.items[0] = block.parent_root;
+        state.latest_justified.root = block.parent_root;
+        state.lastest_finalized.root = block.parent_root;
+    } else {
+        try historical_block_hashes.append(block.parent_root);
+    }
+
     try justified_slots.append(0);
     const missed_slots = block.slot - historical_block_hashes.items.len;
     for (0..missed_slots) |i| {
@@ -192,6 +206,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
+    std.debug.print("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state });
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
