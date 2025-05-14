@@ -121,9 +121,9 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         state.lastest_finalized.root = block.parent_root;
     } else {
         try historical_block_hashes.append(block.parent_root);
+        try justified_slots.append(0);
     }
 
-    try justified_slots.append(0);
     const missed_slots = block.slot - historical_block_hashes.items.len;
     for (0..missed_slots) |i| {
         _ = i;
