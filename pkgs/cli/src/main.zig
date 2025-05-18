@@ -84,7 +84,7 @@ pub fn main() !void {
                 //     .program_path = "zig-out/bin/zeam-stf-powdr",
                 //     .output_dir = "out",
                 // },
-                .risc0 = .{ .program_path = "zig-out/bin/zeam-stf-risc0" },
+                .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" },
             };
 
             _ = try stateProvingManager.prove_transition(state, block, options, allocator);
