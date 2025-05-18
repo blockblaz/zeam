@@ -63,7 +63,7 @@ pub fn main() !void {
                 //     .program_path = "zig-out/bin/zeam-stf-powdr",
                 //     .output_dir = "out",
                 // },
-                .risc0 = .{ .program_path = "zig-out/bin/zeam-stf-risc0" },
+                .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" },
             };
 
             // generate a mock chain with 2 blocks including genesis i.e. 1 block on top of genesis
