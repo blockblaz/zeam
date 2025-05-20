@@ -9,7 +9,7 @@ extern "C" fn risc0_prove(
     binary_path_len: usize,
     output: *mut u8,
     output_len: usize,
-) {
+) -> u32 {
     let serialized_block = unsafe {
         if !serialized_block.is_null() {
             std::slice::from_raw_parts(serialized_block, len)
@@ -45,6 +45,7 @@ extern "C" fn risc0_prove(
     let serialized_receipt = serde_cbor::to_vec(&receipt).unwrap();
     output.copy_from_slice(&serialized_receipt[..]);
     // XXX set len?
+    return serialized_receipt.len() as u32;
 }
 
 #[no_mangle]

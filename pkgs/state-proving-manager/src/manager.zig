@@ -4,8 +4,9 @@ const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const Allocator = std.mem.Allocator;
 
-extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) void;
-extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) void;
+extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
+extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32;
+extern fn risc0_verify(binary_path: *const u8, binary_path_len: usize, receipt: *const u8, receipt_len: usize) bool;
 
 const PowdrConfig = struct {
     program_path: []const u8,
@@ -41,8 +42,12 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
 }
 
 pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void {
-    _ = stf_proof;
     _ = state_root;
     _ = block_root;
-    _ = opts;
+
+    const valid = switch (opts) {
+        else => return error.UnsupportedVerifier,
+    };
+
+    if (!valid) return error.ProofDidNotVerify;
 }
