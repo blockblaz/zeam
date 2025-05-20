@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Builder = std.Build;
 
 const zkvmTarget = struct {
@@ -296,16 +297,16 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         // in case of risc0, use an external tool to format the executable
         // the way the executor expects it.
         if (std.mem.eql(u8, zkvm_target.name, "risc0")) {
-            const risc0_package_os_step = b.addExecutable(.{
+            const risc0_postbuild_gen = b.addExecutable(.{
                 .name = "risc0ospkg",
                 .root_source_file = b.path("build/risc0.zig"),
                 .target = host_target,
                 .optimize = .ReleaseSafe,
             });
-            const run_risc0_package_os_step = b.addRunArtifact(risc0_package_os_step);
-            run_risc0_package_os_step.addFileArg(exe.getEmittedBin());
-            const install_generated = b.addInstallFile(exe.getEmittedBin(), "bin/risc0_runtime.elf");
-            install_generated.step.dependOn(&run_risc0_package_os_step.step);
+            const run_risc0_postbuild_gen_step = b.addRunArtifact(risc0_postbuild_gen);
+            run_risc0_postbuild_gen_step.addFileArg(exe.getEmittedBin());
+            const install_generated = b.addInstallBinFile(try exe.getEmittedBinDirectory().join(b.allocator, "risc0_runtime.elf"), "risc0_runtime.elf");
+            install_generated.step.dependOn(&run_risc0_postbuild_gen_step.step);
             main_exe.dependOn(&install_generated.step);
         }
     }

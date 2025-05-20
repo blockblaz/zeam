@@ -27,12 +27,23 @@ pub fn main() !void {
         try writer.writeInt(u32, 1, .little);
 
         // write program header + len as u32
+        const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
+        try writer.writeInt(u32, @truncate(header.len), .little);
+        // program header
+        _ = try writer.write(header);
 
         // user data length + data
         try writer.writeInt(u32, @truncate(bindata.len), .little);
         _ = try writer.write(bindata);
 
-        // DO NOT write the kernel lenght, it's inferred
+        // DO NOT write the kernel length, it's inferred
+        const kernel = try std.fs.cwd().openFile("build/v1compat.elf", .{});
+        defer kernel.close();
+        const kernelstat = try kernel.stat();
+        const kernelsize = kernelstat.size;
+        const kerneldata = try kernel.readToEndAlloc(allocator, kernelsize);
+        defer allocator.free(kerneldata);
+        _ = try writer.write(kerneldata);
     } else {
         @panic("no binary file given");
     }
