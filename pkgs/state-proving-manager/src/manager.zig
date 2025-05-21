@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
 extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32;
-extern fn risc0_verify(binary_path: *const u8, binary_path_len: usize, receipt: *const u8, receipt_len: usize) bool;
+extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
 
 const PowdrConfig = struct {
     program_path: []const u8,
@@ -33,12 +33,23 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
 
-    var output: [256]u8 = undefined;
-    switch (opts) {
+    // allocate a megabyte of data so that we have enough space for the proof.
+    // XXX not deallocated yet
+    var output = try allocator.alloc(u8, 1024 * 1024);
+    const output_len = switch (opts) {
         .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
-        .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, @ptrCast(&output), 256),
-    }
-    return types.BeamSTFProof{};
+        .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
+    };
+    std.debug.print("proof len={}\n", .{output_len});
+    const proof = types.BeamSTFProof{
+        .proof = output[0..output_len],
+    };
+
+    // XXX just to validate the proof verification code, remove when
+    // block verification is done.
+    try verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, opts);
+
+    return proof;
 }
 
 pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void {
@@ -46,6 +57,7 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
     _ = block_root;
 
     const valid = switch (opts) {
+        .risc0 => |risc0cfg| risc0_verify(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         else => return error.UnsupportedVerifier,
     };
 
