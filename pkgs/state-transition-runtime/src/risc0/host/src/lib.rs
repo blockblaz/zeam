@@ -43,8 +43,7 @@ extern "C" fn risc0_prove(
     let prove_info = prover.prove(env, &guest_elf).unwrap();
     let receipt = prove_info.receipt;
     let serialized_receipt = serde_cbor::to_vec(&receipt).unwrap();
-    output.copy_from_slice(&serialized_receipt[..]);
-    // XXX set len?
+    output[..serialized_receipt.len()].copy_from_slice(&serialized_receipt[..]);
     return serialized_receipt.len() as u32;
 }
 
