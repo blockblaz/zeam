@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Builder = std.Build;
 
 const zkvmTarget = struct {
@@ -10,6 +11,7 @@ const zkvmTarget = struct {
 const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "powdr", .set_pie = true, .build_glue = true },
     .{ .name = "ceno", .set_pie = false },
+    .{ .name = "risc0", .build_glue = true },
 };
 
 pub fn build(b: *Builder) !void {
@@ -148,10 +150,12 @@ pub fn build(b: *Builder) !void {
     prover_step.dependOn(&run_prover.step);
     if (b.args) |args| {
         run_prover.addArgs(args);
+    } else {
+        run_prover.addArgs(&[_][]const u8{"prove"});
     }
     run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
 
-    try build_zkvm_targets(b, &cli_exe.step);
+    try build_zkvm_targets(b, &cli_exe.step, target);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -211,7 +215,7 @@ pub fn build(b: *Builder) !void {
     test_step.dependOn(&run_params_tests.step);
 }
 
-fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
+fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
     const target_query = try std.Build.parseTargetQuery(.{ .arch_os_abi = "riscv32-freestanding-none", .cpu_features = "generic_rv32" });
     const target = b.resolveTargetQuery(target_query);
     const optimize = .ReleaseFast;
@@ -276,5 +280,21 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step) !void {
         }
         exe.setLinkerScript(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/{s}.ld", .{ zkvm_target.name, zkvm_target.name })));
         main_exe.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
+        // in case of risc0, use an external tool to format the executable
+        // the way the executor expects it.
+        if (std.mem.eql(u8, zkvm_target.name, "risc0")) {
+            const risc0_postbuild_gen = b.addExecutable(.{
+                .name = "risc0ospkg",
+                .root_source_file = b.path("build/risc0.zig"),
+                .target = host_target,
+                .optimize = .ReleaseSafe,
+            });
+            const run_risc0_postbuild_gen_step = b.addRunArtifact(risc0_postbuild_gen);
+            run_risc0_postbuild_gen_step.addFileArg(exe.getEmittedBin());
+            const install_generated = b.addInstallBinFile(try exe.getEmittedBinDirectory().join(b.allocator, "risc0_runtime.elf"), "risc0_runtime.elf");
+            install_generated.step.dependOn(&run_risc0_postbuild_gen_step.step);
+            main_exe.dependOn(&install_generated.step);
+        }
     }
 }

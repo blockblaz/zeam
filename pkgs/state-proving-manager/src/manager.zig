@@ -4,24 +4,26 @@ const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const Allocator = std.mem.Allocator;
 
-pub const ZKVMContext = struct {
+extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
+extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32;
+extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
+
+const PowdrConfig = struct {
     program_path: []const u8,
     output_dir: []const u8,
     backend: ?[]const u8 = null,
 };
 
-extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) void;
-
-pub const zkvm_configs: []const ZKVMContext = &.{
-    .{ .program_path = "zig-out/bin/zeam-stf-powdr", .output_dir = "out", .backend = "plonky3" },
+const Risc0Config = struct {
+    program_path: []const u8,
 };
 
-pub const StateTransitionOpts = struct {
-    zk_vm: ZKVMContext,
+pub const StateTransitionOpts = union(enum) {
+    powdr: PowdrConfig,
+    risc0: Risc0Config,
 };
 
 pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
-    _ = opts;
     const prover_input = types.BeamSTFProverInput{
         .state = state,
         .block = block,
@@ -31,14 +33,33 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
 
-    var output: [256]u8 = undefined;
-    powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, zkvm_configs[0].program_path.ptr, zkvm_configs[0].program_path.len, zkvm_configs[0].output_dir.ptr, zkvm_configs[0].output_dir.len);
-    return types.BeamSTFProof{};
+    // allocate a megabyte of data so that we have enough space for the proof.
+    // XXX not deallocated yet
+    var output = try allocator.alloc(u8, 1024 * 1024);
+    const output_len = switch (opts) {
+        .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
+        .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
+    };
+    std.debug.print("proof len={}\n", .{output_len});
+    const proof = types.BeamSTFProof{
+        .proof = output[0..output_len],
+    };
+
+    // XXX just to validate the proof verification code, remove when
+    // block verification is done.
+    try verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, opts);
+
+    return proof;
 }
 
 pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void {
-    _ = stf_proof;
     _ = state_root;
     _ = block_root;
-    _ = opts;
+
+    const valid = switch (opts) {
+        .risc0 => |risc0cfg| risc0_verify(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        else => return error.UnsupportedVerifier,
+    };
+
+    if (!valid) return error.ProofDidNotVerify;
 }

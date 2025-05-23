@@ -5,7 +5,7 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 
-var fixed_mem = [_]u8{0} ** (256 * 1024 * 1024);
+var fixed_mem = [_]u8{0} ** (128 * 1024 * 1024);
 
 const __powdr_prover_data_start: [*]const u8 = @ptrFromInt(0x10000000);
 // this is hardcoded for now, because the compiler seems unable to see

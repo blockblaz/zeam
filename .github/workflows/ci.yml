@@ -10,6 +10,12 @@ name: CI
 jobs:
   lint:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        host: [
+          'risc0',
+          'powdr'
+        ]
     steps:
     - uses: actions/checkout@v2
 
@@ -17,6 +23,26 @@ jobs:
       uses: korandoru/setup-zig@v1
       with:
         zig-version: 0.14.0
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: clippy, rustfmt
+
+    - name: Verify installation
+      run: |
+        rustc --version
+        cargo --version
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ runner.os }}-cargo-${{ matrix.host }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run clippy on hosts
+      run: |
+        cargo clippy --manifest-path pkgs/state-transition-runtime/src/${{ matrix.host }}/host/Cargo.toml # -- -D warnings
 
     - name: Lint
       run: zig fmt --check *.zig
