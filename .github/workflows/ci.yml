@@ -35,6 +35,11 @@ jobs:
         rustc --version
         cargo --version
 
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ runner.os }}-cargo-${{ matrix.host }}-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Run clippy on hosts
       run: |
         cargo clippy --manifest-path pkgs/state-transition-runtime/src/${{ matrix.host }}/host/Cargo.toml # -- -D warnings
