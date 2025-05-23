@@ -40,8 +40,8 @@ export fn main() noreturn {
     // zkvm.io.print_str(input_dump_str);
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
     // Uncomment when debugging
-    const input_dump_str = std.fmt.bufPrint(input_dump[0..], "deserialized input={any}\n", .{prover_input}) catch @panic("error allocating string to dump deserialized input");
-    zkvm.io.print_str(input_dump_str);
+    // const input_dump_str = std.fmt.bufPrint(input_dump[0..], "deserialized input={any}\n", .{prover_input}) catch @panic("error allocating string to dump deserialized input");
+    // zkvm.io.print_str(input_dump_str);
 
     // apply the state transition to modify the state
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block) catch |e| {
