@@ -44,7 +44,7 @@ extern "C" fn risc0_prove(
     let receipt = prove_info.receipt;
     let serialized_receipt = serde_cbor::to_vec(&receipt).unwrap();
     output[..serialized_receipt.len()].copy_from_slice(&serialized_receipt[..]);
-    return serialized_receipt.len() as u32;
+    serialized_receipt.len() as u32
 }
 
 #[no_mangle]
@@ -73,8 +73,5 @@ extern "C" fn risc0_verify(
     let guest_elf = fs::read(std::str::from_utf8(binary_path).unwrap()).unwrap();
     let guest_id = compute_image_id(&guest_elf).unwrap();
 
-    match receipt.verify(guest_id) {
-        Ok(_) => true,
-        _ => false,
-    }
+    receipt.verify(guest_id).is_ok()
 }
