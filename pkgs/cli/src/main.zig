@@ -66,19 +66,16 @@ pub fn main() !void {
             const mock_config = types.GenesisSpec{
                 .genesis_time = 0,
             };
-            const mock_chain = try sftFactory.genMockChain(allocator, 2, mock_config);
+            const mock_chain = try sftFactory.genMockChain(allocator, 3, mock_config);
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
             // block 0 is genesis so we have to apply block 1 onwards
-            for (1..mock_chain.blocks.len) |i| {
-                // this is a signed block
-                const block1 = mock_chain.blocks[i];
-                std.debug.print("block {d}: {any}", .{ i, block1 });
-                std.debug.print("\nprestate slot blockslot={d} stateslot={d}", .{ block1.message.slot, beam_state.slot });
-                _ = try stateProvingManager.prove_transition(beam_state, block1, options, allocator);
+            for (mock_chain.blocks[1..]) |block| {
+                std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
+                _ = try stateProvingManager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sftFactory.apply_transition(allocator, &beam_state, block1);
+                try sftFactory.apply_transition(allocator, &beam_state, block);
             }
         },
         .beam => {
