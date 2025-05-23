@@ -76,8 +76,7 @@ pub fn main() !void {
                 const block1 = mock_chain.blocks[i];
                 std.debug.print("block {d}: {any}", .{ i, block1 });
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}", .{ block1.message.slot, beam_state.slot });
-                _ = options;
-                // _ = try stateProvingManager.prove_transition(beam_state, block1, options, allocator);
+                _ = try stateProvingManager.prove_transition(beam_state, block1, options, allocator);
                 // transition beam state for the next block
                 try sftFactory.apply_transition(allocator, &beam_state, block1);
             }
