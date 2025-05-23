@@ -1,4 +1,9 @@
-on: [push, pull_request]
+on:
+  push:
+    # We intentionally don't run push on feature branches
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 name: CI
 
