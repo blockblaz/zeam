@@ -5,7 +5,7 @@ const types = @import("@zeam/types");
 const ssz = @import("ssz");
 
 pub const ZERO_HASH_HEX = "0000000000000000000000000000000000000000000000000000000000000000";
-pub const ZERO_HASH = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+pub const ZERO_HASH = [_]u8{0x00} ** 32;
 
 pub const ZERO_HASH_48HEX = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
@@ -69,7 +69,11 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .proposer_index = 0,
         .parent_root = parent_root,
         .state_root = state_root,
-        .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = 0 } },
+        .body = types.BeamBlockBody{
+            .execution_payload_header = .{ .timestamp = 0 },
+            // 3sf mini
+            .votes = &[_]types.Mini3SFVote{},
+        },
     };
 
     return genesis_latest_block;
@@ -87,7 +91,11 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
         .proposer_index = 0,
         .parent_root = parent_root,
         .state_root = state_root,
-        .body = types.BeamBlockBody{ .execution_payload_header = .{ .timestamp = 0 } },
+        .body = types.BeamBlockBody{
+            .execution_payload_header = .{ .timestamp = 0 },
+            // 3sf mini votes
+            .votes = &[_]types.Mini3SFVote{},
+        },
     };
 
     return genesis_latest_block;
@@ -95,10 +103,31 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
 
 pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.BeamState {
     const genesis_latest_block = try genGenesisLatestBlock();
+    var parent_root: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(parent_root[0..], ZERO_HASH_HEX);
+
+    // historical hashes and justified slots are slices so we need to alloc them
+    // for them to exist outside this fn scope
+    var historical_hashes_array = std.ArrayList(types.Root).init(allocator);
+    try historical_hashes_array.append(parent_root);
+
+    // add slot0 = genesis justified
+    var justified_slots_array = std.ArrayList(u8).init(allocator);
+    try justified_slots_array.append(1);
+
     const state = types.BeamState{
+        .config = .{ .num_validators = genesis.num_validators },
         .genesis_time = genesis.genesis_time,
         .slot = 0,
         .latest_block_header = try blockToLatestBlockHeader(allocator, genesis_latest_block),
+        // mini3sf
+        .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        .lastest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        .historical_block_hashes = historical_hashes_array.items,
+        .justified_slots = justified_slots_array.items,
+        // justifications map is empty
+        .justifications_roots = &[_]types.Root{},
+        .justifications_validators = &[_]u8{},
     };
 
     return state;
