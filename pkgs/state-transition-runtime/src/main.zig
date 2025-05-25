@@ -25,8 +25,8 @@ export fn main() noreturn {
     // completed.
     const input = zkvm.get_input(allocator);
     defer zkvm.free_input(allocator);
-    var input_dump: [2048]u8 = undefined;
-    _ = std.fmt.bufPrint(input_dump[0..], "serialized input={any} len={}\n", .{ input[0..], input_len.* }) catch @panic("error allocating string to dump serialized input");
+    // var input_dump: [2048]u8 = undefined;
+    // _ = std.fmt.bufPrint(input_dump[0..], "serialized input={any} len={}\n", .{ input[0..], input_len.* }) catch @panic("error allocating string to dump serialized input");
     // Uncomment when debugging
     // zkvm.io.print_str(input_dump_str);
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");

@@ -77,9 +77,12 @@ pub fn main() !void {
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |block| {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
-                _ = try stateProvingManager.prove_transition(beam_state, block, options, allocator);
+                const proof = try stateProvingManager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
                 try sftFactory.apply_transition(allocator, &beam_state, block);
+
+                // verify the block
+                try stateProvingManager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
             }
         },
         .beam => {

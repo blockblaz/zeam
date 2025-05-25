@@ -46,10 +46,6 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
         .proof = output[0..output_len],
     };
 
-    // XXX just to validate the proof verification code, remove when
-    // block verification is done.
-    try verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, opts);
-
     return proof;
 }
 
