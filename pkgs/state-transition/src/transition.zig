@@ -88,6 +88,7 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock) !void {
     const block = signedBlock.message;
     if (block.slot <= state.slot) {
+        log("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot }) catch @panic("error printing block and state slots");
         return StateTransitionError.InvalidPreState;
     }
 

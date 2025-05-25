@@ -18,3 +18,13 @@ fn sys_halt(out_state: *const [8]u32, status: u32) noreturn {
     );
     unreachable;
 }
+
+pub fn get_input(allocator: std.mem.Allocator) []const u8 {
+    var input: []u8 = allocator.alloc(u8, 256) catch @panic("could not allocate space for the input slice");
+    io.read_slice(0, input[0..]);
+    return input;
+}
+
+pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
+    allocator.free(input);
+}

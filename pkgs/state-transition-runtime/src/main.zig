@@ -5,13 +5,9 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 
+// TODO(gballet) move to zkvm module as each zkvm has a
+// different allocated space.
 var fixed_mem = [_]u8{0} ** (128 * 1024 * 1024);
-
-const __powdr_prover_data_start: [*]const u8 = @ptrFromInt(0x10000000);
-// this is hardcoded for now, because the compiler seems unable to see
-// linker script symbols.
-// extern const _powdr_prover_data_start: [*]const u8;
-// extern const __powdr_prover_data_end: [*]const u8;
 
 // implements risv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
@@ -24,16 +20,11 @@ export fn main() noreturn {
     const allocator = fixed_allocator.allocator();
 
     // Get input from memory and deserialize it
-    // TODO(gballet) move that to powdr-specific code when
-    // another zkvm is being used that uses a different way
-    // of passing data to guests.
-    const total_input_len = std.mem.bytesToValue(u32, __powdr_prover_data_start[2048..2052]);
-    const total_input: []const u8 = __powdr_prover_data_start[2052 .. 2052 + total_input_len];
-    const input_len = std.mem.bytesAsValue(u32, total_input[0..4]);
-    const input = total_input[4 .. 4 + input_len.*];
     // TODO(gballet) figure out why printing this string is necessary.
     // It might be worth commenting it once the powdr rebase has been
     // completed.
+    const input = zkvm.get_input(allocator);
+    defer zkvm.free_input(allocator);
     var input_dump: [2048]u8 = undefined;
     _ = std.fmt.bufPrint(input_dump[0..], "serialized input={any} len={}\n", .{ input[0..], input_len.* }) catch @panic("error allocating string to dump serialized input");
     // Uncomment when debugging

@@ -39,6 +39,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     const output_len = switch (opts) {
         .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
         .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
+        // else => @panic("prover isn't enabled"),
     };
     std.debug.print("proof len={}\n", .{output_len});
     const proof = types.BeamSTFProof{

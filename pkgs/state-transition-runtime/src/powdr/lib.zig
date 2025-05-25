@@ -92,3 +92,18 @@ pub fn halt(_: u32) noreturn {
     );
     while (true) {}
 }
+
+const __powdr_prover_data_start: [*]const u8 = @ptrFromInt(0x10000000);
+// this is hardcoded for now, because the compiler seems unable to see
+// linker script symbols.
+// extern const _powdr_prover_data_start: [*]const u8;
+// extern const __powdr_prover_data_end: [*]const u8;
+
+pub fn get_input(_: std.mem.Allocator) []const u8 {
+    const total_input_len = std.mem.bytesToValue(u32, __powdr_prover_data_start[2048..2052]);
+    const total_input: []const u8 = __powdr_prover_data_start[2052 .. 2052 + total_input_len];
+    const input_len = std.mem.bytesAsValue(u32, total_input[0..4]);
+    return total_input[4 .. 4 + input_len.*];
+}
+
+pub fn free_input(_: std.mem.Allocator, _: []const u8) void {}

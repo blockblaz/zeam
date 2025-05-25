@@ -24,26 +24,43 @@ fn sys_write(fd: u32, data: []const u8) void {
     );
 }
 
-fn sys_read(fd: u32, comptime nrequested: usize, buffer: []u8) void {
+fn sys_read(fd: u32, nrequested: usize, buffer: []u8, nread: *u32, last: *u32) void {
     const main_words = nrequested / 4;
 
     const syscall_name: [:0]const u8 = "risc0_zkvm_platform::syscall::nr::SYS_READ";
+    var a0: u32 = undefined;
+    var a1: u32 = undefined;
     asm volatile (
         \\ ecall
-        :
+        : [a0] "={a0}" (a0),
+          [a1] "={a1}" (a1),
         : [syscallNumber] "{t0}" (syscalls.software),
-          [from_host] "{a0}" (buffer),
+          [from_host] "{a0}" (buffer.ptr),
           [from_host_words] "{a1}" (main_words),
           [syscall_name] "{a2}" (syscall_name.ptr),
           [file_descriptor] "{a3}" (fd),
           [main_requested] "{a4}" (nrequested),
         : "memory"
     );
+
+    nread.* = a0;
+    last.* = a1;
 }
 
-pub fn read_slice(_: u32, data: []u32) void {
-    var as_u8: []u8 = @ptrCast(data);
-    read_slice(.stdin, as_u8[0..]);
+pub fn read_slice(fd: u32, data: []u8) void {
+    var count: u32 = 0;
+    // TODO unaligned read if needed for starting point
+    while (count < data.len) {
+        const chunk_len = @min(data.len, 1024 * 4);
+        var nread: u32 = undefined;
+        var last: u32 = 0;
+        sys_read(fd, chunk_len, data[count..], &nread, &last);
+        if (nread == 0) print_str("read 0\n");
+        if (last == 0) print_str("last 0\n");
+        if (nread < chunk_len) break;
+        count += nread;
+    }
+    // TODO unaligned read at the end if need be
 }
 
 pub fn write_slice(fd: u32, data: []const u8) void {
