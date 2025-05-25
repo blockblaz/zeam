@@ -1,5 +1,7 @@
-const magic = "R0BF";
 const std = @import("std");
+
+const magic = "R0BF";
+const BinaryFormatVersion = 1;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -24,7 +26,7 @@ pub fn main() !void {
 
         // magic +  binary format
         _ = try writer.write(magic);
-        try writer.writeInt(u32, 1, .little);
+        try writer.writeInt(u32, BinaryFormatVersion, .little);
 
         // write program header + len as u32
         const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
