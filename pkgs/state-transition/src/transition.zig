@@ -96,15 +96,16 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    std.debug.print("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state });
+    log("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state }) catch @panic("process operations start log panic");
 
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
     // prep the justifications map
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
 
-    const num_validators = state.config.num_validators;
+    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+    const num_validators: usize = @intCast(state.config.num_validators);
     for (state.justifications_roots) |blockRoot| {
-        for (0..state.config.num_validators) |i| {
+        for (0..num_validators) |i| {
             try justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]);
         }
     }
@@ -124,7 +125,8 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         try justified_slots.append(0);
     }
 
-    const missed_slots = block.slot - historical_block_hashes.items.len;
+    const block_slot: usize = @intCast(block.slot);
+    const missed_slots: usize = block_slot - historical_block_hashes.items.len;
     for (0..missed_slots) |i| {
         _ = i;
         try justified_slots.append(0);
@@ -136,15 +138,19 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 
     for (block.body.votes) |vote| {
         // check if vote is sane
-        if (justified_slots.items[vote.source.slot] != 1 or
-            !std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[vote.source.slot]) or
-            !std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[vote.target.slot]) or
-            vote.target.slot <= vote.source.slot or
-            try is_justifiable_slot(state.lastest_finalized.slot, vote.target.slot) == false)
+        const source_slot: usize = @intCast(vote.source.slot);
+        const target_slot: usize = @intCast(vote.target.slot);
+        const validator_id: usize = @intCast(vote.validator_id);
+
+        if (justified_slots.items[source_slot] != 1 or
+            !std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]) or
+            !std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]) or
+            target_slot <= source_slot or
+            try is_justifiable_slot(state.lastest_finalized.slot, target_slot) == false)
         {
             continue;
         }
-        if (vote.validator_id >= num_validators) {
+        if (validator_id >= num_validators) {
             return StateTransitionError.InvalidValidatorId;
         }
 
@@ -157,7 +163,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
             break :targetjustifications targetjustifications;
         };
 
-        target_justifications[vote.validator_id] = 1;
+        target_justifications[validator_id] = 1;
         var target_justifications_count: usize = 0;
         for (target_justifications) |justified| {
             if (justified == 1) {
@@ -169,13 +175,13 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         // note that this simplification works if weight of each validator is 1
         if (target_justifications_count == @divFloor(num_validators * 2, 3)) {
             state.latest_justified = vote.target;
-            justified_slots.items[vote.target.slot] = 1;
+            justified_slots.items[target_slot] = 1;
             _ = justifications.remove(vote.target.root);
         }
 
         // source is finalized if target is the next valid justifiable hash
         var can_target_finalize = true;
-        for (vote.source.slot + 1..vote.target.slot) |check_slot| {
+        for (source_slot + 1..target_slot) |check_slot| {
             if (try is_justifiable_slot(state.lastest_finalized.slot, check_slot)) {
                 can_target_finalize = false;
                 break;
@@ -206,7 +212,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
-    std.debug.print("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state });
+    log("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state }) catch @panic("process operations finished log panic");
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {

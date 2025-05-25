@@ -20,6 +20,7 @@ const sftFactory = @import("@zeam/state-transition");
 
 const ZeamArgs = struct {
     genesis: ?u64,
+    num_validators: ?u64,
 
     __commands__: union(enum) {
         clock: struct {},
@@ -47,7 +48,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     const opts = try simargs.parse(allocator, ZeamArgs, "", "0.0.0");
     const genesis = opts.args.genesis orelse 1234;
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+    const num_validators = opts.args.num_validators orelse 4;
+    std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
 
     switch (opts.args.__commands__) {
         .clock => {
@@ -68,7 +70,8 @@ pub fn main() !void {
 
             // generate a mock chain with 2 blocks including genesis i.e. 1 block on top of genesis
             const mock_config = types.GenesisSpec{
-                .genesis_time = 0,
+                .genesis_time = genesis,
+                .num_validators = num_validators,
             };
             const mock_chain = try sftFactory.genMockChain(allocator, 3, mock_config);
 

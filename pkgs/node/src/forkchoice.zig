@@ -258,7 +258,7 @@ test "forkchoice block tree" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
