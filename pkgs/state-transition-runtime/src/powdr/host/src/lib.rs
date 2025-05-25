@@ -2,7 +2,7 @@ use powdr::Session;
 use std::path::Path;
 
 #[no_mangle]
-pub extern "C" fn powdr_prove(
+extern "C" fn powdr_prove(
     serialized: *const u8,
     len: usize,
     output: *mut u8,
