@@ -123,8 +123,8 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
         // mini3sf
         .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
         .lastest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .historical_block_hashes = historical_hashes_array.items,
-        .justified_slots = justified_slots_array.items,
+        .historical_block_hashes = try historical_hashes_array.toOwnedSlice(),
+        .justified_slots = try justified_slots_array.toOwnedSlice(),
         // justifications map is empty
         .justifications_roots = &[_]types.Root{},
         .justifications_validators = &[_]u8{},
