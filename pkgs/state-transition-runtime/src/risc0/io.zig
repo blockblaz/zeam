@@ -47,7 +47,7 @@ fn sys_read(fd: u32, nrequested: usize, buffer: []u8, nread: *u32, last: *u32) v
     last.* = a1;
 }
 
-pub fn read_slice(fd: u32, data: []u8) void {
+pub fn read_slice(fd: u32, data: []u8) usize {
     var count: u32 = 0;
     // TODO unaligned read if needed for starting point
     while (count < data.len) {
@@ -55,12 +55,13 @@ pub fn read_slice(fd: u32, data: []u8) void {
         var nread: u32 = undefined;
         var last: u32 = 0;
         sys_read(fd, chunk_len, data[count..], &nread, &last);
+        count += nread;
         if (nread == 0) print_str("read 0\n");
         if (last == 0) print_str("last 0\n");
         if (nread < chunk_len) break;
-        count += nread;
     }
     // TODO unaligned read at the end if need be
+    return @as(usize, count);
 }
 
 pub fn write_slice(fd: u32, data: []const u8) void {
