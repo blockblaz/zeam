@@ -25,14 +25,14 @@ export fn main() noreturn {
     // completed.
     const input = zkvm.get_input(allocator);
     defer zkvm.free_input(allocator);
-    // var input_dump: [2048]u8 = undefined;
-    // _ = std.fmt.bufPrint(input_dump[0..], "serialized input={any} len={}\n", .{ input[0..], input_len.* }) catch @panic("error allocating string to dump serialized input");
+    var input_dump_str: [20048]u8 = undefined;
+    _ = std.fmt.bufPrint(input_dump_str[0..], "serialized input={any} len={}\n", .{ input[0..], input.len }) catch @panic("error allocating string to dump serialized input");
     // Uncomment when debugging
-    // zkvm.io.print_str(input_dump_str);
+    zkvm.io.print_str(&input_dump_str);
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
     // Uncomment when debugging
-    // const input_dump_str = std.fmt.bufPrint(input_dump[0..], "deserialized input={any}\n", .{prover_input}) catch @panic("error allocating string to dump deserialized input");
-    // zkvm.io.print_str(input_dump_str);
+    _ = std.fmt.bufPrint(input_dump_str[0..], "deserialized input={any}\n", .{prover_input.state}) catch @panic("error allocating string to dump deserialized input");
+    zkvm.io.print_str(&input_dump_str);
 
     // apply the state transition to modify the state
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{}) catch |e| {
