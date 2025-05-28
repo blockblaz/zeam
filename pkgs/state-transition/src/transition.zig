@@ -13,6 +13,12 @@ const params = @import("@zeam/params");
 // put the active logs at debug level for now by default
 pub const StateTransitionOpts = struct { activeLogLevel: std.log.Level = std.log.Level.debug };
 
+fn debugLog(comptime fmt: []const u8, args: anytype) !void {
+    if (builtin.target.os.tag != .freestanding) {
+        std.debug.print(fmt, args);
+    }
+}
+
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
 //     _ = state;
@@ -96,7 +102,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    log("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state }) catch @panic("process operations start log panic");
+    debugLog("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state }) catch @panic("process operations start log panic");
 
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
     // prep the justifications map
@@ -212,7 +218,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
-    log("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state }) catch @panic("process operations finished log panic");
+    debugLog("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state }) catch @panic("process operations finished log panic");
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
