@@ -123,8 +123,8 @@ pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
 pub const ChainSpec = struct { preset: params.Preset, name: []u8 };
 
 pub const BeamSTFProverInput = struct {
-    state: BeamState,
     block: SignedBeamBlock,
+    state: BeamState,
 };
 
 test "ssz import" {
@@ -153,6 +153,7 @@ test "ssz seralize/deserialize signed beam block" {
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
     try ssz.serialize(SignedBeamBlock, signed_block, &serialized_signed_block);
+    std.debug.print("\n\n\nserialized_signed_block ({d})=\n{any}", .{ serialized_signed_block.items.len, serialized_signed_block.items });
 
     var deserialized_signed_block: SignedBeamBlock = undefined;
     try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
@@ -179,8 +180,8 @@ test "ssz seralize/deserialize signed beam state" {
 
     const state = BeamState{
         .config = config,
-        .genesis_time = 0,
-        .slot = 0,
+        .genesis_time = 93,
+        .slot = 99,
         .latest_block_header = .{
             .slot = 0,
             .proposer_index = 0,
@@ -189,8 +190,8 @@ test "ssz seralize/deserialize signed beam state" {
             .body_root = [_]u8{3} ** 32,
         },
         // mini3sf
-        .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .lastest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
+        .lastest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
         .historical_block_hashes = &[_]Root{},
         .justified_slots = &[_]u8{},
         .justifications_roots = &justifications_roots,
@@ -206,6 +207,7 @@ test "ssz seralize/deserialize signed beam state" {
     var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_state.deinit();
     try ssz.serialize(BeamState, state, &serialized_state);
+    std.debug.print("\n\n\nserialized_state ({d})=\n{any}", .{ serialized_state.items.len, serialized_state.items });
 
     // we need to use arena allocator because deserialization allocs without providing for
     // a way to deinit, this needs to be probably addressed in ssz
@@ -224,4 +226,65 @@ test "ssz seralize/deserialize signed beam state" {
         &state_root,
         std.testing.allocator,
     );
+}
+
+test "ssz seralize/deserialize signed stf prover input" {
+    const config = BeamStateConfig{ .num_validators = 4 };
+    const genesis_root = [_]u8{9} ** 32;
+    var justifications_roots = [_]Root{genesis_root};
+    var justifications_validators = [_]u8{ 0, 1, 1, 1 };
+
+    const state = BeamState{
+        .config = config,
+        .genesis_time = 93,
+        .slot = 99,
+        .latest_block_header = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body_root = [_]u8{3} ** 32,
+        },
+        // mini3sf
+        .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
+        .lastest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
+        .historical_block_hashes = &[_]Root{},
+        .justified_slots = &[_]u8{},
+        .justifications_roots = &justifications_roots,
+        // .justifications_roots = &[_]Root{genesis_root},
+        // 3 validators voting for genesis root except first one
+        .justifications_validators = &justifications_validators,
+        // .justifications = .{
+        //     .roots = &[_]Root{},
+        //     .voting_validators = &[_]u8{},
+        // },
+    };
+
+    const block = SignedBeamBlock{
+        .message = .{
+            .slot = 9,
+            .proposer_index = 3,
+            .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
+            .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
+            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .votes = &[_]Mini3SFVote{} },
+        },
+        .signature = [_]u8{2} ** 48,
+    };
+
+    const prover_input = BeamSTFProverInput{
+        .state = state,
+        .block = block,
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+
+    var serialized = std.ArrayList(u8).init(arena_allocator.allocator());
+    defer serialized.deinit();
+    try ssz.serialize(BeamSTFProverInput, prover_input, &serialized);
+    std.debug.print("\n\n\nprove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
+
+    var prover_input_deserialized: BeamSTFProverInput = undefined;
+    try ssz.deserialize(BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, arena_allocator.allocator());
+    std.debug.print("should deserialize to={any}", .{prover_input_deserialized});
 }
