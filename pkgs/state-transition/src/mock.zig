@@ -42,6 +42,11 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     try blockRootList.append(block_root);
 
     var prev_block = genesis_block;
+
+    // track latest justified and finalized for constructing votes
+    var latest_justified: types.Mini3SFCheckpoint = .{ .root = block_root, .slot = genesis_block.slot };
+    var latest_finalized = latest_justified;
+
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, prev_block, &parent_root, allocator);
@@ -49,6 +54,30 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         var state_root: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(state_root[0..], utils.ZERO_HASH_HEX);
         const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
+        var votes = std.ArrayList(types.Mini3SFVote).init(allocator);
+        // 4 slot moving scenario can be applied over and over with finalization in 0
+        switch (slot % 4) {
+            // no votes on the first block of this
+            1 => {},
+            2 => {
+                const slotVotes = [_]types.Mini3SFVote{
+                    // val 0
+                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
+                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
+                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
+                    // val 1
+                };
+                for (slotVotes) |slotVote| {
+                    try votes.append(slotVote);
+                }
+            },
+            3 => {},
+            0 => {
+                latest_finalized = latest_justified;
+                latest_justified = .{ .root = parent_root, .slot = slot - 1 };
+            },
+            else => unreachable,
+        }
 
         var block = types.BeamBlock{
             .slot = slot,
@@ -57,7 +86,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .state_root = state_root,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .votes = &[_]types.Mini3SFVote{},
+                .votes = try votes.toOwnedSlice(),
             },
         };
 

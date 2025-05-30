@@ -102,7 +102,8 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    debugLog("process opetationg blockslot={d} historical hashes={d} pre state = \n{any}\n", .{ block.slot, historical_block_hashes.items.len, state }) catch @panic("process operations start log panic");
+    debugLog("\n\n===================\nprocess opetationg blockslot={d} votes={any}\n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, block.body.votes, historical_block_hashes.items.len, state.justified_slots }) catch @panic("process operations start log1 panic");
+    debugLog("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log2 panic");
 
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
     // prep the justifications map
@@ -125,7 +126,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         justified_slots.items[0] = 1;
         historical_block_hashes.items[0] = block.parent_root;
         state.latest_justified.root = block.parent_root;
-        state.lastest_finalized.root = block.parent_root;
+        state.latest_finalized.root = block.parent_root;
     } else {
         try historical_block_hashes.append(block.parent_root);
         try justified_slots.append(0);
@@ -152,7 +153,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
             !std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]) or
             !std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]) or
             target_slot <= source_slot or
-            try is_justifiable_slot(state.lastest_finalized.slot, target_slot) == false)
+            try is_justifiable_slot(state.latest_finalized.slot, target_slot) == false)
         {
             continue;
         }
@@ -188,13 +189,13 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         // source is finalized if target is the next valid justifiable hash
         var can_target_finalize = true;
         for (source_slot + 1..target_slot) |check_slot| {
-            if (try is_justifiable_slot(state.lastest_finalized.slot, check_slot)) {
+            if (try is_justifiable_slot(state.latest_finalized.slot, check_slot)) {
                 can_target_finalize = false;
                 break;
             }
         }
         if (can_target_finalize == true) {
-            state.lastest_finalized = vote.source;
+            state.latest_finalized = vote.source;
         }
     }
 
@@ -218,7 +219,9 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
-    debugLog("post opetationg blockslot={d} historical hashes={d} post state = \n{any}\n", .{ block.slot, state.historical_block_hashes.len, state }) catch @panic("process operations finished log panic");
+
+    debugLog("\n---------------\npoststate:historical hashes={d} justified slots ={any}, ", .{ historical_block_hashes.items.len, state.justified_slots }) catch @panic("process operations start log3 panic");
+    debugLog("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log4 panic");
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {

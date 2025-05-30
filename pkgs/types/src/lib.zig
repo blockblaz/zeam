@@ -98,7 +98,7 @@ pub const BeamState = struct {
     slot: u64,
     latest_block_header: BeamBlockHeader,
     latest_justified: Mini3SFCheckpoint,
-    lastest_finalized: Mini3SFCheckpoint,
+    latest_finalized: Mini3SFCheckpoint,
     historical_block_hashes: HistoricalBlockHashes,
     justified_slots: JustifiedSlots,
 
@@ -191,7 +191,7 @@ test "ssz seralize/deserialize signed beam state" {
         },
         // mini3sf
         .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
-        .lastest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
+        .latest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
         .historical_block_hashes = &[_]Root{},
         .justified_slots = &[_]u8{},
         .justifications_roots = &justifications_roots,
@@ -247,7 +247,7 @@ test "ssz seralize/deserialize signed stf prover input" {
         },
         // mini3sf
         .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
-        .lastest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
+        .latest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
         .historical_block_hashes = &[_]Root{},
         .justified_slots = &[_]u8{},
         .justifications_roots = &justifications_roots,
