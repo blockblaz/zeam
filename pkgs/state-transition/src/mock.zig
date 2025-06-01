@@ -45,6 +45,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     // track latest justified and finalized for constructing votes
     var latest_justified: types.Mini3SFCheckpoint = .{ .root = block_root, .slot = genesis_block.slot };
+    var latest_justified_prev = latest_justified;
     var latest_finalized = latest_justified;
 
     for (1..numBlocks) |slot| {
@@ -62,19 +63,49 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             2 => {
                 const slotVotes = [_]types.Mini3SFVote{
                     // val 0
-                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
-                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
-                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = 0 }, .target = .{ .root = parent_root, .slot = 0 }, .source = latest_justified },
-                    // val 1
+                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    // skip val1
+                    // val2
+                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    // val3
+                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
                 };
                 for (slotVotes) |slotVote| {
                     try votes.append(slotVote);
                 }
-            },
-            3 => {},
-            0 => {
-                latest_finalized = latest_justified;
+                // post these votes last_justified would be updated
+                latest_justified_prev = latest_justified;
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
+            },
+            3 => {
+                const slotVotes = [_]types.Mini3SFVote{
+                    // skip val0
+                    // val 1
+                    .{ .validator_id = 1, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    // val2
+                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    // val3
+                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                };
+                for (slotVotes) |slotVote| {
+                    try votes.append(slotVote);
+                }
+                // post these votes last justified and finalized would be updated
+                latest_finalized = latest_justified_prev;
+                latest_justified_prev = latest_justified;
+                latest_justified = .{ .root = parent_root, .slot = slot - 1 };
+            },
+            0 => {
+                const slotVotes = [_]types.Mini3SFVote{
+                    // val 0
+                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    // skip val1
+                    // skip val2
+                    // skip val3
+                };
+                for (slotVotes) |slotVote| {
+                    try votes.append(slotVote);
+                }
             },
             else => unreachable,
         }

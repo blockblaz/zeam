@@ -101,10 +101,10 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // transform state data into consumable format, generally one would keep a `cached`/consumable
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
-    var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    debugLog("\n\n===================\nprocess opetationg blockslot={d} votes={any}\n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, block.body.votes, historical_block_hashes.items.len, state.justified_slots }) catch @panic("process operations start log1 panic");
+    debugLog("\n\n===================\nprocess opetationg blockslot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, state.historical_block_hashes.len, state.justified_slots }) catch @panic("process operations start log1 panic");
     debugLog("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log2 panic");
 
+    var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
     // prep the justifications map
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
@@ -121,14 +121,13 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     // otherwise we need genesis block at 1 because genesis state need to have justified slots
     // historical hashes set which we can't do with genesis block since it becomes cyclic
     // dependancy because of block stateroot requirement
+    try historical_block_hashes.append(block.parent_root);
     if (state.slot == 1) {
         // parent is genesis
-        justified_slots.items[0] = 1;
-        historical_block_hashes.items[0] = block.parent_root;
+        try justified_slots.append(1);
         state.latest_justified.root = block.parent_root;
         state.latest_finalized.root = block.parent_root;
     } else {
-        try historical_block_hashes.append(block.parent_root);
         try justified_slots.append(0);
     }
 
@@ -142,21 +141,28 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         // because genesis is always justified and finalized
         try historical_block_hashes.append(utils.ZERO_HASH);
     }
+    debugLog("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}\n-----\n", .{ missed_slots, justified_slots.items, historical_block_hashes.items }) catch @panic("missed slot log");
 
     for (block.body.votes) |vote| {
         // check if vote is sane
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
         const validator_id: usize = @intCast(vote.validator_id);
+        debugLog("processing vote={any}\n....\n", .{vote}) catch @panic("processing vote log");
 
         if (justified_slots.items[source_slot] != 1 or
+            // not present in 3sf mini but once a target is justified no need to run loop
+            // as we remove the target from justifications map as soon as its justified
+            justified_slots.items[target_slot] == 1 or
             !std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]) or
             !std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]) or
             target_slot <= source_slot or
             try is_justifiable_slot(state.latest_finalized.slot, target_slot) == false)
         {
+            debugLog("~~~~~ skipping the vote as not viable ~~~\n~~~~~~~\n", .{}) catch @panic("vote skip log");
             continue;
         }
+
         if (validator_id >= num_validators) {
             return StateTransitionError.InvalidValidatorId;
         }
@@ -171,12 +177,14 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         };
 
         target_justifications[validator_id] = 1;
+        try justifications.put(vote.target.root, target_justifications);
         var target_justifications_count: usize = 0;
         for (target_justifications) |justified| {
             if (justified == 1) {
                 target_justifications_count += 1;
             }
         }
+        debugLog("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, vote.target.root, target_justifications }) catch @panic("target_justifications log");
 
         // as soon as we hit the threshold do justifications
         // note that this simplification works if weight of each validator is 1
@@ -184,18 +192,21 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
             state.latest_justified = vote.target;
             justified_slots.items[target_slot] = 1;
             _ = justifications.remove(vote.target.root);
-        }
+            debugLog("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_justified}) catch @panic("new justification log");
 
-        // source is finalized if target is the next valid justifiable hash
-        var can_target_finalize = true;
-        for (source_slot + 1..target_slot) |check_slot| {
-            if (try is_justifiable_slot(state.latest_finalized.slot, check_slot)) {
-                can_target_finalize = false;
-                break;
+            // source is finalized if target is the next valid justifiable hash
+            var can_target_finalize = true;
+            for (source_slot + 1..target_slot) |check_slot| {
+                if (try is_justifiable_slot(state.latest_finalized.slot, check_slot)) {
+                    can_target_finalize = false;
+                    break;
+                }
             }
-        }
-        if (can_target_finalize == true) {
-            state.latest_finalized = vote.source;
+            debugLog("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize }) catch @panic("can_target_finalize log");
+            if (can_target_finalize == true) {
+                state.latest_finalized = vote.source;
+                debugLog("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_finalized}) catch @panic("new justification log");
+            }
         }
     }
 
@@ -220,7 +231,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         _ = justifications.remove(root);
     }
 
-    debugLog("\n---------------\npoststate:historical hashes={d} justified slots ={any}, ", .{ historical_block_hashes.items.len, state.justified_slots }) catch @panic("process operations start log3 panic");
+    debugLog("\n---------------\npoststate:historical hashes={d} justified slots ={any}\n justifications_roots:{any}\n justifications_validators= {any}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots, state.justifications_validators }) catch @panic("process operations start log3 panic");
     debugLog("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log4 panic");
 }
 

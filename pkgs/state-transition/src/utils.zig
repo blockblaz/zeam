@@ -109,11 +109,7 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
     // historical hashes and justified slots are slices so we need to alloc them
     // for them to exist outside this fn scope
     var historical_hashes_array = std.ArrayList(types.Root).init(allocator);
-    try historical_hashes_array.append(parent_root);
-
-    // add slot0 = genesis justified
     var justified_slots_array = std.ArrayList(u8).init(allocator);
-    try justified_slots_array.append(1);
 
     const state = types.BeamState{
         .config = .{ .num_validators = genesis.num_validators },
