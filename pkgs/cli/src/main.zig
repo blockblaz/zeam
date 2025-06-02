@@ -68,12 +68,12 @@ pub fn main() !void {
                 .zkvm = .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
             };
 
-            // generate a mock chain with 2 blocks including genesis i.e. 1 block on top of genesis
+            // generate a mock chain with 5blocks including genesis i.e. 4 blocks on top of genesis
             const mock_config = types.GenesisSpec{
                 .genesis_time = genesis,
                 .num_validators = num_validators,
             };
-            const mock_chain = try sftFactory.genMockChain(allocator, 3, mock_config);
+            const mock_chain = try sftFactory.genMockChain(allocator, 5, mock_config);
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
