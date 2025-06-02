@@ -18,12 +18,12 @@ const Risc0Config = struct {
     program_path: []const u8,
 };
 
-pub const StateTransitionOpts = union(enum) {
+pub const ZKStateTransitionOpts = union(enum) {
     powdr: PowdrConfig,
     risc0: Risc0Config,
 };
 
-pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
+pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
     const prover_input = types.BeamSTFProverInput{
         .state = state,
         .block = block,
@@ -49,7 +49,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     return proof;
 }
 
-pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void {
+pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: ZKStateTransitionOpts) !void {
     _ = state_root;
     _ = block_root;
 

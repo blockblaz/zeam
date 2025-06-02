@@ -80,6 +80,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_state_transition.addImport("@zeam/utils", zeam_utils);
     zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
@@ -255,11 +256,19 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
     zeam_types.addImport("@zeam/params", zeam_params);
 
     for (zkvm_targets) |zkvm_target| {
+        // add zeam-params
+        const zeam_utils = b.addModule("@zeam/utils", .{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/utils/src/lib.zig"),
+        });
+
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
             .target = target,
             .root_source_file = b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/lib.zig", .{zkvm_target.name})),
         });
+        zeam_utils.addImport("zkvm", zkvm_module);
 
         // add state transition, create a new module for each zkvm since
         // that module depends on the zkvm module.
@@ -268,6 +277,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .target = target,
             .optimize = optimize,
         });
+        zeam_state_transition.addImport("@zeam/utils", zeam_utils);
         zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);

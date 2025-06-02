@@ -58,7 +58,7 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            const options = stateProvingManager.StateTransitionOpts{
+            const options = stateProvingManager.ZKStateTransitionOpts{
                 // .powdr = .{
                 //     .program_path = "zig-out/bin/zeam-stf-powdr",
                 //     .output_dir = "out",

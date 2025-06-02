@@ -98,7 +98,7 @@ the state transition
 
 3. `pkgs/state-proving-manager`
  ```zig
-   pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: StateTransitionOpts) types.BeamSTFProof
+   pub fn execute_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: ZKStateTransitionOpts) types.BeamSTFProof
 ```
   - invoked to prove a block against a pre state
   - invokes the requested ZK-VM for executing the `pkgs/state-transition-runtime` riscv5 binary with inputs and 
@@ -106,7 +106,7 @@ the state transition
   - returns the state transition proof
 
 ```zig
-pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: StateTransitionOpts) !void
+pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes32, block_root: types.Bytes32, opts: ZKStateTransitionOpts) !void
 ```
  - verifies the state transition proof on a pre state root and block root
 - invokes the requested ZK-VM for verifying the `pkgs/state-traansition-runtim` riscv5 binary with inputs constructed
