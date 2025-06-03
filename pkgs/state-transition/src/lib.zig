@@ -8,9 +8,11 @@ const utils = @import("./utils.zig");
 pub usingnamespace utils;
 
 const transition = @import("./transition.zig");
+
 pub const process_slots = transition.process_slot;
 pub const apply_transition = transition.apply_transition;
 pub const StateTransitionError = transition.StateTransitionError;
+pub const StateTransitionOpts = transition.StateTransitionOpts;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
