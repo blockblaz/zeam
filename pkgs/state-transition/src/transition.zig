@@ -6,10 +6,12 @@ pub const utils = @import("./utils.zig");
 
 const zeam_utils = @import("@zeam/utils");
 const log = zeam_utils.zeamLog;
+const getLogger = zeam_utils.getLogger;
 
 const params = @import("@zeam/params");
 
-pub const StateTransitionOpts = struct { activeLevel: std.log.Level = std.log.Level.info };
+// put the active logs at debug level for now by default
+pub const StateTransitionOpts = struct { activeLevel: std.log.Level = std.log.Level.debug };
 
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
@@ -80,12 +82,15 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
 }
 
 // TODO(gballet) check if beam block needs to be a pointer
-pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock) !void {
+pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock, opts: StateTransitionOpts) !void {
+    // _ = opts;
+    var logger = getLogger();
+    logger.setActiveLevel(opts.activeLevel);
     const block = signedBlock.message;
-    log("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot }) catch @panic("appply transition start log");
+    logger.debug("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot }) catch @panic("appply transition start log");
 
     if (block.slot <= state.slot) {
-        log("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot }) catch @panic("error printing block and state slots");
+        logger.debug("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot }) catch @panic("error printing block and state slots");
         return StateTransitionError.InvalidPreState;
     }
 
@@ -102,7 +107,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     var state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
     if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-        log("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root }) catch @panic("error printing invalid block root");
+        logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root }) catch @panic("error printing invalid block root");
         return StateTransitionError.InvalidPostState;
     }
 }

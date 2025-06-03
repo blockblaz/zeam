@@ -44,7 +44,7 @@ test "apply transition on mocked chain" {
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block);
+        try apply_transition(allocator, &beam_state, block, .{});
     }
 
     // check the post state root to be equal to block2's stateroot
@@ -97,7 +97,7 @@ test "mock genesis and block production" {
     // TODO: the previous process block should have been run on cloned state so we have the original pre
     // state here to run the state transition. for now regen same genesis state
     var state = try utils.genGenesisState(std.testing.allocator, test_config);
-    try apply_transition(std.testing.allocator, &state, mock_chain.blocks[1]);
+    try apply_transition(std.testing.allocator, &state, mock_chain.blocks[1], .{});
     var post_state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state, &post_state_root, std.testing.allocator);
 
@@ -132,7 +132,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block);
+            try apply_transition(allocator, &beam_state, block, .{});
         }
     }
 }

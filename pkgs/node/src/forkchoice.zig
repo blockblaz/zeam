@@ -280,7 +280,7 @@ test "forkchoice block tree" {
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const block = mock_chain.blocks[i];
-        try stf.apply_transition(allocator, &beam_state, block);
+        try stf.apply_transition(allocator, &beam_state, block, .{});
 
         // shouldn't accept a future slot
         const current_slot = block.message.slot;

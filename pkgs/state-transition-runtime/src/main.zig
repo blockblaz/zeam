@@ -35,7 +35,7 @@ export fn main() noreturn {
     // zkvm.io.print_str(input_dump_str);
 
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block) catch |e| {
+    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{}) catch |e| {
         var buf: [256]u8 = undefined;
         const errstr = std.fmt.bufPrint(buf[0..], "error running transition function: {any}", .{e}) catch @panic("error running transition function and error coud not be printed");
         @panic(errstr);
