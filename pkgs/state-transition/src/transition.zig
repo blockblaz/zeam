@@ -184,7 +184,10 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 
         // as soon as we hit the threshold do justifications
         // note that this simplification works if weight of each validator is 1
-        if (target_justifications_count == @divFloor(num_validators * 2, 3)) {
+        //
+        // ceilDiv is not available so this seems like a less compute intesive way without
+        // requring floar division, can be further optimized
+        if (3 * target_justifications_count >= 2 * num_validators) {
             state.latest_justified = vote.target;
             justified_slots.items[target_slot] = 1;
             _ = justifications.remove(vote.target.root);
