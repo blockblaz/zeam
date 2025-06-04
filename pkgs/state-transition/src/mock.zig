@@ -8,6 +8,9 @@ pub const utils = @import("./utils.zig");
 const transition = @import("./transition.zig");
 const params = @import("@zeam/params");
 
+const zeam_utils = @import("@zeam/utils");
+const getLogger = zeam_utils.getLogger;
+
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
@@ -124,7 +127,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
         try transition.process_slots(allocator, &beam_state, block.slot);
         // process block and modify the pre state to post state
-        try transition.process_block(allocator, &beam_state, block);
+        var logger = getLogger();
+        logger.setActiveLevel(.info);
+        try transition.process_block(allocator, &beam_state, block, &logger);
 
         // extract the post state root
         try ssz.hashTreeRoot(types.BeamState, beam_state, &state_root, allocator);

@@ -6,18 +6,13 @@ pub const utils = @import("./utils.zig");
 
 const zeam_utils = @import("@zeam/utils");
 const log = zeam_utils.zeamLog;
+const debugLog = zeam_utils.zeamLog;
 const getLogger = zeam_utils.getLogger;
 
 const params = @import("@zeam/params");
 
 // put the active logs at debug level for now by default
 pub const StateTransitionOpts = struct { activeLogLevel: std.log.Level = std.log.Level.debug };
-
-fn debugLog(comptime fmt: []const u8, args: anytype) !void {
-    if (builtin.target.os.tag != .freestanding) {
-        std.debug.print(fmt, args);
-    }
-}
 
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
@@ -73,7 +68,8 @@ fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     return false;
 }
 
-fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
+fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+    logger.debug("process block header\n", .{}) catch @panic("111");
     // very basic process block header
     if (state.slot != block.slot) {
         log("state slot={} block slot={}", .{ state.slot, block.slot }) catch @panic("error printing invalid block slot");
@@ -97,11 +93,11 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
+fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // transform state data into consumable format, generally one would keep a `cached`/consumable
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
-    debugLog("\n\n===================\nprocess opetationg blockslot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, state.historical_block_hashes.len, state.justified_slots }) catch @panic("process operations start log1 panic");
+    logger.debug("\n\n===================\nprocess opetationg blockslot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, state.historical_block_hashes.len, state.justified_slots }) catch @panic("process operations start log1 panic");
     debugLog("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log2 panic");
 
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
@@ -235,11 +231,11 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     debugLog("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized }) catch @panic("process operations start log4 panic");
 }
 
-pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock) !void {
+pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // start block processing
-    try process_block_header(allocator, state, block);
+    try process_block_header(allocator, state, block, logger);
     try process_execution_payload_header(state, block);
-    try process_operations(allocator, state, block);
+    try process_operations(allocator, state, block, logger);
 }
 
 // fill this up when we have signature scheme
@@ -267,7 +263,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     try process_slots(allocator, state, block.slot);
 
     // process the block
-    try process_block(allocator, state, block);
+    try process_block(allocator, state, block, &logger);
 
     // verify the post state root
     var state_root: [32]u8 = undefined;
