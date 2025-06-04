@@ -59,7 +59,7 @@ pub const ZeamLogger = struct {
         self: *Self,
         comptime fmt: []const u8,
         args: anytype,
-    ) !void {
+    ) void {
         return self.logFn(self.scope, self.activeLevel, .err, fmt, args);
     }
 
@@ -67,14 +67,14 @@ pub const ZeamLogger = struct {
         self: *Self,
         comptime fmt: []const u8,
         args: anytype,
-    ) !void {
+    ) void {
         return self.logFn(self.scope, self.activeLevel, .warn, fmt, args);
     }
     pub fn info(
         self: *Self,
         comptime fmt: []const u8,
         args: anytype,
-    ) !void {
+    ) void {
         return self.logFn(self.scope, self.activeLevel, .info, fmt, args);
     }
 
@@ -82,7 +82,7 @@ pub const ZeamLogger = struct {
         self: *Self,
         comptime fmt: []const u8,
         args: anytype,
-    ) !void {
+    ) void {
         return self.logFn(self.scope, self.activeLevel, .debug, fmt, args);
     }
 };
