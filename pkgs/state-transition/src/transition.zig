@@ -252,7 +252,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     var logger = getLogger();
     logger.setActiveLevel(opts.activeLogLevel);
     const block = signedBlock.message;
-    logger.debug("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot });
+    logger.info("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot });
 
     if (block.slot <= state.slot) {
         logger.debug("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot });
