@@ -123,12 +123,24 @@ pub const ForkChoiceStore = struct {
     finalizedRoot: types.Root,
 };
 
+const VoteTracker = struct {
+    // prev latest vote applied index null if not applied or removed
+    oldIndex: ?usize,
+    // new index at which to apply the latest vote at null if to be removed
+    newIndex: ?usize,
+    // the latest slot for which vote is obtained
+    nextSlot: ?types.Slot,
+};
+
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
     anchorState: types.BeamState,
     config: configs.ChainConfig,
     fcStore: ForkChoiceStore,
     allocator: Allocator,
+    // map of validator ids to vote tracker, better to have a map instead of array
+    // because of churn in validators
+    votes: std.AutoHashMap(usize, VoteTracker),
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
@@ -150,12 +162,12 @@ pub const ForkChoice = struct {
             .timeliness = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
-
         const fc_store = ForkChoiceStore{
             .currentSlot = anchorState.slot,
             .finalizedSlot = anchorState.slot,
             .finalizedRoot = finalized_root,
         };
+        const votes = std.AutoHashMap(usize, VoteTracker).init(allocator);
 
         return Self{
             .allocator = allocator,
@@ -163,6 +175,7 @@ pub const ForkChoice = struct {
             .anchorState = anchorState,
             .config = config,
             .fcStore = fc_store,
+            .votes = votes,
         };
     }
 
