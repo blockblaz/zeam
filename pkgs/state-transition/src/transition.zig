@@ -87,10 +87,10 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     var logger = getLogger();
     logger.setActiveLevel(opts.activeLogLevel);
     const block = signedBlock.message;
-    logger.debug("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot }) catch @panic("appply transition start log");
+    logger.debug("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot });
 
     if (block.slot <= state.slot) {
-        logger.debug("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot }) catch @panic("error printing block and state slots");
+        logger.debug("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot });
         return StateTransitionError.InvalidPreState;
     }
 
@@ -107,7 +107,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     var state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
     if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-        logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root }) catch @panic("error printing invalid block root");
+        logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
         return StateTransitionError.InvalidPostState;
     }
 }
