@@ -59,10 +59,10 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
         .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
         // else => @panic("prover isn't enabled"),
     };
-    std.debug.print("proof len={}\n", .{output_len});
     const proof = types.BeamSTFProof{
         .proof = output[0..output_len],
     };
+    logger.debug("proof len={}\n", .{output_len});
 
     return proof;
 }
