@@ -68,7 +68,7 @@ pub fn main() !void {
                 .zkvm = .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
             };
 
-            // generate a mock chain with 5blocks including genesis i.e. 4 blocks on top of genesis
+            // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
             const mock_config = types.GenesisSpec{
                 .genesis_time = genesis,
                 .num_validators = num_validators,
