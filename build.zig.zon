@@ -3,7 +3,7 @@
     .fingerprint = 0x243fd12cf3aff803,
     .version = "0.0.0",
     .dependencies = .{ .ssz = .{
-        .url = "https://github.com/blockblaz/ssz.zig/archive/9680e53.tar.gz",
+        .url = "https://github.com/blockblaz/ssz.zig/archive/72c544b.tar.gz",
         .hash = "1220436346a26c5fc3d32b3c608a7a408cec3139dae30d74dba4183a6eb2e855dc49",
     }, .zigcli = .{
         .url = "https://github.com/jiacai2050/zigcli/archive/refs/tags/v0.2.0.tar.gz",
