@@ -5,6 +5,10 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 
+const zeam_utils = @import("@zeam/utils");
+// by default logger's activeLevel is std.log.default_level
+var logger = zeam_utils.getLogger();
+
 // TODO(gballet) move to zkvm module as each zkvm has a
 // different allocated space.
 var fixed_mem = [_]u8{0} ** (128 * 1024 * 1024);
@@ -25,24 +29,18 @@ export fn main() noreturn {
     // completed.
     const input = zkvm.get_input(allocator);
     defer zkvm.free_input(allocator);
-    var input_dump_str: [20048]u8 = undefined;
-    _ = std.fmt.bufPrint(input_dump_str[0..], "serialized input={any} len={}\n", .{ input[0..], input.len }) catch @panic("error allocating string to dump serialized input");
-    // Uncomment when debugging
-    zkvm.io.print_str(&input_dump_str);
+    logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
+
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
-    // Uncomment when debugging
-    _ = std.fmt.bufPrint(input_dump_str[0..], "deserialized input={any}\n", .{prover_input.state}) catch @panic("error allocating string to dump deserialized input");
-    zkvm.io.print_str(&input_dump_str);
+    logger.debug("deserialized input={any}\n", .{prover_input.state});
 
     // apply the state transition to modify the state
     // only print info, eventually should be dropped to .err log level
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .activeLogLevel = .info }) catch |e| {
-        var buf: [256]u8 = undefined;
-        const errstr = std.fmt.bufPrint(buf[0..], "error running transition function: {any}", .{e}) catch @panic("error running transition function and error coud not be printed");
-        @panic(errstr);
+        logger.err("error running transition function: {any}", .{e});
     };
 
-    zkvm.io.print_str("state transition completed\n");
+    logger.info("state transition completed\n", .{});
 
     // verify the block.state_root is ssz hash tree root of state
     // this completes our zkvm proving

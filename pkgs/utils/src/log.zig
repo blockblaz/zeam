@@ -18,17 +18,17 @@ pub fn log(comptime scope: @Type(.enum_literal), activeLevel: std.log.Level, com
 
     if (builtin.target.os.tag == .freestanding) {
         const io = @import("zkvm").io;
-        var buf: [1024]u8 = undefined;
+        var buf: [2048]u8 = undefined;
         // TODO don't throw error because it somehow messes with creation of  noopLogger as noopLog
         // doesn't throw and somehow it can't seem to infer error types as they might not be same
         // across all log fns, figure out in a later PR
-        const print_str = std.fmt.bufPrint(buf[0..], prefix ++ fmt, args) catch "error formatting log";
+        const print_str = std.fmt.bufPrint(buf[0..], prefix ++ fmt ++ "\n", args) catch "error formatting log";
         io.print_str(print_str);
     } else {
         std.debug.lockStdErr();
         defer std.debug.unlockStdErr();
         const stderr = std.io.getStdErr().writer();
-        nosuspend stderr.print(prefix ++ fmt, args) catch return;
+        nosuspend stderr.print(prefix ++ fmt ++ "\n", args) catch return;
     }
 }
 

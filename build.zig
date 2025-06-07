@@ -294,6 +294,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         });
         // addimport to root module is even required afer declaring it in mod
         exe.root_module.addImport("ssz", ssz);
+        exe.root_module.addImport("@zeam/utils", zeam_utils);
         exe.root_module.addImport("@zeam/params", zeam_params);
         exe.root_module.addImport("@zeam/types", zeam_types);
         exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);

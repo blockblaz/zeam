@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const utils = @import("@zeam/utils");
+const getLogger = utils.getLogger;
 
 const Allocator = std.mem.Allocator;
 
@@ -41,11 +42,14 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     var serialized = std.ArrayList(u8).init(allocator);
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
-    std.debug.print("\n\n\nprove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
+
+    var logger = getLogger();
+    logger.setActiveLevel(opts.activeLogLevel);
+    logger.debug("prove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
 
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
-    std.debug.print("should deserialize to={any}", .{prover_input_deserialized.state});
+    logger.debug("should deserialize to={any}", .{prover_input_deserialized.state});
 
     // allocate a megabyte of data so that we have enough space for the proof.
     // XXX not deallocated yet
