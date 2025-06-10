@@ -141,6 +141,7 @@ pub const ForkChoice = struct {
     // map of validator ids to vote tracker, better to have a map instead of array
     // because of churn in validators
     votes: std.AutoHashMap(usize, VoteTracker),
+    head: ProtoBlock,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
@@ -169,14 +170,17 @@ pub const ForkChoice = struct {
         };
         const votes = std.AutoHashMap(usize, VoteTracker).init(allocator);
 
-        return Self{
+        var fc = Self{
             .allocator = allocator,
             .protoArray = proto_array,
             .anchorState = anchorState,
             .config = config,
             .fcStore = fc_store,
             .votes = votes,
+            .head = anchor_block,
         };
+        try fc.updateHead();
+        return fc;
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -218,6 +222,12 @@ pub const ForkChoice = struct {
 
         self.fcStore.currentSlot = currentSlot;
         // reset attestations or process checkpoints as prescribed in the specs
+    }
+
+    pub fn updateHead(self: *Self) !void {
+        _ = self;
+        // balances are right now same for the dummy chain and each weighing 1
+        // const deltas =
     }
 
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !void {
