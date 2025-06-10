@@ -16,6 +16,12 @@ const MockChainData = struct {
     genesis_state: types.BeamState,
     blocks: []types.SignedBeamBlock,
     blockRoots: []types.Root,
+    // what should be justified and finalzied post each of these blocks
+    latestJustified: []types.Mini3SFCheckpoint,
+    latestFinalized: []types.Mini3SFCheckpoint,
+    // did justification/finalization happen
+    justification: []bool,
+    finalization: []bool,
 };
 
 pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
@@ -27,6 +33,12 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     const genesis_state = try utils.genGenesisState(allocator, genesis_config);
     var blockList = std.ArrayList(types.SignedBeamBlock).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
+
+    var justificationCPList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
+    var justificationList = std.ArrayList(bool).init(allocator);
+
+    var finalizationCPList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
+    var finalizationList = std.ArrayList(bool).init(allocator);
 
     // figure out a way to clone genesis_state
     var beam_state = try utils.genGenesisState(allocator, genesis_config);
@@ -50,6 +62,15 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var latest_justified: types.Mini3SFCheckpoint = .{ .root = block_root, .slot = genesis_block.slot };
     var latest_justified_prev = latest_justified;
     var latest_finalized = latest_justified;
+
+    try justificationCPList.append(latest_justified);
+    try justificationList.append(true);
+    try finalizationCPList.append(latest_finalized);
+    try finalizationList.append(true);
+
+    // to easily track new justifications/finalizations for bunding in the response
+    var prev_justified_root = latest_justified.root;
+    var prev_finalized_root = latest_finalized.root;
 
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
@@ -146,6 +167,16 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         try blockList.append(signed_block);
         try blockRootList.append(block_root);
 
+        try justificationCPList.append(latest_justified);
+        const justification = !std.mem.eql(u8, &prev_justified_root, &latest_justified.root);
+        try justificationList.append(justification);
+        prev_justified_root = latest_justified.root;
+
+        try finalizationCPList.append(latest_finalized);
+        const finalization = !std.mem.eql(u8, &prev_finalized_root, &latest_finalized.root);
+        try finalizationList.append(finalization);
+        prev_finalized_root = latest_finalized.root;
+
         // now we are ready for next round as the beam_state is not this blocks post state
         prev_block = block;
     }
@@ -155,5 +186,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         .genesis_state = genesis_state,
         .blocks = blockList.items,
         .blockRoots = blockRootList.items,
+        .latestJustified = justificationCPList.items,
+        .latestFinalized = finalizationCPList.items,
+        .justification = justificationList.items,
+        .finalization = finalizationList.items,
     };
 }
