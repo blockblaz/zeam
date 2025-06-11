@@ -46,12 +46,18 @@ pub const BeamChain = struct {
     }
 
     // import block assuming its validated
-    fn onBlock(self: *Self, block: types.SignedBeamBlock) !void {
-        _ = self;
-        _ = block;
+    fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         // 1. get parent state
-        // 2. STF validation + post state
-        // 2. fc onblock
+        const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+
+        // 2. apply STF to get post state
+        try stf.apply_transition(self.allocator, &post_state, signedBlock, .{});
+
+        // 3. fc onblock
+        const block = signedBlock.message;
+        const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
+        try self.states.put(fcBlock.blockRoot, post_state);
         // 3. fc onvotes
         // 3. fc update head
     }
@@ -67,6 +73,8 @@ pub const BeamChain = struct {
         return cb_ptr;
     }
 };
+
+const BlockProcessingError = error{MissingPreState};
 
 test "build mock chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -84,7 +92,7 @@ test "build mock chain" {
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
     const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
-    var beam_state = mock_chain.genesis_state;
+    const beam_state = mock_chain.genesis_state;
     var beam_chain = try BeamChain.init(allocator, chain_config, beam_state);
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalizedRoot, &mock_chain.blockRoots[0]));
@@ -96,14 +104,11 @@ test "build mock chain" {
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const block = mock_chain.blocks[i];
-        try stf.apply_transition(allocator, &beam_state, block, .{});
-
-        // shouldn't accept a future slot
         const current_slot = block.message.slot;
-        try std.testing.expectError(error.FutureSlot, beam_chain.forkChoice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
         beam_chain.forkChoice.tickSlot(current_slot);
-        try beam_chain.forkChoice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        try beam_chain.onBlock(block);
+
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
 

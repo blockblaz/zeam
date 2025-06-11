@@ -230,7 +230,7 @@ pub const ForkChoice = struct {
         // const deltas =
     }
 
-    pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !void {
+    pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {
         _ = state;
 
         const parent_root = block.parent_root;
@@ -266,7 +266,8 @@ pub const ForkChoice = struct {
                 .timeliness = is_timely,
             };
 
-            return self.protoArray.onBlock(proto_block, opts.currentSlot);
+            try self.protoArray.onBlock(proto_block, opts.currentSlot);
+            return proto_block;
         } else {
             return ForkChoiceError.UnknownParent;
         }
@@ -310,7 +311,7 @@ test "forkchoice block tree" {
         try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
         fork_choice.tickSlot(current_slot);
-        try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        _ = try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
 
