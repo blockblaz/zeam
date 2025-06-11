@@ -104,6 +104,7 @@ test "build mock chain" {
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const block = mock_chain.blocks[i];
+        const block_root = mock_chain.blockRoots[i];
         const current_slot = block.message.slot;
 
         beam_chain.forkChoice.tickSlot(current_slot);
@@ -111,8 +112,13 @@ test "build mock chain" {
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
-
         const searched_idx = beam_chain.forkChoice.protoArray.indices.get(mock_chain.blockRoots[i]);
         try std.testing.expect(searched_idx == i);
+
+        // should have matching states in the state
+        const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamState, block_state, &state_root, allocator);
+        try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
     }
 }
