@@ -22,7 +22,10 @@ pub const BeamChain = struct {
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
         const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState);
-        const states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
+
+        var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
+        try states.put(fork_choice.head.blockRoot, anchorState);
+
         return Self{
             .config = config,
             .forkChoice = fork_choice,
