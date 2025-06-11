@@ -179,7 +179,7 @@ pub const ForkChoice = struct {
             .votes = votes,
             .head = anchor_block,
         };
-        try fc.updateHead();
+        _ = try fc.updateHead();
         return fc;
     }
 
@@ -224,10 +224,15 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
-    pub fn updateHead(self: *Self) !void {
-        _ = self;
+    pub fn updateHead(self: *Self) !ProtoBlock {
         // balances are right now same for the dummy chain and each weighing 1
         // const deltas =
+        return self.head;
+    }
+
+    pub fn onAttestation(self: *Self, vote: types.Mini3SFVote) !void {
+        _ = self;
+        _ = vote;
     }
 
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {

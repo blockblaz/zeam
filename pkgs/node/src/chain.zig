@@ -59,7 +59,11 @@ pub const BeamChain = struct {
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try self.states.put(fcBlock.blockRoot, post_state);
         // 3. fc onvotes
+        for (block.body.votes) |vote| {
+            try self.forkChoice.onAttestation(vote);
+        }
         // 3. fc update head
+        _ = try self.forkChoice.updateHead();
     }
 
     pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
