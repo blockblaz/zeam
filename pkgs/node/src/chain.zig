@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json = std.json;
 
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
@@ -65,31 +66,45 @@ pub const BeamChain = struct {
 };
 
 test "build mock chain" {
-    // 1. setup genesis config
-    const test_config = types.GenesisSpec{
-        .genesis_time = 1234,
-        .num_validators = 4,
-    };
-
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const mock_chain = try stf.genMockChain(allocator, 5, test_config);
-    try std.testing.expect(mock_chain.blocks.len == 5);
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    // starting beam state
+    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
-    // block 0 is genesis so we have to apply block 1 onwards
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state);
+
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalizedRoot, &mock_chain.blockRoots[0]));
+    try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalizedRoot, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+
     for (1..mock_chain.blocks.len) |i| {
-        // this is a signed block
+        // get the block post state
         const block = mock_chain.blocks[i];
         try stf.apply_transition(allocator, &beam_state, block, .{});
-    }
 
-    // check the post state root to be equal to block2's stateroot
-    // this is reduant though because apply_transition already checks this for each block's state root
-    var post_state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
-    try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.state_root));
+        // shouldn't accept a future slot
+        const current_slot = block.message.slot;
+        try std.testing.expectError(error.FutureSlot, beam_chain.forkChoice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+
+        beam_chain.forkChoice.tickSlot(current_slot);
+        try beam_chain.forkChoice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
+        try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
+
+        const searched_idx = beam_chain.forkChoice.protoArray.indices.get(mock_chain.blockRoots[i]);
+        try std.testing.expect(searched_idx == i);
+    }
 }
