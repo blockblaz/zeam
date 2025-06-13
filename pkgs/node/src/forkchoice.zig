@@ -125,11 +125,10 @@ pub const ForkChoiceStore = struct {
 
 const VoteTracker = struct {
     // prev latest vote applied index null if not applied or removed
-    oldIndex: ?usize,
+    appliedIndex: ?usize = null,
     // new index at which to apply the latest vote at null if to be removed
-    newIndex: ?usize,
-    // the latest slot for which vote is obtained
-    nextSlot: ?types.Slot,
+    newIndex: ?usize = null,
+    newSlot: ?types.Slot = null,
 };
 
 pub const ForkChoice = struct {
@@ -231,8 +230,17 @@ pub const ForkChoice = struct {
     }
 
     pub fn onAttestation(self: *Self, vote: types.Mini3SFVote) !void {
-        _ = self;
-        _ = vote;
+        // vote has to be of an ancestor of the current slot
+        const new_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
+        if (vote.slot < self.fcStore.currentSlot) {
+            var vote_tracker = self.votes.get(vote.validator_id) orelse VoteTracker{};
+            const vote_tracker_new_slot = vote_tracker.newSlot orelse 0;
+            if (vote.head.slot > vote_tracker_new_slot) {
+                vote_tracker.newIndex = new_index;
+                vote_tracker.newSlot = vote.head.slot;
+            }
+            try self.votes.put(vote.validator_id, vote_tracker);
+        }
     }
 
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {
@@ -279,7 +287,7 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant };
+const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation };
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);

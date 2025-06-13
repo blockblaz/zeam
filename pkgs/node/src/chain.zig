@@ -95,7 +95,7 @@ test "build mock chain" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     var beam_chain = try BeamChain.init(allocator, chain_config, beam_state);
 
@@ -124,5 +124,12 @@ test "build mock chain" {
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamState, block_state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
+    }
+
+    const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
+    for (0..num_validators) |validator_id| {
+        // all validators should have voted as per the mock chain
+        const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
+        try std.testing.expect(vote_tracker != null);
     }
 }
