@@ -141,6 +141,9 @@ pub const ForkChoice = struct {
     // because of churn in validators
     votes: std.AutoHashMap(usize, VoteTracker),
     head: ProtoBlock,
+    // data structure to hold validator deltas, could be grown over time as more validators
+    // get added
+    deltas: std.ArrayList(isize),
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
@@ -168,6 +171,7 @@ pub const ForkChoice = struct {
             .finalizedRoot = finalized_root,
         };
         const votes = std.AutoHashMap(usize, VoteTracker).init(allocator);
+        const deltas = std.ArrayList(isize).init(allocator);
 
         var fc = Self{
             .allocator = allocator,
@@ -177,6 +181,7 @@ pub const ForkChoice = struct {
             .fcStore = fc_store,
             .votes = votes,
             .head = anchor_block,
+            .deltas = deltas,
         };
         _ = try fc.updateHead();
         return fc;
@@ -224,8 +229,33 @@ pub const ForkChoice = struct {
     }
 
     pub fn updateHead(self: *Self) !ProtoBlock {
+        // prep the deltas data structure
+        while (self.deltas.items.len < self.protoArray.nodes.items.len) {
+            try self.deltas.append(0);
+        }
+        for (0..self.deltas.items.len) |i| {
+            self.deltas.items[i] = 0;
+        }
         // balances are right now same for the dummy chain and each weighing 1
-        // const deltas =
+        const validatorWeight = 1;
+
+        for (0..self.config.genesis.num_validators) |validator_id| {
+            var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
+            if (vote_tracker.appliedIndex) |applied_index| {
+                self.deltas.items[applied_index] -= validatorWeight;
+            }
+            vote_tracker.appliedIndex = null;
+
+            // new index could be null if validator exits from the state
+            // we don't need to null the new index after application because
+            // applied and new will be same will no impact but this could still be a
+            // relevant operation if/when the validator weight changes
+            if (vote_tracker.newIndex) |new_index| {
+                self.deltas.items[new_index] += validatorWeight;
+                vote_tracker.appliedIndex = new_index;
+            }
+            try self.votes.put(validator_id, vote_tracker);
+        }
         return self.head;
     }
 
