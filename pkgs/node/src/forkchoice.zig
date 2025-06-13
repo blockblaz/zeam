@@ -19,7 +19,7 @@ pub const ProtoBlock = struct {
 };
 const ProtoMeta = struct {
     parent: ?usize,
-    weight: ?usize,
+    weight: isize,
     bestChild: ?usize,
     bestDescendant: ?usize,
 };
@@ -52,12 +52,6 @@ pub const ProtoArray = struct {
         }
 
         const parent = self.indices.get(block.parentRoot);
-        var weight: usize = undefined;
-        if (block.timeliness) {
-            weight = 1;
-        } else {
-            weight = 0;
-        }
 
         // TODO extend is not working so copy data for now
         // const node = utils.Extend(ProtoNode, block, .{
@@ -73,7 +67,7 @@ pub const ProtoArray = struct {
             .targetRoot = block.targetRoot,
             .timeliness = block.timeliness,
             .parent = parent,
-            .weight = weight,
+            .weight = 0,
             .bestChild = null,
             .bestDescendant = null,
         };
@@ -108,6 +102,64 @@ pub const ProtoArray = struct {
             return block;
         } else {
             return null;
+        }
+    }
+
+    pub fn applyDeltas(self: *Self, deltas: []isize) !void {
+        if (deltas.len != self.nodes.items.len) {
+            return ForkChoiceError.InvalidDeltas;
+        }
+
+        // iterate backwards aaapply deltas and propagating deltas to parents
+        for (0..self.nodes.items.len) |i| {
+            const node_idx = self.nodes.items.len - 1 - i;
+            const node_delta = deltas[node_idx];
+            self.nodes.items[node_idx].weight += node_delta;
+            if (self.nodes.items[node_idx].parent) |parent_idx| {
+                deltas[parent_idx] += node_delta;
+            }
+        }
+
+        // re-iterate backwards and calc best child and decendant
+        // there seems to be no filter block tree in the mini3sf fc
+        for (0..self.nodes.items.len) |i| {
+            const node_idx = self.nodes.items.len - 1 - i;
+            const node = self.nodes.items[node_idx];
+
+            if (self.nodes.items[node_idx].parent) |parent_idx| {
+                const parent = self.nodes.items[parent_idx];
+                var updateBest = false;
+
+                if (parent.bestChild == node_idx) {
+                    // check if bestdecendant needs to be updated even if best child is same
+                    if (parent.bestDescendant != node.bestDescendant) {
+                        updateBest = true;
+                    }
+                } else {
+                    const bestChildOrNull = if (parent.bestChild) |bestChildIdx| self.nodes.items[bestChildIdx] else null;
+
+                    // see if we can update parent's best
+                    if (bestChildOrNull) |bestChild| {
+                        if (bestChild.weight < node.weight) {
+                            updateBest = true;
+                        } else if (bestChild.weight == node.weight) {
+                            // tie break by slot else by hash
+                            if (node.slot > bestChild.slot) {
+                                updateBest = true;
+                            } else if (node.slot == bestChild.slot and (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt)) {
+                                updateBest = true;
+                            }
+                        }
+                    } else {
+                        updateBest = true;
+                    }
+                }
+
+                if (updateBest) {
+                    self.nodes.items[parent_idx].bestChild = node_idx;
+                    self.nodes.items[parent_idx].bestDescendant = node.bestDescendant orelse node_idx;
+                }
+            }
         }
     }
 };
@@ -256,6 +308,10 @@ pub const ForkChoice = struct {
             }
             try self.votes.put(validator_id, vote_tracker);
         }
+
+        try self.protoArray.applyDeltas(self.deltas.items);
+
+        // head is the best decendant of latest justified
         return self.head;
     }
 
@@ -317,7 +373,7 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation };
+const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas };
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
