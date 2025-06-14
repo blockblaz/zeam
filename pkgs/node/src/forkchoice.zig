@@ -313,10 +313,14 @@ pub const ForkChoice = struct {
         try self.protoArray.applyDeltas(self.deltas.items);
 
         // head is the best decendant of latest justified
-        const bestDescendantidx = self.protoArray.indices.get(self.fcStore.justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
-        const bestDescendant = self.protoArray.nodes.items[bestDescendantidx];
-        std.debug.print("bestDescendant={any}\n", .{bestDescendant});
-        self.head = utils.Cast(ProtoBlock, bestDescendant);
+        const justified_idx = self.protoArray.indices.get(self.fcStore.justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
+        const justified_node = self.protoArray.nodes.items[justified_idx];
+
+        // if case of no best descendant latest justified is always best descendant
+        const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
+        const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
+
+        self.head = utils.Cast(ProtoBlock, best_descendant);
         return self.head;
     }
 
@@ -378,7 +382,7 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas, InvalidJustifiedRoot };
+const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas, InvalidJustifiedRoot, InvalidBestDescendant };
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
