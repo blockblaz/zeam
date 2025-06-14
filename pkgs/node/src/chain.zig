@@ -124,6 +124,11 @@ test "build mock chain" {
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamState, block_state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
+
+        // fcstore checkpoints should match
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.justified.root, &mock_chain.latestJustified[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.latestFinalized[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 
     const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
