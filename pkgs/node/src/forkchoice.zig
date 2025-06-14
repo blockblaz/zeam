@@ -173,6 +173,17 @@ pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
     justified: types.Mini3SFCheckpoint,
     finalized: types.Mini3SFCheckpoint,
+
+    const Self = @This();
+    pub fn update(self: *Self, justified: types.Mini3SFCheckpoint, finalized: types.Mini3SFCheckpoint) void {
+        if (justified.slot > self.justified.slot) {
+            self.justified = justified;
+        }
+
+        if (finalized.slot > self.finalized.slot) {
+            self.finalized = finalized;
+        }
+    }
 };
 
 const VoteTracker = struct {
@@ -339,8 +350,6 @@ pub const ForkChoice = struct {
     }
 
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {
-        _ = state;
-
         const parent_root = block.parent_root;
         const slot = block.slot;
 
@@ -359,6 +368,11 @@ pub const ForkChoice = struct {
             if (is_finalized_descendant != true) {
                 return ForkChoiceError.NotFinalizedDesendant;
             }
+
+            // update the checkpoints
+            const justified = state.latest_justified;
+            const finalized = state.latest_finalized;
+            self.fcStore.update(justified, finalized);
 
             var block_root: [32]u8 = undefined;
             try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
