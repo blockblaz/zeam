@@ -171,8 +171,8 @@ const OnBlockOpts = struct {
 
 pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
-    finalizedSlot: types.Slot,
-    finalizedRoot: types.Root,
+    justified: types.Mini3SFCheckpoint,
+    finalized: types.Mini3SFCheckpoint,
 };
 
 const VoteTracker = struct {
@@ -199,28 +199,29 @@ pub const ForkChoice = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
-        const finalized_header = try stf.genStateBlockHeader(allocator, anchorState);
-        var finalized_root: [32]u8 = undefined;
+        const anchor_block_header = try stf.genStateBlockHeader(allocator, anchorState);
+        var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
             types.BeamBlockHeader,
-            finalized_header,
-            &finalized_root,
+            anchor_block_header,
+            &anchor_block_root,
             allocator,
         );
 
         const anchor_block = ProtoBlock{
             .slot = anchorState.slot,
-            .blockRoot = finalized_root,
-            .parentRoot = finalized_header.parent_root,
-            .stateRoot = finalized_header.state_root,
-            .targetRoot = finalized_root,
+            .blockRoot = anchor_block_root,
+            .parentRoot = anchor_block_header.parent_root,
+            .stateRoot = anchor_block_header.state_root,
+            .targetRoot = anchor_block_root,
             .timeliness = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
+        const anchorCP = types.Mini3SFCheckpoint{ .slot = anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
             .currentSlot = anchorState.slot,
-            .finalizedSlot = anchorState.slot,
-            .finalizedRoot = finalized_root,
+            .justified = anchorCP,
+            .finalized = anchorCP,
         };
         const votes = std.AutoHashMap(usize, VoteTracker).init(allocator);
         const deltas = std.ArrayList(isize).init(allocator);
@@ -246,8 +247,8 @@ pub const ForkChoice = struct {
     }
 
     fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
-        const finalized_slot = self.fcStore.finalizedSlot;
-        const finalized_root = self.fcStore.finalizedRoot;
+        const finalized_slot = self.fcStore.finalized.slot;
+        const finalized_root = self.fcStore.finalized.root;
 
         var searched_idx_or_null = self.protoArray.indices.get(blockRoot);
 
@@ -342,7 +343,7 @@ pub const ForkChoice = struct {
 
             if (slot > self.fcStore.currentSlot) {
                 return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.finalizedSlot) {
+            } else if (slot < self.fcStore.finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -394,9 +395,9 @@ test "forkchoice block tree" {
     var beam_state = mock_chain.genesis_state;
     var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state);
 
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalizedRoot, &mock_chain.blockRoots[0]));
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalizedRoot, &fork_choice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
