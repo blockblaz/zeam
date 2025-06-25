@@ -110,7 +110,7 @@ pub const ProtoArray = struct {
             return ForkChoiceError.InvalidDeltas;
         }
 
-        // iterate backwards aaapply deltas and propagating deltas to parents
+        // iterate backwards apply deltas and propagating deltas to parents
         for (0..self.nodes.items.len) |i| {
             const node_idx = self.nodes.items.len - 1 - i;
             const node_delta = deltas[node_idx];
@@ -120,7 +120,7 @@ pub const ProtoArray = struct {
             }
         }
 
-        // re-iterate backwards and calc best child and decendant
+        // re-iterate backwards and calc best child and descendant
         // there seems to be no filter block tree in the mini3sf fc
         for (0..self.nodes.items.len) |i| {
             const node_idx = self.nodes.items.len - 1 - i;
@@ -131,7 +131,7 @@ pub const ProtoArray = struct {
                 var updateBest = false;
 
                 if (parent.bestChild == node_idx) {
-                    // check if bestdecendant needs to be updated even if best child is same
+                    // check if bestDescendant needs to be updated even if best child is same
                     if (parent.bestDescendant != node.bestDescendant) {
                         updateBest = true;
                     }
@@ -323,7 +323,7 @@ pub const ForkChoice = struct {
 
         try self.protoArray.applyDeltas(self.deltas.items);
 
-        // head is the best decendant of latest justified
+        // head is the best descendant of latest justified
         const justified_idx = self.protoArray.indices.get(self.fcStore.justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
         const justified_node = self.protoArray.nodes.items[justified_idx];
 

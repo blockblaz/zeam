@@ -45,7 +45,7 @@ pub const BeamChain = struct {
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
 
-    // import block assuming its validated
+    // import block assuming it is validated
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         // 1. get parent state
         const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
@@ -80,7 +80,7 @@ pub const BeamChain = struct {
 
 const BlockProcessingError = error{MissingPreState};
 
-test "build mock chain" {
+test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
