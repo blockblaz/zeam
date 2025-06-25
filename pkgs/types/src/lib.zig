@@ -128,8 +128,8 @@ pub const BeamSTFProverInput = struct {
     state: BeamState,
 };
 
-// a super hacky cloning utility for ssz - replace by a better mechanis
-// should be upstreated into the ssz lib even with a proper impl
+// TODO: a super hacky cloning utility for ssz container structs
+// replace by a better mechanisms which could be upstreated into the ssz lib as well
 pub fn sszClone(allocator: Allocator, comptime T: type, data: T) !T {
     var bytes = std.ArrayList(u8).init(std.testing.allocator);
     defer bytes.deinit();
