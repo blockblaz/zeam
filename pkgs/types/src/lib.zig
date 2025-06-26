@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
@@ -126,6 +127,18 @@ pub const BeamSTFProverInput = struct {
     block: SignedBeamBlock,
     state: BeamState,
 };
+
+// TODO: a super hacky cloning utility for ssz container structs
+// replace by a better mechanisms which could be upstreated into the ssz lib as well
+pub fn sszClone(allocator: Allocator, comptime T: type, data: T) !T {
+    var bytes = std.ArrayList(u8).init(std.testing.allocator);
+    defer bytes.deinit();
+
+    try ssz.serialize(T, data, &bytes);
+    var cloned: T = undefined;
+    try ssz.deserialize(T, bytes.items[0..], &cloned, allocator);
+    return cloned;
+}
 
 test "ssz import" {
     const data: u16 = 0x5566;

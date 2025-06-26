@@ -18,7 +18,7 @@ pub fn log(comptime scope: @Type(.enum_literal), activeLevel: std.log.Level, com
 
     if (builtin.target.os.tag == .freestanding) {
         const io = @import("zkvm").io;
-        var buf: [2048]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         // TODO don't throw error because it somehow messes with creation of  noopLogger as noopLog
         // doesn't throw and somehow it can't seem to infer error types as they might not be same
         // across all log fns, figure out in a later PR
