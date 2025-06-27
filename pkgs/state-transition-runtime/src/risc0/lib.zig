@@ -28,3 +28,55 @@ pub fn get_input(allocator: std.mem.Allocator) []const u8 {
 pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
     allocator.free(input);
 }
+
+const MAX_SHA_COMPRESS_BLOCKS: usize = 1000;
+pub const DIGEST_WORDS: usize = 8;
+pub const DIGEST_BYTES: usize = @sizeOf(u32) * DIGEST_WORDS;
+
+// TODO check alignment
+fn sys_sha_buffer(out_state: *[32]u8, in_state: *[32]u8, buf: *const u8, count: u32) void {
+    var ptr = buf;
+    var in = in_state;
+    while (count > 0) {
+        const n = @min(count, MAX_SHA_COMPRESS_BLOCKS);
+        asm volatile ("ecall"
+            :
+            : [scallnum] "{t0}" (@intFromEnum(syscalls.sha)),
+              [outstate] "{a0}" (out_state),
+              [instate] "{a1}" (in),
+              [buf] "{a2}" (buf),
+              [bufend] "{a3}" (ptr + DIGEST_BYTES),
+              [n] "{a4}" (n),
+        );
+        count -= n;
+        ptr += (2 * DIGEST_BYTES * count);
+        in = out_state;
+    }
+}
+
+fn sys_poseidon2(state_addr: *[8]u32, in_buf_addr: *const u8, out_buf_addr: *[8]u32, bits_count: u32) void {
+    _ = state_addr;
+    _ = in_buf_addr;
+    _ = out_buf_addr;
+    _ = bits_count;
+    // std.debug.assert(@intFromPtr(state_addr) % WORD_SIZE == 0);
+    // std.debug.assert!(@intFromPtr(in_buf_addr) % WORD_SIZE == 0);
+    // std.debug.assert!(@intFromPtr(out_buf_addr) % WORD_SIZE == 0);
+
+    // asm volatile ("ecall"
+    //     :
+    //     : [scallnum] "{t0}" (@intFromEnum(syscalls.poseidon2)),
+    //       [outstate] "{a0}" (out_state),
+    //       [instate] "{a1}" (in),
+    //       [buf] "{a2}" (buf),
+    //       [bufend] "{a3}" (ptr + DIGEST_BYTES),
+    //       [n] "{a4}" (n),
+    // );
+    // ecall_3(
+    //     ecall::POSEIDON2,
+    //     state_addr as u32 / WORD_SIZE as u32,
+    //     in_buf_addr as u32 / WORD_SIZE as u32,
+    //     out_buf_addr as u32 / WORD_SIZE as u32,
+    //     bits_count,
+    // );
+}
