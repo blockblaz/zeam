@@ -1,0 +1,3 @@
+pub const INPUT_ADDR = 0x90000000;
+pub const INPUT_SIZE = 0x08000000;
+pub const UART_ADDR = 0xA000_0200;
