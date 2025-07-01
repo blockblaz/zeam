@@ -14,7 +14,7 @@ pub fn print_str(str: []const u8) void {
         : [ret] "=r" (-> usize),
     );
     var addr: [*]volatile u8 = if (arch_id_zisk == 0xFFFEEE) @ptrFromInt(0x1000_0000) else @ptrFromInt(mem_layout.UART_ADDR);
-    for (str, 0..) |c, i| {
-        addr[i] = c;
+    for (str) |c| {
+        addr[0] = c;
     }
 }
