@@ -7,6 +7,7 @@ const configs = @import("@zeam/configs");
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
+pub const networkFactory = @import("./network.zig");
 
 // TODO: find a in mem level db for this
 const LevelDB = struct {};
@@ -20,6 +21,7 @@ const NodeOpts = struct {
 pub const BeamNode = struct {
     clock: clockFactory.Clock,
     chain: chainFactory.BeamChain,
+    network: networkFactory.Network,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -31,6 +33,7 @@ pub const BeamNode = struct {
         return Self{
             .clock = clock,
             .chain = chain,
+            .network = networkFactory.default_network,
         };
     }
 

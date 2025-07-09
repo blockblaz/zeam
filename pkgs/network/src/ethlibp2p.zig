@@ -1,7 +1,7 @@
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-pub const Mock = struct {
+pub const EthLibp2p = struct {
     const Self = @This();
 
     pub fn init() Self {
