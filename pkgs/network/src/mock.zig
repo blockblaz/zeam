@@ -1,3 +1,4 @@
+const std = @import("std");
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
@@ -12,6 +13,13 @@ pub const Mock = struct {
         _ = ptr;
         _ = T;
         _ = obj;
+    }
+
+    pub fn subscribe(ptr: *anyopaque, topic: []const u8, handler: *anyopaque) anyerror!void {
+        // std.debug.print("TTTTTTTTTTTTTTTTTT = {any} handler={any} \n", .{ topic, handler });
+        _ = ptr;
+        _ = topic;
+        _ = handler;
     }
 
     pub fn onGossip(ptr: *anyopaque, data: []const u8) anyerror!void {
@@ -34,6 +42,7 @@ pub const Mock = struct {
         return .{ .gossip = .{
             .ptr = self,
             .publishFn = publish,
+            .subscribeFn = subscribe,
             .onGossipFn = onGossip,
         }, .reqresp = .{
             .ptr = self,

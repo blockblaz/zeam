@@ -14,6 +14,12 @@ pub const EthLibp2p = struct {
         _ = obj;
     }
 
+    pub fn subscribe(ptr: *anyopaque, topic: []const u8, hander: *anyopaque) anyerror!void {
+        _ = ptr;
+        _ = topic;
+        _ = hander;
+    }
+
     pub fn onGossip(ptr: *anyopaque, data: []const u8) anyerror!void {
         _ = ptr;
         _ = data;

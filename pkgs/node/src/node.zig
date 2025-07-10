@@ -39,5 +39,7 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         try self.clock.run();
+        // just subscribe to the block topic for now
+        try self.network.backend.gossip.subscribe("block", self);
     }
 };
