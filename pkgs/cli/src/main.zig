@@ -102,7 +102,7 @@ pub fn main() !void {
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
             var beam_node = try BeamNode.init(gpa.allocator(), .{ .config = chain_config, .anchorState = anchorState, .db = .{} });
-            std.debug.print("chainoptionsinfo={any}\n", .{beam_node});
+            std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
 
             try beam_node.run();
         },
