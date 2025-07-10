@@ -4,7 +4,7 @@ const mem_layout = @import("./layout.zig");
 var input_ptr: [*]const u8 = @ptrFromInt(mem_layout.INPUT_ADDR);
 
 pub fn get_input(_: std.mem.Allocator) []const u8 {
-    const input_size = std.mem.readInt(u64, input_ptr[0..8], .little);
+    const input_size = std.mem.readInt(u64, input_ptr[8..16], .little);
     if (input_size > mem_layout.INPUT_SIZE) @panic("invalid input size");
     return input_ptr[8 .. 8 + input_size];
 }

@@ -11,4 +11,4 @@ _start:
     lla sp, _init_stack_top
 
     // "tail-call" to {entry}
-    call main
+    tail main
