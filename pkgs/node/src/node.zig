@@ -47,7 +47,7 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: []const u8) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *networks.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         try self.chain.onGossip(data);
@@ -62,7 +62,8 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         const handler = try self.getOnGossipCbHandler();
-        try self.network.backend.gossip.subscribe("block", handler);
+        var topics = [_]networks.GossipTopic{.block};
+        try self.network.backend.gossip.subscribe(&topics, handler);
 
         // this is a blocking run
         try self.clock.run();

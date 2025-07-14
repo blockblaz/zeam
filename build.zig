@@ -111,6 +111,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/network/src/lib.zig"),
     });
+    zeam_network.addImport("@zeam/types", zeam_types);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{

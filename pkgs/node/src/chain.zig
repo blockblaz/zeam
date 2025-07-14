@@ -6,6 +6,7 @@ const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
+const networks = @import("@zeam/network");
 
 const utils = @import("./utils.zig");
 const OnSlotCbWrapper = utils.OnSlotCbWrapper;
@@ -45,9 +46,9 @@ pub const BeamChain = struct {
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
 
-    pub fn onGossip(self: *Self, data: []const u8) !void {
+    pub fn onGossip(self: *Self, data: *networks.GossipMessage) !void {
         _ = self;
-        std.debug.print("chain received onGossip cb at slot={s}\n", .{data});
+        std.debug.print("chain received onGossip cb at slot={any}\n", .{data});
     }
 
     // import block assuming it is validated
