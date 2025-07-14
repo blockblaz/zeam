@@ -45,6 +45,11 @@ pub const BeamChain = struct {
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
 
+    pub fn onGossip(self: *Self, data: []const u8) !void {
+        _ = self;
+        std.debug.print("chain received onGossip cb at slot={s}\n", .{data});
+    }
+
     // import block assuming it is validated
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         // 1. get parent state
