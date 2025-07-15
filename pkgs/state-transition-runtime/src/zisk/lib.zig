@@ -1,12 +1,13 @@
 const std = @import("std");
 pub const io = @import("./io.zig");
 pub const get_input = io.get_input;
+pub const MARCHID_ZISK = 0xFFFEEE;
 
 pub fn halt(_: u32) noreturn {
     const arch_id_zisk = asm volatile ("csrr %[ret], marchid"
         : [ret] "=r" (-> usize),
     );
-    if (arch_id_zisk == 0xFFFEEE) {
+    if (arch_id_zisk == MARCHID_ZISK) {
         // Zisk exit
         asm volatile (
             \\ li a7, 93
