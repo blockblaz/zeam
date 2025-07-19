@@ -30,7 +30,7 @@ pub const BeamNode = struct {
         var clock = try clockFactory.Clock.init(allocator, opts.config.genesis.genesis_time);
         var chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
 
-        var mock_network: networks.Mock = networks.Mock.init(allocator);
+        var mock_network: networks.Mock = try networks.Mock.init(allocator);
         const backend = mock_network.getNetworkInterface();
         std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
 

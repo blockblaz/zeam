@@ -7,13 +7,17 @@ const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
 pub const Mock = struct {
-    onGossipHandlers: std.ArrayList(interface.OnGossipCbHandler),
+    onGossipHandlers: std.AutoHashMap(interface.GossipTopic, std.ArrayList(interface.OnGossipCbHandler)),
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator) Self {
+    pub fn init(allocator: Allocator) !Self {
+        var onGossipHandlers = std.AutoHashMap(interface.GossipTopic, std.ArrayList(interface.OnGossipCbHandler)).init(allocator);
+        for (std.enums.values(interface.GossipTopic)) |topic| {
+            try onGossipHandlers.put(topic, std.ArrayList(interface.OnGossipCbHandler).init(allocator));
+        }
         return Self{
-            .onGossipHandlers = std.ArrayList(interface.OnGossipCbHandler).init(allocator),
+            .onGossipHandlers = onGossipHandlers,
         };
     }
 
@@ -25,9 +29,12 @@ pub const Mock = struct {
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // TODO onGossipHandlers should be map from topics to handler
-        _ = topics;
-        try self.onGossipHandlers.append(handler);
+        for (topics) |topic| {
+            // handlerarr should already be there
+            var handlerArr = self.onGossipHandlers.get(topic).?;
+            try handlerArr.append(handler);
+            try self.onGossipHandlers.put(topic, handlerArr);
+        }
 
         // TODO: try to check the callback too remove it later
         const signed_block = types.SignedBeamBlock{
@@ -47,7 +54,10 @@ pub const Mock = struct {
     pub fn onGossip(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        for (self.onGossipHandlers.items) |handler| {
+        const topic = interface.GossipTopic.block;
+        const handlerArr = self.onGossipHandlers.get(topic).?;
+        std.debug.print("\n\n\n ongossip handlerarr {any} for topic {any}\n", .{ handlerArr.items, topic });
+        for (handlerArr.items) |handler| {
             try handler.onGossip(data);
         }
     }
