@@ -105,6 +105,14 @@ pub fn build(b: *Builder) !void {
     });
     b.installArtifact(st_lib);
 
+    // add network
+    const zeam_network = b.addModule("@zeam/network", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/network/src/lib.zig"),
+    });
+    zeam_network.addImport("@zeam/types", zeam_types);
+
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
         .target = target,
@@ -118,6 +126,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/types", zeam_types);
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_beam_node.addImport("@zeam/network", zeam_network);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -136,6 +145,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/configs", zeam_configs);
     cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
+    cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
 
     addZkvmGlueLibs(b, cli_exe);
