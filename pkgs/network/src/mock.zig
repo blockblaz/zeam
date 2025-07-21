@@ -54,7 +54,7 @@ pub const Mock = struct {
     pub fn onGossip(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        const topic = interface.GossipTopic.block;
+        const topic = data.getTopic();
         const handlerArr = self.onGossipHandlers.get(topic).?;
         std.debug.print("\n\n\n ongossip handlerarr {any} for topic {any}\n", .{ handlerArr.items, topic });
         for (handlerArr.items) |handler| {
