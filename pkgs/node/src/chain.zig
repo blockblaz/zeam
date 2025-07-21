@@ -35,13 +35,28 @@ pub const BeamChain = struct {
         };
     }
 
-    fn onSlot(ptr: *anyopaque, slot: isize) !void {
-        // demonstrate how to call retrive this struct
+    fn onSlot(ptr: *anyopaque, islot: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        const slot: usize = @intCast(islot);
+
+        // see if you need to product block before you tick the slot to get correct canonical head
+        // ideally this section should be called an interval before the slot is ticked
+        self.prepareNextSlot(slot);
+
+        self.tickSlot(slot);
         self.printSlot(slot);
     }
 
-    fn printSlot(self: *Self, slot: isize) void {
+    fn prepareNextSlot(self: *Self, nextSlot: usize) void {
+        _ = self;
+        _ = nextSlot;
+    }
+
+    fn tickSlot(self: *Self, slot: usize) void {
+        self.forkChoice.tickSlot(slot);
+    }
+
+    fn printSlot(self: *Self, slot: usize) void {
         _ = self;
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
