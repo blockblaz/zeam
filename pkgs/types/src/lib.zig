@@ -128,6 +128,9 @@ pub const BeamSTFProverInput = struct {
     state: BeamState,
 };
 
+// some p2p containers
+pub const BlockByRootRequest = struct { roots: []Root };
+
 // TODO: a super hacky cloning utility for ssz container structs
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
 pub fn sszClone(allocator: Allocator, comptime T: type, data: T) !T {

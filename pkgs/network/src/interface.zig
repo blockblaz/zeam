@@ -15,8 +15,8 @@ pub const GossipSub = struct {
 pub const ReqResp = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    reqRespFn: *const fn (ptr: *anyopaque, obj: *anyopaque) anyerror!void,
-    onReqFn: *const fn (ptr: *anyopaque, data: []const u8) anyerror!void,
+    reqRespFn: *const fn (ptr: *anyopaque, obj: *ReqRespRequest) anyerror!void,
+    onReqFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!void,
 };
 
 pub const NetworkInterface = struct {
@@ -48,4 +48,11 @@ pub const GossipMessage = union(GossipTopic) {
             .block => return .block,
         }
     }
+};
+
+pub const ReqRespMethod = enum {
+    block_by_root,
+};
+pub const ReqRespRequest = union(ReqRespMethod) {
+    block_by_root: types.BlockByRootRequest,
 };

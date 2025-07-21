@@ -23,7 +23,6 @@ pub const Mock = struct {
 
     pub fn publish(ptr: *anyopaque, obj: *interface.GossipMessage) anyerror!void {
         _ = ptr;
-        // _ = T;
         _ = obj;
     }
 
@@ -62,13 +61,12 @@ pub const Mock = struct {
         }
     }
 
-    pub fn reqResp(ptr: *anyopaque, obj: *anyopaque) anyerror!void {
+    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
         _ = ptr;
-        // _ = T;
         _ = obj;
     }
 
-    pub fn onReq(ptr: *anyopaque, data: []const u8) anyerror!void {
+    pub fn onReq(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!void {
         _ = ptr;
         _ = data;
     }

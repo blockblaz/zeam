@@ -8,30 +8,28 @@ pub const EthLibp2p = struct {
         return Self{};
     }
 
-    pub fn publish(ptr: *anyopaque, comptime T: type, obj: *anyopaque) anyerror!void {
+    pub fn publish(ptr: *anyopaque, obj: *interface.GossipMessage) anyerror!void {
         _ = ptr;
-        _ = T;
         _ = obj;
     }
 
-    pub fn subscribe(ptr: *anyopaque, topic: []const u8, hander: *anyopaque) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
         _ = ptr;
-        _ = topic;
-        _ = hander;
+        _ = topics;
+        _ = handler;
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: []const u8) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
         _ = ptr;
         _ = data;
     }
 
-    pub fn reqResp(ptr: *anyopaque, comptime T: type, obj: *anyopaque) anyerror!void {
+    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
         _ = ptr;
-        _ = T;
         _ = obj;
     }
 
-    pub fn onReq(ptr: *anyopaque, data: []const u8) anyerror!void {
+    pub fn onReq(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!void {
         _ = ptr;
         _ = data;
     }
