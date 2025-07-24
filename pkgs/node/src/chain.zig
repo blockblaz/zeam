@@ -8,9 +8,6 @@ const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 
-const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
-
 pub const fcFactory = @import("./forkchoice.zig");
 
 pub const BeamChain = struct {
@@ -35,25 +32,27 @@ pub const BeamChain = struct {
         };
     }
 
-    fn onSlot(ptr: *anyopaque, islot: isize) !void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        const slot: usize = @intCast(islot);
-
+    pub fn onSlot(self: *Self, slot: usize) !void {
         // see if you need to product block before you tick the slot to get correct canonical head
         // ideally this section should be called an interval before the slot is ticked
         self.prepareNextSlot(slot);
-
         self.tickSlot(slot);
-        self.printSlot(slot);
     }
 
     fn prepareNextSlot(self: *Self, nextSlot: usize) void {
+        // nothing to prep for now
         _ = self;
         _ = nextSlot;
     }
 
     fn tickSlot(self: *Self, slot: usize) void {
         self.forkChoice.tickSlot(slot);
+        self.printSlot(slot);
+    }
+
+    pub fn produceBlock(self: *Self) !types.BeamBlock {
+        _ = self;
+        return BlockProductionError.NotImplemented;
     }
 
     fn printSlot(self: *Self, slot: usize) void {
@@ -86,20 +85,10 @@ pub const BeamChain = struct {
         // 3. fc update head
         _ = try self.forkChoice.updateHead();
     }
-
-    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
-        // need a stable pointer across threads
-        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
-        cb_ptr.* = .{
-            .ptr = self,
-            .onSlotCb = onSlot,
-        };
-
-        return cb_ptr;
-    }
 };
 
 const BlockProcessingError = error{MissingPreState};
+const BlockProductionError = error{NotImplemented};
 
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
