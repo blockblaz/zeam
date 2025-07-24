@@ -78,6 +78,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var head_idx: usize = 0;
     try headList.append(.{ .root = block_root, .slot = head_idx });
 
+    var logger = getLogger();
+    logger.setActiveLevel(.info);
+
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, prev_block, &parent_root, allocator);
@@ -160,15 +163,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         };
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
-        try transition.process_slots(allocator, &beam_state, block.slot);
-        // process block and modify the pre state to post state
-        var logger = getLogger();
-        logger.setActiveLevel(.info);
-        try transition.process_block(allocator, &beam_state, block, &logger);
-
-        // extract the post state root
-        try ssz.hashTreeRoot(types.BeamState, beam_state, &state_root, allocator);
-        block.state_root = state_root;
+        try transition.apply_raw_block(allocator, &beam_state, &block, &logger);
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list

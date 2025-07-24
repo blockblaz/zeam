@@ -241,6 +241,20 @@ pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types
     try process_operations(allocator, state, block, logger);
 }
 
+pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+    // prepare pre state to process block for that slot, may be rename prepare_pre_state
+    try process_slots(allocator, state, block.slot);
+
+    // process block and modify the pre state to post state
+    try process_block(allocator, state, block.*, logger);
+
+    logger.debug("extracting state root\n", .{});
+    // extract the post state root
+    var state_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+    block.state_root = state_root;
+}
+
 // fill this up when we have signature scheme
 pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
     _ = signedBlock;

@@ -98,11 +98,23 @@ pub fn main() !void {
                 .allocate = .alloc_if_needed,
             };
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
-            chain_options.genesis_time = genesis;
+
+            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
+
+            chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
-            var beam_node = try BeamNode.init(gpa.allocator(), .{ .config = chain_config, .anchorState = anchorState, .db = .{} });
+
+            var validator_ids = [_]usize{1};
+            var beam_node = try BeamNode.init(gpa.allocator(), .{
+                // options
+                .config = chain_config,
+                .anchorState = anchorState,
+                .db = .{},
+                .validator_ids = &validator_ids,
+            });
             std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
 
             try beam_node.run();

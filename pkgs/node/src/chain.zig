@@ -7,11 +7,17 @@ const types = @import("@zeam/types");
 const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
+const params = @import("@zeam/params");
 
-const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+const zeam_utils = @import("@zeam/utils");
+const getLogger = zeam_utils.getLogger;
 
 pub const fcFactory = @import("./forkchoice.zig");
+
+pub const BlockProductionOpts = struct {
+    slot: usize,
+    proposer_index: usize,
+};
 
 pub const BeamChain = struct {
     config: configs.ChainConfig,
@@ -35,13 +41,62 @@ pub const BeamChain = struct {
         };
     }
 
-    fn onSlot(ptr: *anyopaque, slot: isize) !void {
-        // demonstrate how to call retrive this struct
-        const self: *Self = @ptrCast(@alignCast(ptr));
+    pub fn onSlot(self: *Self, slot: usize) !void {
+        // see if you need to product block before you tick the slot to get correct canonical head
+        // ideally this section should be called an interval before the slot is ticked
+        self.prepareNextSlot(slot);
+        self.tickSlot(slot);
+    }
+
+    fn prepareNextSlot(self: *Self, nextSlot: usize) void {
+        // nothing to prep for now
+        _ = self;
+        _ = nextSlot;
+    }
+
+    fn tickSlot(self: *Self, slot: usize) void {
+        self.forkChoice.tickSlot(slot);
         self.printSlot(slot);
     }
 
-    fn printSlot(self: *Self, slot: isize) void {
+    pub fn produceBlock(self: *Self, opts: BlockProductionOpts) !types.BeamBlock {
+        const chainHead = try self.forkChoice.updateHead();
+        const parent_root = chainHead.blockRoot;
+
+        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+
+        const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
+
+        const votes = [_]types.Mini3SFVote{};
+        var block = types.BeamBlock{
+            .slot = opts.slot,
+            .proposer_index = opts.proposer_index,
+            .parent_root = parent_root,
+            .state_root = undefined,
+            .body = types.BeamBlockBody{
+                .execution_payload_header = .{ .timestamp = timestamp },
+                .votes = &votes,
+            },
+        };
+
+        std.debug.print("\n\n\n going for block production opts={any} raw block={any}\n\n", .{ opts, block });
+
+        // 2. apply STF to get post state
+        var logger = getLogger();
+        logger.setActiveLevel(.debug);
+        try stf.apply_raw_block(self.allocator, &post_state, &block, &logger);
+
+        std.debug.print("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
+
+        // 3. fc onblock
+        const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
+        try self.states.put(fcBlock.blockRoot, post_state);
+
+        return block;
+    }
+
+    fn printSlot(self: *Self, slot: usize) void {
         _ = self;
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
@@ -71,20 +126,10 @@ pub const BeamChain = struct {
         // 3. fc update head
         _ = try self.forkChoice.updateHead();
     }
-
-    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
-        // need a stable pointer across threads
-        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
-        cb_ptr.* = .{
-            .ptr = self,
-            .onSlotCb = onSlot,
-        };
-
-        return cb_ptr;
-    }
 };
 
 const BlockProcessingError = error{MissingPreState};
+const BlockProductionError = error{ NotImplemented, MissingPreState };
 
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
