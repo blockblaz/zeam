@@ -242,15 +242,13 @@ pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types
 }
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
-    logger.info("nprocess slots\n", .{});
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
     try process_slots(allocator, state, block.slot);
 
-    logger.info("nprocess block\n", .{});
     // process block and modify the pre state to post state
     try process_block(allocator, state, block.*, logger);
 
-    logger.info("nprocess state root\n", .{});
+    logger.debug("extracting state root\n", .{});
     // extract the post state root
     var state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);

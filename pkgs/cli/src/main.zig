@@ -98,7 +98,11 @@ pub fn main() !void {
                 .allocate = .alloc_if_needed,
             };
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
-            chain_options.genesis_time = genesis;
+
+            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
+
+            chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
