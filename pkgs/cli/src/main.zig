@@ -102,10 +102,14 @@ pub fn main() !void {
             chain_options.num_validators = num_validators;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
+
+            var validator_ids = [_]usize{1};
             var beam_node = try BeamNode.init(gpa.allocator(), .{
+                // options
                 .config = chain_config,
                 .anchorState = anchorState,
                 .db = .{},
+                .validator_ids = &validator_ids,
             });
             std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
 
