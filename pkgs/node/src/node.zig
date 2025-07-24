@@ -12,6 +12,7 @@ const OnSlotCbWrapper = utils.OnSlotCbWrapper;
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
+pub const validators = @import("./validator.zig");
 
 // TODO: find a in mem level db for this
 const LevelDB = struct {};
@@ -20,6 +21,7 @@ const NodeOpts = struct {
     config: configs.ChainConfig,
     anchorState: types.BeamState,
     db: LevelDB,
+    validator_ids: ?[]usize = null,
 };
 
 pub const BeamNode = struct {
@@ -27,6 +29,7 @@ pub const BeamNode = struct {
     clock: clockFactory.Clock,
     chain: chainFactory.BeamChain,
     network: networkFactory.Network,
+    validator: ?validators.BeamValidator = null,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -35,12 +38,22 @@ pub const BeamNode = struct {
         std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
 
         const network = networkFactory.Network.init(backend);
+        var validator: ?validators.BeamValidator = null;
+
+        // seems like how to declare a mutating chain but without mutating in this particular scope
+        // if it were cost it somehow causes memory issues
+        var chain: chainFactory.BeamChain = undefined;
+        chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
+        if (opts.validator_ids) |ids| {
+            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network });
+        }
 
         return Self{
             .allocator = allocator,
             .clock = try clockFactory.Clock.init(allocator, opts.config.genesis.genesis_time),
-            .chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState),
+            .chain = chain,
             .network = network,
+            .validator = validator,
         };
     }
 
@@ -73,10 +86,9 @@ pub const BeamNode = struct {
         const slot: usize = @intCast(islot);
 
         try self.chain.onSlot(slot);
-    }
-
-    pub fn publish(self: *Self, data: *networks.GossipMessage) !void {
-        return self.network.publish(data);
+        if (self.validator) |*validator| {
+            try validator.onSlot(slot);
+        }
     }
 
     pub fn run(self: *Self) !void {
