@@ -7,8 +7,17 @@ const types = @import("@zeam/types");
 const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
+const params = @import("@zeam/params");
+
+const zeam_utils = @import("@zeam/utils");
+const getLogger = zeam_utils.getLogger;
 
 pub const fcFactory = @import("./forkchoice.zig");
+
+pub const BlockProductionOpts = struct {
+    slot: usize,
+    proposer_index: usize,
+};
 
 pub const BeamChain = struct {
     config: configs.ChainConfig,
@@ -50,15 +59,41 @@ pub const BeamChain = struct {
         self.printSlot(slot);
     }
 
-    pub fn produceBlock(self: *Self, slot: usize) !types.BeamBlock {
-        _ = self;
-        return .{
-            .slot = slot,
-            .proposer_index = 3,
-            .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
-            .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{ .execution_payload_header = types.ExecutionPayloadHeader{ .timestamp = 23 }, .votes = &[_]types.Mini3SFVote{} },
+    pub fn produceBlock(self: *Self, opts: BlockProductionOpts) !types.BeamBlock {
+        const chainHead = try self.forkChoice.updateHead();
+        const parent_root = chainHead.blockRoot;
+
+        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+
+        const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
+
+        const votes = [_]types.Mini3SFVote{};
+        var block = types.BeamBlock{
+            .slot = opts.slot,
+            .proposer_index = opts.proposer_index,
+            .parent_root = parent_root,
+            .state_root = undefined,
+            .body = types.BeamBlockBody{
+                .execution_payload_header = .{ .timestamp = timestamp },
+                .votes = &votes,
+            },
         };
+
+        std.debug.print("\n\n\n going for block production opts={any} raw block={any}\n\n", .{ opts, block });
+
+        // 2. apply STF to get post state
+        var logger = getLogger();
+        logger.setActiveLevel(.debug);
+        try stf.apply_raw_block(self.allocator, &post_state, &block, &logger);
+
+        std.debug.print("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
+
+        // 3. fc onblock
+        const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
+        try self.states.put(fcBlock.blockRoot, post_state);
+
+        return block;
     }
 
     fn printSlot(self: *Self, slot: usize) void {
@@ -94,7 +129,7 @@ pub const BeamChain = struct {
 };
 
 const BlockProcessingError = error{MissingPreState};
-const BlockProductionError = error{NotImplemented};
+const BlockProductionError = error{ NotImplemented, MissingPreState };
 
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);

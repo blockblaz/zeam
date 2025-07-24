@@ -9,8 +9,8 @@ pub usingnamespace utils;
 
 const transition = @import("./transition.zig");
 
-pub const process_slots = transition.process_slot;
 pub const apply_transition = transition.apply_transition;
+pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
 

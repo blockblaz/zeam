@@ -31,10 +31,14 @@ pub const BeamValidator = struct {
         const num_validators: usize = @intCast(self.config.genesis.num_validators);
 
         // check for block production
-        const block_producer_id = slot % num_validators;
-        if (std.mem.indexOfScalar(usize, self.opts.ids, block_producer_id)) |index| {
+        const slot_proposer_id = slot % num_validators;
+        if (std.mem.indexOfScalar(usize, self.opts.ids, slot_proposer_id)) |index| {
             _ = index;
-            const block = try self.opts.chain.produceBlock(slot);
+            std.debug.print("\n\n\n going for block production slot={any} proposer={any}\n\n", .{ slot, slot_proposer_id });
+            const block = self.opts.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id }) catch |err| {
+                std.debug.print("\n\n\n block production error = {any}\n\n", .{err});
+                @panic("block production error");
+            };
             const signed_block = types.SignedBeamBlock{
                 .message = block,
                 .signature = [_]u8{0} ** 48,
