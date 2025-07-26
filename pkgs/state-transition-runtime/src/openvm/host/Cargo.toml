@@ -1,0 +1,22 @@
+[package]
+name = "zeam-prover-host-openvm"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+
+[dependencies]
+# serde = { version = "1.0", default-features = false, features = [
+#   "alloc",
+#   "derive",
+#   "rc",
+# ] }
+# env_logger = "0.10.2"
+# log = "0.4.17"
+openvm = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0", features = ["std"] }
+
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
