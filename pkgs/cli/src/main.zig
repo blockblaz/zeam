@@ -108,7 +108,7 @@ pub fn main() !void {
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             var validator_ids = [_]usize{1};
-            var beam_node = try BeamNode.init(gpa.allocator(), .{
+            var beam_node = try BeamNode.init(allocator, .{
                 // options
                 .config = chain_config,
                 .anchorState = anchorState,
@@ -117,7 +117,14 @@ pub fn main() !void {
             });
             std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
 
-            try beam_node.run();
+            for (1..4) |uslot| {
+                const slot: isize = @intCast(uslot);
+                try BeamNode.onSlot(&beam_node, slot);
+            }
+
+            std.debug.print("forkchoice={any}\n", .{beam_node.chain.forkChoice});
+
+            // try beam_node.run();
         },
     }
 }
