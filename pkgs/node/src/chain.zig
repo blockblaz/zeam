@@ -102,8 +102,21 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
-        _ = self;
-        std.debug.print("chain received onGossip cb at slot={any}\n", .{data});
+        switch (data.*) {
+            .block => |block| {
+                std.debug.print("chain received block onGossip cb at slot={any}\n", .{block});
+                var block_root: [32]u8 = undefined;
+                try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
+
+                //check if we have the block already in forkchoice
+                const hasBlock = self.forkChoice.hasBlock(block_root);
+                std.debug.print("blockroot={x} hasblock={any}\n", .{ block_root, hasBlock });
+                if (!hasBlock) {
+                    const hasParentBlock = self.forkChoice.hasBlock(block.message.parent_root);
+                    std.debug.print("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
+                }
+            },
+        }
     }
 
     // import block assuming it is validated

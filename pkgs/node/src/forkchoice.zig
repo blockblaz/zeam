@@ -396,6 +396,15 @@ pub const ForkChoice = struct {
             return ForkChoiceError.UnknownParent;
         }
     }
+
+    pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
+        const block_or_null = self.protoArray.getBlock(blockRoot);
+        if (block_or_null) |_| {
+            return true;
+        }
+
+        return false;
+    }
 };
 
 const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas, InvalidJustifiedRoot, InvalidBestDescendant };
