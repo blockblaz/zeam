@@ -33,7 +33,8 @@ pub const BeamNode = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
-        var mock_network: networks.Mock = try networks.Mock.init(allocator);
+        var mock_network: *networks.Mock = try allocator.create(networks.Mock);
+        mock_network.* = try networks.Mock.init(allocator);
         const backend = mock_network.getNetworkInterface();
         std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
 
