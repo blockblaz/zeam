@@ -27,7 +27,7 @@ const NodeOpts = struct {
 pub const BeamNode = struct {
     allocator: Allocator,
     clock: clockFactory.Clock,
-    chain: chainFactory.BeamChain,
+    chain: *chainFactory.BeamChain,
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
 
@@ -42,8 +42,8 @@ pub const BeamNode = struct {
 
         // seems like how to declare a mutating chain but without mutating in this particular scope
         // if it were cost it somehow causes memory issues
-        var chain: chainFactory.BeamChain = undefined;
-        chain = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
+        const chain = try allocator.create(chainFactory.BeamChain);
+        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
         if (opts.validator_ids) |ids| {
             validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network });
         }
@@ -81,12 +81,14 @@ pub const BeamNode = struct {
         return cb_ptr;
     }
 
-    fn onSlot(ptr: *anyopaque, islot: isize) !void {
+    pub fn onSlot(ptr: *anyopaque, islot: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const slot: usize = @intCast(islot);
 
         try self.chain.onSlot(slot);
+        // _ = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
         if (self.validator) |*validator| {
+            // _ = try validator.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
             try validator.onSlot(slot);
         }
     }
