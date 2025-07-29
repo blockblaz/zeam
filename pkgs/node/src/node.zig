@@ -21,13 +21,14 @@ const NodeOpts = struct {
     config: configs.ChainConfig,
     anchorState: types.BeamState,
     backend: networks.NetworkInterface,
+    clock: *clockFactory.Clock,
     db: LevelDB,
     validator_ids: ?[]usize = null,
 };
 
 pub const BeamNode = struct {
     allocator: Allocator,
-    clock: clockFactory.Clock,
+    clock: *clockFactory.Clock,
     chain: *chainFactory.BeamChain,
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
@@ -46,7 +47,7 @@ pub const BeamNode = struct {
 
         return Self{
             .allocator = allocator,
-            .clock = try clockFactory.Clock.init(allocator, opts.config.genesis.genesis_time),
+            .clock = opts.clock,
             .chain = chain,
             .network = network,
             .validator = validator,
@@ -96,8 +97,5 @@ pub const BeamNode = struct {
 
         const chainOnSlot = try self.getOnSlotCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
-
-        // this is a blocking run
-        try self.clock.run();
     }
 };

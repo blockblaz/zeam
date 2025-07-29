@@ -109,25 +109,32 @@ pub fn main() !void {
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
-            var validator_ids = [_]usize{1};
-
             var mock_network: *networks.Mock = try allocator.create(networks.Mock);
             mock_network.* = try networks.Mock.init(allocator);
             const backend = mock_network.getNetworkInterface();
             std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
 
-            var beam_node = try BeamNode.init(allocator, .{
+            var clock = try allocator.create(Clock);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time);
+
+            var validator_ids_1 = [_]usize{1};
+            // var validator_ids_2 = [_]usize{2};
+
+            var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
                 .config = chain_config,
                 .anchorState = anchorState,
                 .backend = backend,
+                .clock = clock,
                 .db = .{},
-                .validator_ids = &validator_ids,
+                .validator_ids = &validator_ids_1,
             });
-            std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
+            std.debug.print("chainoptionsinfo={any}\n", .{beam_node_1.chain});
 
-            try beam_node.run();
-            std.debug.print("forkchoice={any}\n", .{beam_node.chain.forkChoice});
+            try beam_node_1.run();
+            try clock.run();
+
+            std.debug.print("forkchoice={any}\n", .{beam_node_1.chain.forkChoice});
         },
     }
 }
