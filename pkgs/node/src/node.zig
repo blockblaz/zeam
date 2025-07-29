@@ -95,9 +95,9 @@ pub const BeamNode = struct {
     }
 
     pub fn run(self: *Self) !void {
-        // const handler = try self.getOnGossipCbHandler();
-        // var topics = [_]networks.GossipTopic{.block};
-        // try self.network.backend.gossip.subscribe(&topics, handler);
+        const handler = try self.getOnGossipCbHandler();
+        var topics = [_]networks.GossipTopic{.block};
+        try self.network.backend.gossip.subscribe(&topics, handler);
 
         const chainOnSlot = try self.getOnSlotCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
