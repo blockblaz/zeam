@@ -101,7 +101,7 @@ pub const BeamChain = struct {
         std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
     }
 
-    pub fn onGossip(self: *Self, data: *networks.GossipMessage) !void {
+    pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         _ = self;
         std.debug.print("chain received onGossip cb at slot={any}\n", .{data});
     }

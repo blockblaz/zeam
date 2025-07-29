@@ -13,4 +13,8 @@ pub const Network = struct {
     pub fn init(backend: networks.NetworkInterface) Self {
         return Self{ .backend = backend };
     }
+
+    pub fn publish(self: *Self, data: *const networks.GossipMessage) !void {
+        return self.backend.gossip.publish(data);
+    }
 };

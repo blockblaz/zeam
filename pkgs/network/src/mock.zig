@@ -21,7 +21,7 @@ pub const Mock = struct {
         };
     }
 
-    pub fn publish(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
         return Self.onGossip(ptr, data);
     }
@@ -36,7 +36,7 @@ pub const Mock = struct {
         }
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         const topic = data.getTopic();

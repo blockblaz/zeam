@@ -4,19 +4,21 @@ const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 
 const chains = @import("./chain.zig");
-const networks = @import("./network.zig");
+const networkFactory = @import("./network.zig");
+const networks = @import("@zeam/network");
 
 pub const ValidatorParams = struct {
     // could be keys when deposit mechanism is implemented
     ids: []usize,
     chain: *chains.BeamChain,
-    network: networks.Network,
+    network: networkFactory.Network,
 };
 
 pub const BeamValidator = struct {
     allocator: Allocator,
     config: configs.ChainConfig,
     chain: *chains.BeamChain,
+    network: networkFactory.Network,
     ids: []usize,
 
     const Self = @This();
@@ -25,6 +27,7 @@ pub const BeamValidator = struct {
             .allocator = allocator,
             .config = config,
             .chain = opts.chain,
+            .network = opts.network,
             .ids = opts.ids,
         };
     }
@@ -41,8 +44,9 @@ pub const BeamValidator = struct {
                 .message = block,
                 .signature = [_]u8{0} ** 48,
             };
-            std.debug.print("\n\n\n validator block production slot={any} block={any}\n\n\n", .{ slot, signed_block });
-            // try self.opts.network.publish(.{ .block = signed_block });
+            const signed_block_message = networks.GossipMessage{ .block = signed_block };
+            std.debug.print("\n\n\n validator block production slot={any} block={any}\n\n\n", .{ slot, signed_block_message });
+            try self.network.publish(&signed_block_message);
         }
     }
 };
