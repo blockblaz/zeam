@@ -117,14 +117,13 @@ pub fn main() !void {
             });
             std.debug.print("chainoptionsinfo={any}\n", .{beam_node.chain});
 
-            for (1..4) |uslot| {
-                const slot: isize = @intCast(uslot);
-                try BeamNode.onSlot(&beam_node, slot);
-            }
+            // for (1..4) |uslot| {
+            //     const slot: isize = @intCast(uslot);
+            //     try BeamNode.onSlot(&beam_node, slot);
+            // }
+            try beam_node.run();
 
             std.debug.print("forkchoice={any}\n", .{beam_node.chain.forkChoice});
-
-            // try beam_node.run();
         },
     }
 }
