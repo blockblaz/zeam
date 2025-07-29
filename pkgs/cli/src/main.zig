@@ -18,6 +18,8 @@ const utilsLib = @import("@zeam/utils");
 
 const sftFactory = @import("@zeam/state-transition");
 
+const networks = @import("@zeam/network");
+
 const ZeamArgs = struct {
     genesis: ?u64,
     num_validators: ?u64,
@@ -108,10 +110,17 @@ pub fn main() !void {
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             var validator_ids = [_]usize{1};
+
+            var mock_network: *networks.Mock = try allocator.create(networks.Mock);
+            mock_network.* = try networks.Mock.init(allocator);
+            const backend = mock_network.getNetworkInterface();
+            std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
+
             var beam_node = try BeamNode.init(allocator, .{
                 // options
                 .config = chain_config,
                 .anchorState = anchorState,
+                .backend = backend,
                 .db = .{},
                 .validator_ids = &validator_ids,
             });
