@@ -118,7 +118,7 @@ pub fn main() !void {
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time);
 
             var validator_ids_1 = [_]usize{1};
-            // var validator_ids_2 = [_]usize{2};
+            var validator_ids_2 = [_]usize{2};
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
@@ -129,9 +129,19 @@ pub fn main() !void {
                 .db = .{},
                 .validator_ids = &validator_ids_1,
             });
+            var beam_node_2 = try BeamNode.init(allocator, .{
+                // options
+                .config = chain_config,
+                .anchorState = anchorState,
+                .backend = backend,
+                .clock = clock,
+                .db = .{},
+                .validator_ids = &validator_ids_2,
+            });
             std.debug.print("chainoptionsinfo={any}\n", .{beam_node_1.chain});
 
             try beam_node_1.run();
+            try beam_node_2.run();
             try clock.run();
 
             std.debug.print("forkchoice={any}\n", .{beam_node_1.chain.forkChoice});

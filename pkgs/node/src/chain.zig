@@ -56,7 +56,7 @@ pub const BeamChain = struct {
 
     fn tickSlot(self: *Self, slot: usize) void {
         self.forkChoice.tickSlot(slot);
-        self.printSlot(slot);
+        // self.printSlot(slot);
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
@@ -96,9 +96,9 @@ pub const BeamChain = struct {
         return block;
     }
 
-    fn printSlot(self: *Self, slot: usize) void {
-        _ = self;
-        std.debug.print("chain received on slot cb at slot={d}\n", .{slot});
+    pub fn printSlot(self: *Self, slot: usize) !void {
+        const fcHead = try self.forkChoice.updateHead();
+        std.debug.print("chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
@@ -110,13 +110,20 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                std.debug.print("blockroot={x} hasblock={any}\n", .{ block_root, hasBlock });
+                std.debug.print("blockroot={any} hasblock={any}\n", .{ block_root, hasBlock });
                 if (!hasBlock) {
                     const hasParentBlock = self.forkChoice.hasBlock(block.message.parent_root);
                     std.debug.print("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
+                    if (hasParentBlock) {
+                        self.onBlock(block) catch |err| {
+                            std.debug.print("\n\n\n ^^^^^^^^ Block processing error ^^^^^^\n{any}\n", .{err});
+                        };
+                    }
                 }
             },
         }
+
+        try self.printSlot(self.forkChoice.fcStore.currentSlot);
     }
 
     // import block assuming it is validated

@@ -88,6 +88,8 @@ pub const BeamNode = struct {
             // _ = try validator.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
             try validator.onSlot(slot);
         }
+
+        try self.chain.printSlot(slot);
     }
 
     pub fn run(self: *Self) !void {
