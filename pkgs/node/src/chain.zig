@@ -14,7 +14,7 @@ const getLogger = zeam_utils.getLogger;
 
 pub const fcFactory = @import("./forkchoice.zig");
 
-pub const BlockProductionOpts = struct {
+pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
 };
@@ -59,7 +59,7 @@ pub const BeamChain = struct {
         self.printSlot(slot);
     }
 
-    pub fn produceBlock(self: *Self, opts: BlockProductionOpts) !types.BeamBlock {
+    pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
         const chainHead = try self.forkChoice.updateHead();
         const parent_root = chainHead.blockRoot;
 

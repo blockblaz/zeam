@@ -41,8 +41,6 @@ pub const BeamNode = struct {
         const network = networkFactory.Network.init(backend);
         var validator: ?validators.BeamValidator = null;
 
-        // seems like how to declare a mutating chain but without mutating in this particular scope
-        // if it were cost it somehow causes memory issues
         const chain = try allocator.create(chainFactory.BeamChain);
         chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
         if (opts.validator_ids) |ids| {

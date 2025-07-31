@@ -6,8 +6,8 @@ const types = @import("@zeam/types");
 const chains = @import("./chain.zig");
 const networks = @import("./network.zig");
 
-pub const ValidatorOpts = struct {
-    // could be keys when deposit mechanism is implememted
+pub const ValidatorParams = struct {
+    // could be keys when deposit mechanism is implemented
     ids: []usize,
     chain: *chains.BeamChain,
     network: networks.Network,
@@ -20,7 +20,7 @@ pub const BeamValidator = struct {
     ids: []usize,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorOpts) Self {
+    pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorParams) Self {
         return Self{
             .allocator = allocator,
             .config = config,

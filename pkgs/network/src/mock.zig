@@ -22,7 +22,7 @@ pub const Mock = struct {
     }
 
     pub fn publish(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
-        // prevent from publishing to self handler
+        // TODO: prevent from publishing to self handler
         return Self.onGossip(ptr, data);
     }
 
