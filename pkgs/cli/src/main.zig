@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const build_options = @import("build_options");
 
 const simargs = @import("simargs");
 
@@ -39,14 +40,42 @@ const ZeamArgs = struct {
     },
 
     pub const __messages__ = .{
-        .genesis = "genesis time",
+        .genesis = "Genesis time for the chain (default: 1234)",
+        .num_validators = "Number of validators (default: 4)",
     };
 };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    const opts = try simargs.parse(allocator, ZeamArgs, "", "0.0.0");
+    const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
+    const app_version = build_options.version;
+    
+    // Check for help flags before parsing
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
+            const stdout = std.io.getStdOut().writer();
+            _ = try stdout.write(app_description);
+            _ = try stdout.write("\n\nUsage: zeam [OPTIONS] <COMMAND>\n\n");
+            _ = try stdout.write("Commands:\n");
+            _ = try stdout.write("  clock    Run the clock service for slot timing\n");
+            _ = try stdout.write("  beam     Run a full Beam node\n");
+            _ = try stdout.write("  prove    Generate and verify ZK proofs for state transitions\n\n");
+            _ = try stdout.write("Options:\n");
+            _ = try stdout.write("  --genesis <NUM>         Genesis time for the chain (default: 1234)\n");
+            _ = try stdout.write("  --num-validators <NUM>  Number of validators (default: 4)\n");
+            _ = try stdout.write("  -h, --help             Show this help message\n\n");
+            _ = try stdout.write("Version: ");
+            _ = try stdout.write(app_version);
+            _ = try stdout.write("\n");
+            return;
+        }
+    }
+    
+    const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
     const genesis = opts.args.genesis orelse 1234;
     const num_validators = opts.args.num_validators orelse 4;
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });

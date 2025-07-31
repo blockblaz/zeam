@@ -1,12 +1,13 @@
 # Git
-.git/
+.git/*
+!.git/HEAD
+!.git/refs
 .gitignore
 .github/
 
 # Build artifacts
 zig-out/
 zig-cache/
-build/
 *.o
 *.a
 *.so
