@@ -27,7 +27,7 @@ fn addZkvmGlueLibs(b: *Builder, comp: *Builder.Step.Compile) void {
 pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    
+
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
 

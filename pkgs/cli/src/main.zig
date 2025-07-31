@@ -50,11 +50,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
-    
+
     // Check for help flags before parsing
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    
+
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
             const stdout = std.io.getStdOut().writer();
@@ -74,7 +74,7 @@ pub fn main() !void {
             return;
         }
     }
-    
+
     const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
     const genesis = opts.args.genesis orelse 1234;
     const num_validators = opts.args.num_validators orelse 4;

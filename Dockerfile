@@ -1,8 +1,11 @@
 # Build stage
 FROM ubuntu:24.04 AS builder
 
+# Use bash and enable pipefail
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xz-utils \
     git \
@@ -47,9 +50,9 @@ COPY .git/refs .git/refs
 RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
     if [ -z "$GIT_VERSION" ] || [ "$GIT_VERSION" = "unknown" ]; then \
         REF=$(cat .git/HEAD | sed 's/ref: //'); \
-        GIT_VERSION=$(cat .git/$REF 2>/dev/null | head -c 7 || echo "unknown"); \
+        GIT_VERSION=$(cat ".git/$REF" 2>/dev/null | head -c 7 || echo "unknown"); \
     else \
-        GIT_VERSION=$(echo $GIT_VERSION | head -c 7); \
+        GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
     zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
 
@@ -94,4 +97,3 @@ ENTRYPOINT ["/app/zig-out/bin/zeam"]
 #
 # 4. The final image uses scratch base with manually copied libraries
 #    for the absolute minimal size possible.
-#
