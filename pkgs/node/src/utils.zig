@@ -5,13 +5,12 @@ const Mutex = Thread.Mutex;
 const xev = @import("xev");
 
 pub const EventLoop = struct {
-    loop: xev.Loop,
+    loop: *xev.Loop,
     // events from libp2p or other threads will also be pushed on it
     mutex: Mutex,
 
     const Self = @This();
-    pub fn init() !Self {
-        const loop = try xev.Loop.init(.{});
+    pub fn init(loop: *xev.Loop) !Self {
         const mutex = Mutex{};
 
         return Self{

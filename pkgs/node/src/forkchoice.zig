@@ -169,7 +169,7 @@ const OnBlockOpts = struct {
     blockDelayMs: u64,
     // to activate/deactivate the future slot check
     // TODO remove once events issue is fixed
-    strict: bool = false,
+    strict: bool = true,
 };
 
 pub const ForkChoiceStore = struct {

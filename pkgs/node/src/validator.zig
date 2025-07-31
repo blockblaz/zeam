@@ -40,13 +40,15 @@ pub const BeamValidator = struct {
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
             std.debug.print("\n\n\n going for block production slot={any} proposer={any} index={any}\n\n", .{ slot, slot_proposer_id, index });
             const block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+
             const signed_block = types.SignedBeamBlock{
                 .message = block,
                 .signature = [_]u8{0} ** 48,
             };
-            const signed_block_message = networks.GossipMessage{ .block = signed_block };
+            const signed_block_message = try self.allocator.create(networks.GossipMessage);
+            signed_block_message.* = networks.GossipMessage{ .block = signed_block };
             std.debug.print("\n\n\n validator block production slot={any} block={any}\n\n\n", .{ slot, signed_block_message });
-            try self.network.publish(&signed_block_message);
+            try self.network.publish(signed_block_message);
         }
     }
 };
