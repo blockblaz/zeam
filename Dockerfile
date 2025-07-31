@@ -80,23 +80,18 @@ ENTRYPOINT ["/app/zig-out/bin/zeam"]
 
 # IMPORTANT NOTES:
 #
-# 1. The 'prove' command requires Docker to be available at runtime:
-#    docker run -v /var/run/docker.sock:/var/run/docker.sock zeam:latest prove
 #
-# 2. The 'clock' and 'beam' commands use xev event loop which may have 
+# 1. The 'clock' and 'beam' commands use xev event loop which may have 
 #    container compatibility issues. The PermissionDenied error occurs even
 #    with additional capabilities. This appears to be a limitation of running
 #    the xev-based event loop in a containerized environment.
 #
-# 3. The scratch image has no users, shells, or package managers - only
+# 2. The scratch image has no users, shells, or package managers - only
 #    the binary and required libraries.
 #
-# 4. For debugging, you'll need to copy the binary to another container
+# 3. For debugging, you'll need to copy the binary to another container
 #    with debugging tools.
 #
-# 5. The final image uses scratch base with manually copied libraries
+# 4. The final image uses scratch base with manually copied libraries
 #    for the absolute minimal size possible.
 #
-# The Docker build completes successfully and the binaries are properly installed.
-# The runtime issues with clock/beam commands appear to be related to xev's
-# requirements for system resources that are not easily satisfied in containers.
