@@ -8,7 +8,7 @@ const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
 const MockPublishWrapper = struct {
-    ptr: *anyopaque,
+    handler: interface.OnGossipCbHandler,
     data: *const interface.GossipMessage,
 };
 
@@ -37,37 +37,7 @@ pub const Mock = struct {
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
-        // TODO: track and dealloc the structures
-        const self: *Self = @ptrCast(@alignCast(ptr));
-        const c = try self.allocator.create(xev.Completion);
-        c.* = undefined;
-
-        const publishWrapper = try self.allocator.create(MockPublishWrapper);
-        publishWrapper.* = MockPublishWrapper{ .ptr = ptr, .data = data };
-
-        self.timer.run(
-            self.loop,
-            c,
-            1,
-            MockPublishWrapper,
-            publishWrapper,
-            (struct {
-                fn callback(
-                    ud: ?*MockPublishWrapper,
-                    _: *xev.Loop,
-                    _: *xev.Completion,
-                    r: xev.Timer.RunError!void,
-                ) xev.CallbackAction {
-                    _ = r catch unreachable;
-                    if (ud) |pwrap| {
-                        std.debug.print("\n\n\n\n XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{});
-                        _ = Mock.onGossip(pwrap.ptr, pwrap.data) catch void;
-                    }
-                    return .disarm;
-                }
-            }).callback,
-        );
-        // we don't need to run the loop as this is a shared loop and is already being run by the clock
+        return Self.onGossip(ptr, data);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -87,8 +57,38 @@ pub const Mock = struct {
         const handlerArr = self.onGossipHandlers.get(topic).?;
         std.debug.print("\n\n\n ongossip handlerarr {any} for topic {any}\n", .{ handlerArr.items, topic });
         for (handlerArr.items) |handler| {
-            try handler.onGossip(data);
+
+            // TODO: track and dealloc the structures
+            const c = try self.allocator.create(xev.Completion);
+            c.* = undefined;
+
+            const publishWrapper = try self.allocator.create(MockPublishWrapper);
+            publishWrapper.* = MockPublishWrapper{ .handler = handler, .data = data };
+
+            self.timer.run(
+                self.loop,
+                c,
+                1,
+                MockPublishWrapper,
+                publishWrapper,
+                (struct {
+                    fn callback(
+                        ud: ?*MockPublishWrapper,
+                        _: *xev.Loop,
+                        _: *xev.Completion,
+                        r: xev.Timer.RunError!void,
+                    ) xev.CallbackAction {
+                        _ = r catch unreachable;
+                        if (ud) |pwrap| {
+                            std.debug.print("\n\n\n\n XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{});
+                            _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                        }
+                        return .disarm;
+                    }
+                }).callback,
+            );
         }
+        // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }
 
     pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
