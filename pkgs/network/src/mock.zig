@@ -37,6 +37,7 @@ pub const Mock = struct {
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
+        // TODO: track and dealloc the structures
         const self: *Self = @ptrCast(@alignCast(ptr));
         const c = try self.allocator.create(xev.Completion);
         c.* = undefined;
@@ -66,7 +67,7 @@ pub const Mock = struct {
                 }
             }).callback,
         );
-        // try self.loop.run(.until_done);
+        // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
