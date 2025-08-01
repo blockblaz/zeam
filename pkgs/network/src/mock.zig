@@ -83,6 +83,8 @@ pub const Mock = struct {
                             std.debug.print("\n\n\n\n XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{});
                             _ = pwrap.handler.onGossip(pwrap.data) catch void;
                         }
+                        // TODO defer freeing the publishwrapper but need handle to the allocator
+                        // also figure out how and when to best dealloc the completion
                         return .disarm;
                     }
                 }).callback,
