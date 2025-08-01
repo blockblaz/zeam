@@ -136,8 +136,12 @@ pub fn main() !void {
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
+            // TODO we seem to be needing one loop because then the events added to loop are not being fired
+            // in the order to which they have been added even with the an appropriate delay added
+            // behavior of this further needs to be investigated but for now we will share the same loop
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
+
             var mock_network: *networks.Mock = try allocator.create(networks.Mock);
             mock_network.* = try networks.Mock.init(allocator, loop);
             const backend = mock_network.getNetworkInterface();
