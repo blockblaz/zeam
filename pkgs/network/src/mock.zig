@@ -47,7 +47,7 @@ pub const Mock = struct {
         self.timer.run(
             self.loop,
             c,
-            1000,
+            1,
             MockPublishWrapper,
             publishWrapper,
             (struct {
