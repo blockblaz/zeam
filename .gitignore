@@ -4,3 +4,13 @@ zig-out/
 target
 *.asm
 out
+
+# Claude and AI assistant files
+CLAUDE.md
+.claude/
+.cursorrules
+.cursor/
+.github/copilot-instructions.md
+.aider*
+.continue/
+.codeium/

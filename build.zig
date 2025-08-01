@@ -28,6 +28,9 @@ pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Get git commit hash as version
+    const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
+
     // add ssz
     const ssz = b.dependency("ssz", .{
         .target = target,
@@ -128,6 +131,10 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
 
+    // Create build options
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
@@ -137,6 +144,7 @@ pub fn build(b: *Builder) !void {
     });
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
+    cli_exe.root_module.addImport("build_options", build_options.createModule());
     cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);

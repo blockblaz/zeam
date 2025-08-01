@@ -1,0 +1,49 @@
+# Git
+.git/*
+!.git/HEAD
+!.git/refs
+.gitignore
+.github/
+
+# Build artifacts
+zig-out/
+zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+
+# Rust/Cargo artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+**/Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation build artifacts
+docs/_build/
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Test artifacts
+*.test
+test-results/
+
+# Local configuration
+.env
+.env.local
+*.local
+
+# CLAUDE.md (project-specific, not needed in container)
+CLAUDE.md
