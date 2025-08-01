@@ -26,8 +26,9 @@ pub const Clock = struct {
     pub fn init(
         allocator: Allocator,
         genesis_time: usize,
+        loop: *xev.Loop,
     ) !Self {
-        const events = try utils.EventLoop.init();
+        const events = try utils.EventLoop.init(loop);
         const timer = try xev.Timer.init();
 
         const genesis_time_ms: isize = @intCast(genesis_time * std.time.ms_per_s);
@@ -61,7 +62,7 @@ pub const Clock = struct {
             cbWrapper.slot = self.current_slot + 1;
 
             self.timer.run(
-                &self.events.loop,
+                self.events.loop,
                 &cbWrapper.c,
                 time_to_next_slot_ms,
                 OnSlotCbWrapper,

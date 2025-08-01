@@ -167,9 +167,6 @@ pub const ProtoArray = struct {
 const OnBlockOpts = struct {
     currentSlot: types.Slot,
     blockDelayMs: u64,
-    // to activate/deactivate the future slot check
-    // TODO remove once events issue is fixed
-    strict: bool = false,
 };
 
 pub const ForkChoiceStore = struct {
@@ -364,14 +361,7 @@ pub const ForkChoice = struct {
 
             if (slot > self.fcStore.currentSlot) {
                 std.debug.print("\n\n slot={any} currentslot={any}\n\n", .{ slot, self.fcStore.currentSlot });
-                // instead of returning error for now, roll forward the slot till we fix the async events
-                // because mock network sends gossip forwards without letting the onslot fire for all the
-                // nodes
-                if (opts.strict) {
-                    return ForkChoiceError.FutureSlot;
-                } else {
-                    self.tickSlot(slot);
-                }
+                return ForkChoiceError.FutureSlot;
             } else if (slot < self.fcStore.finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
@@ -451,7 +441,7 @@ test "forkchoice block tree" {
 
         // shouldn't accept a future slot
         const current_slot = block.message.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .strict = true }));
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
         fork_choice.tickSlot(current_slot);
         _ = try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
