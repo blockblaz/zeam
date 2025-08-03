@@ -20,8 +20,10 @@ const utilsLib = @import("@zeam/utils");
 const sftFactory = @import("@zeam/state-transition");
 
 const ZeamArgs = struct {
-    genesis: ?u64,
-    num_validators: ?u64,
+    genesis: u64 = 1234,
+    num_validators: u64 = 4,
+    help: bool = false,
+    version: bool = false,
 
     __commands__: union(enum) {
         clock: struct {},
@@ -37,11 +39,22 @@ const ZeamArgs = struct {
                 .dist_dir = "Directory where the zkvm guest programs are found",
             };
         },
+
+        pub const __messages__ = .{
+            .clock = "Run the clock service for slot timing",
+            .beam = "Run a full Beam node",
+            .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
+        };
     },
 
     pub const __messages__ = .{
-        .genesis = "Genesis time for the chain (default: 1234)",
-        .num_validators = "Number of validators (default: 4)",
+        .genesis = "Genesis time for the chain",
+        .num_validators = "Number of validators",
+    };
+
+    pub const __shorts__ = .{
+        .help = .h,
+        .version = .v,
     };
 };
 
@@ -51,33 +64,10 @@ pub fn main() !void {
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
 
-    // Check for help flags before parsing
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
-            const stdout = std.io.getStdOut().writer();
-            _ = try stdout.write(app_description);
-            _ = try stdout.write("\n\nUsage: zeam [OPTIONS] <COMMAND>\n\n");
-            _ = try stdout.write("Commands:\n");
-            _ = try stdout.write("  clock    Run the clock service for slot timing\n");
-            _ = try stdout.write("  beam     Run a full Beam node\n");
-            _ = try stdout.write("  prove    Generate and verify ZK proofs for state transitions\n\n");
-            _ = try stdout.write("Options:\n");
-            _ = try stdout.write("  --genesis <NUM>         Genesis time for the chain (default: 1234)\n");
-            _ = try stdout.write("  --num-validators <NUM>  Number of validators (default: 4)\n");
-            _ = try stdout.write("  -h, --help             Show this help message\n\n");
-            _ = try stdout.write("Version: ");
-            _ = try stdout.write(app_version);
-            _ = try stdout.write("\n");
-            return;
-        }
-    }
-
     const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
-    const genesis = opts.args.genesis orelse 1234;
-    const num_validators = opts.args.num_validators orelse 4;
+    const genesis = opts.args.genesis;
+    const num_validators = opts.args.num_validators;
+
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
 
     switch (opts.args.__commands__) {
