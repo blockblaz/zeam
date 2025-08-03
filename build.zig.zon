@@ -6,8 +6,8 @@
         .url = "https://github.com/blockblaz/ssz.zig/archive/72c544b.tar.gz",
         .hash = "1220436346a26c5fc3d32b3c608a7a408cec3139dae30d74dba4183a6eb2e855dc49",
     }, .zigcli = .{
-        .url = "https://github.com/jiacai2050/zigcli/archive/refs/tags/v0.2.0.tar.gz",
-        .hash = "1220d88560a67e3044f6358f03b0aa3102a53134f745c69d7e0cefac21e7febbd8b5",
+        .url = "https://github.com/jiacai2050/zigcli/archive/v0.2.3.tar.gz",
+        .hash = "zigcli-0.2.3-ORC7jGKRAgAYW8y8hO3S4v2DsqbnyOrgximDYNgfB_Bw",
     }, .xev = .{
         .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
         .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
