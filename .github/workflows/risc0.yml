@@ -1,0 +1,39 @@
+on:
+  pull_request:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches: [main]
+
+name: risc0
+
+jobs:
+  risc0:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Zig
+      uses: korandoru/setup-zig@v1
+      with:
+        zig-version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: clippy, rustfmt
+
+    - name: Install risc0
+      run: |
+        cat /home/runner/.bashrc
+        curl -L https://risczero.com/install | bash
+        source "/home/runner/.bashrc"
+        echo $PATH
+        pwd
+        cat /home/runner/.bashrc
+        /home/runner/.risc0/bin/rzup install r0vm 3.0.0-rc.1
+
+    - name: run prover
+      run: zig build run -- prove -z risc0
