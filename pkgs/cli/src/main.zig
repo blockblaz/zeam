@@ -9,6 +9,7 @@ const nodeLib = @import("@zeam/node");
 const Clock = nodeLib.Clock;
 const stateProvingManager = @import("@zeam/state-proving-manager");
 const BeamNode = nodeLib.BeamNode;
+const xev = @import("xev");
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -81,7 +82,8 @@ pub fn main() !void {
 
     switch (opts.args.__commands__) {
         .clock => {
-            var clock = try Clock.init(gpa.allocator(), genesis);
+            var loop = try xev.Loop.init(.{});
+            var clock = try Clock.init(gpa.allocator(), genesis, &loop);
             std.debug.print("clock {any}\n", .{clock});
 
             try clock.run();
@@ -134,13 +136,19 @@ pub fn main() !void {
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
+            // TODO we seem to be needing one loop because then the events added to loop are not being fired
+            // in the order to which they have been added even with the an appropriate delay added
+            // behavior of this further needs to be investigated but for now we will share the same loop
+            const loop = try allocator.create(xev.Loop);
+            loop.* = try xev.Loop.init(.{});
+
             var mock_network: *networks.Mock = try allocator.create(networks.Mock);
-            mock_network.* = try networks.Mock.init(allocator);
+            mock_network.* = try networks.Mock.init(allocator, loop);
             const backend = mock_network.getNetworkInterface();
             std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
 
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
