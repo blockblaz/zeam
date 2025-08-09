@@ -29,13 +29,19 @@ pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
     allocator.free(input);
 }
 
-var fixed_mem = [_]u8{0} ** (128 * 1024 * 1024);
+pub extern var _end: usize;
 var fixed_allocator: std.heap.FixedBufferAllocator = undefined;
 var fixed_allocator_initialized = false;
 
 pub fn get_allocator() std.mem.Allocator {
     if (!fixed_allocator_initialized) {
-        fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
+        const mem_start: [*]u8 = @ptrCast(&_end);
+        const mem_end: [*]u8 = @ptrFromInt(0xC000000);
+        const mem_size: usize = @intFromPtr(mem_end) - @intFromPtr(mem_start);
+        const mem_area: []u8 = mem_start[0..mem_size];
+        asm volatile ("" ::: "memory");
+
+        fixed_allocator = std.heap.FixedBufferAllocator.init(mem_area);
         fixed_allocator_initialized = true;
     }
     return fixed_allocator.allocator();
