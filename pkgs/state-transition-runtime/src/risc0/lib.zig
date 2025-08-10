@@ -34,6 +34,9 @@ var fixed_allocator = undefined;
 var fixed_allocator_initialized = false;
 
 pub fn get_allocator() std.mem.Allocator {
-    fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
+    if (!fixed_allocator_initialized) {
+        fixed_allocator = std.heap.FixedBufferAllocator.init(fixed_mem[0..]);
+        fixed_allocator_initialized = true;
+    }
     return fixed_allocator.allocator();
 }
