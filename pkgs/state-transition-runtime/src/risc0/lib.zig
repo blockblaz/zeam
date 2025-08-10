@@ -30,7 +30,7 @@ pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
 }
 
 var fixed_mem = [_]u8{0} ** (128 * 1024 * 1024);
-var fixed_allocator = undefined;
+var fixed_allocator: std.heap.FixedBufferAllocator = undefined;
 var fixed_allocator_initialized = false;
 
 pub fn get_allocator() std.mem.Allocator {
