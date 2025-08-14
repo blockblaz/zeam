@@ -173,6 +173,7 @@ pub fn build(b: *Builder) !void {
     run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
 
     try build_zkvm_targets(b, &cli_exe.step, target);
+    try build_rust_libp2p(b, &cli_exe.step, target);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -343,4 +344,14 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             main_exe.dependOn(&install_generated.step);
         }
     }
+}
+
+fn build_rust_libp2p(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
+    _ = b;
+    _ = main_exe;
+    _ = host_target;
+
+    const RUST_DIR = "./pkgs/network/src/rustlibp2p-bridge";
+    const RUST_RELEASE_DIR = main_exe ++ "/target/debug";
+    const DLL_NAME = "librustlibp2p_bridge.a";
 }
