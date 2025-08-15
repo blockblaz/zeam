@@ -34,7 +34,7 @@ const ZeamArgs = struct {
         },
         beam: struct {
             help: bool = false,
-            mockNetwork: bool = true,
+            mockNetwork: bool = false,
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -119,6 +119,8 @@ pub fn main() !void {
             }
         },
         .beam => {
+            std.debug.print("beam opts ={any}\n", .{opts.args.__commands__.beam});
+
             const mock_network = opts.args.__commands__.beam.mockNetwork;
 
             // some base mainnet spec would be loaded to build this up
