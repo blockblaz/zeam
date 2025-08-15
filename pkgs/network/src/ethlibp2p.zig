@@ -7,22 +7,38 @@ const xev = @import("xev");
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, message_ptr: [*:0]const u8, message_len: usize) void {
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, message_ptr: [*]const u8, message_len: usize) void {
     const message: []const u8 = message_ptr[0..message_len];
     _ = message;
     _ = zigHandler;
 }
 
+// TODO: change listen port and connect port both to list of multiaddrs
+pub extern fn createAndRunNetwork(a: *EthLibp2p, listenPort: i32, connectPort: i32) u32;
+pub extern fn publishMsgToRustBridge(message_ptr: [*]const u8, message_len: usize) void;
+
+pub const EthLibp2pParams = struct {
+    port: isize,
+    // TODO convert into array multiaddrs
+    // right now just take a connect peer port for testing ease
+    peers: isize,
+};
+
 pub const EthLibp2p = struct {
     gossipHandler: interface.GenericGossipHandler,
+    params: EthLibp2pParams,
+
     const Self = @This();
 
-    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
-        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
+    pub fn init(
+        allocator: Allocator,
+        loop: *xev.Loop,
+        params: EthLibp2pParams,
+    ) !Self {
+        return Self{ .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
-        // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.onGossip(data);
     }
