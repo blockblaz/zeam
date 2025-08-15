@@ -1,27 +1,40 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const types = @import("@zeam/types");
+const xev = @import("xev");
+
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, message_ptr: [*:0]const u8, message_len: usize) void {
+    const message: []const u8 = message_ptr[0..message_len];
+    _ = message;
+    _ = zigHandler;
+}
+
 pub const EthLibp2p = struct {
+    gossipHandler: interface.GenericGossipHandler,
     const Self = @This();
 
-    pub fn init() Self {
-        return Self{};
+    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
+        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
     }
 
-    pub fn publish(ptr: *anyopaque, obj: *interface.GossipMessage) anyerror!void {
-        _ = ptr;
-        _ = obj;
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+        // TODO: prevent from publishing to self handler
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.gossipHandler.onGossip(data);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
-        _ = ptr;
-        _ = topics;
-        _ = handler;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.gossipHandler.subscribe(topics, handler);
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *interface.GossipMessage) anyerror!void {
-        _ = ptr;
-        _ = data;
+    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.gossipHandler.onGossip(data);
     }
 
     pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
@@ -38,6 +51,7 @@ pub const EthLibp2p = struct {
         return .{ .gossip = .{
             .ptr = self,
             .publishFn = publish,
+            .subscribeFn = subscribe,
             .onGossipFn = onGossip,
         }, .reqresp = .{
             .ptr = self,

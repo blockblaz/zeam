@@ -15,11 +15,13 @@ use std::os::raw::c_char;
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
-#[no_mangle]
-pub fn createNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
+// TODO: protect the access by mutex
+static mut swarm_state: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
-    let rt = Builder::new_multi_thread()
-        .worker_threads(4)
+#[no_mangle]
+pub fn createAndRunNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
+
+    let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -32,11 +34,8 @@ pub fn createNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
         });
 }
 
-static mut swarm_state: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-
-
 #[no_mangle]
-pub fn publishMsg(message_str: *const u8, message_len: usize){
+pub fn publishMsgToRustBridge(message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
         println!("publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
@@ -50,74 +49,7 @@ pub fn publishMsg(message_str: *const u8, message_len: usize){
 }
 
 extern "C" {
-    fn zig_add(libp2pEvents: u64, a: i32, b: i32, message: *mut c_char) -> i32;
-}
-
-fn newSwarm() -> libp2p::swarm::Swarm<Behaviour> {
-    let local_private_key = secp256k1::Keypair::generate();
-    let local_keypair:Keypair = local_private_key.into();
-    let transport = build_transport(local_keypair.clone(), false).unwrap();
-    println!("build the transport");
-
-    let builder = SwarmBuilder::with_existing_identity(local_keypair)
-        .with_tokio()
-        .with_other_transport(|_key| transport)
-        .expect("infalible");
-    
-    let mut swarm = builder
-    .with_behaviour(|key| Behaviour::new(key.clone())).unwrap()
-    .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
-    .build();
-
-    let topic = gossipsub::IdentTopic::new("test-net");
-    // subscribes to our topic
-    swarm.behaviour_mut().gossipsub.subscribe(&topic);
-
-    swarm
-}
-
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    gossipsub: gossipsub::Behaviour,
-}
-
-
-impl Behaviour {
-    fn new(key: identity::Keypair) -> Self {
-        let local_public_key = key.public();
-        // To content-address message, we can take the hash of message and use it as an ID.
-        let message_id_fn = |message: &gossipsub::Message| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
-        };
-
-        // Set a custom gossipsub configuration
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-        // .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-        .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
-        // signing)
-        .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
-        .build().unwrap();
-        // .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
-
-        // build a gossipsub network behaviour
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()),
-            gossipsub_config,
-        ).unwrap();
-
-        Self {
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/ipfs/0.1.0".into(),
-                local_public_key.clone(),
-            )),
-            ping: ping::Behaviour::default(),
-            gossipsub,
-        }
-    }
+    fn handleMsgFromRustBridge(zigHandler: u64, message: *const u8, len: usize);
 }
 
 
@@ -186,10 +118,10 @@ pub async fn run_eventloop(&mut self) {
                     })) => {
                     {
 
-                        let my_vec: Vec<u8> =  message.data;
-                        let raw_ptr: *mut c_char = CString::new(my_vec).expect("cstring").into_raw(); 
-                        let result = unsafe {zig_add(self.zigHandler,23,42, raw_ptr)};
-                        println!("\nzig callback result {result}\n");
+                        let message_ptr = message.data.as_ptr();
+                        let message_len = message.data.len();
+                        unsafe {handleMsgFromRustBridge(self.zigHandler, message_ptr, message_len)};
+                        println!("\nzig callback completed\n");
                     }
 
                     
@@ -198,6 +130,74 @@ pub async fn run_eventloop(&mut self) {
             }
         }
 }
+}
+
+
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+}
+
+
+impl Behaviour {
+    fn new(key: identity::Keypair) -> Self {
+        let local_public_key = key.public();
+        // To content-address message, we can take the hash of message and use it as an ID.
+        let message_id_fn = |message: &gossipsub::Message| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        };
+
+        // Set a custom gossipsub configuration
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+        // .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+        .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
+        // signing)
+        .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
+        .build().unwrap();
+        // .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
+
+        // build a gossipsub network behaviour
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub_config,
+        ).unwrap();
+
+        Self {
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/ipfs/0.1.0".into(),
+                local_public_key.clone(),
+            )),
+            ping: ping::Behaviour::default(),
+            gossipsub,
+        }
+    }
+}
+
+fn newSwarm() -> libp2p::swarm::Swarm<Behaviour> {
+    let local_private_key = secp256k1::Keypair::generate();
+    let local_keypair:Keypair = local_private_key.into();
+    let transport = build_transport(local_keypair.clone(), false).unwrap();
+    println!("build the transport");
+
+    let builder = SwarmBuilder::with_existing_identity(local_keypair)
+        .with_tokio()
+        .with_other_transport(|_key| transport)
+        .expect("infalible");
+    
+    let mut swarm = builder
+    .with_behaviour(|key| Behaviour::new(key.clone())).unwrap()
+    .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
+    .build();
+
+    let topic = gossipsub::IdentTopic::new("test-net");
+    // subscribes to our topic
+    swarm.behaviour_mut().gossipsub.subscribe(&topic);
+
+    swarm
 }
 
 fn build_transport(

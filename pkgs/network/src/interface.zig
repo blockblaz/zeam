@@ -1,4 +1,8 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const types = @import("@zeam/types");
+const xev = @import("xev");
 
 pub const GossipSub = struct {
     // ptr to the implementation
@@ -59,4 +63,82 @@ pub const ReqRespMethod = enum {
 };
 pub const ReqRespRequest = union(ReqRespMethod) {
     block_by_root: types.BlockByRootRequest,
+};
+
+const MessagePublishWrapper = struct {
+    handler: OnGossipCbHandler,
+    data: *const GossipMessage,
+};
+
+pub const GenericGossipHandler = struct {
+    loop: *xev.Loop,
+    timer: xev.Timer,
+    allocator: Allocator,
+    onGossipHandlers: std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)),
+
+    const Self = @This();
+    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
+        const timer = try xev.Timer.init();
+
+        var onGossipHandlers = std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)).init(allocator);
+        for (std.enums.values(GossipTopic)) |topic| {
+            try onGossipHandlers.put(topic, std.ArrayList(OnGossipCbHandler).init(allocator));
+        }
+        return Self{
+            .allocator = allocator,
+            .loop = loop,
+            .timer = timer,
+            .onGossipHandlers = onGossipHandlers,
+        };
+    }
+
+    pub fn onGossip(self: *Self, data: *const GossipMessage) anyerror!void {
+        const topic = data.getTopic();
+        const handlerArr = self.onGossipHandlers.get(topic).?;
+        std.debug.print("\n\n\n ongossip handlerarr {any} for topic {any}\n", .{ handlerArr.items, topic });
+        for (handlerArr.items) |handler| {
+
+            // TODO: track and dealloc the structures
+            const c = try self.allocator.create(xev.Completion);
+            c.* = undefined;
+
+            const publishWrapper = try self.allocator.create(MessagePublishWrapper);
+            publishWrapper.* = MessagePublishWrapper{ .handler = handler, .data = data };
+
+            self.timer.run(
+                self.loop,
+                c,
+                1,
+                MessagePublishWrapper,
+                publishWrapper,
+                (struct {
+                    fn callback(
+                        ud: ?*MessagePublishWrapper,
+                        _: *xev.Loop,
+                        _: *xev.Completion,
+                        r: xev.Timer.RunError!void,
+                    ) xev.CallbackAction {
+                        _ = r catch unreachable;
+                        if (ud) |pwrap| {
+                            std.debug.print("\n\n\n\n XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{});
+                            _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                        }
+                        // TODO defer freeing the publishwrapper but need handle to the allocator
+                        // also figure out how and when to best dealloc the completion
+                        return .disarm;
+                    }
+                }).callback,
+            );
+        }
+        // we don't need to run the loop as this is a shared loop and is already being run by the clock
+    }
+
+    pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
+        for (topics) |topic| {
+            // handlerarr should already be there
+            var handlerArr = self.onGossipHandlers.get(topic).?;
+            try handlerArr.append(handler);
+            try self.onGossipHandlers.put(topic, handlerArr);
+        }
+    }
 };
