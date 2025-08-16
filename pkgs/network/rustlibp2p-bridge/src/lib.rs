@@ -35,12 +35,13 @@ pub fn createAndRunNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
 }
 
 #[no_mangle]
-pub fn publishMsgToRustBridge(message_str: *const u8, message_len: usize){
+pub fn publishMsgToRustBridge(topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
         println!("publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
-        let topic = gossipsub::IdentTopic::new("test-net");
+        // TODO: get the topic mapping from topic_id
+        let topic = gossipsub::IdentTopic::new("block");
         let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
         if let Err(e) = swarm.behaviour_mut().gossipsub
                     .publish(topic.clone(), message_data){
@@ -49,7 +50,7 @@ pub fn publishMsgToRustBridge(message_str: *const u8, message_len: usize){
 }
 
 extern "C" {
-    fn handleMsgFromRustBridge(zigHandler: u64, topic_ptr: *const u8, topic_len: usize, message_ptr: *const u8, message_len: usize);
+    fn handleMsgFromRustBridge(zigHandler: u64, topic_id: u32, message_ptr: *const u8, message_len: usize);
 }
 
 
@@ -122,7 +123,7 @@ pub async fn run_eventloop(&mut self) {
                         let topic_len = topic.len();
                         let message_ptr = message.data.as_ptr();
                         let message_len = message.data.len();
-                        unsafe {handleMsgFromRustBridge(self.zigHandler, topic_ptr, topic_len, message_ptr, message_len)};
+                        unsafe {handleMsgFromRustBridge(self.zigHandler, 0 , message_ptr, message_len)};
                         println!("\nzig callback completed\n");
                     }
 
@@ -195,7 +196,8 @@ fn newSwarm() -> libp2p::swarm::Swarm<Behaviour> {
     .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
     .build();
 
-    let topic = gossipsub::IdentTopic::new("test-net");
+    // get all the topics to subscribe. infact impl the subscribe call from zig
+    let topic = gossipsub::IdentTopic::new("block");
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic);
 

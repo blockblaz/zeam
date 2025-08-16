@@ -116,6 +116,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_network.addImport("@zeam/types", zeam_types);
     zeam_network.addImport("xev", xev);
+    zeam_network.addImport("ssz", ssz);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{

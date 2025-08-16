@@ -2,23 +2,43 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
+const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const xev = @import("xev");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_ptr: [*]const u8, topic_len: usize, message_ptr: [*]const u8, message_len: usize) void {
-    const topic: []const u8 = topic_ptr[0..topic_len];
-    const message: []const u8 = message_ptr[0..message_len];
-    _ = topic;
-    _ = message;
-    _ = zigHandler;
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void {
+    const topic = switch (topic_id) {
+        0 => interface.GossipTopic.block,
+        else => {
+            std.debug.print("\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge !!!!\n", .{topic_id});
+            return;
+        },
+    };
+
+    const message_bytes: []const u8 = message_ptr[0..message_len];
+    const message: interface.GossipMessage = switch (topic) {
+        .block => blockmessage: {
+            var message_data: types.SignedBeamBlock = undefined;
+            ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
+                std.debug.print("!!!! Error in deserializing the signed block message e={any} !!!!\n", .{e});
+                return;
+            };
+
+            break :blockmessage .{ .block = message_data };
+        },
+    };
+
+    zigHandler.gossipHandler.onGossip(&message) catch |e| {
+        std.debug.print("!!!! onGossip handling of message failed with error e={any} !!!!\n", .{e});
+    };
 }
 
 // TODO: change listen port and connect port both to list of multiaddrs
 pub extern fn createAndRunNetwork(a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
-pub extern fn publishMsgToRustBridge(message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn publishMsgToRustBridge(topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     port: i32,
@@ -28,6 +48,7 @@ pub const EthLibp2pParams = struct {
 };
 
 pub const EthLibp2p = struct {
+    allocator: Allocator,
     gossipHandler: interface.GenericGossipHandler,
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
@@ -39,7 +60,7 @@ pub const EthLibp2p = struct {
         loop: *xev.Loop,
         params: EthLibp2pParams,
     ) !Self {
-        return Self{ .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
+        return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
     }
 
     pub fn run(self: *Self) !void {
@@ -48,6 +69,21 @@ pub const EthLibp2p = struct {
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        // publish
+        const topic = data.getTopic();
+        const topic_id = switch (topic) {
+            .block => 0,
+        };
+        const message = switch (topic) {
+            .block => messagebytes: {
+                var serialized = std.ArrayList(u8).init(self.allocator);
+                defer serialized.deinit();
+                try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
+
+                break :messagebytes serialized.items;
+            },
+        };
+        publishMsgToRustBridge(topic_id, message.ptr, message.len);
         return self.gossipHandler.onGossip(data);
     }
 
