@@ -232,7 +232,7 @@ pub fn build(b: *Builder) !void {
     cli_tests.linkSystemLibrary("rustlibp2p_bridge");
     cli_tests.addLibraryPath(b.path("zig-out/bin"));
     cli_tests.step.dependOn(&libp2p_cmd.step);
-    cli_tests.step.dependOn(&b.addInstallBinFile(b.path("pkgs/network/rustlibp2p-bridge/target/release/librustlibp2p_bridge.so"), "librustlibp2p_bridge.so").step);
+    cli_tests.step.dependOn(&b.addInstallBinFile(b.path("./pkgs/network/rustlibp2p-bridge/target/release/librustlibp2p_bridge.so"), "librustlibp2p_bridge.so").step);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
