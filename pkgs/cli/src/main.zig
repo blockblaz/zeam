@@ -159,13 +159,17 @@ pub fn main() !void {
                 // TODO: right now EthLibp2p act as a mock network
                 // however convert it into libp2p network by using rust bridge and create 2 separate networks
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .port = 9000, .peers = -1 });
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .port = 9001, .peers = -1 });
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
-                // init a new lib2p network here
-                var network2 = network1;
-                backend2 = network2.getNetworkInterface();
+                // init a new lib2p network here to connect with network1
+                var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .port = 9002, .peers = 9001 });
+                try network2.run();
+
+                // still using network1 for backend for in process network behav
+                backend2 = network1.getNetworkInterface();
                 std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
             }
 

@@ -17,9 +17,11 @@ type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 // TODO: protect the access by mutex
 static mut swarm_state: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+// a hack to start a second network for self testing purposes
+static mut swarm_state1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 #[no_mangle]
-pub fn createAndRunNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
+pub fn createAndRunNetwork(networkId: u32, zigHandler: u64, selfPort: i32, connectPort: i32) {
 
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -27,7 +29,7 @@ pub fn createAndRunNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
         .unwrap();
 
         rt.block_on(async move {
-            let mut p2p_net = Network::new(zigHandler);
+            let mut p2p_net = Network::new(networkId, zigHandler);
            p2p_net.start_network(selfPort, connectPort).await;       
            p2p_net.run_eventloop().await;
 
@@ -35,14 +37,15 @@ pub fn createAndRunNetwork(zigHandler: u64, selfPort: i32, connectPort: i32) {
 }
 
 #[no_mangle]
-pub fn publishMsgToRustBridge(topic_id: u32, message_str: *const u8, message_len: usize){
+pub fn publishMsgToRustBridge(networkId:u32, topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
         println!("publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
         // TODO: get the topic mapping from topic_id
         let topic = gossipsub::IdentTopic::new("block");
-        let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
+         let mut swarm = if(networkId < 1) {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
+        // let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
         if let Err(e) = swarm.behaviour_mut().gossipsub
                     .publish(topic.clone(), message_data){
                     println!("Publish error: {e:?}");
@@ -55,11 +58,13 @@ extern "C" {
 
 
 pub struct Network {
+    networkId: u32,
     zigHandler: u64,
 }
 impl Network {
-    pub fn new(zigHandler: u64) -> Self {
+    pub fn new(networkId: u32, zigHandler: u64) -> Self {
     let network: Network = Network {
+        networkId,
         zigHandler,
     };
 
@@ -100,15 +105,27 @@ pub async fn start_network(&mut self,selfPort: i32, connectPort: i32) {
         println!("spinning on {selfPort} and standing by...");
     }
 
-    unsafe{
+    if(self.networkId < 1){
+        unsafe{
         swarm_state = Some(swarm);
+      }
+    }else{
+        unsafe{
+        swarm_state1 = Some(swarm);
+      }
     }
+
+    // unsafe{
+    //     swarm_state = Some(swarm);
+    //   }
 
 }
 
 pub async fn run_eventloop(&mut self) {
-    let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
-     loop {
+    let mut swarm = if(self.networkId < 1) {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
+    // let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
+
+    loop {
             match swarm.select_next_some().await {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("\nListening on {address:?}\n");

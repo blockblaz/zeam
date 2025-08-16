@@ -31,16 +31,19 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         },
     };
 
+    std.debug.print("\n!!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ topic, message, message_bytes });
+
     zigHandler.gossipHandler.onGossip(&message) catch |e| {
         std.debug.print("!!!! onGossip handling of message failed with error e={any} !!!!\n", .{e});
     };
 }
 
 // TODO: change listen port and connect port both to list of multiaddrs
-pub extern fn createAndRunNetwork(a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
-pub extern fn publishMsgToRustBridge(topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn createAndRunNetwork(networkId: u32, a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
+pub extern fn publishMsgToRustBridge(networkId: u32, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
+    networkId: u32,
     port: i32,
     // TODO convert into array multiaddrs
     // right now just take a connect peer port for testing ease
@@ -64,7 +67,7 @@ pub const EthLibp2p = struct {
     }
 
     pub fn run(self: *Self) !void {
-        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetwork, .{ self, self.params.port, self.params.peers });
+        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetwork, .{ self.params.networkId, self, self.params.port, self.params.peers });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
@@ -85,7 +88,7 @@ pub const EthLibp2p = struct {
             },
         };
         std.debug.print("\n\ncalling publishMsgToRustBridge with byes={any} for data={any}\n\n", .{ message, data });
-        publishMsgToRustBridge(topic_id, message.ptr, message.len);
+        publishMsgToRustBridge(self.params.networkId, topic_id, message.ptr, message.len);
         return self.gossipHandler.onGossip(data);
     }
 
