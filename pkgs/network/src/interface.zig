@@ -95,7 +95,7 @@ pub const GenericGossipHandler = struct {
         };
     }
 
-    pub fn onGossip(self: *Self, data: *const GossipMessage) anyerror!void {
+    pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
         const topic = data.getTopic();
         const handlerArr = self.onGossipHandlers.get(topic).?;
         std.debug.print("\n\n\nnetwork-{d}:: ongossip handlerArr {any} for topic {any}\n", .{ self.networkId, handlerArr.items, topic });
@@ -109,30 +109,38 @@ pub const GenericGossipHandler = struct {
             publishWrapper.* = MessagePublishWrapper{ .handler = handler, .data = data, .networkId = self.networkId };
             std.debug.print("\n\n\nnetwork-{d}:: schedueling ongossip publishWrapper={any} on loop for topic {any}\n", .{ self.networkId, topic, publishWrapper });
 
-            self.timer.run(
-                self.loop,
-                c,
-                1,
-                MessagePublishWrapper,
-                publishWrapper,
-                (struct {
-                    fn callback(
-                        ud: ?*MessagePublishWrapper,
-                        _: *xev.Loop,
-                        _: *xev.Completion,
-                        r: xev.Timer.RunError!void,
-                    ) xev.CallbackAction {
-                        _ = r catch unreachable;
-                        if (ud) |pwrap| {
-                            std.debug.print("\n\n\n\nnetwork-{d}:: XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{pwrap.networkId});
-                            _ = pwrap.handler.onGossip(pwrap.data) catch void;
+            // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
+            // remove this option once resolved
+            if (scheduleOnLoop) {
+                self.timer.run(
+                    self.loop,
+                    c,
+                    1,
+                    MessagePublishWrapper,
+                    publishWrapper,
+                    (struct {
+                        fn callback(
+                            ud: ?*MessagePublishWrapper,
+                            _: *xev.Loop,
+                            _: *xev.Completion,
+                            r: xev.Timer.RunError!void,
+                        ) xev.CallbackAction {
+                            _ = r catch unreachable;
+                            if (ud) |pwrap| {
+                                std.debug.print("\n\n\n\nnetwork-{d}:: XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{pwrap.networkId});
+                                _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                            }
+                            // TODO defer freeing the publishwrapper but need handle to the allocator
+                            // also figure out how and when to best dealloc the completion
+                            return .disarm;
                         }
-                        // TODO defer freeing the publishwrapper but need handle to the allocator
-                        // also figure out how and when to best dealloc the completion
-                        return .disarm;
-                    }
-                }).callback,
-            );
+                    }).callback,
+                );
+            } else {
+                publishWrapper.handler.onGossip(publishWrapper.data) catch |e| {
+                    std.debug.print("\nnetwork-{d}:: onGossip handler error={any}\n", .{ self.networkId, e });
+                };
+            }
         }
         // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }

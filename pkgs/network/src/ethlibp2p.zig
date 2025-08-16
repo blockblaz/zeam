@@ -33,7 +33,8 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
 
     std.debug.print("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, topic, message, message_bytes });
 
-    zigHandler.gossipHandler.onGossip(&message) catch |e| {
+    // TODO: figure out why scheduling on the loop is not working
+    zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
         std.debug.print("!!!! onGossip handling of message failed with error e={any} !!!!\n", .{e});
     };
 }
@@ -98,7 +99,7 @@ pub const EthLibp2p = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data);
+        return self.gossipHandler.onGossip(data, false);
     }
 
     pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
