@@ -67,7 +67,6 @@ impl Network {
 }
 
 pub async fn start_network(&mut self,selfPort: i32, connectPort: i32) {
-    let mut p2p_net = self;
     let mut swarm = newSwarm();
         println!("starting listner");
 
