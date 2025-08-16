@@ -77,12 +77,12 @@ pub const EthLibp2p = struct {
         const message = switch (topic) {
             .block => messagebytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
-                defer serialized.deinit();
                 try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
 
                 break :messagebytes serialized.items;
             },
         };
+        std.debug.print("\n\ncalling publishMsgToRustBridge with byes={any} for data={any}\n\n", .{ message, data });
         publishMsgToRustBridge(topic_id, message.ptr, message.len);
         return self.gossipHandler.onGossip(data);
     }

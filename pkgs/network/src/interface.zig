@@ -95,7 +95,7 @@ pub const GenericGossipHandler = struct {
     pub fn onGossip(self: *Self, data: *const GossipMessage) anyerror!void {
         const topic = data.getTopic();
         const handlerArr = self.onGossipHandlers.get(topic).?;
-        std.debug.print("\n\n\n ongossip handlerarr {any} for topic {any}\n", .{ handlerArr.items, topic });
+        std.debug.print("\n\n\n ongossip handlerArr {any} for topic {any}\n", .{ handlerArr.items, topic });
         for (handlerArr.items) |handler| {
 
             // TODO: track and dealloc the structures
