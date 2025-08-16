@@ -34,7 +34,7 @@ const ZeamArgs = struct {
         },
         beam: struct {
             help: bool = false,
-            mockNetwork: bool = false,
+            mockNetwork: bool = true,
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -158,10 +158,13 @@ pub fn main() !void {
             } else {
                 // TODO: right now EthLibp2p act as a mock network
                 // however convert it into libp2p network by using rust bridge and create 2 separate networks
-                var network: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
-                network.* = try networks.EthLibp2p.init(allocator, loop, .{ .port = 9000, .peers = -1 });
-                backend1 = network.getNetworkInterface();
-                backend2 = network.getNetworkInterface();
+                var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .port = 9000, .peers = -1 });
+                backend1 = network1.getNetworkInterface();
+
+                // init a new lib2p network here
+                var network2 = network1;
+                backend2 = network2.getNetworkInterface();
                 std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
             }
 
