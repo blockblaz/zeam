@@ -25,7 +25,6 @@ const networks = @import("@zeam/network");
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     num_validators: u64 = 4,
-
     help: bool = false,
     version: bool = false,
 
