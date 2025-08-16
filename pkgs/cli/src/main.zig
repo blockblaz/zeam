@@ -34,6 +34,7 @@ const ZeamArgs = struct {
         },
         beam: struct {
             help: bool = false,
+            mockNetwork: bool = false,
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -118,6 +119,10 @@ pub fn main() !void {
             }
         },
         .beam => {
+            std.debug.print("beam opts ={any}\n", .{opts.args.__commands__.beam});
+
+            const mock_network = opts.args.__commands__.beam.mockNetwork;
+
             // some base mainnet spec would be loaded to build this up
             const chain_spec =
                 \\{"preset": "mainnet", "name": "beamdev"}
@@ -142,10 +147,29 @@ pub fn main() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            var mock_network: *networks.Mock = try allocator.create(networks.Mock);
-            mock_network.* = try networks.Mock.init(allocator, loop);
-            const backend = mock_network.getNetworkInterface();
-            std.debug.print("---\n\n mock gossip {any}\n\n", .{backend.gossip});
+            var backend1: networks.NetworkInterface = undefined;
+            var backend2: networks.NetworkInterface = undefined;
+            if (mock_network) {
+                var network: *networks.Mock = try allocator.create(networks.Mock);
+                network.* = try networks.Mock.init(allocator, loop);
+                backend1 = network.getNetworkInterface();
+                backend2 = network.getNetworkInterface();
+                std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
+            } else {
+                // TODO: right now EthLibp2p act as a mock network
+                // however convert it into libp2p network by using rust bridge and create 2 separate networks
+                var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .port = 9001, .peers = -1 });
+                try network1.run();
+                backend1 = network1.getNetworkInterface();
+
+                // init a new lib2p network here to connect with network1
+                var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .port = 9002, .peers = 9001 });
+                try network2.run();
+                backend2 = network2.getNetworkInterface();
+                std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
+            }
 
             var clock = try allocator.create(Clock);
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
@@ -155,18 +179,20 @@ pub fn main() !void {
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
+                .nodeId = 0,
                 .config = chain_config,
                 .anchorState = anchorState,
-                .backend = backend,
+                .backend = backend1,
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_1,
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
                 // options
+                .nodeId = 1,
                 .config = chain_config,
                 .anchorState = anchorState,
-                .backend = backend,
+                .backend = backend2,
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_2,

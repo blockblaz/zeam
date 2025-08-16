@@ -116,6 +116,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_network.addImport("@zeam/types", zeam_types);
     zeam_network.addImport("xev", xev);
+    zeam_network.addImport("ssz", ssz);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
@@ -160,6 +161,8 @@ pub fn build(b: *Builder) !void {
     addZkvmGlueLibs(b, cli_exe);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
+    cli_exe.linkSystemLibrary("rustlibp2p_bridge");
+    cli_exe.addLibraryPath(b.path("zig-out/bin"));
     b.installArtifact(cli_exe);
 
     const run_prover = b.addRunArtifact(cli_exe);
@@ -173,6 +176,13 @@ pub fn build(b: *Builder) !void {
     run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
 
     try build_zkvm_targets(b, &cli_exe.step, target);
+
+    // build the libp2p glue
+    var libp2p_cmd = build_rust_project(b, "pkgs/network/rustlibp2p-bridge");
+    cli_exe.step.dependOn(&libp2p_cmd.step);
+    var libp2p_install_cmd = b.addInstallBinFile(b.path("pkgs/network/rustlibp2p-bridge/target/release/librustlibp2p_bridge.so"), "librustlibp2p_bridge.so");
+    libp2p_install_cmd.step.dependOn(&libp2p_cmd.step);
+    cli_exe.step.dependOn(&libp2p_install_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -221,6 +231,9 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     addZkvmGlueLibs(b, cli_tests);
+    cli_tests.linkSystemLibrary("rustlibp2p_bridge");
+    cli_tests.addLibraryPath(b.path("zig-out/bin"));
+    cli_tests.step.dependOn(&libp2p_install_cmd.step);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -234,20 +247,24 @@ pub fn build(b: *Builder) !void {
 
     for (zkvm_targets) |zkvm_target| {
         if (zkvm_target.build_glue) {
-            const zkvm_host_cmd = b.addSystemCommand(&.{
-                "cargo",
-                "+nightly",
-                "-C",
-                b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}),
-                "-Z",
-                "unstable-options",
-                "build",
-                "--release",
-            });
+            var zkvm_host_cmd = build_rust_project(b, b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}));
             cli_exe.step.dependOn(&zkvm_host_cmd.step);
             cli_tests.step.dependOn(&zkvm_host_cmd.step);
         }
     }
+}
+
+fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
+    return b.addSystemCommand(&.{
+        "cargo",
+        "+nightly",
+        "-C",
+        path,
+        "-Z",
+        "unstable-options",
+        "build",
+        "--release",
+    });
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {

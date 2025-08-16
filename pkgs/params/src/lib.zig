@@ -14,5 +14,5 @@ const activePresetValues = @field(presets, @tagName(activePreset));
 pub const SECONDS_PER_SLOT = activePresetValues.SECONDS_PER_SLOT;
 
 test "test preset loading" {
-    try std.testing.expect(SECONDS_PER_SLOT == 4);
+    try std.testing.expect(SECONDS_PER_SLOT == mainnetPreset.preset.SECONDS_PER_SLOT);
 }

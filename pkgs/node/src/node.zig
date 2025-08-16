@@ -24,6 +24,7 @@ const NodeOpts = struct {
     clock: *clockFactory.Clock,
     db: LevelDB,
     validator_ids: ?[]usize = null,
+    nodeId: u32 = 0,
 };
 
 pub const BeamNode = struct {
@@ -32,6 +33,7 @@ pub const BeamNode = struct {
     chain: *chainFactory.BeamChain,
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
+    nodeId: u32,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -40,7 +42,7 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         const network = networkFactory.Network.init(opts.backend);
 
-        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState);
+        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId);
         if (opts.validator_ids) |ids| {
             validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network });
         }
@@ -51,6 +53,7 @@ pub const BeamNode = struct {
             .chain = chain,
             .network = network,
             .validator = validator,
+            .nodeId = opts.nodeId,
         };
     }
 
