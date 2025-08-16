@@ -49,7 +49,7 @@ pub fn publishMsgToRustBridge(message_str: *const u8, message_len: usize){
 }
 
 extern "C" {
-    fn handleMsgFromRustBridge(zigHandler: u64, message: *const u8, len: usize);
+    fn handleMsgFromRustBridge(zigHandler: u64, topic_ptr: *const u8, topic_len: usize, message_ptr: *const u8, message_len: usize);
 }
 
 
@@ -117,10 +117,12 @@ pub async fn run_eventloop(&mut self) {
                     message, ..
                     })) => {
                     {
-
+                        let topic = message.topic.as_str();
+                        let topic_ptr = topic.as_ptr();
+                        let topic_len = topic.len();
                         let message_ptr = message.data.as_ptr();
                         let message_len = message.data.len();
-                        unsafe {handleMsgFromRustBridge(self.zigHandler, message_ptr, message_len)};
+                        unsafe {handleMsgFromRustBridge(self.zigHandler, topic_ptr, topic_len, message_ptr, message_len)};
                         println!("\nzig callback completed\n");
                     }
 

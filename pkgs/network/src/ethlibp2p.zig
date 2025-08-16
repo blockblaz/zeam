@@ -8,8 +8,10 @@ const xev = @import("xev");
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, message_ptr: [*]const u8, message_len: usize) void {
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_ptr: [*]const u8, topic_len: usize, message_ptr: [*]const u8, message_len: usize) void {
+    const topic: []const u8 = topic_ptr[0..topic_len];
     const message: []const u8 = message_ptr[0..message_len];
+    _ = topic;
     _ = message;
     _ = zigHandler;
 }
