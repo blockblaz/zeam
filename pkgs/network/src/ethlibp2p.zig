@@ -41,7 +41,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
 
 // TODO: change listen port and connect port both to list of multiaddrs
 pub extern fn createAndRunNetwork(networkId: u32, a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
-pub extern fn publishMsgToRustBridge(networkId: u32, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -88,8 +88,8 @@ pub const EthLibp2p = struct {
                 break :messagebytes serialized.items;
             },
         };
-        std.debug.print("\n\nnetwork-{d}:: calling publishMsgToRustBridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
-        publishMsgToRustBridge(self.params.networkId, topic_id, message.ptr, message.len);
+        std.debug.print("\n\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
+        publish_msg_to_rust_bridge(self.params.networkId, topic_id, message.ptr, message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {

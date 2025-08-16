@@ -21,7 +21,7 @@ static mut swarm_state: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 static mut swarm_state1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 #[no_mangle]
-pub fn createAndRunNetwork(networkId: u32, zigHandler: u64, selfPort: i32, connectPort: i32) {
+pub fn createAndRunNetwork(network_id: u32, zig_handler: u64, self_port: i32, connect_port: i32) {
 
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -29,22 +29,22 @@ pub fn createAndRunNetwork(networkId: u32, zigHandler: u64, selfPort: i32, conne
         .unwrap();
 
         rt.block_on(async move {
-            let mut p2p_net = Network::new(networkId, zigHandler);
-           p2p_net.start_network(selfPort, connectPort).await;       
+            let mut p2p_net = Network::new(network_id, zig_handler);
+           p2p_net.start_network(self_port, connect_port).await;
            p2p_net.run_eventloop().await;
 
         });
 }
 
 #[no_mangle]
-pub fn publishMsgToRustBridge(networkId:u32, topic_id: u32, message_str: *const u8, message_len: usize){
+pub fn publish_msg_to_rust_bridge(network_id:u32, topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
-        println!("rustbridge-{networkId}:: publishing message s={:?}",message_slice);
+        println!("rustbridge-{network_id}:: publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
         // TODO: get the topic mapping from topic_id
         let topic = gossipsub::IdentTopic::new("block");
-         let mut swarm = if(networkId < 1) {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
+         let swarm = if(network_id < 1) {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
         // let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
         if let Err(e) = swarm.behaviour_mut().gossipsub
                     .publish(topic.clone(), message_data){
@@ -53,39 +53,39 @@ pub fn publishMsgToRustBridge(networkId:u32, topic_id: u32, message_str: *const 
 }
 
 extern "C" {
-    fn handleMsgFromRustBridge(zigHandler: u64, topic_id: u32, message_ptr: *const u8, message_len: usize);
+    fn handleMsgFromRustBridge(zig_handler: u64, topic_id: u32, message_ptr: *const u8, message_len: usize);
 }
 
 
 pub struct Network {
-    networkId: u32,
-    zigHandler: u64,
+    network_id: u32,
+    zig_handler: u64,
 }
 impl Network {
-    pub fn new(networkId: u32, zigHandler: u64) -> Self {
+    pub fn new(network_id: u32, zig_handler: u64) -> Self {
     let network: Network = Network {
-        networkId,
-        zigHandler,
+        network_id,
+        zig_handler,
     };
 
     network
 }
 
-pub async fn start_network(&mut self,selfPort: i32, connectPort: i32) {
-    let mut swarm = newSwarm();
+pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
+    let mut swarm = new_swarm();
         println!("starting listner");
 
     swarm.listen_on(
         Multiaddr::empty()
             .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(selfPort as u16)),
-    );
+            .with(Protocol::Tcp(self_port as u16)),
+    ).unwrap();
 
     println!("going for loop match");
 
-    if(connectPort > 0){
-        let connectString = format!("/ip4/127.0.0.1/tcp/{}", connectPort);
-        let addr: Multiaddr = connectString.parse().unwrap();
+    if(connect_port > 0){
+        let connect_string = format!("/ip4/127.0.0.1/tcp/{}", connect_port);
+        let addr: Multiaddr = connect_string.parse().unwrap();
 
         // helper closure for dialing peers
         let mut dial = |mut multiaddr: Multiaddr| {
@@ -100,12 +100,12 @@ pub async fn start_network(&mut self,selfPort: i32, connectPort: i32) {
         };
 
         dial(addr.clone());
-        println!("spinning on {selfPort} and connecting on {connectPort}");
+        println!("spinning on {self_port} and connecting on {connect_port}");
     }else{
-        println!("spinning on {selfPort} and standing by...");
+        println!("spinning on {self_port} and standing by...");
     }
 
-    if(self.networkId < 1){
+    if self.network_id < 1 {
         unsafe{
         swarm_state = Some(swarm);
       }
@@ -122,7 +122,7 @@ pub async fn start_network(&mut self,selfPort: i32, connectPort: i32) {
 }
 
 pub async fn run_eventloop(&mut self) {
-    let mut swarm = if(self.networkId < 1) {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
+    let swarm = if self.network_id < 1 {unsafe {swarm_state.as_mut().unwrap()}} else {unsafe {swarm_state1.as_mut().unwrap()}};
     // let mut swarm = unsafe {swarm_state.as_mut().unwrap()};
 
     loop {
@@ -135,12 +135,12 @@ pub async fn run_eventloop(&mut self) {
                     })) => {
                     {
                         let topic = message.topic.as_str();
-                        let topic_ptr = topic.as_ptr();
-                        let topic_len = topic.len();
+                        let _topic_ptr = topic.as_ptr();
+                        let _topic_len = topic.len();
                         let message_ptr = message.data.as_ptr();
                         let message_len = message.data.len();
-                        unsafe {handleMsgFromRustBridge(self.zigHandler, 0 , message_ptr, message_len)};
-                        println!("\nrustbridge{0}:: zig callback completed\n", self.networkId);
+                        unsafe {handleMsgFromRustBridge(self.zig_handler, 0 , message_ptr, message_len)};
+                        println!("\nrustbridge{0}:: zig callback completed\n", self.network_id);
                     }
 
                     
@@ -196,7 +196,7 @@ impl Behaviour {
     }
 }
 
-fn newSwarm() -> libp2p::swarm::Swarm<Behaviour> {
+fn new_swarm() -> libp2p::swarm::Swarm<Behaviour> {
     let local_private_key = secp256k1::Keypair::generate();
     let local_keypair:Keypair = local_private_key.into();
     let transport = build_transport(local_keypair.clone(), false).unwrap();
@@ -215,7 +215,7 @@ fn newSwarm() -> libp2p::swarm::Swarm<Behaviour> {
     // get all the topics to subscribe. infact impl the subscribe call from zig
     let topic = gossipsub::IdentTopic::new("block");
     // subscribes to our topic
-    swarm.behaviour_mut().gossipsub.subscribe(&topic);
+    swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
     swarm
 }
