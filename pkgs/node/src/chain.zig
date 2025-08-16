@@ -170,7 +170,8 @@ test "process and add mock blocks into a node's chain" {
 
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
-    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state);
+    const nodeid = 10; // random value
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid);
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
