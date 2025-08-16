@@ -167,9 +167,7 @@ pub fn main() !void {
                 var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .port = 9002, .peers = 9001 });
                 try network2.run();
-
-                // still using network1 for backend for in process network behav
-                backend2 = network1.getNetworkInterface();
+                backend2 = network2.getNetworkInterface();
                 std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
             }
 
@@ -181,6 +179,7 @@ pub fn main() !void {
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
+                .nodeId = 0,
                 .config = chain_config,
                 .anchorState = anchorState,
                 .backend = backend1,
@@ -190,6 +189,7 @@ pub fn main() !void {
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
                 // options
+                .nodeId = 1,
                 .config = chain_config,
                 .anchorState = anchorState,
                 .backend = backend2,
