@@ -30,7 +30,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: pkgs/state-transition-runtime/src/risc0/host
-        key: ${{ hashFiles('**/*') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
 
     - name: Install risc0
       run: |
