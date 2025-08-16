@@ -4,7 +4,11 @@ version = "0.0.1"
 edition = "2021"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = "symbols"
 
 [dependencies]
 libp2p-mplex = "0.42"

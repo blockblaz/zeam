@@ -348,18 +348,20 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
 
 fn build_rust_libp2p(b: *Builder, main_exe: *Builder.Step.Compile) !void {
     const RUST_DIR = "./pkgs/network/rustlibp2p-bridge";
-    const RUST_RELEASE_DIR = RUST_DIR ++ "/target/debug";
-    const DLL_NAME = "librustlibp2p_bridge.a";
+    const RUST_RELEASE_DIR = RUST_DIR ++ "/target/release";
+    const DLL_NAME = "librustlibp2p_bridge.so";
     const RUST_DLL_RELEASE_PATH = RUST_RELEASE_DIR ++ "/" ++ DLL_NAME;
     const ZIG_LIB_OUT_DIR = "zig-out/lib";
 
     std.debug.print("RustDir={s} RUST_RELEASE_DIR={s} DLL_NAME={s}\n\n", .{ RUST_DIR, RUST_RELEASE_DIR, DLL_NAME });
 
-    _ = b.run(&[_][]const u8{ "cargo", "build", "--manifest-path", RUST_DIR ++ "/Cargo.toml" });
+    _ = b.run(&[_][]const u8{ "cargo", "+nightly", "-C", RUST_DIR, "-Z", "unstable-options", "build", "--release" });
     const cwd = std.fs.cwd();
     std.debug.print("Copying {s} to {s}\n", .{ RUST_DLL_RELEASE_PATH, ZIG_LIB_OUT_DIR });
     try std.fs.Dir.copyFile(cwd, RUST_DLL_RELEASE_PATH, cwd, ZIG_LIB_OUT_DIR ++ "/" ++ DLL_NAME, .{});
     std.debug.print("Copied {s} to {s}\n", .{ DLL_NAME, ZIG_LIB_OUT_DIR });
 
-    main_exe.addObjectFile(b.path(ZIG_LIB_OUT_DIR ++ "/" ++ DLL_NAME));
+    main_exe.linkSystemLibrary("rustlibp2p_bridge");
+    main_exe.addLibraryPath(b.path(ZIG_LIB_OUT_DIR));
+    main_exe.addRPath(b.path(ZIG_LIB_OUT_DIR));
 }
