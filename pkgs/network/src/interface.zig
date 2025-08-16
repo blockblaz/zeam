@@ -68,6 +68,7 @@ pub const ReqRespRequest = union(ReqRespMethod) {
 const MessagePublishWrapper = struct {
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
+    networkId: u32,
 };
 
 pub const GenericGossipHandler = struct {
@@ -105,7 +106,8 @@ pub const GenericGossipHandler = struct {
             c.* = undefined;
 
             const publishWrapper = try self.allocator.create(MessagePublishWrapper);
-            publishWrapper.* = MessagePublishWrapper{ .handler = handler, .data = data };
+            publishWrapper.* = MessagePublishWrapper{ .handler = handler, .data = data, .networkId = self.networkId };
+            std.debug.print("\n\n\nnetwork-{d}:: schedueling ongossip publishWrapper={any} on loop for topic {any}\n", .{ self.networkId, topic, publishWrapper });
 
             self.timer.run(
                 self.loop,
@@ -122,7 +124,7 @@ pub const GenericGossipHandler = struct {
                     ) xev.CallbackAction {
                         _ = r catch unreachable;
                         if (ud) |pwrap| {
-                            std.debug.print("\n\n\n\n XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{});
+                            std.debug.print("\n\n\n\nnetwork-{d}:: XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{pwrap.networkId});
                             _ = pwrap.handler.onGossip(pwrap.data) catch void;
                         }
                         // TODO defer freeing the publishwrapper but need handle to the allocator
