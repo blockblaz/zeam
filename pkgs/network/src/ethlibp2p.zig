@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
@@ -14,19 +15,20 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, message_ptr: [*]const 
 }
 
 // TODO: change listen port and connect port both to list of multiaddrs
-pub extern fn createAndRunNetwork(a: *EthLibp2p, listenPort: i32, connectPort: i32) u32;
+pub extern fn createAndRunNetwork(a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
 pub extern fn publishMsgToRustBridge(message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
-    port: isize,
+    port: i32,
     // TODO convert into array multiaddrs
     // right now just take a connect peer port for testing ease
-    peers: isize,
+    peers: i32,
 };
 
 pub const EthLibp2p = struct {
     gossipHandler: interface.GenericGossipHandler,
     params: EthLibp2pParams,
+    rustBridgeThread: ?Thread = null,
 
     const Self = @This();
 
@@ -36,6 +38,10 @@ pub const EthLibp2p = struct {
         params: EthLibp2pParams,
     ) !Self {
         return Self{ .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
+    }
+
+    pub fn run(self: *Self) !void {
+        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetwork, .{ self, self.params.port, self.params.peers });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
