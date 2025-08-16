@@ -39,7 +39,7 @@ pub fn createAndRunNetwork(networkId: u32, zigHandler: u64, selfPort: i32, conne
 #[no_mangle]
 pub fn publishMsgToRustBridge(networkId:u32, topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
-        println!("publishing message s={:?}",message_slice);
+        println!("rustbridge-{networkId}:: publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
         // TODO: get the topic mapping from topic_id
@@ -140,7 +140,7 @@ pub async fn run_eventloop(&mut self) {
                         let message_ptr = message.data.as_ptr();
                         let message_len = message.data.len();
                         unsafe {handleMsgFromRustBridge(self.zigHandler, 0 , message_ptr, message_len)};
-                        println!("\nzig callback completed\n");
+                        println!("\nrustbridge{0}:: zig callback completed\n", self.networkId);
                     }
 
                     

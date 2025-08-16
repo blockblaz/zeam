@@ -12,7 +12,7 @@ pub const Mock = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
-        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
+        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, 0) };
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {

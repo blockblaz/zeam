@@ -31,7 +31,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         },
     };
 
-    std.debug.print("\n!!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ topic, message, message_bytes });
+    std.debug.print("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, topic, message, message_bytes });
 
     zigHandler.gossipHandler.onGossip(&message) catch |e| {
         std.debug.print("!!!! onGossip handling of message failed with error e={any} !!!!\n", .{e});
@@ -63,7 +63,7 @@ pub const EthLibp2p = struct {
         loop: *xev.Loop,
         params: EthLibp2pParams,
     ) !Self {
-        return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop) };
+        return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId) };
     }
 
     pub fn run(self: *Self) !void {
@@ -87,9 +87,8 @@ pub const EthLibp2p = struct {
                 break :messagebytes serialized.items;
             },
         };
-        std.debug.print("\n\ncalling publishMsgToRustBridge with byes={any} for data={any}\n\n", .{ message, data });
+        std.debug.print("\n\nnetwork-{d}:: calling publishMsgToRustBridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
         publishMsgToRustBridge(self.params.networkId, topic_id, message.ptr, message.len);
-        return self.gossipHandler.onGossip(data);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {

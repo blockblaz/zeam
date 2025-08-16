@@ -75,9 +75,10 @@ pub const GenericGossipHandler = struct {
     timer: xev.Timer,
     allocator: Allocator,
     onGossipHandlers: std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)),
+    networkId: u32,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
+    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32) !Self {
         const timer = try xev.Timer.init();
 
         var onGossipHandlers = std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)).init(allocator);
@@ -89,13 +90,14 @@ pub const GenericGossipHandler = struct {
             .loop = loop,
             .timer = timer,
             .onGossipHandlers = onGossipHandlers,
+            .networkId = networkId,
         };
     }
 
     pub fn onGossip(self: *Self, data: *const GossipMessage) anyerror!void {
         const topic = data.getTopic();
         const handlerArr = self.onGossipHandlers.get(topic).?;
-        std.debug.print("\n\n\n ongossip handlerArr {any} for topic {any}\n", .{ handlerArr.items, topic });
+        std.debug.print("\n\n\nnetwork-{d}:: ongossip handlerArr {any} for topic {any}\n", .{ self.networkId, handlerArr.items, topic });
         for (handlerArr.items) |handler| {
 
             // TODO: track and dealloc the structures
