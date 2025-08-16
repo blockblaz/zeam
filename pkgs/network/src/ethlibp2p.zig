@@ -74,6 +74,8 @@ pub const EthLibp2p = struct {
         const topic_id = switch (topic) {
             .block => 0,
         };
+
+        // TODO: deinit the message later ob once done
         const message = switch (topic) {
             .block => messagebytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
