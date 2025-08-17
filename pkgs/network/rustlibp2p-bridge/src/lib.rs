@@ -4,16 +4,16 @@ use libp2p::{gossipsub, identify, identity, core, noise, ping, yamux, PeerId, Tr
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use std::time::Duration;
 use futures::future::Either;
-use std::{net::Ipv4Addr,collections::hash_map::DefaultHasher,hash::{Hash, Hasher},};
+use std::{net::Ipv4Addr,collections::hash_map::DefaultHasher,hash::{Hash, Hasher}, sync::Mutex};
 use futures::StreamExt;
 use tokio::runtime::Builder;
+use std::sync::OnceLock;
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
-// TODO: protect the access by mutex
-static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-// a hack to start a second network for self testing purposes
-static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+// Use safe global state management instead of unsafe static mut
+static SWARM_STATE: OnceLock<Mutex<libp2p::swarm::Swarm<Behaviour>>> = OnceLock::new();
+static SWARM_STATE1: OnceLock<Mutex<libp2p::swarm::Swarm<Behaviour>>> = OnceLock::new();
 
 #[no_mangle]
 pub fn create_and_run_network(network_id: u32, zig_handler: u64, self_port: i32, connect_port: i32) {
@@ -39,8 +39,14 @@ pub fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *
 
         // TODO: get the topic mapping from topic_id
         let topic = gossipsub::IdentTopic::new("block");
-         let swarm = if network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
-        // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
+        
+        let swarm_lock = if network_id < 1 {
+            SWARM_STATE.get().expect("SWARM_STATE not initialized")
+        } else {
+            SWARM_STATE1.get().expect("SWARM_STATE1 not initialized")
+        };
+        
+        let mut swarm = swarm_lock.lock().unwrap();
         if let Err(e) = swarm.behaviour_mut().gossipsub
                     .publish(topic.clone(), message_data){
                     println!("Publish error: {e:?}");
@@ -101,13 +107,13 @@ pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
     }
 
     if self.network_id < 1 {
-        unsafe{
-        SWARM_STATE = Some(swarm);
-      }
-    }else{
-        unsafe{
-        SWARM_STATE1 = Some(swarm);
-      }
+        if let Err(_) = SWARM_STATE.set(Mutex::new(swarm)) {
+            panic!("SWARM_STATE already initialized");
+        }
+    } else {
+        if let Err(_) = SWARM_STATE1.set(Mutex::new(swarm)) {
+            panic!("SWARM_STATE1 already initialized");
+        }
     }
 
     // unsafe{
@@ -117,8 +123,13 @@ pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
 }
 
 pub async fn run_eventloop(&mut self) {
-    let swarm = if self.network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
-    // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
+    let swarm_lock = if self.network_id < 1 {
+        SWARM_STATE.get().expect("SWARM_STATE not initialized")
+    } else {
+        SWARM_STATE1.get().expect("SWARM_STATE1 not initialized")
+    };
+    
+    let mut swarm = swarm_lock.lock().unwrap();
 
     loop {
             match swarm.select_next_some().await {
