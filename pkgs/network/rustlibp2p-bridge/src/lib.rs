@@ -2,12 +2,13 @@ use libp2p::core::{multiaddr::Protocol, multiaddr::Multiaddr, muxing::StreamMuxe
 use libp2p::identity::{secp256k1, Keypair};
 use libp2p::{gossipsub, identify, identity, core, noise, ping, yamux, PeerId, Transport, SwarmBuilder};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use std::time::Duration;
+use tokio::time::{timeout, Duration};
 use futures::future::Either;
 use std::{net::Ipv4Addr,collections::hash_map::DefaultHasher,hash::{Hash, Hasher}, sync::Mutex};
 use futures::StreamExt;
 use tokio::runtime::Builder;
 use std::sync::OnceLock;
+use std::io::{self, Write}; // Import the necessary traits
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
@@ -46,7 +47,10 @@ pub fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *
             SWARM_STATE1.get().expect("SWARM_STATE1 not initialized")
         };
         
+        println!("aquiring swarm_lock");
         let mut swarm = swarm_lock.lock().unwrap();
+        println!("aquired  swarm_lock");
+
         if let Err(e) = swarm.behaviour_mut().gossipsub
                     .publish(topic.clone(), message_data){
                     println!("Publish error: {e:?}");
@@ -128,17 +132,18 @@ pub async fn run_eventloop(&mut self) {
     } else {
         SWARM_STATE1.get().expect("SWARM_STATE1 not initialized")
     };
-    
-    let mut swarm = swarm_lock.lock().unwrap();
 
+    // run the event loop yielding it every 100ms for publish to aquire mutex if called
+    let timeout_duration = Duration::from_millis(100);
     loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => {
+            let mut swarm = swarm_lock.lock().unwrap();
+            match timeout(timeout_duration, swarm.select_next_some()).await {
+                Ok(SwarmEvent::NewListenAddr { address, .. }) => {
                     println!("\nListening on {address:?}\n");
                 },
-                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                Ok(SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     message, ..
-                    })) => {
+                    }))) => {
                     {
                         let topic = message.topic.as_str();
                         let _topic_ptr = topic.as_ptr();
@@ -151,8 +156,17 @@ pub async fn run_eventloop(&mut self) {
 
                     
                 },
-                e => println!("{e:?}"),
+                // other events we are not interested in
+                Ok(e) => println!("{e:?}"),
+                // silently ignore timeout and reloop
+                Err(_e) => {},
             }
+
+            // print . for debugging to signal loop yielding
+            // TODO: remove once debugging done
+            print!("{0}.",self.network_id);
+            io::stdout().flush().unwrap();
+            drop(swarm);
         }
 }
 }
