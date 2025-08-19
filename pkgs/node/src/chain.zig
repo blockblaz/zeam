@@ -25,15 +25,17 @@ pub const BeamChain = struct {
     allocator: Allocator,
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
+    nodeId: u32,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState) !Self {
+    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, nodeId: u32) !Self {
         const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState);
 
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, anchorState);
 
         return Self{
+            .nodeId = nodeId,
             .config = config,
             .forkChoice = fork_choice,
             .allocator = allocator,
@@ -80,7 +82,7 @@ pub const BeamChain = struct {
             },
         };
 
-        std.debug.print("\n\n\n going for block production opts={any} raw block={any}\n\n", .{ opts, block });
+        std.debug.print("\n\n\n node-{d}::going for block production opts={any} raw block={any}\n\n", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state
         var logger = getLogger();
@@ -98,13 +100,13 @@ pub const BeamChain = struct {
 
     pub fn printSlot(self: *Self, slot: usize) !void {
         const fcHead = try self.forkChoice.updateHead();
-        std.debug.print("chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ slot, fcHead.blockRoot, fcHead.slot });
+        std.debug.print("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |block| {
-                std.debug.print("chain received block onGossip cb at slot={any}\n", .{block});
+                std.debug.print("node-{d}::chain received block onGossip cb at slot={any}\n", .{ self.nodeId, block });
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
 
@@ -168,7 +170,8 @@ test "process and add mock blocks into a node's chain" {
 
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
-    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state);
+    const nodeid = 10; // random value
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid);
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
