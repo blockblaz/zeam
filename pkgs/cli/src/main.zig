@@ -197,13 +197,28 @@ pub fn main() !void {
                 .db = .{},
                 .validator_ids = &validator_ids_2,
             });
-            std.debug.print("chainoptionsinfo={any}\n", .{beam_node_1.chain});
+            std.debug.print("chainoptionsinfo: {any}\n", .{.{
+                .nodeId = beam_node_1.chain.nodeId,
+                .config = beam_node_1.chain.config,
+                // .forkChoice = beam_node_1.chain.forkChoice,
+                .allocator = beam_node_1.chain.allocator,
+                .states = beam_node_1.chain.states,
+            }});
 
             try beam_node_1.run();
             try beam_node_2.run();
             try clock.run();
 
-            std.debug.print("forkchoice={any}\n", .{beam_node_1.chain.forkChoice});
+            std.debug.print("chainoptionsinfo: {any}\n", .{.{
+                .protoArray = beam_node_2.chain.forkChoice.protoArray,
+                .anchorState = beam_node_2.chain.forkChoice.anchorState,
+                .config = beam_node_2.chain.forkChoice.config,
+                .fcStore = beam_node_2.chain.forkChoice.fcStore,
+                .allocator = beam_node_2.chain.forkChoice.allocator,
+                .votes = beam_node_2.chain.forkChoice.votes,
+                .head = beam_node_2.chain.forkChoice.head,
+                .deltas = beam_node_2.chain.forkChoice.deltas,
+            }});
         },
     }
 }

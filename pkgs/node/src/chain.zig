@@ -26,10 +26,17 @@ pub const BeamChain = struct {
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
+    logger: *zeam_utils.ZeamLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, nodeId: u32) !Self {
-        const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState);
+    pub fn init(
+        allocator: Allocator,
+        config: configs.ChainConfig,
+        anchorState: types.BeamState,
+        nodeId: u32,
+        logger: *zeam_utils.ZeamLogger,
+    ) !Self {
+        const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState, logger);
 
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, anchorState);
@@ -40,6 +47,7 @@ pub const BeamChain = struct {
             .forkChoice = fork_choice,
             .allocator = allocator,
             .states = states,
+            .logger = logger,
         };
     }
 
@@ -82,14 +90,12 @@ pub const BeamChain = struct {
             },
         };
 
-        std.debug.print("\n\n\n node-{d}::going for block production opts={any} raw block={any}\n\n", .{ self.nodeId, opts, block });
+        // self.logger.debug("\n\n\n node-{d}::going for block production opts={any} raw block={any}\n\n", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state
-        var logger = getLogger();
-        logger.setActiveLevel(.debug);
-        try stf.apply_raw_block(self.allocator, &post_state, &block, &logger);
+        try stf.apply_raw_block(self.allocator, &post_state, &block, self.logger);
 
-        std.debug.print("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
+        // self.logger.debug("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
 
         // 3. fc onblock
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
@@ -100,25 +106,25 @@ pub const BeamChain = struct {
 
     pub fn printSlot(self: *Self, slot: usize) !void {
         const fcHead = try self.forkChoice.updateHead();
-        std.debug.print("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+        self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |block| {
-                std.debug.print("node-{d}::chain received block onGossip cb at slot={any}\n", .{ self.nodeId, block });
+                // self.logger.debug("node-{d}::chain received block onGossip cb at slot={any}\n", .{ self.nodeId, block });
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                std.debug.print("blockroot={any} hasblock={any}\n", .{ block_root, hasBlock });
+                // self.logger.debug("blockroot={any} hasblock={any}\n", .{ block_root, hasBlock });
                 if (!hasBlock) {
                     const hasParentBlock = self.forkChoice.hasBlock(block.message.parent_root);
-                    std.debug.print("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
+                    // self.logger.debug("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
                     if (hasParentBlock) {
                         self.onBlock(block) catch |err| {
-                            std.debug.print("\n\n\n ^^^^^^^^ Block processing error ^^^^^^\n{any}\n", .{err});
+                            self.logger.debug("\n\n\n ^^^^^^^^ Block processing error ^^^^^^\n{any}\n", .{err});
                         };
                     }
                 }
