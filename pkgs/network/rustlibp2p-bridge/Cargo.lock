@@ -2689,6 +2689,7 @@ dependencies = [
  "futures",
  "libp2p",
  "libp2p-mplex",
+ "once_cell",
  "slog",
  "tokio",
 ]

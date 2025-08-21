@@ -7,13 +7,19 @@ use futures::future::Either;
 use std::{net::Ipv4Addr,collections::hash_map::DefaultHasher,hash::{Hash, Hasher},};
 use futures::StreamExt;
 use tokio::runtime::Builder;
+use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
-// TODO: protect the access by mutex
-static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-// a hack to start a second network for self testing purposes
-static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+#[derive(Debug)]
+enum SwarmCommand {
+    Publish { topic_id: u32, message: Vec<u8> },
+}
+
+static SWARM_CHANNELS: Lazy<Mutex<HashMap<u32, mpsc::UnboundedSender<SwarmCommand>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[no_mangle]
 pub fn create_and_run_network(network_id: u32, zig_handler: u64, self_port: i32, connect_port: i32) {
@@ -25,26 +31,33 @@ pub fn create_and_run_network(network_id: u32, zig_handler: u64, self_port: i32,
 
         rt.block_on(async move {
             let mut p2p_net = Network::new(network_id, zig_handler);
-           p2p_net.start_network(self_port, connect_port).await;
-           p2p_net.run_eventloop().await;
-
+            let (swarm, command_rx) = p2p_net.start_network(self_port, connect_port).await;
+            p2p_net.run_eventloop(swarm, command_rx).await;
         });
 }
 
 #[no_mangle]
-pub fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *const u8, message_len: usize){
+pub fn publish_msg_to_rust_bridge(network_id:u32, topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
         println!("rustbridge-{network_id}:: publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
-        // TODO: get the topic mapping from topic_id
-        let topic = gossipsub::IdentTopic::new("block");
-         let swarm = if network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
-        // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
-        if let Err(e) = swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), message_data){
-                    println!("Publish error: {e:?}");
+        let command = SwarmCommand::Publish { 
+            topic_id, 
+            message: message_data 
+        };
+
+        if let Ok(channels) = SWARM_CHANNELS.lock() {
+            if let Some(sender) = channels.get(&network_id) {
+                if let Err(e) = sender.send(command) {
+                    println!("Failed to send publish command: {e:?}");
                 }
+            } else {
+                println!("No channel found for network_id: {}", network_id);
+            }
+        } else {
+            println!("Failed to acquire lock on SWARM_CHANNELS");
+        }
 }
 
 extern "C" {
@@ -66,7 +79,7 @@ impl Network {
     network
 }
 
-pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
+pub async fn start_network(&mut self,self_port: i32, connect_port: i32) -> (libp2p::swarm::Swarm<Behaviour>, mpsc::UnboundedReceiver<SwarmCommand>) {
     let mut swarm = new_swarm();
         println!("starting listner");
 
@@ -100,49 +113,58 @@ pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
         println!("spinning on {self_port} and standing by...");
     }
 
-    if self.network_id < 1 {
-        unsafe{
-        SWARM_STATE = Some(swarm);
-      }
-    }else{
-        unsafe{
-        SWARM_STATE1 = Some(swarm);
-      }
+    // Create channel for this network
+    let (tx, rx) = mpsc::unbounded_channel();
+    
+    // Register the channel
+    if let Ok(mut channels) = SWARM_CHANNELS.lock() {
+        channels.insert(self.network_id, tx);
     }
 
-    // unsafe{
-    //     SWARM_STATE = Some(swarm);
-    //   }
-
+    (swarm, rx)
 }
 
-pub async fn run_eventloop(&mut self) {
-    let swarm = if self.network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
-    // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
-
+pub async fn run_eventloop(&mut self, mut swarm: libp2p::swarm::Swarm<Behaviour>, mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>) {
     loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("\nListening on {address:?}\n");
-                },
-                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    message, ..
-                    })) => {
-                    {
-                        let topic = message.topic.as_str();
-                        let _topic_ptr = topic.as_ptr();
-                        let _topic_len = topic.len();
-                        let message_ptr = message.data.as_ptr();
-                        let message_len = message.data.len();
-                        unsafe {handleMsgFromRustBridge(self.zig_handler, 0 , message_ptr, message_len)};
-                        println!("\nrustbridge{0}:: zig callback completed\n", self.network_id);
+        tokio::select! {
+            swarm_event = swarm.select_next_some() => {
+                match swarm_event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("\nListening on {address:?}\n");
+                    },
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        message, ..
+                        })) => {
+                        {
+                            let topic = message.topic.as_str();
+                            let _topic_ptr = topic.as_ptr();
+                            let _topic_len = topic.len();
+                            let message_ptr = message.data.as_ptr();
+                            let message_len = message.data.len();
+                            unsafe {handleMsgFromRustBridge(self.zig_handler, 0 , message_ptr, message_len)};
+                            println!("\nrustbridge{0}:: zig callback completed\n", self.network_id);
+                        }
+                    },
+                    e => println!("{e:?}"),
+                }
+            }
+            command = command_rx.recv() => {
+                match command {
+                    Some(SwarmCommand::Publish { topic_id: _topic_id, message }) => {
+                        // TODO: get the topic mapping from topic_id
+                        let topic = gossipsub::IdentTopic::new("block");
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), message) {
+                            println!("Publish error: {e:?}");
+                        }
                     }
-
-                    
-                },
-                e => println!("{e:?}"),
+                    None => {
+                        println!("Command channel closed, stopping event loop");
+                        break;
+                    }
+                }
             }
         }
+    }
 }
 }
 
