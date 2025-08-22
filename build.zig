@@ -5,23 +5,18 @@ const Builder = std.Build;
 const zkvmTarget = struct {
     name: []const u8,
     set_pie: bool = false,
-    build_glue: bool = false,
     triplet: []const u8,
     cpu_features: []const u8,
 };
 
 const zkvm_targets: []const zkvmTarget = &.{
-    .{ .name = "risc0", .build_glue = true, .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
-    .{ .name = "zisk", .set_pie = true, .build_glue = false, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
+    .{ .name = "risc0", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
 // Add the glue libs to a compile target
 fn addZkvmGlueLibs(b: *Builder, comp: *Builder.Step.Compile) void {
-    for (zkvm_targets) |zkvm_target| {
-        if (zkvm_target.build_glue) {
-            comp.addObjectFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/host/target/release/libzeam_prover_host_{s}.a", .{ zkvm_target.name, zkvm_target.name })));
-        }
-    }
+    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
 }
 
 pub fn build(b: *Builder) !void {
@@ -246,13 +241,9 @@ pub fn build(b: *Builder) !void {
     const run_params_tests = b.addRunArtifact(params_tests);
     test_step.dependOn(&run_params_tests.step);
 
-    for (zkvm_targets) |zkvm_target| {
-        if (zkvm_target.build_glue) {
-            var zkvm_host_cmd = build_rust_project(b, b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}));
-            cli_exe.step.dependOn(&zkvm_host_cmd.step);
-            cli_tests.step.dependOn(&zkvm_host_cmd.step);
-        }
-    }
+    var zkvm_host_cmd = build_rust_project(b, "rust");
+    cli_exe.step.dependOn(&zkvm_host_cmd.step);
+    cli_tests.step.dependOn(&zkvm_host_cmd.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
