@@ -177,6 +177,14 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
+            const node1 = .node1;
+            const node2 = .node2;
+
+            var logger1 = utilsLib.getScopedLogger(node1);
+            var logger2 = utilsLib.getScopedLogger(node2);
+            logger1.setActiveLevel(.debug);
+            logger2.setActiveLevel(.debug);
+
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
                 .nodeId = 0,
@@ -186,6 +194,7 @@ pub fn main() !void {
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_1,
+                .logger = &logger1,
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
                 // options
@@ -196,29 +205,12 @@ pub fn main() !void {
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_2,
+                .logger = &logger2,
             });
-            std.debug.print("chainoptionsinfo: {any}\n", .{.{
-                .nodeId = beam_node_1.chain.nodeId,
-                .config = beam_node_1.chain.config,
-                // .forkChoice = beam_node_1.chain.forkChoice,
-                .allocator = beam_node_1.chain.allocator,
-                .states = beam_node_1.chain.states,
-            }});
 
             try beam_node_1.run();
             try beam_node_2.run();
             try clock.run();
-
-            std.debug.print("chainoptionsinfo: {any}\n", .{.{
-                .protoArray = beam_node_2.chain.forkChoice.protoArray,
-                .anchorState = beam_node_2.chain.forkChoice.anchorState,
-                .config = beam_node_2.chain.forkChoice.config,
-                .fcStore = beam_node_2.chain.forkChoice.fcStore,
-                .allocator = beam_node_2.chain.forkChoice.allocator,
-                .votes = beam_node_2.chain.forkChoice.votes,
-                .head = beam_node_2.chain.forkChoice.head,
-                .deltas = beam_node_2.chain.forkChoice.deltas,
-            }});
         },
     }
 }

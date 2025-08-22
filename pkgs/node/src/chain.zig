@@ -90,12 +90,12 @@ pub const BeamChain = struct {
             },
         };
 
-        // self.logger.debug("\n\n\n node-{d}::going for block production opts={any} raw block={any}\n\n", .{ self.nodeId, opts, block });
+        self.logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state
         try stf.apply_raw_block(self.allocator, &post_state, &block, self.logger);
 
-        // self.logger.debug("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
+        self.logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
 
         // 3. fc onblock
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
@@ -106,25 +106,25 @@ pub const BeamChain = struct {
 
     pub fn printSlot(self: *Self, slot: usize) !void {
         const fcHead = try self.forkChoice.updateHead();
-        self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+        self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |block| {
-                // self.logger.debug("node-{d}::chain received block onGossip cb at slot={any}\n", .{ self.nodeId, block });
+                self.logger.debug("node-{d}::chain received block onGossip cb at slot={any}", .{ self.nodeId, block });
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                // self.logger.debug("blockroot={any} hasblock={any}\n", .{ block_root, hasBlock });
+                self.logger.debug("blockroot={any} hasblock={any}", .{ block_root, hasBlock });
                 if (!hasBlock) {
                     const hasParentBlock = self.forkChoice.hasBlock(block.message.parent_root);
-                    // self.logger.debug("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
+                    self.logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
                     if (hasParentBlock) {
                         self.onBlock(block) catch |err| {
-                            self.logger.debug("\n\n\n ^^^^^^^^ Block processing error ^^^^^^\n{any}\n", .{err});
+                            self.logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
                         };
                     }
                 }

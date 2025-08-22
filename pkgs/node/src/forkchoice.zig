@@ -291,7 +291,7 @@ pub const ForkChoice = struct {
         }
 
         self.fcStore.currentSlot = currentSlot;
-        // self.logger.debug("\n\n forkchoice ticked slot to {any}\n", .{self.fcStore.currentSlot});
+        self.logger.debug("forkchoice ticked slot to {any}", .{self.fcStore.currentSlot});
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
@@ -362,7 +362,7 @@ pub const ForkChoice = struct {
             _ = parent_block;
 
             if (slot > self.fcStore.currentSlot) {
-                self.logger.debug("\n\n slot={any} currentslot={any}\n\n", .{ slot, self.fcStore.currentSlot });
+                self.logger.debug(" slot={any} currentslot={any}", .{ slot, self.fcStore.currentSlot });
                 return ForkChoiceError.FutureSlot;
             } else if (slot < self.fcStore.finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
