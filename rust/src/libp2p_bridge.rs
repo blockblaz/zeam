@@ -11,8 +11,10 @@ use tokio::runtime::Builder;
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 // TODO: protect the access by mutex
+#[allow(static_mut_refs)]
 static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 // a hack to start a second network for self testing purposes
+#[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 #[no_mangle]
@@ -31,14 +33,18 @@ pub fn create_and_run_network(network_id: u32, zig_handler: u64, self_port: i32,
         });
 }
 
+/// # Safety
+/// The caller must ensure that `message_str` points to valid memory of `message_len` bytes.
 #[no_mangle]
-pub fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *const u8, message_len: usize){
-        let message_slice = unsafe { std::slice::from_raw_parts(message_str, message_len) };
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *const u8, message_len: usize){
+        let message_slice = std::slice::from_raw_parts(message_str, message_len);
         println!("rustbridge-{network_id}:: publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
         // TODO: get the topic mapping from topic_id
         let topic = gossipsub::IdentTopic::new("block");
+         #[allow(static_mut_refs)]
          let swarm = if network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
         // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
         if let Err(e) = swarm.behaviour_mut().gossipsub
@@ -117,6 +123,7 @@ pub async fn start_network(&mut self,self_port: i32, connect_port: i32) {
 }
 
 pub async fn run_eventloop(&mut self) {
+    #[allow(static_mut_refs)]
     let swarm = if self.network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
     // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
 

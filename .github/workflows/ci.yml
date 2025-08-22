@@ -36,7 +36,7 @@ jobs:
 
     - name: Run clippy on hosts
       run: |
-        cargo clippy --manifest-path rust/Cargo.toml # -- -D warnings
+        cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
 
     - name: Lint
       run: zig fmt --check *.zig
