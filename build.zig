@@ -156,18 +156,9 @@ pub fn build(b: *Builder) !void {
     addZkvmGlueLibs(b, cli_exe);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
-    cli_exe.linkSystemLibrary("rustlibp2p_bridge");
-    cli_exe.addLibraryPath(b.path("zig-out/bin"));
     b.installArtifact(cli_exe);
 
     try build_zkvm_targets(b, &cli_exe.step, target);
-
-    // build the libp2p glue
-    var libp2p_cmd = build_rust_project(b, "pkgs/network/rustlibp2p-bridge");
-    cli_exe.step.dependOn(&libp2p_cmd.step);
-    var libp2p_install_cmd = b.addInstallBinFile(b.path("pkgs/network/rustlibp2p-bridge/target/release/librustlibp2p_bridge.so"), "librustlibp2p_bridge.so");
-    libp2p_install_cmd.step.dependOn(&libp2p_cmd.step);
-    cli_exe.step.dependOn(&libp2p_install_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -178,7 +169,6 @@ pub fn build(b: *Builder) !void {
         run_prover.addArgs(&[_][]const u8{"prove"});
         run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
     }
-    run_prover.step.dependOn(&libp2p_install_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
 
@@ -227,9 +217,6 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     addZkvmGlueLibs(b, cli_tests);
-    cli_tests.linkSystemLibrary("rustlibp2p_bridge");
-    cli_tests.addLibraryPath(b.path("zig-out/bin"));
-    cli_tests.step.dependOn(&libp2p_install_cmd.step);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 

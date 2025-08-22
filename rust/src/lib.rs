@@ -1,6 +1,8 @@
 use risc0_zkvm::{compute_image_id, default_prover, ExecutorEnv, Receipt};
 use std::fs;
 
+pub mod libp2p_bridge;
+
 #[no_mangle]
 extern "C" fn risc0_prove(
     serialized_block: *const u8,
