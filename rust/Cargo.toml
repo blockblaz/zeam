@@ -1,16 +1,11 @@
 [package]
-name = "rustlibp2p-bridge"
-version = "0.0.1"
+name = "rustglue"
+version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib"]
-
-[profile.release]
-lto = true
-strip = "symbols"
-
 [dependencies]
+risc0-zkvm = { version = "3.0.0-rc.1" }
+serde_cbor = "0.11.2"
 libp2p-mplex = "0.42"
 futures = "0.3.31"
 tokio = { version = "1", features = ["full"] }
@@ -20,3 +15,10 @@ slog = { version = "2", features = ["max_level_debug", "release_max_level_debug"
 version = "0.54"
 default-features = false
 features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+lto = true
+strip = "symbols"

@@ -73,7 +73,6 @@ fn tagged_struct(tag: []const u8, down: []const [32]u8, data: []const u32) [32]u
     return hash_bytes(buffer[0..total_size]);
 }
 
-
 fn sys_halt(out_state: *const [8]u32, status: u32) noreturn {
     asm volatile ("ecall"
         :

@@ -10,12 +10,6 @@ name: CI
 jobs:
   lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        host: [
-          'risc0',
-          'powdr'
-        ]
     steps:
     - uses: actions/checkout@v2
 
@@ -38,11 +32,11 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ runner.os }}-cargo-${{ matrix.host }}-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run clippy on hosts
       run: |
-        cargo clippy --manifest-path pkgs/state-transition-runtime/src/${{ matrix.host }}/host/Cargo.toml # -- -D warnings
+        cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
 
     - name: Lint
       run: zig fmt --check *.zig
