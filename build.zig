@@ -156,6 +156,9 @@ pub fn build(b: *Builder) !void {
     addZkvmGlueLibs(b, cli_exe);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
+    if (target.result.os.tag == .macos) {
+        cli_exe.linkFramework("CoreFoundation");
+    }
     b.installArtifact(cli_exe);
 
     try build_zkvm_targets(b, &cli_exe.step, target);
@@ -217,6 +220,9 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     addZkvmGlueLibs(b, cli_tests);
+    if (target.result.os.tag == .macos) {
+        cli_tests.linkFramework("CoreFoundation");
+    }
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
