@@ -6,6 +6,8 @@ const types = @import("@zeam/types");
 
 const utils = @import("./utils.zig");
 pub usingnamespace utils;
+const zeam_utils = @import("@zeam/utils");
+
 
 const transition = @import("./transition.zig");
 
@@ -41,13 +43,17 @@ test "apply transition on mocked chain" {
     const mock_chain = try genMockChain(allocator, 5, test_config);
     try std.testing.expect(mock_chain.blocks.len == 5);
 
+    const logger = zeam_utils.getLogger(.info);
+
+
+
     // starting beam state
     var beam_state = mock_chain.genesis_state;
     // block 0 is genesis so we have to apply block 1 onwards
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block, .{});
+        try apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
     }
 
     // check the post state root to be equal to block2's stateroot
@@ -69,6 +75,7 @@ test "genStateBlockHeader" {
     const allocator = arena_allocator.allocator();
 
     const mock_chain = try genMockChain(allocator, 2, test_config);
+    const logger = zeam_utils.getLogger(.info);
 
     var beam_state = mock_chain.genesis_state;
     for (0..mock_chain.blocks.len) |i| {
@@ -86,7 +93,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block, .{});
+            try apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
         }
     }
 }

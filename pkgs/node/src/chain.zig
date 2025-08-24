@@ -10,7 +10,6 @@ const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 
 const zeam_utils = @import("@zeam/utils");
-const getLogger = zeam_utils.getLogger;
 
 pub const fcFactory = @import("./forkchoice.zig");
 
@@ -177,7 +176,9 @@ test "process and add mock blocks into a node's chain" {
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeid = 10; // random value
-    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid);
+    const logger = zeam_utils.getLogger(.info);
+
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);

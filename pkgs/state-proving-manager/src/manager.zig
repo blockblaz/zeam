@@ -3,7 +3,6 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const utils = @import("@zeam/utils");
-const getLogger = utils.getLogger;
 
 const Allocator = std.mem.Allocator;
 
