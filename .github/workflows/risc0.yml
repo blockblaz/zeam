@@ -26,8 +26,7 @@ jobs:
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        workspaces: pkgs/state-transition-runtime/src/risc0/host
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+        workspaces: rust
 
     - name: Install risc0
       run: |

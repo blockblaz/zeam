@@ -32,7 +32,7 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        workspaces: rust
 
     - name: Run clippy on hosts
       run: |
