@@ -26,7 +26,7 @@ pub const BeamChain = struct {
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
-    logger: *zeam_utils.ZeamLogger,
+    logger: *const zeam_utils.ZeamLogger,
 
     const Self = @This();
     pub fn init(
@@ -34,7 +34,7 @@ pub const BeamChain = struct {
         config: configs.ChainConfig,
         anchorState: types.BeamState,
         nodeId: u32,
-        logger: *zeam_utils.ZeamLogger,
+        logger: *const zeam_utils.ZeamLogger,
     ) !Self {
         const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState, logger);
 
@@ -141,7 +141,7 @@ pub const BeamChain = struct {
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
         // 2. apply STF to get post state
-        try stf.apply_transition(self.allocator, &post_state, signedBlock, .{});
+        try stf.apply_transition(self.allocator, &post_state, signedBlock, .{ .logger = self.logger });
 
         // 3. fc onblock
         const block = signedBlock.message;

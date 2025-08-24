@@ -44,8 +44,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
 
-    var logger = getLogger();
-    logger.setActiveLevel(opts.activeLogLevel);
+    const logger = opts.logger;
     logger.debug("prove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
 
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;

@@ -78,8 +78,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var head_idx: usize = 0;
     try headList.append(.{ .root = block_root, .slot = head_idx });
 
-    var logger = getLogger();
-    logger.setActiveLevel(.info);
+    // TODO: pass logger as genmockchain arg with scope set
+    const logger = getLogger(.info);
 
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
