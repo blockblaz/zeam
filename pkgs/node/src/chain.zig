@@ -8,6 +8,7 @@ const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
+const metrics = @import("@zeam/metrics");
 
 const zeam_utils = @import("@zeam/utils");
 
@@ -135,6 +136,7 @@ pub const BeamChain = struct {
 
     // import block assuming it is validated
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
+        const onblock_timer = metrics.chain_onblock_duration_seconds.start();
         // 1. get parent state
         const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
@@ -152,6 +154,7 @@ pub const BeamChain = struct {
         }
         // 3. fc update head
         _ = try self.forkChoice.updateHead();
+        onblock_timer.observe();
     }
 };
 
