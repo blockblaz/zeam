@@ -24,10 +24,14 @@ RUN curl -L https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz |
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install RISC0 toolchain using rzup
-RUN curl -L https://risczero.com/install | bash
+# Install RISC0 toolchain using rzup (only for linux/amd64)
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        curl -L https://risczero.com/install | bash && \
+        export PATH="/root/.risc0/bin:${PATH}" && \
+        rzup install; \
+    fi
 ENV PATH="/root/.risc0/bin:${PATH}"
-RUN rzup install
 
 # Set working directory
 WORKDIR /app
@@ -80,8 +84,8 @@ COPY --from=builder /app/zig-out/ /app/zig-out/
 # Copy runtime resources
 COPY --from=builder /app/resources/ /app/resources/
 
-# Set the zeam binary as the entrypoint
-ENTRYPOINT ["/app/zig-out/bin/zeam"]
+# Set the zeam binary as the entrypoint with beam parameter by default
+ENTRYPOINT ["/app/zig-out/bin/zeam", "beam"]
 
 # IMPORTANT NOTES:
 #
