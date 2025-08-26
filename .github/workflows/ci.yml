@@ -89,6 +89,6 @@ jobs:
         context: .
         file: ./Dockerfile
         push: false  # Don't push, just build to verify
-        tags: zeam:pr-${{ github.event.number }}
+        tags: zeam:ci-${{ github.run_number }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
