@@ -44,6 +44,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("xev");
+    const metrics = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("metrics");
 
     // add zeam-params
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -77,6 +81,14 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/utils", zeam_utils);
     zeam_configs.addImport("@zeam/types", zeam_types);
     zeam_configs.addImport("@zeam/params", zeam_params);
+
+    // add zeam-metrics
+    const zeam_metrics = b.addModule("@zeam/metrics", .{
+        .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_metrics.addImport("metrics", metrics);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -132,6 +144,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
+    zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
 
     // Create build options
     const build_options = b.addOptions();
@@ -157,6 +170,8 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
+    cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    cli_exe.root_module.addImport("metrics", metrics);
 
     addRustGlueLib(b, cli_exe, target);
     cli_exe.linkLibC(); // for rust static libs to link
