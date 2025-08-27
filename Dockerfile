@@ -15,10 +15,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig 0.14.0
-RUN curl -L https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar -xJ \
-    && mv zig-linux-x86_64-0.14.0 /opt/zig \
-    && ln -s /opt/zig/zig /usr/local/bin/zig
+# Install Zig 0.14.0 based on architecture
+ARG TARGETARCH
+RUN ZIG_VERSION="0.14.0" && \
+    case "$TARGETARCH" in \
+        amd64) ZIG_ARCH="x86_64" ;; \
+        arm64) ZIG_ARCH="aarch64" ;; \
+        arm) ZIG_ARCH="armv7a" ;; \
+        386) ZIG_ARCH="x86" ;; \
+        riscv64) ZIG_ARCH="riscv64" ;; \
+        *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
+    esac && \
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" | tar -xJ && \
+    mv "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" /opt/zig && \
+    ln -s /opt/zig/zig /usr/local/bin/zig
 
 # Install Rust 1.85+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0
@@ -62,18 +72,58 @@ RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") &&
     fi && \
     zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
 
+# Intermediate stage to prepare runtime libraries
+FROM ubuntu:24.04 AS runtime-prep
+ARG TARGETARCH
+
+# Copy built binaries and resources from builder
+COPY --from=builder /app/zig-out/ /app/zig-out/
+COPY --from=builder /app/resources/ /app/resources/
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Create a script to copy the right libraries based on architecture
+RUN mkdir -p /runtime-libs && \
+    case "$TARGETARCH" in \
+        amd64) \
+            LIBDIR="x86_64-linux-gnu" && \
+            LDSO="/lib64/ld-linux-x86-64.so.2" \
+            ;; \
+        arm64) \
+            LIBDIR="aarch64-linux-gnu" && \
+            LDSO="/lib/ld-linux-aarch64.so.1" \
+            ;; \
+        arm) \
+            LIBDIR="arm-linux-gnueabihf" && \
+            LDSO="/lib/ld-linux-armhf.so.3" \
+            ;; \
+        386) \
+            LIBDIR="i386-linux-gnu" && \
+            LDSO="/lib/ld-linux.so.2" \
+            ;; \
+        riscv64) \
+            LIBDIR="riscv64-linux-gnu" && \
+            LDSO="/lib/ld-linux-riscv64-lp64d.so.1" \
+            ;; \
+        *) \
+            echo "Unsupported architecture: $TARGETARCH" && exit 1 \
+            ;; \
+    esac && \
+    if [ -d "/lib/$LIBDIR" ]; then \
+        mkdir -p "/runtime-libs/lib/$LIBDIR" && \
+        for lib in libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libgcc_s.so.1 libstdc++.so.6; do \
+            [ -f "/lib/$LIBDIR/$lib" ] && cp -L "/lib/$LIBDIR/$lib" "/runtime-libs/lib/$LIBDIR/" || true; \
+        done; \
+    fi && \
+    if [ -f "$LDSO" ]; then \
+        mkdir -p "/runtime-libs$(dirname $LDSO)" && \
+        cp -L "$LDSO" "/runtime-libs$LDSO"; \
+    fi
+
 # Runtime stage - using scratch for absolute minimal size
 FROM scratch AS runtime
 
-# Copy only the essential runtime libraries from Ubuntu
-COPY --from=builder /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/librt.so.1 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib/x86_64-linux-gnu/libstdc++.so.6 /lib/x86_64-linux-gnu/
-COPY --from=builder /lib64/ld-linux-x86-64.so.2 /lib64/
+# Copy the architecture-specific libraries and loader
+COPY --from=runtime-prep /runtime-libs/ /
 
 # Copy SSL certificates for HTTPS
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
