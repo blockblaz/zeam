@@ -44,13 +44,18 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("xev");
+    const pg = b.dependency("datetime", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
-    // add zeam-params
+    // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/utils/src/lib.zig"),
     });
+    zeam_utils.addImport("datetime", pg.module("datetime"));
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -149,6 +154,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("build_options", build_options.createModule());
     cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("xev", xev);
+    cli_exe.root_module.addImport("datetime", pg.module("datetime"));
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);
@@ -266,6 +272,10 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .target = target,
             .optimize = optimize,
         }).module("ssz.zig");
+        const pg = b.dependency("datetime", .{
+            .target = target,
+            .optimize = optimize,
+        });
 
         // add zeam-params
         const zeam_params = b.addModule("@zeam/params", .{
@@ -288,6 +298,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
+        zeam_utils.addImport("datetime", pg.module("datetime"));
 
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,

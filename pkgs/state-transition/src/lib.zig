@@ -8,7 +8,6 @@ const utils = @import("./utils.zig");
 pub usingnamespace utils;
 const zeam_utils = @import("@zeam/utils");
 
-
 const transition = @import("./transition.zig");
 
 pub const apply_transition = transition.apply_transition;
@@ -44,8 +43,6 @@ test "apply transition on mocked chain" {
     try std.testing.expect(mock_chain.blocks.len == 5);
 
     const logger = zeam_utils.getLogger(.info);
-
-
 
     // starting beam state
     var beam_state = mock_chain.genesis_state;
