@@ -4,7 +4,7 @@ const datetime = @import("datetime");
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
-pub fn comptTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, timestamp_str: anytype) void {
+pub fn comptTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, timestamp_str: []const u8) void {
     if (@intFromEnum(level) > @intFromEnum(activeLevel)) {
         return;
     }
@@ -39,7 +39,6 @@ pub fn comptTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, com
 pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
     var ts_buf: [64]u8 = undefined;
     const timestamp_str = getFormattedTimestamp(&ts_buf);
-
     switch (scope) {
         .default => return comptTimeLog(.default, activeLevel, level, fmt, args, timestamp_str),
         .n1 => return comptTimeLog(.n1, activeLevel, level, fmt, args, timestamp_str),
