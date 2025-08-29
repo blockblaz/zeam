@@ -272,10 +272,6 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .target = target,
             .optimize = optimize,
         }).module("ssz.zig");
-        const pg = b.dependency("datetime", .{
-            .target = target,
-            .optimize = optimize,
-        });
 
         // add zeam-params
         const zeam_params = b.addModule("@zeam/params", .{
@@ -298,7 +294,6 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
-        zeam_utils.addImport("datetime", pg.module("datetime"));
 
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
