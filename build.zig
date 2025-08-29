@@ -44,10 +44,11 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("xev");
+
     const datetime = b.dependency("datetime", .{
         .target = target,
         .optimize = optimize,
-    });
+    }).module("datetime");
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -55,7 +56,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .root_source_file = b.path("pkgs/utils/src/lib.zig"),
     });
-    zeam_utils.addImport("datetime", datetime.module("datetime"));
+    zeam_utils.addImport("datetime", datetime);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -154,7 +155,6 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("build_options", build_options.createModule());
     cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
     cli_exe.root_module.addImport("xev", xev);
-    cli_exe.root_module.addImport("datetime", datetime.module("datetime"));
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);

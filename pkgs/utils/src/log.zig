@@ -108,24 +108,20 @@ pub fn getLogger(activeLevel: ?std.log.Level) ZeamLogger {
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
-    if (builtin.target.os.tag == .freestanding) {
-        return buf[0..0];
-    } else {
-        const ts = std.time.timestamp();
-        // converts millisecond to Datetime
-        const dt = datetime.datetime.Datetime.fromTimestamp(ts * 1000);
+    const ts = std.time.timestamp();
+    // converts millisecond to Datetime
+    const dt = datetime.datetime.Datetime.fromTimestamp(ts * 1000);
 
-        const months: [12][]const u8 = .{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-        const month_str = months[dt.date.month - 1];
-        const ms: u16 = @intCast(dt.time.nanosecond / 1_000_000);
+    const months: [12][]const u8 = .{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const month_str = months[dt.date.month - 1];
+    const ms: u16 = @intCast(dt.time.nanosecond / 1_000_000);
 
-        return std.fmt.bufPrint(buf[0..], "{s} {:0>2} {:0>2}:{:0>2}:{:0>2} {:0>3}", .{
-            month_str,
-            dt.date.day,
-            dt.time.hour,
-            dt.time.minute,
-            dt.time.second,
-            ms,
-        }) catch return buf[0..0];
-    }
+    return std.fmt.bufPrint(buf[0..], "{s} {:0>2} {:0>2}:{:0>2}:{:0>2} {:0>3}", .{
+        month_str,
+        dt.date.day,
+        dt.time.hour,
+        dt.time.minute,
+        dt.time.second,
+        ms,
+    }) catch return buf[0..0];
 }
