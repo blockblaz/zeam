@@ -20,9 +20,6 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     if (builtin.target.os.tag == .freestanding) {
         const io = @import("zkvm").io;
         var buf: [4096]u8 = undefined;
-        // TODO don't throw error because it somehow messes with creation of  noopLogger as noopLog
-        // doesn't throw and somehow it can't seem to infer error types as they might not be same
-        // across all log fns, figure out in a later PR
         // skip adding timestamp inside zkvm to keep the execution trace static between prover and verifier
         const print_str = std.fmt.bufPrint(buf[0..], prefix ++ fmt ++ "\n", args) catch @panic("error formatting log\n");
         io.print_str(print_str);
