@@ -23,6 +23,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         // TODO don't throw error because it somehow messes with creation of  noopLogger as noopLog
         // doesn't throw and somehow it can't seem to infer error types as they might not be same
         // across all log fns, figure out in a later PR
+        // skip adding timestamp inside zkvm to keep the execution trace static between prover and verifier
         const print_str = std.fmt.bufPrint(buf[0..], prefix ++ fmt ++ "\n", args) catch @panic("error formatting log\n");
         io.print_str(print_str);
     } else {
@@ -30,7 +31,6 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         defer std.debug.unlockStdErr();
         const stderr = std.io.getStdErr().writer();
 
-        // timestamp is not used in the freestanding os because it would then change execution trace for the prover/verifier
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
 
