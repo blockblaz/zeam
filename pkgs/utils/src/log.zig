@@ -116,7 +116,7 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
     const month_str = months[dt.date.month - 1];
     const ms: u16 = @intCast(dt.time.nanosecond / 1_000_000);
 
-    return std.fmt.bufPrint(buf[0..], "{s} {:0>2} {:0>2}:{:0>2}:{:0>2} {:0>3}", .{
+    return std.fmt.bufPrint(buf[0..], "{s}-{:0>2} {:0>2}:{:0>2}:{:0>2}.{:0>3}", .{
         month_str,
         dt.date.day,
         dt.time.hour,
