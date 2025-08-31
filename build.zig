@@ -54,6 +54,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("datetime");
 
+    const enr = b.dependency("zig_enr", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig-enr");
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -201,6 +206,18 @@ pub fn build(b: *Builder) !void {
         run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
     }
 
+    // Add the tools cli executable
+    const tools_cli_exe = b.addExecutable(.{
+        .name = "zeam-tools",
+        .root_source_file = b.path("pkgs/tools-cli/src/main.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    tools_cli_exe.root_module.addImport("enr", enr);
+    tools_cli_exe.root_module.addImport("build_options", build_options.createModule());
+    tools_cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    b.installArtifact(tools_cli_exe);
+
     const test_step = b.step("test", "Run unit tests");
 
     const types_tests = b.addTest(.{
@@ -261,6 +278,15 @@ pub fn build(b: *Builder) !void {
     test_step.dependOn(&run_params_tests.step);
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
+
+    const tools_cli_tests = b.addTest(.{
+        .root_module = tools_cli_exe.root_module,
+        .optimize = optimize,
+        .target = target,
+    });
+    tools_cli_tests.root_module.addImport("enr", enr);
+    const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    test_step.dependOn(&run_tools_cli_test.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
