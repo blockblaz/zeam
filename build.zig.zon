@@ -19,6 +19,10 @@
             .url = "git+https://github.com/frmdstryr/zig-datetime?ref=master#3a39a21e6e34dcb0ade0ff828d0914d40ba535f3",
             .hash = "datetime-0.8.0-cJNXzP_YAQBxQ5hkNNP6ScnG5XsqciJmeP5RVV4xwCBA",
         },
+        .zig_enr = .{
+            .url = "git+https://github.com/blockblaz/enr#702fc2262cad4d387ef62385569534f8e20e499e",
+            .hash = "zig_enr-0.0.0-ak9ZXDk5AQCrVlosm0vlP__x0E5YX0oEhqaaYCf2Dq72",
+        },
     },
     .paths = .{""},
 }
