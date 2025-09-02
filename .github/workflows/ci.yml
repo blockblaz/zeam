@@ -16,7 +16,7 @@ jobs:
     - name: Set up Zig
       uses: korandoru/setup-zig@v1
       with:
-        zig-version: 0.14.0
+        zig-version: 0.14.1
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -49,10 +49,10 @@ jobs:
     - name: Set up Zig
       uses: korandoru/setup-zig@v1
       with:
-        zig-version: 0.14.0
+        zig-version: 0.14.1
 
     - name: build
-      run: zig build
+      run: zig build all
 
   test:
     name: test
@@ -66,11 +66,11 @@ jobs:
     - name: Set up Zig
       uses: korandoru/setup-zig@v1
       with:
-        zig-version: 0.14.0
+        zig-version: 0.14.1
     
     - name: Test
       # figure out how to build the monorepo builds
-      run: zig build test --summary all
+      run: zig build test-all --summary all
 
   docker-build:
     name: docker-build

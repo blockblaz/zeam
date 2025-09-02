@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig 0.14.0 based on architecture
+# Install Zig 0.14.1 based on architecture
 ARG TARGETARCH
-RUN ZIG_VERSION="0.14.0" && \
+RUN ZIG_VERSION="0.14.1" && \
     case "$TARGETARCH" in \
         amd64) ZIG_ARCH="x86_64" ;; \
         arm64) ZIG_ARCH="aarch64" ;; \
@@ -70,7 +70,7 @@ RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") &&
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
+    zig build all -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep
