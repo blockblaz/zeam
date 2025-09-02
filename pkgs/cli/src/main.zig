@@ -91,7 +91,7 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            const logger = utilsLib.getLogger(null);
+            const logger = utilsLib.getLogger(null, null);
 
             const options = stateProvingManager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -180,8 +180,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, .debug);
-            const logger2 = utilsLib.getScopedLogger(.n2, .debug);
+            const logger1 = utilsLib.getScopedLogger(.n1, .debug, "/home/noopur/zeammain/zeam");
+            const logger2 = utilsLib.getScopedLogger(.n2, .debug, "/home/noopur/zeammain/zeam");
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options

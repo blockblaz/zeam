@@ -176,7 +176,7 @@ test "process and add mock blocks into a node's chain" {
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeid = 10; // random value
-    const logger = zeam_utils.getLogger(.info);
+    const logger = zeam_utils.getLogger(.info, null);
 
     var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
 
