@@ -70,7 +70,7 @@ jobs:
     
     - name: Test
       # figure out how to build the monorepo builds
-      run: zig build test --summary all
+      run: zig build test-all --summary all
 
   docker-build:
     name: docker-build
