@@ -26,8 +26,8 @@ RUN ZIG_VERSION="0.14.1" && \
         riscv64) ZIG_ARCH="riscv64" ;; \
         *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" | tar -xJ && \
-    mv "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" /opt/zig && \
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ && \
+    mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig && \
     ln -s /opt/zig/zig /usr/local/bin/zig
 
 # Install Rust 1.85+
