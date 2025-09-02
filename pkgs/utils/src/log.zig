@@ -43,7 +43,8 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
                 "{s} {s}" ++ fmt ++ "\n",
                 .{ timestamp_str, prefix } ++ args,
             ) catch return;
-            nosuspend f.writeAll(print_str) catch return;
+            nosuspend f.writeAll(print_str);
+            f.flush() catch return;
         }
     }
 }
@@ -70,7 +71,6 @@ pub const ZeamLogger = struct {
     scope: LoggerScope,
     file: ?std.fs.File, // optional log file
     filePath: ?[]const u8, // path to log file directory
-    // fileDate: datetime.datetime.Date,
 
     const Self = @This();
     pub fn init(scope: LoggerScope, activeLevel: std.log.Level, filePath: ?[]const u8) Self {
@@ -80,29 +80,40 @@ pub const ZeamLogger = struct {
             .activeLevel = activeLevel,
             .file = file,
             .filePath = filePath,
-            // .fileDate = date,
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.file) |f| {
+            f.close();
+            self.file = null;
+        }
     }
 
     fn maybeRotate(self: *const Self) !void {
         if (builtin.target.os.tag == .freestanding) {
             return;
-        }
-
-        if (self.file == null) {
-            return; // no rotation if no file path is provided
         } else {
-            const stat = self.file.?.stat() catch return;
-            const size = stat.size;
-            if (size < 10 * 1024 * 1024) { // 10 MB
-                return;
+            if (self.file == null) {
+                return; // no rotation if no file
+            } else {
+                const today = @divFloor(std.time.milliTimestamp(), std.time.ms_per_day); // number of days since epoch
+                const stat = self.file.?.stat() catch return;
+                const filemodifiedDate = @divFloor(stat.mtime, std.time.ns_per_day);
+                // if the file was not modified today, rotate
+                if (today != filemodifiedDate) {
+                    const previousDate = datetime.datetime.Date.fromTimestamp(std.time.milliTimestamp()).shiftDays(-1);
+                    self.file.?.close();
+                    var buf: [64]u8 = undefined;
+                    const new_name = try std.fmt.bufPrint(&buf, "node-{d:0>2}-{d:0>2}.log", .{
+                        previousDate.month,
+                        previousDate.day,
+                    });
+                    try std.fs.cwd().rename("node.log", new_name);
+                    self.file = getFile(self.filePath);
+                    return;
+                }
             }
-
-            self.file.?.close();
-
-            try std.fs.cwd().rename("node.log", "node-0.log");
-
-            self.file = getFile(self.filePath);
         }
     }
 
@@ -175,20 +186,11 @@ pub fn getFile(filePath: ?[]const u8) ?std.fs.File {
     }
 
     // try to create/open a file
-    // do not close here .. will be closed when the last log gets written and new log file is created
+    // do not close here .. will be closed when the last log of the day gets written and new log file is created
     // directory must exist already
     var file: ?std.fs.File = null;
     if (filePath) |path| {
         var dir = std.fs.cwd().openDir(path, .{}) catch return null;
-
-        // converts millisecond to Datetime
-        // const dt = datetime.datetime.Datetime.fromTimestamp(std.time.milliTimestamp());
-        // const name_buf: [32]u8 = undefined;
-        // const file_name = std.fmt.bufPrint(&name_buf, "node-{:0>2}{:0>2}.log", .{
-        //     dt.date.month,
-        //     dt.date.day,
-        // });
-
         file = dir.createFile(
             "node.log",
             .{
