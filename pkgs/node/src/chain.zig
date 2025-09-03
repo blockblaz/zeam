@@ -82,6 +82,11 @@ pub const BeamChain = struct {
         });
 
         self.forkChoice.onTick(time_intervals, has_proposal);
+        if (interval == 1) {
+            // interval to vote so we should put out the chain status information to the user along with
+            // latest head which most likely should be the new block recieved and processed
+            self.printSlot(slot);
+        }
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
@@ -123,9 +128,13 @@ pub const BeamChain = struct {
         return block;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) !void {
-        const fcHead = try self.forkChoice.updateHead();
-        self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+    pub fn printSlot(self: *Self, slot: usize) void {
+        const fcHead = self.forkChoice.updateHead() catch |err| {
+            self.logger.err("forkchoice updatehead error={any}", .{err});
+            return;
+        };
+
+        self.logger.debug("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
@@ -150,7 +159,7 @@ pub const BeamChain = struct {
             },
         }
 
-        try self.printSlot(self.forkChoice.fcStore.currentSlot);
+        self.printSlot(self.forkChoice.fcStore.currentSlot);
     }
 
     // import block assuming it is validated
