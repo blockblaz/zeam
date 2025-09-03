@@ -7,6 +7,8 @@ const chains = @import("./chain.zig");
 const networkFactory = @import("./network.zig");
 const networks = @import("@zeam/network");
 
+const constants = @import("./constants.zig");
+
 pub const ValidatorParams = struct {
     // could be keys when deposit mechanism is implemented
     ids: []usize,
@@ -32,7 +34,17 @@ pub const BeamValidator = struct {
         };
     }
 
-    pub fn onSlot(self: *Self, slot: usize) !void {
+    pub fn onInterval(self: *Self, time_intervals: usize) !void {
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+
+        // if a new slot interval may be do a proposal
+        if (interval == 0) {
+            return maybeDoProposal(self, slot);
+        }
+    }
+
+    pub fn maybeDoProposal(self: *Self, slot: usize) !void {
         const num_validators: usize = @intCast(self.config.genesis.num_validators);
 
         // check for block production

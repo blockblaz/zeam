@@ -33,11 +33,11 @@ pub const EventLoop = struct {
 const OnIntervalCbType = *const fn (ud: *anyopaque, slot: isize) anyerror!void;
 pub const OnIntervalCbWrapper = struct {
     ptr: *anyopaque,
-    onSlotCb: OnIntervalCbType,
-    slot: isize = 0,
+    onIntervalCb: OnIntervalCbType,
+    interval: isize = 0,
     c: xev.Completion = undefined,
 
-    pub fn onSlot(self: OnIntervalCbWrapper) !void {
-        return self.onSlotCb(self.ptr, self.slot);
+    pub fn onInterval(self: OnIntervalCbWrapper) !void {
+        return self.onIntervalCb(self.ptr, self.interval);
     }
 };

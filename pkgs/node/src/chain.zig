@@ -13,6 +13,7 @@ const metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
 
 pub const fcFactory = @import("./forkchoice.zig");
+const constants = @import("./constants.zig");
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -27,6 +28,7 @@ pub const BeamChain = struct {
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
     logger: *const zeam_utils.ZeamLogger,
+    registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
     pub fn init(
@@ -51,25 +53,42 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn onSlot(self: *Self, slot: usize) !void {
-        // see if you need to product block before you tick the slot to get correct canonical head
-        // ideally this section should be called an interval before the slot is ticked
-        self.prepareNextSlot(slot);
-        self.tickSlot(slot);
+    pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
+        // right now its simple assignment but eventually it should be a set
+        // tacking registrations and keeping it alive for 3*2=6 slots
+        self.registered_validator_ids = validator_ids;
     }
 
-    fn prepareNextSlot(self: *Self, nextSlot: usize) void {
-        // nothing to prep for now
-        _ = self;
-        _ = nextSlot;
-    }
+    pub fn onInterval(self: *Self, time_intervals: usize) !void {
+        // see if the node has a proposal this slot to properly tick
+        // forkchoice head
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+        var has_proposal = false;
+        if (interval == 0) {
+            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const slot_proposer_id = slot % num_validators;
+            if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
+                _ = index;
+                has_proposal = true;
+            }
+        }
 
-    fn tickSlot(self: *Self, slot: usize) void {
-        self.forkChoice.tickSlot(slot);
-        // self.printSlot(slot);
+        self.logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposasl={} ", .{
+            time_intervals,
+            slot,
+            interval,
+            has_proposal,
+        });
+
+        self.forkChoice.onTick(time_intervals, has_proposal);
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
+        // right now with integrated validator into node produceBlock is always gurranteed to be
+        // called post ticking the chain to the correct time, but once validator is separated
+        // one must make the forkchoice tick to the right time if there is a race condition
+        // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
         const parent_root = chainHead.blockRoot;
 
