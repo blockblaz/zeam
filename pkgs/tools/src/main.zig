@@ -28,14 +28,14 @@ const ToolsArgs = struct {
     const ENRGenCmd = struct {
         sk: []const u8,
         ip: []const u8,
-        udp: u16,
+        quic: u16,
         out: ?[]const u8 = null,
         help: bool = false,
 
         pub const __shorts__ = .{
             .sk = .s,
             .ip = .i,
-            .udp = .u,
+            .quic = .u,
             .out = .o,
             .help = .h,
         };
@@ -43,7 +43,7 @@ const ToolsArgs = struct {
         pub const __messages__ = .{
             .sk = "Secret key (hex string with or without 0x prefix)",
             .ip = "IPv4 address for the ENR",
-            .udp = "UDP port for discovery",
+            .quic = "QUIC port for discovery",
             .out = "Output file path (prints to stdout if not specified)",
             .help = "Show help information for the enrgen command",
         };
@@ -125,16 +125,16 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
         defer file.close();
 
         const writer = file.writer();
-        try genENR(cmd.sk, cmd.ip, cmd.udp, writer);
+        try genENR(cmd.sk, cmd.ip, cmd.quic, writer);
 
         std.debug.print("ENR written to: {s}\n", .{output_path});
     } else {
         const stdout = std.io.getStdOut().writer();
-        try genENR(cmd.sk, cmd.ip, cmd.udp, stdout);
+        try genENR(cmd.sk, cmd.ip, cmd.quic, stdout);
     }
 }
 
-fn genENR(secret_key: []const u8, ip: []const u8, udp: u16, out_writer: anytype) !void {
+fn genENR(secret_key: []const u8, ip: []const u8, quic: u16, out_writer: anytype) !void {
     var secret_key_bytes: [32]u8 = undefined;
     const secret_key_str = if (std.mem.startsWith(u8, secret_key, "0x"))
         secret_key[2..]
@@ -161,10 +161,10 @@ fn genENR(secret_key: []const u8, ip: []const u8, udp: u16, out_writer: anytype)
         return error.ENRSetIPFailed;
     };
 
-    var udp_bytes: [2]u8 = undefined;
-    std.mem.writeInt(u16, &udp_bytes, udp, .big);
-    signable_enr.set("udp", &udp_bytes) catch {
-        return error.ENRSetUDPFailed;
+    var quic_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &quic_bytes, quic, .big);
+    signable_enr.set("quic", &quic_bytes) catch {
+        return error.ENRSetQUICFailed;
     };
 
     var enr_out: [610]u8 = undefined;
@@ -186,7 +186,7 @@ test "generate ENR to buffer" {
 
     const result = fbs.getWritten();
 
-    try std.testing.expectEqualStrings("enr:-IS4QCtBWKK8ofiKMxL_KhnGO5ionyhaL2RuCuEkWKuCYsAdI5AXvkrOiwB2HJjDmf6NslHcHOiuYTnAazS2IAdkfcyAgmlkgnY0gmlwhMAAAgGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_oxVtw0RW_QAdpzBQA8yWM0xOIN1ZHCCBNI", result);
+    try std.testing.expectEqualStrings("enr:-IW4QP3E2K97wLIvYbu2upNn5CfjWdD4kmW6YjxNcdroKIA_V81rQhAtp_JG711GtlHXStpGT03JZzM1I3VoAj9S5Z-AgmlkgnY0gmlwhMAAAgGEcXVpY4IE0olzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", result);
 }
 
 test "generate ENR with 0x prefix" {
@@ -197,7 +197,7 @@ test "generate ENR with 0x prefix" {
     try genENR("0xb71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "127.0.0.1", 30303, writer);
 
     const result = fbs.getWritten();
-    try std.testing.expectEqualStrings("enr:-IS4QPJJ49maJ1joqvdBUCMsEBGREZNmTeqF4nB3N13SfOOAJ04Na1psf4FudZEixm9_sDwCQFzA9haE3UHteLC-mOyAgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_oxVtw0RW_QAdpzBQA8yWM0xOIN1ZHCCdl8", result);
+    try std.testing.expectEqualStrings("enr:-IW4QI9SLVH8scoBp80eUJdBENXALDXyf4psnqjs9be2rVYgcLY-R9FUPU0Ykg1o44fYBacr3V9OyfyXuggsBIDgbSOAgmlkgnY0gmlwhH8AAAGEcXVpY4J2X4lzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", result);
 }
 
 test "invalid secret key length" {
