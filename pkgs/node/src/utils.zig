@@ -30,14 +30,14 @@ pub const EventLoop = struct {
     }
 };
 
-const OnSlotCbType = *const fn (ud: *anyopaque, slot: isize) anyerror!void;
-pub const OnSlotCbWrapper = struct {
+const OnIntervalCbType = *const fn (ud: *anyopaque, slot: isize) anyerror!void;
+pub const OnIntervalCbWrapper = struct {
     ptr: *anyopaque,
-    onSlotCb: OnSlotCbType,
+    onSlotCb: OnIntervalCbType,
     slot: isize = 0,
     c: xev.Completion = undefined,
 
-    pub fn onSlot(self: OnSlotCbWrapper) !void {
+    pub fn onSlot(self: OnIntervalCbWrapper) !void {
         return self.onSlotCb(self.ptr, self.slot);
     }
 };

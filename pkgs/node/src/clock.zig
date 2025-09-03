@@ -7,7 +7,7 @@ const params = @import("@zeam/params");
 const SECONDS_PER_SLOT_MS: isize = params.SECONDS_PER_SLOT * std.time.ms_per_s;
 
 const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 
 const CLOCK_DISPARITY_MS: isize = 100;
 
@@ -17,7 +17,7 @@ pub const Clock = struct {
     current_slot: isize,
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
-    on_slot_cbs: std.ArrayList(*OnSlotCbWrapper),
+    on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
 
     timer: xev.Timer,
 
@@ -41,7 +41,7 @@ pub const Clock = struct {
             .current_slot = current_slot,
             .events = events,
             .timer = timer,
-            .on_slot_cbs = std.ArrayList(*OnSlotCbWrapper).init(allocator),
+            .on_slot_cbs = std.ArrayList(*OnIntervalCbWrapper).init(allocator),
         };
     }
 
@@ -65,11 +65,11 @@ pub const Clock = struct {
                 self.events.loop,
                 &cbWrapper.c,
                 time_to_next_slot_ms,
-                OnSlotCbWrapper,
+                OnIntervalCbWrapper,
                 cbWrapper,
                 (struct {
                     fn callback(
-                        ud: ?*OnSlotCbWrapper,
+                        ud: ?*OnIntervalCbWrapper,
                         _: *xev.Loop,
                         _: *xev.Completion,
                         r: xev.Timer.RunError!void,
@@ -92,7 +92,7 @@ pub const Clock = struct {
         }
     }
 
-    pub fn subscribeOnSlot(self: *Self, cb: *OnSlotCbWrapper) !void {
+    pub fn subscribeOnSlot(self: *Self, cb: *OnIntervalCbWrapper) !void {
         try self.on_slot_cbs.append(cb);
     }
 };

@@ -8,7 +8,7 @@ const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
 
 const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
@@ -72,9 +72,9 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
+    pub fn getOnIntervalCbWrapper(self: *Self) !*OnIntervalCbWrapper {
         // need a stable pointer across threads
-        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
+        const cb_ptr = try self.allocator.create(OnIntervalCbWrapper);
         cb_ptr.* = .{
             .ptr = self,
             .onSlotCb = onSlot,
@@ -102,7 +102,7 @@ pub const BeamNode = struct {
         var topics = [_]networks.GossipTopic{.block};
         try self.network.backend.gossip.subscribe(&topics, handler);
 
-        const chainOnSlot = try self.getOnSlotCbWrapper();
+        const chainOnSlot = try self.getOnIntervalCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };
