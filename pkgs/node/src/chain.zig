@@ -106,6 +106,9 @@ pub const BeamChain = struct {
     pub fn printSlot(self: *Self, slot: usize) !void {
         const fcHead = try self.forkChoice.updateHead();
         self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+        self.logger.maybeRotate() catch |err| {
+            self.logger.err("error rotating log file: {any}", .{err});
+        };
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {

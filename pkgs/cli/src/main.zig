@@ -180,8 +180,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, .debug, "/home/noopur/zeammain/zeam");
-            const logger2 = utilsLib.getScopedLogger(.n2, .debug, "/home/noopur/zeammain/zeam");
+            const logger1 = utilsLib.getScopedLogger(.n1, .debug, "./log");
+            const logger2 = utilsLib.getScopedLogger(.n2, .debug, "./log");
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
