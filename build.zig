@@ -36,10 +36,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
-    const zigcli = b.dependency("zigcli", .{
+    const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
-    });
+    }).module("simargs");
     const xev = b.dependency("xev", .{
         .target = target,
         .optimize = optimize,
@@ -173,7 +173,7 @@ pub fn build(b: *Builder) !void {
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
-    cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
@@ -219,7 +219,7 @@ pub fn build(b: *Builder) !void {
     });
     tools_cli_exe.root_module.addImport("enr", enr);
     tools_cli_exe.root_module.addImport("build_options", build_options_module);
-    tools_cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    tools_cli_exe.root_module.addImport("simargs", simargs);
 
     const install_tools_cli = b.addInstallArtifact(tools_cli_exe, .{});
     tools_step.dependOn(&install_tools_cli.step);

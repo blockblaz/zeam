@@ -70,7 +70,7 @@ RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") &&
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build all -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
+    zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep

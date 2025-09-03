@@ -13,7 +13,7 @@ pub fn startMetricsServer(allocator: std.mem.Allocator, port: u16) !void {
     // Start server in background thread
     const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
     thread.detach();
-    
+
     std.log.info("Metrics server started on port {d}", .{port});
 }
 

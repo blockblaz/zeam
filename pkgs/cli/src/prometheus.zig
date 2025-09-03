@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Generates a Prometheus configuration file content based on the metrics port.
 /// This can be used to create a prometheus.yml file that matches the CLI arguments.
-/// 
+///
 /// The generated configuration includes:
 /// - Global scrape and evaluation intervals
 /// - Prometheus self-monitoring target
