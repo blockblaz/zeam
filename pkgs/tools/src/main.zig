@@ -35,7 +35,7 @@ const ToolsArgs = struct {
         pub const __shorts__ = .{
             .sk = .s,
             .ip = .i,
-            .quic = .u,
+            .quic = .q,
             .out = .o,
             .help = .h,
         };
@@ -167,14 +167,7 @@ fn genENR(secret_key: []const u8, ip: []const u8, quic: u16, out_writer: anytype
         return error.ENRSetQUICFailed;
     };
 
-    var enr_out: [610]u8 = undefined;
-    const encoded_txt = signable_enr.encodeToTxt(&enr_out) catch {
-        return error.ENREncodingFailed;
-    };
-
-    out_writer.writeAll(encoded_txt) catch {
-        return error.WriteFailed;
-    };
+    try enr.writeSignableENR(out_writer, &signable_enr);
 }
 
 test "generate ENR to buffer" {
