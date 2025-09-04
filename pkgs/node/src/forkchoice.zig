@@ -308,6 +308,23 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
+    pub fn accept_new_votes(self: *Self){
+        _ = self;
+    }
+
+    pub fn get_proposal_head(self: *Self, slot: types.Slot) Root {
+        const time_intervals = slot * constants.INTERVALS_PER_SLOT;
+        // this could be called independently by the validator when its a separate process
+        // and FC would need to be protected by mutex to make it thread safe but for now
+        // this is deterministally called after the fc has been ticked ahead
+        // so the following call should be a no-op
+        self.onTick(time_intervals, true);
+        // accept any new votes in case previous ontick was a no-op and either the validator
+        // wasn't registered or there have been new votes
+        self.accept_new_votes();
+        return self.head;
+    }
+
     pub fn updateHead(self: *Self) !ProtoBlock {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
