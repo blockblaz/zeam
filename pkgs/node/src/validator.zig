@@ -39,8 +39,12 @@ pub const BeamValidator = struct {
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
         // if a new slot interval may be do a proposal
-        if (interval == 0) {
-            return maybeDoProposal(self, slot);
+        switch (interval) {
+            0 => return maybeDoProposal(self, slot),
+            1 => return mayBeDoAttestation(self, slot),
+            2 => {},
+            3 => {},
+            else => @panic("interval error"),
         }
     }
 
@@ -62,5 +66,10 @@ pub const BeamValidator = struct {
             std.debug.print("\n\n\n validator block production slot={any} block={any}\n\n\n", .{ slot, signed_block_message });
             try self.network.publish(signed_block_message);
         }
+    }
+
+    pub fn mayBeDoVoting(self: *Self, slot: usize) !void {
+        if (self.ids.len == 0) return;
+        const head = self.chain.forkChoice.get_proposal_head();
     }
 };
