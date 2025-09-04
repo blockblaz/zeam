@@ -92,12 +92,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     }
 
     metrics = .{
-        .chain_onblock_duration_seconds = Metrics.ChainHistogram.init("chain_onblock_duration_seconds", .{
-            .help = "Time taken to process a block in the chain's onBlock function."
-        }, .{}),
-        .block_processing_duration_seconds = Metrics.BlockProcessingHistogram.init("block_processing_duration_seconds", .{
-            .help = "Time taken to process a block in the state transition function."
-        }, .{}),
+        .chain_onblock_duration_seconds = Metrics.ChainHistogram.init("chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
+        .block_processing_duration_seconds = Metrics.BlockProcessingHistogram.init("block_processing_duration_seconds", .{ .help = "Time taken to process a block in the state transition function." }, .{}),
     };
 
     g_initialized = true;
