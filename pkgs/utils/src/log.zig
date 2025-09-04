@@ -45,7 +45,6 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             ) catch return;
             nosuspend f.writeAll(print_str) catch return;
             // f.flush() catch return;
-            // f.sync() catch return;
         }
     }
 }
@@ -75,7 +74,7 @@ pub const ZeamLogger = struct {
 
     const Self = @This();
     pub fn init(scope: LoggerScope, activeLevel: std.log.Level, filePath: ?[]const u8) Self {
-        const file = getFile(filePath);
+        const file = getFile(scope, filePath);
         return Self{
             .scope = scope,
             .activeLevel = activeLevel,
@@ -100,32 +99,42 @@ pub const ZeamLogger = struct {
             } else {
                 const stat = self.file.?.stat() catch return;
                 const size = stat.size;
-                if (size < 10 * 1024 * 1024) { // 10 MB
+                // if (size < 10 * 1024 * 1024) { // 10 MB
+                if (size < 10 * 1024) { // for testing
+                    return;
+                } else {
+                    const date = datetime.datetime.Datetime.fromTimestamp(std.time.milliTimestamp());
+                    var ts_buf: [128]u8 = undefined;
+                    const timestamp = try std.fmt.bufPrint(
+                        &ts_buf,
+                        "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}.{d:0>3}",
+                        .{
+                            date.date.year,
+                            date.date.month,
+                            date.date.day,
+                            date.time.hour,
+                            date.time.minute,
+                            date.time.second,
+                            date.time.nanosecond / 1_000_000,
+                        },
+                    );
+
+                    var name_buf: [64]u8 = undefined;
+                    const base_name = switch (self.scope) {
+                        .default => "node.log",
+                        else => try std.fmt.bufPrint(&name_buf, "node-{s}.log", .{@tagName(self.scope)}),
+                    };
+
+                    var new_buf: [128]u8 = undefined;
+                    const rotated_name = switch (self.scope) {
+                        .default => try std.fmt.bufPrint(&new_buf, "node-{s}.log", .{timestamp}),
+                        else => try std.fmt.bufPrint(&new_buf, "node-{s}-{s}.log", .{ @tagName(self.scope), timestamp }),
+                    };
+                    self.file.?.close();
+                    try std.fs.cwd().rename(base_name, rotated_name);
+                    @constCast(self).file = getFile(self.scope, self.filePath);
                     return;
                 }
-
-                self.file.?.close();
-
-                try std.fs.cwd().rename("node.log", "node-0.log");
-
-                @constCast(self).file = getFile(self.filePath);
-                return;
-                // const today = @divFloor(std.time.milliTimestamp(), std.time.ms_per_day); // number of days since epoch
-                // const stat = self.file.?.stat() catch return;
-                // const filemodifiedDate = @divFloor(stat.mtime, std.time.ns_per_day);
-                // // if the file was not modified today, rotate
-                // if (today != filemodifiedDate) {
-                //     const previousDate = datetime.datetime.Date.fromTimestamp(std.time.milliTimestamp()).shiftDays(-1);
-                //     self.file.?.close();
-                //     var buf: [64]u8 = undefined;
-                //     const new_name = try std.fmt.bufPrint(&buf, "node-{d:0>2}-{d:0>2}.log", .{
-                //         previousDate.month,
-                //         previousDate.day,
-                //     });
-                //     try std.fs.cwd().rename("node.log", new_name);
-                //     self.file = getFile(self.filePath);
-                //     return;
-                // }
             }
         }
     }
@@ -189,7 +198,7 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
     }) catch return buf[0..0];
 }
 
-pub fn getFile(filePath: ?[]const u8) ?std.fs.File {
+pub fn getFile(scope: LoggerScope, filePath: ?[]const u8) ?std.fs.File {
     if (filePath == null) {
         return null; // do not write to file if path is not provided
     }
@@ -200,14 +209,24 @@ pub fn getFile(filePath: ?[]const u8) ?std.fs.File {
     var file: ?std.fs.File = null;
     if (filePath) |path| {
         var dir = std.fs.cwd().openDir(path, .{}) catch return null;
+
+        const filename = switch (scope) {
+            .default => "node.log",
+            else => blk: {
+                var buf: [64]u8 = undefined;
+                break :blk std.fmt.bufPrint(&buf, "node-{s}.log", .{@tagName(scope)}) catch return null;
+            },
+        };
+
         file = dir.createFile(
-            "node.log",
+            filename,
             .{
                 .read = true,
                 .truncate = false, // append mode
             },
         ) catch return null;
-        // file.?.seekFromEnd(0);
+
+        file.?.seekFromEnd(0) catch {};
     }
     return file;
 }
