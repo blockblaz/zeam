@@ -54,7 +54,7 @@ pub const BeamChain = struct {
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
-        // right now its simple assignment but eventually it should be a set
+        // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
         self.registered_validator_ids = validator_ids;
     }
