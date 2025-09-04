@@ -3,7 +3,6 @@ const Allocator = std.mem.Allocator;
 
 const xev = @import("xev");
 
-const params = @import("@zeam/params");
 const constants = @import("./constants.zig");
 
 const utils = @import("./utils.zig");
