@@ -87,6 +87,10 @@ pub const BeamChain = struct {
             // latest head which most likely should be the new block recieved and processed
             self.printSlot(slot);
         }
+        // check if log rotation is needed
+        self.logger.maybeRotate() catch |err| {
+            self.logger.err("error rotating log file: {any}", .{err});
+        };
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
