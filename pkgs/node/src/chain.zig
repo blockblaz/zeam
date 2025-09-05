@@ -8,10 +8,12 @@ const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
+const metrics = @import("@zeam/metrics");
 
 const zeam_utils = @import("@zeam/utils");
 
 pub const fcFactory = @import("./forkchoice.zig");
+const constants = @import("./constants.zig");
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -26,6 +28,7 @@ pub const BeamChain = struct {
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
     logger: *const zeam_utils.ZeamLogger,
+    registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
     pub fn init(
@@ -50,28 +53,47 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn onSlot(self: *Self, slot: usize) !void {
-        // see if you need to product block before you tick the slot to get correct canonical head
-        // ideally this section should be called an interval before the slot is ticked
-        self.prepareNextSlot(slot);
-        self.tickSlot(slot);
-        self.logger.maybeRotate() catch |err| {
-            self.logger.err("error rotating log file: {any}", .{err});
-        };
+    pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
+        // right now it's simple assignment but eventually it should be a set
+        // tacking registrations and keeping it alive for 3*2=6 slots
+        self.registered_validator_ids = validator_ids;
     }
 
-    fn prepareNextSlot(self: *Self, nextSlot: usize) void {
-        // nothing to prep for now
-        _ = self;
-        _ = nextSlot;
-    }
+    pub fn onInterval(self: *Self, time_intervals: usize) !void {
+        // see if the node has a proposal this slot to properly tick
+        // forkchoice head
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+        var has_proposal = false;
+        if (interval == 0) {
+            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const slot_proposer_id = slot % num_validators;
+            if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
+                _ = index;
+                has_proposal = true;
+            }
+        }
 
-    fn tickSlot(self: *Self, slot: usize) void {
-        self.forkChoice.tickSlot(slot);
-        // self.printSlot(slot);
+        self.logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposasl={} ", .{
+            time_intervals,
+            slot,
+            interval,
+            has_proposal,
+        });
+
+        self.forkChoice.onTick(time_intervals, has_proposal);
+        if (interval == 1) {
+            // interval to vote so we should put out the chain status information to the user along with
+            // latest head which most likely should be the new block recieved and processed
+            self.printSlot(slot);
+        }
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
+        // right now with integrated validator into node produceBlock is always gurranteed to be
+        // called post ticking the chain to the correct time, but once validator is separated
+        // one must make the forkchoice tick to the right time if there is a race condition
+        // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
         const parent_root = chainHead.blockRoot;
 
@@ -106,9 +128,13 @@ pub const BeamChain = struct {
         return block;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) !void {
-        const fcHead = try self.forkChoice.updateHead();
-        self.logger.debug("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+    pub fn printSlot(self: *Self, slot: usize) void {
+        const fcHead = self.forkChoice.updateHead() catch |err| {
+            self.logger.err("forkchoice updatehead error={any}", .{err});
+            return;
+        };
+
+        self.logger.debug("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
@@ -133,11 +159,12 @@ pub const BeamChain = struct {
             },
         }
 
-        try self.printSlot(self.forkChoice.fcStore.currentSlot);
+        self.printSlot(self.forkChoice.fcStore.currentSlot);
     }
 
     // import block assuming it is validated
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
+        const onblock_timer = metrics.chain_onblock_duration_seconds.start();
         // 1. get parent state
         const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
@@ -155,6 +182,7 @@ pub const BeamChain = struct {
         }
         // 3. fc update head
         _ = try self.forkChoice.updateHead();
+        onblock_timer.observe();
     }
 };
 

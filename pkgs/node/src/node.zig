@@ -8,7 +8,7 @@ const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
 
 const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
@@ -47,6 +47,7 @@ pub const BeamNode = struct {
         chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId, opts.logger);
         if (opts.validator_ids) |ids| {
             validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network });
+            chain.registerValidatorIds(ids);
         }
 
         return Self{
@@ -72,29 +73,27 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
+    pub fn getOnIntervalCbWrapper(self: *Self) !*OnIntervalCbWrapper {
         // need a stable pointer across threads
-        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
+        const cb_ptr = try self.allocator.create(OnIntervalCbWrapper);
         cb_ptr.* = .{
             .ptr = self,
-            .onSlotCb = onSlot,
+            .onIntervalCb = onInterval,
         };
 
         return cb_ptr;
     }
 
-    pub fn onSlot(ptr: *anyopaque, islot: isize) !void {
+    pub fn onInterval(ptr: *anyopaque, iinterval: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const slot: usize = @intCast(islot);
+        const interval: usize = @intCast(iinterval);
 
-        try self.chain.onSlot(slot);
-        // _ = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
+        try self.chain.onInterval(interval);
         if (self.validator) |*validator| {
-            // _ = try validator.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
-            try validator.onSlot(slot);
+            // we also tick validator per interval in case it would
+            // need to sync its future duties when its an independent validator
+            try validator.onInterval(interval);
         }
-
-        try self.chain.printSlot(slot);
     }
 
     pub fn run(self: *Self) !void {
@@ -102,7 +101,7 @@ pub const BeamNode = struct {
         var topics = [_]networks.GossipTopic{.block};
         try self.network.backend.gossip.subscribe(&topics, handler);
 
-        const chainOnSlot = try self.getOnSlotCbWrapper();
+        const chainOnSlot = try self.getOnIntervalCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };

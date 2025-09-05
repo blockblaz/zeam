@@ -19,8 +19,12 @@ const ChainOptions = configs.ChainOptions;
 const utilsLib = @import("@zeam/utils");
 
 const sftFactory = @import("@zeam/state-transition");
+const metrics = @import("@zeam/metrics");
+const metricsServer = @import("metrics_server.zig");
 
 const networks = @import("@zeam/network");
+
+const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusConfig;
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
@@ -35,6 +39,7 @@ const ZeamArgs = struct {
         beam: struct {
             help: bool = false,
             mockNetwork: bool = false,
+            metricsPort: u16 = 9667,
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -50,11 +55,37 @@ const ZeamArgs = struct {
                 .dist_dir = "Directory where the zkvm guest programs are found",
             };
         },
+        prometheus: struct {
+            help: bool = false,
+
+            __commands__: union(enum) {
+                genconfig: struct {
+                    metrics_port: u16 = 9667,
+                    filename: []const u8 = "prometheus.yml",
+                    help: bool = false,
+
+                    pub const __shorts__ = .{
+                        .metrics_port = .p,
+                        .filename = .f,
+                    };
+
+                    pub const __messages__ = .{
+                        .metrics_port = "Port to use for publishing metrics",
+                        .filename = "output name for the config file",
+                    };
+                },
+
+                pub const __messages__ = .{
+                    .genconfig = "Generate the prometheus configuration file",
+                };
+            },
+        },
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
             .beam = "Run a full Beam node",
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
+            .prometheus = "Prometheus configuration management",
         };
     },
 
@@ -121,10 +152,15 @@ pub fn main() !void {
                 try stateProvingManager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
             }
         },
-        .beam => {
-            std.debug.print("beam opts ={any}\n", .{opts.args.__commands__.beam});
+        .beam => |beamcmd| {
+            try metrics.init(allocator);
 
-            const mock_network = opts.args.__commands__.beam.mockNetwork;
+            // Start metrics HTTP server
+            try metricsServer.startMetricsServer(allocator, beamcmd.metricsPort);
+
+            std.debug.print("beam opts ={any}\n", .{beamcmd});
+
+            const mock_network = beamcmd.mockNetwork;
 
             // some base mainnet spec would be loaded to build this up
             const chain_spec =
@@ -209,6 +245,15 @@ pub fn main() !void {
             try beam_node_1.run();
             try beam_node_2.run();
             try clock.run();
+        },
+        .prometheus => |prometheus| switch (prometheus.__commands__) {
+            .genconfig => |genconfig| {
+                const generated_config = try generatePrometheusConfig(allocator, genconfig.metrics_port);
+                const cwd = std.fs.cwd();
+                const config_file = try cwd.createFile(genconfig.filename, .{ .truncate = true });
+                defer config_file.close();
+                try config_file.writeAll(generated_config);
+            },
         },
     }
 }

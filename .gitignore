@@ -14,3 +14,9 @@ CLAUDE.md
 .aider*
 .continue/
 .codeium/
+
+# Log files
+zeam.log
+
+# Config files
+prometheus.yml

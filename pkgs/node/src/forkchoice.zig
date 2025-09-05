@@ -8,6 +8,8 @@ const configs = @import("@zeam/configs");
 const utils = @import("@zeam/utils");
 const stf = @import("@zeam/state-transition");
 
+const constants = @import("./constants.zig");
+
 pub const ProtoBlock = struct {
     slot: types.Slot,
     // we can keep these in hex not hex strings because stringhashmap just relies on []
@@ -283,6 +285,17 @@ pub const ForkChoice = struct {
         }
 
         return false;
+    }
+
+    pub fn onTick(self: *Self, time_intervals: usize, has_proposal: bool) void {
+        // the onTick will be properly implemented on the followup PR for devnet0 fc update
+        // for now it will just call tickSlot for the current mechanims
+        const current_slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const current_interval = time_intervals % constants.INTERVALS_PER_SLOT;
+        if (current_interval == 0) {
+            self.tickSlot(current_slot);
+        }
+        _ = has_proposal;
     }
 
     pub fn tickSlot(self: *Self, currentSlot: types.Slot) void {
