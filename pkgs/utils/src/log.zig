@@ -44,7 +44,6 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
                 .{ timestamp_str, prefix } ++ args,
             ) catch return;
             nosuspend f.writeAll(print_str) catch return;
-            // f.flush() catch return;
         }
     }
 }
@@ -58,7 +57,6 @@ pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.l
     }
 }
 
-//
 const LoggerScope = enum {
     default,
     n1,
@@ -71,6 +69,7 @@ pub const ZeamLogger = struct {
     scope: LoggerScope,
     file: ?std.fs.File, // optional log file
     filePath: ?[]const u8, // path to log file directory
+    mutex: if (builtin.target.os.tag == .freestanding) void else std.Thread.Mutex, // Conditional mutex
 
     const Self = @This();
     pub fn init(scope: LoggerScope, activeLevel: std.log.Level, filePath: ?[]const u8) Self {
@@ -80,6 +79,7 @@ pub const ZeamLogger = struct {
             .activeLevel = activeLevel,
             .file = file,
             .filePath = filePath,
+            .mutex = if (builtin.target.os.tag == .freestanding) {} else std.Thread.Mutex{}, // Conditional initialization
         };
     }
 
@@ -93,48 +93,52 @@ pub const ZeamLogger = struct {
     pub fn maybeRotate(self: *const Self) !void {
         if (builtin.target.os.tag == .freestanding) {
             return;
-        } else {
-            if (self.file == null) {
-                return; // no rotation if no file
-            } else {
-                const stat = self.file.?.stat() catch return;
-                const size = stat.size;
-                // if (size < 10 * 1024 * 1024) { // 10 MB
-                if (size < 10 * 1024) { // for testing
-                    return;
-                } else {
-                    const date = datetime.datetime.Datetime.fromTimestamp(std.time.milliTimestamp());
-                    var ts_buf: [128]u8 = undefined;
-                    const timestamp = try std.fmt.bufPrint(
-                        &ts_buf,
-                        "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}.{d:0>3}",
-                        .{
-                            date.date.year,
-                            date.date.month,
-                            date.date.day,
-                            date.time.hour,
-                            date.time.minute,
-                            date.time.second,
-                            date.time.nanosecond / 1_000_000,
-                        },
-                    );
+        }
 
-                    var name_buf: [64]u8 = undefined;
-                    const base_name = switch (self.scope) {
-                        .default => "node.log",
-                        else => try std.fmt.bufPrint(&name_buf, "node-{s}.log", .{@tagName(self.scope)}),
-                    };
+        if (self.file) |file| {
+            const stat = file.stat() catch return;
 
-                    var new_buf: [128]u8 = undefined;
-                    const rotated_name = switch (self.scope) {
-                        .default => try std.fmt.bufPrint(&new_buf, "node-{s}.log", .{timestamp}),
-                        else => try std.fmt.bufPrint(&new_buf, "node-{s}-{s}.log", .{ @tagName(self.scope), timestamp }),
-                    };
-                    self.file.?.close();
-                    try std.fs.cwd().rename(base_name, rotated_name);
-                    @constCast(self).file = getFile(self.scope, self.filePath);
-                    return;
-                }
+            const size = stat.size;
+            if (size < 10 * 1024 * 1024) { // 10 MB
+                return;
+            }
+
+            const date = datetime.datetime.Datetime.fromTimestamp(std.time.milliTimestamp());
+            var ts_buf: [128]u8 = undefined;
+            const timestamp = try std.fmt.bufPrint(
+                &ts_buf,
+                "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}.{d:0>3}",
+                .{
+                    date.date.year,
+                    date.date.month,
+                    date.date.day,
+                    date.time.hour,
+                    date.time.minute,
+                    date.time.second,
+                    date.time.nanosecond / 1_000_000,
+                },
+            );
+
+            var name_buf: [64]u8 = undefined;
+            const base_name = switch (self.scope) {
+                .default => "node.log",
+                else => try std.fmt.bufPrint(&name_buf, "node-{s}.log", .{@tagName(self.scope)}),
+            };
+
+            var new_buf: [128]u8 = undefined;
+            const rotated_name = switch (self.scope) {
+                .default => try std.fmt.bufPrint(&new_buf, "node-{s}.log", .{timestamp}),
+                else => try std.fmt.bufPrint(&new_buf, "node-{s}-{s}.log", .{ @tagName(self.scope), timestamp }),
+            };
+
+            if (self.filePath) |path| {
+                @constCast(&self.mutex).lock();
+                defer @constCast(&self.mutex).unlock();
+                file.close();
+                var dir = std.fs.cwd().openDir(path, .{}) catch return;
+                defer dir.close();
+                try dir.rename(base_name, rotated_name);
+                @constCast(self).file = getFile(self.scope, self.filePath);
             }
         }
     }
@@ -202,13 +206,17 @@ pub fn getFile(scope: LoggerScope, filePath: ?[]const u8) ?std.fs.File {
     if (filePath == null) {
         return null; // do not write to file if path is not provided
     }
+    if (builtin.target.os.tag == .freestanding) {
+        return null; // no file logging inside zkvm for now
+    }
 
     // try to create/open a file
-    // do not close here .. will be closed when the last log of the day gets written and new log file is created
+    // do not close here .. will be closed when log file is rotated and new log file is created
     // directory must exist already
     var file: ?std.fs.File = null;
     if (filePath) |path| {
         var dir = std.fs.cwd().openDir(path, .{}) catch return null;
+        defer dir.close();
 
         const filename = switch (scope) {
             .default => "node.log",
