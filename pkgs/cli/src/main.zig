@@ -95,7 +95,7 @@ const ZeamArgs = struct {
         .genesis = "Genesis time for the chain",
         .num_validators = "Number of validators",
         .log_filename = "Log Filename",
-        .log_filepath = "Log Filepath",
+        .log_filepath = "Log Filepath - must exist",
     };
 
     pub const __shorts__ = .{
@@ -128,7 +128,7 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            const logger = utilsLib.getLogger(null, null, null);
+            const logger = utilsLib.getLogger(null, null);
 
             const options = stateProvingManager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -222,8 +222,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, .debug, log_filepath, log_filename);
-            const logger2 = utilsLib.getScopedLogger(.n2, .debug, log_filepath, log_filename);
+            const logger1 = utilsLib.getScopedLogger(.n1, .debug, utilsLib.FileParams{ .filePath = log_filepath, .fileName = log_filename });
+            const logger2 = utilsLib.getScopedLogger(.n2, .debug, utilsLib.FileParams{ .filePath = log_filepath, .fileName = log_filename });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
