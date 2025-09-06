@@ -29,6 +29,8 @@ const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusCon
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     num_validators: u64 = 4,
+    log_filename: []const u8 = "consensus", // Default logger filename
+    log_filepath: []const u8 = "./log", // Default logger filepath
     help: bool = false,
     version: bool = false,
 
@@ -92,6 +94,8 @@ const ZeamArgs = struct {
     pub const __messages__ = .{
         .genesis = "Genesis time for the chain",
         .num_validators = "Number of validators",
+        .log_filename = "Log Filename",
+        .log_filepath = "Log Filepath",
     };
 
     pub const __shorts__ = .{
@@ -109,6 +113,8 @@ pub fn main() !void {
     const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
     const genesis = opts.args.genesis;
     const num_validators = opts.args.num_validators;
+    const log_filename = opts.args.log_filename;
+    const log_filepath = opts.args.log_filepath;
 
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
 
@@ -122,7 +128,7 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            const logger = utilsLib.getLogger(null, null);
+            const logger = utilsLib.getLogger(null, null, null);
 
             const options = stateProvingManager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -216,8 +222,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, .debug, "./log");
-            const logger2 = utilsLib.getScopedLogger(.n2, .debug, "./log");
+            const logger1 = utilsLib.getScopedLogger(.n1, .debug, log_filepath, log_filename);
+            const logger2 = utilsLib.getScopedLogger(.n2, .debug, log_filepath, log_filename);
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options

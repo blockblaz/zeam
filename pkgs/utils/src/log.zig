@@ -31,18 +31,18 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
 
-        nosuspend stderr.print(
+        var buf: [4096]u8 = undefined;
+        const print_str = std.fmt.bufPrint(
+            buf[0..],
             "{s} {s}" ++ fmt ++ "\n",
             .{ timestamp_str, prefix } ++ args,
         ) catch return;
+
+        // Print to stderr
+        nosuspend stderr.writeAll(print_str) catch return;
+
         // Also write to file if provided
         if (file) |f| {
-            var buf: [4096]u8 = undefined;
-            const print_str = std.fmt.bufPrint(
-                buf[0..],
-                "{s} {s}" ++ fmt ++ "\n",
-                .{ timestamp_str, prefix } ++ args,
-            ) catch return;
             nosuspend f.writeAll(print_str) catch return;
         }
     }
@@ -69,16 +69,18 @@ pub const ZeamLogger = struct {
     scope: LoggerScope,
     file: ?std.fs.File, // optional log file
     filePath: ?[]const u8, // path to log file directory
+    fileName: []const u8, // log file name
     mutex: if (builtin.target.os.tag == .freestanding) void else std.Thread.Mutex, // Conditional mutex
 
     const Self = @This();
-    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, filePath: ?[]const u8) Self {
-        const file = getFile(scope, filePath);
+    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, filePath: ?[]const u8, fileName: ?[]const u8) Self {
+        const file = getFile(scope, filePath, fileName orelse "consensus");
         return Self{
             .scope = scope,
             .activeLevel = activeLevel,
             .file = file,
             .filePath = filePath,
+            .fileName = fileName orelse "consensus", // base filename
             .mutex = if (builtin.target.os.tag == .freestanding) {} else std.Thread.Mutex{}, // Conditional initialization
         };
     }
@@ -121,14 +123,14 @@ pub const ZeamLogger = struct {
 
             var name_buf: [64]u8 = undefined;
             const base_name = switch (self.scope) {
-                .default => "node.log",
-                else => try std.fmt.bufPrint(&name_buf, "node-{s}.log", .{@tagName(self.scope)}),
+                .default => try std.fmt.bufPrint(&name_buf, "{s}.log", .{self.fileName}),
+                else => try std.fmt.bufPrint(&name_buf, "{s}-{s}.log", .{ self.fileName, @tagName(self.scope) }),
             };
 
             var new_buf: [128]u8 = undefined;
             const rotated_name = switch (self.scope) {
-                .default => try std.fmt.bufPrint(&new_buf, "node-{s}.log", .{timestamp}),
-                else => try std.fmt.bufPrint(&new_buf, "node-{s}-{s}.log", .{ @tagName(self.scope), timestamp }),
+                .default => try std.fmt.bufPrint(&new_buf, "{s}-{s}.log", .{ self.fileName, timestamp }),
+                else => try std.fmt.bufPrint(&new_buf, "{s}-{s}-{s}.log", .{ self.fileName, @tagName(self.scope), timestamp }),
             };
 
             if (self.filePath) |path| {
@@ -138,7 +140,7 @@ pub const ZeamLogger = struct {
                 var dir = std.fs.cwd().openDir(path, .{}) catch return;
                 defer dir.close();
                 try dir.rename(base_name, rotated_name);
-                @constCast(self).file = getFile(self.scope, self.filePath);
+                @constCast(self).file = getFile(self.scope, self.filePath, self.fileName);
             }
         }
     }
@@ -175,12 +177,12 @@ pub const ZeamLogger = struct {
     }
 };
 
-pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, filePath: ?[]const u8) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, filePath);
+pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, filePath: ?[]const u8, fileName: ?[]const u8) ZeamLogger {
+    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, filePath, fileName);
 }
 
-pub fn getLogger(activeLevel: ?std.log.Level, filePath: ?[]const u8) ZeamLogger {
-    return ZeamLogger.init(std.log.default_log_scope, activeLevel orelse std.log.default_level, filePath);
+pub fn getLogger(activeLevel: ?std.log.Level, filePath: ?[]const u8, fileName: ?[]const u8) ZeamLogger {
+    return ZeamLogger.init(std.log.default_log_scope, activeLevel orelse std.log.default_level, filePath, fileName);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
@@ -202,7 +204,7 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
     }) catch return buf[0..0];
 }
 
-pub fn getFile(scope: LoggerScope, filePath: ?[]const u8) ?std.fs.File {
+pub fn getFile(scope: LoggerScope, filePath: ?[]const u8, filename: []const u8) ?std.fs.File {
     if (filePath == null) {
         return null; // do not write to file if path is not provided
     }
@@ -218,16 +220,16 @@ pub fn getFile(scope: LoggerScope, filePath: ?[]const u8) ?std.fs.File {
         var dir = std.fs.cwd().openDir(path, .{}) catch return null;
         defer dir.close();
 
-        const filename = switch (scope) {
-            .default => "node.log",
+        var buf: [64]u8 = undefined;
+        const filename_withscope = switch (scope) {
+            .default => filename,
             else => blk: {
-                var buf: [64]u8 = undefined;
-                break :blk std.fmt.bufPrint(&buf, "node-{s}.log", .{@tagName(scope)}) catch return null;
+                break :blk std.fmt.bufPrint(&buf, "{s}-{s}.log", .{ filename, @tagName(scope) }) catch return null;
             },
         };
 
         file = dir.createFile(
-            filename,
+            filename_withscope,
             .{
                 .read = true,
                 .truncate = false, // append mode
