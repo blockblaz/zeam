@@ -31,6 +31,8 @@ const ZeamArgs = struct {
     num_validators: u64 = 4,
     log_filename: []const u8 = "consensus", // Default logger filename
     log_filepath: []const u8 = "./log", // Default logger filepath
+    log_file_active_level: std.log.Level = .debug, //default log file ActiveLevel
+    console_log_level: std.log.Level = .info, //default console log level
     help: bool = false,
     version: bool = false,
 
@@ -96,6 +98,8 @@ const ZeamArgs = struct {
         .num_validators = "Number of validators",
         .log_filename = "Log Filename",
         .log_filepath = "Log Filepath - must exist",
+        .log_file_active_level = "Log File Active Level, May be separate from console log level",
+        .console_log_level = "Log Level for console logging",
     };
 
     pub const __shorts__ = .{
@@ -115,6 +119,8 @@ pub fn main() !void {
     const num_validators = opts.args.num_validators;
     const log_filename = opts.args.log_filename;
     const log_filepath = opts.args.log_filepath;
+    const log_file_active_level = opts.args.log_file_active_level;
+    const console_log_level = opts.args.console_log_level;
 
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
 
@@ -222,8 +228,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, .debug, utilsLib.FileParams{ .filePath = log_filepath, .fileName = log_filename });
-            const logger2 = utilsLib.getScopedLogger(.n2, .debug, utilsLib.FileParams{ .filePath = log_filepath, .fileName = log_filename });
+            const logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            const logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
