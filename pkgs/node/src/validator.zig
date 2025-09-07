@@ -62,10 +62,9 @@ pub const BeamValidator = struct {
                 .message = block,
                 .signature = [_]u8{0} ** 48,
             };
-            const signed_block_message = try self.allocator.create(networks.GossipMessage);
-            signed_block_message.* = networks.GossipMessage{ .block = signed_block };
+            const signed_block_message = networks.GossipMessage{ .block = signed_block };
             std.debug.print("validator block production slot={any} block={any}\n", .{ slot, signed_block_message });
-            try self.network.publish(signed_block_message);
+            try self.network.publish(&signed_block_message);
         }
     }
 
