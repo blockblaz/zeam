@@ -20,6 +20,10 @@ pub const BlockProductionParams = struct {
     proposer_index: usize,
 };
 
+pub const VoteConstructionParams = struct {
+    slot: usize,
+};
+
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     forkChoice: fcFactory.ForkChoice,
@@ -128,19 +132,36 @@ pub const BeamChain = struct {
         return block;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) void {
-        const fcHead = self.forkChoice.updateHead() catch |err| {
-            self.logger.err("forkchoice updatehead error={any}", .{err});
-            return;
+    pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
+        const slot = opts.slot;
+        // this will be removed in followup PR to reflect latest spec changes
+        const validator_id = 0;
+
+        const head = self.forkChoice.get_proposal_head(slot);
+        const target = self.forkChoice.get_vote_target();
+
+        const vote = types.Mini3SFVote{
+            //
+            .slot = slot,
+            .validator_id = validator_id,
+            .head = head,
+            .target = target,
+            .source = self.forkChoice.fcStore.justified,
         };
 
-        self.logger.debug("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
+        return vote;
+    }
+
+    pub fn printSlot(self: *Self, slot: usize) void {
+        // head is auto updated if receieved a block or block proposal done
+        const fcHead = self.forkChoice.head;
+        self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |block| {
-                self.logger.debug("node-{d}::chain received block onGossip cb at slot={any}", .{ self.nodeId, block });
+                self.logger.debug("chain received block onGossip cb at slot={any}", .{block});
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
 
@@ -156,6 +177,10 @@ pub const BeamChain = struct {
                         };
                     }
                 }
+            },
+            .vote => |vote| {
+                self.logger.debug("chain received block onGossip cb at slot={any}", .{vote});
+                // TODO handle vote
             },
         }
 

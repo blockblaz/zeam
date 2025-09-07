@@ -39,6 +39,9 @@ pub const Mini3SFVote = struct {
     target: Mini3SFCheckpoint,
     source: Mini3SFCheckpoint,
 };
+
+// this will be updated to correct impl in the followup PR to reflect latest spec changes
+pub const SignedVote = Mini3SFVote;
 // issue in serialization/deserialization with ssz list, for now use slice
 // for which serialization/deserialization is not an issue but hash is not stable/expected
 // pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, MAX_VALIDATORS);

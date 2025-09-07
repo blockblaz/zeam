@@ -28,7 +28,7 @@ const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusCon
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
-    num_validators: u64 = 4,
+    num_validators: u64 = 3,
     help: bool = false,
     version: bool = false,
 

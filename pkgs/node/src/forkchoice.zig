@@ -173,6 +173,7 @@ const OnBlockOpts = struct {
 
 pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
+    // TODO rename them as latest_justified, latest_finalized to reflect spec closely
     justified: types.Mini3SFCheckpoint,
     finalized: types.Mini3SFCheckpoint,
 
@@ -308,11 +309,11 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
-    pub fn accept_new_votes(self: *Self){
+    pub fn accept_new_votes(self: *Self) !void {
         _ = self;
     }
 
-    pub fn get_proposal_head(self: *Self, slot: types.Slot) Root {
+    pub fn get_proposal_head(self: *Self, slot: types.Slot) types.Mini3SFCheckpoint {
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
@@ -321,8 +322,23 @@ pub const ForkChoice = struct {
         self.onTick(time_intervals, true);
         // accept any new votes in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new votes
-        self.accept_new_votes();
-        return self.head;
+        try self.accept_new_votes();
+        const head = self.head;
+
+        return types.Mini3SFCheckpoint{
+            .root = head.blockRoot,
+            .slot = head.slot,
+        };
+    }
+
+    pub fn get_vote_target(self: *Self) types.Mini3SFCheckpoint {
+        const target = self.head;
+        // TODO correct impl of the target as per the forkchoice specs
+        // for now target is approximated to head
+        return types.Mini3SFCheckpoint{
+            .root = target.blockRoot,
+            .slot = target.slot,
+        };
     }
 
     pub fn updateHead(self: *Self) !ProtoBlock {

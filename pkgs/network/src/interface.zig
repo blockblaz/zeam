@@ -45,15 +45,18 @@ pub const OnGossipCbHandler = struct {
 
 pub const GossipTopic = enum {
     block,
+    vote,
 };
 pub const GossipMessage = union(GossipTopic) {
     block: types.SignedBeamBlock,
+    vote: types.SignedVote,
 
     const Self = @This();
     // figureout is there a generic way to find active enum
     pub fn getTopic(self: *const Self) GossipTopic {
         switch (self.*) {
             .block => return .block,
+            .vote => return .vote,
         }
     }
 };
