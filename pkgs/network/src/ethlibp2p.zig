@@ -12,6 +12,7 @@ const NetworkInterface = interface.NetworkInterface;
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void {
     const topic = switch (topic_id) {
         0 => interface.GossipTopic.block,
+        1 => interface.GossipTopic.vote,
         else => {
             std.debug.print("\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge !!!!\n", .{topic_id});
             return;

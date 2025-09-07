@@ -82,6 +82,7 @@ pub const BeamValidator = struct {
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
             std.debug.print("validator construced vote slot={any} vote={any}\n", .{ slot, signed_vote_message });
+            try self.network.publish(&signed_vote_message);
         }
     }
 };

@@ -179,7 +179,7 @@ pub const BeamChain = struct {
                 }
             },
             .vote => |vote| {
-                self.logger.debug("chain received block onGossip cb at slot={any}", .{vote});
+                self.logger.debug("chain received vote onGossip cb at slot={any}", .{vote});
                 // TODO handle vote
             },
         }
