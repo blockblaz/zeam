@@ -153,8 +153,14 @@ pub const BeamChain = struct {
     }
 
     pub fn printSlot(self: *Self, slot: usize) void {
-        // head is auto updated if receieved a block or block proposal done
-        const fcHead = self.forkChoice.head;
+        // head should be auto updated if receieved a block or block proposal done
+        // however it doesn't get updated unless called updatehead even though processs block
+        // logs show it has been updated. debug and fix the call below
+        const fcHead = self.forkChoice.updateHead() catch |err| {
+            self.logger.err("forkchoice updatehead error={any}", .{err});
+            return;
+        };
+
         self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
