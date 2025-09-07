@@ -28,6 +28,8 @@ const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusCon
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
+    // choosing 3 vals as default so that default beam cmd run which runs two nodes to interop
+    // can justify and finalize
     num_validators: u64 = 3,
     help: bool = false,
     version: bool = false,
