@@ -314,11 +314,22 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
-    pub fn accept_new_votes(self: *Self) !void {
-        _ = self;
+    pub fn accept_new_votes(self: *Self) !ProtoBlock {
+        for (0..self.config.genesis.num_validators) |validator_id| {
+            var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
+            if (vote_tracker.latestNew) |new_vote| {
+                // we can directly assign because we always make sure that new vote is fresher
+                // than an onchain vote by purging those which are earlier than those seen on chain
+                vote_tracker.latestKnown = new_vote;
+            }
+
+            try self.votes.put(validator_id, vote_tracker);
+        }
+
+        return self.updateHead();
     }
 
-    pub fn get_proposal_head(self: *Self, slot: types.Slot) types.Mini3SFCheckpoint {
+    pub fn get_proposal_head(self: *Self, slot: types.Slot) !types.Mini3SFCheckpoint {
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
@@ -327,8 +338,7 @@ pub const ForkChoice = struct {
         self.onTick(time_intervals, true);
         // accept any new votes in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new votes
-        try self.accept_new_votes();
-        const head = self.head;
+        const head = try self.accept_new_votes();
 
         return types.Mini3SFCheckpoint{
             .root = head.blockRoot,

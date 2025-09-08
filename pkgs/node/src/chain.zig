@@ -135,7 +135,7 @@ pub const BeamChain = struct {
     pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
         const slot = opts.slot;
 
-        const head = self.forkChoice.get_proposal_head(slot);
+        const head = try self.forkChoice.get_proposal_head(slot);
         const target = self.forkChoice.get_vote_target();
 
         const vote = types.Mini3SFVote{
