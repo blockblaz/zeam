@@ -33,7 +33,6 @@ pub const Mini3SFCheckpoint = struct {
 };
 
 pub const Mini3SFVote = struct {
-    validator_id: u64,
     slot: Slot,
     head: Mini3SFCheckpoint,
     target: Mini3SFCheckpoint,
@@ -41,11 +40,16 @@ pub const Mini3SFVote = struct {
 };
 
 // this will be updated to correct impl in the followup PR to reflect latest spec changes
-pub const SignedVote = Mini3SFVote;
+pub const SignedVote = struct {
+    validator_id: u64,
+    message: Mini3SFVote,
+    // TODO signature objects to be updated in a followup PR
+    signature: Bytes48,
+};
 // issue in serialization/deserialization with ssz list, for now use slice
 // for which serialization/deserialization is not an issue but hash is not stable/expected
 // pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, MAX_VALIDATORS);
-pub const Mini3SFVotes = []Mini3SFVote;
+pub const SignedVotes = []SignedVote;
 
 // 3sf mini impl simplified assumptions
 pub const MAX_VALIDATORS = 4096;
@@ -53,7 +57,7 @@ pub const BeamBlockBody = struct {
     // some form of APS
     execution_payload_header: ExecutionPayloadHeader,
     // mini 3sf simplified votes
-    votes: Mini3SFVotes,
+    atttestations: SignedVotes,
 };
 
 pub const BeamBlock = struct {

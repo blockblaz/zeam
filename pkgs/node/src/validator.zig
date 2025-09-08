@@ -77,8 +77,11 @@ pub const BeamValidator = struct {
 
         for (self.ids) |validator_id| {
             // SignedVote to be fixed in the followup PR to correctly align types with the latest spec
-            var signed_vote: types.SignedVote = vote;
-            signed_vote.validator_id = validator_id;
+            const signed_vote: types.SignedVote = .{
+                .validator_id = validator_id,
+                .message = vote,
+                .signature = [_]u8{0} ** 48,
+            };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
             std.debug.print("validator construced vote slot={any} vote={any}\n", .{ slot, signed_vote_message });

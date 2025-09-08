@@ -384,17 +384,20 @@ pub const ForkChoice = struct {
         return self.head;
     }
 
-    pub fn onAttestation(self: *Self, vote: types.Mini3SFVote) !void {
+    pub fn onAttestation(self: *Self, signed_vote: types.SignedVote) !void {
         // vote has to be of an ancestor of the current slot
+        const validator_id = signed_vote.validator_id;
+        const vote = signed_vote.message;
+
         const new_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
         if (vote.slot < self.fcStore.currentSlot) {
-            var vote_tracker = self.votes.get(vote.validator_id) orelse VoteTracker{};
+            var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
             const vote_tracker_new_slot = vote_tracker.newSlot orelse 0;
             if (vote.head.slot > vote_tracker_new_slot) {
                 vote_tracker.newIndex = new_index;
                 vote_tracker.newSlot = vote.head.slot;
             }
-            try self.votes.put(vote.validator_id, vote_tracker);
+            try self.votes.put(validator_id, vote_tracker);
         }
     }
 

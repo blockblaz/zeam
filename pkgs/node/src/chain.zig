@@ -106,7 +106,7 @@ pub const BeamChain = struct {
 
         const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
-        const votes = [_]types.Mini3SFVote{};
+        const votes = [_]types.SignedVote{};
         var block = types.BeamBlock{
             .slot = opts.slot,
             .proposer_index = opts.proposer_index,
@@ -114,7 +114,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .votes = &votes,
+                .atttestations = &votes,
             },
         };
 
@@ -134,8 +134,6 @@ pub const BeamChain = struct {
 
     pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
         const slot = opts.slot;
-        // this will be removed in followup PR to reflect latest spec changes
-        const validator_id = 0;
 
         const head = self.forkChoice.get_proposal_head(slot);
         const target = self.forkChoice.get_vote_target();
@@ -143,7 +141,6 @@ pub const BeamChain = struct {
         const vote = types.Mini3SFVote{
             //
             .slot = slot,
-            .validator_id = validator_id,
             .head = head,
             .target = target,
             .source = self.forkChoice.fcStore.justified,
@@ -208,8 +205,8 @@ pub const BeamChain = struct {
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try self.states.put(fcBlock.blockRoot, post_state);
         // 3. fc onvotes
-        for (block.body.votes) |vote| {
-            try self.forkChoice.onAttestation(vote);
+        for (block.body.atttestations) |signed_vote| {
+            try self.forkChoice.onAttestation(signed_vote);
         }
         // 3. fc update head
         _ = try self.forkChoice.updateHead();

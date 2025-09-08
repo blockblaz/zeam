@@ -72,7 +72,7 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .body = types.BeamBlockBody{
             .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini
-            .votes = &[_]types.Mini3SFVote{},
+            .atttestations = &[_]types.SignedVote{},
         },
     };
 
@@ -94,7 +94,7 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
         .body = types.BeamBlockBody{
             .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini votes
-            .votes = &[_]types.Mini3SFVote{},
+            .atttestations = &[_]types.SignedVote{},
         },
     };
 
