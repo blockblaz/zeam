@@ -16,7 +16,6 @@ pub const ProtoBlock = struct {
     blockRoot: types.Root,
     parentRoot: types.Root,
     stateRoot: types.Root,
-    targetRoot: types.Root,
     timeliness: bool,
 };
 const ProtoMeta = struct {
@@ -66,7 +65,6 @@ pub const ProtoArray = struct {
             .blockRoot = block.blockRoot,
             .parentRoot = block.parentRoot,
             .stateRoot = block.stateRoot,
-            .targetRoot = block.targetRoot,
             .timeliness = block.timeliness,
             .parent = parent,
             .weight = 0,
@@ -98,7 +96,6 @@ pub const ProtoArray = struct {
                 .blockRoot = node.blockRoot,
                 .parentRoot = node.parentRoot,
                 .stateRoot = node.stateRoot,
-                .targetRoot = node.targetRoot,
                 .timeliness = node.timeliness,
             };
             return block;
@@ -173,28 +170,37 @@ const OnBlockOpts = struct {
 
 pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
-    // TODO rename them as latest_justified, latest_finalized to reflect spec closely
-    justified: types.Mini3SFCheckpoint,
-    finalized: types.Mini3SFCheckpoint,
+    latest_justified: types.Mini3SFCheckpoint,
+    // finalized is not tracked the same way in 3sf mini as it corresponds to head's finalized
+    // however its unlikely that a finalized can be rolled back in a normal node operation
+    // (for example a buggy chain has been finalized in which case node should be started with
+    //  anchor of the new non buggy branch)
+    latest_finalized: types.Mini3SFCheckpoint,
 
     const Self = @This();
     pub fn update(self: *Self, justified: types.Mini3SFCheckpoint, finalized: types.Mini3SFCheckpoint) void {
-        if (justified.slot > self.justified.slot) {
-            self.justified = justified;
+        if (justified.slot > self.latest_justified.slot) {
+            self.latest_justified = justified;
         }
 
-        if (finalized.slot > self.finalized.slot) {
-            self.finalized = finalized;
+        if (finalized.slot > self.latest_finalized.slot) {
+            self.latest_finalized = finalized;
         }
     }
 };
 
+const ProtoVote = struct {
+    index: usize = 0,
+    slot: types.Slot = 0,
+};
+
 const VoteTracker = struct {
-    // prev latest vote applied index null if not applied or removed
+    // prev latest vote applied index null if not applied
     appliedIndex: ?usize = null,
-    // new index at which to apply the latest vote at null if to be removed
-    newIndex: ?usize = null,
-    newSlot: ?types.Slot = null,
+    // latest known on-chain vote of the validator
+    latestKnown: ?ProtoVote = null,
+    // nlatest new vote of validator not yet seen on-chain
+    latestNew: ?ProtoVote = null,
 };
 
 pub const ForkChoice = struct {
@@ -228,15 +234,14 @@ pub const ForkChoice = struct {
             .blockRoot = anchor_block_root,
             .parentRoot = anchor_block_header.parent_root,
             .stateRoot = anchor_block_header.state_root,
-            .targetRoot = anchor_block_root,
             .timeliness = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Mini3SFCheckpoint{ .slot = anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
             .currentSlot = anchorState.slot,
-            .justified = anchorCP,
-            .finalized = anchorCP,
+            .latest_justified = anchorCP,
+            .latest_finalized = anchorCP,
         };
         const votes = std.AutoHashMap(usize, VoteTracker).init(allocator);
         const deltas = std.ArrayList(isize).init(allocator);
@@ -263,8 +268,8 @@ pub const ForkChoice = struct {
     }
 
     fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
-        const finalized_slot = self.fcStore.finalized.slot;
-        const finalized_root = self.fcStore.finalized.root;
+        const finalized_slot = self.fcStore.latest_finalized.slot;
+        const finalized_root = self.fcStore.latest_finalized.root;
 
         var searched_idx_or_null = self.protoArray.indices.get(blockRoot);
 
@@ -363,9 +368,9 @@ pub const ForkChoice = struct {
             // we don't need to null the new index after application because
             // applied and new will be same will no impact but this could still be a
             // relevant operation if/when the validator weight changes
-            if (vote_tracker.newIndex) |new_index| {
-                self.deltas.items[new_index] += validatorWeight;
-                vote_tracker.appliedIndex = new_index;
+            if (vote_tracker.latestKnown) |new_vote| {
+                self.deltas.items[new_vote.index] += validatorWeight;
+                vote_tracker.appliedIndex = new_vote.index;
             }
             try self.votes.put(validator_id, vote_tracker);
         }
@@ -373,7 +378,7 @@ pub const ForkChoice = struct {
         try self.protoArray.applyDeltas(self.deltas.items);
 
         // head is the best descendant of latest justified
-        const justified_idx = self.protoArray.indices.get(self.fcStore.justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
+        const justified_idx = self.protoArray.indices.get(self.fcStore.latest_justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
         const justified_node = self.protoArray.nodes.items[justified_idx];
 
         // if case of no best descendant latest justified is always best descendant
@@ -384,23 +389,48 @@ pub const ForkChoice = struct {
         return self.head;
     }
 
-    pub fn onAttestation(self: *Self, signed_vote: types.SignedVote) !void {
+    pub fn onAttestation(self: *Self, signed_vote: types.SignedVote, is_from_block: bool) !void {
         // vote has to be of an ancestor of the current slot
         const validator_id = signed_vote.validator_id;
         const vote = signed_vote.message;
+        const new_head_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
+        if (vote.slot > self.fcStore.currentSlot) return ForkChoiceError.InvalidFutureAttestation;
+        var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
 
-        const new_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
-        if (vote.slot < self.fcStore.currentSlot) {
-            var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
-            const vote_tracker_new_slot = vote_tracker.newSlot orelse 0;
-            if (vote.head.slot > vote_tracker_new_slot) {
-                vote_tracker.newIndex = new_index;
-                vote_tracker.newSlot = vote.head.slot;
+        // update latest known voted head of the validator if already included on chain
+        if (is_from_block) {
+            if (vote.slot == self.fcStore.currentSlot) return ForkChoiceError.InvalidOnChainAttestation;
+
+            const vote_tracker_latest_known_slot = (vote_tracker.latestKnown orelse ProtoVote{}).slot;
+            if (vote.head.slot > vote_tracker_latest_known_slot) {
+                vote_tracker.latestKnown = .{
+                    //
+                    .index = new_head_index,
+                    .slot = vote.head.slot,
+                };
             }
-            try self.votes.put(validator_id, vote_tracker);
+
+            // also clear out our latest new non included vote if this is even later than that
+            const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
+            if (vote.head.slot > vote_tracker_latest_new_slot) {
+                vote_tracker.latestNew = null;
+            }
+        } else {
+            // just update latest new voted head of the validator
+            const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
+            if (vote.head.slot > vote_tracker_latest_new_slot) {
+                vote_tracker.latestNew = .{
+                    //
+                    .index = new_head_index,
+                    .slot = vote.head.slot,
+                };
+            }
         }
+
+        try self.votes.put(validator_id, vote_tracker);
     }
 
+    // we process state outside forkchoice onblock to parallize verifications and just use the post state here
     pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {
         const parent_root = block.parent_root;
         const slot = block.slot;
@@ -413,7 +443,7 @@ pub const ForkChoice = struct {
             if (slot > self.fcStore.currentSlot) {
                 self.logger.debug(" slot={any} currentslot={any}", .{ slot, self.fcStore.currentSlot });
                 return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.finalized.slot) {
+            } else if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -436,8 +466,6 @@ pub const ForkChoice = struct {
                 .blockRoot = block_root,
                 .parentRoot = parent_root,
                 .stateRoot = block.state_root,
-                // depends on the finalization gadget
-                .targetRoot = block_root,
                 .timeliness = is_timely,
             };
 
@@ -458,7 +486,11 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas, InvalidJustifiedRoot, InvalidBestDescendant };
+const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, InvalidFutureAttestation,
+    //
+    InvalidOnChainAttestation, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas,
+    //
+    InvalidJustifiedRoot, InvalidBestDescendant };
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -480,9 +512,9 @@ test "forkchoice block tree" {
     const logger = utils.getLogger(.info);
     var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state, &logger);
 
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
