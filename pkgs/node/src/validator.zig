@@ -76,7 +76,6 @@ pub const BeamValidator = struct {
         const vote = try self.chain.constructVote(.{ .slot = slot });
 
         for (self.ids) |validator_id| {
-            // SignedVote to be fixed in the followup PR to correctly align types with the latest spec
             const signed_vote: types.SignedVote = .{
                 .validator_id = validator_id,
                 .message = vote,
