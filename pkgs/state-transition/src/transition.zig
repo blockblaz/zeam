@@ -138,12 +138,13 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     }
     logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}\n-----\n", .{ missed_slots, justified_slots.items, historical_block_hashes.items });
 
-    for (block.body.votes) |vote| {
+    for (block.body.atttestations) |signed_vote| {
+        const validator_id: usize = @intCast(signed_vote.validator_id);
+        const vote = signed_vote.message;
         // check if vote is sane
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
-        const validator_id: usize = @intCast(vote.validator_id);
-        logger.debug("processing vote={any}\n....\n", .{vote});
+        logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
 
         if (justified_slots.items[source_slot] != 1 or
             // not present in 3sf mini but once a target is justified no need to run loop

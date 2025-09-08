@@ -20,6 +20,10 @@ pub const BlockProductionParams = struct {
     proposer_index: usize,
 };
 
+pub const VoteConstructionParams = struct {
+    slot: usize,
+};
+
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     forkChoice: fcFactory.ForkChoice,
@@ -106,7 +110,7 @@ pub const BeamChain = struct {
 
         const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
-        const votes = [_]types.Mini3SFVote{};
+        const votes = [_]types.SignedVote{};
         var block = types.BeamBlock{
             .slot = opts.slot,
             .proposer_index = opts.proposer_index,
@@ -114,7 +118,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .votes = &votes,
+                .atttestations = &votes,
             },
         };
 
@@ -132,19 +136,39 @@ pub const BeamChain = struct {
         return block;
     }
 
+    pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
+        const slot = opts.slot;
+
+        const head = self.forkChoice.get_proposal_head(slot);
+        const target = self.forkChoice.get_vote_target();
+
+        const vote = types.Mini3SFVote{
+            //
+            .slot = slot,
+            .head = head,
+            .target = target,
+            .source = self.forkChoice.fcStore.justified,
+        };
+
+        return vote;
+    }
+
     pub fn printSlot(self: *Self, slot: usize) void {
+        // head should be auto updated if receieved a block or block proposal done
+        // however it doesn't get updated unless called updatehead even though processs block
+        // logs show it has been updated. debug and fix the call below
         const fcHead = self.forkChoice.updateHead() catch |err| {
             self.logger.err("forkchoice updatehead error={any}", .{err});
             return;
         };
 
-        self.logger.debug("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
+        self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{ slot, fcHead.blockRoot, fcHead.slot });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |block| {
-                self.logger.debug("node-{d}::chain received block onGossip cb at slot={any}", .{ self.nodeId, block });
+                self.logger.debug("chain received block onGossip cb at slot={any}", .{block});
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
 
@@ -160,6 +184,10 @@ pub const BeamChain = struct {
                         };
                     }
                 }
+            },
+            .vote => |vote| {
+                self.logger.debug("chain received vote onGossip cb at slot={any}", .{vote});
+                // TODO handle vote
             },
         }
 
@@ -181,8 +209,8 @@ pub const BeamChain = struct {
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try self.states.put(fcBlock.blockRoot, post_state);
         // 3. fc onvotes
-        for (block.body.votes) |vote| {
-            try self.forkChoice.onAttestation(vote);
+        for (block.body.atttestations) |signed_vote| {
+            try self.forkChoice.onAttestation(signed_vote);
         }
         // 3. fc update head
         _ = try self.forkChoice.updateHead();

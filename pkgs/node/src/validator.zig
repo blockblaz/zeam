@@ -39,8 +39,12 @@ pub const BeamValidator = struct {
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
         // if a new slot interval may be do a proposal
-        if (interval == 0) {
-            return maybeDoProposal(self, slot);
+        switch (interval) {
+            0 => return self.maybeDoProposal(slot),
+            1 => return self.mayBeDoAttestation(slot),
+            2 => {},
+            3 => {},
+            else => @panic("interval error"),
         }
     }
 
@@ -50,17 +54,36 @@ pub const BeamValidator = struct {
         // check for block production
         const slot_proposer_id = slot % num_validators;
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
-            std.debug.print("\n\n\n going for block production slot={any} proposer={any} index={any}\n\n", .{ slot, slot_proposer_id, index });
+            _ = index;
+            std.debug.print("constructing block message slot={any} proposer={any}\n", .{ slot, slot_proposer_id });
             const block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
             const signed_block = types.SignedBeamBlock{
                 .message = block,
                 .signature = [_]u8{0} ** 48,
             };
-            const signed_block_message = try self.allocator.create(networks.GossipMessage);
-            signed_block_message.* = networks.GossipMessage{ .block = signed_block };
-            std.debug.print("\n\n\n validator block production slot={any} block={any}\n\n\n", .{ slot, signed_block_message });
-            try self.network.publish(signed_block_message);
+            const signed_block_message = networks.GossipMessage{ .block = signed_block };
+            std.debug.print("validator block production slot={any} block={any}\n", .{ slot, signed_block_message });
+            try self.network.publish(&signed_block_message);
+        }
+    }
+
+    pub fn mayBeDoAttestation(self: *Self, slot: usize) !void {
+        if (self.ids.len == 0) return;
+
+        std.debug.print("constructing vote message for slot={any}\n", .{slot});
+        const vote = try self.chain.constructVote(.{ .slot = slot });
+
+        for (self.ids) |validator_id| {
+            const signed_vote: types.SignedVote = .{
+                .validator_id = validator_id,
+                .message = vote,
+                .signature = [_]u8{0} ** 48,
+            };
+
+            const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
+            std.debug.print("validator construced vote slot={any} vote={any}\n", .{ slot, signed_vote_message });
+            try self.network.publish(&signed_vote_message);
         }
     }
 };

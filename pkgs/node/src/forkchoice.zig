@@ -173,6 +173,7 @@ const OnBlockOpts = struct {
 
 pub const ForkChoiceStore = struct {
     currentSlot: types.Slot,
+    // TODO rename them as latest_justified, latest_finalized to reflect spec closely
     justified: types.Mini3SFCheckpoint,
     finalized: types.Mini3SFCheckpoint,
 
@@ -308,6 +309,38 @@ pub const ForkChoice = struct {
         // reset attestations or process checkpoints as prescribed in the specs
     }
 
+    pub fn accept_new_votes(self: *Self) !void {
+        _ = self;
+    }
+
+    pub fn get_proposal_head(self: *Self, slot: types.Slot) types.Mini3SFCheckpoint {
+        const time_intervals = slot * constants.INTERVALS_PER_SLOT;
+        // this could be called independently by the validator when its a separate process
+        // and FC would need to be protected by mutex to make it thread safe but for now
+        // this is deterministally called after the fc has been ticked ahead
+        // so the following call should be a no-op
+        self.onTick(time_intervals, true);
+        // accept any new votes in case previous ontick was a no-op and either the validator
+        // wasn't registered or there have been new votes
+        try self.accept_new_votes();
+        const head = self.head;
+
+        return types.Mini3SFCheckpoint{
+            .root = head.blockRoot,
+            .slot = head.slot,
+        };
+    }
+
+    pub fn get_vote_target(self: *Self) types.Mini3SFCheckpoint {
+        const target = self.head;
+        // TODO correct impl of the target as per the forkchoice specs
+        // for now target is approximated to head
+        return types.Mini3SFCheckpoint{
+            .root = target.blockRoot,
+            .slot = target.slot,
+        };
+    }
+
     pub fn updateHead(self: *Self) !ProtoBlock {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
@@ -351,17 +384,20 @@ pub const ForkChoice = struct {
         return self.head;
     }
 
-    pub fn onAttestation(self: *Self, vote: types.Mini3SFVote) !void {
+    pub fn onAttestation(self: *Self, signed_vote: types.SignedVote) !void {
         // vote has to be of an ancestor of the current slot
+        const validator_id = signed_vote.validator_id;
+        const vote = signed_vote.message;
+
         const new_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
         if (vote.slot < self.fcStore.currentSlot) {
-            var vote_tracker = self.votes.get(vote.validator_id) orelse VoteTracker{};
+            var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
             const vote_tracker_new_slot = vote_tracker.newSlot orelse 0;
             if (vote.head.slot > vote_tracker_new_slot) {
                 vote_tracker.newIndex = new_index;
                 vote_tracker.newSlot = vote.head.slot;
             }
-            try self.votes.put(vote.validator_id, vote_tracker);
+            try self.votes.put(validator_id, vote_tracker);
         }
     }
 

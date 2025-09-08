@@ -37,13 +37,21 @@ pub fn create_and_run_network(network_id: u32, zig_handler: u64, self_port: i32,
 /// The caller must ensure that `message_str` points to valid memory of `message_len` bytes.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe fn publish_msg_to_rust_bridge(network_id:u32, _topic_id: u32, message_str: *const u8, message_len: usize){
+pub unsafe fn publish_msg_to_rust_bridge(network_id:u32,topic_id: u32, message_str: *const u8, message_len: usize){
         let message_slice = std::slice::from_raw_parts(message_str, message_len);
         println!("rustbridge-{network_id}:: publishing message s={:?}",message_slice);
         let message_data = message_slice.to_vec();
 
         // TODO: get the topic mapping from topic_id
-        let topic = gossipsub::IdentTopic::new("block");
+        let topic = match topic_id {
+            0 => gossipsub::IdentTopic::new("block"),
+            1 => gossipsub::IdentTopic::new("vote"),
+            unknown_id => {
+                println!("Invalid topic_id: {unknown_id}");
+                return;
+            },
+        };
+        
          #[allow(static_mut_refs)]
          let swarm = if network_id < 1 {unsafe {SWARM_STATE.as_mut().unwrap()}} else {unsafe {SWARM_STATE1.as_mut().unwrap()}};
         // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
@@ -137,11 +145,20 @@ pub async fn run_eventloop(&mut self) {
                     })) => {
                     {
                         let topic = message.topic.as_str();
-                        let _topic_ptr = topic.as_ptr();
-                        let _topic_len = topic.len();
+                        let topic_id: u32 = match topic {
+                            "block" => 0,
+                            "vote" => 1,
+                            unknown_topic => {
+                                println!("\nrustbridge{0}:: unknown_topic={unknown_topic}\n", self.network_id);
+                                // Will return here return from event loop or return from the match poll to go
+                                // for next iteration of loop
+                                return;
+                            }
+                        };
+
                         let message_ptr = message.data.as_ptr();
                         let message_len = message.data.len();
-                        unsafe {handleMsgFromRustBridge(self.zig_handler, 0 , message_ptr, message_len)};
+                        unsafe {handleMsgFromRustBridge(self.zig_handler, topic_id , message_ptr, message_len)};
                         println!("\nrustbridge{0}:: zig callback completed\n", self.network_id);
                     }
 
@@ -215,9 +232,11 @@ fn new_swarm() -> libp2p::swarm::Swarm<Behaviour> {
     .build();
 
     // get all the topics to subscribe. infact impl the subscribe call from zig
-    let topic = gossipsub::IdentTopic::new("block");
+    let block_topic = gossipsub::IdentTopic::new("block");
+    let vote_topic = gossipsub::IdentTopic::new("vote");
     // subscribes to our topic
-    swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+    swarm.behaviour_mut().gossipsub.subscribe(&block_topic).unwrap();
+    swarm.behaviour_mut().gossipsub.subscribe(&vote_topic).unwrap();
 
     swarm
 }

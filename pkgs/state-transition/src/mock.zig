@@ -88,7 +88,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         var state_root: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(state_root[0..], utils.ZERO_HASH_HEX);
         const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
-        var votes = std.ArrayList(types.Mini3SFVote).init(allocator);
+        var votes = std.ArrayList(types.SignedVote).init(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
             // no votes on the first block of this
@@ -96,14 +96,45 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 head_idx = slot;
             },
             2 => {
-                const slotVotes = [_]types.Mini3SFVote{
+                const slotVotes = [_]types.SignedVote{
                     // val 0
-                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 0,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
                     // skip val1
+
                     // val2
-                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 2,
+                        .message = .{ //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
+
                     // val3
-                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 3,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
                 };
                 for (slotVotes) |slotVote| {
                     try votes.append(slotVote);
@@ -115,14 +146,47 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             3 => {
-                const slotVotes = [_]types.Mini3SFVote{
+                const slotVotes = [_]types.SignedVote{
                     // skip val0
+
                     // val 1
-                    .{ .validator_id = 1, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 1,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
+
                     // val2
-                    .{ .validator_id = 2, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 2,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
+
                     // val3
-                    .{ .validator_id = 3, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 3,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
                 };
                 for (slotVotes) |slotVote| {
                     try votes.append(slotVote);
@@ -135,11 +199,24 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             0 => {
-                const slotVotes = [_]types.Mini3SFVote{
+                const slotVotes = [_]types.SignedVote{
                     // val 0
-                    .{ .validator_id = 0, .slot = slot - 1, .head = .{ .root = parent_root, .slot = slot - 1 }, .target = .{ .root = parent_root, .slot = slot - 1 }, .source = latest_justified },
+                    .{
+                        .validator_id = 0,
+                        .message = .{
+                            //
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
+                        },
+                        .signature = [_]u8{0} ** 48,
+                    },
+
                     // skip val1
+
                     // skip val2
+
                     // skip val3
                 };
 
@@ -158,7 +235,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .state_root = state_root,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .votes = try votes.toOwnedSlice(),
+                .atttestations = try votes.toOwnedSlice(),
             },
         };
 
