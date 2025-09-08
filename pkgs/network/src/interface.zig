@@ -56,6 +56,21 @@ pub const GossipMessage = union(GossipTopic) {
     pub fn getTopic(self: *const Self) GossipTopic {
         return std.meta.activeTag(self.*);
     }
+
+    pub fn clone(self: *const Self, allocator: Allocator) !*Self {
+        const cloned_data = try allocator.create(Self);
+
+        switch (self.*) {
+            .block => {
+                cloned_data.* = .{ .block = try types.sszClone(allocator, types.SignedBeamBlock, self.block) };
+            },
+            .vote => {
+                cloned_data.* = .{ .vote = try types.sszClone(allocator, types.SignedVote, self.vote) };
+            },
+        }
+
+        return cloned_data;
+    }
 };
 
 pub const ReqRespMethod = enum {
@@ -101,17 +116,25 @@ pub const GenericGossipHandler = struct {
         std.debug.print("\n\n\nnetwork-{d}:: ongossip handlerArr {any} for topic {any}\n", .{ self.networkId, handlerArr.items, topic });
         for (handlerArr.items) |handler| {
 
-            // TODO: track and dealloc the structures
-            const c = try self.allocator.create(xev.Completion);
-            c.* = undefined;
-
-            const publishWrapper = try self.allocator.create(MessagePublishWrapper);
-            publishWrapper.* = MessagePublishWrapper{ .handler = handler, .data = data, .networkId = self.networkId };
-            std.debug.print("\n\n\nnetwork-{d}:: schedueling ongossip publishWrapper={any} on loop for topic {any}\n\n", .{ self.networkId, topic, publishWrapper });
-
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
             // remove this option once resolved
             if (scheduleOnLoop) {
+                // TODO: track and dealloc the structures
+                const c = try self.allocator.create(xev.Completion);
+                c.* = undefined;
+
+                const publishWrapper = try self.allocator.create(MessagePublishWrapper);
+                const cloned_data = try data.clone(self.allocator);
+
+                publishWrapper.* = MessagePublishWrapper{
+                    .handler = handler,
+                    // clone the data to be independently deallocated as the mock network publish will
+                    // return the callflow back and it might dealloc the data before loop and process it
+                    .data = cloned_data,
+                    .networkId = self.networkId,
+                };
+                std.debug.print("\n\n\nnetwork-{d}:: schedueling ongossip publishWrapper={any} on loop for topic {any}\n\n", .{ self.networkId, topic, publishWrapper });
+
                 self.timer.run(
                     self.loop,
                     c,
@@ -130,14 +153,14 @@ pub const GenericGossipHandler = struct {
                                 std.debug.print("\n\n\n\nnetwork-{d}:: XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{pwrap.networkId});
                                 _ = pwrap.handler.onGossip(pwrap.data) catch void;
                             }
-                            // TODO defer freeing the publishwrapper but need handle to the allocator
+                            // TODO defer freeing the publishwrapper and its data but need handle to the allocator
                             // also figure out how and when to best dealloc the completion
                             return .disarm;
                         }
                     }).callback,
                 );
             } else {
-                publishWrapper.handler.onGossip(publishWrapper.data) catch |e| {
+                handler.onGossip(data) catch |e| {
                     std.debug.print("\nnetwork-{d}:: onGossip handler error={any}\n", .{ self.networkId, e });
                 };
             }
