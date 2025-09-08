@@ -378,9 +378,9 @@ pub const ForkChoice = struct {
             // we don't need to null the new index after application because
             // applied and new will be same will no impact but this could still be a
             // relevant operation if/when the validator weight changes
-            if (vote_tracker.latestKnown) |new_vote| {
-                self.deltas.items[new_vote.index] += validatorWeight;
-                vote_tracker.appliedIndex = new_vote.index;
+            if (vote_tracker.latestKnown) |apply_vote| {
+                self.deltas.items[apply_vote.index] += validatorWeight;
+                vote_tracker.appliedIndex = apply_vote.index;
             }
             try self.votes.put(validator_id, vote_tracker);
         }
