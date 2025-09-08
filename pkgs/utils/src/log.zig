@@ -186,11 +186,21 @@ pub const ZeamLogger = struct {
 };
 
 pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileParams: ?FileParams) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileParams);
+    var new_fileParams = fileParams;
+    // if null fileParams, use default,
+    if (fileParams == null) {
+        new_fileParams = FileParams{ .fileActiveLevel = .debug, .filePath = "./log", .fileName = "consensus" };
+    }
+    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, new_fileParams);
 }
 
 pub fn getLogger(activeLevel: ?std.log.Level, fileParams: ?FileParams) ZeamLogger {
-    return ZeamLogger.init(std.log.default_log_scope, activeLevel orelse std.log.default_level, fileParams);
+    var new_fileParams = fileParams;
+    // if null fileParams, use default
+    if (fileParams == null) {
+        new_fileParams = FileParams{ .fileActiveLevel = .debug, .filePath = "./log", .fileName = "consensus" };
+    }
+    return ZeamLogger.init(std.log.default_log_scope, activeLevel orelse std.log.default_level, new_fileParams);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
