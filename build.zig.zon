@@ -1,6 +1,6 @@
 .{
     .name = .zeam,
-    .fingerprint = 0x243fd12cffd82793,
+    .fingerprint = 0x243fd12cbfabbe73,
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
