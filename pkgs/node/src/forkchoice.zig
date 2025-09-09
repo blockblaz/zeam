@@ -365,6 +365,12 @@ pub const ForkChoice = struct {
         };
     }
 
+    pub fn getProposalVotes(self: *Self) ![]types.SignedVote {
+        var included_votes = std.ArrayList(types.SignedVote).init(self.allocator);
+        // TODO simple strategy to include all votes that are consistent with the latest justified
+        return included_votes.toOwnedSlice();
+    }
+
     pub fn getVoteTarget(self: *Self) !types.Mini3SFCheckpoint {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;

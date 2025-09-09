@@ -99,6 +99,7 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
+        const votes = try self.forkChoice.getProposalVotes();
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -106,7 +107,6 @@ pub const BeamChain = struct {
 
         const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
-        const votes = [_]types.SignedVote{};
         var block = types.BeamBlock{
             .slot = opts.slot,
             .proposer_index = opts.proposer_index,
@@ -114,7 +114,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .atttestations = &votes,
+                .atttestations = votes,
             },
         };
 
