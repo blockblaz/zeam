@@ -164,8 +164,6 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
-        // const file = if (self.fileParams) |params| params.file else null;
         return log(
             self.scope,
             self.activeLevel,
@@ -181,8 +179,6 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
-        // const file = if (self.fileParams) |params| params.file else null;
         return log(
             self.scope,
             self.activeLevel,
@@ -198,8 +194,6 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
-        // const file = if (self.fileParams) |params| params.file else null;
         return log(
             self.scope,
             self.activeLevel,
@@ -215,8 +209,6 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
-        // const file = if (self.fileParams) |params| params.file else null;
         return log(
             self.scope,
             self.activeLevel,
