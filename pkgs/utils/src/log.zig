@@ -44,7 +44,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         }
 
         // Also write to file if provided and file exists
-        if (@intFromEnum(fileParams.?.fileActiveLevel) >= @intFromEnum(level) and fileParams.?.file != null) {
+        if (fileParams != null and @intFromEnum(fileParams.?.fileActiveLevel) >= @intFromEnum(level) and fileParams.?.file != null) {
             nosuspend fileParams.?.file.?.writeAll(print_str) catch return;
         }
     }
