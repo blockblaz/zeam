@@ -4,8 +4,8 @@ const datetime = @import("datetime");
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
-pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, fileActiveLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, file: ?std.fs.File) void {
-    if ((@intFromEnum(level) > @intFromEnum(activeLevel)) and (@intFromEnum(level) > @intFromEnum(fileActiveLevel))) {
+pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams) void {
+    if ((@intFromEnum(level) > @intFromEnum(activeLevel)) and (fileParams == null or (@intFromEnum(level) > @intFromEnum(fileParams.?.fileActiveLevel)))) {
         return;
     }
 
@@ -44,18 +44,18 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, file
         }
 
         // Also write to file if provided and file exists
-        if (@intFromEnum(fileActiveLevel) >= @intFromEnum(level) and file != null) {
-            nosuspend file.?.writeAll(print_str) catch return;
+        if (@intFromEnum(fileParams.?.fileActiveLevel) >= @intFromEnum(level) and fileParams.?.file != null) {
+            nosuspend fileParams.?.file.?.writeAll(print_str) catch return;
         }
     }
 }
 
-pub fn log(scope: LoggerScope, activeLevel: std.log.Level, fileActiveLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, file: ?std.fs.File) void {
+pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams) void {
     switch (scope) {
-        .default => return compTimeLog(.default, activeLevel, fileActiveLevel, level, fmt, args, file),
-        .n1 => return compTimeLog(.n1, activeLevel, fileActiveLevel, level, fmt, args, file),
-        .n2 => return compTimeLog(.n2, activeLevel, fileActiveLevel, level, fmt, args, file),
-        .n3 => return compTimeLog(.n3, activeLevel, fileActiveLevel, level, fmt, args, file),
+        .default => return compTimeLog(.default, activeLevel, level, fmt, args, fileParams),
+        .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileParams),
+        .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileParams),
+        .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileParams),
     }
 }
 
@@ -70,53 +70,57 @@ pub const FileParams = struct {
     fileActiveLevel: std.log.Level = .debug,
     filePath: []const u8,
     fileName: []const u8,
+    file: ?std.fs.File = null, // optional log file
+    last_rotation_day: i64 = 0,
+    mutex: if (builtin.target.os.tag == .freestanding) void else std.Thread.Mutex = if (builtin.target.os.tag == .freestanding) {} else std.Thread.Mutex{},
 };
 
 pub const ZeamLogger = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
-    file: ?std.fs.File, // optional log file
     fileParams: ?FileParams,
-    last_rotation_day: i64,
-    mutex: if (builtin.target.os.tag == .freestanding) void else std.Thread.Mutex, // Conditional mutex
 
     const Self = @This();
     pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileParams: ?FileParams) Self {
-        const file = if (fileParams != null)
-            getFile(scope, fileParams.?.filePath, fileParams.?.fileName)
-        else
-            null;
+        var updated_params = fileParams;
+        if (updated_params) |*params| {
+            params.file = getFile(scope, params.filePath, params.fileName);
+            params.last_rotation_day = if (builtin.target.os.tag == .freestanding) 0 else @as(i64, @intCast(@divFloor(std.time.timestamp(), 24 * 60 * 60)));
+        }
+
         return Self{
             .scope = scope,
             .activeLevel = activeLevel,
-            .file = file,
-            .fileParams = if (fileParams != null) fileParams else null,
-            .last_rotation_day = if (builtin.target.os.tag == .freestanding) 0 else @divFloor(std.time.timestamp(), 24 * 60 * 60),
-            .mutex = if (builtin.target.os.tag == .freestanding) {} else std.Thread.Mutex{}, // Conditional initialization
+            .fileParams = updated_params,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.file) |f| {
-            f.close();
-            self.file = null;
+        if (self.fileParams) |*params| {
+            if (params.file) |f| {
+                f.close();
+                params.file = null;
+            }
         }
     }
 
-    pub fn maybeRotate(self: *const Self) !void {
-        // mayBeRotate will not and shouldn' t be called from zkvm
-        if (self.file == null) return;
+    pub fn maybeRotate(self: *Self) !void {
+        // mayBeRotate will not and shouldn't be called from zkvm
+        //         if (builtin.target.os.tag == .freestanding) return;
+        if (self.fileParams == null) return;
 
-        if (self.file) |file| {
+        if (self.fileParams.?.file == null) return;
+
+        if (self.fileParams.?.file) |file| {
             const now = std.time.timestamp();
             const sec_per_day = 24 * 60 * 60;
-            const current_epoch_day = @divFloor(now, sec_per_day);
+            const current_epoch_day = @as(i64, @intCast(@divFloor(now, sec_per_day)));
 
-            if (current_epoch_day == self.last_rotation_day) {
+            if (current_epoch_day == self.fileParams.?.last_rotation_day) {
                 return;
             }
+            const date = datetime.datetime.Datetime.fromTimestamp(self.fileParams.?.last_rotation_day * sec_per_day * 1000);
 
-            const date = datetime.datetime.Datetime.fromTimestamp(std.time.milliTimestamp());
             var ts_buf: [128]u8 = undefined;
             const date_ext = try std.fmt.bufPrint(
                 &ts_buf,
@@ -140,16 +144,18 @@ pub const ZeamLogger = struct {
                 else => try std.fmt.bufPrint(&new_buf, "{s}-{s}-{s}.log", .{ self.fileParams.?.fileName, @tagName(self.scope), date_ext }),
             };
 
-            if (self.fileParams) |params| {
-                @constCast(&self.mutex).lock();
-                defer @constCast(&self.mutex).unlock();
-                file.close();
-                var dir = std.fs.cwd().openDir(params.filePath, .{}) catch return;
-                defer dir.close();
-                try dir.rename(base_name, rotated_name);
-                @constCast(self).file = getFile(self.scope, params.filePath, params.fileName);
-                @constCast(self).last_rotation_day = current_epoch_day;
-            }
+            // Lock the mutex from fileParams
+            self.fileParams.?.mutex.lock();
+            defer self.fileParams.?.mutex.unlock();
+
+            file.close();
+            var dir = std.fs.cwd().openDir(self.fileParams.?.filePath, .{}) catch return;
+            defer dir.close();
+            try dir.rename(base_name, rotated_name);
+
+            // Update the file and rotation day in fileParams
+            self.fileParams.?.file = getFile(self.scope, self.fileParams.?.filePath, self.fileParams.?.fileName);
+            self.fileParams.?.last_rotation_day = current_epoch_day;
         }
     }
 
@@ -158,7 +164,16 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        return log(self.scope, self.activeLevel, self.fileParams.?.fileActiveLevel, .err, fmt, args, self.file);
+        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
+        // const file = if (self.fileParams) |params| params.file else null;
+        return log(
+            self.scope,
+            self.activeLevel,
+            .err,
+            fmt,
+            args,
+            self.fileParams,
+        );
     }
 
     pub fn warn(
@@ -166,14 +181,33 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        return log(self.scope, self.activeLevel, self.fileParams.?.fileActiveLevel, .warn, fmt, args, self.file);
+        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
+        // const file = if (self.fileParams) |params| params.file else null;
+        return log(
+            self.scope,
+            self.activeLevel,
+            .warn,
+            fmt,
+            args,
+            self.fileParams,
+        );
     }
+
     pub fn info(
         self: *const Self,
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        return log(self.scope, self.activeLevel, self.fileParams.?.fileActiveLevel, .info, fmt, args, self.file);
+        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
+        // const file = if (self.fileParams) |params| params.file else null;
+        return log(
+            self.scope,
+            self.activeLevel,
+            .info,
+            fmt,
+            args,
+            self.fileParams,
+        );
     }
 
     pub fn debug(
@@ -181,26 +215,25 @@ pub const ZeamLogger = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        return log(self.scope, self.activeLevel, self.fileParams.?.fileActiveLevel, .debug, fmt, args, self.file);
+        // const file_level = if (self.fileParams) |params| params.fileActiveLevel else .debug;
+        // const file = if (self.fileParams) |params| params.file else null;
+        return log(
+            self.scope,
+            self.activeLevel,
+            .debug,
+            fmt,
+            args,
+            self.fileParams,
+        );
     }
 };
 
 pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileParams: ?FileParams) ZeamLogger {
-    var new_fileParams = fileParams;
-    // if null fileParams, use default,
-    if (fileParams == null) {
-        new_fileParams = FileParams{ .fileActiveLevel = .debug, .filePath = "./log", .fileName = "consensus" };
-    }
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, new_fileParams);
+    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileParams);
 }
 
 pub fn getLogger(activeLevel: ?std.log.Level, fileParams: ?FileParams) ZeamLogger {
-    var new_fileParams = fileParams;
-    // if null fileParams, use default
-    if (fileParams == null) {
-        new_fileParams = FileParams{ .fileActiveLevel = .debug, .filePath = "./log", .fileName = "consensus" };
-    }
-    return ZeamLogger.init(std.log.default_log_scope, activeLevel orelse std.log.default_level, new_fileParams);
+    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileParams);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
@@ -244,15 +277,14 @@ pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?
         },
     };
 
-    var file: ?std.fs.File = null;
-    file = dir.createFile(
+    const file = dir.createFile(
         filename_withscope,
         .{
             .read = true,
             .truncate = false,
         },
     ) catch return null;
-    file.?.seekFromEnd(0) catch {};
 
+    file.seekFromEnd(0) catch {};
     return file;
 }

@@ -26,7 +26,7 @@ const NodeOpts = struct {
     db: LevelDB,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: *zeam_utils.ZeamLogger,
 };
 
 pub const BeamNode = struct {

@@ -136,7 +136,7 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            const logger = utilsLib.getLogger(null, null);
+            var logger = utilsLib.getLogger(null, null);
 
             const options = stateProvingManager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -230,8 +230,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            const logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
