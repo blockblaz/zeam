@@ -192,7 +192,7 @@ pub const BeamChain = struct {
 
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
-    // our implemented forkchoice's onblock. this is to parellize apply transition with other verifications
+    // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         const onblock_timer = metrics.chain_onblock_duration_seconds.start();
 
