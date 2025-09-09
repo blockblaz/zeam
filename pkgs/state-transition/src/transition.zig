@@ -46,7 +46,7 @@ pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.
     }
 }
 
-fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
+pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     if (candidate < finalized) {
         return StateTransitionError.InvalidJustifiableSlot;
     }

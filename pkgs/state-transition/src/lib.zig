@@ -14,6 +14,7 @@ pub const apply_transition = transition.apply_transition;
 pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
+pub const is_justifiable_slot = transition.is_justifiable_slot;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
