@@ -85,7 +85,7 @@ pub const BeamChain = struct {
             has_proposal,
         });
 
-        self.forkChoice.onTick(time_intervals, has_proposal);
+        try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
@@ -139,7 +139,7 @@ pub const BeamChain = struct {
     pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
         const slot = opts.slot;
 
-        const head = self.forkChoice.get_proposal_head(slot);
+        const head = try self.forkChoice.get_proposal_head(slot);
         const target = self.forkChoice.get_vote_target();
 
         const vote = types.Mini3SFVote{
@@ -147,7 +147,7 @@ pub const BeamChain = struct {
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.fcStore.justified,
+            .source = self.forkChoice.fcStore.latest_justified,
         };
 
         return vote;
@@ -191,12 +191,15 @@ pub const BeamChain = struct {
             },
         }
 
-        self.printSlot(self.forkChoice.fcStore.currentSlot);
+        self.printSlot(self.forkChoice.fcStore.timeSlots);
     }
 
-    // import block assuming it is validated
+    // import block assuming it is gossip validated or synced
+    // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
+    // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         const onblock_timer = metrics.chain_onblock_duration_seconds.start();
+
         // 1. get parent state
         const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
@@ -208,11 +211,13 @@ pub const BeamChain = struct {
         const block = signedBlock.message;
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try self.states.put(fcBlock.blockRoot, post_state);
-        // 3. fc onvotes
+
+        // 4. fc onvotes
         for (block.body.atttestations) |signed_vote| {
-            try self.forkChoice.onAttestation(signed_vote);
+            try self.forkChoice.onAttestation(signed_vote, true);
         }
-        // 3. fc update head
+
+        // 5. fc update head
         _ = try self.forkChoice.updateHead();
         onblock_timer.observe();
     }
@@ -243,9 +248,9 @@ test "process and add mock blocks into a node's chain" {
 
     var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
 
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
@@ -255,7 +260,7 @@ test "process and add mock blocks into a node's chain" {
         const block_root = mock_chain.blockRoots[i];
         const current_slot = block.message.slot;
 
-        beam_chain.forkChoice.tickSlot(current_slot);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         try beam_chain.onBlock(block);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
@@ -270,8 +275,8 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
 
         // fcstore checkpoints should match
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.justified.root, &mock_chain.latestJustified[i].root));
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.latestFinalized[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_justified.root, &mock_chain.latestJustified[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.latestFinalized[i].root));
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 

@@ -36,10 +36,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
-    const zigcli = b.dependency("zigcli", .{
+    const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
-    });
+    }).module("simargs");
     const xev = b.dependency("xev", .{
         .target = target,
         .optimize = optimize,
@@ -53,6 +53,11 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("datetime");
+
+    const enr = b.dependency("zig_enr", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig-enr");
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -156,6 +161,7 @@ pub fn build(b: *Builder) !void {
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
+    const build_options_module = build_options.createModule();
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -166,8 +172,8 @@ pub fn build(b: *Builder) !void {
     });
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
-    cli_exe.root_module.addImport("build_options", build_options.createModule());
-    cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    cli_exe.root_module.addImport("build_options", build_options_module);
+    cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
@@ -201,7 +207,28 @@ pub fn build(b: *Builder) !void {
         run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
     }
 
-    const test_step = b.step("test", "Run unit tests");
+    const tools_step = b.step("tools", "Build zeam tools");
+
+    const tools_cli_exe = b.addExecutable(.{
+        .name = "zeam-tools",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/tools/src/main.zig"),
+        }),
+    });
+    tools_cli_exe.root_module.addImport("enr", enr);
+    tools_cli_exe.root_module.addImport("build_options", build_options_module);
+    tools_cli_exe.root_module.addImport("simargs", simargs);
+
+    const install_tools_cli = b.addInstallArtifact(tools_cli_exe, .{});
+    tools_step.dependOn(&install_tools_cli.step);
+
+    const all_step = b.step("all", "Build all executables and tools");
+    all_step.dependOn(&cli_exe.step);
+    all_step.dependOn(tools_step);
+
+    const test_step = b.step("test", "Run zeam core tests");
 
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
@@ -261,6 +288,18 @@ pub fn build(b: *Builder) !void {
     test_step.dependOn(&run_params_tests.step);
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
+
+    const tools_test_step = b.step("test-tools", "Run zeam tools tests");
+    const tools_cli_tests = b.addTest(.{
+        .root_module = tools_cli_exe.root_module,
+        .optimize = optimize,
+        .target = target,
+    });
+    tools_cli_tests.root_module.addImport("enr", enr);
+    const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    tools_test_step.dependOn(&run_tools_cli_test.step);
+
+    test_step.dependOn(tools_test_step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {

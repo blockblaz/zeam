@@ -1,6 +1,6 @@
 .{
     .name = .zeam,
-    .fingerprint = 0x243fd12cb97b9437,
+    .fingerprint = 0x243fd12ce9ee69c2,
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
@@ -22,6 +22,10 @@
         .metrics = .{
             .url = "https://github.com/karlseguin/metrics.zig/archive/2b584b6209871b7215706028988169599451dc0d.tar.gz",
             .hash = "metrics-0.0.0-W7G4eCG0AQCQXidzvV5kx4l0smr_WCw-8JLIwS_OHYoW",
+        },
+        .zig_enr = .{
+            .url = "git+https://github.com/blockblaz/enr#02f187591f8a9616623e0bc91d139f0d18c99bcf",
+            .hash = "zig_enr-0.0.0-cO2P20iiAQALUQA-fb_70u0hyoBJo7u_tdeZue8FuyuZ",
         },
     },
     .paths = .{""},
