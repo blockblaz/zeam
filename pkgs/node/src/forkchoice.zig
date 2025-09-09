@@ -169,7 +169,10 @@ const OnBlockOpts = struct {
 };
 
 pub const ForkChoiceStore = struct {
-    currentSlot: types.Slot,
+    // time in intervals and slots since genesis
+    time: types.Interval,
+    timeSlots: types.Slot,
+
     latest_justified: types.Mini3SFCheckpoint,
     // finalized is not tracked the same way in 3sf mini as it corresponds to head's finalized
     // however its unlikely that a finalized can be rolled back in a normal node operation
@@ -213,6 +216,7 @@ pub const ForkChoice = struct {
     // because of churn in validators
     votes: std.AutoHashMap(usize, VoteTracker),
     head: ProtoBlock,
+    safeTarget: ProtoBlock,
     // data structure to hold validator deltas, could be grown over time as more validators
     // get added
     deltas: std.ArrayList(isize),
@@ -239,7 +243,8 @@ pub const ForkChoice = struct {
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Mini3SFCheckpoint{ .slot = anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
-            .currentSlot = anchorState.slot,
+            .time = anchorState.slot * constants.INTERVALS_PER_SLOT,
+            .timeSlots = anchorState.slot,
             .latest_justified = anchorCP,
             .latest_finalized = anchorCP,
         };
@@ -254,6 +259,7 @@ pub const ForkChoice = struct {
             .fcStore = fc_store,
             .votes = votes,
             .head = anchor_block,
+            .safeTarget = anchor_block,
             .deltas = deltas,
             .logger = logger,
         };
@@ -293,28 +299,35 @@ pub const ForkChoice = struct {
         return false;
     }
 
-    pub fn onTick(self: *Self, time_intervals: usize, has_proposal: bool) void {
-        // the onTick will be properly implemented on the followup PR for devnet0 fc update
-        // for now it will just call tickSlot for the current mechanims
-        const current_slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        const current_interval = time_intervals % constants.INTERVALS_PER_SLOT;
-        if (current_interval == 0) {
-            self.tickSlot(current_slot);
+    pub fn tickInterval(self: *Self, hasProposal: bool) !void {
+        self.fcStore.time += 1;
+        const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
+        switch (currentInterval) {
+            0 => {
+                self.fcStore.timeSlots += 1;
+                if (hasProposal) {
+                    _ = try self.acceptNewVotes();
+                }
+            },
+            1 => {},
+            2 => {
+                _ = try self.updateSafeTarget();
+            },
+            3 => {
+                _ = try self.acceptNewVotes();
+            },
+            else => @panic("invalid interval"),
         }
-        _ = has_proposal;
+        self.logger.debug("forkchoice ticked to time (intervals){d} = slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
-    pub fn tickSlot(self: *Self, currentSlot: types.Slot) void {
-        if (self.fcStore.currentSlot >= currentSlot) {
-            return;
+    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+        while (self.fcStore.time < time_intervals) {
+            try self.tickInterval(has_proposal and (self.fcStore.time + 1) == time_intervals);
         }
-
-        self.fcStore.currentSlot = currentSlot;
-        self.logger.debug("forkchoice ticked slot to {any}", .{self.fcStore.currentSlot});
-        // reset attestations or process checkpoints as prescribed in the specs
     }
 
-    pub fn accept_new_votes(self: *Self) !ProtoBlock {
+    pub fn acceptNewVotes(self: *Self) !ProtoBlock {
         for (0..self.config.genesis.num_validators) |validator_id| {
             var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
             if (vote_tracker.latestNew) |new_vote| {
@@ -335,10 +348,10 @@ pub const ForkChoice = struct {
         // and FC would need to be protected by mutex to make it thread safe but for now
         // this is deterministally called after the fc has been ticked ahead
         // so the following call should be a no-op
-        self.onTick(time_intervals, true);
+        try self.onInterval(time_intervals, true);
         // accept any new votes in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new votes
-        const head = try self.accept_new_votes();
+        const head = try self.acceptNewVotes();
 
         return types.Mini3SFCheckpoint{
             .root = head.blockRoot,
@@ -354,6 +367,11 @@ pub const ForkChoice = struct {
             .root = target.blockRoot,
             .slot = target.slot,
         };
+    }
+
+    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
+        // TODO implement as per spec
+        return self.safeTarget;
     }
 
     pub fn updateHead(self: *Self) !ProtoBlock {
@@ -404,12 +422,12 @@ pub const ForkChoice = struct {
         const validator_id = signed_vote.validator_id;
         const vote = signed_vote.message;
         const new_head_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
-        if (vote.slot > self.fcStore.currentSlot) return ForkChoiceError.InvalidFutureAttestation;
+        if (vote.slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
         var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
 
         // update latest known voted head of the validator if already included on chain
         if (is_from_block) {
-            if (vote.slot == self.fcStore.currentSlot) return ForkChoiceError.InvalidOnChainAttestation;
+            if (vote.slot == self.fcStore.timeSlots) return ForkChoiceError.InvalidOnChainAttestation;
 
             const vote_tracker_latest_known_slot = (vote_tracker.latestKnown orelse ProtoVote{}).slot;
             if (vote.head.slot > vote_tracker_latest_known_slot) {
@@ -450,8 +468,7 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot > self.fcStore.currentSlot) {
-                self.logger.debug(" slot={any} currentslot={any}", .{ slot, self.fcStore.currentSlot });
+            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.time) {
                 return ForkChoiceError.FutureSlot;
             } else if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
@@ -537,7 +554,7 @@ test "forkchoice block tree" {
         const current_slot = block.message.slot;
         try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
-        fork_choice.tickSlot(current_slot);
+        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));

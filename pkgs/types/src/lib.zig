@@ -7,6 +7,7 @@ const params = @import("@zeam/params");
 // just dummy type right now to test imports
 pub const Bytes32 = [32]u8;
 pub const Slot = u64;
+pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 

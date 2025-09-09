@@ -85,7 +85,7 @@ pub const BeamChain = struct {
             has_proposal,
         });
 
-        self.forkChoice.onTick(time_intervals, has_proposal);
+        try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
@@ -187,7 +187,7 @@ pub const BeamChain = struct {
             },
         }
 
-        self.printSlot(self.forkChoice.fcStore.currentSlot);
+        self.printSlot(self.forkChoice.fcStore.timeSlots);
     }
 
     // import block assuming it is gossip validated or synced
@@ -256,7 +256,7 @@ test "process and add mock blocks into a node's chain" {
         const block_root = mock_chain.blockRoots[i];
         const current_slot = block.message.slot;
 
-        beam_chain.forkChoice.tickSlot(current_slot);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         try beam_chain.onBlock(block);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
