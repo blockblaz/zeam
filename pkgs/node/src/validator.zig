@@ -64,6 +64,8 @@ pub const BeamValidator = struct {
             };
             const signed_block_message = networks.GossipMessage{ .block = signed_block };
             std.debug.print("validator block production slot={any} block={any}\n", .{ slot, signed_block_message });
+            // publish block is right now a no-op however move gossip message construction and publish there
+            try self.chain.publishBlock(signed_block);
             try self.network.publish(&signed_block_message);
         }
     }
@@ -83,6 +85,8 @@ pub const BeamValidator = struct {
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
             std.debug.print("validator construced vote slot={any} vote={any}\n", .{ slot, signed_vote_message });
+            try self.chain.publishVote(signed_vote);
+            // move gossip message construction and publish to publishVote
             try self.network.publish(&signed_vote_message);
         }
     }

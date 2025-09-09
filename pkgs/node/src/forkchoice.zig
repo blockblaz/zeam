@@ -126,12 +126,18 @@ pub const ProtoArray = struct {
             const node = self.nodes.items[node_idx];
 
             if (self.nodes.items[node_idx].parent) |parent_idx| {
+                const nodeBestDescendant = node.bestDescendant orelse (
+                    // by recurssion, we will always have a bestDescendant >= cutoff
+                    if (self.nodes.items[node_idx].weight >= cutoff_weight) node_idx else null
+                    //
+                );
+
                 const parent = self.nodes.items[parent_idx];
                 var updateBest = false;
 
                 if (parent.bestChild == node_idx) {
                     // check if bestDescendant needs to be updated even if best child is same
-                    if (parent.bestDescendant != node.bestDescendant) {
+                    if (parent.bestDescendant != nodeBestDescendant) {
                         updateBest = true;
                     }
                 } else {
@@ -156,11 +162,7 @@ pub const ProtoArray = struct {
 
                 if (updateBest) {
                     self.nodes.items[parent_idx].bestChild = node_idx;
-                    self.nodes.items[parent_idx].bestDescendant = node.bestDescendant orelse (
-                        // by recurssion, we will always have a bestDescendant >= cutoff
-                        if (self.nodes.items[node_idx].weight >= cutoff_weight) node_idx else null
-                        //
-                    );
+                    self.nodes.items[parent_idx].bestDescendant = nodeBestDescendant;
                 }
             }
         }
@@ -428,6 +430,14 @@ pub const ForkChoice = struct {
         // if case of no best descendant latest justified is always best descendant
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas={any} justified_node={any} best_descendant_idx={d}", .{
+            //
+            from_known,
+            cutoff_weight,
+            deltas,
+            justified_node,
+            best_descendant_idx,
+        });
 
         const fcHead = utils.Cast(ProtoBlock, best_descendant);
         return fcHead;
@@ -449,13 +459,10 @@ pub const ForkChoice = struct {
         const validator_id = signed_vote.validator_id;
         const vote = signed_vote.message;
         const new_head_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
-        if (vote.slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
-        var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
 
+        var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
         // update latest known voted head of the validator if already included on chain
         if (is_from_block) {
-            if (vote.slot == self.fcStore.timeSlots) return ForkChoiceError.InvalidOnChainAttestation;
-
             const vote_tracker_latest_known_slot = (vote_tracker.latestKnown orelse ProtoVote{}).slot;
             if (vote.head.slot > vote_tracker_latest_known_slot) {
                 vote_tracker.latestKnown = .{
@@ -471,6 +478,7 @@ pub const ForkChoice = struct {
                 vote_tracker.latestNew = null;
             }
         } else {
+            if (vote.slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
             // just update latest new voted head of the validator
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
             if (vote.head.slot > vote_tracker_latest_new_slot) {
