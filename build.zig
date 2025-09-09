@@ -299,9 +299,7 @@ pub fn build(b: *Builder) !void {
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
-    const all_tests_step = b.step("test-all", "Run all tests");
-    all_tests_step.dependOn(test_step);
-    all_tests_step.dependOn(tools_test_step);
+    test_step.dependOn(tools_test_step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
