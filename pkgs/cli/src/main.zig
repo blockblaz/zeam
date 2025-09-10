@@ -198,8 +198,6 @@ pub fn main() !void {
                 backend2 = network.getNetworkInterface();
                 std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
             } else {
-                // TODO: right now EthLibp2p act as a mock network
-                // however convert it into libp2p network by using rust bridge and create 2 separate networks
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
                 defer for (listen_addresses1) |addr| addr.deinit();
