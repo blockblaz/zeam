@@ -10,6 +10,7 @@ const Clock = nodeLib.Clock;
 const stateProvingManager = @import("@zeam/state-proving-manager");
 const BeamNode = nodeLib.BeamNode;
 const xev = @import("xev");
+const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -200,13 +201,19 @@ pub fn main() !void {
                 // TODO: right now EthLibp2p act as a mock network
                 // however convert it into libp2p network by using rust bridge and create 2 separate networks
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .port = 9001, .peers = -1 });
+                const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
+                defer for (listen_addresses1) |addr| addr.deinit();
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses1, .connect_peers = null });
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
                 var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .port = 9002, .peers = 9001 });
+                const listen_addresses2 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")};
+                defer for (listen_addresses2) |addr| addr.deinit();
+                const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
+                defer for (connect_peers) |addr| addr.deinit();
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .listen_addresses = listen_addresses2, .connect_peers = connect_peers });
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
                 std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});

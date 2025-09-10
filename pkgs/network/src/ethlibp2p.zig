@@ -5,6 +5,7 @@ const Thread = std.Thread;
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const xev = @import("xev");
+const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -48,16 +49,24 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
     };
 }
 
+export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void {
+    const listen_slice = std.mem.span(listenAddresses);
+    zigHandler.allocator.free(listen_slice);
+
+    const connect_slice = std.mem.span(connectAddresses);
+    if (connect_slice.len > 0) {
+        zigHandler.allocator.free(connect_slice);
+    }
+}
+
 // TODO: change listen port and connect port both to list of multiaddrs
-pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenPort: i32, connectPort: i32) void;
+pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
 pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
-    port: i32,
-    // TODO convert into array multiaddrs
-    // right now just take a connect peer port for testing ease
-    peers: i32,
+    listen_addresses: []const Multiaddr,
+    connect_peers: ?[]const Multiaddr,
 };
 
 pub const EthLibp2p = struct {
@@ -77,7 +86,12 @@ pub const EthLibp2p = struct {
     }
 
     pub fn run(self: *Self) !void {
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, self.params.port, self.params.peers });
+        const listen_addresses_str = try multiaddrsToString(self.allocator, self.params.listen_addresses);
+        const connect_peers_str = if (self.params.connect_peers) |peers|
+            try multiaddrsToString(self.allocator, peers)
+        else
+            "";
+        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, listen_addresses_str.ptr, connect_peers_str.ptr });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
@@ -139,5 +153,31 @@ pub const EthLibp2p = struct {
             .reqRespFn = reqResp,
             .onReqFn = onReq,
         } };
+    }
+
+    fn multiaddrsToString(allocator: Allocator, addrs: []const Multiaddr) ![:0]u8 {
+        if (addrs.len == 0) {
+            return try allocator.dupeZ(u8, "");
+        }
+
+        var addr_strings = std.ArrayList([]const u8).init(allocator);
+        defer {
+            for (addr_strings.items) |addr_str| {
+                allocator.free(addr_str);
+            }
+            addr_strings.deinit();
+        }
+
+        for (addrs) |addr| {
+            const addr_str = try addr.toString(allocator);
+            try addr_strings.append(addr_str);
+        }
+
+        const joined = try std.mem.join(allocator, ",", addr_strings.items);
+        defer allocator.free(joined);
+
+        const result = try allocator.dupeZ(u8, joined);
+
+        return result;
     }
 };
