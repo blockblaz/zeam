@@ -179,9 +179,6 @@ impl Network {
             }
         }
 
-        // unsafe{
-        //     SWARM_STATE = Some(swarm);
-        //   }
     }
 
     pub async fn run_eventloop(&mut self) {
