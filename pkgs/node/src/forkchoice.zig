@@ -199,8 +199,12 @@ pub const ForkChoiceStore = struct {
 };
 
 const ProtoVote = struct {
+    //
     index: usize = 0,
     slot: types.Slot = 0,
+    // we can construct proto votes from the anchor state justifications but will not exactly know
+    // the votes
+    vote: ?types.SignedVote = null,
 };
 
 const VoteTracker = struct {
@@ -368,6 +372,9 @@ pub const ForkChoice = struct {
     pub fn getProposalVotes(self: *Self) ![]types.SignedVote {
         var included_votes = std.ArrayList(types.SignedVote).init(self.allocator);
         // TODO simple strategy to include all votes that are consistent with the latest justified
+        for (0..self.config.genesis.num_validators) |validator_id| {
+            _ = validator_id;
+        }
         return included_votes.toOwnedSlice();
     }
 
@@ -470,28 +477,30 @@ pub const ForkChoice = struct {
         // update latest known voted head of the validator if already included on chain
         if (is_from_block) {
             const vote_tracker_latest_known_slot = (vote_tracker.latestKnown orelse ProtoVote{}).slot;
-            if (vote.head.slot > vote_tracker_latest_known_slot) {
+            if (vote.slot > vote_tracker_latest_known_slot) {
                 vote_tracker.latestKnown = .{
                     //
                     .index = new_head_index,
-                    .slot = vote.head.slot,
+                    .slot = vote.slot,
+                    .vote = signed_vote,
                 };
             }
 
             // also clear out our latest new non included vote if this is even later than that
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
-            if (vote.head.slot > vote_tracker_latest_new_slot) {
+            if (vote.slot > vote_tracker_latest_new_slot) {
                 vote_tracker.latestNew = null;
             }
         } else {
             if (vote.slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
             // just update latest new voted head of the validator
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
-            if (vote.head.slot > vote_tracker_latest_new_slot) {
+            if (vote.slot > vote_tracker_latest_new_slot) {
                 vote_tracker.latestNew = .{
                     //
                     .index = new_head_index,
-                    .slot = vote.head.slot,
+                    .slot = vote.slot,
+                    .vote = signed_vote,
                 };
             }
         }
