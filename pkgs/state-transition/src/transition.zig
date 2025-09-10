@@ -162,7 +162,7 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
             target_not_ahead or
             !is_target_justifiable)
         {
-            logger.debug("~~~~~ skipping the vote as not viable !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={}) ~~~\n~~~~~~~\n", .{
+            logger.debug("skipping the vote as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
                 is_source_justified,
                 is_target_already_justified,
                 has_correct_source_root,
