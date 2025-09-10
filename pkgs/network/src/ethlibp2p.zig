@@ -54,6 +54,7 @@ export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u
     zigHandler.allocator.free(listen_slice);
 
     const connect_slice = std.mem.span(connectAddresses);
+    // because connectAddresses can be empty string "" which not allocate memory in the heap
     if (connect_slice.len > 0) {
         zigHandler.allocator.free(connect_slice);
     }

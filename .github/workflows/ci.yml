@@ -34,12 +34,16 @@ jobs:
       with:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Check Rust formatting
+      run: |
+        cargo fmt --manifest-path rust/Cargo.toml -- --check
+
     - name: Run clippy on hosts
       run: |
         cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
 
     - name: Lint
-      run: zig fmt --check *.zig
+      run: zig fmt --check .
 
   build:
     runs-on: ubuntu-latest

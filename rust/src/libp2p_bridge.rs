@@ -25,35 +25,30 @@ static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 #[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
+/// # Safety
+///
+/// The caller must ensure that `listen_addresses` and `connect_addresses` point to valid null-terminated C strings.
 #[no_mangle]
-pub fn create_and_run_network(
+pub unsafe fn create_and_run_network(
     network_id: u32,
     zig_handler: u64,
     listen_addresses: *const c_char,
     connect_addresses: *const c_char,
 ) {
-    let listen_multiaddrs = unsafe {
-        std::ffi::CStr::from_ptr(listen_addresses)
-            .to_string_lossy()
-            .split(",")
-            .map(|addr| {
-                addr.parse::<Multiaddr>().expect("Invalid multiaddress")
-            })
-            .collect::<Vec<_>>()
-    };
+    let listen_multiaddrs = std::ffi::CStr::from_ptr(listen_addresses)
+        .to_string_lossy()
+        .split(",")
+        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
+        .collect::<Vec<_>>();
 
-    let connect_multiaddrs = unsafe {
-        std::ffi::CStr::from_ptr(connect_addresses)
-            .to_string_lossy()
-            .split(",")
-            .filter(|s| !s.trim().is_empty()) // filter out empty strings
-            .map(|addr| {
-                addr.parse::<Multiaddr>().expect("Invalid multiaddress")
-            })
-            .collect::<Vec<_>>()
-    };
+    let connect_multiaddrs = std::ffi::CStr::from_ptr(connect_addresses)
+        .to_string_lossy()
+        .split(",")
+        .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
+        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
+        .collect::<Vec<_>>();
 
-    unsafe { releaseAddresses(zig_handler, listen_addresses, connect_addresses); };
+    releaseAddresses(zig_handler, listen_addresses, connect_addresses);
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -154,7 +149,7 @@ impl Network {
 
         println!("going for loop match");
 
-        if connect_addresses.len() > 0 {
+        if !connect_addresses.is_empty() {
             // helper closure for dialing peers
             let mut dial = |mut multiaddr: Multiaddr| {
                 // strip the p2p protocol if it exists
