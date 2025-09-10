@@ -371,9 +371,21 @@ pub const ForkChoice = struct {
 
     pub fn getProposalVotes(self: *Self) ![]types.SignedVote {
         var included_votes = std.ArrayList(types.SignedVote).init(self.allocator);
-        // TODO simple strategy to include all votes that are consistent with the latest justified
+        const latest_justified = self.fcStore.latest_justified;
+
+        // TODO naive strategy to include all votes that are consistent with the latest justified
+        // replace by the other mini 3sf simple strategy to loop and see if justification happens and
+        // till no further votes can be added
         for (0..self.config.genesis.num_validators) |validator_id| {
-            _ = validator_id;
+            const validator_vote = ((self.votes.get(validator_id) orelse VoteTracker{})
+                //
+                .latestKnown orelse ProtoVote{}).vote;
+
+            if (validator_vote) |signed_vote| {
+                if (std.mem.eql(u8, &latest_justified.root, &signed_vote.message.source.root)) {
+                    try included_votes.append(signed_vote);
+                }
+            }
         }
         return included_votes.toOwnedSlice();
     }
