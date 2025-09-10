@@ -188,7 +188,6 @@ impl Network {
         } else {
             unsafe { SWARM_STATE1.as_mut().unwrap() }
         };
-        // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
 
         loop {
             match swarm.select_next_some().await {
