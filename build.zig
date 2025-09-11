@@ -5,22 +5,22 @@ const Builder = std.Build;
 const zkvmTarget = struct {
     name: []const u8,
     set_pie: bool = false,
-    build_glue: bool = false,
     triplet: []const u8,
     cpu_features: []const u8,
 };
 
 const zkvm_targets: []const zkvmTarget = &.{
-    .{ .name = "risc0", .build_glue = true, .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
-    .{ .name = "zisk", .set_pie = true, .build_glue = false, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
+    .{ .name = "risc0", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
 // Add the glue libs to a compile target
-fn addZkvmGlueLibs(b: *Builder, comp: *Builder.Step.Compile) void {
-    for (zkvm_targets) |zkvm_target| {
-        if (zkvm_target.build_glue) {
-            comp.addObjectFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/host/target/release/libzeam_prover_host_{s}.a", .{ zkvm_target.name, zkvm_target.name })));
-        }
+fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
+    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+    // Add macOS framework linking for CLI tests
+    if (target.result.os.tag == .macos) {
+        comp.linkFramework("CoreFoundation");
+        comp.linkFramework("SystemConfiguration");
     }
 }
 
@@ -36,21 +36,36 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
-    const zigcli = b.dependency("zigcli", .{
+    const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
-    });
+    }).module("simargs");
     const xev = b.dependency("xev", .{
         .target = target,
         .optimize = optimize,
     }).module("xev");
+    const metrics = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("metrics");
 
-    // add zeam-params
+    const datetime = b.dependency("datetime", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("datetime");
+
+    const enr = b.dependency("zig_enr", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig-enr");
+
+    // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/utils/src/lib.zig"),
     });
+    zeam_utils.addImport("datetime", datetime);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -78,6 +93,14 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/types", zeam_types);
     zeam_configs.addImport("@zeam/params", zeam_params);
 
+    // add zeam-metrics
+    const zeam_metrics = b.addModule("@zeam/metrics", .{
+        .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_metrics.addImport("metrics", metrics);
+
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
@@ -88,6 +111,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
+    zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -132,10 +156,12 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
+    zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
 
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
+    const build_options_module = build_options.createModule();
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -146,8 +172,8 @@ pub fn build(b: *Builder) !void {
     });
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
-    cli_exe.root_module.addImport("build_options", build_options.createModule());
-    cli_exe.root_module.addImport("simargs", zigcli.module("simargs"));
+    cli_exe.root_module.addImport("build_options", build_options_module);
+    cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
@@ -157,22 +183,19 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
+    cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    cli_exe.root_module.addImport("metrics", metrics);
 
-    addZkvmGlueLibs(b, cli_exe);
+    addRustGlueLib(b, cli_exe, target);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
-    cli_exe.linkSystemLibrary("rustlibp2p_bridge");
-    cli_exe.addLibraryPath(b.path("zig-out/bin"));
+
     b.installArtifact(cli_exe);
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    // build the libp2p glue
-    var libp2p_cmd = build_rust_project(b, "pkgs/network/rustlibp2p-bridge");
-    cli_exe.step.dependOn(&libp2p_cmd.step);
-    var libp2p_install_cmd = b.addInstallBinFile(b.path("pkgs/network/rustlibp2p-bridge/target/release/librustlibp2p_bridge.so"), "librustlibp2p_bridge.so");
-    libp2p_install_cmd.step.dependOn(&libp2p_cmd.step);
-    cli_exe.step.dependOn(&libp2p_install_cmd.step);
+    var zkvm_host_cmd = build_rust_project(b, "rust");
+    cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -183,9 +206,29 @@ pub fn build(b: *Builder) !void {
         run_prover.addArgs(&[_][]const u8{"prove"});
         run_prover.addArgs(&[_][]const u8{ "-d", b.fmt("{s}/bin", .{b.install_path}) });
     }
-    run_prover.step.dependOn(&libp2p_install_cmd.step);
 
-    const test_step = b.step("test", "Run unit tests");
+    const tools_step = b.step("tools", "Build zeam tools");
+
+    const tools_cli_exe = b.addExecutable(.{
+        .name = "zeam-tools",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/tools/src/main.zig"),
+        }),
+    });
+    tools_cli_exe.root_module.addImport("enr", enr);
+    tools_cli_exe.root_module.addImport("build_options", build_options_module);
+    tools_cli_exe.root_module.addImport("simargs", simargs);
+
+    const install_tools_cli = b.addInstallArtifact(tools_cli_exe, .{});
+    tools_step.dependOn(&install_tools_cli.step);
+
+    const all_step = b.step("all", "Build all executables and tools");
+    all_step.dependOn(&cli_exe.step);
+    all_step.dependOn(tools_step);
+
+    const test_step = b.step("test", "Run zeam core tests");
 
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
@@ -215,6 +258,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
+    addRustGlueLib(b, manager_tests, target);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
@@ -231,10 +275,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    addZkvmGlueLibs(b, cli_tests);
-    cli_tests.linkSystemLibrary("rustlibp2p_bridge");
-    cli_tests.addLibraryPath(b.path("zig-out/bin"));
-    cli_tests.step.dependOn(&libp2p_install_cmd.step);
+    addRustGlueLib(b, cli_tests, target);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -245,14 +286,20 @@ pub fn build(b: *Builder) !void {
     });
     const run_params_tests = b.addRunArtifact(params_tests);
     test_step.dependOn(&run_params_tests.step);
+    manager_tests.step.dependOn(&zkvm_host_cmd.step);
+    cli_tests.step.dependOn(&zkvm_host_cmd.step);
 
-    for (zkvm_targets) |zkvm_target| {
-        if (zkvm_target.build_glue) {
-            var zkvm_host_cmd = build_rust_project(b, b.fmt("pkgs/state-transition-runtime/src/{s}/host", .{zkvm_target.name}));
-            cli_exe.step.dependOn(&zkvm_host_cmd.step);
-            cli_tests.step.dependOn(&zkvm_host_cmd.step);
-        }
-    }
+    const tools_test_step = b.step("test-tools", "Run zeam tools tests");
+    const tools_cli_tests = b.addTest(.{
+        .root_module = tools_cli_exe.root_module,
+        .optimize = optimize,
+        .target = target,
+    });
+    tools_cli_tests.root_module.addImport("enr", enr);
+    const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    tools_test_step.dependOn(&run_tools_cli_test.step);
+
+    test_step.dependOn(tools_test_step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {

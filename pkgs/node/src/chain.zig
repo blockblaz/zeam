@@ -8,15 +8,20 @@ const stf = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
+const metrics = @import("@zeam/metrics");
 
 const zeam_utils = @import("@zeam/utils");
-const getLogger = zeam_utils.getLogger;
 
 pub const fcFactory = @import("./forkchoice.zig");
+const constants = @import("./constants.zig");
 
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
+};
+
+pub const VoteConstructionParams = struct {
+    slot: usize,
 };
 
 pub const BeamChain = struct {
@@ -26,10 +31,18 @@ pub const BeamChain = struct {
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
+    logger: *const zeam_utils.ZeamLogger,
+    registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, nodeId: u32) !Self {
-        const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState);
+    pub fn init(
+        allocator: Allocator,
+        config: configs.ChainConfig,
+        anchorState: types.BeamState,
+        nodeId: u32,
+        logger: *const zeam_utils.ZeamLogger,
+    ) !Self {
+        const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState, logger);
 
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, anchorState);
@@ -40,29 +53,53 @@ pub const BeamChain = struct {
             .forkChoice = fork_choice,
             .allocator = allocator,
             .states = states,
+            .logger = logger,
         };
     }
 
-    pub fn onSlot(self: *Self, slot: usize) !void {
-        // see if you need to product block before you tick the slot to get correct canonical head
-        // ideally this section should be called an interval before the slot is ticked
-        self.prepareNextSlot(slot);
-        self.tickSlot(slot);
+    pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
+        // right now it's simple assignment but eventually it should be a set
+        // tacking registrations and keeping it alive for 3*2=6 slots
+        self.registered_validator_ids = validator_ids;
     }
 
-    fn prepareNextSlot(self: *Self, nextSlot: usize) void {
-        // nothing to prep for now
-        _ = self;
-        _ = nextSlot;
-    }
+    pub fn onInterval(self: *Self, time_intervals: usize) !void {
+        // see if the node has a proposal this slot to properly tick
+        // forkchoice head
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+        var has_proposal = false;
+        if (interval == 0) {
+            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const slot_proposer_id = slot % num_validators;
+            if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
+                _ = index;
+                has_proposal = true;
+            }
+        }
 
-    fn tickSlot(self: *Self, slot: usize) void {
-        self.forkChoice.tickSlot(slot);
-        // self.printSlot(slot);
+        self.logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
+            time_intervals,
+            slot,
+            interval,
+            has_proposal,
+        });
+
+        try self.forkChoice.onInterval(time_intervals, has_proposal);
+        if (interval == 1) {
+            // interval to vote so we should put out the chain status information to the user along with
+            // latest head which most likely should be the new block recieved and processed
+            self.printSlot(slot);
+        }
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
+        // right now with integrated validator into node produceBlock is always gurranteed to be
+        // called post ticking the chain to the correct time, but once validator is separated
+        // one must make the forkchoice tick to the right time if there is a race condition
+        // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
+        const votes = try self.forkChoice.getProposalVotes();
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -70,7 +107,6 @@ pub const BeamChain = struct {
 
         const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
-        const votes = [_]types.Mini3SFVote{};
         var block = types.BeamBlock{
             .slot = opts.slot,
             .proposer_index = opts.proposer_index,
@@ -78,75 +114,153 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .votes = &votes,
+                .atttestations = votes,
             },
         };
 
-        std.debug.print("\n\n\n node-{d}::going for block production opts={any} raw block={any}\n\n", .{ self.nodeId, opts, block });
+        self.logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
 
-        // 2. apply STF to get post state
-        var logger = getLogger();
-        logger.setActiveLevel(.debug);
-        try stf.apply_raw_block(self.allocator, &post_state, &block, &logger);
+        // 2. apply STF to get post state & update post state root & cache it
+        try stf.apply_raw_block(self.allocator, &post_state, &block, self.logger);
+        self.logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
 
-        std.debug.print("\n\n\n applied raw block opts={any} raw block={any}\n\n", .{ opts, block });
-
-        // 3. fc onblock
-        const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
-        try self.states.put(fcBlock.blockRoot, post_state);
+        // 3. cache state to save recompute while adding the block on publish
+        var block_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+        try self.states.put(block_root, post_state);
 
         return block;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) !void {
-        const fcHead = try self.forkChoice.updateHead();
-        std.debug.print("node-{d}::chain received on slot cb at slot={d} head={any} headslot={d}\n", .{ self.nodeId, slot, fcHead.blockRoot, fcHead.slot });
+    // TODO: right now validator indepdently publishes to the network but move gossip message
+    // construction and publishing from there to here
+    pub fn publishBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
+        var block_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamBlock, signedBlock.message, &block_root, self.allocator);
+        try self.onBlock(signedBlock, self.states.get(block_root));
+    }
+
+    pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
+        const slot = opts.slot;
+
+        const head = try self.forkChoice.getProposalHead(slot);
+        const target = try self.forkChoice.getVoteTarget();
+
+        const vote = types.Mini3SFVote{
+            //
+            .slot = slot,
+            .head = head,
+            .target = target,
+            .source = self.forkChoice.fcStore.latest_justified,
+        };
+
+        return vote;
+    }
+
+    // TODO: right now validator indepdently publishes to the network but move the gossip
+    // message construction and publish at a refactor PR
+    pub fn publishVote(self: *Self, signedVote: types.SignedVote) !void {
+        // no need to see if we produced this vote as everything is trusted in-process lifecycle
+        // validate when validator is separated out
+        return self.onAttestation(signedVote);
+    }
+
+    pub fn printSlot(self: *Self, slot: usize) void {
+        // head should be auto updated if receieved a block or block proposal done
+        // however it doesn't get updated unless called updatehead even though processs block
+        // logs show it has been updated. debug and fix the call below
+        const fcHead = self.forkChoice.updateHead() catch |err| {
+            self.logger.err("forkchoice updatehead error={any}", .{err});
+            return;
+        };
+
+        self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{
+            //
+            slot,
+            fcHead.blockRoot,
+            fcHead.slot,
+        });
     }
 
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
-            .block => |block| {
-                std.debug.print("node-{d}::chain received block onGossip cb at slot={any}\n", .{ self.nodeId, block });
+            .block => |signed_block| {
+                const block = signed_block.message;
                 var block_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator);
+                try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                std.debug.print("blockroot={any} hasblock={any}\n", .{ block_root, hasBlock });
+                self.logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
+                    //
+                    signed_block,
+                    block_root,
+                    hasBlock,
+                });
+
                 if (!hasBlock) {
-                    const hasParentBlock = self.forkChoice.hasBlock(block.message.parent_root);
-                    std.debug.print("block processing is required hasParentBlock={any}\n", .{hasParentBlock});
+                    const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
+                    self.logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
                     if (hasParentBlock) {
-                        self.onBlock(block) catch |err| {
-                            std.debug.print("\n\n\n ^^^^^^^^ Block processing error ^^^^^^\n{any}\n", .{err});
+                        self.onBlock(signed_block, null) catch |err| {
+                            self.logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
                         };
                     }
                 }
             },
-        }
+            .vote => |signed_vote| {
+                const vote = signed_vote.message;
+                const hasHead = self.forkChoice.hasBlock(vote.head.root);
+                self.logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
+                    //
+                    signed_vote,
+                    hasHead,
+                });
 
-        try self.printSlot(self.forkChoice.fcStore.currentSlot);
+                if (hasHead) {
+                    self.onAttestation(signed_vote) catch |err| {
+                        self.logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
+                    };
+                }
+            },
+        }
     }
 
-    // import block assuming it is validated
-    fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
-        // 1. get parent state
-        const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
-        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+    // import block assuming it is gossip validated or synced
+    // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
+    // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
+    fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, ipost_state: ?types.BeamState) !void {
+        const onblock_timer = metrics.chain_onblock_duration_seconds.start();
 
-        // 2. apply STF to get post state
-        try stf.apply_transition(self.allocator, &post_state, signedBlock, .{});
+        const post_state = ipost_state orelse computedstate: {
+            // 1. get parent state
+            const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+            var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+
+            // 2. apply STF to get post state
+            try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{ .logger = self.logger });
+            break :computedstate cpost_state;
+        };
 
         // 3. fc onblock
         const block = signedBlock.message;
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try self.states.put(fcBlock.blockRoot, post_state);
-        // 3. fc onvotes
-        for (block.body.votes) |vote| {
-            try self.forkChoice.onAttestation(vote);
+
+        // 4. fc onvotes
+        for (block.body.atttestations) |signed_vote| {
+            self.forkChoice.onAttestation(signed_vote, true) catch |e| {
+                self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+            };
         }
-        // 3. fc update head
+
+        // 5. fc update head
         _ = try self.forkChoice.updateHead();
+        onblock_timer.observe();
+    }
+
+    fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
+        return self.forkChoice.onAttestation(signedVote, false);
     }
 };
 
@@ -171,11 +285,13 @@ test "process and add mock blocks into a node's chain" {
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeid = 10; // random value
-    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid);
+    const logger = zeam_utils.getLogger(.info);
 
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.blockRoots[0]));
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
+
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
@@ -185,8 +301,8 @@ test "process and add mock blocks into a node's chain" {
         const block_root = mock_chain.blockRoots[i];
         const current_slot = block.message.slot;
 
-        beam_chain.forkChoice.tickSlot(current_slot);
-        try beam_chain.onBlock(block);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.onBlock(block, null);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
@@ -200,8 +316,8 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
 
         // fcstore checkpoints should match
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.justified.root, &mock_chain.latestJustified[i].root));
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.finalized.root, &mock_chain.latestFinalized[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_justified.root, &mock_chain.latestJustified[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.latestFinalized[i].root));
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 

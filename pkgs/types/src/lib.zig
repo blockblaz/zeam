@@ -7,6 +7,7 @@ const params = @import("@zeam/params");
 // just dummy type right now to test imports
 pub const Bytes32 = [32]u8;
 pub const Slot = u64;
+pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 
@@ -33,16 +34,23 @@ pub const Mini3SFCheckpoint = struct {
 };
 
 pub const Mini3SFVote = struct {
-    validator_id: u64,
     slot: Slot,
     head: Mini3SFCheckpoint,
     target: Mini3SFCheckpoint,
     source: Mini3SFCheckpoint,
 };
+
+// this will be updated to correct impl in the followup PR to reflect latest spec changes
+pub const SignedVote = struct {
+    validator_id: u64,
+    message: Mini3SFVote,
+    // TODO signature objects to be updated in a followup PR
+    signature: Bytes48,
+};
 // issue in serialization/deserialization with ssz list, for now use slice
 // for which serialization/deserialization is not an issue but hash is not stable/expected
 // pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, MAX_VALIDATORS);
-pub const Mini3SFVotes = []Mini3SFVote;
+pub const SignedVotes = []SignedVote;
 
 // 3sf mini impl simplified assumptions
 pub const MAX_VALIDATORS = 4096;
@@ -50,7 +58,7 @@ pub const BeamBlockBody = struct {
     // some form of APS
     execution_payload_header: ExecutionPayloadHeader,
     // mini 3sf simplified votes
-    votes: Mini3SFVotes,
+    atttestations: SignedVotes,
 };
 
 pub const BeamBlock = struct {
@@ -160,7 +168,7 @@ test "ssz seralize/deserialize signed beam block" {
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .votes = &[_]Mini3SFVote{} },
+            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .atttestations = &[_]SignedVote{} },
         },
         .signature = [_]u8{2} ** 48,
     };
@@ -282,7 +290,7 @@ test "ssz seralize/deserialize signed stf prover input" {
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .votes = &[_]Mini3SFVote{} },
+            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .atttestations = &[_]SignedVote{} },
         },
         .signature = [_]u8{2} ** 48,
     };

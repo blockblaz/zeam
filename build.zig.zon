@@ -1,16 +1,32 @@
 .{
     .name = .zeam,
-    .fingerprint = 0x243fd12cf3aff803,
+    .fingerprint = 0x243fd12ce9ee69c2,
     .version = "0.0.0",
-    .dependencies = .{ .ssz = .{
-        .url = "https://github.com/blockblaz/ssz.zig/archive/72c544b.tar.gz",
-        .hash = "1220436346a26c5fc3d32b3c608a7a408cec3139dae30d74dba4183a6eb2e855dc49",
-    }, .zigcli = .{
-        .url = "https://github.com/jiacai2050/zigcli/archive/v0.2.3.tar.gz",
-        .hash = "zigcli-0.2.3-ORC7jGKRAgAYW8y8hO3S4v2DsqbnyOrgximDYNgfB_Bw",
-    }, .xev = .{
-        .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
-        .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
-    } },
+    .dependencies = .{
+        .ssz = .{
+            .url = "https://github.com/blockblaz/ssz.zig/archive/72c544b.tar.gz",
+            .hash = "1220436346a26c5fc3d32b3c608a7a408cec3139dae30d74dba4183a6eb2e855dc49",
+        },
+        .zigcli = .{
+            .url = "https://github.com/jiacai2050/zigcli/archive/v0.2.3.tar.gz",
+            .hash = "zigcli-0.2.3-ORC7jGKRAgAYW8y8hO3S4v2DsqbnyOrgximDYNgfB_Bw",
+        },
+        .xev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
+            .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
+        },
+        .datetime = .{
+            .url = "git+https://github.com/frmdstryr/zig-datetime?ref=master#3a39a21e6e34dcb0ade0ff828d0914d40ba535f3",
+            .hash = "datetime-0.8.0-cJNXzP_YAQBxQ5hkNNP6ScnG5XsqciJmeP5RVV4xwCBA",
+        },
+        .metrics = .{
+            .url = "https://github.com/karlseguin/metrics.zig/archive/2b584b6209871b7215706028988169599451dc0d.tar.gz",
+            .hash = "metrics-0.0.0-W7G4eCG0AQCQXidzvV5kx4l0smr_WCw-8JLIwS_OHYoW",
+        },
+        .zig_enr = .{
+            .url = "git+https://github.com/blockblaz/enr#02f187591f8a9616623e0bc91d139f0d18c99bcf",
+            .hash = "zig_enr-0.0.0-cO2P20iiAQALUQA-fb_70u0hyoBJo7u_tdeZue8FuyuZ",
+        },
+    },
     .paths = .{""},
 }

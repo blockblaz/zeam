@@ -62,7 +62,7 @@ out for this space for annoucements on the same or reach out to us via our [comm
 
 #### Prerequisites
 
- - Zeam requires zig version 0.14.0+ to build.
+ - Zeam requires zig version 0.14.1 to build.
  - Zeam requires Rust 1.85+ to be able to build the rust connections to various zkvms
  - The default prover is now [risc0](github.com/risc0/risc0) and it needs to be [installed](https://dev.risczero.com/api/zkvm/install).
 

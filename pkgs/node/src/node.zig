@@ -5,9 +5,10 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
+const zeam_utils = @import("@zeam/utils");
 
 const utils = @import("./utils.zig");
-const OnSlotCbWrapper = utils.OnSlotCbWrapper;
+const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
@@ -25,6 +26,7 @@ const NodeOpts = struct {
     db: LevelDB,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
+    logger: *const zeam_utils.ZeamLogger,
 };
 
 pub const BeamNode = struct {
@@ -34,6 +36,7 @@ pub const BeamNode = struct {
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
     nodeId: u32,
+    logger: *const zeam_utils.ZeamLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -42,9 +45,10 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         const network = networkFactory.Network.init(opts.backend);
 
-        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId);
+        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId, opts.logger);
         if (opts.validator_ids) |ids| {
             validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network });
+            chain.registerValidatorIds(ids);
         }
 
         return Self{
@@ -54,6 +58,7 @@ pub const BeamNode = struct {
             .network = network,
             .validator = validator,
             .nodeId = opts.nodeId,
+            .logger = opts.logger,
         };
     }
 
@@ -70,37 +75,42 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn getOnSlotCbWrapper(self: *Self) !*OnSlotCbWrapper {
+    pub fn getOnIntervalCbWrapper(self: *Self) !*OnIntervalCbWrapper {
         // need a stable pointer across threads
-        const cb_ptr = try self.allocator.create(OnSlotCbWrapper);
+        const cb_ptr = try self.allocator.create(OnIntervalCbWrapper);
         cb_ptr.* = .{
             .ptr = self,
-            .onSlotCb = onSlot,
+            .onIntervalCb = onInterval,
         };
 
         return cb_ptr;
     }
 
-    pub fn onSlot(ptr: *anyopaque, islot: isize) !void {
+    pub fn onInterval(ptr: *anyopaque, iinterval: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const slot: usize = @intCast(islot);
+        const interval: usize = @intCast(iinterval);
 
-        try self.chain.onSlot(slot);
-        // _ = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
+        self.chain.onInterval(interval) catch |e| {
+            self.logger.err("Error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+            // no point going further if chain is not ticked properly
+            return e;
+        };
         if (self.validator) |*validator| {
-            // _ = try validator.chain.produceBlock(.{ .slot = slot, .proposer_index = slot });
-            try validator.onSlot(slot);
+            // we also tick validator per interval in case it would
+            // need to sync its future duties when its an independent validator
+            validator.onInterval(interval) catch |e| {
+                self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                return e;
+            };
         }
-
-        try self.chain.printSlot(slot);
     }
 
     pub fn run(self: *Self) !void {
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{.block};
+        var topics = [_]networks.GossipTopic{ .block, .vote };
         try self.network.backend.gossip.subscribe(&topics, handler);
 
-        const chainOnSlot = try self.getOnSlotCbWrapper();
+        const chainOnSlot = try self.getOnIntervalCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };

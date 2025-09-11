@@ -12,6 +12,7 @@ const NetworkInterface = interface.NetworkInterface;
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void {
     const topic = switch (topic_id) {
         0 => interface.GossipTopic.block,
+        1 => interface.GossipTopic.vote,
         else => {
             std.debug.print("\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge !!!!\n", .{topic_id});
             return;
@@ -28,6 +29,14 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
             };
 
             break :blockmessage .{ .block = message_data };
+        },
+        .vote => votemessage: {
+            var message_data: types.SignedVote = undefined;
+            ssz.deserialize(types.SignedVote, message_bytes, &message_data, zigHandler.allocator) catch |e| {
+                std.debug.print("!!!! Error in deserializing the signed vote message e={any} !!!!\n", .{e});
+                return;
+            };
+            break :votemessage .{ .vote = message_data };
         },
     };
 
@@ -75,17 +84,24 @@ pub const EthLibp2p = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
         const topic = data.getTopic();
-        const topic_id = switch (topic) {
+        const topic_id: u32 = switch (topic) {
             .block => 0,
+            .vote => 1,
         };
 
         // TODO: deinit the message later ob once done
         const message = switch (topic) {
-            .block => messagebytes: {
+            .block => blockbytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
                 try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
 
-                break :messagebytes serialized.items;
+                break :blockbytes serialized.items;
+            },
+            .vote => votebytes: {
+                var serialized = std.ArrayList(u8).init(self.allocator);
+                try ssz.serialize(types.SignedVote, data.vote, &serialized);
+
+                break :votebytes serialized.items;
             },
         };
         std.debug.print("\n\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
