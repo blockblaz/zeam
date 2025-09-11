@@ -45,7 +45,7 @@ pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.
     }
 }
 
-fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
+pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     if (candidate < finalized) {
         return StateTransitionError.InvalidJustifiableSlot;
     }
@@ -145,16 +145,30 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
         const target_slot: usize = @intCast(vote.target.slot);
         logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
 
-        if (justified_slots.items[source_slot] != 1 or
+        const is_source_justified = justified_slots.items[source_slot] == 1;
+        const is_target_already_justified = justified_slots.items[target_slot] == 1;
+        const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]);
+        const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]);
+        const target_not_ahead = target_slot <= source_slot;
+        const is_target_justifiable = try is_justifiable_slot(state.latest_finalized.slot, target_slot);
+
+        if (!is_source_justified or
             // not present in 3sf mini but once a target is justified no need to run loop
             // as we remove the target from justifications map as soon as its justified
-            justified_slots.items[target_slot] == 1 or
-            !std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]) or
-            !std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]) or
-            target_slot <= source_slot or
-            try is_justifiable_slot(state.latest_finalized.slot, target_slot) == false)
+            is_target_already_justified or
+            !has_correct_source_root or
+            !has_correct_target_root or
+            target_not_ahead or
+            !is_target_justifiable)
         {
-            logger.debug("~~~~~ skipping the vote as not viable ~~~\n~~~~~~~\n", .{});
+            logger.debug("skipping the vote as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                is_source_justified,
+                is_target_already_justified,
+                has_correct_source_root,
+                has_correct_target_root,
+                target_not_ahead,
+                is_target_justifiable,
+            });
             continue;
         }
 
