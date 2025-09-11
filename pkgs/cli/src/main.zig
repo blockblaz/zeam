@@ -230,8 +230,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
