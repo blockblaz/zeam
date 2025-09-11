@@ -230,10 +230,10 @@ pub const ForkChoice = struct {
     // data structure to hold validator deltas, could be grown over time as more validators
     // get added
     deltas: std.ArrayList(isize),
-    logger: *const utils.ZeamLogger,
+    logger: *utils.ZeamLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: *const utils.ZeamLogger) !Self {
+    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: *utils.ZeamLogger) !Self {
         const anchor_block_header = try stf.genStateBlockHeader(allocator, anchorState);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
@@ -598,7 +598,7 @@ test "forkchoice block tree" {
 
     const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
-    const logger = utils.getLogger(.info);
+    var logger = utils.getLogger(.info, null);
     var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state, &logger);
 
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));

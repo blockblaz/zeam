@@ -7,7 +7,7 @@ const state_transition = @import("@zeam/state-transition");
 
 const zeam_utils = @import("@zeam/utils");
 // by default logger's activeLevel should be the default active level of the build
-const logger = zeam_utils.getLogger(null);
+var logger = zeam_utils.getLogger(null, null);
 
 // implements riscv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`

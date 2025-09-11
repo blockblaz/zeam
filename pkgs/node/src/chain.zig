@@ -31,7 +31,7 @@ pub const BeamChain = struct {
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: *zeam_utils.ZeamLogger,
     registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
@@ -40,7 +40,7 @@ pub const BeamChain = struct {
         config: configs.ChainConfig,
         anchorState: types.BeamState,
         nodeId: u32,
-        logger: *const zeam_utils.ZeamLogger,
+        logger: *zeam_utils.ZeamLogger,
     ) !Self {
         const fork_choice = try fcFactory.ForkChoice.init(allocator, config, anchorState, logger);
 
@@ -91,6 +91,10 @@ pub const BeamChain = struct {
             // latest head which most likely should be the new block recieved and processed
             self.printSlot(slot);
         }
+        // check if log rotation is needed
+        self.logger.maybeRotate() catch |err| {
+            self.logger.err("error rotating log file: {any}", .{err});
+        };
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !types.BeamBlock {
@@ -285,7 +289,7 @@ test "process and add mock blocks into a node's chain" {
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeid = 10; // random value
-    const logger = zeam_utils.getLogger(.info);
+    var logger = zeam_utils.getLogger(.info, null);
 
     var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
 

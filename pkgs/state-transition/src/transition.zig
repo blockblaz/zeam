@@ -6,12 +6,11 @@ pub const utils = @import("./utils.zig");
 
 const zeam_utils = @import("@zeam/utils");
 const debugLog = zeam_utils.zeamLog;
-const getLogger = zeam_utils.getLogger;
 
 const params = @import("@zeam/params");
 
 // put the active logs at debug level for now by default
-pub const StateTransitionOpts = struct { logger: *const zeam_utils.ZeamLogger };
+pub const StateTransitionOpts = struct { logger: *zeam_utils.ZeamLogger };
 
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
@@ -67,7 +66,7 @@ pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     return false;
 }
 
-fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *const zeam_utils.ZeamLogger) !void {
+fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     logger.debug("process block header\n", .{});
     // very basic process block header
     if (state.slot != block.slot) {
@@ -92,7 +91,7 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *const zeam_utils.ZeamLogger) !void {
+fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // transform state data into consumable format, generally one would keep a `cached`/consumable
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
@@ -248,14 +247,14 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
     logger.debug("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized });
 }
 
-pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *const zeam_utils.ZeamLogger) !void {
+pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // start block processing
     try process_block_header(allocator, state, block, logger);
     try process_execution_payload_header(state, block);
     try process_operations(allocator, state, block, logger);
 }
 
-pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *const zeam_utils.ZeamLogger) !void {
+pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
     try process_slots(allocator, state, block.slot);
 
