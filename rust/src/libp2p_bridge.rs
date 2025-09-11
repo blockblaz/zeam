@@ -178,7 +178,6 @@ impl Network {
                 SWARM_STATE1 = Some(swarm);
             }
         }
-
     }
 
     pub async fn run_eventloop(&mut self) {
