@@ -200,6 +200,7 @@ pub fn main() !void {
             } else {
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
+                // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 defer for (listen_addresses1) |addr| addr.deinit();
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses1, .connect_peers = null });
                 try network1.run();
@@ -207,6 +208,7 @@ pub fn main() !void {
 
                 // init a new lib2p network here to connect with network1
                 var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 const listen_addresses2 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")};
                 defer for (listen_addresses2) |addr| addr.deinit();
                 const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
