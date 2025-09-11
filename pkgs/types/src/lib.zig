@@ -10,10 +10,15 @@ pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
+pub const Bytes4000 = [4000]u8;
 
 pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
 pub const RootHex = [64]u8;
+
+// TODO: moved them into params
+pub const MAX_VALIDATORS = 4096;
+pub const HISTORICAL_ROOTS_LIMIT = 262_144;
 
 pub const BeamBlockHeader = struct {
     slot: Slot,
@@ -45,18 +50,17 @@ pub const SignedVote = struct {
     validator_id: u64,
     message: Mini3SFVote,
     // TODO signature objects to be updated in a followup PR
-    signature: Bytes48,
+    signature: Bytes4000,
 };
 // issue in serialization/deserialization with ssz list, for now use slice
 // for which serialization/deserialization is not an issue but hash is not stable/expected
 // pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, MAX_VALIDATORS);
 pub const SignedVotes = []SignedVote;
 
-// 3sf mini impl simplified assumptions
-pub const MAX_VALIDATORS = 4096;
 pub const BeamBlockBody = struct {
-    // some form of APS
-    execution_payload_header: ExecutionPayloadHeader,
+    // some form of APS - to be activated later - disabled for PQ devnet0
+    // execution_payload_header: ExecutionPayloadHeader,
+
     // mini 3sf simplified votes
     atttestations: SignedVotes,
 };
@@ -72,13 +76,13 @@ pub const BeamBlock = struct {
 pub const SignedBeamBlock = struct {
     message: BeamBlock,
     // winternitz signature might be of different size depending on num chunks and chunk size
-    signature: Bytes48,
+    signature: Bytes4000,
 };
 
-// impl 3sf mini, ideally genesis_time can also move into config but we don't know what will
-// be the final shape of the state
+// PQ devnet0 config
 pub const BeamStateConfig = struct {
     num_validators: u64,
+    genesis_time: u64,
 };
 
 // issue with serialize/deserialize list so implement with slices
@@ -103,11 +107,12 @@ pub const JustifiedSlots = []u8;
 // };
 pub const BeamState = struct {
     config: BeamStateConfig,
-    genesis_time: u64,
     slot: u64,
     latest_block_header: BeamBlockHeader,
+
     latest_justified: Mini3SFCheckpoint,
     latest_finalized: Mini3SFCheckpoint,
+
     historical_block_hashes: HistoricalBlockHashes,
     justified_slots: JustifiedSlots,
 
