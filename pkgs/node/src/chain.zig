@@ -242,7 +242,12 @@ pub const BeamChain = struct {
             var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
             // 2. apply STF to get post state
-            try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{ .logger = self.logger });
+            const validSignatures = if (stf.verify_signatures(signedBlock)) true else false;
+            try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
+                //
+                .logger = self.logger,
+                .validSignatures = validSignatures,
+            });
             break :computedstate cpost_state;
         };
 
