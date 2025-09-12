@@ -118,7 +118,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 .execution_payload_header = .{ .timestamp = timestamp },
-                .atttestations = votes,
+                .attestations = votes,
             },
         };
 
@@ -257,7 +257,7 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. fc onvotes
-        for (block.body.atttestations) |signed_vote| {
+        for (block.body.attestations) |signed_vote| {
             self.forkChoice.onAttestation(signed_vote, true) catch |e| {
                 self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };

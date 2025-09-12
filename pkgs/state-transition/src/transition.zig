@@ -120,7 +120,7 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     try justified_slots.append(if (state.latest_block_header.slot == 0) 1 else 0);
 
     const block_slot: usize = @intCast(block.slot);
-    const missed_slots: usize = block_slot - state.latest_block_header.slot - 1;
+    const missed_slots: usize = @intCast(block_slot - state.latest_block_header.slot - 1);
     for (0..missed_slots) |i| {
         _ = i;
         try historical_block_hashes.append(utils.ZERO_HASH);
@@ -299,7 +299,7 @@ pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
-    try process_slots(allocator, state, block.slot);
+    try process_slots(allocator, state, block.slot, logger);
 
     // process block and modify the pre state to post state
     try process_block(allocator, state, block.*, logger);
@@ -329,7 +329,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 
     // prepare the pre state for this block slot
-    try process_slots(allocator, state, block.slot);
+    try process_slots(allocator, state, block.slot, logger);
     // process the block
     try process_block(allocator, state, block, logger);
 
@@ -345,11 +345,4 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 }
 
-pub const StateTransitionError = error{
-    InvalidParentRoot,
-    InvalidPreState,
-    InvalidPostState,
-    InvalidExecutionPayloadHeaderTimestamp,
-    InvalidJustifiableSlot,
-    InvalidValidatorId,
-};
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer };

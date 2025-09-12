@@ -72,7 +72,7 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .body = types.BeamBlockBody{
             .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini
-            .atttestations = &[_]types.SignedVote{},
+            .attestations = &[_]types.SignedVote{},
         },
     };
 
@@ -94,7 +94,7 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
         .body = types.BeamBlockBody{
             .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini votes
-            .atttestations = &[_]types.SignedVote{},
+            .attestations = &[_]types.SignedVote{},
         },
     };
 
@@ -112,8 +112,10 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
     var justified_slots_array = std.ArrayList(u8).init(allocator);
 
     const state = types.BeamState{
-        .config = .{ .num_validators = genesis.num_validators },
-        .genesis_time = genesis.genesis_time,
+        .config = .{
+            .num_validators = genesis.num_validators,
+            .genesis_time = genesis.genesis_time,
+        },
         .slot = 0,
         .latest_block_header = try blockToLatestBlockHeader(allocator, genesis_latest_block),
         // mini3sf
