@@ -2,6 +2,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const datetime = @import("datetime");
 
+// ANSI color codes for terminal output
+const Colors = struct {
+    const reset = "\x1b[0m";
+
+    // Level colors
+    const err = "\x1b[31m"; // Red
+    const warn = "\x1b[33m"; // Yellow
+    const info = "\x1b[32m"; // Green
+    const debug = "\x1b[36m"; // Cyan
+
+    // Timestamp color
+    const timestamp = "\x1b[90m"; // Bright black (gray)
+    const scope = "\x1b[35m"; // Magenta
+};
+
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
 pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileLogParams: ?FileLogParams) void {
@@ -30,29 +45,43 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
 
+        // Get colors for this log level
+        const level_color = getLevelColor(level);
+        const timestamp_color = Colors.timestamp;
+        const scope_color = Colors.scope;
+        const reset_color = Colors.reset;
+
         var buf: [4096]u8 = undefined;
-        const print_str = std.fmt.bufPrint(
+        var print_str = std.fmt.bufPrint(
             buf[0..],
-            "{s} {s}" ++ fmt ++ "\n",
-            .{ timestamp_str, prefix } ++ args,
+            "{s}{s}{s} {s}[{s}]{s} {s}{s}{s}" ++ fmt ++ "\n",
+            .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
         ) catch return;
 
-        // Print to stderr
+        // Print to stderr with colors
         if (@intFromEnum(activeLevel) >= @intFromEnum(level)) {
             nosuspend stderr.writeAll(print_str) catch return;
         }
 
-        // Write to file using FileLogParams
+        // Write to file with colors (same format as stderr)
         if (fileLogParams != null and @intFromEnum(fileLogParams.?.fileActiveLevel) >= @intFromEnum(level)) {
+            if (!fileLogParams.?.fileColors) {
+                print_str = std.fmt.bufPrint(
+                    buf[0..],
+                    "{s} {s}" ++ fmt ++ "\n",
+                    .{ timestamp_str, prefix } ++ args,
+                ) catch return;
+            }
+
             nosuspend fileLogParams.?.file.writeAll(print_str) catch |err| {
-                stderr.print("{s} [ERROR] {s}: Failed to write to log file : {any}\n", .{ timestamp_str, scope_prefix, err }) catch {};
+                // Error message with colors
+                stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err }) catch {};
             };
         }
 
         if (fileLogParams == null and builtin.target.os.tag != .freestanding) {
-            // All logs should be written to file.
-            // But if no fileLogParams are passed but we are not in freestanding mode, print error - not able to write to file
-            nosuspend stderr.print("{s} [ERROR] {s}: Failed to write to log file \n", .{ timestamp_str, scope_prefix }) catch {};
+            // Error message for missing file params with colors
+            nosuspend stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file (no file params)\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color }) catch {};
         }
     }
 }
@@ -60,10 +89,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
 pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams) void {
     // Convert FileParams to FileLogParams - only create if file exists
     const fileLogParams: ?FileLogParams = if ((fileParams != null) and (fileParams.?.file != null))
-        FileLogParams{
-            .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel,
-            .file = fileParams.?.file.?,
-        }
+        FileLogParams{ .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel, .file = fileParams.?.file.?, .fileColors = fileParams.?.fileBehaviour.fileColors }
     else
         null;
 
@@ -85,12 +111,14 @@ const LoggerScope = enum {
 pub const FileLogParams = struct {
     fileActiveLevel: std.log.Level,
     file: std.fs.File,
+    fileColors: bool,
 };
 
 pub const FileBehaviourParams = struct {
     fileActiveLevel: std.log.Level = .debug,
     filePath: []const u8,
     fileName: []const u8,
+    fileColors: bool = true,
 };
 
 pub const FileParams = struct {
@@ -104,6 +132,7 @@ pub const DEFAULT_FILE_BEHAVIOUR = FileBehaviourParams{
     .fileActiveLevel = .debug,
     .filePath = "./log",
     .fileName = "consensus",
+    .fileColors = true,
 };
 
 pub const ZeamLogger = struct {
@@ -328,4 +357,13 @@ pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?
     };
 
     return file;
+}
+
+fn getLevelColor(comptime level: std.log.Level) []const u8 {
+    return switch (level) {
+        .err => Colors.err,
+        .warn => Colors.warn,
+        .info => Colors.info,
+        .debug => Colors.debug,
+    };
 }

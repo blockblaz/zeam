@@ -31,6 +31,7 @@ const ZeamArgs = struct {
     log_filename: []const u8 = "consensus", // Default logger filename
     log_filepath: []const u8 = "./log", // Default logger filepath
     log_file_active_level: std.log.Level = .debug, //default log file ActiveLevel
+    log_file_colors: bool = true, //default log file color
     console_log_level: std.log.Level = .info, //default console log level
     // choosing 3 vals as default so that default beam cmd run which runs two nodes to interop
     // can justify and finalize
@@ -101,6 +102,7 @@ const ZeamArgs = struct {
         .log_filename = "Log Filename",
         .log_filepath = "Log Filepath - must exist",
         .log_file_active_level = "Log File Active Level, May be separate from console log level",
+        .log_file_colors = "Display color formatted log in files for use in color supported editors",
         .console_log_level = "Log Level for console logging",
     };
 
@@ -122,6 +124,7 @@ pub fn main() !void {
     const log_filename = opts.args.log_filename;
     const log_filepath = opts.args.log_filepath;
     const log_file_active_level = opts.args.log_file_active_level;
+    const log_file_colors = opts.args.log_file_colors;
     const console_log_level = opts.args.console_log_level;
 
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
@@ -230,8 +233,8 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .fileColors = log_file_colors });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .fileColors = log_file_colors });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
