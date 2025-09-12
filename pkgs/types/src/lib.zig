@@ -181,7 +181,7 @@ test "ssz seralize/deserialize signed beam block" {
                 .attestations = &[_]SignedVote{},
             },
         },
-        .signature = [_]u8{2} ** 48,
+        .signature = [_]u8{2} ** SIGSIZE,
     };
 
     // check SignedBeamBlock serialization/deserialization
@@ -308,7 +308,7 @@ test "ssz seralize/deserialize signed stf prover input" {
                 .attestations = &[_]SignedVote{},
             },
         },
-        .signature = [_]u8{2} ** 48,
+        .signature = [_]u8{2} ** SIGSIZE,
     };
 
     const prover_input = BeamSTFProverInput{

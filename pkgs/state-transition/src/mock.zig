@@ -226,7 +226,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         var block = types.BeamBlock{
             .slot = slot,
-            .proposer_index = 1,
+            .proposer_index = slot % genesis_config.num_validators,
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
