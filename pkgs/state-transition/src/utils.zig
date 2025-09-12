@@ -111,6 +111,16 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
     var historical_hashes_array = std.ArrayList(types.Root).init(allocator);
     var justified_slots_array = std.ArrayList(u8).init(allocator);
 
+    // Initialize justifications arrays with proper size
+    // justifications_validators should be a multiple of num_validators
+    var justifications_roots_array = std.ArrayList(types.Root).init(allocator);
+    var justifications_validators_array = std.ArrayList(u8).init(allocator);
+
+    // For genesis, we start with empty justifications
+    // but we need to ensure the arrays are properly sized for SSZ serialization
+    const justifications_roots = try justifications_roots_array.toOwnedSlice();
+    const justifications_validators = try justifications_validators_array.toOwnedSlice();
+
     const state = types.BeamState{
         .config = .{ .num_validators = genesis.num_validators },
         .genesis_time = genesis.genesis_time,
@@ -121,9 +131,9 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
         .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
         .historical_block_hashes = try historical_hashes_array.toOwnedSlice(),
         .justified_slots = try justified_slots_array.toOwnedSlice(),
-        // justifications map is empty
-        .justifications_roots = &[_]types.Root{},
-        .justifications_validators = &[_]u8{},
+        // justifications map is empty but properly allocated
+        .justifications_roots = justifications_roots,
+        .justifications_validators = justifications_validators,
     };
 
     return state;

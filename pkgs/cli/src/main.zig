@@ -27,6 +27,9 @@ const networks = @import("@zeam/network");
 
 const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusConfig;
 
+const genesisLib = @import("@zeam/genesis");
+const clientLib = @import("@zeam/client");
+
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     log_filename: []const u8 = "consensus", // Default logger filename
@@ -87,12 +90,51 @@ const ZeamArgs = struct {
                 };
             },
         },
+        genesis: struct {
+            config: []const u8,
+            validators: []const u8,
+            output_dir: []const u8,
+            help: bool = false,
+
+            pub const __shorts__ = .{
+                .config = .c,
+                .validators = .v,
+                .output_dir = .o,
+                .help = .h,
+            };
+
+            pub const __messages__ = .{
+                .config = "Path to config.yaml file",
+                .validators = "Path to validator-config.yaml file",
+                .output_dir = "Output directory for generated files",
+                .help = "Show help information for the genesis command",
+            };
+        },
+        client: struct {
+            genesis_dir: []const u8,
+            node_name: []const u8 = "ream_0",
+            help: bool = false,
+
+            pub const __shorts__ = .{
+                .genesis_dir = .d,
+                .node_name = .n,
+                .help = .h,
+            };
+
+            pub const __messages__ = .{
+                .genesis_dir = "Directory containing genesis files",
+                .node_name = "Node name (validator name from validators.yaml)",
+                .help = "Show help information for the client command",
+            };
+        },
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
             .beam = "Run a full Beam node",
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
+            .genesis = "Generate genesis files from configuration",
+            .client = "Start a client node with genesis configuration",
         };
     },
 
@@ -275,6 +317,33 @@ pub fn main() !void {
                 defer config_file.close();
                 try config_file.writeAll(generated_config);
             },
+        },
+        .genesis => |genesis_cmd| {
+            std.debug.print("Generating genesis files from config: {s}, validators: {s}, output: {s}\n", .{ genesis_cmd.config, genesis_cmd.validators, genesis_cmd.output_dir });
+
+            var generator = genesisLib.GenesisGenerator.init(allocator);
+            try generator.generate(
+                genesis_cmd.config,
+                genesis_cmd.validators,
+                genesis_cmd.output_dir,
+            );
+
+            std.debug.print("Genesis files generated successfully in: {s}\n", .{genesis_cmd.output_dir});
+        },
+        .client => |client_cmd| {
+            std.debug.print("Starting client node '{s}' with genesis directory: {s}\n", .{ client_cmd.node_name, client_cmd.genesis_dir });
+
+            var client_node = try clientLib.Client.init(
+                allocator,
+                client_cmd.genesis_dir,
+                client_cmd.node_name,
+                log_filename,
+                log_filepath,
+                log_file_active_level,
+                console_log_level,
+            );
+
+            try client_node.start();
         },
     }
 }

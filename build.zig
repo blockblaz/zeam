@@ -165,6 +165,33 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/network", zeam_network);
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
 
+    // add genesis generator
+    const zeam_genesis = b.addModule("@zeam/genesis", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/genesis/src/lib.zig"),
+    });
+    zeam_genesis.addImport("@zeam/types", zeam_types);
+    zeam_genesis.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_genesis.addImport("enr", enr);
+    zeam_genesis.addImport("ssz", ssz);
+
+    // add client
+    const zeam_client = b.addModule("@zeam/client", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/client/src/lib.zig"),
+    });
+    zeam_client.addImport("@zeam/types", zeam_types);
+    zeam_client.addImport("@zeam/node", zeam_beam_node);
+    zeam_client.addImport("@zeam/configs", zeam_configs);
+    zeam_client.addImport("@zeam/network", zeam_network);
+    zeam_client.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_client.addImport("@zeam/utils", zeam_utils);
+    zeam_client.addImport("xev", xev);
+    zeam_client.addImport("multiformats", multiformats);
+    zeam_client.addImport("ssz", ssz);
+
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
@@ -191,6 +218,8 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    cli_exe.root_module.addImport("@zeam/genesis", zeam_genesis);
+    cli_exe.root_module.addImport("@zeam/client", zeam_client);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
 

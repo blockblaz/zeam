@@ -136,6 +136,42 @@ pub const BeamSTFProverInput = struct {
     state: BeamState,
 };
 
+// Validator configuration types for genesis generation
+pub const ENRFields = struct {
+    ip: ?[]const u8 = null,
+    ip6: ?[]const u8 = null,
+    tcp: ?u16 = null,
+    udp: ?u16 = null,
+    quic: ?u16 = null,
+    seq: ?u64 = null,
+    // Allow arbitrary custom fields as key-value pairs
+    custom: ?[]CustomField = null,
+};
+
+pub const CustomField = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const ValidatorConfig = struct {
+    name: []const u8,
+    enr: ?[]const u8 = null, // Pre-generated ENR
+    privkey: ?[]const u8 = null, // Private key for ENR generation
+    enrFields: ?ENRFields = null, // ENR field specifications
+    count: u32, // Number of validator indices
+};
+
+pub const ValidatorConfigFile = struct {
+    shuffle: []const u8, // "roundrobin" or other strategies
+    validators: []ValidatorConfig,
+};
+
+// Genesis configuration from config.yaml
+pub const GenesisConfig = struct {
+    GENESIS_TIME: u64,
+    VALIDATOR_COUNT: u64,
+};
+
 // some p2p containers
 pub const BlockByRootRequest = struct { roots: []Root };
 
