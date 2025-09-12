@@ -1,3 +1,6 @@
+comptime {
+    @setEvalBranchQuota(50000000);
+}
 const std = @import("std");
 const json = std.json;
 const build_options = @import("build_options");
