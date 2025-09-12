@@ -10,7 +10,9 @@ pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
-pub const Bytes4000 = [4000]u8;
+
+pub const SIGSIZE = 40;
+pub const Bytes4000 = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
@@ -59,7 +61,7 @@ pub const SignedVotes = []SignedVote;
 
 pub const BeamBlockBody = struct {
     // some form of APS - to be activated later - disabled for PQ devnet0
-    execution_payload_header: ExecutionPayloadHeader,
+    // execution_payload_header: ExecutionPayloadHeader,
 
     // mini 3sf simplified votes
     attestations: SignedVotes,
@@ -173,7 +175,11 @@ test "ssz seralize/deserialize signed beam block" {
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .attestations = &[_]SignedVote{} },
+            .body = .{
+                //
+                // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
+                .attestations = &[_]SignedVote{},
+            },
         },
         .signature = [_]u8{2} ** 48,
     };
@@ -187,7 +193,7 @@ test "ssz seralize/deserialize signed beam block" {
     var deserialized_signed_block: SignedBeamBlock = undefined;
     try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
 
-    try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
+    // try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.state_root, &deserialized_signed_block.message.state_root));
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.parent_root, &deserialized_signed_block.message.parent_root));
 
@@ -202,14 +208,13 @@ test "ssz seralize/deserialize signed beam block" {
 }
 
 test "ssz seralize/deserialize signed beam state" {
-    const config = BeamStateConfig{ .num_validators = 4 };
+    const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
     const genesis_root = [_]u8{9} ** 32;
     var justifications_roots = [_]Root{genesis_root};
     var justifications_validators = [_]u8{ 0, 1, 1, 1 };
 
     const state = BeamState{
         .config = config,
-        .genesis_time = 93,
         .slot = 99,
         .latest_block_header = .{
             .slot = 0,
@@ -258,14 +263,16 @@ test "ssz seralize/deserialize signed beam state" {
 }
 
 test "ssz seralize/deserialize signed stf prover input" {
-    const config = BeamStateConfig{ .num_validators = 4 };
+    const config = BeamStateConfig{
+        .num_validators = 4,
+        .genesis_time = 93,
+    };
     const genesis_root = [_]u8{9} ** 32;
     var justifications_roots = [_]Root{genesis_root};
     var justifications_validators = [_]u8{ 0, 1, 1, 1 };
 
     const state = BeamState{
         .config = config,
-        .genesis_time = 93,
         .slot = 99,
         .latest_block_header = .{
             .slot = 0,
@@ -295,7 +302,11 @@ test "ssz seralize/deserialize signed stf prover input" {
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{ .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 }, .attestations = &[_]SignedVote{} },
+            .body = .{
+                //
+                // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
+                .attestations = &[_]SignedVote{},
+            },
         },
         .signature = [_]u8{2} ** 48,
     };

@@ -109,7 +109,7 @@ pub const BeamChain = struct {
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
-        const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
+        // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
         var block = types.BeamBlock{
             .slot = opts.slot,
@@ -117,7 +117,7 @@ pub const BeamChain = struct {
             .parent_root = parent_root,
             .state_root = undefined,
             .body = types.BeamBlockBody{
-                .execution_payload_header = .{ .timestamp = timestamp },
+                // .execution_payload_header = .{ .timestamp = timestamp },
                 .attestations = votes,
             },
         };
@@ -242,7 +242,10 @@ pub const BeamChain = struct {
             var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
             // 2. apply STF to get post state
-            const validSignatures = if (stf.verify_signatures(signedBlock)) true else false;
+            var validSignatures = true;
+            stf.verify_signatures(signedBlock) catch {
+                validSignatures = false;
+            };
             try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
                 //
                 .logger = self.logger,

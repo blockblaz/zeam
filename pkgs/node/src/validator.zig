@@ -60,7 +60,7 @@ pub const BeamValidator = struct {
 
             const signed_block = types.SignedBeamBlock{
                 .message = block,
-                .signature = [_]u8{0} ** 48,
+                .signature = [_]u8{0} ** types.SIGSIZE,
             };
             const signed_block_message = networks.GossipMessage{ .block = signed_block };
             std.debug.print("validator block production slot={any} block={any}\n", .{ slot, signed_block_message });
@@ -80,7 +80,7 @@ pub const BeamValidator = struct {
             const signed_vote: types.SignedVote = .{
                 .validator_id = validator_id,
                 .message = vote,
-                .signature = [_]u8{0} ** 48,
+                .signature = [_]u8{0} ** types.SIGSIZE,
             };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };

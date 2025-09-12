@@ -135,7 +135,7 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
 }
 
-// not active in PQ devnet0
+// not active in PQ devnet0 - zig will automatically prune this from code
 fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBlock) !void {
     const expected_timestamp = state.genesis_time + block.slot * params.SECONDS_PER_SLOT;
     if (expected_timestamp != block.body.execution_payload_header.timestamp) {
