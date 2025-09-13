@@ -47,6 +47,21 @@ pub const GossipTopic = enum {
     block,
     vote,
 };
+
+pub fn parseTopic(c_topic: [*]const u8) ?GossipTopic {
+    const topic = std.mem.span(c_topic);
+    if (std.mem.eql(u8, topic, "block")) return .block;
+    if (std.mem.eql(u8, topic, "vote")) return .vote;
+    return null;
+}
+
+pub fn topicToString(topic: GossipTopic) [*]const u8 {
+    return switch (topic) {
+        .block => "block",
+        .vote => "vote",
+    };
+}
+
 pub const GossipMessage = union(GossipTopic) {
     block: types.SignedBeamBlock,
     vote: types.SignedVote,

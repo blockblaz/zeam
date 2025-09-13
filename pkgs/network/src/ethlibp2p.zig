@@ -10,18 +10,17 @@ const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void {
-    const topic = switch (topic_id) {
-        0 => interface.GossipTopic.block,
-        1 => interface.GossipTopic.vote,
-        else => {
-            std.debug.print("\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge !!!!\n", .{topic_id});
-            return;
-        },
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*]const c_char, message_ptr: [*]const u8, message_len: usize) void {
+    const goss_topic = interface.parseTopic(topic) orelse {
+        std.debug.print(
+            "!!!! Ignoring Invalid topic_str={s} !!!!\n",
+            .{topic},
+        );
+        return;
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
-    const message: interface.GossipMessage = switch (topic) {
+    const message: interface.GossipMessage = switch (goss_topic) {
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
@@ -62,7 +61,7 @@ export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u
 
 // TODO: change listen port and connect port both to list of multiaddrs
 pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
-pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic: [*]const c_char, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -99,10 +98,6 @@ pub const EthLibp2p = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
         const topic = data.getTopic();
-        const topic_id: u32 = switch (topic) {
-            .block => 0,
-            .vote => 1,
-        };
 
         // TODO: deinit the message later ob once done
         const message = switch (topic) {
@@ -119,8 +114,9 @@ pub const EthLibp2p = struct {
                 break :votebytes serialized.items;
             },
         };
+
         std.debug.print("\n\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
-        publish_msg_to_rust_bridge(self.params.networkId, topic_id, message.ptr, message.len);
+        publish_msg_to_rust_bridge(self.params.networkId, interface.topicToString(topic), message.ptr, message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
