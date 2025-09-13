@@ -89,9 +89,8 @@ test "mock network publish/subscribe" {
     };
 
     var topics_array = [_]interface.GossipTopic{.block};
-    var start: usize = 0;
-    _ = &start;
-    const topics_slice = topics_array[start..];
+    const topics_slice = topics_array[0..];
+
     try net_if.gossip.subscribe(topics_slice, handler);
 
     const block_msg = interface.GossipMessage{
@@ -116,3 +115,4 @@ test "mock network publish/subscribe" {
 
     try std.testing.expect(received_block == true);
 }
+
