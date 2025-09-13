@@ -48,14 +48,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     return filename;
 }
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
-    const goss_topic = interface.GossipTopic.parseTopic(topic) orelse {
-        zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge", .{std.mem.span(topic)});
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
+    const topic = interface.GossipTopic.parseTopic(topic_str) orelse {
+        zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge", .{std.mem.span(topic_str)});
         return;
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
-    const message: interface.GossipMessage = switch (goss_topic) {
+    const message: interface.GossipMessage = switch (topic) {
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
@@ -85,7 +85,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*:0]const u8, 
         },
     };
 
-    zigHandler.logger.debug("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic), message, message_bytes });
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
@@ -106,7 +106,7 @@ export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u
 
 // TODO: change listen port and connect port both to list of multiaddrs
 pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
-pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,

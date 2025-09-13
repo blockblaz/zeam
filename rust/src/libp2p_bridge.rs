@@ -87,10 +87,10 @@ pub unsafe fn publish_msg_to_rust_bridge(
         return;
     }
 
-    let topic_str = std::ffi::CStr::from_ptr(topic)
+    let topic = std::ffi::CStr::from_ptr(topic)
         .to_string_lossy()
         .to_string();
-    let topic = gossipsub::IdentTopic::new(topic_str);
+    let topic = gossipsub::IdentTopic::new(topic);
 
     #[allow(static_mut_refs)]
     let swarm = if network_id < 1 {
@@ -212,19 +212,13 @@ impl Network {
                             return;
                         }
                     };
-
-                    let topic_ptr = topic.as_ptr();
+                    let topic = topic.as_ptr();
 
                     let message_ptr = message.data.as_ptr();
                     let message_len = message.data.len();
 
                     unsafe {
-                        handleMsgFromRustBridge(
-                            self.zig_handler,
-                            topic_ptr,
-                            message_ptr,
-                            message_len,
-                        )
+                        handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
                     };
                     println!(
                         "\nrustbridge{0}:: zig callback completed\n",
