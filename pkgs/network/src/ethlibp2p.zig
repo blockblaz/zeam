@@ -10,11 +10,11 @@ const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*]const c_char, message_ptr: [*]const u8, message_len: usize) void {
-    const goss_topic = interface.parseTopic(topic) orelse {
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
+    const goss_topic = interface.GossipTopic.parseTopic(topic) orelse {
         std.debug.print(
             "!!!! Ignoring Invalid topic_str={s} !!!!\n",
-            .{topic},
+            .{std.mem.span(topic)},
         );
         return;
     };
@@ -40,7 +40,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic: [*]const c_char
         },
     };
 
-    std.debug.print("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, topic, message, message_bytes });
+    std.debug.print("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic), message, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
@@ -61,7 +61,7 @@ export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u
 
 // TODO: change listen port and connect port both to list of multiaddrs
 pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
-pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic: [*]const c_char, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -98,6 +98,7 @@ pub const EthLibp2p = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
         const topic = data.getTopic();
+        const topic_str: [*:0]const u8 = @ptrCast(@tagName(topic));
 
         // TODO: deinit the message later ob once done
         const message = switch (topic) {
@@ -116,7 +117,7 @@ pub const EthLibp2p = struct {
         };
 
         std.debug.print("\n\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
-        publish_msg_to_rust_bridge(self.params.networkId, interface.topicToString(topic), message.ptr, message.len);
+        publish_msg_to_rust_bridge(self.params.networkId, topic_str, message.ptr, message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {

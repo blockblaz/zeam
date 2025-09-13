@@ -64,7 +64,9 @@ pub unsafe fn create_and_run_network(
 }
 
 /// # Safety
+///
 /// The caller must ensure that `message_str` points to valid memory of `message_len` bytes.
+/// The caller must ensure that `topic` points to valid null-terminated C string.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn publish_msg_to_rust_bridge(
@@ -203,7 +205,10 @@ impl Network {
                     let topic = match CString::new(topic) {
                         Ok(cstr) => cstr,
                         Err(_) => {
-                            eprintln!("rustbridge{}:: unknown_topic={}", self.network_id, topic);
+                            eprintln!(
+                                "rustbridge{}:: invalid_topic_string={}",
+                                self.network_id, topic
+                            );
                             return;
                         }
                     };
