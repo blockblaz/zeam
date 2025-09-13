@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
+const zeam_utils = @import("@zeam/utils");
 
 const chains = @import("./chain.zig");
 const networkFactory = @import("./network.zig");
@@ -14,6 +15,7 @@ pub const ValidatorParams = struct {
     ids: []usize,
     chain: *chains.BeamChain,
     network: networkFactory.Network,
+    logger: *zeam_utils.ZeamLogger,
 };
 
 pub const BeamValidator = struct {
@@ -22,6 +24,7 @@ pub const BeamValidator = struct {
     chain: *chains.BeamChain,
     network: networkFactory.Network,
     ids: []usize,
+    logger: *const zeam_utils.ZeamLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorParams) Self {
@@ -31,6 +34,7 @@ pub const BeamValidator = struct {
             .chain = opts.chain,
             .network = opts.network,
             .ids = opts.ids,
+            .logger = opts.logger,
         };
     }
 
@@ -55,15 +59,15 @@ pub const BeamValidator = struct {
         const slot_proposer_id = slot % num_validators;
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
             _ = index;
-            std.debug.print("constructing block message slot={any} proposer={any}\n", .{ slot, slot_proposer_id });
+            self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
             const signed_block = types.SignedBeamBlock{
                 .message = block,
-                .signature = [_]u8{0} ** 48,
+                .signature = [_]u8{0} ** types.SIGSIZE,
             };
             const signed_block_message = networks.GossipMessage{ .block = signed_block };
-            std.debug.print("validator block production slot={any} block={any}\n", .{ slot, signed_block_message });
+            self.logger.info("validator block production slot={d} block={any}", .{ slot, signed_block_message });
             // publish block is right now a no-op however move gossip message construction and publish there
             try self.chain.publishBlock(signed_block);
             try self.network.publish(&signed_block_message);
@@ -73,18 +77,18 @@ pub const BeamValidator = struct {
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !void {
         if (self.ids.len == 0) return;
 
-        std.debug.print("constructing vote message for slot={any}\n", .{slot});
+        self.logger.info("constructing vote message for slot={d}", .{slot});
         const vote = try self.chain.constructVote(.{ .slot = slot });
 
         for (self.ids) |validator_id| {
             const signed_vote: types.SignedVote = .{
                 .validator_id = validator_id,
                 .message = vote,
-                .signature = [_]u8{0} ** 48,
+                .signature = [_]u8{0} ** types.SIGSIZE,
             };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
-            std.debug.print("validator construced vote slot={any} vote={any}\n", .{ slot, signed_vote_message });
+            self.logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message });
             try self.chain.publishVote(signed_vote);
             // move gossip message construction and publish to publishVote
             try self.network.publish(&signed_vote_message);

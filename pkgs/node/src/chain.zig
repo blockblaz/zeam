@@ -109,7 +109,8 @@ pub const BeamChain = struct {
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
-        const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
+        // keeping for later when execution will be integrated into lean
+        // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
         var block = types.BeamBlock{
             .slot = opts.slot,
@@ -117,8 +118,8 @@ pub const BeamChain = struct {
             .parent_root = parent_root,
             .state_root = undefined,
             .body = types.BeamBlockBody{
-                .execution_payload_header = .{ .timestamp = timestamp },
-                .atttestations = votes,
+                // .execution_payload_header = .{ .timestamp = timestamp },
+                .attestations = votes,
             },
         };
 
@@ -242,7 +243,15 @@ pub const BeamChain = struct {
             var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
             // 2. apply STF to get post state
-            try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{ .logger = self.logger });
+            var validSignatures = true;
+            stf.verify_signatures(signedBlock) catch {
+                validSignatures = false;
+            };
+            try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
+                //
+                .logger = self.logger,
+                .validSignatures = validSignatures,
+            });
             break :computedstate cpost_state;
         };
 
@@ -252,7 +261,7 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. fc onvotes
-        for (block.body.atttestations) |signed_vote| {
+        for (block.body.attestations) |signed_vote| {
             self.forkChoice.onAttestation(signed_vote, true) catch |e| {
                 self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };
