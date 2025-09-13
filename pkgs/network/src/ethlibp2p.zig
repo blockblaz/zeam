@@ -12,40 +12,40 @@ const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 
 /// Writes failed deserialization bytes to disk for debugging purposes
-/// Returns true if the file was successfully created, false otherwise
+/// Returns the filename if the file was successfully created, null otherwise
 /// If timestamp is null, generates a new timestamp automatically
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: *const zeam_utils.ZeamLogger) bool {
+fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: *const zeam_utils.ZeamLogger) ?[]const u8 {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
         error.PathAlreadyExists => {}, // Directory already exists, continue
         else => {
-            logger.err("Failed to create dumps directory: {any}", .{e});
-            return false;
+            logger.err("Failed to create deserialization dumps directory: {any}", .{e});
+            return null;
         },
     };
 
     // Generate timestamp-based filename
     const actual_timestamp = timestamp orelse std.time.timestamp();
     const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
-        logger.err("Failed to allocate filename: {any}", .{e});
-        return false;
+        logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
+        return null;
     };
     defer allocator.free(filename);
 
     // Write bytes to file
     const file = std.fs.cwd().createFile(filename, .{ .truncate = true }) catch |e| {
-        logger.err("Failed to create file {s}: {any}", .{ filename, e });
-        return false;
+        logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
+        return null;
     };
     defer file.close();
 
     file.writeAll(message_bytes) catch |e| {
-        logger.err("Failed to write bytes to file {s}: {any}", .{ filename, e });
-        return false;
+        logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
+        return null;
     };
 
-    logger.debug("Written {d} bytes to {s} for debugging", .{ message_bytes.len, filename });
-    return true;
+    logger.warn("SSZ deserialization failed for {s} message - written {d} bytes to debug file: {s}", .{ message_type, message_bytes.len, filename });
+    return filename;
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message_ptr: [*]const u8, message_len: usize) void {
@@ -63,8 +63,12 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed block message e={any}", .{e});
-                _ = writeFailedBytes(message_bytes, "block", zigHandler.allocator, null, zigHandler.logger);
+                zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
+                if (writeFailedBytes(message_bytes, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
+                } else {
+                    zigHandler.logger.err("Block deserialization failed - could not create debug file", .{});
+                }
                 return;
             };
 
@@ -73,8 +77,12 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         .vote => votemessage: {
             var message_data: types.SignedVote = undefined;
             ssz.deserialize(types.SignedVote, message_bytes, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed vote message e={any}", .{e});
-                _ = writeFailedBytes(message_bytes, "vote", zigHandler.allocator, null, zigHandler.logger);
+                zigHandler.logger.err("Error in deserializing the signed vote message: {any}", .{e});
+                if (writeFailedBytes(message_bytes, "vote", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("Vote deserialization failed - debug file created: {s}", .{filename});
+                } else {
+                    zigHandler.logger.err("Vote deserialization failed - could not create debug file", .{});
+                }
                 return;
             };
             break :votemessage .{ .vote = message_data };
@@ -241,8 +249,8 @@ test "writeFailedBytes creates file with correct content" {
     // Test case 1: Valid data that should succeed
     const valid_bytes = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 };
     const result1 = writeFailedBytes(&valid_bytes, "test", allocator, test_timestamp, &test_logger);
-    testing.expect(result1 == true) catch {
-        std.debug.print("writeFailedBytes should return true for valid data\n", .{});
+    testing.expect(result1 != null) catch {
+        std.debug.print("writeFailedBytes should return filename for valid data\n", .{});
     };
 
     // Now verify the file was created and contains correct content
@@ -270,8 +278,8 @@ test "writeFailedBytes creates file with correct content" {
     // Test case 2: Empty data that should still succeed
     const empty_bytes = [_]u8{};
     const result2 = writeFailedBytes(&empty_bytes, "empty", allocator, test_timestamp, &test_logger);
-    testing.expect(result2 == true) catch {
-        std.debug.print("writeFailedBytes should return true for empty data\n", .{});
+    testing.expect(result2 != null) catch {
+        std.debug.print("writeFailedBytes should return filename for empty data\n", .{});
     };
 
     // Verify empty file was created
