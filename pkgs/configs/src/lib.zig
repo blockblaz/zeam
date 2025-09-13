@@ -9,6 +9,7 @@ const utils = @import("@zeam/utils");
 pub const ChainOptions = utils.Partial(utils.MixIn(types.GenesisSpec, types.ChainSpec));
 
 const configs = @import("./configs/mainnet.zig");
+const Yaml = @import("yaml").Yaml;
 
 pub const Chain = enum { custom };
 
@@ -43,6 +44,25 @@ pub const ChainConfig = struct {
 const ChainConfigError = error{
     InvalidChainSpec,
 };
+
+pub fn loadFromYAMLFile(allocator:Allocator, file_path: []const u8) !Yaml {
+    const resolved_path = if (std.fs.path.isAbsolute(file_path)) 
+        try allocator.dupe(u8, file_path)
+    else 
+        try std.fs.cwd().realpathAlloc(allocator, file_path);
+    defer allocator.free(resolved_path);
+
+    const file = try std.fs.openFileAbsolute(resolved_path, .{});
+    defer file.close();
+
+    const source = try file.readToEndAlloc(allocator, 1024 * 1024); // max 1MB
+    defer allocator.free(source);
+
+    var yaml: Yaml = .{ .source = source };
+    errdefer yaml.deinit(allocator);
+    try yaml.load(allocator);
+    return yaml;
+}
 
 test "custom dev chain" {
     const dev_spec =
