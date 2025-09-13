@@ -45,10 +45,10 @@ const ChainConfigError = error{
     InvalidChainSpec,
 };
 
-pub fn loadFromYAMLFile(allocator:Allocator, file_path: []const u8) !Yaml {
-    const resolved_path = if (std.fs.path.isAbsolute(file_path)) 
+pub fn loadFromYAMLFile(allocator: Allocator, file_path: []const u8) !Yaml {
+    const resolved_path = if (std.fs.path.isAbsolute(file_path))
         try allocator.dupe(u8, file_path)
-    else 
+    else
         try std.fs.cwd().realpathAlloc(allocator, file_path);
     defer allocator.free(resolved_path);
 

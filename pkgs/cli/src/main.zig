@@ -97,9 +97,10 @@ const ZeamArgs = struct {
             config_filepath: []const u8 = "./config.yaml",
             bootnodes_filepath: []const u8 = "./nodes.yaml",
             validators_filepath: []const u8 = "./validators.yaml",
-            genesis_filepath: ?[]const u8 = null,
+            genesis_filepath: ?[]const u8,
             node_id: u32 = 0,
-            metrics_port: ?u16 = null,
+            metrics_enable: bool = false,
+            metrics_port: u16 = 9667,
 
             pub const __shorts__ = .{
                 .help = .h,
@@ -112,6 +113,7 @@ const ZeamArgs = struct {
                 .genesis_filepath = "Path to the genesis state file",
                 .node_id = "Node id for this lean node",
                 .metrics_port = "Port to use for publishing metrics",
+                .metrics_enable = "Enable metrics endpoint",
             };
         },
 
@@ -306,114 +308,157 @@ pub fn main() !void {
             },
         },
         .lean_node => |leancmd| {
-            // Freeing the global secp256k1 context at the end of the program
-            defer enr.deinitGlobalSecp256k1Ctx();
-            const node_id = leancmd.node_id;
-            const config_filepath = leancmd.config_filepath;
-            const bootnodes_filepath = leancmd.bootnodes_filepath;
-            const validators_filepath = leancmd.validators_filepath;
-            // const genesis_filepath = leancmd.genesis_filepath;
-
-            var parsed_bootnodes = try configs.loadFromYAMLFile(allocator, bootnodes_filepath);
-            defer parsed_bootnodes.deinit(allocator);
-
-            var parsed_config = try configs.loadFromYAMLFile(allocator, config_filepath);
-            defer parsed_config.deinit(allocator);
-
-            var parsed_validators = try configs.loadFromYAMLFile(allocator, validators_filepath);
-            defer parsed_validators.deinit(allocator);
-
-            const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
-            defer allocator.free(bootnodes);
-
-            const genesis_spec = try genesisConfigFromYAML(parsed_config);
-
-            const validator_indices = try validatorIndicesFromYAML(allocator, node_id, parsed_validators);
-            defer allocator.free(validator_indices);
-
-            if (leancmd.metrics_port) |port| {
-                try metrics.init(allocator);
-                try metricsServer.startMetricsServer(allocator, port);
-            }
-
-            // some base mainnet spec would be loaded to build this up
-            const chain_spec =
-                \\{"preset": "mainnet", "name": "beamdev"}
-            ;
-            const options = json.ParseOptions{
-                .ignore_unknown_fields = true,
-                .allocate = .alloc_if_needed,
+            const start_options = StartNodeOptions{
+                .node_id = leancmd.node_id,
+                .config_filepath = leancmd.config_filepath,
+                .bootnodes_filepath = leancmd.bootnodes_filepath,
+                .validators_filepath = leancmd.validators_filepath,
+                .genesis_filepath = leancmd.genesis_filepath,
+                .metrics_enable = leancmd.metrics_enable,
+                .metrics_port = leancmd.metrics_port,
+                .log_filename = log_filename,
+                .log_filepath = log_filepath,
+                .log_file_active_level = log_file_active_level,
+                .console_log_level = console_log_level,
             };
-            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
 
-            chain_options.genesis_time = genesis_spec.genesis_time;
-            chain_options.num_validators = genesis_spec.num_validators;
-            const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
-
-            // TODO we seem to be needing one loop because then the events added to loop are not being fired
-            // in the order to which they have been added even with the an appropriate delay added
-            // behavior of this further needs to be investigated but for now we will share the same loop
-            const loop = try allocator.create(xev.Loop);
-            loop.* = try xev.Loop.init(.{});
-
-            var network = try allocator.create(networks.EthLibp2p);
-            var node_enr: ENR = undefined;
-            try ENR.decodeTxtInto(&node_enr, bootnodes[validator_indices[0]]);
-            var node_multiaddrs = try node_enr.multiaddrP2PQUIC(allocator);
-            defer node_multiaddrs.deinit(allocator);
-            const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
-            // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
-            defer {
-                for (listen_addresses) |addr| addr.deinit();
-                allocator.free(listen_addresses);
-            }
-
-            var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
-            defer connect_peer_list.deinit(allocator);
-
-            for (bootnodes, 0..) |n, i| {
-                if (i != validator_indices[0]) {
-                    var n_enr: ENR = undefined;
-                    try ENR.decodeTxtInto(&n_enr, n);
-                    var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(allocator);
-                    defer peer_multiaddr_list.deinit(allocator);
-                    const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(allocator);
-                    defer allocator.free(peer_multiaddrs);
-                    try connect_peer_list.appendSlice(allocator, peer_multiaddrs);
-                }
-            }
-
-            const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
-            defer {
-                for (connect_peers) |addr| addr.deinit();
-                allocator.free(connect_peers);
-            }
-            network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers });
-            try network.run();
-            const backend = network.getNetworkInterface();
-
-            var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
-
-            var logger = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-
-            var beam_node = try BeamNode.init(allocator, .{
-                // options
-                .nodeId = node_id,
-                .config = chain_config,
-                .anchorState = anchorState,
-                .backend = backend,
-                .clock = clock,
-                .db = .{},
-                .validator_ids = validator_indices,
-                .logger = &logger,
-            });
-
-            try beam_node.run();
-            try clock.run();
+            try startNode(allocator, start_options);
         },
     }
+}
+
+const StartNodeOptions = struct {
+    node_id: u32,
+    config_filepath: []const u8,
+    bootnodes_filepath: []const u8,
+    validators_filepath: []const u8,
+    genesis_filepath: ?[]const u8,
+    metrics_enable: bool,
+    metrics_port: u16,
+    log_filename: []const u8,
+    log_filepath: []const u8,
+    log_file_active_level: std.log.Level,
+    console_log_level: std.log.Level,
+};
+
+fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void {
+    // Freeing the global secp256k1 context at the end of the program
+    defer enr.deinitGlobalSecp256k1Ctx();
+
+    const node_id = options.node_id;
+    const config_filepath = options.config_filepath;
+    const bootnodes_filepath = options.bootnodes_filepath;
+    const validators_filepath = options.validators_filepath;
+    const genesis_filepath = options.genesis_filepath;
+    // TODO: support genesis file loading when ssz library supports it
+    _ = genesis_filepath;
+
+    var parsed_bootnodes = try configs.loadFromYAMLFile(allocator, bootnodes_filepath);
+    defer parsed_bootnodes.deinit(allocator);
+
+    var parsed_config = try configs.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    var parsed_validators = try configs.loadFromYAMLFile(allocator, validators_filepath);
+    defer parsed_validators.deinit(allocator);
+
+    const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
+    defer allocator.free(bootnodes);
+
+    const genesis_spec = try genesisConfigFromYAML(parsed_config);
+
+    const validator_indices = try validatorIndicesFromYAML(allocator, node_id, parsed_validators);
+    defer allocator.free(validator_indices);
+
+    if (options.metrics_enable) {
+        try metrics.init(allocator);
+        try metricsServer.startMetricsServer(allocator, options.metrics_port);
+    }
+
+    // some base mainnet spec would be loaded to build this up
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev"}
+    ;
+    const json_options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+
+    chain_options.genesis_time = genesis_spec.genesis_time;
+    chain_options.num_validators = genesis_spec.num_validators;
+    const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+    const anchorState = try sftFactory.genGenesisState(allocator, chain_config.genesis);
+
+    // TODO we seem to be needing one loop because then the events added to loop are not being fired
+    // in the order to which they have been added even with the an appropriate delay added
+    // behavior of this further needs to be investigated but for now we will share the same loop
+    const loop = try allocator.create(xev.Loop);
+    loop.* = try xev.Loop.init(.{});
+
+    const self_node_index = validator_indices[0];
+    var network = try allocator.create(networks.EthLibp2p);
+    var node_enr: ENR = undefined;
+    defer node_enr.deinit();
+    try ENR.decodeTxtInto(&node_enr, bootnodes[self_node_index]);
+
+    // Overriding the IP to 0.0.0.0 to listen on all interfaces
+    try node_enr.kvs.put("ip", "\x00\x00\x00\x00");
+
+    var node_multiaddrs = try node_enr.multiaddrP2PQUIC(allocator);
+    defer node_multiaddrs.deinit(allocator);
+    const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
+    // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
+    defer {
+        for (listen_addresses) |addr| addr.deinit();
+        allocator.free(listen_addresses);
+    }
+
+    var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
+    defer connect_peer_list.deinit(allocator);
+
+    for (bootnodes, 0..) |n, i| {
+        if (i != self_node_index) {
+            var n_enr: ENR = undefined;
+            try ENR.decodeTxtInto(&n_enr, n);
+            var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(allocator);
+            defer peer_multiaddr_list.deinit(allocator);
+            const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(allocator);
+            defer allocator.free(peer_multiaddrs);
+            try connect_peer_list.appendSlice(allocator, peer_multiaddrs);
+        }
+    }
+
+    const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
+    defer {
+        for (connect_peers) |addr| addr.deinit();
+        allocator.free(connect_peers);
+    }
+
+    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers });
+    try network.run();
+    const backend = network.getNetworkInterface();
+
+    var clock = try allocator.create(Clock);
+    clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+
+    var logger = utilsLib.getScopedLogger(.default, options.console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = options.log_file_active_level, .filePath = options.log_filepath, .fileName = options.log_filename });
+
+    var beam_node = try BeamNode.init(allocator, .{
+        // options
+        .nodeId = node_id,
+        .config = chain_config,
+        .anchorState = anchorState,
+        .backend = backend,
+        .clock = clock,
+        .db = .{},
+        .validator_ids = validator_indices,
+        .logger = &logger,
+    });
+
+    try beam_node.run();
+    std.debug.print("Lean node {d} listened on {?d}\n", .{ node_id, try node_enr.getQUIC() });
+    try clock.run();
 }
 
 fn genesisConfigFromYAML(config: yaml.Yaml) !types.GenesisSpec {
@@ -440,21 +485,28 @@ fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validato
     return try validator_indices.toOwnedSlice(allocator);
 }
 
-test "config yaml" {
-    var config1 = try configs.loadFromYAMLFile(std.testing.allocator, "config.yaml");
+test "config yaml parsing" {
+    var config1 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
     defer config1.deinit(std.testing.allocator);
     const genesis_spec = try genesisConfigFromYAML(config1);
-    std.debug.print("lean node genesis spec ={}\n", .{genesis_spec});
+    try std.testing.expectEqual(9, genesis_spec.num_validators);
+    try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
 
-    var config2 = try configs.loadFromYAMLFile(std.testing.allocator, "validators.yaml");
+    var config2 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
     defer config2.deinit(std.testing.allocator);
     const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, 0, config2);
     defer std.testing.allocator.free(validator_indices);
-    std.debug.print("lean node validator indices ={any}\n", .{validator_indices});
+    try std.testing.expectEqual(3, validator_indices.len);
+    try std.testing.expectEqual(1, validator_indices[0]);
+    try std.testing.expectEqual(4, validator_indices[1]);
+    try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try configs.loadFromYAMLFile(std.testing.allocator, "nodes.yaml");
+    var config3 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
     defer config3.deinit(std.testing.allocator);
     const nodes = try nodesFromYAML(std.testing.allocator, config3);
     defer std.testing.allocator.free(nodes);
-    std.debug.print("lean node nodes ={s}\n", .{nodes});
+    try std.testing.expectEqual(3, nodes.len);
+    try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
+    try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
+    try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
 }
