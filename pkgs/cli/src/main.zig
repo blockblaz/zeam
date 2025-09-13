@@ -205,8 +205,22 @@ pub fn main() !void {
             loop.* = try xev.Loop.init(.{});
 
             // Create loggers first so they can be passed to network implementations
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            // Ensure log directory exists if log_filepath is not provided or is the default "./log"
+            if (std.mem.eql(u8, log_filepath, "./log")) {
+                var cwd = std.fs.cwd();
+                // Try to open the directory, create if it doesn't exist
+                if (cwd.openDir(log_filepath, .{})) |_| {
+                    // Directory exists, do nothing
+                } else |_| {
+                    // Directory does not exist, create it
+                    cwd.makeDir(log_filepath) catch |err| {
+                        std.debug.print("\nERROR : Failed to create log directory: {any}\n", .{err});
+                    };
+                }
+            }
+
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
@@ -243,23 +257,6 @@ pub fn main() !void {
 
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
-
-            // Ensure log directory exists if log_filepath is not provided or is the default "./log"
-            if (std.mem.eql(u8, log_filepath, "./log")) {
-                var cwd = std.fs.cwd();
-                // Try to open the directory, create if it doesn't exist
-                if (cwd.openDir(log_filepath, .{})) |_| {
-                    // Directory exists, do nothing
-                } else |_| {
-                    // Directory does not exist, create it
-                    cwd.makeDir(log_filepath) catch |err| {
-                        std.debug.print("\nERROR : Failed to create log directory: {any}\n", .{err});
-                    };
-                }
-            }
-
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
