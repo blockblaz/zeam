@@ -201,20 +201,24 @@ pub fn main() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
+            // Create loggers first so they can be passed to network implementations
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
-                network.* = try networks.Mock.init(allocator, loop);
+                network.* = try networks.Mock.init(allocator, loop, &logger1);
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
-                std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
+                logger1.debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
                 // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 defer for (listen_addresses1) |addr| addr.deinit();
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses1, .connect_peers = null });
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses1, .connect_peers = null }, &logger1);
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
@@ -225,10 +229,10 @@ pub fn main() !void {
                 defer for (listen_addresses2) |addr| addr.deinit();
                 const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
                 defer for (connect_peers) |addr| addr.deinit();
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .listen_addresses = listen_addresses2, .connect_peers = connect_peers });
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, &logger2);
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
-                std.debug.print("---\n\n mock gossip {any}\n\n", .{backend1.gossip});
+                logger1.debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -236,9 +240,6 @@ pub fn main() !void {
 
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
-
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options

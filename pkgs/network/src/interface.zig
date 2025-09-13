@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
+const zeam_utils = @import("@zeam/utils");
 
 pub const GossipSub = struct {
     // ptr to the implementation
@@ -84,6 +85,7 @@ const MessagePublishWrapper = struct {
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
     networkId: u32,
+    logger: *const zeam_utils.ZeamLogger,
 };
 
 pub const GenericGossipHandler = struct {
@@ -92,9 +94,10 @@ pub const GenericGossipHandler = struct {
     allocator: Allocator,
     onGossipHandlers: std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
+    logger: *const zeam_utils.ZeamLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32) !Self {
+    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: *const zeam_utils.ZeamLogger) !Self {
         const timer = try xev.Timer.init();
 
         var onGossipHandlers = std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)).init(allocator);
@@ -107,13 +110,14 @@ pub const GenericGossipHandler = struct {
             .timer = timer,
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
+            .logger = logger,
         };
     }
 
     pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
         const topic = data.getTopic();
         const handlerArr = self.onGossipHandlers.get(topic).?;
-        std.debug.print("\n\n\nnetwork-{d}:: ongossip handlerArr {any} for topic {any}\n", .{ self.networkId, handlerArr.items, topic });
+        self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, topic });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -132,8 +136,9 @@ pub const GenericGossipHandler = struct {
                     // return the callflow back and it might dealloc the data before loop and process it
                     .data = cloned_data,
                     .networkId = self.networkId,
+                    .logger = self.logger,
                 };
-                std.debug.print("\n\n\nnetwork-{d}:: schedueling ongossip publishWrapper={any} on loop for topic {any}\n\n", .{ self.networkId, topic, publishWrapper });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, topic, publishWrapper });
 
                 self.timer.run(
                     self.loop,
@@ -150,7 +155,7 @@ pub const GenericGossipHandler = struct {
                         ) xev.CallbackAction {
                             _ = r catch unreachable;
                             if (ud) |pwrap| {
-                                std.debug.print("\n\n\n\nnetwork-{d}:: XXXEEEEEEEVVVVVVV ONGOSSIP PUBLISH \n\n\n ", .{pwrap.networkId});
+                                pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
                                 _ = pwrap.handler.onGossip(pwrap.data) catch void;
                             }
                             // TODO defer freeing the publishwrapper and its data but need handle to the allocator
@@ -161,7 +166,7 @@ pub const GenericGossipHandler = struct {
                 );
             } else {
                 handler.onGossip(data) catch |e| {
-                    std.debug.print("\nnetwork-{d}:: onGossip handler error={any}\n", .{ self.networkId, e });
+                    self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
                 };
             }
         }

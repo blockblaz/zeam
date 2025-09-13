@@ -145,6 +145,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/network/src/lib.zig"),
     });
     zeam_network.addImport("@zeam/types", zeam_types);
+    zeam_network.addImport("@zeam/utils", zeam_utils);
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
@@ -310,6 +311,9 @@ pub fn build(b: *Builder) !void {
     });
     const run_params_tests = b.addRunArtifact(params_tests);
     test_step.dependOn(&run_params_tests.step);
+
+    
+
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
 

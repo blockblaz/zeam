@@ -46,11 +46,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var beam_state = try utils.genGenesisState(allocator, genesis_config);
     const genesis_block = try utils.genGenesisBlock(allocator, beam_state);
 
-    var gen_signature: [48]u8 = undefined;
-    _ = try std.fmt.hexToBytes(gen_signature[0..], utils.ZERO_HASH_48HEX);
     const gen_signed_block = types.SignedBeamBlock{
         .message = genesis_block,
-        .signature = gen_signature,
+        .signature = utils.ZERO_HASH_4000,
     };
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
@@ -84,9 +82,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         var parent_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, prev_block, &parent_root, allocator);
 
-        var state_root: [32]u8 = undefined;
-        _ = try std.fmt.hexToBytes(state_root[0..], utils.ZERO_HASH_HEX);
-        const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
+        const state_root: [32]u8 = utils.ZERO_HASH;
+        // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
         var votes = std.ArrayList(types.SignedVote).init(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
@@ -106,7 +103,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                     // skip val1
 
@@ -119,7 +116,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
@@ -132,7 +129,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
                 for (slotVotes) |slotVote| {
@@ -158,7 +155,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val2
@@ -171,7 +168,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
@@ -184,7 +181,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
                 for (slotVotes) |slotVote| {
@@ -209,7 +206,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** 48,
+                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // skip val1
@@ -229,12 +226,12 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         var block = types.BeamBlock{
             .slot = slot,
-            .proposer_index = 1,
+            .proposer_index = slot % genesis_config.num_validators,
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
-                .execution_payload_header = .{ .timestamp = timestamp },
-                .atttestations = try votes.toOwnedSlice(),
+                // .execution_payload_header = .{ .timestamp = timestamp },
+                .attestations = try votes.toOwnedSlice(),
             },
         };
 
@@ -243,11 +240,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list
-        var signature: [48]u8 = undefined;
-        _ = try std.fmt.hexToBytes(signature[0..], utils.ZERO_HASH_48HEX);
         const signed_block = types.SignedBeamBlock{
             .message = block,
-            .signature = signature,
+            .signature = utils.ZERO_HASH_4000,
         };
         try blockList.append(signed_block);
         try blockRootList.append(block_root);

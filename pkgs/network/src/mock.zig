@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
+const zeam_utils = @import("@zeam/utils");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -11,8 +12,8 @@ pub const Mock = struct {
     gossipHandler: interface.GenericGossipHandler,
     const Self = @This();
 
-    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
-        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, 0) };
+    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: *const zeam_utils.ZeamLogger) !Self {
+        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger) };
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
@@ -63,7 +64,8 @@ test "mock network publish/subscribe" {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var mock_net = try Mock.init(allocator, &loop);
+    var test_logger = zeam_utils.getLogger(null, null);
+    var mock_net = try Mock.init(allocator, &loop, &test_logger);
     const net_if = mock_net.getNetworkInterface();
 
     var received_block = false;
@@ -100,11 +102,10 @@ test "mock network publish/subscribe" {
                 .parent_root = [_]u8{1} ** 32,
                 .state_root = [_]u8{2} ** 32,
                 .body = .{
-                    .execution_payload_header = .{ .timestamp = 123 },
-                    .atttestations = &.{},
+                    .attestations = &.{},
                 },
             },
-            .signature = [_]u8{0} ** 48,
+            .signature = [_]u8{0} ** 40,
         },
     };
 
@@ -115,4 +116,3 @@ test "mock network publish/subscribe" {
 
     try std.testing.expect(received_block == true);
 }
-
