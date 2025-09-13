@@ -169,6 +169,7 @@ pub fn build(b: *Builder) !void {
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
+    build_options.addOption(bool, "enable_sim_tests", b.option(bool, "enable_sim_tests", "Enable slow CLI integration tests") orelse false);
     const build_options_module = build_options.createModule();
 
     // Add the cli executable

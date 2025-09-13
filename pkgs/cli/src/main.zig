@@ -48,6 +48,11 @@ const ZeamArgs = struct {
             mockNetwork: bool = false,
             metricsPort: u16 = 9667,
         },
+        sim: struct {
+            help: bool = false,
+            mockNetwork: bool = true, // Default to true for sim (in-process simulation)
+            metricsPort: u16 = 9667,
+        },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
             zkvm: stateProvingManager.ZKVMs = .risc0,
@@ -91,6 +96,7 @@ const ZeamArgs = struct {
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
             .beam = "Run a full Beam node",
+            .sim = "Run an in-process simulation with single node",
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
         };
@@ -268,6 +274,61 @@ pub fn main() !void {
             try beam_node_2.run();
             try clock.run();
         },
+        .sim => |simcmd| {
+            try metrics.init(allocator);
+
+            // Start metrics HTTP server
+            try metricsServer.startMetricsServer(allocator, simcmd.metricsPort);
+
+            std.debug.print("sim opts ={any}\n", .{simcmd});
+
+            // Always use mock network for sim (in-process simulation)
+            const chain_spec =
+                \\{"preset": "mainnet", "name": "beamdev"}
+            ;
+            const options = json.ParseOptions{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_if_needed,
+            };
+            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
+
+            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
+
+            chain_options.genesis_time = time_now;
+            chain_options.num_validators = num_validators;
+            const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+            const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
+
+            const loop = try allocator.create(xev.Loop);
+            loop.* = try xev.Loop.init(.{});
+
+            // Use all validators for sim (single node simulation)
+            var validator_ids = [_]usize{ 1, 2, 3 };
+            var logger = utilsLib.getScopedLogger(.n1, .debug, null);
+
+            // Single node with mock network for in-process simulation
+            var network: *networks.Mock = try allocator.create(networks.Mock);
+            network.* = try networks.Mock.init(allocator, loop, &logger);
+            const backend = network.getNetworkInterface();
+
+            var clock = try allocator.create(Clock);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+
+            var beam_node = try BeamNode.init(allocator, .{
+                .nodeId = 0,
+                .config = chain_config,
+                .anchorState = anchorState,
+                .backend = backend,
+                .clock = clock,
+                .db = .{},
+                .validator_ids = &validator_ids,
+                .logger = &logger,
+            });
+
+            try beam_node.run();
+            try clock.run();
+        },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
                 const generated_config = try generatePrometheusConfig(allocator, genconfig.metrics_port);
@@ -277,5 +338,15 @@ pub fn main() !void {
                 try config_file.writeAll(generated_config);
             },
         },
+    }
+}
+
+// Import tests
+test {
+    _ = @import("cli_unit_tests.zig");
+
+    // Conditionally import integration tests based on build option
+    if (build_options.enable_sim_tests) {
+        _ = @import("cli_integration_tests.zig");
     }
 }
