@@ -435,14 +435,14 @@ fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void {
         allocator.free(connect_peers);
     }
 
-    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers });
+    var logger = utilsLib.getScopedLogger(.default, options.console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = options.log_file_active_level, .filePath = options.log_filepath, .fileName = options.log_filename });
+
+    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers }, &logger);
     try network.run();
     const backend = network.getNetworkInterface();
 
     var clock = try allocator.create(Clock);
     clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
-
-    var logger = utilsLib.getScopedLogger(.default, options.console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = options.log_file_active_level, .filePath = options.log_filepath, .fileName = options.log_filename });
 
     var beam_node = try BeamNode.init(allocator, .{
         // options
