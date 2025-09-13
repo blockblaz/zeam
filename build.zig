@@ -54,10 +54,16 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("datetime");
 
-    const enr = b.dependency("zig_enr", .{
+    const enr_dep = b.dependency("zig_enr", .{
         .target = target,
         .optimize = optimize,
-    }).module("zig-enr");
+    });
+    const enr = enr_dep.module("zig-enr");
+
+    const multiformats = enr_dep.builder.dependency("zmultiformats", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("multiformats-zig");
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -139,8 +145,10 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/network/src/lib.zig"),
     });
     zeam_network.addImport("@zeam/types", zeam_types);
+    zeam_network.addImport("@zeam/utils", zeam_utils);
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
+    zeam_network.addImport("multiformats", multiformats);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
@@ -185,6 +193,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
     cli_exe.root_module.addImport("metrics", metrics);
+    cli_exe.root_module.addImport("multiformats", multiformats);
 
     addRustGlueLib(b, cli_exe, target);
     cli_exe.linkLibC(); // for rust static libs to link
@@ -286,6 +295,18 @@ pub fn build(b: *Builder) !void {
     });
     const run_params_tests = b.addRunArtifact(params_tests);
     test_step.dependOn(&run_params_tests.step);
+
+    const network_tests = b.addTest(.{
+        .root_module = zeam_network,
+        .optimize = optimize,
+        .target = target,
+    });
+    network_tests.root_module.addImport("@zeam/types", zeam_types);
+    network_tests.root_module.addImport("xev", xev);
+    network_tests.root_module.addImport("ssz", ssz);
+    const run_network_tests = b.addRunArtifact(network_tests);
+    test_step.dependOn(&run_network_tests.step);
+
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
 

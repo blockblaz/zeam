@@ -10,7 +10,14 @@ const debugLog = zeam_utils.zeamLog;
 const params = @import("@zeam/params");
 
 // put the active logs at debug level for now by default
-pub const StateTransitionOpts = struct { logger: *zeam_utils.ZeamLogger };
+pub const StateTransitionOpts = struct {
+    // signatures are validated outside for keeping life simple for the STF prover
+    // we will trust client will validate them however the flag here
+    // represents such dependancy and assumption for STF
+    validSignatures: bool = true,
+    validateResult: bool = true,
+    logger: *zeam_utils.ZeamLogger,
+};
 
 // pub fn process_epoch(state: types.BeamState) void {
 //     // right now nothing to do
@@ -33,14 +40,14 @@ pub fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 }
 
 // prepare the state to be pre state of the slot
-pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot) !void {
+pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: *zeam_utils.ZeamLogger) !void {
+    if (slot <= state.slot) {
+        logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, state.slot });
+        return StateTransitionError.InvalidPreState;
+    }
+
     while (state.slot < slot) {
         try process_slot(allocator, state);
-        // There might not be epoch processing in beam
-        // if ((state.slot + 1) % SLOTS_PER_EPOCH == 0) {
-        //     process_epoch(state);
-        // }
-
         state.slot += 1;
     }
 }
@@ -68,12 +75,27 @@ pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
 
 fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     logger.debug("process block header\n", .{});
-    // very basic process block header
+
+    // 1. match state and block slot
     if (state.slot != block.slot) {
-        logger.err("state slot={} block slot={}", .{ state.slot, block.slot });
+        logger.err("process-block-header: invalid mismatching state-slot={} != block-slot={}", .{ state.slot, block.slot });
         return StateTransitionError.InvalidPreState;
     }
 
+    // 2. match state's latest block header and block slot
+    if (state.latest_block_header.slot >= block.slot) {
+        logger.err("process-block-header: invalid future latest_block_header-slot={} >= block-slot={}", .{ state.latest_block_header.slot, block.slot });
+        return StateTransitionError.InvalidLatestBlockHeader;
+    }
+
+    // 3. check proposer is correct
+    const correct_proposer_index = block.slot % state.config.num_validators;
+    if (block.proposer_index != correct_proposer_index) {
+        logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ block.proposer_index, block.slot, correct_proposer_index });
+        return StateTransitionError.InvalidProposer;
+    }
+
+    // 4. verify latest block header is the parent
     var head_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &head_root, allocator);
     if (!std.mem.eql(u8, &head_root, &block.parent_root)) {
@@ -81,9 +103,39 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
         return StateTransitionError.InvalidParentRoot;
     }
 
+    // update justified and finalized with parent root in state if this is the first block post genesis
+    if (state.latest_block_header.slot == 0) {
+        // fixed  length array structures should just be copied over
+        state.latest_justified.root = block.parent_root;
+        state.latest_finalized.root = block.parent_root;
+    }
+
+    // extend historical block hashes and justified slots structures
+    // can optimize to have a "cached" state where these sttructures are already in consimable format
+    var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
+    var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
+
+    try historical_block_hashes.append(block.parent_root);
+    // if parent is genesis it is already justified
+    try justified_slots.append(if (state.latest_block_header.slot == 0) 1 else 0);
+
+    const block_slot: usize = @intCast(block.slot);
+    const missed_slots: usize = @intCast(block_slot - state.latest_block_header.slot - 1);
+    for (0..missed_slots) |i| {
+        _ = i;
+        try historical_block_hashes.append(utils.ZERO_HASH);
+        try justified_slots.append(0);
+    }
+    logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, justified_slots.items, historical_block_hashes.items });
+
+    // again "cached" state would optimize make this avoidable till the very end of state root calc
+    state.historical_block_hashes = try historical_block_hashes.toOwnedSlice();
+    state.justified_slots = try justified_slots.toOwnedSlice();
+
     state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
 }
 
+// not active in PQ devnet0 - zig will automatically prune this from code
 fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBlock) !void {
     const expected_timestamp = state.genesis_time + block.slot * params.SECONDS_PER_SLOT;
     if (expected_timestamp != block.body.execution_payload_header.timestamp) {
@@ -92,52 +144,42 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
 }
 
 fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+    // 1. process attestations
+    try process_attestations(allocator, state, block.body.attestations, logger);
+}
+
+fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: []types.SignedVote, logger: *zeam_utils.ZeamLogger) !void {
+    logger.debug("\n\n===================\nprocess opetationg slot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ state.slot, state.historical_block_hashes.len, state.justified_slots });
+    logger.debug("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized });
+
     // transform state data into consumable format, generally one would keep a `cached`/consumable
     // copy of state but we will get to that later especially w.r.t. proving
     // prep data
-    logger.debug("\n\n===================\nprocess opetationg blockslot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ block.slot, state.historical_block_hashes.len, state.justified_slots });
-    logger.debug("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized });
-
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
+
     // prep the justifications map
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
-
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
     for (state.justifications_roots) |blockRoot| {
         for (0..num_validators) |i| {
-            try justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]);
+            justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
+                logger.err("Invalid justifications parsing justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
+                    //
+                    state.justifications_validators.len,
+                    num_validators,
+                    i,
+                    i * num_validators,
+                    (i + 1) * num_validators,
+                    e,
+                });
+                return e;
+            };
         }
     }
 
-    // self injected handling to make sure we can still have genesis block at 0
-    // otherwise we need genesis block at 1 because genesis state need to have justified slots
-    // historical hashes set which we can't do with genesis block since it becomes cyclic
-    // dependancy because of block stateroot requirement
-    try historical_block_hashes.append(block.parent_root);
-    if (state.slot == 1) {
-        // parent is genesis
-        try justified_slots.append(1);
-        state.latest_justified.root = block.parent_root;
-        state.latest_finalized.root = block.parent_root;
-    } else {
-        try justified_slots.append(0);
-    }
-
-    const block_slot: usize = @intCast(block.slot);
-    const missed_slots: usize = block_slot - historical_block_hashes.items.len;
-    for (0..missed_slots) |i| {
-        _ = i;
-        try justified_slots.append(0);
-        // we push zero hash instead of none to keep our SSZ structure simple
-        // in applying votes we can eliminate this issue by having source/target to be non zerohash
-        // because genesis is always justified and finalized
-        try historical_block_hashes.append(utils.ZERO_HASH);
-    }
-    logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}\n-----\n", .{ missed_slots, justified_slots.items, historical_block_hashes.items });
-
-    for (block.body.atttestations) |signed_vote| {
+    for (attestations) |signed_vote| {
         const validator_id: usize = @intCast(signed_vote.validator_id);
         const vote = signed_vote.message;
         // check if vote is sane
@@ -250,13 +292,14 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // start block processing
     try process_block_header(allocator, state, block, logger);
-    try process_execution_payload_header(state, block);
+    // PQ devner-0 has no execution
+    // try process_execution_payload_header(state, block);
     try process_operations(allocator, state, block, logger);
 }
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
-    try process_slots(allocator, state, block.slot);
+    try process_slots(allocator, state, block.slot, logger);
 
     // process block and modify the pre state to post state
     try process_block(allocator, state, block.*, logger);
@@ -277,36 +320,29 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock, opts: StateTransitionOpts) !void {
     const logger = opts.logger;
     const block = signedBlock.message;
-    logger.info("apply transition stateslot={d} blockslot={d}\n", .{ state.slot, block.slot });
+    logger.debug("applying  state transition state-slot={d} block-slot={d}\n", .{ state.slot, block.slot });
 
-    if (block.slot <= state.slot) {
-        logger.debug("slots are invalid for block {any}: {} >= {}\n", .{ block, block.slot, state.slot });
-        return StateTransitionError.InvalidPreState;
+    // client is supposed to call verify_signatures outside STF to make STF prover friendly
+    const validSignatures = opts.validSignatures;
+    if (!validSignatures) {
+        return StateTransitionError.InvalidBlockSignatures;
     }
 
-    // verify the proposer and attestation signatures on signed block
-    try verify_signatures(signedBlock);
-
     // prepare the pre state for this block slot
-    try process_slots(allocator, state, block.slot);
-
+    try process_slots(allocator, state, block.slot, logger);
     // process the block
     try process_block(allocator, state, block, logger);
 
-    // verify the post state root
-    var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
-    if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-        logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
-        return StateTransitionError.InvalidPostState;
+    const validateResult = opts.validateResult;
+    if (validateResult) {
+        // verify the post state root
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+        if (!std.mem.eql(u8, &state_root, &block.state_root)) {
+            logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
+            return StateTransitionError.InvalidPostState;
+        }
     }
 }
 
-pub const StateTransitionError = error{
-    InvalidParentRoot,
-    InvalidPreState,
-    InvalidPostState,
-    InvalidExecutionPayloadHeaderTimestamp,
-    InvalidJustifiableSlot,
-    InvalidValidatorId,
-};
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer };
