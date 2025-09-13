@@ -109,6 +109,7 @@ pub const BeamChain = struct {
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
         var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
 
+        // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
         var block = types.BeamBlock{
