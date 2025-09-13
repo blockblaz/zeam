@@ -76,7 +76,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     try headList.append(.{ .root = block_root, .slot = head_idx });
 
     // TODO: pass logger as genmockchain arg with scope set
-    var logger = zeam_utils.getLogger(.info, null);
+    var logger = zeam_utils.getTestLogger();
 
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;

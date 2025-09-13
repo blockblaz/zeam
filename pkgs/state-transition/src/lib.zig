@@ -44,7 +44,7 @@ test "apply transition on mocked chain" {
     const mock_chain = try genMockChain(allocator, 5, test_config);
     try std.testing.expect(mock_chain.blocks.len == 5);
 
-    var logger = zeam_utils.getLogger(.info, null);
+    var logger = zeam_utils.getTestLogger();
 
     // starting beam state
     var beam_state = mock_chain.genesis_state;
@@ -74,7 +74,7 @@ test "genStateBlockHeader" {
     const allocator = arena_allocator.allocator();
 
     const mock_chain = try genMockChain(allocator, 2, test_config);
-    var logger = zeam_utils.getLogger(.info, null);
+    var logger = zeam_utils.getTestLogger();
 
     var beam_state = mock_chain.genesis_state;
     for (0..mock_chain.blocks.len) |i| {
