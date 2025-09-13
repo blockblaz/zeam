@@ -278,6 +278,22 @@ pub fn build(b: *Builder) !void {
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
+    const network_tests = b.addTest(.{
+        .root_module = zeam_network,
+        .optimize = optimize,
+        .target = target,
+    });
+    network_tests.root_module.addImport("@zeam/types", zeam_types);
+    network_tests.root_module.addImport("xev", xev);
+    network_tests.root_module.addImport("ssz", ssz);
+    network_tests.root_module.addImport("multiformats", multiformats);
+    const run_network_test = b.addRunArtifact(network_tests);
+    addRustGlueLib(b, network_tests, target);
+    network_tests.linkLibC();
+    network_tests.linkSystemLibrary("pthread");
+    network_tests.linkSystemLibrary("unwind");
+    test_step.dependOn(&run_network_test.step);
+
     const cli_tests = b.addTest(.{
         .root_module = cli_exe.root_module,
         .optimize = optimize,

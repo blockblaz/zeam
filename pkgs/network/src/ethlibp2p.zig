@@ -15,7 +15,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         0 => interface.GossipTopic.block,
         1 => interface.GossipTopic.vote,
         else => {
-            std.debug.print("\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge !!!!\n", .{topic_id});
+            std.debug.print("\\n!!!! Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge \\!\\!\\!\\n", .{topic_id});
             return;
         },
     };
@@ -25,7 +25,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
-                std.debug.print("!!!! Error in deserializing the signed block message e={any} !!!!\n", .{e});
+                std.debug.print("\\n!!!! Error in deserializing the signed block message e={any} \\!\\!\\!\\n", .{e});
                 return;
             };
 
@@ -34,18 +34,18 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_id: u32, message
         .vote => votemessage: {
             var message_data: types.SignedVote = undefined;
             ssz.deserialize(types.SignedVote, message_bytes, &message_data, zigHandler.allocator) catch |e| {
-                std.debug.print("!!!! Error in deserializing the signed vote message e={any} !!!!\n", .{e});
+                std.debug.print("\\n!!!! Error in deserializing the signed vote message e={any} \\!\\!\\!\\n", .{e});
                 return;
             };
             break :votemessage .{ .vote = message_data };
         },
     };
 
-    std.debug.print("\nnetwork-{d}:: !!!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, topic, message, message_bytes });
+    std.debug.print("\\nnetwork-{d}:: \\!\\!\\!handleMsgFromRustBridge topic={any}:: message={any} from bytes={any} \\n", .{ zigHandler.params.networkId, topic, message, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
-        std.debug.print("!!!! onGossip handling of message failed with error e={any} !!!!\n", .{e});
+        std.debug.print("!!!! onGossip handling of message failed with error e={any} \\!\\!\\!\\n", .{e});
     };
 }
 
@@ -119,7 +119,7 @@ pub const EthLibp2p = struct {
                 break :votebytes serialized.items;
             },
         };
-        std.debug.print("\n\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\n\n", .{ self.params.networkId, message, data });
+        std.debug.print("\\n\\nnetwork-{d}:: calling publish_msg_to_rust_bridge with byes={any} for data={any}\\n\\n", .{ self.params.networkId, message, data });
         publish_msg_to_rust_bridge(self.params.networkId, topic_id, message.ptr, message.len);
     }
 
@@ -182,3 +182,31 @@ pub const EthLibp2p = struct {
         return result;
     }
 };
+
+test "multiaddrsToString" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Test for Empty list
+    const empty_addrs = &[_]Multiaddr{};
+    const empty_str = try EthLibp2p.multiaddrsToString(allocator, empty_addrs);
+    defer allocator.free(empty_str);
+    try std.testing.expectEqualStrings("", empty_str);
+
+    // Test for Single address
+    var addr1 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9000");
+    defer addr1.deinit();
+    const single_addr = &[_]Multiaddr{addr1};
+    const single_str = try EthLibp2p.multiaddrsToString(allocator, single_addr);
+    defer allocator.free(single_str);
+    try std.testing.expectEqualStrings("/ip4/127.0.0.1/tcp/9000", single_str);
+
+    // Test for Multiple addresses
+    var addr2 = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001");
+    defer addr2.deinit();
+    const multi_addrs = &[_]Multiaddr{ addr1, addr2 };
+    const multi_str = try EthLibp2p.multiaddrsToString(allocator, multi_addrs);
+    defer allocator.free(multi_str);
+    try std.testing.expectEqualStrings("/ip4/127.0.0.1/tcp/9000,/ip4/0.0.0.0/tcp/9001", multi_str);
+}

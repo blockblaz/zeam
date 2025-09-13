@@ -54,3 +54,65 @@ pub const Mock = struct {
         } };
     }
 };
+
+test "mock network publish/subscribe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var mock_net = try Mock.init(allocator, &loop);
+    const net_if = mock_net.getNetworkInterface();
+
+    var received_block = false;
+    const TestContext = struct {
+        received_block: *bool,
+    };
+    var test_ctx = TestContext{ .received_block = &received_block };
+
+    const on_gossip = struct {
+        fn callback(ptr: *anyopaque, data: *const interface.GossipMessage) !void {
+            const ctx: *TestContext = @ptrCast(@alignCast(ptr));
+            if (data.* == .block) {
+                ctx.received_block.* = true;
+            }
+        }
+    }.callback;
+
+    const handler = interface.OnGossipCbHandler{
+        .ptr = &test_ctx,
+        .onGossipCb = on_gossip,
+    };
+
+    var topics_array = [_]interface.GossipTopic{.block};
+    var start: usize = 0;
+    _ = &start;
+    const topics_slice = topics_array[start..];
+    try net_if.gossip.subscribe(topics_slice, handler);
+
+    const block_msg = interface.GossipMessage{
+        .block = .{
+            .message = .{
+                .slot = 1,
+                .proposer_index = 1,
+                .parent_root = [_]u8{1} ** 32,
+                .state_root = [_]u8{2} ** 32,
+                .body = .{
+                    .execution_payload_header = .{ .timestamp = 123 },
+                    .atttestations = &.{},
+                },
+            },
+            .signature = [_]u8{0} ** 48,
+        },
+    };
+
+    try net_if.gossip.publish(&block_msg);
+
+    // Run the event loop once to process the scheduled gossip event
+    try loop.run(.once);
+
+    try std.testing.expect(received_block == true);
+}
+
