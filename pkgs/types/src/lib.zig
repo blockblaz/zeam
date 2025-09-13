@@ -19,7 +19,7 @@ pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
 pub const RootHex = [64]u8;
 
-// TODO: moved them into params
+// TODO: move them into params
 pub const MAX_VALIDATORS = 4096;
 pub const HISTORICAL_ROOTS_LIMIT = 262_144;
 
