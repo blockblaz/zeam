@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::runtime::Builder;
 
+use std::ffi::CString;
+
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 // TODO: protect the access by mutex
@@ -62,12 +64,14 @@ pub unsafe fn create_and_run_network(
 }
 
 /// # Safety
+///
 /// The caller must ensure that `message_str` points to valid memory of `message_len` bytes.
+/// The caller must ensure that `topic` points to valid null-terminated C string.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn publish_msg_to_rust_bridge(
     network_id: u32,
-    topic_id: u32,
+    topic: *const c_char,
     message_str: *const u8,
     message_len: usize,
 ) {
@@ -78,15 +82,15 @@ pub unsafe fn publish_msg_to_rust_bridge(
     );
     let message_data = message_slice.to_vec();
 
-    // TODO: get the topic mapping from topic_id
-    let topic = match topic_id {
-        0 => gossipsub::IdentTopic::new("block"),
-        1 => gossipsub::IdentTopic::new("vote"),
-        unknown_id => {
-            println!("Invalid topic_id: {unknown_id}");
-            return;
-        }
-    };
+    if topic.is_null() {
+        eprintln!("Error: null pointer passed for `topic` in publish_msg_to_rust_bridge");
+        return;
+    }
+
+    let topic = std::ffi::CStr::from_ptr(topic)
+        .to_string_lossy()
+        .to_string();
+    let topic = gossipsub::IdentTopic::new(topic);
 
     #[allow(static_mut_refs)]
     let swarm = if network_id < 1 {
@@ -107,7 +111,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
 extern "C" {
     fn handleMsgFromRustBridge(
         zig_handler: u64,
-        topic_id: u32,
+        topic: *const c_char,
         message_ptr: *const u8,
         message_len: usize,
     );
@@ -197,37 +201,29 @@ impl Network {
                     message,
                     ..
                 })) => {
-                    {
-                        let topic = message.topic.as_str();
-                        let topic_id: u32 = match topic {
-                            "block" => 0,
-                            "vote" => 1,
-                            unknown_topic => {
-                                println!(
-                                    "\nrustbridge{0}:: unknown_topic={unknown_topic}\n",
-                                    self.network_id
-                                );
-                                // Will return here return from event loop or return from the match poll to go
-                                // for next iteration of loop
-                                return;
-                            }
-                        };
+                    let topic = message.topic.as_str();
+                    let topic = match CString::new(topic) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            eprintln!(
+                                "rustbridge{}:: invalid_topic_string={}",
+                                self.network_id, topic
+                            );
+                            return;
+                        }
+                    };
+                    let topic = topic.as_ptr();
 
-                        let message_ptr = message.data.as_ptr();
-                        let message_len = message.data.len();
-                        unsafe {
-                            handleMsgFromRustBridge(
-                                self.zig_handler,
-                                topic_id,
-                                message_ptr,
-                                message_len,
-                            )
-                        };
-                        println!(
-                            "\nrustbridge{0}:: zig callback completed\n",
-                            self.network_id
-                        );
-                    }
+                    let message_ptr = message.data.as_ptr();
+                    let message_len = message.data.len();
+
+                    unsafe {
+                        handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
+                    };
+                    println!(
+                        "\nrustbridge{0}:: zig callback completed\n",
+                        self.network_id
+                    );
                 }
                 e => println!("{e:?}"),
             }
