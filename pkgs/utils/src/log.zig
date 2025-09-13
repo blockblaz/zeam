@@ -65,7 +65,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
 
         // Write to file with colors (same format as stderr)
         if (fileLogParams != null and @intFromEnum(fileLogParams.?.fileActiveLevel) >= @intFromEnum(level)) {
-            if (!fileLogParams.?.fileColors) {
+            if (fileLogParams.?.noFileColors) {
                 print_str = std.fmt.bufPrint(
                     buf[0..],
                     "{s} {s}" ++ fmt ++ "\n",
@@ -74,22 +74,22 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             }
 
             nosuspend fileLogParams.?.file.writeAll(print_str) catch |err| {
-                // Error message with colors
+                // Error message
                 stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err }) catch {};
             };
         }
 
-        if (fileLogParams == null and builtin.target.os.tag != .freestanding) {
-            // Error message for missing file params with colors
-            nosuspend stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file (no file params)\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color }) catch {};
-        }
+        // if (fileLogParams == null and builtin.target.os.tag != .freestanding) {
+        //     // Error message for missing file params
+        //     nosuspend stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file (no file params)\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color }) catch {};
+        // }
     }
 }
 
 pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams) void {
     // Convert FileParams to FileLogParams - only create if file exists
     const fileLogParams: ?FileLogParams = if ((fileParams != null) and (fileParams.?.file != null))
-        FileLogParams{ .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel, .file = fileParams.?.file.?, .fileColors = fileParams.?.fileBehaviour.fileColors }
+        FileLogParams{ .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel, .file = fileParams.?.file.?, .noFileColors = fileParams.?.fileBehaviour.noFileColors }
     else
         null;
 
@@ -111,14 +111,14 @@ const LoggerScope = enum {
 pub const FileLogParams = struct {
     fileActiveLevel: std.log.Level,
     file: std.fs.File,
-    fileColors: bool,
+    noFileColors: bool,
 };
 
 pub const FileBehaviourParams = struct {
     fileActiveLevel: std.log.Level = .debug,
     filePath: []const u8,
     fileName: []const u8,
-    fileColors: bool = true,
+    noFileColors: bool = false,
 };
 
 pub const FileParams = struct {
@@ -132,21 +132,25 @@ pub const DEFAULT_FILE_BEHAVIOUR = FileBehaviourParams{
     .fileActiveLevel = .debug,
     .filePath = "./log",
     .fileName = "consensus",
-    .fileColors = true,
+    .noFileColors = false,
 };
 
 pub const ZeamLogger = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
     fileParams: ?FileParams,
+    testLogger: bool,
 
     const Self = @This();
-    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileBehaviourParams: ?FileBehaviourParams) Self {
+    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileBehaviourParams: ?FileBehaviourParams, testLogger: bool) Self {
         var effective_params = fileBehaviourParams;
         if (builtin.target.os.tag == .freestanding) {
             effective_params = null;
-        } else if (fileBehaviourParams == null) {
+        } else if ((fileBehaviourParams == null) and (!testLogger)) {
             effective_params = DEFAULT_FILE_BEHAVIOUR;
+        }
+        if (testLogger) {
+            effective_params = null;
         }
 
         const fileParams: ?FileParams = if (effective_params) |params| blk: {
@@ -162,6 +166,7 @@ pub const ZeamLogger = struct {
             .scope = scope,
             .activeLevel = activeLevel,
             .fileParams = fileParams,
+            .testLogger = testLogger,
         };
     }
 
@@ -287,11 +292,18 @@ pub const ZeamLogger = struct {
 
 // Must write to file, If no file options are passed DEFAULT_FILE_BEHAVIOUR is used
 pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
+    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams, false);
 }
 
 pub fn getLogger(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
+    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams, false);
+}
+
+// pub fn getTestLogger(activeLevel: ?std.log.Level) ZeamLogger {
+//     return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, null, true);
+// }
+pub fn getTestLogger() ZeamLogger {
+    return ZeamLogger.init(.default, .debug, null, true);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
