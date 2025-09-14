@@ -174,7 +174,7 @@ pub const BeamChain = struct {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
-        const fcHead = self.forkChoice.updateHead() catch |err| {
+        const fc_head = self.forkChoice.updateHead() catch |err| {
             self.logger.err("forkchoice updatehead error={any}", .{err});
             return;
         };
@@ -184,8 +184,8 @@ pub const BeamChain = struct {
         const finalized = self.forkChoice.fcStore.latest_finalized;
 
         // Calculate chain progress
-        const blocksBehind = if (slot > fcHead.slot) slot - fcHead.slot else 0;
-        const isTimely = fcHead.timeliness;
+        const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
+        const is_timely = fc_head.timeliness;
 
         self.logger.info(
             \\+===============================================================+
@@ -203,12 +203,12 @@ pub const BeamChain = struct {
             \\+===============================================================+
         , .{
             slot,
-            fcHead.slot,
-            blocksBehind,
-            std.fmt.fmtSliceHexLower(&fcHead.blockRoot),
-            std.fmt.fmtSliceHexLower(&fcHead.parentRoot),
-            std.fmt.fmtSliceHexLower(&fcHead.stateRoot),
-            if (isTimely) "YES" else "NO",
+            fc_head.slot,
+            blocks_behind,
+            std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
+            std.fmt.fmtSliceHexLower(&fc_head.parentRoot),
+            std.fmt.fmtSliceHexLower(&fc_head.stateRoot),
+            if (is_timely) "YES" else "NO",
             justified.slot,
             std.fmt.fmtSliceHexLower(&justified.root),
             finalized.slot,
