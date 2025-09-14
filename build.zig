@@ -77,6 +77,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/utils/src/lib.zig"),
     });
     zeam_utils.addImport("datetime", datetime);
+    zeam_utils.addImport("yaml", yaml);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -103,8 +104,7 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/utils", zeam_utils);
     zeam_configs.addImport("@zeam/types", zeam_types);
     zeam_configs.addImport("@zeam/params", zeam_params);
-    zeam_configs.addImport("yaml", yaml);
-
+ 
     // add zeam-metrics
     const zeam_metrics = b.addModule("@zeam/metrics", .{
         .root_source_file = b.path("pkgs/metrics/src/lib.zig"),

@@ -353,13 +353,13 @@ fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void {
     // TODO: support genesis file loading when ssz library supports it
     _ = genesis_filepath;
 
-    var parsed_bootnodes = try configs.loadFromYAMLFile(allocator, bootnodes_filepath);
+    var parsed_bootnodes = try utilsLib.loadFromYAMLFile(allocator, bootnodes_filepath);
     defer parsed_bootnodes.deinit(allocator);
 
-    var parsed_config = try configs.loadFromYAMLFile(allocator, config_filepath);
+    var parsed_config = try utilsLib.loadFromYAMLFile(allocator, config_filepath);
     defer parsed_config.deinit(allocator);
 
-    var parsed_validators = try configs.loadFromYAMLFile(allocator, validators_filepath);
+    var parsed_validators = try utilsLib.loadFromYAMLFile(allocator, validators_filepath);
     defer parsed_validators.deinit(allocator);
 
     const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
@@ -486,13 +486,13 @@ fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validato
 }
 
 test "config yaml parsing" {
-    var config1 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
+    var config1 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
     defer config1.deinit(std.testing.allocator);
     const genesis_spec = try genesisConfigFromYAML(config1);
     try std.testing.expectEqual(9, genesis_spec.num_validators);
     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
 
-    var config2 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
+    var config2 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
     defer config2.deinit(std.testing.allocator);
     const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, 0, config2);
     defer std.testing.allocator.free(validator_indices);
@@ -501,7 +501,7 @@ test "config yaml parsing" {
     try std.testing.expectEqual(4, validator_indices[1]);
     try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try configs.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
+    var config3 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
     defer config3.deinit(std.testing.allocator);
     const nodes = try nodesFromYAML(std.testing.allocator, config3);
     defer std.testing.allocator.free(nodes);
