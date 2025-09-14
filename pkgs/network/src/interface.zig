@@ -47,7 +47,20 @@ pub const OnGossipCbHandler = struct {
 pub const GossipTopic = enum {
     block,
     vote,
+
+    pub fn parseTopic(topic_str: [*:0]const u8) ?GossipTopic {
+        const topic: []const u8 = std.mem.span(topic_str);
+
+        for (std.enums.values(GossipTopic)) |variant| {
+            if (std.mem.eql(u8, topic, @ptrCast(@tagName(variant)))) {
+                return variant;
+            }
+        }
+
+        return null;
+    }
 };
+
 pub const GossipMessage = union(GossipTopic) {
     block: types.SignedBeamBlock,
     vote: types.SignedVote,

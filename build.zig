@@ -21,6 +21,7 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
     if (target.result.os.tag == .macos) {
         comp.linkFramework("CoreFoundation");
         comp.linkFramework("SystemConfiguration");
+        comp.linkFramework("Security");
     }
 }
 
