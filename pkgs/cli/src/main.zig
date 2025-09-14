@@ -355,13 +355,13 @@ pub fn main() !void {
 }
 
 test "config yaml parsing" {
-    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
+    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/config.yaml");
     defer config1.deinit(std.testing.allocator);
     const genesis_spec = try configs.genesisConfigFromYAML(config1);
     try std.testing.expectEqual(9, genesis_spec.num_validators);
     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
 
-    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
+    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/validators.yaml");
     defer config2.deinit(std.testing.allocator);
     const validator_indices = try node.validatorIndicesFromYAML(std.testing.allocator, 0, config2);
     defer std.testing.allocator.free(validator_indices);
@@ -370,7 +370,7 @@ test "config yaml parsing" {
     try std.testing.expectEqual(4, validator_indices[1]);
     try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
+    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/nodes.yaml");
     defer config3.deinit(std.testing.allocator);
     const nodes = try node.nodesFromYAML(std.testing.allocator, config3);
     defer std.testing.allocator.free(nodes);
