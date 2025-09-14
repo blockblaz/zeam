@@ -93,10 +93,7 @@ const ZeamArgs = struct {
         },
         node: struct {
             help: bool = false,
-            config_filepath: []const u8 = "./config.yaml",
-            bootnodes_filepath: []const u8 = "./nodes.yaml",
-            validators_filepath: []const u8 = "./validators.yaml",
-            genesis_filepath: ?[]const u8,
+            custom_genesis: []const u8,
             node_id: u32 = 0,
             metrics_enable: bool = false,
             metrics_port: u16 = 9667,
@@ -106,10 +103,7 @@ const ZeamArgs = struct {
             };
 
             pub const __messages__ = .{
-                .config_filepath = "Path to the config yaml file",
-                .bootnodes_filepath = "Path to the bootnodes yaml file",
-                .validators_filepath = "Path to the validators yaml file",
-                .genesis_filepath = "Path to the genesis state file",
+                .custom_genesis = "Custom genesis directory path",
                 .node_id = "Node id for this lean node",
                 .metrics_port = "Port to use for publishing metrics",
                 .metrics_enable = "Enable metrics endpoint",
@@ -307,12 +301,24 @@ pub fn main() !void {
             },
         },
         .node => |leancmd| {
-            const config_filepath = leancmd.config_filepath;
-            const bootnodes_filepath = leancmd.bootnodes_filepath;
-            const validators_filepath = leancmd.validators_filepath;
-            const genesis_filepath = leancmd.genesis_filepath;
+            const custom_genesis = leancmd.custom_genesis;
+            if (std.fs.path.isAbsolute(custom_genesis)) {
+                var dir = try std.fs.openDirAbsolute(custom_genesis, .{});
+                defer dir.close();
+            } else {
+                var dir = try std.fs.cwd().openDir(custom_genesis, .{});
+                defer dir.close();
+            }
+
+            const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/config.yaml" });
+            defer allocator.free(config_filepath);
+            const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/nodes.yaml" });
+            defer allocator.free(bootnodes_filepath);
+            const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/validators.yaml" });
+            defer allocator.free(validators_filepath);
             // TODO: support genesis file loading when ssz library supports it
-            _ = genesis_filepath;
+            // const genesis_filepath = try std.mem.concat(allocator, &[_][]const u8{custom_genesis, "/genesis.ssz"});
+            // defer allocator.free(genesis_filepath);
 
             var parsed_bootnodes = try utils_lib.loadFromYAMLFile(allocator, bootnodes_filepath);
             defer parsed_bootnodes.deinit(allocator);

@@ -42,7 +42,7 @@ pub const ChainConfig = struct {
 };
 
 const ChainConfigError = error{
-InvalidChainSpec,
+    InvalidChainSpec,
 };
 
 pub fn genesisConfigFromYAML(config: Yaml) !types.GenesisSpec {
