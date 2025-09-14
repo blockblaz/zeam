@@ -141,7 +141,7 @@ impl Network {
         connect_addresses: Vec<Multiaddr>,
     ) {
         let mut swarm = new_swarm();
-        println!("starting listner");
+        println!("starting listener");
 
         for mut addr in listen_addresses {
             strip_peer_id(&mut addr);
