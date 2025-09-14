@@ -5,10 +5,10 @@ const build_options = @import("build_options");
 const simargs = @import("simargs");
 
 const types = @import("@zeam/types");
-const nodeLib = @import("@zeam/node");
-const Clock = nodeLib.Clock;
-const stateProvingManager = @import("@zeam/state-proving-manager");
-const BeamNode = nodeLib.BeamNode;
+const node_lib = @import("@zeam/node");
+const Clock = node_lib.Clock;
+const state_proving_manager = @import("@zeam/state-proving-manager");
+const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
@@ -17,11 +17,11 @@ const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
 
-const utilsLib = @import("@zeam/utils");
+const utils_lib = @import("@zeam/utils");
 
-const sftFactory = @import("@zeam/state-transition");
+const sft_factory = @import("@zeam/state-transition");
 const metrics = @import("@zeam/metrics");
-const metricsServer = @import("metrics_server.zig");
+const metrics_server = @import("metrics_server.zig");
 
 const networks = @import("@zeam/network");
 
@@ -29,8 +29,7 @@ const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusCon
 const yaml = @import("yaml");
 const enr = @import("enr");
 const ENR = enr.ENR;
-
-const prefix = "zeam_";
+const node = @import("node.zig");
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
@@ -55,7 +54,7 @@ const ZeamArgs = struct {
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
-            zkvm: stateProvingManager.ZKVMs = .risc0,
+            zkvm: state_proving_manager.ZKVMs = .risc0,
             help: bool = false,
 
             pub const __shorts__ = .{
@@ -92,7 +91,7 @@ const ZeamArgs = struct {
                 };
             },
         },
-        lean_node: struct {
+        node: struct {
             help: bool = false,
             config_filepath: []const u8 = "./config.yaml",
             bootnodes_filepath: []const u8 = "./nodes.yaml",
@@ -122,7 +121,7 @@ const ZeamArgs = struct {
             .beam = "Run a full Beam node",
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
-            .lean_node = "Run a lean node",
+            .node = "Run a lean node",
         };
     },
 
@@ -167,9 +166,9 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            var logger = utilsLib.getLogger(null, null);
+            var logger = utils_lib.getLogger(null, null);
 
-            const options = stateProvingManager.ZKStateTransitionOpts{
+            const options = state_proving_manager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
@@ -182,26 +181,26 @@ pub fn main() !void {
                 .genesis_time = genesis,
                 .num_validators = num_validators,
             };
-            const mock_chain = try sftFactory.genMockChain(allocator, 5, mock_config);
+            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config);
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |block| {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
-                const proof = try stateProvingManager.prove_transition(beam_state, block, options, allocator);
+                const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sftFactory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
 
                 // verify the block
-                try stateProvingManager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
+                try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
             }
         },
         .beam => |beamcmd| {
             try metrics.init(allocator);
 
             // Start metrics HTTP server
-            try metricsServer.startMetricsServer(allocator, beamcmd.metricsPort);
+            try metrics_server.startMetricsServer(allocator, beamcmd.metricsPort);
 
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
@@ -223,7 +222,7 @@ pub fn main() !void {
             chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
+            const anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
             // in the order to which they have been added even with the an appropriate delay added
@@ -232,8 +231,8 @@ pub fn main() !void {
             loop.* = try xev.Loop.init(.{});
 
             // Create loggers first so they can be passed to network implementations
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger1 = utils_lib.getScopedLogger(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var logger2 = utils_lib.getScopedLogger(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
@@ -307,203 +306,67 @@ pub fn main() !void {
                 try config_file.writeAll(generated_config);
             },
         },
-        .lean_node => |leancmd| {
-            const start_options = StartNodeOptions{
+        .node => |leancmd| {
+            const config_filepath = leancmd.config_filepath;
+            const bootnodes_filepath = leancmd.bootnodes_filepath;
+            const validators_filepath = leancmd.validators_filepath;
+            const genesis_filepath = leancmd.genesis_filepath;
+            // TODO: support genesis file loading when ssz library supports it
+            _ = genesis_filepath;
+
+            var parsed_bootnodes = try utils_lib.loadFromYAMLFile(allocator, bootnodes_filepath);
+            defer parsed_bootnodes.deinit(allocator);
+
+            var parsed_config = try utils_lib.loadFromYAMLFile(allocator, config_filepath);
+            defer parsed_config.deinit(allocator);
+
+            var parsed_validators = try utils_lib.loadFromYAMLFile(allocator, validators_filepath);
+            defer parsed_validators.deinit(allocator);
+
+            const bootnodes = try node.nodesFromYAML(allocator, parsed_bootnodes);
+            defer allocator.free(bootnodes);
+
+            const genesis_spec = try configs.genesisConfigFromYAML(parsed_config);
+
+            const validator_indices = try node.validatorIndicesFromYAML(allocator, leancmd.node_id, parsed_validators);
+            defer allocator.free(validator_indices);
+
+            var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+
+            const start_options = node.StartNodeOptions{
                 .node_id = leancmd.node_id,
-                .config_filepath = leancmd.config_filepath,
-                .bootnodes_filepath = leancmd.bootnodes_filepath,
-                .validators_filepath = leancmd.validators_filepath,
-                .genesis_filepath = leancmd.genesis_filepath,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
-                .log_filename = log_filename,
-                .log_filepath = log_filepath,
-                .log_file_active_level = log_file_active_level,
-                .console_log_level = console_log_level,
+                .bootnodes = bootnodes,
+                .genesis_spec = genesis_spec,
+                .validator_indices = validator_indices,
+                .logger = &logger,
             };
 
-            try startNode(allocator, start_options);
+            try node.startNode(allocator, start_options);
         },
     }
 }
 
-const StartNodeOptions = struct {
-    node_id: u32,
-    config_filepath: []const u8,
-    bootnodes_filepath: []const u8,
-    validators_filepath: []const u8,
-    genesis_filepath: ?[]const u8,
-    metrics_enable: bool,
-    metrics_port: u16,
-    log_filename: []const u8,
-    log_filepath: []const u8,
-    log_file_active_level: std.log.Level,
-    console_log_level: std.log.Level,
-};
-
-fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void {
-    // Freeing the global secp256k1 context at the end of the program
-    defer enr.deinitGlobalSecp256k1Ctx();
-
-    const node_id = options.node_id;
-    const config_filepath = options.config_filepath;
-    const bootnodes_filepath = options.bootnodes_filepath;
-    const validators_filepath = options.validators_filepath;
-    const genesis_filepath = options.genesis_filepath;
-    // TODO: support genesis file loading when ssz library supports it
-    _ = genesis_filepath;
-
-    var parsed_bootnodes = try utilsLib.loadFromYAMLFile(allocator, bootnodes_filepath);
-    defer parsed_bootnodes.deinit(allocator);
-
-    var parsed_config = try utilsLib.loadFromYAMLFile(allocator, config_filepath);
-    defer parsed_config.deinit(allocator);
-
-    var parsed_validators = try utilsLib.loadFromYAMLFile(allocator, validators_filepath);
-    defer parsed_validators.deinit(allocator);
-
-    const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
-    defer allocator.free(bootnodes);
-
-    const genesis_spec = try genesisConfigFromYAML(parsed_config);
-
-    const validator_indices = try validatorIndicesFromYAML(allocator, node_id, parsed_validators);
-    defer allocator.free(validator_indices);
-
-    if (options.metrics_enable) {
-        try metrics.init(allocator);
-        try metricsServer.startMetricsServer(allocator, options.metrics_port);
-    }
-
-    // some base mainnet spec would be loaded to build this up
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev"}
-    ;
-    const json_options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    };
-    var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
-
-    chain_options.genesis_time = genesis_spec.genesis_time;
-    chain_options.num_validators = genesis_spec.num_validators;
-    const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-    const anchorState = try sftFactory.genGenesisState(allocator, chain_config.genesis);
-
-    // TODO we seem to be needing one loop because then the events added to loop are not being fired
-    // in the order to which they have been added even with the an appropriate delay added
-    // behavior of this further needs to be investigated but for now we will share the same loop
-    const loop = try allocator.create(xev.Loop);
-    loop.* = try xev.Loop.init(.{});
-
-    const self_node_index = validator_indices[0];
-    var network = try allocator.create(networks.EthLibp2p);
-    var node_enr: ENR = undefined;
-    defer node_enr.deinit();
-    try ENR.decodeTxtInto(&node_enr, bootnodes[self_node_index]);
-
-    // Overriding the IP to 0.0.0.0 to listen on all interfaces
-    try node_enr.kvs.put("ip", "\x00\x00\x00\x00");
-
-    var node_multiaddrs = try node_enr.multiaddrP2PQUIC(allocator);
-    defer node_multiaddrs.deinit(allocator);
-    const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
-    // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
-    defer {
-        for (listen_addresses) |addr| addr.deinit();
-        allocator.free(listen_addresses);
-    }
-
-    var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
-    defer connect_peer_list.deinit(allocator);
-
-    for (bootnodes, 0..) |n, i| {
-        if (i != self_node_index) {
-            var n_enr: ENR = undefined;
-            try ENR.decodeTxtInto(&n_enr, n);
-            var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(allocator);
-            defer peer_multiaddr_list.deinit(allocator);
-            const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(allocator);
-            defer allocator.free(peer_multiaddrs);
-            try connect_peer_list.appendSlice(allocator, peer_multiaddrs);
-        }
-    }
-
-    const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
-    defer {
-        for (connect_peers) |addr| addr.deinit();
-        allocator.free(connect_peers);
-    }
-
-    var logger = utilsLib.getScopedLogger(.default, options.console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = options.log_file_active_level, .filePath = options.log_filepath, .fileName = options.log_filename });
-
-    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers }, &logger);
-    try network.run();
-    const backend = network.getNetworkInterface();
-
-    var clock = try allocator.create(Clock);
-    clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
-
-    var beam_node = try BeamNode.init(allocator, .{
-        // options
-        .nodeId = node_id,
-        .config = chain_config,
-        .anchorState = anchorState,
-        .backend = backend,
-        .clock = clock,
-        .db = .{},
-        .validator_ids = validator_indices,
-        .logger = &logger,
-    });
-
-    try beam_node.run();
-    std.debug.print("Lean node {d} listened on {?d}\n", .{ node_id, try node_enr.getQUIC() });
-    try clock.run();
-}
-
-fn genesisConfigFromYAML(config: yaml.Yaml) !types.GenesisSpec {
-    const genesis_spec: types.GenesisSpec = .{
-        .genesis_time = @intCast(config.docs.items[0].map.get("GENESIS_TIME").?.int),
-        .num_validators = @intCast(config.docs.items[0].map.get("VALIDATOR_COUNT").?.int),
-    };
-    return genesis_spec;
-}
-
-fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: yaml.Yaml) ![]const []const u8 {
-    return try nodes_config.parse(allocator, [][]const u8);
-}
-
-fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: yaml.Yaml) ![]usize {
-    var validator_indices: std.ArrayListUnmanaged(usize) = .empty;
-    defer validator_indices.deinit(allocator);
-
-    var node_key_buf: [prefix.len + 4]u8 = undefined;
-    const node_key = try std.fmt.bufPrint(&node_key_buf, "{s}{d}", .{ prefix, node_id });
-    for (validators_config.docs.items[0].map.get(node_key).?.list) |item| {
-        try validator_indices.append(allocator, @intCast(item.int));
-    }
-    return try validator_indices.toOwnedSlice(allocator);
-}
-
 test "config yaml parsing" {
-    var config1 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
+    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/config.yaml");
     defer config1.deinit(std.testing.allocator);
-    const genesis_spec = try genesisConfigFromYAML(config1);
+    const genesis_spec = try configs.genesisConfigFromYAML(config1);
     try std.testing.expectEqual(9, genesis_spec.num_validators);
     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
 
-    var config2 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
+    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/validators.yaml");
     defer config2.deinit(std.testing.allocator);
-    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, 0, config2);
+    const validator_indices = try node.validatorIndicesFromYAML(std.testing.allocator, 0, config2);
     defer std.testing.allocator.free(validator_indices);
     try std.testing.expectEqual(3, validator_indices.len);
     try std.testing.expectEqual(1, validator_indices[0]);
     try std.testing.expectEqual(4, validator_indices[1]);
     try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try utilsLib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
+    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/fixtures/nodes.yaml");
     defer config3.deinit(std.testing.allocator);
-    const nodes = try nodesFromYAML(std.testing.allocator, config3);
+    const nodes = try node.nodesFromYAML(std.testing.allocator, config3);
     defer std.testing.allocator.free(nodes);
     try std.testing.expectEqual(3, nodes.len);
     try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);

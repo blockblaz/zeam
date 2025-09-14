@@ -104,7 +104,8 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/utils", zeam_utils);
     zeam_configs.addImport("@zeam/types", zeam_types);
     zeam_configs.addImport("@zeam/params", zeam_params);
- 
+    zeam_configs.addImport("yaml", yaml);
+
     // add zeam-metrics
     const zeam_metrics = b.addModule("@zeam/metrics", .{
         .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
