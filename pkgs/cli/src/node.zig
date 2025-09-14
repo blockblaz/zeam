@@ -32,6 +32,10 @@ pub const StartNodeOptions = struct {
     logger: *Logger,
 };
 
+/// Starts a node with the given options.
+/// This function does not return until the node is stopped.
+/// It initializes the metrics server if enabled, sets up the network,
+/// and starts the Beam node with the provided configuration.
 pub fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void {
     const node_id = options.node_id;
 
@@ -124,10 +128,29 @@ pub fn startNode(allocator: std.mem.Allocator, options: StartNodeOptions) !void 
     try clock.run();
 }
 
+/// Parses the nodes from a YAML configuration.
+/// Expects a YAML structure like:
+/// ```yaml
+///   - enr1...
+///   - enr2...
+/// ```
+/// Returns a set of ENR strings. The caller is responsible for freeing the returned slice.
 pub fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
     return try nodes_config.parse(allocator, [][]const u8);
 }
 
+/// Parses the validator indices for a given node from a YAML configuration.
+/// Expects a YAML structure like:
+/// ```yaml
+/// node_0:
+///   - 0
+///   - 1
+/// node_1:
+///   - 2
+///   - 3
+/// ```
+/// where `node_{node_id}` is the key for the node's validator indices.
+/// Returns a set of validator indices. The caller is responsible for freeing the returned slice.
 pub fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: Yaml) ![]usize {
     var validator_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer validator_indices.deinit(allocator);

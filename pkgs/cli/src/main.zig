@@ -27,8 +27,6 @@ const networks = @import("@zeam/network");
 
 const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusConfig;
 const yaml = @import("yaml");
-const enr = @import("enr");
-const ENR = enr.ENR;
 const node = @import("node.zig");
 
 const ZeamArgs = struct {
