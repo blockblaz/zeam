@@ -179,11 +179,40 @@ pub const BeamChain = struct {
             return;
         };
 
-        self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{
-            //
+        // Get additional chain information
+        const justified = self.forkChoice.fcStore.latest_justified;
+        const finalized = self.forkChoice.fcStore.latest_finalized;
+
+        // Calculate chain progress
+        const blocksBehind = if (slot > fcHead.slot) slot - fcHead.slot else 0;
+        const isTimely = fcHead.timeliness;
+
+        self.logger.info(
+            \\+===============================================================+
+            \\                         CHAIN STATUS                            
+            \\+===============================================================+
+            \\  Current Slot: {d} | Head Slot: {d} | Behind: {d}
+            \\+---------------------------------------------------------------+
+            \\  Head Block Root:    0x{any}
+            \\  Parent Block Root:  0x{any}
+            \\  State Root:         0x{any}
+            \\  Timely:             {s}
+            \\+---------------------------------------------------------------+
+            \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
+            \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\+===============================================================+
+        , .{
             slot,
-            fcHead.blockRoot,
             fcHead.slot,
+            blocksBehind,
+            std.fmt.fmtSliceHexLower(&fcHead.blockRoot),
+            std.fmt.fmtSliceHexLower(&fcHead.parentRoot),
+            std.fmt.fmtSliceHexLower(&fcHead.stateRoot),
+            if (isTimely) "YES" else "NO",
+            justified.slot,
+            std.fmt.fmtSliceHexLower(&justified.root),
+            finalized.slot,
+            std.fmt.fmtSliceHexLower(&finalized.root),
         });
     }
 
