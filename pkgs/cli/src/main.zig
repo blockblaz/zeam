@@ -32,7 +32,7 @@ const ZeamArgs = struct {
     log_filename: []const u8 = "consensus", // Default logger filename
     log_filepath: []const u8 = "./log", // Default logger filepath
     log_file_active_level: std.log.Level = .debug, //default log file ActiveLevel
-    log_no_file_colors: bool = false, //dont log colors in log files
+    monocolor_file_log: bool = false, //dont log colors in log files
     console_log_level: std.log.Level = .info, //default console log level
     // choosing 3 vals as default so that default beam cmd run which runs two nodes to interop
     // can justify and finalize
@@ -103,7 +103,7 @@ const ZeamArgs = struct {
         .log_filename = "Log Filename",
         .log_filepath = "Log Filepath - must exist",
         .log_file_active_level = "Log File Active Level, May be separate from console log level",
-        .log_no_file_colors = "Dont Log color formatted log in files for use in non color supported editors",
+        .monocolor_file_log = "Dont Log color formatted log in files for use in non color supported editors",
         .console_log_level = "Log Level for console logging",
     };
 
@@ -125,7 +125,7 @@ pub fn main() !void {
     const log_filename = opts.args.log_filename;
     const log_filepath = opts.args.log_filepath;
     const log_file_active_level = opts.args.log_file_active_level;
-    const log_no_file_colors = opts.args.log_no_file_colors;
+    const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
     std.debug.print("opts ={any} genesis={d} num_validators={d}\n", .{ opts, genesis, num_validators });
@@ -204,23 +204,19 @@ pub fn main() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            // Create loggers first so they can be passed to network implementations
             // Ensure log directory exists if log_filepath is not provided or is the default "./log"
             if (std.mem.eql(u8, log_filepath, "./log")) {
                 var cwd = std.fs.cwd();
-                // Try to open the directory, create if it doesn't exist
-                if (cwd.openDir(log_filepath, .{})) |_| {
-                    // Directory exists, do nothing
-                } else |_| {
-                    // Directory does not exist, create it
+                if (cwd.openDir(log_filepath, .{})) |_| {} else |_| {
                     cwd.makeDir(log_filepath) catch |err| {
-                        std.debug.print("\nERROR : Failed to create log directory: {any}\n", .{err});
+                        std.debug.print("ERROR : Failed to create log directory: {any}\n", .{err});
                     };
                 }
             }
 
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .noFileColors = log_no_file_colors });
+            // Create loggers first so they can be passed to network implementations
+            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
