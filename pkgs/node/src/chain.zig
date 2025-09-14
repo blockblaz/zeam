@@ -188,6 +188,7 @@ pub const BeamChain = struct {
         const is_timely = fc_head.timeliness;
 
         self.logger.info(
+            \\
             \\+===============================================================+
             \\                         CHAIN STATUS                            
             \\+===============================================================+
@@ -201,6 +202,7 @@ pub const BeamChain = struct {
             \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
             \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
             \\+===============================================================+
+            \\
         , .{
             slot,
             fc_head.slot,
@@ -369,4 +371,60 @@ test "process and add mock blocks into a node's chain" {
         const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
         try std.testing.expect(vote_tracker != null);
     }
+}
+
+test "printSlot output demonstration" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Create a chain configuration
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    // Create a mock chain with some blocks
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const nodeid = 42; // Test node ID
+    var logger = zeam_utils.getLogger(.info, null);
+
+    // Initialize the beam chain
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
+
+    // Process some blocks to have a more interesting chain state
+    for (1..mock_chain.blocks.len) |i| {
+        const block = mock_chain.blocks[i];
+        const current_slot = block.message.slot;
+
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.onBlock(block, null);
+    }
+
+    // Register some validators to make the output more interesting
+    var validator_ids = [_]usize{ 0, 1, 2 };
+    beam_chain.registerValidatorIds(&validator_ids);
+
+    // Test printSlot at different slots to see the output
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
+    beam_chain.printSlot(0);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
+    beam_chain.printSlot(1);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
+    beam_chain.printSlot(2);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
+    beam_chain.printSlot(5);
+
+    // Verify that the chain state is as expected
+    try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
+    try std.testing.expect(beam_chain.registered_validator_ids.len == 3);
 }
