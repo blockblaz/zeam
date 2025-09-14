@@ -300,6 +300,7 @@ pub fn main() !void {
         },
         .node => |leancmd| {
             const custom_genesis = leancmd.custom_genesis;
+            // check if custom_genesis directory exists
             if (std.fs.path.isAbsolute(custom_genesis)) {
                 var dir = try std.fs.openDirAbsolute(custom_genesis, .{});
                 defer dir.close();
@@ -308,72 +309,22 @@ pub fn main() !void {
                 defer dir.close();
             }
 
-            const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/config.yaml" });
-            defer allocator.free(config_filepath);
-            const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/nodes.yaml" });
-            defer allocator.free(bootnodes_filepath);
-            const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ custom_genesis, "/validators.yaml" });
-            defer allocator.free(validators_filepath);
-            // TODO: support genesis file loading when ssz library supports it
-            // const genesis_filepath = try std.mem.concat(allocator, &[_][]const u8{custom_genesis, "/genesis.ssz"});
-            // defer allocator.free(genesis_filepath);
-
-            var parsed_bootnodes = try utils_lib.loadFromYAMLFile(allocator, bootnodes_filepath);
-            defer parsed_bootnodes.deinit(allocator);
-
-            var parsed_config = try utils_lib.loadFromYAMLFile(allocator, config_filepath);
-            defer parsed_config.deinit(allocator);
-
-            var parsed_validators = try utils_lib.loadFromYAMLFile(allocator, validators_filepath);
-            defer parsed_validators.deinit(allocator);
-
-            const bootnodes = try node.nodesFromYAML(allocator, parsed_bootnodes);
-            defer allocator.free(bootnodes);
-
-            const genesis_spec = try configs.genesisConfigFromYAML(parsed_config);
-
-            const validator_indices = try node.validatorIndicesFromYAML(allocator, leancmd.node_id, parsed_validators);
-            defer allocator.free(validator_indices);
-
             var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
-            const start_options = node.StartNodeOptions{
+            var start_options = node.StartNodeOptions{
                 .node_id = leancmd.node_id,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
-                .bootnodes = bootnodes,
-                .genesis_spec = genesis_spec,
-                .validator_indices = validator_indices,
+                .bootnodes = undefined,
+                .genesis_spec = undefined,
+                .validator_indices = undefined,
                 .logger = &logger,
             };
+            defer start_options.deinit(allocator);
 
-            try node.startNode(allocator, start_options);
+            try node.loadGenesisConfig(allocator, custom_genesis, &start_options);
+
+            try node.startNode(allocator, &start_options);
         },
     }
-}
-
-test "config yaml parsing" {
-    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/config.yaml");
-    defer config1.deinit(std.testing.allocator);
-    const genesis_spec = try configs.genesisConfigFromYAML(config1);
-    try std.testing.expectEqual(9, genesis_spec.num_validators);
-    try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
-
-    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/validators.yaml");
-    defer config2.deinit(std.testing.allocator);
-    const validator_indices = try node.validatorIndicesFromYAML(std.testing.allocator, 0, config2);
-    defer std.testing.allocator.free(validator_indices);
-    try std.testing.expectEqual(3, validator_indices.len);
-    try std.testing.expectEqual(1, validator_indices[0]);
-    try std.testing.expectEqual(4, validator_indices[1]);
-    try std.testing.expectEqual(7, validator_indices[2]);
-
-    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/nodes.yaml");
-    defer config3.deinit(std.testing.allocator);
-    const nodes = try node.nodesFromYAML(std.testing.allocator, config3);
-    defer std.testing.allocator.free(nodes);
-    try std.testing.expectEqual(3, nodes.len);
-    try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
-    try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
-    try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
 }

@@ -53,6 +53,26 @@ pub fn genesisConfigFromYAML(config: Yaml) !types.GenesisSpec {
     return genesis_spec;
 }
 
+test "load genesis config from yaml" {
+    const yaml_content =
+        \\# Genesis Settings
+        \\GENESIS_TIME: 1704085200
+        \\
+        \\# Validator Settings  
+        \\VALIDATOR_COUNT: 9
+    ;
+
+    var yaml: Yaml = .{ .source = yaml_content };
+    errdefer yaml.deinit(std.testing.allocator);
+    try yaml.load(std.testing.allocator);
+
+    const genesis_config = try genesisConfigFromYAML(yaml);
+    std.debug.print("genesis config = {any}\n", .{genesis_config});
+
+    try std.testing.expect(genesis_config.genesis_time == 1704085200);
+    try std.testing.expect(genesis_config.num_validators == 9);
+}
+
 test "custom dev chain" {
     const dev_spec =
         \\{"preset": "mainnet", "name": "devchain1", "genesis_time": 1244, "num_validators": 4}
