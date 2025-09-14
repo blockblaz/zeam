@@ -194,12 +194,12 @@ pub const EthLibp2p = struct {
     }
 
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
-        return .{ .gossip = .{ 
+        return .{ .gossip = .{
             .ptr = self,
             .publishFn = publish,
             .subscribeFn = subscribe,
             .onGossipFn = onGossip,
-        }, .reqresp = .{ 
+        }, .reqresp = .{
             .ptr = self,
             .reqRespFn = reqResp,
             .onReqFn = onReq,
@@ -314,7 +314,6 @@ test "multiaddrsToString" {
     // Test for Empty list
     const empty_addrs = &[_]Multiaddr{};
     const empty_str = try EthLibp2p.multiaddrsToString(allocator, empty_addrs);
-    defer allocator.free(empty_str);
     try std.testing.expectEqualStrings("", empty_str);
 
     // Test for Single address

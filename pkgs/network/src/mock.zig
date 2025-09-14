@@ -115,4 +115,3 @@ test "mock network publish/subscribe" {
 
     try std.testing.expect(received_block == true);
 }
-
