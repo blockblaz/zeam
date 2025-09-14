@@ -231,7 +231,7 @@ test "writeFailedBytes creates file with correct content" {
     const allocator = testing.allocator;
 
     // Create a test logger
-    var test_logger = zeam_utils.getLogger(null, null);
+    var test_logger = zeam_utils.getTestLogger();
 
     // Ensure directory exists before test (CI-safe)
     std.fs.cwd().makeDir("deserialization_dumps") catch {};

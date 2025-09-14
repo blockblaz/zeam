@@ -290,7 +290,7 @@ pub fn getLogger(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviou
 }
 
 pub fn getTestLogger() ZeamLogger {
-    return ZeamLogger.init(.default, .debug, null, true);
+    return ZeamLogger.init(.default, std.log.default_level, null, true);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
