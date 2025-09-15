@@ -44,7 +44,7 @@ pub const StartNodeOptions = struct {
 /// - `nodes.yaml`: Contains the bootnodes in ENR format.
 /// - `validators.yaml`: Contains the validator indices for each node.
 /// The function updates the provided `StartNodeOptions` with the loaded data.
-pub fn loadGenesisConfig(allocator: std.mem.Allocator, path: []const u8, opts: *StartNodeOptions) !void {
+pub fn loadGenesisConfig(allocator: std.mem.Allocator, path: []const u8, override_genesis_time: ?u64, opts: *StartNodeOptions) !void {
     if (std.fs.path.isAbsolute(path)) {
         var dir = try std.fs.openDirAbsolute(path, .{});
         defer dir.close();
@@ -74,7 +74,7 @@ pub fn loadGenesisConfig(allocator: std.mem.Allocator, path: []const u8, opts: *
 
     const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
 
-    const genesis_spec = try configs.genesisConfigFromYAML(parsed_config);
+    const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, override_genesis_time);
 
     const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_id, parsed_validators);
 
@@ -230,7 +230,7 @@ pub fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, vali
 test "config yaml parsing" {
     var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/config.yaml");
     defer config1.deinit(std.testing.allocator);
-    const genesis_spec = try configs.genesisConfigFromYAML(config1);
+    const genesis_spec = try configs.genesisConfigFromYAML(config1, null);
     try std.testing.expectEqual(9, genesis_spec.num_validators);
     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
 

@@ -93,6 +93,7 @@ const ZeamArgs = struct {
         node: struct {
             help: bool = false,
             custom_genesis: []const u8,
+            override_genesis_time: ?u64,
             node_id: u32 = 0,
             metrics_enable: bool = false,
             metrics_port: u16 = 9667,
@@ -103,6 +104,7 @@ const ZeamArgs = struct {
 
             pub const __messages__ = .{
                 .custom_genesis = "Custom genesis directory path",
+                .override_genesis_time = "Override genesis time in the config.yaml",
                 .node_id = "Node id for this lean node",
                 .metrics_port = "Port to use for publishing metrics",
                 .metrics_enable = "Enable metrics endpoint",
@@ -335,7 +337,7 @@ pub fn main() !void {
             };
             defer start_options.deinit(allocator);
 
-            try node.loadGenesisConfig(allocator, custom_genesis, &start_options);
+            try node.loadGenesisConfig(allocator, custom_genesis, leancmd.override_genesis_time, &start_options);
 
             try node.startNode(allocator, &start_options);
         },

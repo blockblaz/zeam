@@ -45,9 +45,10 @@ const ChainConfigError = error{
     InvalidChainSpec,
 };
 
-pub fn genesisConfigFromYAML(config: Yaml) !types.GenesisSpec {
+pub fn genesisConfigFromYAML(config: Yaml, override_genesis_time: ?u64) !types.GenesisSpec {
+    const genesis_time: u64 = if (override_genesis_time) |gen_time| gen_time else @intCast(config.docs.items[0].map.get("GENESIS_TIME").?.int);
     const genesis_spec: types.GenesisSpec = .{
-        .genesis_time = @intCast(config.docs.items[0].map.get("GENESIS_TIME").?.int),
+        .genesis_time = genesis_time,
         .num_validators = @intCast(config.docs.items[0].map.get("VALIDATOR_COUNT").?.int),
     };
     return genesis_spec;
@@ -66,11 +67,14 @@ test "load genesis config from yaml" {
     defer yaml.deinit(std.testing.allocator);
     try yaml.load(std.testing.allocator);
 
-    const genesis_config = try genesisConfigFromYAML(yaml);
-    std.debug.print("genesis config = {any}\n", .{genesis_config});
+    const genesis_config = try genesisConfigFromYAML(yaml, null);
 
     try std.testing.expect(genesis_config.genesis_time == 1704085200);
     try std.testing.expect(genesis_config.num_validators == 9);
+
+    const genesis_config_override = try genesisConfigFromYAML(yaml, 1234);
+    try std.testing.expect(genesis_config_override.genesis_time == 1234);
+    try std.testing.expect(genesis_config_override.num_validators == 9);
 }
 
 test "custom dev chain" {
