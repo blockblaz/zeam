@@ -236,8 +236,8 @@ pub fn main() !void {
             }
 
             // Create loggers first so they can be passed to network implementations
-            var logger1 = utilsLib.getScopedLogger(.n1, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger2 = utilsLib.getScopedLogger(.n2, console_log_level, utilsLib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger1 = utils_lib.getScopedLogger(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2 = utils_lib.getScopedLogger(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
