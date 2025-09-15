@@ -17,7 +17,7 @@ const NetworkInterface = interface.NetworkInterface;
 fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: *const zeam_utils.ZeamLogger) ?[]const u8 {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
-        error.PathAlreadyExists => {}, // Directory already exists, continue
+        error.PathAlreadyExists => {},
         else => {
             logger.err("Failed to create deserialization dumps directory: {any}", .{e});
             return null;
@@ -297,4 +297,31 @@ test "writeFailedBytes creates file with correct content" {
 
     // Cleanup after we're done with the directory
     std.fs.cwd().deleteTree("deserialization_dumps") catch {};
+}
+
+test "multiaddrsToString" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Test for Empty list
+    const empty_addrs = &[_]Multiaddr{};
+    const empty_str = try EthLibp2p.multiaddrsToString(allocator, empty_addrs);
+    try std.testing.expectEqualStrings("", empty_str);
+
+    // Test for Single address
+    var addr1 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9000");
+    defer addr1.deinit();
+    const single_addr = &[_]Multiaddr{addr1};
+    const single_str = try EthLibp2p.multiaddrsToString(allocator, single_addr);
+    defer allocator.free(single_str);
+    try std.testing.expectEqualStrings("/ip4/127.0.0.1/tcp/9000", single_str);
+
+    // Test for Multiple addresses
+    var addr2 = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001");
+    defer addr2.deinit();
+    const multi_addrs = &[_]Multiaddr{ addr1, addr2 };
+    const multi_str = try EthLibp2p.multiaddrsToString(allocator, multi_addrs);
+    defer allocator.free(multi_str);
+    try std.testing.expectEqualStrings("/ip4/127.0.0.1/tcp/9000,/ip4/0.0.0.0/tcp/9001", multi_str);
 }

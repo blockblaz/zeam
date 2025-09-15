@@ -6,3 +6,7 @@ pub usingnamespace mockFactory;
 
 const ethlibp2pFactory = @import("./ethlibp2p.zig");
 pub usingnamespace ethlibp2pFactory;
+
+test {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}
