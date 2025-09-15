@@ -246,7 +246,10 @@ test "config yaml parsing" {
     var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/src/test/fixtures/nodes.yaml");
     defer config3.deinit(std.testing.allocator);
     const nodes = try nodesFromYAML(std.testing.allocator, config3);
-    defer std.testing.allocator.free(nodes);
+    defer {
+        for (nodes) |node| std.testing.allocator.free(node);
+        std.testing.allocator.free(nodes);
+    }
     try std.testing.expectEqual(3, nodes.len);
     try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
     try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);

@@ -341,3 +341,7 @@ pub fn main() !void {
         },
     }
 }
+
+test {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}
