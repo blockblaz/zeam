@@ -145,9 +145,10 @@ impl Network {
         connect_addresses: Vec<Multiaddr>,
     ) {
         let mut swarm = new_swarm();
-        println!("starting listner");
+        println!("starting listener");
 
-        for addr in listen_addresses {
+        for mut addr in listen_addresses {
+            strip_peer_id(&mut addr);
             swarm.listen_on(addr).unwrap();
         }
 
@@ -279,7 +280,7 @@ impl Behaviour {
 fn new_swarm() -> libp2p::swarm::Swarm<Behaviour> {
     let local_private_key = secp256k1::Keypair::generate();
     let local_keypair: Keypair = local_private_key.into();
-    let transport = build_transport(local_keypair.clone(), false).unwrap();
+    let transport = build_transport(local_keypair.clone(), true).unwrap();
     println!("build the transport");
 
     let builder = SwarmBuilder::with_existing_identity(local_keypair)

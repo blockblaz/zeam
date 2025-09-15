@@ -27,6 +27,10 @@
             .url = "git+https://github.com/blockblaz/enr#02f187591f8a9616623e0bc91d139f0d18c99bcf",
             .hash = "zig_enr-0.0.0-cO2P20iiAQALUQA-fb_70u0hyoBJo7u_tdeZue8FuyuZ",
         },
+        .zig_yaml = .{
+            .url = "git+https://github.com/kubkon/zig-yaml#a37be441b042d8aa119213f82f715c0dd1019655",
+            .hash = "zig_yaml-0.1.0-C1161hmEAgBeNkAzDaTpcf-2HBydmS1KpJ6FVfGIZfr_",
+        },
     },
     .paths = .{""},
 }

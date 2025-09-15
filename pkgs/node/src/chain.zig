@@ -174,16 +174,47 @@ pub const BeamChain = struct {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
-        const fcHead = self.forkChoice.updateHead() catch |err| {
+        const fc_head = self.forkChoice.updateHead() catch |err| {
             self.logger.err("forkchoice updatehead error={any}", .{err});
             return;
         };
 
-        self.logger.info("chain received on slot cb at slot={d} head={any} headslot={d}", .{
-            //
+        // Get additional chain information
+        const justified = self.forkChoice.fcStore.latest_justified;
+        const finalized = self.forkChoice.fcStore.latest_finalized;
+
+        // Calculate chain progress
+        const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
+        const is_timely = fc_head.timeliness;
+
+        self.logger.info(
+            \\
+            \\+===============================================================+
+            \\                         CHAIN STATUS                            
+            \\+===============================================================+
+            \\  Current Slot: {d} | Head Slot: {d} | Behind: {d}
+            \\+---------------------------------------------------------------+
+            \\  Head Block Root:    0x{any}
+            \\  Parent Block Root:  0x{any}
+            \\  State Root:         0x{any}
+            \\  Timely:             {s}
+            \\+---------------------------------------------------------------+
+            \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
+            \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\+===============================================================+
+            \\
+        , .{
             slot,
-            fcHead.blockRoot,
-            fcHead.slot,
+            fc_head.slot,
+            blocks_behind,
+            std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
+            std.fmt.fmtSliceHexLower(&fc_head.parentRoot),
+            std.fmt.fmtSliceHexLower(&fc_head.stateRoot),
+            if (is_timely) "YES" else "NO",
+            justified.slot,
+            std.fmt.fmtSliceHexLower(&justified.root),
+            finalized.slot,
+            std.fmt.fmtSliceHexLower(&finalized.root),
         });
     }
 
@@ -340,4 +371,60 @@ test "process and add mock blocks into a node's chain" {
         const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
         try std.testing.expect(vote_tracker != null);
     }
+}
+
+test "printSlot output demonstration" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Create a chain configuration
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    // Create a mock chain with some blocks
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const nodeid = 42; // Test node ID
+    var logger = zeam_utils.getLogger(.info, null);
+
+    // Initialize the beam chain
+    var beam_chain = try BeamChain.init(allocator, chain_config, beam_state, nodeid, &logger);
+
+    // Process some blocks to have a more interesting chain state
+    for (1..mock_chain.blocks.len) |i| {
+        const block = mock_chain.blocks[i];
+        const current_slot = block.message.slot;
+
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.onBlock(block, null);
+    }
+
+    // Register some validators to make the output more interesting
+    var validator_ids = [_]usize{ 0, 1, 2 };
+    beam_chain.registerValidatorIds(&validator_ids);
+
+    // Test printSlot at different slots to see the output
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
+    beam_chain.printSlot(0);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
+    beam_chain.printSlot(1);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
+    beam_chain.printSlot(2);
+
+    std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
+    beam_chain.printSlot(5);
+
+    // Verify that the chain state is as expected
+    try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
+    try std.testing.expect(beam_chain.registered_validator_ids.len == 3);
 }

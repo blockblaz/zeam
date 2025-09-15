@@ -66,6 +66,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("multiformats-zig");
 
+    const yaml = b.dependency("zig_yaml", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("yaml");
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -73,6 +78,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/utils/src/lib.zig"),
     });
     zeam_utils.addImport("datetime", datetime);
+    zeam_utils.addImport("yaml", yaml);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -99,6 +105,7 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/utils", zeam_utils);
     zeam_configs.addImport("@zeam/types", zeam_types);
     zeam_configs.addImport("@zeam/params", zeam_params);
+    zeam_configs.addImport("yaml", yaml);
 
     // add zeam-metrics
     const zeam_metrics = b.addModule("@zeam/metrics", .{
@@ -195,6 +202,8 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
+    cli_exe.root_module.addImport("enr", enr);
+    cli_exe.root_module.addImport("yaml", yaml);
 
     addRustGlueLib(b, cli_exe, target);
     cli_exe.linkLibC(); // for rust static libs to link

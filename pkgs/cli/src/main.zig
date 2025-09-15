@@ -5,10 +5,10 @@ const build_options = @import("build_options");
 const simargs = @import("simargs");
 
 const types = @import("@zeam/types");
-const nodeLib = @import("@zeam/node");
-const Clock = nodeLib.Clock;
-const stateProvingManager = @import("@zeam/state-proving-manager");
-const BeamNode = nodeLib.BeamNode;
+const node_lib = @import("@zeam/node");
+const Clock = node_lib.Clock;
+const state_proving_manager = @import("@zeam/state-proving-manager");
+const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
@@ -17,15 +17,17 @@ const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
 
-const utilsLib = @import("@zeam/utils");
+const utils_lib = @import("@zeam/utils");
 
-const sftFactory = @import("@zeam/state-transition");
+const sft_factory = @import("@zeam/state-transition");
 const metrics = @import("@zeam/metrics");
-const metricsServer = @import("metrics_server.zig");
+const metrics_server = @import("metrics_server.zig");
 
 const networks = @import("@zeam/network");
 
 const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusConfig;
+const yaml = @import("yaml");
+const node = @import("node.zig");
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
@@ -51,7 +53,7 @@ const ZeamArgs = struct {
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
-            zkvm: stateProvingManager.ZKVMs = .risc0,
+            zkvm: state_proving_manager.ZKVMs = .risc0,
             help: bool = false,
 
             pub const __shorts__ = .{
@@ -88,12 +90,31 @@ const ZeamArgs = struct {
                 };
             },
         },
+        node: struct {
+            help: bool = false,
+            custom_genesis: []const u8,
+            node_id: u32 = 0,
+            metrics_enable: bool = false,
+            metrics_port: u16 = 9667,
+
+            pub const __shorts__ = .{
+                .help = .h,
+            };
+
+            pub const __messages__ = .{
+                .custom_genesis = "Custom genesis directory path",
+                .node_id = "Node id for this lean node",
+                .metrics_port = "Port to use for publishing metrics",
+                .metrics_enable = "Enable metrics endpoint",
+            };
+        },
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
             .beam = "Run a full Beam node",
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
+            .node = "Run a lean node",
         };
     },
 
@@ -140,9 +161,9 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            var logger = utilsLib.getLogger(null, null);
+            var logger = utils_lib.getLogger(null, null);
 
-            const options = stateProvingManager.ZKStateTransitionOpts{
+            const options = state_proving_manager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
@@ -155,26 +176,26 @@ pub fn main() !void {
                 .genesis_time = genesis,
                 .num_validators = num_validators,
             };
-            const mock_chain = try sftFactory.genMockChain(allocator, 5, mock_config);
+            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config);
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |block| {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
-                const proof = try stateProvingManager.prove_transition(beam_state, block, options, allocator);
+                const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sftFactory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
 
                 // verify the block
-                try stateProvingManager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
+                try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
             }
         },
         .beam => |beamcmd| {
             try metrics.init(allocator);
 
             // Start metrics HTTP server
-            try metricsServer.startMetricsServer(allocator, beamcmd.metricsPort);
+            try metrics_server.startMetricsServer(allocator, beamcmd.metricsPort);
 
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
@@ -196,7 +217,7 @@ pub fn main() !void {
             chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            const anchorState = try sftFactory.genGenesisState(gpa.allocator(), chain_config.genesis);
+            const anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
             // in the order to which they have been added even with the an appropriate delay added
@@ -289,6 +310,34 @@ pub fn main() !void {
                 defer config_file.close();
                 try config_file.writeAll(generated_config);
             },
+        },
+        .node => |leancmd| {
+            const custom_genesis = leancmd.custom_genesis;
+            // check if custom_genesis directory exists
+            if (std.fs.path.isAbsolute(custom_genesis)) {
+                var dir = try std.fs.openDirAbsolute(custom_genesis, .{});
+                defer dir.close();
+            } else {
+                var dir = try std.fs.cwd().openDir(custom_genesis, .{});
+                defer dir.close();
+            }
+
+            var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+
+            var start_options = node.StartNodeOptions{
+                .node_id = leancmd.node_id,
+                .metrics_enable = leancmd.metrics_enable,
+                .metrics_port = leancmd.metrics_port,
+                .bootnodes = undefined,
+                .genesis_spec = undefined,
+                .validator_indices = undefined,
+                .logger = &logger,
+            };
+            defer start_options.deinit(allocator);
+
+            try node.loadGenesisConfig(allocator, custom_genesis, &start_options);
+
+            try node.startNode(allocator, &start_options);
         },
     }
 }
