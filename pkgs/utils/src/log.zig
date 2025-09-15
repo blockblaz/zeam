@@ -51,8 +51,8 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         var buf: [4096]u8 = undefined;
         var print_str = std.fmt.bufPrint(
             buf[0..],
-            "{s}{s} {s}[{s}] {s}{s}{s}" ++ fmt ++ "\n",
-            .{ timestamp_color, timestamp_str, level_color, comptime level.asText(), scope_color, scope_prefix, reset_color } ++ args,
+            "{s}{s}{s} {s}[{s}]{s} {s}{s}{s}" ++ fmt ++ "\n",
+            .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
         ) catch return;
 
         // Print to stderr
@@ -71,7 +71,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             }
 
             nosuspend fileLogParams.?.file.writeAll(print_str) catch |err| {
-                stderr.print("{s}{s} {s}[ERROR]{s} {s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, Colors.err, scope_color, scope_prefix, reset_color, err }) catch {};
+                stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err }) catch {};
             };
         }
     }
@@ -119,32 +119,14 @@ pub const FileParams = struct {
     last_rotation_day: i64 = 0,
 };
 
-pub const DEFAULT_FILE_BEHAVIOUR = FileBehaviourParams{
-    .fileActiveLevel = .debug,
-    .filePath = "./log",
-    .fileName = "consensus",
-    .monocolorFile = false,
-};
-
 pub const ZeamLogger = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
     fileParams: ?FileParams,
-    testLogger: bool,
 
     const Self = @This();
-    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileBehaviourParams: ?FileBehaviourParams, testLogger: bool) Self {
-        var effective_params = fileBehaviourParams;
-        if (builtin.target.os.tag == .freestanding) {
-            effective_params = null;
-        } else if ((fileBehaviourParams == null) and (!testLogger)) {
-            effective_params = DEFAULT_FILE_BEHAVIOUR;
-        }
-        if (testLogger) {
-            effective_params = null;
-        }
-
-        const fileParams: ?FileParams = if (effective_params) |params| blk: {
+    pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileBehaviourParams: ?FileBehaviourParams) Self {
+        const fileParams: ?FileParams = if (fileBehaviourParams) |params| blk: {
             break :blk FileParams{
                 .file = getFile(scope, params.filePath, params.fileName),
                 .fileBehaviour = params,
@@ -157,7 +139,6 @@ pub const ZeamLogger = struct {
             .scope = scope,
             .activeLevel = activeLevel,
             .fileParams = fileParams,
-            .testLogger = testLogger,
         };
     }
 
@@ -282,15 +263,15 @@ pub const ZeamLogger = struct {
 };
 
 pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams, false);
+    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
 pub fn getLogger(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams, false);
+    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
 pub fn getTestLogger() ZeamLogger {
-    return ZeamLogger.init(.default, std.log.default_level, null, true);
+    return ZeamLogger.init(.default, std.log.default_level, null);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
