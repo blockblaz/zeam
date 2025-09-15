@@ -63,7 +63,7 @@ test "load genesis config from yaml" {
     ;
 
     var yaml: Yaml = .{ .source = yaml_content };
-    errdefer yaml.deinit(std.testing.allocator);
+    defer yaml.deinit(std.testing.allocator);
     try yaml.load(std.testing.allocator);
 
     const genesis_config = try genesisConfigFromYAML(yaml);
@@ -85,7 +85,7 @@ test "custom dev chain" {
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
     };
-    const dev_options = (try json.parseFromSlice(ChainOptions, arena_allocator.allocator(), dev_spec, options));
+    const dev_options = (try json.parseFromSlice(ChainOptions, arena_allocator.allocator(), dev_spec, options)).value;
 
     const dev_config = try ChainConfig.init(Chain.custom, dev_options);
     std.debug.print("dev config = {any}\n", .{dev_config});
