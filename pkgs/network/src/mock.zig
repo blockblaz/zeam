@@ -89,4 +89,19 @@ test "Mock messaging across two subscribers" {
             data.received.* = message.*;
         }
     }.onGossip;
+
+    // Both subscribers subscribe to the same block topic
+    var topics = [_]interface.GossipTopic{.block};
+    var subscriber1_data = struct { calls: *u32, received: *?interface.GossipMessage }{ .calls = &subscriber1_calls, .received = &subscriber1_received_message };
+    var subscriber2_data = struct { calls: *u32, received: *?interface.GossipMessage }{ .calls = &subscriber2_calls, .received = &subscriber2_received_message };
+
+    try Mock.subscribe(@ptrCast(&mock), &topics, .{
+        .ptr = &subscriber1_data,
+        .onGossipCb = subscriber1_callback,
+    });
+    try Mock.subscribe(@ptrCast(&mock), &topics, .{
+        .ptr = &subscriber2_data,
+        .onGossipCb = subscriber2_callback,
+    });
+
 }
