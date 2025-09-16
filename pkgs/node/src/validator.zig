@@ -88,7 +88,7 @@ pub const BeamValidator = struct {
             };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
-            self.logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message });
+            self.logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
             try self.chain.publishVote(signed_vote);
             // move gossip message construction and publish to publishVote
             try self.network.publish(&signed_vote_message);
