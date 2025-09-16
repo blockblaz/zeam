@@ -281,6 +281,11 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     state.justifications_roots = try justifications_roots.toOwnedSlice();
     state.justifications_validators = try justifications_validators.toOwnedSlice();
 
+    // clear out the local map
+    for (state.justifications_roots) |root| {
+        _ = justifications.remove(root);
+    }
+
     logger.debug("poststate:historical hashes={d} justified slots ={any}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots.len, state.justifications_validators.len });
     logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 }
