@@ -16,7 +16,7 @@ CLAUDE.md
 .codeium/
 
 # Log files
-zeam.log
+*.log
 
 # Config files
 prometheus.yml

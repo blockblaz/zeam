@@ -10,6 +10,7 @@ libp2p-mplex = "0.42"
 futures = "0.3.31"
 tokio = { version = "1", features = ["full"] }
 slog = { version = "2", features = ["max_level_debug", "release_max_level_debug", "nested-values"] }
+hex = "0.4.3"
 
 [dependencies.libp2p]
 version = "0.54"

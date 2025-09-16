@@ -3,6 +3,7 @@ use futures::StreamExt;
 use libp2p::core::{
     multiaddr::Multiaddr, multiaddr::Protocol, muxing::StreamMuxerBox, transport::Boxed,
 };
+
 use libp2p::identity::{secp256k1, Keypair};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
@@ -16,7 +17,7 @@ use std::{
 };
 use tokio::runtime::Builder;
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
@@ -34,30 +35,52 @@ static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 pub unsafe fn create_and_run_network(
     network_id: u32,
     zig_handler: u64,
+    local_private_key: *const c_char,
     listen_addresses: *const c_char,
     connect_addresses: *const c_char,
 ) {
-    let listen_multiaddrs = std::ffi::CStr::from_ptr(listen_addresses)
+    let listen_multiaddrs = CStr::from_ptr(listen_addresses)
         .to_string_lossy()
         .split(",")
         .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
         .collect::<Vec<_>>();
 
-    let connect_multiaddrs = std::ffi::CStr::from_ptr(connect_addresses)
+    let connect_multiaddrs = CStr::from_ptr(connect_addresses)
         .to_string_lossy()
         .split(",")
         .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
         .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
         .collect::<Vec<_>>();
 
-    releaseAddresses(zig_handler, listen_addresses, connect_addresses);
+    let local_private_key_hex = CStr::from_ptr(local_private_key)
+        .to_string_lossy()
+        .into_owned();
+
+    let private_key_hex = local_private_key_hex
+        .strip_prefix("0x")
+        .unwrap_or(&local_private_key_hex);
+
+    let mut private_key_bytes =
+        hex::decode(private_key_hex).expect("Invalid hex string for private key");
+
+    let local_key_pair = Keypair::from(secp256k1::Keypair::from(
+        secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes)
+            .expect("Invalid private key bytes"),
+    ));
+
+    releaseStartNetworkParams(
+        zig_handler,
+        local_private_key,
+        listen_addresses,
+        connect_addresses,
+    );
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
         p2p_net
-            .start_network(listen_multiaddrs, connect_multiaddrs)
+            .start_network(local_key_pair, listen_multiaddrs, connect_multiaddrs)
             .await;
         p2p_net.run_eventloop().await;
     });
@@ -87,9 +110,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
         return;
     }
 
-    let topic = std::ffi::CStr::from_ptr(topic)
-        .to_string_lossy()
-        .to_string();
+    let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
     let topic = gossipsub::IdentTopic::new(topic);
 
     #[allow(static_mut_refs)]
@@ -118,8 +139,9 @@ extern "C" {
 }
 
 extern "C" {
-    fn releaseAddresses(
+    fn releaseStartNetworkParams(
         zig_handler: u64,
+        local_private_key: *const c_char,
         listen_addresses: *const c_char,
         connect_addresses: *const c_char,
     );
@@ -141,10 +163,11 @@ impl Network {
 
     pub async fn start_network(
         &mut self,
+        key_pair: Keypair,
         listen_addresses: Vec<Multiaddr>,
         connect_addresses: Vec<Multiaddr>,
     ) {
-        let mut swarm = new_swarm();
+        let mut swarm = new_swarm(key_pair);
         println!("starting listener");
 
         for mut addr in listen_addresses {
@@ -277,9 +300,7 @@ impl Behaviour {
     }
 }
 
-fn new_swarm() -> libp2p::swarm::Swarm<Behaviour> {
-    let local_private_key = secp256k1::Keypair::generate();
-    let local_keypair: Keypair = local_private_key.into();
+fn new_swarm(local_keypair: Keypair) -> libp2p::swarm::Swarm<Behaviour> {
     let transport = build_transport(local_keypair.clone(), true).unwrap();
     println!("build the transport");
 

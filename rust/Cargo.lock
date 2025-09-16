@@ -3774,6 +3774,7 @@ name = "rustglue"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "libp2p",
  "libp2p-mplex",
  "risc0-zkvm",
