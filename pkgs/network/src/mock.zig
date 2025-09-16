@@ -67,4 +67,10 @@ test "Mock messaging across two subscribers" {
     var logger = zeam_utils.getTestLogger();
     var mock = try Mock.init(allocator, &loop, &logger);
 
+    // Track calls and capture received messages
+    var subscriber1_calls: u32 = 0;
+    var subscriber2_calls: u32 = 0;
+    var subscriber1_received_message: ?interface.GossipMessage = null;
+    var subscriber2_received_message: ?interface.GossipMessage = null;
+
 }
