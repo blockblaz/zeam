@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 slog = { version = "2", features = ["max_level_debug", "release_max_level_debug", "nested-values"] }
 snap = "1"
 sha2 = "0.9"
-hex = "0.4"
+hex = "0.4.3"
 
 [dependencies.libp2p]
 version = "0.54"

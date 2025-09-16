@@ -93,23 +93,23 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 }
 
-export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void {
-    const listen_slice = std.mem.span(listenAddresses);
-    zigHandler.allocator.free(listen_slice);
+export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void {
+    const listen_slice = std.mem.span(listen_addresses);
+    zig_handler.allocator.free(listen_slice);
 
-    const connect_slice = std.mem.span(connectAddresses);
-    // because connectAddresses can be empty string "" which not allocate memory in the heap
-    if (connect_slice.len > 0) {
-        zigHandler.allocator.free(connect_slice);
-    }
+    const connect_slice = std.mem.span(connect_addresses);
+    zig_handler.allocator.free(connect_slice);
+
+    const private_key_slice = std.mem.span(local_private_key);
+    zig_handler.allocator.free(private_key_slice);
 }
 
-// TODO: change listen port and connect port both to list of multiaddrs
-pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
+pub extern fn create_and_run_network(network_id: u32, handle: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void;
 pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
+    local_private_key: []const u8,
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
 };
@@ -137,8 +137,9 @@ pub const EthLibp2p = struct {
         const connect_peers_str = if (self.params.connect_peers) |peers|
             try multiaddrsToString(self.allocator, peers)
         else
-            "";
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, listen_addresses_str.ptr, connect_peers_str.ptr });
+            try self.allocator.dupeZ(u8, "");
+        const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
+        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
