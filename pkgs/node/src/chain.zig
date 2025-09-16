@@ -18,6 +18,7 @@ const jsonToString = zeam_utils.jsonToString;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
+const tree_visualizer = @import("./tree_visualizer.zig");
 
 const node = @import("./node.zig");
 const PeerInfo = node.PeerInfo;
@@ -251,6 +252,11 @@ pub const BeamChain = struct {
         const slot: usize = if (islot < 0) 0 else @intCast(islot);
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
+
+        // Build tree visualization
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const tree_visual = tree_visualizer.buildTreeVisualization(arena.allocator(), self.forkChoice.protoArray.nodes.items) catch "Tree visualization failed";
 
         self.module_logger.info(
             \\
