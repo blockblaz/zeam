@@ -2,8 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fcFactory = @import("./forkchoice.zig");
 
-/// Builds a tree visualization of the fork choice tree
-pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.ProtoNode) ![]const u8 {
+/// Builds a tree visualization of the fork choice tree with optional depth limit
+pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.ProtoNode, max_depth: ?usize) ![]const u8 {
     var tree_lines = std.ArrayList(u8).init(allocator);
     defer tree_lines.deinit();
 
@@ -19,14 +19,14 @@ pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.Pro
 
     // Build tree visualization starting from roots
     for (root_indices.items) |root_idx| {
-        try visualizeTreeBranch(allocator, &tree_lines, nodes, root_idx, 0, "");
+        try visualizeTreeBranch(allocator, &tree_lines, nodes, root_idx, 0, "", max_depth);
     }
 
     return tree_lines.toOwnedSlice();
 }
 
 /// Recursively builds a tree branch visualization
-fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8) !void {
+fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8, max_depth: ?usize) !void {
     const node = nodes[node_idx];
     const hex_root = std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])}) catch "0x????";
     defer allocator.free(hex_root);
@@ -35,6 +35,17 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     defer allocator.free(node_line);
 
     try tree_lines.appendSlice(node_line);
+
+    // Check if we've reached the maximum depth
+    if (max_depth) |max| {
+        if (depth >= max) {
+            const truncated_comment = std.fmt.allocPrint(allocator, " // ... (truncated at depth {d})", .{max}) catch return;
+            defer allocator.free(truncated_comment);
+            try tree_lines.appendSlice(truncated_comment);
+            try tree_lines.append('\n');
+            return;
+        }
+    }
 
     var children = std.ArrayList(usize).init(allocator);
     defer children.deinit();
@@ -71,7 +82,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
         }
 
         // Recursively process child
-        try visualizeTreeBranch(allocator, tree_lines, nodes, child_idx, depth + 1, "");
+        try visualizeTreeBranch(allocator, tree_lines, nodes, child_idx, depth + 1, "", max_depth);
     }
 }
 
