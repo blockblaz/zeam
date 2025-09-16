@@ -103,15 +103,3 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
     return indent.toOwnedSlice();
 }
 
-/// Helper function to create vertical continuation lines
-fn createVerticalLines(allocator: Allocator, depth: usize) ![]const u8 {
-    var lines = std.ArrayList(u8).init(allocator);
-    defer lines.deinit();
-
-    // Add vertical lines for each depth level
-    for (0..depth) |_| {
-        try lines.appendSlice("    │");
-    }
-
-    return lines.toOwnedSlice();
-}
