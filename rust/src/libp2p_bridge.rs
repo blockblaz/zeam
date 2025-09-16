@@ -10,12 +10,10 @@ use libp2p::{
 };
 use std::os::raw::c_char;
 use std::time::Duration;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 use tokio::runtime::Builder;
 
+use sha2::Digest;
+use snap::raw::Decoder;
 use std::ffi::CString;
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
@@ -239,15 +237,44 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)] // store as 4-byte value
+pub enum MessageDomain {
+    ValidSnappy = 0x01000000,
+    InvalidSnappy = 0x00000000,
+}
+
+impl From<MessageDomain> for [u8; 4] {
+    fn from(domain: MessageDomain) -> Self {
+        (domain as u32).to_be_bytes()
+    }
+}
+
 impl Behaviour {
+    fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
+        // Try to decompress; fallback to raw data
+        let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
+            match Decoder::new().decompress_vec(&message.data) {
+                Ok(decoded) => (decoded, MessageDomain::ValidSnappy.into()),
+                Err(_) => (message.data.clone(), MessageDomain::InvalidSnappy.into()),
+            };
+
+        // Prepare hashing
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(domain);
+        hasher.update(message.topic.as_str().len().to_le_bytes());
+        hasher.update(message.topic.as_str().as_bytes());
+        hasher.update(&data_for_hash);
+
+        // Take first 20 bytes as message-id
+        let digest = hasher.finalize();
+        gossipsub::MessageId::from(&digest[..20])
+    }
+
     fn new(key: identity::Keypair) -> Self {
         let local_public_key = key.public();
         // To content-address message, we can take the hash of message and use it as an ID.
-        let message_id_fn = |message: &gossipsub::Message| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
-        };
+        let message_id_fn = |message: &gossipsub::Message| Self::message_id_fn(message);
 
         // Set a custom gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -367,5 +394,47 @@ fn strip_peer_id(addr: &mut Multiaddr) {
         Some(Protocol::P2p(_)) => {}
         Some(other) => addr.push(other),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::gossipsub::IdentTopic;
+    use libp2p::gossipsub::MessageId;
+    use snap::raw::Encoder;
+
+    #[test]
+    fn test_message_id_computation_with_snappy() {
+        let compressed_data = {
+            let mut encoder = Encoder::new();
+            encoder.compress_vec(b"hello").unwrap()
+        };
+        let message = gossipsub::Message {
+            source: None,
+            data: compressed_data,
+            sequence_number: None,
+            topic: IdentTopic::new("test").into(),
+        };
+        let message_id = Behaviour::message_id_fn(&message);
+        let expected_hex = "2e40c861545cc5b46d2220062e7440b9190bc383";
+        let expected_bytes = hex::decode(expected_hex).unwrap();
+        assert_eq!(message_id, MessageId::new(&expected_bytes));
+    }
+
+    #[test]
+    fn test_message_id_computation_basic() {
+        // Test basic message ID computation without snappy decompression
+        let message_id = Behaviour::message_id_fn(&gossipsub::Message {
+            source: None,
+            data: b"hello".to_vec(),
+            sequence_number: None,
+            topic: IdentTopic::new("test").into(),
+        });
+
+        // Verify the ID is correct
+        let expected_hex = "a7f41aaccd241477955c981714eb92244c2efc98";
+        let expected_bytes = hex::decode(expected_hex).unwrap();
+        assert_eq!(message_id, MessageId::new(&expected_bytes));
     }
 }
