@@ -73,22 +73,15 @@ test "Mock messaging across two subscribers" {
     var subscriber1_received_message: ?interface.GossipMessage = null;
     var subscriber2_received_message: ?interface.GossipMessage = null;
 
-    // Inline callback functions
-    const subscriber1_callback = struct {
-        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
-            const data: *struct { calls: *u32, received: *?interface.GossipMessage } = @ptrCast(@alignCast(ptr));
-            data.calls.* += 1;
-            data.received.* = message.*;
-        }
-    }.onGossip;
+    // Common callback function for both subscribers
+    fn common_onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+        const data: *struct { calls: *u32, received: *?interface.GossipMessage } = @ptrCast(@alignCast(ptr));
+        data.calls.* += 1;
+        data.received.* = message.*;
+    }
 
-    const subscriber2_callback = struct {
-        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
-            const data: *struct { calls: *u32, received: *?interface.GossipMessage } = @ptrCast(@alignCast(ptr));
-            data.calls.* += 1;
-            data.received.* = message.*;
-        }
-    }.onGossip;
+    const subscriber1_callback = common_onGossip;
+    const subscriber2_callback = common_onGossip;
 
     // Both subscribers subscribe to the same block topic
     var topics = [_]interface.GossipTopic{.block};
