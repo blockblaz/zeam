@@ -136,7 +136,7 @@ pub const BeamChain = struct {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
             const islot: isize = @intCast(slot);
-            self.printSlot(islot);
+            self.printSlot(islot, null);
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
@@ -204,7 +204,7 @@ pub const BeamChain = struct {
         return vote;
     }
 
-    pub fn printSlot(self: *Self, islot: isize) void {
+    pub fn printSlot(self: *Self, islot: isize, tree_depth: ?usize) void {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
@@ -228,7 +228,7 @@ pub const BeamChain = struct {
         // Build tree visualization
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const tree_visual = tree_visualizer.buildTreeVisualization(arena.allocator(), self.forkChoice.protoArray.nodes.items) catch "Tree visualization failed";
+        const tree_visual = tree_visualizer.buildTreeVisualization(arena.allocator(), self.forkChoice.protoArray.nodes.items, tree_depth) catch "Tree visualization failed";
 
         self.module_logger.info(
             \\
@@ -557,16 +557,16 @@ test "printSlot output demonstration" {
 
     // Test printSlot at different slots to see the output
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
-    beam_chain.printSlot(0);
+    beam_chain.printSlot(0, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
-    beam_chain.printSlot(1);
+    beam_chain.printSlot(1, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
-    beam_chain.printSlot(2);
+    beam_chain.printSlot(2, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
-    beam_chain.printSlot(5);
+    beam_chain.printSlot(5, null);
 
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
