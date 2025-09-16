@@ -163,7 +163,6 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
     for (state.justifications_roots, 0..) |blockRoot, i| {
-        const blockRoot = state.justifications_roots[i];
         justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
             logger.err("Invalid parsing justification roots={d} justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
                 //
