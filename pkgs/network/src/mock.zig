@@ -56,6 +56,18 @@ pub const Mock = struct {
     }
 };
 
+// Helper functions and structs for testing
+const SubscriberData = struct {
+    calls: *u32,
+    received: *?interface.GossipMessage,
+};
+
+fn common_onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+    const data: *SubscriberData = @ptrCast(@alignCast(ptr));
+    data.calls.* += 1;
+    data.received.* = message.*;
+}
+
 test "Mock messaging across two subscribers" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
@@ -73,20 +85,13 @@ test "Mock messaging across two subscribers" {
     var subscriber1_received_message: ?interface.GossipMessage = null;
     var subscriber2_received_message: ?interface.GossipMessage = null;
 
-    // Common callback function for both subscribers
-    fn common_onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
-        const data: *struct { calls: *u32, received: *?interface.GossipMessage } = @ptrCast(@alignCast(ptr));
-        data.calls.* += 1;
-        data.received.* = message.*;
-    }
-
     const subscriber1_callback = common_onGossip;
     const subscriber2_callback = common_onGossip;
 
     // Both subscribers subscribe to the same block topic
     var topics = [_]interface.GossipTopic{.block};
-    var subscriber1_data = struct { calls: *u32, received: *?interface.GossipMessage }{ .calls = &subscriber1_calls, .received = &subscriber1_received_message };
-    var subscriber2_data = struct { calls: *u32, received: *?interface.GossipMessage }{ .calls = &subscriber2_calls, .received = &subscriber2_received_message };
+    var subscriber1_data = SubscriberData{ .calls = &subscriber1_calls, .received = &subscriber1_received_message };
+    var subscriber2_data = SubscriberData{ .calls = &subscriber2_calls, .received = &subscriber2_received_message };
 
     try Mock.subscribe(@ptrCast(&mock), &topics, .{
         .ptr = &subscriber1_data,
