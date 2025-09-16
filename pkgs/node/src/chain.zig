@@ -272,6 +272,9 @@ pub const BeamChain = struct {
             \\+---------------------------------------------------------------+
             \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
             \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\+---------------------------------------------------------------+
+            \\  ForkChoice Tree:
+            \\{s}
             \\+===============================================================+
             \\
         , .{
@@ -287,6 +290,7 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&justified.root),
             finalized.slot,
             std.fmt.fmtSliceHexLower(&finalized.root),
+            tree_visual,
         });
     }
 
