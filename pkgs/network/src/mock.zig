@@ -55,3 +55,7 @@ pub const Mock = struct {
         } };
     }
 };
+
+test "Mock messaging across two subscribers" {
+    
+}
