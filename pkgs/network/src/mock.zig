@@ -119,4 +119,10 @@ test "Mock messaging across two subscribers" {
         },
         .signature = [_]u8{3} ** types.SIGSIZE,
     } };
+
+    // Publish the message - both subscribers should receive it
+    try Mock.publish(@ptrCast(&mock), block_message);
+
+    // Run the event loop to process scheduled callbacks
+    try loop.run(.until_done);
 }
