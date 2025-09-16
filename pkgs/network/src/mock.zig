@@ -125,4 +125,26 @@ test "Mock messaging across two subscribers" {
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);
+
+    // Verify both subscribers received the message
+    try std.testing.expect(subscriber1_calls == 1);
+    try std.testing.expect(subscriber2_calls == 1);
+
+    // Verify both subscribers received the same message content
+    try std.testing.expect(subscriber1_received_message != null);
+    try std.testing.expect(subscriber2_received_message != null);
+
+    const received1 = subscriber1_received_message.?;
+    const received2 = subscriber2_received_message.?;
+
+    // Verify both received block messages
+    try std.testing.expect(received1 == .block);
+    try std.testing.expect(received2 == .block);
+
+    // Verify the block content is identical
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
+    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
+    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &received1.block.signature, &received2.block.signature));
 }
