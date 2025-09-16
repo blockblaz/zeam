@@ -28,10 +28,10 @@ pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.Pro
 /// Recursively builds a tree branch visualization
 fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8, max_depth: ?usize) !void {
     const node = nodes[node_idx];
-    const hex_root = std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])}) catch return;
+    const hex_root = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])});
     defer allocator.free(hex_root);
 
-    const node_line = std.fmt.allocPrint(allocator, "{s}{s} ({d})", .{ prefix, hex_root, node.slot }) catch return;
+    const node_line = try std.fmt.allocPrint(allocator, "{s}{s} ({d})", .{ prefix, hex_root, node.slot });
     defer allocator.free(node_line);
 
     try tree_lines.appendSlice(node_line);
@@ -39,7 +39,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     // Check if we've reached the maximum depth
     if (max_depth) |max| {
         if (depth >= max) {
-            const truncated_comment = std.fmt.allocPrint(allocator, " // ... (truncated at depth {d})", .{max}) catch return;
+            const truncated_comment = try std.fmt.allocPrint(allocator, " // ... (truncated at depth {d})", .{max});
             defer allocator.free(truncated_comment);
             try tree_lines.appendSlice(truncated_comment);
             try tree_lines.append('\n');
@@ -59,7 +59,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     }
 
     if (children.items.len > 0) {
-        const child_count_comment = std.fmt.allocPrint(allocator, " // has {d} child branch{s}", .{ children.items.len, if (children.items.len == 1) "" else "es" }) catch return;
+        const child_count_comment = try std.fmt.allocPrint(allocator, " // has {d} child branch{s}", .{ children.items.len, if (children.items.len == 1) "" else "es" });
         defer allocator.free(child_count_comment);
         try tree_lines.appendSlice(child_count_comment);
     }
@@ -69,12 +69,12 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
         const child_node = nodes[child_idx];
         const is_last_child = child_i == children.items.len - 1;
 
-        const indent = createTreeIndent(allocator, depth, is_last_child) catch return;
+        const indent = try createTreeIndent(allocator, depth, is_last_child);
         defer allocator.free(indent);
 
         // Check for missing slots between parent and child
         if (child_node.slot > node.slot + 1) {
-            const missing_line = std.fmt.allocPrint(allocator, "{s}[slots {d}..{d}] ─┘ ", .{ indent, node.slot + 1, child_node.slot - 1 }) catch return;
+            const missing_line = try std.fmt.allocPrint(allocator, "{s}[slots {d}..{d}] ─┘ ", .{ indent, node.slot + 1, child_node.slot - 1 });
             defer allocator.free(missing_line);
             try tree_lines.appendSlice(missing_line);
         } else {
@@ -102,4 +102,3 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
 
     return indent.toOwnedSlice();
 }
-
