@@ -104,4 +104,19 @@ test "Mock messaging across two subscribers" {
         .onGossipCb = subscriber2_callback,
     });
 
+    // Create a simple block message
+    const block_message = try allocator.create(interface.GossipMessage);
+    defer allocator.destroy(block_message);
+    block_message.* = .{ .block = .{
+        .message = .{
+            .slot = 1,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body = .{
+                .attestations = &[_]types.SignedVote{},
+            },
+        },
+        .signature = [_]u8{3} ** types.SIGSIZE,
+    } };
 }
