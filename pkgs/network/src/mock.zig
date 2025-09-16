@@ -57,5 +57,14 @@ pub const Mock = struct {
 };
 
 test "Mock messaging across two subscribers" {
-    
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger = zeam_utils.getTestLogger();
+    var mock = try Mock.init(allocator, &loop, &logger);
+
 }
