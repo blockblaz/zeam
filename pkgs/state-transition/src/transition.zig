@@ -260,8 +260,8 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
     // Update justifications lists
     // Clear existing lists
-    state.justifications_roots = try ssz.utils.List(types.Root, params.MAX_JUSTIFICATION_ROOTS).init(0);
-    state.justifications_validators = try ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS).init(0);
+    state.justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(0);
+    state.justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(0);
 
     // Populate justifications from map
     var bit_offset: usize = 0;

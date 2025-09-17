@@ -14,8 +14,8 @@ const activePresetValues = @field(presets, @tagName(activePreset));
 pub const SECONDS_PER_SLOT = activePresetValues.SECONDS_PER_SLOT;
 
 // SSZ capacity constants
-pub const MAX_JUSTIFICATION_ROOTS = activePresetValues.MAX_JUSTIFICATION_ROOTS;
-pub const MAX_JUSTIFICATION_VALIDATORS = activePresetValues.MAX_JUSTIFICATION_VALIDATORS;
+pub const HISTORICAL_ROOTS_LIMIT = activePresetValues.HISTORICAL_ROOTS_LIMIT;
+pub const VALIDATOR_REGISTRY_LIMIT = activePresetValues.VALIDATOR_REGISTRY_LIMIT;
 pub const MAX_REQUEST_BLOCKS = activePresetValues.MAX_REQUEST_BLOCKS;
 
 test "test preset loading" {

@@ -19,9 +19,6 @@ pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
 pub const RootHex = [64]u8;
 
-// TODO: move them into params
-pub const MAX_VALIDATORS = 4096;
-pub const HISTORICAL_ROOTS_LIMIT = 262_144;
 
 pub const BeamBlockHeader = struct {
     slot: Slot,
@@ -55,8 +52,8 @@ pub const SignedVote = struct {
     // TODO signature objects to be updated in a followup PR
     signature: Bytes4000,
 };
-pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, MAX_VALIDATORS);
-pub const SignedVotes = ssz.utils.List(SignedVote, MAX_VALIDATORS);
+pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, params.VALIDATOR_REGISTRY_LIMIT);
+pub const SignedVotes = ssz.utils.List(SignedVote, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const BeamBlockBody = struct {
     // some form of APS - to be activated later - disabled for PQ devnet0
@@ -86,9 +83,8 @@ pub const BeamStateConfig = struct {
     genesis_time: u64,
 };
 
-pub const MAX_HISTORICAL_BLOCK_HASHES = 4096;
-pub const HistoricalBlockHashes = ssz.utils.List(Root, MAX_HISTORICAL_BLOCK_HASHES);
-pub const JustifiedSlots = ssz.utils.Bitlist(MAX_HISTORICAL_BLOCK_HASHES);
+pub const HistoricalBlockHashes = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
+pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
 // array of array ssz needs to be also figured out
 // implement justification map as flat array of keys, with flatted corresponding
 // justifications of num_validators each, which isn't an issue for now because
@@ -109,8 +105,8 @@ pub const BeamState = struct {
     justified_slots: JustifiedSlots,
 
     // a flat representation of the justifications map
-    justifications_roots: ssz.utils.List(Root, params.MAX_JUSTIFICATION_ROOTS),
-    justifications_validators: ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS),
+    justifications_roots: ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT),
+    justifications_validators: ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT),
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
@@ -220,11 +216,11 @@ test "ssz seralize/deserialize signed beam block" {
 //         .historical_block_hashes = try HistoricalBlockHashes.init(0),
 //         .justified_slots = try JustifiedSlots.init(0),
 //         .justifications_roots = blk: {
-//             var roots = try ssz.utils.List(Root, params.MAX_JUSTIFICATION_ROOTS).init(0);
+//             var roots = try ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT).init(0);
 //             try roots.append(genesis_root);
 //             break :blk roots;
 //         },
-//         .justifications_validators = try ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS).init(0),
+//         .justifications_validators = try ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT).init(0),
 //         // .justifications = .{
 //         //     .roots = &[_]Root{},
 //         //     .voting_validators = &[_]u8{},
@@ -279,11 +275,11 @@ test "ssz seralize/deserialize signed beam block" {
 //         .historical_block_hashes = try HistoricalBlockHashes.init(0),
 //         .justified_slots = try JustifiedSlots.init(0),
 //         .justifications_roots = blk: {
-//             var roots = try ssz.utils.List(Root, params.MAX_JUSTIFICATION_ROOTS).init(0);
+//             var roots = try ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT).init(0);
 //             try roots.append(genesis_root);
 //             break :blk roots;
 //         },
-//         .justifications_validators = try ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS).init(0),
+//         .justifications_validators = try ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT).init(0),
 //         // .justifications = .{
 //         //     .roots = &[_]Root{},
 //         //     .voting_validators = &[_]u8{},

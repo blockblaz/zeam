@@ -103,8 +103,8 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
         .historical_block_hashes = try types.HistoricalBlockHashes.init(0),
         .justified_slots = try types.JustifiedSlots.init(0),
         // justifications map is empty
-        .justifications_roots = try ssz.utils.List(types.Root, params.MAX_JUSTIFICATION_ROOTS).init(0),
-        .justifications_validators = try ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS).init(0),
+        .justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(0),
+        .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(0),
     };
 
     return state;
