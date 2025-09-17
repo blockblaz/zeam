@@ -369,8 +369,8 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn getProposalVotes(self: *Self) ![]types.SignedVote {
-        var included_votes = std.ArrayList(types.SignedVote).init(self.allocator);
+    pub fn getProposalVotes(self: *Self) !types.SignedVotes {
+        var included_votes = try types.SignedVotes.init(0);
         const latest_justified = self.fcStore.latest_justified;
 
         // TODO naive strategy to include all votes that are consistent with the latest justified
@@ -387,7 +387,7 @@ pub const ForkChoice = struct {
                 }
             }
         }
-        return included_votes.toOwnedSlice();
+        return included_votes;
     }
 
     pub fn getVoteTarget(self: *Self) !types.Mini3SFCheckpoint {

@@ -292,7 +292,7 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. fc onvotes
-        for (block.body.attestations) |signed_vote| {
+        for (block.body.attestations.constSlice()) |signed_vote| {
             self.forkChoice.onAttestation(signed_vote, true) catch |e| {
                 self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };
