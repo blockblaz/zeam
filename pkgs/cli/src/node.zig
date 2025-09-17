@@ -78,7 +78,8 @@ pub const Node = struct {
         chain_options.genesis_time = options.genesis_spec.genesis_time;
         chain_options.num_validators = options.genesis_spec.num_validators;
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-        const anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
+        var anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
+        errdefer anchorState.deinit(allocator);
 
         // TODO we seem to be needing one loop because then the events added to loop are not being fired
         // in the order to which they have been added even with the an appropriate delay added
@@ -95,7 +96,10 @@ pub const Node = struct {
         defer node_multiaddrs.deinit(allocator);
         // move the ownership to the `EthLibp2p`, will be freed in its deinit
         const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
-
+        errdefer {
+            for (listen_addresses) |addr| addr.deinit();
+            allocator.free(listen_addresses);
+        }
         var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
         defer connect_peer_list.deinit(allocator);
 
@@ -113,12 +117,16 @@ pub const Node = struct {
 
         // move the ownership to the `EthLibp2p`, will be freed in its deinit
         const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
-
+        errdefer {
+            for (connect_peers) |addr| addr.deinit();
+            allocator.free(connect_peers);
+        }
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger);
-
+        errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        errdefer self.clock.deinit(allocator);
 
-        const beam_node = try BeamNode.init(allocator, .{
+        self.beam_node = try BeamNode.init(allocator, .{
             // options
             .nodeId = node_id,
             .config = chain_config,
@@ -129,8 +137,6 @@ pub const Node = struct {
             .validator_ids = options.validator_indices,
             .logger = options.logger,
         });
-
-        self.beam_node = beam_node;
     }
 
     pub fn deinit(self: *Self) void {
@@ -202,11 +208,20 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
     defer parsed_validators.deinit(allocator);
 
     const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
-
+    errdefer {
+        for (bootnodes) |b| allocator.free(b);
+        allocator.free(bootnodes);
+    }
+    if (bootnodes.len == 0) {
+        return error.InvalidNodesConfig;
+    }
     const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, node_cmd.override_genesis_time);
 
     const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_id, parsed_validators);
-
+    errdefer allocator.free(validator_indices);
+    if (validator_indices.len == 0) {
+        return error.InvalidValidatorConfig;
+    }
     try utils_lib.checkDIRExists(node_cmd.network_dir);
     const local_priv_key_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.network_dir, "/key" });
     defer allocator.free(local_priv_key_filepath);
