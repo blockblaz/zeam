@@ -19,6 +19,7 @@ const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
 const Logger = utils_lib.ZeamLogger;
+const NodeCommand = @import("main.zig").NodeCommand;
 
 const prefix = "zeam_";
 
@@ -29,35 +30,29 @@ pub const StartNodeOptions = struct {
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
     metrics_port: u16,
+    local_priv_key: []const u8,
     logger: *Logger,
 
     pub fn deinit(self: *StartNodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
         allocator.free(self.bootnodes);
         allocator.free(self.validator_indices);
+        allocator.free(self.local_priv_key);
     }
 };
 
-/// Loads the genesis configuration, bootnodes, and validator indices from the specified directory.
-/// The directory should contain the following files:
-/// - `config.yaml`: Contains the genesis configuration.
-/// - `nodes.yaml`: Contains the bootnodes in ENR format.
-/// - `validators.yaml`: Contains the validator indices for each node.
-/// The function updates the provided `StartNodeOptions` with the loaded data.
-pub fn loadGenesisConfig(allocator: std.mem.Allocator, path: []const u8, override_genesis_time: ?u64, opts: *StartNodeOptions) !void {
-    if (std.fs.path.isAbsolute(path)) {
-        var dir = try std.fs.openDirAbsolute(path, .{});
-        defer dir.close();
-    } else {
-        var dir = try std.fs.cwd().openDir(path, .{});
-        defer dir.close();
-    }
+/// Builds the start options for a node based on the provided command and options.
+/// It loads the necessary configuration files, parses them, and populates the
+/// `StartNodeOptions` structure.
+/// The caller is responsible for freeing the allocated resources in `StartNodeOptions`.
+pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, opts: *StartNodeOptions) !void {
+    try utils_lib.checkDIRExists(node_cmd.custom_genesis);
 
-    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ path, "/config.yaml" });
+    const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
     defer allocator.free(config_filepath);
-    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ path, "/nodes.yaml" });
+    const bootnodes_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/nodes.yaml" });
     defer allocator.free(bootnodes_filepath);
-    const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ path, "/validators.yaml" });
+    const validators_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/validators.yaml" });
     defer allocator.free(validators_filepath);
     // TODO: support genesis file loading when ssz library supports it
     // const genesis_filepath = try std.mem.concat(allocator, &[_][]const u8{custom_genesis, "/genesis.ssz"});
@@ -74,13 +69,19 @@ pub fn loadGenesisConfig(allocator: std.mem.Allocator, path: []const u8, overrid
 
     const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
 
-    const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, override_genesis_time);
+    const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, node_cmd.override_genesis_time);
 
     const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_id, parsed_validators);
 
+    try utils_lib.checkDIRExists(node_cmd.network_dir);
+    const local_priv_key_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.network_dir, "/key" });
+    defer allocator.free(local_priv_key_filepath);
+    const local_priv_key = try utils_lib.readFileToEndAlloc(allocator, local_priv_key_filepath, 512);
+
     opts.bootnodes = bootnodes;
-    opts.genesis_spec = genesis_spec;
     opts.validator_indices = validator_indices;
+    opts.local_priv_key = local_priv_key;
+    opts.genesis_spec = genesis_spec;
 }
 
 /// Starts a node with the given options.
@@ -155,7 +156,7 @@ pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions)
         allocator.free(connect_peers);
     }
 
-    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers }, options.logger);
+    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger);
     try network.run();
     const backend = network.getNetworkInterface();
 

@@ -329,6 +329,14 @@ pub fn build(b: *Builder) !void {
     const run_configs_tests = b.addRunArtifact(configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
+    const utils_tests = b.addTest(.{
+        .root_module = zeam_utils,
+        .optimize = optimize,
+        .target = target,
+    });
+    const run_utils_tests = b.addRunArtifact(utils_tests);
+    test_step.dependOn(&run_utils_tests.step);
+
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
 

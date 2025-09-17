@@ -28,6 +28,31 @@ const networks = @import("@zeam/network");
 const generatePrometheusConfig = @import("prometheus.zig").generatePrometheusConfig;
 const yaml = @import("yaml");
 const node = @import("node.zig");
+const enr_lib = @import("enr");
+
+pub const NodeCommand = struct {
+    help: bool = false,
+    custom_genesis: []const u8,
+    node_id: u32 = 0,
+    metrics_enable: bool = false,
+    metrics_port: u16 = 9667,
+    override_genesis_time: ?u64,
+    network_dir: []const u8 = "./network",
+
+    pub const __shorts__ = .{
+        .help = .h,
+    };
+
+    pub const __messages__ = .{
+        .custom_genesis = "Custom genesis directory path",
+        .node_id = "Node id for this lean node",
+        .metrics_port = "Port to use for publishing metrics",
+        .metrics_enable = "Enable metrics endpoint",
+        .network_dir = "Directory to store network related information, e.g., peer ids, keys, etc.",
+        .override_genesis_time = "Override genesis time in the config.yaml",
+        .help = "Show help information for the node command",
+    };
+};
 
 const ZeamArgs = struct {
     genesis: u64 = 1234,
@@ -90,26 +115,7 @@ const ZeamArgs = struct {
                 };
             },
         },
-        node: struct {
-            help: bool = false,
-            custom_genesis: []const u8,
-            override_genesis_time: ?u64,
-            node_id: u32 = 0,
-            metrics_enable: bool = false,
-            metrics_port: u16 = 9667,
-
-            pub const __shorts__ = .{
-                .help = .h,
-            };
-
-            pub const __messages__ = .{
-                .custom_genesis = "Custom genesis directory path",
-                .override_genesis_time = "Override genesis time in the config.yaml",
-                .node_id = "Node id for this lean node",
-                .metrics_port = "Port to use for publishing metrics",
-                .metrics_enable = "Enable metrics endpoint",
-            };
-        },
+        node: NodeCommand,
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
@@ -251,21 +257,25 @@ pub fn main() !void {
                 logger1.debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                const key_pair1 = enr_lib.KeyPair.generate();
+                const priv_key1 = key_pair1.v4.toString();
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
                 // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 defer for (listen_addresses1) |addr| addr.deinit();
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses1, .connect_peers = null }, &logger1);
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, &logger1);
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
                 var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                const key_pair2 = enr_lib.KeyPair.generate();
+                const priv_key2 = key_pair2.v4.toString();
                 // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 const listen_addresses2 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")};
                 defer for (listen_addresses2) |addr| addr.deinit();
                 const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
                 defer for (connect_peers) |addr| addr.deinit();
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, &logger2);
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, &logger2);
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
                 logger1.debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
@@ -314,30 +324,22 @@ pub fn main() !void {
             },
         },
         .node => |leancmd| {
-            const custom_genesis = leancmd.custom_genesis;
-            // check if custom_genesis directory exists
-            if (std.fs.path.isAbsolute(custom_genesis)) {
-                var dir = try std.fs.openDirAbsolute(custom_genesis, .{});
-                defer dir.close();
-            } else {
-                var dir = try std.fs.cwd().openDir(custom_genesis, .{});
-                defer dir.close();
-            }
-
             var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
-            var start_options = node.StartNodeOptions{
+            var start_options: node.StartNodeOptions = .{
                 .node_id = leancmd.node_id,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
                 .bootnodes = undefined,
                 .genesis_spec = undefined,
                 .validator_indices = undefined,
+                .local_priv_key = undefined,
                 .logger = &logger,
             };
+
             defer start_options.deinit(allocator);
 
-            try node.loadGenesisConfig(allocator, custom_genesis, leancmd.override_genesis_time, &start_options);
+            try node.buildStartOptions(allocator, leancmd, &start_options);
 
             try node.startNode(allocator, &start_options);
         },

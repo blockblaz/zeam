@@ -141,13 +141,13 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 }
 
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: *zeam_utils.ZeamLogger) !void {
-    logger.debug("\n\n===================\nprocess opetationg slot={d} \n prestate:historical hashes={d} justified slots ={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len() });
-    logger.debug("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized });
+    logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
+    logger.debug("prestate justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 
     // work directly with SSZ types
     // historical_block_hashes and justified_slots are already SSZ types in state
 
-    // prep the justifications map - simplified for SSZ Bitlist migration
+    // prep the justifications map
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
     defer {
         var iterator = justifications.iterator();
@@ -158,14 +158,17 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     }
     const num_validators: usize = @intCast(state.config.num_validators);
 
-    // TODO: This is a simplified implementation for SSZ migration
-    // The original logic was more complex but needs redesign for Bitlist
-    // For now, create empty entries for each justification root
-    for (state.justifications_roots.constSlice()) |blockRoot| {
+    // Initialize justifications from state
+    for (state.justifications_roots.constSlice(), 0..) |blockRoot, i| {
         const validator_data = try allocator.alloc(u8, num_validators);
-        // Initialize all as not participating for now
-        for (validator_data) |*byte| {
-            byte.* = 0;
+        // Copy existing justification data if available, otherwise initialize as empty
+        for (validator_data, 0..) |*byte, j| {
+            const bit_index = i * num_validators + j;
+            if (bit_index < state.justifications_validators.len()) {
+                byte.* = if (state.justifications_validators.get(bit_index)) 1 else 0;
+            } else {
+                byte.* = 0;
+            }
         }
         try justifications.put(blockRoot, validator_data);
     }
@@ -255,18 +258,27 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         }
     }
 
-    // Update SSZ justifications directly
-    // TODO: Clear and rebuild the SSZ Lists
-    // For now, simplified implementation for SSZ migration
+    // Update justifications lists
+    // Clear existing lists
+    state.justifications_roots = try ssz.utils.List(types.Root, params.MAX_JUSTIFICATION_ROOTS).init(0);
+    state.justifications_validators = try ssz.utils.Bitlist(params.MAX_JUSTIFICATION_VALIDATORS).init(0);
+
+    // Populate justifications from map
+    var bit_offset: usize = 0;
     var iterator = justifications.iterator();
     while (iterator.next()) |kv| {
         try state.justifications_roots.append(kv.key_ptr.*);
-        // TODO: Convert validator data back to Bitlist format
-        // For now, simplified - actual implementation needs bit conversion
+        // Set individual bits for validator justifications
+        for (kv.value_ptr.*, 0..) |validator_bit, j| {
+            if (validator_bit == 1) {
+                state.justifications_validators.set(bit_offset + j, true);
+            }
+        }
+        bit_offset += num_validators;
     }
 
-    logger.debug("\n---------------\npoststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators= {d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
-    logger.debug("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized });
+    logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
+    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
