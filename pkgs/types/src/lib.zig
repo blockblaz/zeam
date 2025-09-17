@@ -122,6 +122,13 @@ pub const BeamState = struct {
     // a flat representation of the justifications map
     justifications_roots: []Root,
     justifications_validators: []u8,
+
+    pub fn deinit(self: *BeamState, allocator: Allocator) void {
+        // historical_block_hashes and justified_slots are slices so need to be freed
+        //justifications_roots and justifications_validators not freed for now as they are not allocated
+        allocator.free(self.historical_block_hashes);
+        allocator.free(self.justified_slots);
+    }
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries

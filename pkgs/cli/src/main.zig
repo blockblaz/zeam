@@ -326,7 +326,7 @@ pub fn main() !void {
         .node => |leancmd| {
             var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
-            var start_options: node.StartNodeOptions = .{
+            var start_options: node.NodeOptions = .{
                 .node_id = leancmd.node_id,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
@@ -341,7 +341,11 @@ pub fn main() !void {
 
             try node.buildStartOptions(allocator, leancmd, &start_options);
 
-            try node.startNode(allocator, &start_options);
+            var lean_node: node.Node = undefined;
+
+            try node.Node.init(&lean_node, allocator, &start_options);
+            defer lean_node.deinit();
+            try lean_node.run();
         },
     }
 }

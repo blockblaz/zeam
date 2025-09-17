@@ -132,6 +132,16 @@ pub const EthLibp2p = struct {
         return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger), .logger = logger };
     }
 
+    pub fn deinit(self: *Self) void {
+        for (self.params.listen_addresses) |addr| addr.deinit();
+        self.allocator.free(self.params.listen_addresses);
+
+        if (self.params.connect_peers) |peers| {
+            for (peers) |addr| addr.deinit();
+            self.allocator.free(peers);
+        }
+    }
+
     pub fn run(self: *Self) !void {
         const listen_addresses_str = try multiaddrsToString(self.allocator, self.params.listen_addresses);
         const connect_peers_str = if (self.params.connect_peers) |peers|

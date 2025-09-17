@@ -57,6 +57,14 @@ pub const BeamChain = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        var it = self.states.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.states.deinit();
+    }
+
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
         // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
