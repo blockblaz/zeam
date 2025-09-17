@@ -45,6 +45,7 @@ test "apply transition on mocked chain" {
     try std.testing.expect(mock_chain.blocks.len == 5);
 
     var logger = zeam_utils.getTestLogger();
+    const child_logger = logger.child(.state_transition);
 
     // starting beam state
     var beam_state = mock_chain.genesis_state;
@@ -52,7 +53,7 @@ test "apply transition on mocked chain" {
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+        try apply_transition(allocator, &beam_state, block, .{ .logger = &logger, .child_logger = child_logger });
     }
 
     // check the post state root to be equal to block2's stateroot
@@ -75,6 +76,7 @@ test "genStateBlockHeader" {
 
     const mock_chain = try genMockChain(allocator, 2, test_config);
     var logger = zeam_utils.getTestLogger();
+    const child_logger = logger.child(.state_transition);
 
     var beam_state = mock_chain.genesis_state;
     for (0..mock_chain.blocks.len) |i| {
@@ -92,7 +94,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+            try apply_transition(allocator, &beam_state, block, .{ .logger = &logger, .child_logger = child_logger });
         }
     }
 }

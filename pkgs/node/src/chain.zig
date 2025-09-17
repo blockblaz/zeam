@@ -32,6 +32,7 @@ pub const BeamChain = struct {
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
     logger: *zeam_utils.ZeamLogger,
+    child_logger: zeam_utils.ChildLogger,
     registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
@@ -54,6 +55,7 @@ pub const BeamChain = struct {
             .allocator = allocator,
             .states = states,
             .logger = logger,
+            .child_logger = logger.child(.chain),
         };
     }
 
@@ -68,6 +70,7 @@ pub const BeamChain = struct {
         // forkchoice head
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+
         var has_proposal = false;
         if (interval == 0) {
             const num_validators: usize = @intCast(self.config.genesis.num_validators);
@@ -78,7 +81,7 @@ pub const BeamChain = struct {
             }
         }
 
-        self.logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
+        self.child_logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
             time_intervals,
             slot,
             interval,
@@ -93,7 +96,7 @@ pub const BeamChain = struct {
         }
         // check if log rotation is needed
         self.logger.maybeRotate() catch |err| {
-            self.logger.err("error rotating log file: {any}", .{err});
+            self.child_logger.err("error rotating log file: {any}", .{err});
         };
     }
 
@@ -123,11 +126,11 @@ pub const BeamChain = struct {
             },
         };
 
-        self.logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
+        self.child_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, &post_state, &block, self.logger);
-        self.logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
+        try stf.apply_raw_block(self.allocator, &post_state, &block, self.child_logger);
+        self.child_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -175,7 +178,7 @@ pub const BeamChain = struct {
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
         const fc_head = self.forkChoice.updateHead() catch |err| {
-            self.logger.err("forkchoice updatehead error={any}", .{err});
+            self.child_logger.err("forkchoice updatehead error={any}", .{err});
             return;
         };
 
@@ -187,7 +190,7 @@ pub const BeamChain = struct {
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
-        self.logger.info(
+        self.child_logger.info(
             \\
             \\+===============================================================+
             \\                         CHAIN STATUS                            
@@ -227,7 +230,7 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                self.logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
+                self.child_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
                     //
                     signed_block,
                     block_root,
@@ -236,10 +239,10 @@ pub const BeamChain = struct {
 
                 if (!hasBlock) {
                     const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
-                    self.logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
+                    self.child_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
                     if (hasParentBlock) {
                         self.onBlock(signed_block, null) catch |err| {
-                            self.logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                            self.child_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
                         };
                     }
                 }
@@ -247,7 +250,7 @@ pub const BeamChain = struct {
             .vote => |signed_vote| {
                 const vote = signed_vote.message;
                 const hasHead = self.forkChoice.hasBlock(vote.head.root);
-                self.logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
+                self.child_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
                     //
                     signed_vote,
                     hasHead,
@@ -255,7 +258,7 @@ pub const BeamChain = struct {
 
                 if (hasHead) {
                     self.onAttestation(signed_vote) catch |err| {
-                        self.logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
+                        self.child_logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
                     };
                 }
             },
@@ -281,6 +284,7 @@ pub const BeamChain = struct {
             try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
                 //
                 .logger = self.logger,
+                .child_logger = self.child_logger,
                 .validSignatures = validSignatures,
             });
             break :computedstate cpost_state;
@@ -294,7 +298,7 @@ pub const BeamChain = struct {
         // 4. fc onvotes
         for (block.body.attestations) |signed_vote| {
             self.forkChoice.onAttestation(signed_vote, true) catch |e| {
-                self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+                self.child_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };
         }
 

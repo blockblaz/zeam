@@ -170,6 +170,7 @@ pub fn main() !void {
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
             var logger = utils_lib.getLogger(null, null);
+            const child_logger = logger.child(.state_proving_manager);
 
             const options = state_proving_manager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -177,6 +178,7 @@ pub fn main() !void {
                     .powdr => return error.PowdrIsDeprecated,
                 },
                 .logger = &logger,
+                .child_logger = child_logger,
             };
 
             // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
@@ -193,7 +195,7 @@ pub fn main() !void {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
                 const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger, .child_logger = child_logger });
 
                 // verify the block
                 try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);

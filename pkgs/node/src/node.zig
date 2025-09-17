@@ -37,6 +37,7 @@ pub const BeamNode = struct {
     validator: ?validators.BeamValidator = null,
     nodeId: u32,
     logger: *const zeam_utils.ZeamLogger,
+    child_logger: zeam_utils.ChildLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -59,6 +60,7 @@ pub const BeamNode = struct {
             .validator = validator,
             .nodeId = opts.nodeId,
             .logger = opts.logger,
+            .child_logger = opts.logger.child(.node),
         };
     }
 
@@ -91,7 +93,7 @@ pub const BeamNode = struct {
         const interval: usize = @intCast(iinterval);
 
         self.chain.onInterval(interval) catch |e| {
-            self.logger.err("Error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+            self.child_logger.err("Error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
             // no point going further if chain is not ticked properly
             return e;
         };
@@ -99,7 +101,7 @@ pub const BeamNode = struct {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
             validator.onInterval(interval) catch |e| {
-                self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                self.child_logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
         }
