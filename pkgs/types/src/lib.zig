@@ -125,7 +125,7 @@ pub const BeamState = struct {
 
     pub fn deinit(self: *BeamState, allocator: Allocator) void {
         // historical_block_hashes and justified_slots are slices so need to be freed
-        //justifications_roots and justifications_validators not freed for now as they are not allocated
+        // justifications_roots and justifications_validators not freed for now as they are not allocated
         allocator.free(self.historical_block_hashes);
         allocator.free(self.justified_slots);
     }
