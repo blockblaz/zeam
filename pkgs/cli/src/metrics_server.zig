@@ -5,6 +5,7 @@ const metrics = @import("@zeam/metrics");
 pub fn startMetricsServer(allocator: std.mem.Allocator, port: u16) !void {
     // Create a simple HTTP server context
     const ctx = try allocator.create(SimpleMetricsServer);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .port = port,
