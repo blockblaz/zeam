@@ -161,14 +161,13 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     // Initialize justifications from state
     for (state.justifications_roots.constSlice(), 0..) |blockRoot, i| {
         const validator_data = try allocator.alloc(u8, num_validators);
-        // Copy existing justification data if available, otherwise initialize as empty
+        // Copy existing justification data if available, otherwise return error
         for (validator_data, 0..) |*byte, j| {
             const bit_index = i * num_validators + j;
-            if (bit_index < state.justifications_validators.len()) {
-                byte.* = if (state.justifications_validators.get(bit_index)) 1 else 0;
-            } else {
-                byte.* = 0;
+            if (bit_index >= state.justifications_validators.len()) {
+                return StateTransitionError.InvalidJustificationIndex;
             }
+            byte.* = if (state.justifications_validators.get(bit_index)) 1 else 0;
         }
         try justifications.put(blockRoot, validator_data);
     }
@@ -181,10 +180,23 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         const target_slot: usize = @intCast(vote.target.slot);
         logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
 
-        const is_source_justified = if (source_slot < state.justified_slots.len()) state.justified_slots.get(source_slot) else false;
-        const is_target_already_justified = if (target_slot < state.justified_slots.len()) state.justified_slots.get(target_slot) else false;
-        const has_correct_source_root = if (source_slot < state.historical_block_hashes.len()) std.mem.eql(u8, &vote.source.root, &state.historical_block_hashes.get(source_slot)) else false;
-        const has_correct_target_root = if (target_slot < state.historical_block_hashes.len()) std.mem.eql(u8, &vote.target.root, &state.historical_block_hashes.get(target_slot)) else false;
+        if (source_slot >= state.justified_slots.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (target_slot >= state.justified_slots.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (source_slot >= state.historical_block_hashes.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (target_slot >= state.historical_block_hashes.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+
+        const is_source_justified = state.justified_slots.get(source_slot);
+        const is_target_already_justified = state.justified_slots.get(target_slot);
+        const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &state.historical_block_hashes.get(source_slot));
+        const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &state.historical_block_hashes.get(target_slot));
         const target_not_ahead = target_slot <= source_slot;
         const is_target_justifiable = try is_justifiable_slot(state.latest_finalized.slot, target_slot);
 
@@ -261,7 +273,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     // Update justifications lists
     // Clear existing lists
     state.justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(0);
-    state.justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(0);
+    state.justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
 
     // Populate justifications from map
     var bit_offset: usize = 0;
@@ -337,4 +349,4 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 }
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex };
