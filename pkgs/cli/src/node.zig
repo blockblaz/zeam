@@ -86,42 +86,8 @@ pub const Node = struct {
         // behavior of this further needs to be investigated but for now we will share the same loop
         self.loop = try xev.Loop.init(.{});
 
-        const self_node_index = options.validator_indices[0];
-        try ENR.decodeTxtInto(&self.enr, options.bootnodes[self_node_index]);
-
-        // Overriding the IP to 0.0.0.0 to listen on all interfaces
-        try self.enr.kvs.put("ip", "\x00\x00\x00\x00");
-
-        var node_multiaddrs = try self.enr.multiaddrP2PQUIC(allocator);
-        defer node_multiaddrs.deinit(allocator);
-        // move the ownership to the `EthLibp2p`, will be freed in its deinit
-        const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
-        errdefer {
-            for (listen_addresses) |addr| addr.deinit();
-            allocator.free(listen_addresses);
-        }
-        var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
-        defer connect_peer_list.deinit(allocator);
-
-        for (options.bootnodes, 0..) |n, i| {
-            if (i != self_node_index) {
-                var n_enr: ENR = undefined;
-                try ENR.decodeTxtInto(&n_enr, n);
-                var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(allocator);
-                defer peer_multiaddr_list.deinit(allocator);
-                const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(allocator);
-                defer allocator.free(peer_multiaddrs);
-                try connect_peer_list.appendSlice(allocator, peer_multiaddrs);
-            }
-        }
-
-        // move the ownership to the `EthLibp2p`, will be freed in its deinit
-        const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
-        errdefer {
-            for (connect_peers) |addr| addr.deinit();
-            allocator.free(connect_peers);
-        }
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger);
+        const addresses = try self.constructMultiaddrs();
+        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = addresses.listen_addresses, .connect_peers = addresses.connect_peers, .local_private_key = options.local_priv_key }, options.logger);
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
         errdefer self.clock.deinit(allocator);
@@ -179,6 +145,46 @@ pub const Node = struct {
         self.options.logger.info("────────────────────────────────────────────────────────", .{});
 
         try self.clock.run();
+    }
+
+    fn constructMultiaddrs(self: *Self) !struct { listen_addresses: []const Multiaddr, connect_peers: []const Multiaddr } {
+        const self_node_index = self.options.validator_indices[0];
+        try ENR.decodeTxtInto(&self.enr, self.options.bootnodes[self_node_index]);
+
+        // Overriding the IP to 0.0.0.0 to listen on all interfaces
+        try self.enr.kvs.put("ip", "\x00\x00\x00\x00");
+
+        var node_multiaddrs = try self.enr.multiaddrP2PQUIC(self.allocator);
+        defer node_multiaddrs.deinit(self.allocator);
+        // move the ownership to the `EthLibp2p`, will be freed in its deinit
+        const listen_addresses = try node_multiaddrs.toOwnedSlice(self.allocator);
+        errdefer {
+            for (listen_addresses) |addr| addr.deinit();
+            self.allocator.free(listen_addresses);
+        }
+        var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
+        defer connect_peer_list.deinit(self.allocator);
+
+        for (self.options.bootnodes, 0..) |n, i| {
+            if (i != self_node_index) {
+                var n_enr: ENR = undefined;
+                try ENR.decodeTxtInto(&n_enr, n);
+                var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(self.allocator);
+                defer peer_multiaddr_list.deinit(self.allocator);
+                const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(self.allocator);
+                defer self.allocator.free(peer_multiaddrs);
+                try connect_peer_list.appendSlice(self.allocator, peer_multiaddrs);
+            }
+        }
+
+        // move the ownership to the `EthLibp2p`, will be freed in its deinit
+        const connect_peers = try connect_peer_list.toOwnedSlice(self.allocator);
+        errdefer {
+            for (connect_peers) |addr| addr.deinit();
+            self.allocator.free(connect_peers);
+        }
+
+        return .{ .listen_addresses = listen_addresses, .connect_peers = connect_peers };
     }
 };
 
@@ -241,7 +247,7 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
 ///   - enr2...
 /// ```
 /// Returns a set of ENR strings. The caller is responsible for freeing the returned slice.
-pub fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
+fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
     const temp_nodes = try nodes_config.parse(allocator, [][]const u8);
     defer allocator.free(temp_nodes);
 
@@ -270,7 +276,7 @@ pub fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const 
 /// ```
 /// where `node_{node_id}` is the key for the node's validator indices.
 /// Returns a set of validator indices. The caller is responsible for freeing the returned slice.
-pub fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: Yaml) ![]usize {
+fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: Yaml) ![]usize {
     var validator_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer validator_indices.deinit(allocator);
 
