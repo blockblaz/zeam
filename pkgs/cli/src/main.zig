@@ -343,7 +343,7 @@ pub fn main() !void {
 
             var lean_node: node.Node = undefined;
 
-            try node.Node.init(&lean_node, allocator, &start_options);
+            try lean_node.init(allocator, &start_options);
             defer lean_node.deinit();
             try lean_node.run();
         },
