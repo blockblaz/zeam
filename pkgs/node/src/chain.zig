@@ -14,6 +14,7 @@ const zeam_utils = @import("@zeam/utils");
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
+const tree_visualizer = @import("./tree_visualizer.zig");
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -89,7 +90,7 @@ pub const BeamChain = struct {
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
-            self.printSlot(slot);
+            self.printSlot(slot, null);
         }
         // check if log rotation is needed
         self.logger.maybeRotate() catch |err| {
@@ -170,7 +171,7 @@ pub const BeamChain = struct {
         return self.onAttestation(signedVote);
     }
 
-    pub fn printSlot(self: *Self, slot: usize) void {
+    pub fn printSlot(self: *Self, slot: usize, tree_depth: ?usize) void {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
@@ -187,6 +188,11 @@ pub const BeamChain = struct {
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
+        // Build tree visualization
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const tree_visual = tree_visualizer.buildTreeVisualization(arena.allocator(), self.forkChoice.protoArray.nodes.items, tree_depth) catch "Tree visualization failed";
+
         self.logger.info(
             \\
             \\+===============================================================+
@@ -201,6 +207,9 @@ pub const BeamChain = struct {
             \\+---------------------------------------------------------------+
             \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
             \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\+---------------------------------------------------------------+
+            \\  ForkChoice Tree:
+            \\{s}
             \\+===============================================================+
             \\
         , .{
@@ -215,6 +224,7 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&justified.root),
             finalized.slot,
             std.fmt.fmtSliceHexLower(&finalized.root),
+            tree_visual,
         });
     }
 
@@ -413,16 +423,16 @@ test "printSlot output demonstration" {
 
     // Test printSlot at different slots to see the output
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
-    beam_chain.printSlot(0);
+    beam_chain.printSlot(0, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
-    beam_chain.printSlot(1);
+    beam_chain.printSlot(1, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
-    beam_chain.printSlot(2);
+    beam_chain.printSlot(2, null);
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
-    beam_chain.printSlot(5);
+    beam_chain.printSlot(5, null);
 
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
