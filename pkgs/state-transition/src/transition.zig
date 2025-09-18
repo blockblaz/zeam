@@ -269,10 +269,23 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
     var justifications_roots = std.ArrayList(types.Root).init(allocator);
     var justifications_validators = std.ArrayList(u8).init(allocator);
+
+    // First, collect all keys
     var iterator = justifications.iterator();
     while (iterator.next()) |kv| {
         try justifications_roots.append(kv.key_ptr.*);
-        try justifications_validators.appendSlice(kv.value_ptr.*);
+    }
+
+    // Sort the roots
+    std.mem.sortUnstable(types.Root, justifications_roots.items, {}, struct {
+        fn lessThanFn(_: void, a: types.Root, b: types.Root) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lessThanFn);
+
+    // Now iterate over sorted roots and flatten validators in order
+    for (justifications_roots.items) |root| {
+        try justifications_validators.appendSlice(justifications.get(root) orelse unreachable);
     }
 
     allocator.free(state.justifications_roots);
