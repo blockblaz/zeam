@@ -160,6 +160,7 @@ pub const Node = struct {
             \\  ███████╗███████╗██║  ██║██║ ╚═╝ ██║
             \\  ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝
             \\
+            \\ a blazing fast lean consensus client
         ;
 
         var encoded_txt_buf: [1000]u8 = undefined;
