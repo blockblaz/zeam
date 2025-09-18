@@ -3,6 +3,7 @@ use futures::StreamExt;
 use libp2p::core::{
     multiaddr::Multiaddr, multiaddr::Protocol, muxing::StreamMuxerBox, transport::Boxed,
 };
+
 use libp2p::identity::{secp256k1, Keypair};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
@@ -10,13 +11,11 @@ use libp2p::{
 };
 use std::os::raw::c_char;
 use std::time::Duration;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 use tokio::runtime::Builder;
 
-use std::ffi::CString;
+use sha2::Digest;
+use snap::raw::Decoder;
+use std::ffi::{CStr, CString};
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
@@ -34,30 +33,52 @@ static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 pub unsafe fn create_and_run_network(
     network_id: u32,
     zig_handler: u64,
+    local_private_key: *const c_char,
     listen_addresses: *const c_char,
     connect_addresses: *const c_char,
 ) {
-    let listen_multiaddrs = std::ffi::CStr::from_ptr(listen_addresses)
+    let listen_multiaddrs = CStr::from_ptr(listen_addresses)
         .to_string_lossy()
         .split(",")
         .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
         .collect::<Vec<_>>();
 
-    let connect_multiaddrs = std::ffi::CStr::from_ptr(connect_addresses)
+    let connect_multiaddrs = CStr::from_ptr(connect_addresses)
         .to_string_lossy()
         .split(",")
         .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
         .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
         .collect::<Vec<_>>();
 
-    releaseAddresses(zig_handler, listen_addresses, connect_addresses);
+    let local_private_key_hex = CStr::from_ptr(local_private_key)
+        .to_string_lossy()
+        .into_owned();
+
+    let private_key_hex = local_private_key_hex
+        .strip_prefix("0x")
+        .unwrap_or(&local_private_key_hex);
+
+    let mut private_key_bytes =
+        hex::decode(private_key_hex).expect("Invalid hex string for private key");
+
+    let local_key_pair = Keypair::from(secp256k1::Keypair::from(
+        secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes)
+            .expect("Invalid private key bytes"),
+    ));
+
+    releaseStartNetworkParams(
+        zig_handler,
+        local_private_key,
+        listen_addresses,
+        connect_addresses,
+    );
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
         p2p_net
-            .start_network(listen_multiaddrs, connect_multiaddrs)
+            .start_network(local_key_pair, listen_multiaddrs, connect_multiaddrs)
             .await;
         p2p_net.run_eventloop().await;
     });
@@ -87,9 +108,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
         return;
     }
 
-    let topic = std::ffi::CStr::from_ptr(topic)
-        .to_string_lossy()
-        .to_string();
+    let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
     let topic = gossipsub::IdentTopic::new(topic);
 
     #[allow(static_mut_refs)]
@@ -118,8 +137,9 @@ extern "C" {
 }
 
 extern "C" {
-    fn releaseAddresses(
+    fn releaseStartNetworkParams(
         zig_handler: u64,
+        local_private_key: *const c_char,
         listen_addresses: *const c_char,
         connect_addresses: *const c_char,
     );
@@ -141,10 +161,11 @@ impl Network {
 
     pub async fn start_network(
         &mut self,
+        key_pair: Keypair,
         listen_addresses: Vec<Multiaddr>,
         connect_addresses: Vec<Multiaddr>,
     ) {
-        let mut swarm = new_swarm();
+        let mut swarm = new_swarm(key_pair);
         println!("starting listener");
 
         for mut addr in listen_addresses {
@@ -239,15 +260,44 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)] // store as 4-byte value
+pub enum MessageDomain {
+    ValidSnappy = 0x01000000,
+    InvalidSnappy = 0x00000000,
+}
+
+impl From<MessageDomain> for [u8; 4] {
+    fn from(domain: MessageDomain) -> Self {
+        (domain as u32).to_be_bytes()
+    }
+}
+
 impl Behaviour {
+    fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
+        // Try to decompress; fallback to raw data
+        let (data_for_hash, domain): (Vec<u8>, [u8; 4]) =
+            match Decoder::new().decompress_vec(&message.data) {
+                Ok(decoded) => (decoded, MessageDomain::ValidSnappy.into()),
+                Err(_) => (message.data.clone(), MessageDomain::InvalidSnappy.into()),
+            };
+
+        // Prepare hashing
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(domain);
+        hasher.update(message.topic.as_str().len().to_le_bytes());
+        hasher.update(message.topic.as_str().as_bytes());
+        hasher.update(&data_for_hash);
+
+        // Take first 20 bytes as message-id
+        let digest = hasher.finalize();
+        gossipsub::MessageId::from(&digest[..20])
+    }
+
     fn new(key: identity::Keypair) -> Self {
         let local_public_key = key.public();
         // To content-address message, we can take the hash of message and use it as an ID.
-        let message_id_fn = |message: &gossipsub::Message| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
-        };
+        let message_id_fn = |message: &gossipsub::Message| Self::message_id_fn(message);
 
         // Set a custom gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -277,9 +327,7 @@ impl Behaviour {
     }
 }
 
-fn new_swarm() -> libp2p::swarm::Swarm<Behaviour> {
-    let local_private_key = secp256k1::Keypair::generate();
-    let local_keypair: Keypair = local_private_key.into();
+fn new_swarm(local_keypair: Keypair) -> libp2p::swarm::Swarm<Behaviour> {
     let transport = build_transport(local_keypair.clone(), true).unwrap();
     println!("build the transport");
 
@@ -367,5 +415,47 @@ fn strip_peer_id(addr: &mut Multiaddr) {
         Some(Protocol::P2p(_)) => {}
         Some(other) => addr.push(other),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::gossipsub::IdentTopic;
+    use libp2p::gossipsub::MessageId;
+    use snap::raw::Encoder;
+
+    #[test]
+    fn test_message_id_computation_with_snappy() {
+        let compressed_data = {
+            let mut encoder = Encoder::new();
+            encoder.compress_vec(b"hello").unwrap()
+        };
+        let message = gossipsub::Message {
+            source: None,
+            data: compressed_data,
+            sequence_number: None,
+            topic: IdentTopic::new("test").into(),
+        };
+        let message_id = Behaviour::message_id_fn(&message);
+        let expected_hex = "2e40c861545cc5b46d2220062e7440b9190bc383";
+        let expected_bytes = hex::decode(expected_hex).unwrap();
+        assert_eq!(message_id, MessageId::new(&expected_bytes));
+    }
+
+    #[test]
+    fn test_message_id_computation_basic() {
+        // Test basic message ID computation without snappy decompression
+        let message_id = Behaviour::message_id_fn(&gossipsub::Message {
+            source: None,
+            data: b"hello".to_vec(),
+            sequence_number: None,
+            topic: IdentTopic::new("test").into(),
+        });
+
+        // Verify the ID is correct
+        let expected_hex = "a7f41aaccd241477955c981714eb92244c2efc98";
+        let expected_bytes = hex::decode(expected_hex).unwrap();
+        assert_eq!(message_id, MessageId::new(&expected_bytes));
     }
 }

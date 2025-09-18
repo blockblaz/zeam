@@ -149,8 +149,8 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 }
 
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: []types.SignedVote, logger: *zeam_utils.ZeamLogger) !void {
-    logger.debug("\n\n===================\nprocess opetationg slot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ state.slot, state.historical_block_hashes.len, state.justified_slots });
-    logger.debug("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized });
+    logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={any} votes={any}, ", .{ state.slot, state.historical_block_hashes.len, state.justified_slots, attestations.len });
+    logger.debug("prestate justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 
     // transform state data into consumable format, generally one would keep a `cached`/consumable
     // copy of state but we will get to that later especially w.r.t. proving
@@ -162,21 +162,20 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
-    for (state.justifications_roots) |blockRoot| {
-        for (0..num_validators) |i| {
-            justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
-                logger.err("Invalid justifications parsing justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
-                    //
-                    state.justifications_validators.len,
-                    num_validators,
-                    i,
-                    i * num_validators,
-                    (i + 1) * num_validators,
-                    e,
-                });
-                return e;
-            };
-        }
+    for (state.justifications_roots, 0..) |blockRoot, i| {
+        justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
+            logger.err("Invalid parsing justification roots={d} justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
+                //
+                state.justifications_roots.len,
+                state.justifications_validators.len,
+                num_validators,
+                i,
+                i * num_validators,
+                (i + 1) * num_validators,
+                e,
+            });
+            return e;
+        };
     }
 
     for (attestations) |signed_vote| {
@@ -281,12 +280,13 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     state.justifications_roots = try justifications_roots.toOwnedSlice();
     state.justifications_validators = try justifications_validators.toOwnedSlice();
 
+    // clear out the local map
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
 
-    logger.debug("\n---------------\npoststate:historical hashes={d} justified slots ={any}\n justifications_roots:{any}\n justifications_validators= {any}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots, state.justifications_validators });
-    logger.debug("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized });
+    logger.debug("poststate:historical hashes={d} justified slots ={any}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots.len, state.justifications_validators.len });
+    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 }
 
 pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
