@@ -84,7 +84,7 @@ fn sys_halt(out_state: *const [8]u32, status: u32) noreturn {
 }
 
 pub fn get_input(allocator: std.mem.Allocator) []const u8 {
-    var input: []u8 = allocator.alloc(u8, 1024) catch @panic("could not allocate space for the input slice");
+    var input: []u8 = allocator.alloc(u8, 1024 * 8) catch @panic("could not allocate space for the input slice");
     const input_size = io.read_slice(0, input[0..]);
     return input[0..input_size];
 }
