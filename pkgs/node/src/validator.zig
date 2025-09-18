@@ -15,7 +15,7 @@ pub const ValidatorParams = struct {
     ids: []usize,
     chain: *chains.BeamChain,
     network: networkFactory.Network,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 };
 
 pub const BeamValidator = struct {
@@ -24,8 +24,7 @@ pub const BeamValidator = struct {
     chain: *chains.BeamChain,
     network: networkFactory.Network,
     ids: []usize,
-    logger: *const zeam_utils.ZeamLogger,
-    child_logger: zeam_utils.ChildLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorParams) Self {
@@ -36,7 +35,6 @@ pub const BeamValidator = struct {
             .network = opts.network,
             .ids = opts.ids,
             .logger = opts.logger,
-            .child_logger = opts.logger.child(.validator),
         };
     }
 
@@ -61,7 +59,7 @@ pub const BeamValidator = struct {
         const slot_proposer_id = slot % num_validators;
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
             _ = index;
-            self.child_logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
+            self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
             const signed_block = types.SignedBeamBlock{
@@ -69,7 +67,7 @@ pub const BeamValidator = struct {
                 .signature = [_]u8{0} ** types.SIGSIZE,
             };
             const signed_block_message = networks.GossipMessage{ .block = signed_block };
-            self.child_logger.info("validator block production slot={d} block={any}", .{ slot, signed_block_message });
+            self.logger.info("validator block production slot={d} block={any}", .{ slot, signed_block_message });
             // publish block is right now a no-op however move gossip message construction and publish there
             try self.chain.publishBlock(signed_block);
             try self.network.publish(&signed_block_message);
@@ -79,7 +77,7 @@ pub const BeamValidator = struct {
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !void {
         if (self.ids.len == 0) return;
 
-        self.child_logger.info("constructing vote message for slot={d}", .{slot});
+        self.logger.info("constructing vote message for slot={d}", .{slot});
         const vote = try self.chain.constructVote(.{ .slot = slot });
 
         for (self.ids) |validator_id| {
@@ -90,7 +88,7 @@ pub const BeamValidator = struct {
             };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
-            self.child_logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
+            self.logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
             try self.chain.publishVote(signed_vote);
             // move gossip message construction and publish to publishVote
             try self.network.publish(&signed_vote_message);

@@ -149,7 +149,7 @@ pub const FileParams = struct {
     last_rotation_day: i64 = 0,
 };
 
-pub const ZeamLogger = struct {
+pub const ZeamLoggerConfig = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
     fileParams: ?FileParams,
@@ -231,83 +231,19 @@ pub const ZeamLogger = struct {
         }
     }
 
-    pub fn err(
-        self: *const Self,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) void {
-        return log(
-            self.scope,
-            self.activeLevel,
-            .err,
-            fmt,
-            args,
-            self.fileParams,
-            null, // No module tag for parent logger
-        );
-    }
-
-    pub fn warn(
-        self: *const Self,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) void {
-        return log(
-            self.scope,
-            self.activeLevel,
-            .warn,
-            fmt,
-            args,
-            self.fileParams,
-            null, // No module tag for parent logger
-        );
-    }
-
-    pub fn info(
-        self: *const Self,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) void {
-        return log(
-            self.scope,
-            self.activeLevel,
-            .info,
-            fmt,
-            args,
-            self.fileParams,
-            null, // No module tag for parent logger
-        );
-    }
-
-    pub fn debug(
-        self: *const Self,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) void {
-        return log(
-            self.scope,
-            self.activeLevel,
-            .debug,
-            fmt,
-            args,
-            self.fileParams,
-            null, // No module tag for parent logger
-        );
-    }
-
-    /// Create a child logger with a specific module tag
-    pub fn child(self: *const Self, moduleTag: ModuleTag) ChildLogger {
-        return ChildLogger{
-            .parent = self,
+    /// Create a module logger with a specific module tag
+    pub fn logger(self: *const Self, moduleTag: ?ModuleTag) ModuleLogger {
+        return ModuleLogger{
+            .config = self,
             .moduleTag = moduleTag,
         };
     }
 };
 
-/// Child logger that adds module-specific tags to log messages
-pub const ChildLogger = struct {
-    parent: *const ZeamLogger,
-    moduleTag: ModuleTag,
+/// Module logger that adds module-specific tags to log messages
+pub const ModuleLogger = struct {
+    config: *const ZeamLoggerConfig,
+    moduleTag: ?ModuleTag,
 
     const Self = @This();
 
@@ -317,12 +253,12 @@ pub const ChildLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.parent.scope,
-            self.parent.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .err,
             fmt,
             args,
-            self.parent.fileParams,
+            self.config.fileParams,
             self.moduleTag,
         );
     }
@@ -333,12 +269,12 @@ pub const ChildLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.parent.scope,
-            self.parent.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .warn,
             fmt,
             args,
-            self.parent.fileParams,
+            self.config.fileParams,
             self.moduleTag,
         );
     }
@@ -349,12 +285,12 @@ pub const ChildLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.parent.scope,
-            self.parent.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .info,
             fmt,
             args,
-            self.parent.fileParams,
+            self.config.fileParams,
             self.moduleTag,
         );
     }
@@ -365,27 +301,27 @@ pub const ChildLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.parent.scope,
-            self.parent.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .debug,
             fmt,
             args,
-            self.parent.fileParams,
+            self.config.fileParams,
             self.moduleTag,
         );
     }
 };
 
-pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
+pub fn getScopedLoggerConfig(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
-pub fn getLogger(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
+pub fn getLoggerConfig(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
-pub fn getTestLogger() ZeamLogger {
-    return ZeamLogger.init(.default, std.log.default_level, null);
+pub fn getTestLoggerConfig() ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(.default, std.log.default_level, null);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
@@ -468,14 +404,14 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
         .chain => "chain",
         .configs => "configs",
         .forkchoice => "forkchoice",
-        .gossip_handler => "gossip_handler",
+        .gossip_handler => "gossip",
         .metrics => "metrics",
         .network => "network",
         .node => "node",
         .params => "params",
-        .state_proving_manager => "state_proving_manager",
+        .state_proving_manager => "prover",
         .state_transition => "stf",
-        .state_transition_runtime => "stf_runtime",
+        .state_transition_runtime => "runtime",
         .tools => "tools",
         .types => "types",
         .utils => "utils",

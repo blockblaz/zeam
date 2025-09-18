@@ -7,8 +7,8 @@ const state_transition = @import("@zeam/state-transition");
 
 const zeam_utils = @import("@zeam/utils");
 // by default logger's activeLevel should be the default active level of the build
-var logger = zeam_utils.getLogger(null, null);
-const child_logger = logger.child(.state_transition_runtime);
+var zeam_logger_config = zeam_utils.getLoggerConfig(null, null);
+const logger = zeam_logger_config.logger(.state_transition_runtime);
 
 // implements riscv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
@@ -25,17 +25,17 @@ export fn main() noreturn {
     // completed.
     const input = zkvm.get_input(allocator);
     defer zkvm.free_input(allocator);
-    child_logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
+    logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
-    child_logger.debug("deserialized input={any}\n", .{prover_input.state});
+    logger.debug("deserialized input={any}\n", .{prover_input.state});
 
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = &logger, .child_logger = child_logger }) catch |e| {
-        child_logger.err("error running transition function: {any}", .{e});
+    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = logger }) catch |e| {
+        logger.err("error running transition function: {any}", .{e});
     };
 
-    child_logger.info("state transition completed\n", .{});
+    logger.info("state transition completed\n", .{});
 
     // verify the block.state_root is ssz hash tree root of state
     // this completes our zkvm proving

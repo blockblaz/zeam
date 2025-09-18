@@ -18,7 +18,7 @@ const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
-const Logger = utils_lib.ZeamLogger;
+const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
 
 const prefix = "zeam_";
@@ -31,7 +31,7 @@ pub const StartNodeOptions = struct {
     metrics_enable: bool,
     metrics_port: u16,
     local_priv_key: []const u8,
-    logger: *Logger,
+    logger_config: *LoggerConfig,
 
     pub fn deinit(self: *StartNodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -156,7 +156,7 @@ pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions)
         allocator.free(connect_peers);
     }
 
-    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger);
+    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger_config.logger(.network));
     try network.run();
     const backend = network.getNetworkInterface();
 
@@ -172,7 +172,7 @@ pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions)
         .clock = clock,
         .db = .{},
         .validator_ids = options.validator_indices,
-        .logger = options.logger,
+        .logger_config = options.logger_config,
     });
 
     try beam_node.run();
