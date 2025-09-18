@@ -279,7 +279,7 @@ pub fn main() !void {
                 // options
                 .nodeId = 0,
                 .config = chain_config,
-                .anchorState = anchorState,
+                .anchorState = &anchorState,
                 .backend = backend1,
                 .clock = clock,
                 .db = .{},
@@ -290,7 +290,7 @@ pub fn main() !void {
                 // options
                 .nodeId = 1,
                 .config = chain_config,
-                .anchorState = anchorState,
+                .anchorState = &anchorState,
                 .backend = backend2,
                 .clock = clock,
                 .db = .{},

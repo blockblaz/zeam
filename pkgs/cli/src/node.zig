@@ -166,7 +166,7 @@ pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions)
         // options
         .nodeId = node_id,
         .config = chain_config,
-        .anchorState = anchorState,
+        .anchorState = &anchorState,
         .backend = backend,
         .clock = clock,
         .db = .{},
