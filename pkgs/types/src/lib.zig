@@ -12,7 +12,7 @@ pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 
 //update signature size to 4000 after ssz is fixed
-pub const SIGSIZE = 40;
+pub const SIGSIZE = 4000;
 pub const Bytes4000 = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
@@ -189,7 +189,7 @@ test "ssz seralize/deserialize signed beam block" {
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
     try ssz.serialize(SignedBeamBlock, signed_block, &serialized_signed_block);
-    std.debug.print("\n\n\nserialized_signed_block ({d})=\n{any}", .{ serialized_signed_block.items.len, serialized_signed_block.items });
+    std.debug.print("\n\n\nserialized_signed_block ({d})", .{serialized_signed_block.items.len});
 
     var deserialized_signed_block: SignedBeamBlock = undefined;
     try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
@@ -323,9 +323,12 @@ test "ssz seralize/deserialize signed stf prover input" {
     var serialized = std.ArrayList(u8).init(arena_allocator.allocator());
     defer serialized.deinit();
     try ssz.serialize(BeamSTFProverInput, prover_input, &serialized);
-    std.debug.print("\n\n\nprove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
 
     var prover_input_deserialized: BeamSTFProverInput = undefined;
     try ssz.deserialize(BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, arena_allocator.allocator());
-    std.debug.print("should deserialize to={any}", .{prover_input_deserialized});
+
+    // TODO create a sszEql fn in ssz to recursively compare two ssz structures
+    // for now inspect two items
+    try std.testing.expect(std.mem.eql(u8, &prover_input.block.signature, &prover_input_deserialized.block.signature));
+    try std.testing.expect(std.mem.eql(u8, &prover_input.state.latest_block_header.state_root, &prover_input_deserialized.state.latest_block_header.state_root));
 }
