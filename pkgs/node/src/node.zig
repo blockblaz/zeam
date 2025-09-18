@@ -20,7 +20,7 @@ const LevelDB = struct {};
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: types.BeamState,
+    anchorState: *const types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     db: LevelDB,
@@ -45,7 +45,15 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         const network = networkFactory.Network.init(opts.backend);
 
-        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId, opts.logger);
+        chain.* = try chainFactory.BeamChain.init(
+            allocator,
+            chainFactory.ChainOpts{
+                .config = opts.config,
+                .anchorState = opts.anchorState,
+                .nodeId = opts.nodeId,
+                .logger = opts.logger,
+            },
+        );
         if (opts.validator_ids) |ids| {
             validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger });
             chain.registerValidatorIds(ids);
