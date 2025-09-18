@@ -62,6 +62,10 @@ pub const BeamNode = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self.chain);
+    }
+
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
