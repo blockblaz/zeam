@@ -148,7 +148,6 @@ pub const EthLibp2p = struct {
         // publish
         const topic = data.getTopic();
         const topic_str: [*:0]const u8 = @ptrCast(@tagName(topic));
-        const logger = self.logger.child(.network);
 
         // TODO: deinit the message later ob once done
         const message = switch (topic) {
@@ -165,7 +164,7 @@ pub const EthLibp2p = struct {
                 break :votebytes serialized.items;
             },
         };
-        logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, message, data });
+        self.child_logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, message, data });
         publish_msg_to_rust_bridge(self.params.networkId, topic_str, message.ptr, message.len);
     }
 
