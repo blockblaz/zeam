@@ -235,7 +235,7 @@ test "ssz seralize/deserialize signed beam state" {
     var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_state.deinit();
     try ssz.serialize(BeamState, state, &serialized_state);
-    std.debug.print("\n\n\nserialized_state ({d})=\n{any}", .{ serialized_state.items.len, serialized_state.items });
+    std.debug.print("\n\n\nserialized_state ({d})", .{serialized_state.items.len});
 
     // we need to use arena allocator because deserialization allocs without providing for
     // a way to deinit, this needs to be probably addressed in ssz
