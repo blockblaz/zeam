@@ -55,3 +55,94 @@ pub const Mock = struct {
         } };
     }
 };
+
+// Helper functions and structs for testing
+const SubscriberData = struct {
+    calls: *u32,
+    received: *?interface.GossipMessage,
+};
+
+fn common_onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+    const data: *SubscriberData = @ptrCast(@alignCast(ptr));
+    data.calls.* += 1;
+    data.received.* = message.*;
+}
+
+test "Mock messaging across two subscribers" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger = zeam_utils.getTestLogger();
+    var mock = try Mock.init(allocator, &loop, &logger);
+
+    // Track calls and capture received messages
+    var subscriber1_calls: u32 = 0;
+    var subscriber2_calls: u32 = 0;
+    var subscriber1_received_message: ?interface.GossipMessage = null;
+    var subscriber2_received_message: ?interface.GossipMessage = null;
+
+    const subscriber1_callback = common_onGossip;
+    const subscriber2_callback = common_onGossip;
+
+    // Both subscribers subscribe to the same block topic
+    var topics = [_]interface.GossipTopic{.block};
+    var subscriber1_data = SubscriberData{ .calls = &subscriber1_calls, .received = &subscriber1_received_message };
+    var subscriber2_data = SubscriberData{ .calls = &subscriber2_calls, .received = &subscriber2_received_message };
+
+    try Mock.subscribe(@ptrCast(&mock), &topics, .{
+        .ptr = &subscriber1_data,
+        .onGossipCb = subscriber1_callback,
+    });
+    try Mock.subscribe(@ptrCast(&mock), &topics, .{
+        .ptr = &subscriber2_data,
+        .onGossipCb = subscriber2_callback,
+    });
+
+    // Create a simple block message
+    const block_message = try allocator.create(interface.GossipMessage);
+    defer allocator.destroy(block_message);
+    block_message.* = .{ .block = .{
+        .message = .{
+            .slot = 1,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body = .{
+                .attestations = &[_]types.SignedVote{},
+            },
+        },
+        .signature = [_]u8{3} ** types.SIGSIZE,
+    } };
+
+    // Publish the message - both subscribers should receive it
+    try Mock.publish(@ptrCast(&mock), block_message);
+
+    // Run the event loop to process scheduled callbacks
+    try loop.run(.until_done);
+
+    // Verify both subscribers received the message
+    try std.testing.expect(subscriber1_calls == 1);
+    try std.testing.expect(subscriber2_calls == 1);
+
+    // Verify both subscribers received the same message content
+    try std.testing.expect(subscriber1_received_message != null);
+    try std.testing.expect(subscriber2_received_message != null);
+
+    const received1 = subscriber1_received_message.?;
+    const received2 = subscriber2_received_message.?;
+
+    // Verify both received block messages
+    try std.testing.expect(received1 == .block);
+    try std.testing.expect(received2 == .block);
+
+    // Verify the block content is identical
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
+    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
+    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &received1.block.signature, &received2.block.signature));
+}
