@@ -84,6 +84,8 @@ pub const BeamStateConfig = struct {
 
 pub const HistoricalBlockHashes = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
 pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
+pub const JustificationsRoots = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
+pub const JustificationsValidators = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
 // array of array ssz needs to be also figured out
 // implement justification map as flat array of keys, with flatted corresponding
 // justifications of num_validators each, which isn't an issue for now because
@@ -104,8 +106,8 @@ pub const BeamState = struct {
     justified_slots: JustifiedSlots,
 
     // a flat representation of the justifications map
-    justifications_roots: ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT),
-    justifications_validators: ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT),
+    justifications_roots: JustificationsRoots,
+    justifications_validators: JustificationsValidators,
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries

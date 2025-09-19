@@ -272,21 +272,19 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
     // Update justifications lists
     // Clear existing lists
-    state.justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(0);
-    state.justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
+    state.justifications_roots = try types.JustificationsRoots.init(0);
+    state.justifications_validators = try types.JustificationsValidators.init(0);
 
     // Populate justifications from map
-    var bit_offset: usize = 0;
     var iterator = justifications.iterator();
     while (iterator.next()) |kv| {
         try state.justifications_roots.append(kv.key_ptr.*);
-        // Set individual bits for validator justifications
-        for (kv.value_ptr.*, 0..) |validator_bit, j| {
-            if (validator_bit == 1) {
-                state.justifications_validators.set(bit_offset + j, true);
-            }
+        // append individual bits for validator justifications
+        // have a batch set method to set it since eventual num vals are div by 8
+        // and hence the vector can be fully appeneded as bytes
+        for (kv.value_ptr.*) |validator_bit| {
+            try state.justifications_validators.append(validator_bit == 1);
         }
-        bit_offset += num_validators;
     }
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
