@@ -159,6 +159,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
 
     var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    errdefer justifications.deinit(allocator);
     try loadJustifications(allocator, &justifications, state, logger);
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
@@ -313,9 +314,6 @@ fn flattenJustifications(allocator: Allocator, justifications: *std.AutoHashMapU
     allocator.free(state.justifications_validators);
     state.justifications_roots = try justifications_roots.toOwnedSlice(allocator);
     state.justifications_validators = try justifications_validators.toOwnedSlice(allocator);
-
-    std.debug.assert(justifications.count() == 0);
-    justifications.deinit(allocator);
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
