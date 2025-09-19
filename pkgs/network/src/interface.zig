@@ -98,7 +98,7 @@ const MessagePublishWrapper = struct {
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
     networkId: u32,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 };
 
 pub const GenericGossipHandler = struct {
@@ -107,10 +107,10 @@ pub const GenericGossipHandler = struct {
     allocator: Allocator,
     onGossipHandlers: std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: *const zeam_utils.ZeamLogger) !Self {
+    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
 
         var onGossipHandlers = std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)).init(allocator);

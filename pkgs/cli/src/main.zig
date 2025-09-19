@@ -169,14 +169,15 @@ pub fn main() !void {
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            var logger = utils_lib.getLogger(null, null);
+            var zeam_logger_config = utils_lib.getLoggerConfig(null, null);
+            const logger = zeam_logger_config.logger(.state_proving_manager);
 
             const options = state_proving_manager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
                 },
-                .logger = &logger,
+                .logger = logger,
             };
 
             // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
@@ -193,7 +194,7 @@ pub fn main() !void {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
                 const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = logger });
 
                 // verify the block
                 try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
@@ -244,17 +245,17 @@ pub fn main() !void {
             }
 
             // Create loggers first so they can be passed to network implementations
-            var logger1 = utils_lib.getScopedLogger(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger2 = utils_lib.getScopedLogger(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
-                network.* = try networks.Mock.init(allocator, loop, &logger1);
+                network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network));
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
-                logger1.debug("--- mock gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
                 var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
@@ -262,7 +263,7 @@ pub fn main() !void {
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
                 // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 defer for (listen_addresses1) |addr| addr.deinit();
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, &logger1);
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, logger1_config.logger(.network));
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
@@ -275,10 +276,10 @@ pub fn main() !void {
                 defer for (listen_addresses2) |addr| addr.deinit();
                 const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
                 defer for (connect_peers) |addr| addr.deinit();
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, &logger2);
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, logger2_config.logger(.network));
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
-                logger1.debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -296,7 +297,7 @@ pub fn main() !void {
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_1,
-                .logger = &logger1,
+                .logger_config = &logger1_config,
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
                 // options
@@ -307,7 +308,7 @@ pub fn main() !void {
                 .clock = clock,
                 .db = .{},
                 .validator_ids = &validator_ids_2,
-                .logger = &logger2,
+                .logger_config = &logger2_config,
             });
 
             try beam_node_1.run();
@@ -324,9 +325,9 @@ pub fn main() !void {
             },
         },
         .node => |leancmd| {
-            var logger = utils_lib.getLogger(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
-            var start_options: node.StartNodeOptions = .{
+            var start_options: node.NodeOptions = .{
                 .node_id = leancmd.node_id,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
@@ -334,14 +335,18 @@ pub fn main() !void {
                 .genesis_spec = undefined,
                 .validator_indices = undefined,
                 .local_priv_key = undefined,
-                .logger = &logger,
+                .logger_config = &zeam_logger_config,
             };
 
             defer start_options.deinit(allocator);
 
             try node.buildStartOptions(allocator, leancmd, &start_options);
 
-            try node.startNode(allocator, &start_options);
+            var lean_node: node.Node = undefined;
+
+            try lean_node.init(allocator, &start_options);
+            defer lean_node.deinit();
+            try lean_node.run();
         },
     }
 }
