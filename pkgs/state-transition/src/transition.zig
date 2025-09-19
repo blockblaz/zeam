@@ -158,25 +158,9 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
     var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
 
-    // prep the justifications map
-    var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
+    var justifications = try loadJustificationsMap(allocator, state, logger);
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
-    for (state.justifications_roots, 0..) |blockRoot, i| {
-        justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
-            logger.err("Invalid parsing justification roots={d} justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
-                //
-                state.justifications_roots.len,
-                state.justifications_validators.len,
-                num_validators,
-                i,
-                i * num_validators,
-                (i + 1) * num_validators,
-                e,
-            });
-            return e;
-        };
-    }
 
     for (attestations) |signed_vote| {
         const validator_id: usize = @intCast(signed_vote.validator_id);
@@ -222,12 +206,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             for (0..targetjustifications.len) |i| {
                 targetjustifications[i] = 0;
             }
-            try justifications.put(vote.target.root, targetjustifications);
+            try justifications.put(allocator, vote.target.root, targetjustifications);
             break :targetjustifications targetjustifications;
         };
 
         target_justifications[validator_id] = 1;
-        try justifications.put(vote.target.root, target_justifications);
+        try justifications.put(allocator, vote.target.root, target_justifications);
         var target_justifications_count: usize = 0;
         for (target_justifications) |justified| {
             if (justified == 1) {
@@ -267,13 +251,52 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     state.historical_block_hashes = try historical_block_hashes.toOwnedSlice();
     state.justified_slots = try justified_slots.toOwnedSlice();
 
-    var justifications_roots = std.ArrayList(types.Root).init(allocator);
-    var justifications_validators = std.ArrayList(u8).init(allocator);
+    try flattenJustificationsMap(allocator, &justifications, state);
+
+    logger.debug("poststate:historical hashes={d} justified slots ={any}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots.len, state.justifications_validators.len });
+    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+}
+
+/// Helper function to load justifications from state into a map
+fn loadJustificationsMap(allocator: Allocator, state: *types.BeamState, logger: *zeam_utils.ZeamLogger) !std.AutoHashMapUnmanaged(types.Root, []u8) {
+    var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+
+    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+    const num_validators: usize = @intCast(state.config.num_validators);
+    for (state.justifications_roots, 0..) |blockRoot, i| {
+        const start_idx = i * num_validators;
+        const end_idx = (i + 1) * num_validators;
+
+        std.debug.assert(end_idx <= state.justifications_validators.len);
+
+        justifications.put(allocator, blockRoot, state.justifications_validators[start_idx..end_idx]) catch |e| {
+            logger.err("Invalid parsing justification roots={d} justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
+                state.justifications_roots.len,
+                state.justifications_validators.len,
+                num_validators,
+                i,
+                start_idx,
+                end_idx,
+                e,
+            });
+            return e;
+        };
+    }
+
+    return justifications;
+}
+
+/// Helper function to flatten justifications map back to state arrays
+fn flattenJustificationsMap(allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(types.Root, []u8), state: *types.BeamState) !void {
+    var justifications_roots: std.ArrayListUnmanaged(types.Root) = .empty;
+    defer justifications_roots.deinit(allocator);
+    var justifications_validators: std.ArrayListUnmanaged(u8) = .empty;
+    defer justifications_validators.deinit(allocator);
 
     // First, collect all keys
     var iterator = justifications.iterator();
     while (iterator.next()) |kv| {
-        try justifications_roots.append(kv.key_ptr.*);
+        try justifications_roots.append(allocator, kv.key_ptr.*);
     }
 
     // Sort the roots
@@ -285,21 +308,19 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
     // Now iterate over sorted roots and flatten validators in order
     for (justifications_roots.items) |root| {
-        try justifications_validators.appendSlice(justifications.get(root) orelse unreachable);
+        try justifications_validators.appendSlice(allocator, justifications.get(root) orelse unreachable);
     }
 
     allocator.free(state.justifications_roots);
     allocator.free(state.justifications_validators);
-    state.justifications_roots = try justifications_roots.toOwnedSlice();
-    state.justifications_validators = try justifications_validators.toOwnedSlice();
+    state.justifications_roots = try justifications_roots.toOwnedSlice(allocator);
+    state.justifications_validators = try justifications_validators.toOwnedSlice(allocator);
 
     // clear out the local map
     for (state.justifications_roots) |root| {
         _ = justifications.remove(root);
     }
-
-    logger.debug("poststate:historical hashes={d} justified slots ={any}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots.len, state.justifications_validators.len });
-    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+    justifications.deinit(allocator);
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
