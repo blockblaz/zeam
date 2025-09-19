@@ -218,11 +218,9 @@ test "ssz seralize/deserialize signed beam state" {
             try roots.append(genesis_root);
             break :blk roots;
         },
+        // the init to max size will fill the list and works because the list doesn't store delimiter
+        // else one needs to go through the append route
         .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT),
-        // .justifications = .{
-        //     .roots = &[_]Root{},
-        //     .voting_validators = &[_]u8{},
-        // },
     };
 
     var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
