@@ -19,7 +19,7 @@ pub const Mock = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data, false); // Use sync delivery for tests
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -29,7 +29,7 @@ pub const Mock = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data, false); // Use sync delivery for tests
     }
 
     pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
