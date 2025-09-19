@@ -185,13 +185,13 @@ test "ssz seralize/deserialize signed beam block" {
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.parent_root, &deserialized_signed_block.message.parent_root));
 
     // successful merklization
-    // var block_root: [32]u8 = undefined;
-    // try ssz.hashTreeRoot(
-    //     SignedBeamBlock,
-    //     signed_block,
-    //     &block_root,
-    //     std.testing.allocator,
-    // );
+    var block_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(
+        BeamBlock,
+        signed_block.message,
+        &block_root,
+        std.testing.allocator,
+    );
 }
 
 test "ssz seralize/deserialize signed beam state" {
