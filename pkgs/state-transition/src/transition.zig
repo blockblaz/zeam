@@ -259,7 +259,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 }
 
 /// Helper function to load justifications from state into a map
-fn loadJustifications(allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(types.Root, []u8), state: *types.BeamState, logger: *zeam_utils.ZeamLogger) !void {
+fn loadJustifications(allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(types.Root, []u8), state: *types.BeamState, logger: zeam_utils.ModuleLogger) !void {
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
     for (state.justifications_roots, 0..) |blockRoot, i| {
