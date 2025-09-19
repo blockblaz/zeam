@@ -89,7 +89,6 @@ pub const Node = struct {
         self.loop = try xev.Loop.init(.{});
 
         const addresses = try self.constructMultiaddrs();
-
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = addresses.listen_addresses, .connect_peers = addresses.connect_peers, .local_private_key = options.local_priv_key }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
@@ -106,6 +105,7 @@ pub const Node = struct {
             .validator_ids = options.validator_indices,
             .logger_config = options.logger_config,
         });
+
         self.logger = options.logger_config.logger(.node);
     }
 
