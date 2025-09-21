@@ -35,6 +35,8 @@ pub const BeamChain = struct {
     // For all other modules, we just need module_logger
     zeam_logger_config: *zeam_utils.ZeamLoggerConfig,
     module_logger: zeam_utils.ModuleLogger,
+    stf_logger: zeam_utils.ModuleLogger,
+    block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
@@ -58,6 +60,8 @@ pub const BeamChain = struct {
             .states = states,
             .zeam_logger_config = logger_config,
             .module_logger = logger_config.logger(.chain),
+            .stf_logger = logger_config.logger(.state_transition),
+            .block_building_logger = logger_config.logger(.state_transition_block_building),
         };
     }
 
@@ -139,7 +143,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, &post_state, &block, self.module_logger);
+        try stf.apply_raw_block(self.allocator, &post_state, &block, self.block_building_logger);
         self.module_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
 
         // 3. cache state to save recompute while adding the block on publish
@@ -293,7 +297,7 @@ pub const BeamChain = struct {
             };
             try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
                 //
-                .logger = self.module_logger,
+                .logger = self.stf_logger,
                 .validSignatures = validSignatures,
             });
             break :computedstate cpost_state;
