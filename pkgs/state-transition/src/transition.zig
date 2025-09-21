@@ -148,6 +148,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     // historical_block_hashes and justified_slots are already SSZ types in state
 
     var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer {
+        var iterator = justifications.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.value_ptr.*);
+        }
+    }
     errdefer justifications.deinit(allocator);
     try loadJustifications(allocator, &justifications, state, logger);
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
