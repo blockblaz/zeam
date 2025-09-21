@@ -392,6 +392,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/types/src/lib.zig"),
         });
+        zeam_types.addImport("ssz", ssz);
         zeam_types.addImport("@zeam/params", zeam_params);
 
         // add zeam-params
