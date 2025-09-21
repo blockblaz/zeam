@@ -98,8 +98,9 @@ pub unsafe fn publish_msg_to_rust_bridge(
 ) {
     let message_slice = std::slice::from_raw_parts(message_str, message_len);
     println!(
-        "rustbridge-{network_id}:: publishing message s={:?}",
-        message_slice
+        "rustbridge-{network_id}:: publishing message s={:?}..({:?})",
+        hex::encode(&message_slice[..100]),
+        message_len
     );
     let message_data = message_slice.to_vec();
 

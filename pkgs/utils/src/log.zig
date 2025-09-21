@@ -12,11 +12,12 @@ const Colors = struct {
 
     const timestamp = "\x1b[90m"; // Bright black
     const scope = "\x1b[35m"; // Magenta
+    const module = "\x1b[94m"; // Bright blue
 };
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
-pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileLogParams: ?FileLogParams) void {
+pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileLogParams: ?FileLogParams, moduleTag: ?ModuleTag) void {
     if ((@intFromEnum(level) > @intFromEnum(activeLevel)) and (fileLogParams == null or (@intFromEnum(level) > @intFromEnum(fileLogParams.?.fileActiveLevel)))) {
         return;
     }
@@ -26,7 +27,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     const scope_prefix = "(" ++ switch (scope) {
         .default => system_prefix,
         else => system_prefix ++ "-" ++ @tagName(scope),
-    } ++ "): ";
+    } ++ "):";
     const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
 
     if (builtin.target.os.tag == .freestanding) {
@@ -46,14 +47,22 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         const level_color = getLevelColor(level);
         const timestamp_color = Colors.timestamp;
         const scope_color = Colors.scope;
+        const module_color = Colors.module;
         const reset_color = Colors.reset;
 
         var buf: [4096]u8 = undefined;
-        var print_str = std.fmt.bufPrint(
-            buf[0..],
-            "{s}{s}{s} {s}[{s}]{s} {s}{s}{s}" ++ fmt ++ "\n",
-            .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
-        ) catch return;
+        var print_str = if (moduleTag) |tag|
+            std.fmt.bufPrint(
+                buf[0..],
+                "{s}{s}{s} {s}[{s}]{s} {s}{s}{s} {s}[{s}]{s} " ++ fmt ++ "\n",
+                .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color, module_color, getModuleTagName(tag), reset_color } ++ args,
+            ) catch return
+        else
+            std.fmt.bufPrint(
+                buf[0..],
+                "{s}{s}{s} {s}[{s}]{s} {s}{s}{s} " ++ fmt ++ "\n",
+                .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
+            ) catch return;
 
         // Print to stderr
         if (@intFromEnum(activeLevel) >= @intFromEnum(level)) {
@@ -77,7 +86,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     }
 }
 
-pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams) void {
+pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams, moduleTag: ?ModuleTag) void {
     // Convert FileParams to FileLogParams - only create if file exists
     const fileLogParams: ?FileLogParams = if ((fileParams != null) and (fileParams.?.file != null))
         FileLogParams{ .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel, .file = fileParams.?.file.?, .monocolorFile = fileParams.?.fileBehaviour.monocolorFile }
@@ -85,10 +94,10 @@ pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.l
         null;
 
     switch (scope) {
-        .default => return compTimeLog(.default, activeLevel, level, fmt, args, fileLogParams),
-        .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams),
-        .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams),
-        .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams),
+        .default => return compTimeLog(.default, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams, moduleTag),
     }
 }
 
@@ -97,6 +106,32 @@ const LoggerScope = enum {
     n1,
     n2,
     n3,
+};
+
+pub const ModuleTag = enum {
+    cli,
+    chain,
+    configs,
+    forkchoice,
+    gossip_handler,
+    metrics,
+    network,
+    node,
+    params,
+    state_proving_manager,
+    state_transition,
+    state_transition_block_building,
+    runtime,
+    state_transition_runtime,
+    mock,
+    state_transition_mock,
+    state_transition_mock_block_building,
+    tools,
+    types,
+    utils,
+    validator,
+    // Add more modules as needed
+    // Update getModuleTagName function to include new modules
 };
 
 pub const FileLogParams = struct {
@@ -119,7 +154,7 @@ pub const FileParams = struct {
     last_rotation_day: i64 = 0,
 };
 
-pub const ZeamLogger = struct {
+pub const ZeamLoggerConfig = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
     fileParams: ?FileParams,
@@ -201,18 +236,35 @@ pub const ZeamLogger = struct {
         }
     }
 
+    /// Create a module logger with a specific module tag
+    pub fn logger(self: *const Self, moduleTag: ?ModuleTag) ModuleLogger {
+        return ModuleLogger{
+            .config = self,
+            .moduleTag = moduleTag,
+        };
+    }
+};
+
+/// Module logger that adds module-specific tags to log messages
+pub const ModuleLogger = struct {
+    config: *const ZeamLoggerConfig,
+    moduleTag: ?ModuleTag,
+
+    const Self = @This();
+
     pub fn err(
         self: *const Self,
         comptime fmt: []const u8,
         args: anytype,
     ) void {
         return log(
-            self.scope,
-            self.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .err,
             fmt,
             args,
-            self.fileParams,
+            self.config.fileParams,
+            self.moduleTag,
         );
     }
 
@@ -222,12 +274,13 @@ pub const ZeamLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.scope,
-            self.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .warn,
             fmt,
             args,
-            self.fileParams,
+            self.config.fileParams,
+            self.moduleTag,
         );
     }
 
@@ -237,12 +290,13 @@ pub const ZeamLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.scope,
-            self.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .info,
             fmt,
             args,
-            self.fileParams,
+            self.config.fileParams,
+            self.moduleTag,
         );
     }
 
@@ -252,26 +306,27 @@ pub const ZeamLogger = struct {
         args: anytype,
     ) void {
         return log(
-            self.scope,
-            self.activeLevel,
+            self.config.scope,
+            self.config.activeLevel,
             .debug,
             fmt,
             args,
-            self.fileParams,
+            self.config.fileParams,
+            self.moduleTag,
         );
     }
 };
 
-pub fn getScopedLogger(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
+pub fn getScopedLoggerConfig(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
-pub fn getLogger(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLogger {
-    return ZeamLogger.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
+pub fn getLoggerConfig(activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(.default, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
 
-pub fn getTestLogger() ZeamLogger {
-    return ZeamLogger.init(.default, std.log.default_level, null);
+pub fn getTestLoggerConfig() ZeamLoggerConfig {
+    return ZeamLoggerConfig.init(.default, std.log.default_level, null);
 }
 
 pub fn getFormattedTimestamp(buf: []u8) []const u8 {
@@ -345,5 +400,31 @@ fn getLevelColor(comptime level: std.log.Level) []const u8 {
         .warn => Colors.warn,
         .info => Colors.info,
         .debug => Colors.debug,
+    };
+}
+
+fn getModuleTagName(tag: ModuleTag) []const u8 {
+    return switch (tag) {
+        .cli => "cli",
+        .chain => "chain",
+        .configs => "configs",
+        .forkchoice => "forkchoice",
+        .gossip_handler => "gossip",
+        .metrics => "metrics",
+        .network => "network",
+        .node => "node",
+        .params => "params",
+        .state_proving_manager => "prover",
+        .state_transition => "stf",
+        .state_transition_block_building => "stf-blk-building",
+        .runtime => "runtime",
+        .state_transition_runtime => "stf-runtime",
+        .mock => "mock",
+        .state_transition_mock => "stf-mock",
+        .state_transition_mock_block_building => "stf-mock-blk-building",
+        .tools => "tools",
+        .types => "types",
+        .utils => "utils",
+        .validator => "validator",
     };
 }

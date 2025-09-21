@@ -26,7 +26,7 @@ const NodeOpts = struct {
     db: LevelDB,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
-    logger: *zeam_utils.ZeamLogger,
+    logger_config: *zeam_utils.ZeamLoggerConfig,
 };
 
 pub const BeamNode = struct {
@@ -36,7 +36,7 @@ pub const BeamNode = struct {
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
     nodeId: u32,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -51,11 +51,11 @@ pub const BeamNode = struct {
                 .config = opts.config,
                 .anchorState = opts.anchorState,
                 .nodeId = opts.nodeId,
-                .logger = opts.logger,
+                .logger_config = opts.logger_config,
             },
         );
         if (opts.validator_ids) |ids| {
-            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger });
+            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
             chain.registerValidatorIds(ids);
         }
 
@@ -66,8 +66,12 @@ pub const BeamNode = struct {
             .network = network,
             .validator = validator,
             .nodeId = opts.nodeId,
-            .logger = opts.logger,
+            .logger = opts.logger_config.logger(.node),
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self.chain);
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage) anyerror!void {

@@ -15,7 +15,7 @@ pub const ValidatorParams = struct {
     ids: []usize,
     chain: *chains.BeamChain,
     network: networkFactory.Network,
-    logger: *zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 };
 
 pub const BeamValidator = struct {
@@ -24,7 +24,7 @@ pub const BeamValidator = struct {
     chain: *chains.BeamChain,
     network: networkFactory.Network,
     ids: []usize,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorParams) Self {

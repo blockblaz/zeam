@@ -7,12 +7,14 @@ const state_transition = @import("@zeam/state-transition");
 
 const zeam_utils = @import("@zeam/utils");
 // by default logger's activeLevel should be the default active level of the build
-var logger = zeam_utils.getLogger(null, null);
+var zeam_logger_config = zeam_utils.getLoggerConfig(null, null);
+const logger = zeam_logger_config.logger(.runtime);
+const stf_runtime_logger = zeam_logger_config.logger(.state_transition_runtime);
 
 // implements riscv5 runtime that runs in zkvm on provided inputs and witnesses to execute
 // and prove the state transition as imported from `pkgs/state-transition`
 export fn main() noreturn {
-    zkvm.io.print_str("running block transition function\n");
+    logger.info("running block transition function\n", .{});
 
     var prover_input: types.BeamSTFProverInput = undefined;
 
@@ -30,7 +32,7 @@ export fn main() noreturn {
     logger.debug("deserialized input={any}\n", .{prover_input.state});
 
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = &logger }) catch |e| {
+    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = stf_runtime_logger }) catch |e| {
         logger.err("error running transition function: {any}", .{e});
     };
 

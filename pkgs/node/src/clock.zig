@@ -44,6 +44,14 @@ pub const Clock = struct {
         };
     }
 
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        self.timer.deinit();
+        for (self.on_interval_cbs.items) |cbWrapper| {
+            allocator.destroy(cbWrapper);
+        }
+        self.on_interval_cbs.deinit();
+    }
+
     pub fn tickInterval(self: *Self) void {
         const time_now_ms: isize = @intCast(std.time.milliTimestamp());
         while (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {

@@ -28,7 +28,7 @@ pub const ChainOpts = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     nodeId: u32,
-    logger: *zeam_utils.ZeamLogger,
+    logger_config: *zeam_utils.ZeamLoggerConfig,
 };
 
 pub const BeamChain = struct {
@@ -38,7 +38,12 @@ pub const BeamChain = struct {
     // from finalized onwards to recent
     states: std.AutoHashMap(types.Root, types.BeamState),
     nodeId: u32,
-    logger: *zeam_utils.ZeamLogger,
+    // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
+    // For all other modules, we just need module_logger
+    zeam_logger_config: *zeam_utils.ZeamLoggerConfig,
+    module_logger: zeam_utils.ModuleLogger,
+    stf_logger: zeam_utils.ModuleLogger,
+    block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
 
     const Self = @This();
@@ -46,7 +51,8 @@ pub const BeamChain = struct {
         allocator: Allocator,
         opts: ChainOpts,
     ) !Self {
-        const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, opts.logger);
+        const logger_config = opts.logger_config;
+        const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, logger_config.logger(.forkchoice));
 
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, opts.anchorState.*);
@@ -57,8 +63,19 @@ pub const BeamChain = struct {
             .forkChoice = fork_choice,
             .allocator = allocator,
             .states = states,
-            .logger = opts.logger,
+            .zeam_logger_config = logger_config,
+            .module_logger = logger_config.logger(.chain),
+            .stf_logger = logger_config.logger(.state_transition),
+            .block_building_logger = logger_config.logger(.state_transition_block_building),
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.states.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.states.deinit();
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -72,6 +89,7 @@ pub const BeamChain = struct {
         // forkchoice head
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+
         var has_proposal = false;
         if (interval == 0) {
             const num_validators: usize = @intCast(self.config.genesis.num_validators);
@@ -82,7 +100,7 @@ pub const BeamChain = struct {
             }
         }
 
-        self.logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
+        self.module_logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
             time_intervals,
             slot,
             interval,
@@ -96,8 +114,8 @@ pub const BeamChain = struct {
             self.printSlot(slot);
         }
         // check if log rotation is needed
-        self.logger.maybeRotate() catch |err| {
-            self.logger.err("error rotating log file: {any}", .{err});
+        self.zeam_logger_config.maybeRotate() catch |err| {
+            self.module_logger.err("error rotating log file: {any}", .{err});
         };
     }
 
@@ -127,11 +145,11 @@ pub const BeamChain = struct {
             },
         };
 
-        self.logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
+        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, &post_state, &block, self.logger);
-        self.logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
+        try stf.apply_raw_block(self.allocator, &post_state, &block, self.block_building_logger);
+        self.module_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -179,7 +197,7 @@ pub const BeamChain = struct {
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
         const fc_head = self.forkChoice.updateHead() catch |err| {
-            self.logger.err("forkchoice updatehead error={any}", .{err});
+            self.module_logger.err("forkchoice updatehead error={any}", .{err});
             return;
         };
 
@@ -191,7 +209,7 @@ pub const BeamChain = struct {
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
-        self.logger.info(
+        self.module_logger.info(
             \\
             \\+===============================================================+
             \\                         CHAIN STATUS                            
@@ -231,7 +249,7 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                self.logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
+                self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
                     //
                     signed_block,
                     block_root,
@@ -240,10 +258,10 @@ pub const BeamChain = struct {
 
                 if (!hasBlock) {
                     const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
-                    self.logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
+                    self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
                     if (hasParentBlock) {
                         self.onBlock(signed_block, null) catch |err| {
-                            self.logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
                         };
                     }
                 }
@@ -251,7 +269,7 @@ pub const BeamChain = struct {
             .vote => |signed_vote| {
                 const vote = signed_vote.message;
                 const hasHead = self.forkChoice.hasBlock(vote.head.root);
-                self.logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
+                self.module_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
                     //
                     signed_vote,
                     hasHead,
@@ -259,7 +277,7 @@ pub const BeamChain = struct {
 
                 if (hasHead) {
                     self.onAttestation(signed_vote) catch |err| {
-                        self.logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
+                        self.module_logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
                     };
                 }
             },
@@ -284,7 +302,7 @@ pub const BeamChain = struct {
             };
             try stf.apply_transition(self.allocator, &cpost_state, signedBlock, .{
                 //
-                .logger = self.logger,
+                .logger = self.stf_logger,
                 .validSignatures = validSignatures,
             });
             break :computedstate cpost_state;
@@ -296,9 +314,9 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. fc onvotes
-        for (block.body.attestations) |signed_vote| {
+        for (block.body.attestations.constSlice()) |signed_vote| {
             self.forkChoice.onAttestation(signed_vote, true) catch |e| {
-                self.logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };
         }
 
@@ -333,9 +351,9 @@ test "process and add mock blocks into a node's chain" {
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeId = 10; // random value
-    var logger = zeam_utils.getTestLogger();
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger = &logger });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
@@ -397,10 +415,10 @@ test "printSlot output demonstration" {
     const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
     const beam_state = mock_chain.genesis_state;
     const nodeId = 42; // Test node ID
-    var logger = zeam_utils.getLogger(.info, null);
+    var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger = &logger });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {

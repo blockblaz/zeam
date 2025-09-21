@@ -18,12 +18,13 @@ const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
-const Logger = utils_lib.ZeamLogger;
+const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
+const zeam_utils = @import("@zeam/utils");
 
 const prefix = "zeam_";
 
-pub const StartNodeOptions = struct {
+pub const NodeOptions = struct {
     node_id: u32,
     bootnodes: []const []const u8,
     validator_indices: []usize,
@@ -31,9 +32,9 @@ pub const StartNodeOptions = struct {
     metrics_enable: bool,
     metrics_port: u16,
     local_priv_key: []const u8,
-    logger: *Logger,
+    logger_config: *LoggerConfig,
 
-    pub fn deinit(self: *StartNodeOptions, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
         allocator.free(self.bootnodes);
         allocator.free(self.validator_indices);
@@ -41,11 +42,161 @@ pub const StartNodeOptions = struct {
     }
 };
 
+/// A Node that encapsulates the networking, blockchain, and validator functionalities.
+/// It manages the event loop, network interface, clock, and beam node.
+pub const Node = struct {
+    loop: xev.Loop,
+    network: networks.EthLibp2p,
+    beam_node: BeamNode,
+    clock: Clock,
+    enr: ENR,
+    options: *const NodeOptions,
+    allocator: std.mem.Allocator,
+    logger: zeam_utils.ModuleLogger,
+
+    const Self = @This();
+
+    pub fn init(self: *Self, allocator: std.mem.Allocator, options: *const NodeOptions) !void {
+        self.allocator = allocator;
+        self.options = options;
+
+        const node_id = options.node_id;
+
+        if (options.metrics_enable) {
+            try metrics.init(allocator);
+            try metrics_server.startMetricsServer(allocator, options.metrics_port);
+        }
+
+        // some base mainnet spec would be loaded to build this up
+        const chain_spec =
+            \\{"preset": "mainnet", "name": "beamdev"}
+        ;
+        const json_options = json.ParseOptions{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_if_needed,
+        };
+        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+
+        chain_options.genesis_time = options.genesis_spec.genesis_time;
+        chain_options.num_validators = options.genesis_spec.num_validators;
+        const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+        var anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
+        errdefer anchorState.deinit(allocator);
+
+        // TODO we seem to be needing one loop because then the events added to loop are not being fired
+        // in the order to which they have been added even with the an appropriate delay added
+        // behavior of this further needs to be investigated but for now we will share the same loop
+        self.loop = try xev.Loop.init(.{});
+
+        const addresses = try self.constructMultiaddrs();
+        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = addresses.listen_addresses, .connect_peers = addresses.connect_peers, .local_private_key = options.local_priv_key }, options.logger_config.logger(.network));
+        errdefer self.network.deinit();
+        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        errdefer self.clock.deinit(allocator);
+
+        self.beam_node = try BeamNode.init(allocator, .{
+            // options
+            .nodeId = node_id,
+            .config = chain_config,
+            .anchorState = &anchorState,
+            .backend = self.network.getNetworkInterface(),
+            .clock = &self.clock,
+            .db = .{},
+            .validator_ids = options.validator_indices,
+            .logger_config = options.logger_config,
+        });
+
+        self.logger = options.logger_config.logger(.node);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.clock.deinit(self.allocator);
+        self.beam_node.deinit();
+        self.network.deinit();
+        self.enr.deinit();
+        self.loop.deinit();
+    }
+
+    pub fn run(self: *Node) !void {
+        try self.network.run();
+        try self.beam_node.run();
+
+        const ascii_art =
+            \\
+            \\  ███████╗███████╗ █████╗ ███╗   ███╗
+            \\  ╚══███╔╝██╔════╝██╔══██╗████╗ ████║
+            \\    ███╔╝ █████╗  ███████║██╔████╔██║
+            \\   ███╔╝  ██╔══╝  ██╔══██║██║╚██╔╝██║
+            \\  ███████╗███████╗██║  ██║██║ ╚═╝ ██║
+            \\  ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝
+            \\
+            \\ a blazing fast lean consensus client
+        ;
+
+        var encoded_txt_buf: [1000]u8 = undefined;
+        const encoded_txt = try self.enr.encodeToTxt(&encoded_txt_buf);
+
+        const quic_port = try self.enr.getQUIC();
+
+        // Use logger.info instead of std.debug.print
+        self.logger.info("\n{s}", .{ascii_art});
+        self.logger.info("════════════════════════════════════════════════════════", .{});
+        self.logger.info("  🚀 Zeam Lean Node Started Successfully!", .{});
+        self.logger.info("════════════════════════════════════════════════════════", .{});
+        self.logger.info("  Node ID: {d}", .{self.options.node_id});
+        self.logger.info("  Listening on QUIC port: {?d}", .{quic_port});
+        self.logger.info("  ENR: {s}", .{encoded_txt});
+        self.logger.info("────────────────────────────────────────────────────────", .{});
+
+        try self.clock.run();
+    }
+
+    fn constructMultiaddrs(self: *Self) !struct { listen_addresses: []const Multiaddr, connect_peers: []const Multiaddr } {
+        const self_node_index = self.options.validator_indices[0];
+        try ENR.decodeTxtInto(&self.enr, self.options.bootnodes[self_node_index]);
+
+        // Overriding the IP to 0.0.0.0 to listen on all interfaces
+        try self.enr.kvs.put("ip", "\x00\x00\x00\x00");
+
+        var node_multiaddrs = try self.enr.multiaddrP2PQUIC(self.allocator);
+        defer node_multiaddrs.deinit(self.allocator);
+        // move the ownership to the `EthLibp2p`, will be freed in its deinit
+        const listen_addresses = try node_multiaddrs.toOwnedSlice(self.allocator);
+        errdefer {
+            for (listen_addresses) |addr| addr.deinit();
+            self.allocator.free(listen_addresses);
+        }
+        var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
+        defer connect_peer_list.deinit(self.allocator);
+
+        for (self.options.bootnodes, 0..) |n, i| {
+            if (i != self_node_index) {
+                var n_enr: ENR = undefined;
+                try ENR.decodeTxtInto(&n_enr, n);
+                var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(self.allocator);
+                defer peer_multiaddr_list.deinit(self.allocator);
+                const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(self.allocator);
+                defer self.allocator.free(peer_multiaddrs);
+                try connect_peer_list.appendSlice(self.allocator, peer_multiaddrs);
+            }
+        }
+
+        // move the ownership to the `EthLibp2p`, will be freed in its deinit
+        const connect_peers = try connect_peer_list.toOwnedSlice(self.allocator);
+        errdefer {
+            for (connect_peers) |addr| addr.deinit();
+            self.allocator.free(connect_peers);
+        }
+
+        return .{ .listen_addresses = listen_addresses, .connect_peers = connect_peers };
+    }
+};
+
 /// Builds the start options for a node based on the provided command and options.
 /// It loads the necessary configuration files, parses them, and populates the
 /// `StartNodeOptions` structure.
 /// The caller is responsible for freeing the allocated resources in `StartNodeOptions`.
-pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, opts: *StartNodeOptions) !void {
+pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, opts: *NodeOptions) !void {
     try utils_lib.checkDIRExists(node_cmd.custom_genesis);
 
     const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
@@ -68,11 +219,20 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
     defer parsed_validators.deinit(allocator);
 
     const bootnodes = try nodesFromYAML(allocator, parsed_bootnodes);
-
+    errdefer {
+        for (bootnodes) |b| allocator.free(b);
+        allocator.free(bootnodes);
+    }
+    if (bootnodes.len == 0) {
+        return error.InvalidNodesConfig;
+    }
     const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, node_cmd.override_genesis_time);
 
     const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_id, parsed_validators);
-
+    errdefer allocator.free(validator_indices);
+    if (validator_indices.len == 0) {
+        return error.InvalidValidatorConfig;
+    }
     try utils_lib.checkDIRExists(node_cmd.network_dir);
     const local_priv_key_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.network_dir, "/key" });
     defer allocator.free(local_priv_key_filepath);
@@ -84,102 +244,6 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
     opts.genesis_spec = genesis_spec;
 }
 
-/// Starts a node with the given options.
-/// This function does not return until the node is stopped.
-/// It initializes the metrics server if enabled, sets up the network,
-/// and starts the Beam node with the provided configuration.
-pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions) !void {
-    const node_id = options.node_id;
-
-    if (options.metrics_enable) {
-        try metrics.init(allocator);
-        try metrics_server.startMetricsServer(allocator, options.metrics_port);
-    }
-
-    // some base mainnet spec would be loaded to build this up
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev"}
-    ;
-    const json_options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    };
-    var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
-
-    chain_options.genesis_time = options.genesis_spec.genesis_time;
-    chain_options.num_validators = options.genesis_spec.num_validators;
-    const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-    const anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
-
-    // TODO we seem to be needing one loop because then the events added to loop are not being fired
-    // in the order to which they have been added even with the an appropriate delay added
-    // behavior of this further needs to be investigated but for now we will share the same loop
-    const loop = try allocator.create(xev.Loop);
-    loop.* = try xev.Loop.init(.{});
-
-    const self_node_index = options.validator_indices[0];
-    var network = try allocator.create(networks.EthLibp2p);
-    var node_enr: ENR = undefined;
-    defer node_enr.deinit();
-    try ENR.decodeTxtInto(&node_enr, options.bootnodes[self_node_index]);
-
-    // Overriding the IP to 0.0.0.0 to listen on all interfaces
-    try node_enr.kvs.put("ip", "\x00\x00\x00\x00");
-
-    var node_multiaddrs = try node_enr.multiaddrP2PQUIC(allocator);
-    defer node_multiaddrs.deinit(allocator);
-    const listen_addresses = try node_multiaddrs.toOwnedSlice(allocator);
-    // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
-    defer {
-        for (listen_addresses) |addr| addr.deinit();
-        allocator.free(listen_addresses);
-    }
-
-    var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
-    defer connect_peer_list.deinit(allocator);
-
-    for (options.bootnodes, 0..) |n, i| {
-        if (i != self_node_index) {
-            var n_enr: ENR = undefined;
-            try ENR.decodeTxtInto(&n_enr, n);
-            var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(allocator);
-            defer peer_multiaddr_list.deinit(allocator);
-            const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(allocator);
-            defer allocator.free(peer_multiaddrs);
-            try connect_peer_list.appendSlice(allocator, peer_multiaddrs);
-        }
-    }
-
-    const connect_peers = try connect_peer_list.toOwnedSlice(allocator);
-    defer {
-        for (connect_peers) |addr| addr.deinit();
-        allocator.free(connect_peers);
-    }
-
-    network.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .listen_addresses = listen_addresses, .connect_peers = connect_peers, .local_private_key = options.local_priv_key }, options.logger);
-    try network.run();
-    const backend = network.getNetworkInterface();
-
-    var clock = try allocator.create(Clock);
-    clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
-
-    var beam_node = try BeamNode.init(allocator, .{
-        // options
-        .nodeId = node_id,
-        .config = chain_config,
-        .anchorState = &anchorState,
-        .backend = backend,
-        .clock = clock,
-        .db = .{},
-        .validator_ids = options.validator_indices,
-        .logger = options.logger,
-    });
-
-    try beam_node.run();
-    std.debug.print("Lean node {d} listened on {?d}\n", .{ node_id, try node_enr.getQUIC() });
-    try clock.run();
-}
-
 /// Parses the nodes from a YAML configuration.
 /// Expects a YAML structure like:
 /// ```yaml
@@ -187,7 +251,7 @@ pub fn startNode(allocator: std.mem.Allocator, options: *const StartNodeOptions)
 ///   - enr2...
 /// ```
 /// Returns a set of ENR strings. The caller is responsible for freeing the returned slice.
-pub fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
+fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
     const temp_nodes = try nodes_config.parse(allocator, [][]const u8);
     defer allocator.free(temp_nodes);
 
@@ -216,7 +280,7 @@ pub fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const 
 /// ```
 /// where `node_{node_id}` is the key for the node's validator indices.
 /// Returns a set of validator indices. The caller is responsible for freeing the returned slice.
-pub fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: Yaml) ![]usize {
+fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_id: u32, validators_config: Yaml) ![]usize {
     var validator_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer validator_indices.deinit(allocator);
 

@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
-const utils = @import("@zeam/utils");
+const zeam_utils = @import("@zeam/utils");
 const stf = @import("@zeam/state-transition");
 
 const constants = @import("./constants.zig");
@@ -24,7 +24,7 @@ const ProtoMeta = struct {
     bestChild: ?usize,
     bestDescendant: ?usize,
 };
-pub const ProtoNode = utils.MixIn(ProtoBlock, ProtoMeta);
+pub const ProtoNode = zeam_utils.MixIn(ProtoBlock, ProtoMeta);
 
 pub const ProtoArray = struct {
     nodes: std.ArrayList(ProtoNode),
@@ -230,10 +230,10 @@ pub const ForkChoice = struct {
     // data structure to hold validator deltas, could be grown over time as more validators
     // get added
     deltas: std.ArrayList(isize),
-    logger: *utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: *utils.ZeamLogger) !Self {
+    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: zeam_utils.ModuleLogger) !Self {
         const anchor_block_header = try stf.genStateBlockHeader(allocator, anchorState);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
@@ -312,6 +312,7 @@ pub const ForkChoice = struct {
     pub fn tickInterval(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
+
         switch (currentInterval) {
             0 => {
                 self.fcStore.timeSlots += 1;
@@ -328,7 +329,7 @@ pub const ForkChoice = struct {
             },
             else => @panic("invalid interval"),
         }
-        self.logger.debug("forkchoice ticked to time (intervals){d} = slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
+        self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
@@ -369,8 +370,8 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn getProposalVotes(self: *Self) ![]types.SignedVote {
-        var included_votes = std.ArrayList(types.SignedVote).init(self.allocator);
+    pub fn getProposalVotes(self: *Self) !types.SignedVotes {
+        var included_votes = try types.SignedVotes.init(0);
         const latest_justified = self.fcStore.latest_justified;
 
         // TODO naive strategy to include all votes that are consistent with the latest justified
@@ -387,7 +388,7 @@ pub const ForkChoice = struct {
                 }
             }
         }
-        return included_votes.toOwnedSlice();
+        return included_votes;
     }
 
     pub fn getVoteTarget(self: *Self) !types.Mini3SFCheckpoint {
@@ -455,6 +456,7 @@ pub const ForkChoice = struct {
         // if case of no best descendant latest justified is always best descendant
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
+
         self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas={any} justified_node={any} best_descendant_idx={d}", .{
             //
             from_known,
@@ -464,7 +466,7 @@ pub const ForkChoice = struct {
             best_descendant_idx,
         });
 
-        const fcHead = utils.Cast(ProtoBlock, best_descendant);
+        const fcHead = zeam_utils.Cast(ProtoBlock, best_descendant);
         return fcHead;
     }
 
@@ -598,8 +600,9 @@ test "forkchoice block tree" {
 
     const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
-    var logger = utils.getTestLogger();
-    var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state, &logger);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.forkchoice);
+    var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state, module_logger);
 
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
@@ -610,7 +613,7 @@ test "forkchoice block tree" {
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const block = mock_chain.blocks[i];
-        try stf.apply_transition(allocator, &beam_state, block, .{ .logger = &logger });
+        try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
         // shouldn't accept a future slot
         const current_slot = block.message.slot;
