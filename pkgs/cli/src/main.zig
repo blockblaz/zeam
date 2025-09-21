@@ -171,6 +171,7 @@ pub fn main() !void {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
             var zeam_logger_config = utils_lib.getLoggerConfig(null, null);
             const logger = zeam_logger_config.logger(.state_proving_manager);
+            const stf_logger = zeam_logger_config.logger(.state_transition);
 
             const options = state_proving_manager.ZKStateTransitionOpts{
                 .zkvm = blk: switch (provecmd.zkvm) {
@@ -194,7 +195,7 @@ pub fn main() !void {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
                 const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = logger });
+                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });
 
                 // verify the block
                 try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);

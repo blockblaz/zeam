@@ -77,7 +77,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     // TODO: pass logger as genmockchain arg with scope set
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.state_transition);
+    const block_building_logger = zeam_logger_config.logger(.state_transition_mock_block_building);
 
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
@@ -237,7 +237,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         };
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
-        try transition.apply_raw_block(allocator, &beam_state, &block, module_logger);
+        try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger);
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list
