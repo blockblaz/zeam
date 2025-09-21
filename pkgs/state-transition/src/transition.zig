@@ -156,9 +156,9 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     }
     errdefer justifications.deinit(allocator);
     try loadJustifications(allocator, &justifications, state, logger);
+
     // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
-
     for (attestations.constSlice()) |signed_vote| {
         const validator_id: usize = @intCast(signed_vote.validator_id);
         const vote = signed_vote.message;
