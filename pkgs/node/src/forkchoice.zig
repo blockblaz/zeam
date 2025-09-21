@@ -329,7 +329,7 @@ pub const ForkChoice = struct {
             },
             else => @panic("invalid interval"),
         }
-        self.logger.debug("forkchoice ticked to time (intervals){d} = slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
+        self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
