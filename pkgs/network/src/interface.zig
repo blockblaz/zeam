@@ -9,10 +9,10 @@ pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
-    subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
+    subscribeFn: *const fn (ptr: *anyopaque, topics: []TopicKind, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage) anyerror!void,
 
-    pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(self: GossipSub, topics: []TopicKind, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
     }
 
@@ -44,14 +44,14 @@ pub const OnGossipCbHandler = struct {
     }
 };
 
-pub const GossipTopic = enum {
+pub const TopicKind = enum {
     block,
     vote,
 
-    pub fn parseTopic(topic_str: [*:0]const u8) ?GossipTopic {
+    pub fn parseTopic(topic_str: [*:0]const u8) ?TopicKind {
         const topic: []const u8 = std.mem.span(topic_str);
 
-        for (std.enums.values(GossipTopic)) |variant| {
+        for (std.enums.values(TopicKind)) |variant| {
             if (std.mem.eql(u8, topic, @ptrCast(@tagName(variant)))) {
                 return variant;
             }
@@ -61,13 +61,13 @@ pub const GossipTopic = enum {
     }
 };
 
-pub const GossipMessage = union(GossipTopic) {
+pub const GossipMessage = union(TopicKind) {
     block: types.SignedBeamBlock,
     vote: types.SignedVote,
 
     const Self = @This();
     // figureout is there a generic way to find active enum
-    pub fn getTopic(self: *const Self) GossipTopic {
+    pub fn getTopic(self: *const Self) TopicKind {
         return std.meta.activeTag(self.*);
     }
 
@@ -105,7 +105,7 @@ pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
     allocator: Allocator,
-    onGossipHandlers: std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)),
+    onGossipHandlers: std.AutoHashMap(TopicKind, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
 
@@ -113,8 +113,8 @@ pub const GenericGossipHandler = struct {
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
 
-        var onGossipHandlers = std.AutoHashMap(GossipTopic, std.ArrayList(OnGossipCbHandler)).init(allocator);
-        for (std.enums.values(GossipTopic)) |topic| {
+        var onGossipHandlers = std.AutoHashMap(TopicKind, std.ArrayList(OnGossipCbHandler)).init(allocator);
+        for (std.enums.values(TopicKind)) |topic| {
             try onGossipHandlers.put(topic, std.ArrayList(OnGossipCbHandler).init(allocator));
         }
         return Self{
@@ -186,7 +186,7 @@ pub const GenericGossipHandler = struct {
         // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }
 
-    pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(self: *Self, topics: []TopicKind, handler: OnGossipCbHandler) anyerror!void {
         for (topics) |topic| {
             // handlerarr should already be there
             var handlerArr = self.onGossipHandlers.get(topic).?;

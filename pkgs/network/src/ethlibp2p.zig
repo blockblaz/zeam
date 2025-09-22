@@ -49,7 +49,7 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
-    const topic = interface.GossipTopic.parseTopic(topic_str) orelse {
+    const topic = interface.TopicKind.parseTopic(topic_str) orelse {
         zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge", .{std.mem.span(topic_str)});
         return;
     };
@@ -177,7 +177,7 @@ pub const EthLibp2p = struct {
         publish_msg_to_rust_bridge(self.params.networkId, topic_str, message.ptr, message.len);
     }
 
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []interface.TopicKind, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.subscribe(topics, handler);
     }

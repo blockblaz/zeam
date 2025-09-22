@@ -119,7 +119,7 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{ .block, .vote };
+        var topics = [_]networks.TopicKind{ .block, .vote };
         try self.network.backend.gossip.subscribe(&topics, handler);
 
         const chainOnSlot = try self.getOnIntervalCbWrapper();

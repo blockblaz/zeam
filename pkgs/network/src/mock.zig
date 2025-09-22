@@ -22,7 +22,7 @@ pub const Mock = struct {
         return self.gossipHandler.onGossip(data, true);
     }
 
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []interface.TopicKind, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.subscribe(topics, handler);
     }
