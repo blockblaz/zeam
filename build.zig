@@ -71,6 +71,12 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
+    // add rocksdb
+    const rocksdb = b.dependency("rocksdb", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("bindings");
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -79,6 +85,15 @@ pub fn build(b: *Builder) !void {
     });
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
+
+    // add zeam-database
+    const zeam_database = b.addModule("@zeam/database", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/database/src/lib.zig"),
+    });
+    zeam_database.addImport("rocksdb", rocksdb);
+    zeam_database.addImport("@zeam/utils", zeam_utils);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -173,6 +188,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
+    zeam_beam_node.addImport("@zeam/database", zeam_database);
 
     // Create build options
     const build_options = b.addOptions();
@@ -192,6 +208,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    cli_exe.root_module.addImport("@zeam/database", zeam_database);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);
     cli_exe.root_module.addImport("@zeam/configs", zeam_configs);
@@ -336,6 +353,16 @@ pub fn build(b: *Builder) !void {
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
     test_step.dependOn(&run_utils_tests.step);
+
+    const database_tests = b.addTest(.{
+        .root_module = zeam_database,
+        .optimize = optimize,
+        .target = target,
+    });
+    database_tests.root_module.addImport("rocksdb", rocksdb);
+    database_tests.root_module.addImport("@zeam/utils", zeam_utils);
+    const run_database_tests = b.addRunArtifact(database_tests);
+    test_step.dependOn(&run_database_tests.step);
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
