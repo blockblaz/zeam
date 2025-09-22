@@ -172,6 +172,7 @@ pub const ProtoArray = struct {
 const OnBlockOpts = struct {
     currentSlot: types.Slot,
     blockDelayMs: u64,
+    blockRoot: ?types.Root = null,
 };
 
 pub const ForkChoiceStore = struct {
@@ -523,7 +524,7 @@ pub const ForkChoice = struct {
     }
 
     // we process state outside forkchoice onblock to parallize verifications and just use the post state here
-    pub fn onBlock(self: *Self, block: types.BeamBlock, state: types.BeamState, opts: OnBlockOpts) !ProtoBlock {
+    pub fn onBlock(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
@@ -548,8 +549,11 @@ pub const ForkChoice = struct {
             const finalized = state.latest_finalized;
             self.fcStore.update(justified, finalized);
 
-            var block_root: [32]u8 = undefined;
-            try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+            const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
+                var cblock_root: [32]u8 = undefined;
+                try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+                break :computedroot cblock_root;
+            };
             const is_timely = self.isBlockTimely(opts.blockDelayMs);
 
             const proto_block = ProtoBlock{
@@ -617,10 +621,10 @@ test "forkchoice block tree" {
 
         // shouldn't accept a future slot
         const current_slot = block.message.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
         try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        _ = try fork_choice.onBlock(block.message, beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        _ = try fork_choice.onBlock(block.message, &beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
 

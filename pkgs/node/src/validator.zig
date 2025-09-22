@@ -60,17 +60,18 @@ pub const BeamValidator = struct {
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
             _ = index;
             self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            const block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+            const producedBlock = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
             const signed_block = types.SignedBeamBlock{
-                .message = block,
+                .message = producedBlock.block,
                 .signature = [_]u8{0} ** types.SIGSIZE,
             };
             const signed_block_message = networks.GossipMessage{ .block = signed_block };
-            self.logger.info("validator block production slot={d} block={any}", .{ slot, signed_block_message });
+            self.logger.debug("publishing produced block slot={d} block={any}", .{ slot, signed_block_message });
             // publish block is right now a no-op however move gossip message construction and publish there
             try self.chain.publishBlock(signed_block);
             try self.network.publish(&signed_block_message);
+            self.logger.info("published produced block slot={d} block root=0x{s}", .{ slot, std.fmt.fmtSliceHexLower(&producedBlock.blockRoot) });
         }
     }
 
@@ -88,10 +89,11 @@ pub const BeamValidator = struct {
             };
 
             const signed_vote_message = networks.GossipMessage{ .vote = signed_vote };
-            self.logger.info("validator constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
+            self.logger.debug("publishing constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
             try self.chain.publishVote(signed_vote);
             // move gossip message construction and publish to publishVote
             try self.network.publish(&signed_vote_message);
+            self.logger.info("published constructed vote slot={d} vote={any}", .{ slot, signed_vote_message.vote.message });
         }
     }
 };

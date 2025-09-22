@@ -1,8 +1,9 @@
 const std = @import("std");
 
 pub const Timer = struct {
-    pub fn observe(self: Timer) void {
+    pub fn observe(self: Timer) f32 {
         _ = self;
+        return 0;
     }
 };
 
