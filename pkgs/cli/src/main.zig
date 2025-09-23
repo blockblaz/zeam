@@ -268,7 +268,7 @@ pub fn main() !void {
                 defer for (listen_addresses1) |addr| addr.deinit();
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .network_name = network_name1, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, logger1_config.logger(.network));
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .network_name = network_name1, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null, }, logger1_config.logger(.network));
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
