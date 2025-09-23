@@ -31,7 +31,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     const hex_root = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])});
     defer allocator.free(hex_root);
 
-    const node_line = try std.fmt.allocPrint(allocator, "{s}{s} ({d})", .{ prefix, hex_root, node.slot });
+    const node_line = try std.fmt.allocPrint(allocator, "{s}{s}({d})", .{ prefix, hex_root, node.slot });
     defer allocator.free(node_line);
 
     try tree_lines.appendSlice(node_line);
