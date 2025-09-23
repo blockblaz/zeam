@@ -268,7 +268,13 @@ pub fn main() !void {
                 defer for (listen_addresses1) |addr| addr.deinit();
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .network_name = network_name1, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null, }, logger1_config.logger(.network));
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{
+                    .networkId = 0,
+                    .network_name = network_name1,
+                    .local_private_key = &priv_key1,
+                    .listen_addresses = listen_addresses1,
+                    .connect_peers = null,
+                }, logger1_config.logger(.network));
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
@@ -283,7 +289,13 @@ pub fn main() !void {
                 defer for (connect_peers) |addr| addr.deinit();
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .network_name = network_name2, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, logger2_config.logger(.network));
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{
+                    .networkId = 1,
+                    .network_name = network_name2,
+                    .local_private_key = &priv_key2,
+                    .listen_addresses = listen_addresses2,
+                    .connect_peers = connect_peers,
+                }, logger2_config.logger(.network));
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});

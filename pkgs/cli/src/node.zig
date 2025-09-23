@@ -91,7 +91,13 @@ pub const Node = struct {
         const addresses = try self.constructMultiaddrs();
         const network_name = try allocator.dupe(u8, chain_config.spec.name);
         errdefer allocator.free(network_name);
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .network_name = network_name, .listen_addresses = addresses.listen_addresses, .connect_peers = addresses.connect_peers, .local_private_key = options.local_priv_key }, options.logger_config.logger(.network));
+        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
+            .networkId = 0,
+            .network_name = network_name,
+            .listen_addresses = addresses.listen_addresses,
+            .connect_peers = addresses.connect_peers,
+            .local_private_key = options.local_priv_key,
+        }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
         errdefer self.clock.deinit(allocator);

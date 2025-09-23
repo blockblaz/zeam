@@ -49,13 +49,13 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
-    const topic = interface.GossipTopic.decode(zigHandler.allocator, topic_str) catch |err| {
+    const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
         zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
         return;
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
-    const message: interface.GossipMessage = switch (topic.kind) {
+    const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
@@ -166,8 +166,8 @@ pub const EthLibp2p = struct {
             topics_list.deinit(self.allocator);
         }
 
-        for (std.enums.values(interface.TopicKind)) |kind| {
-            var topic = try interface.GossipTopic.init(self.allocator, kind, .ssz_snappy, self.params.network_name);
+        for (std.enums.values(interface.GossipTopic)) |gossip_topic| {
+            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
             defer topic.deinit();
             const topic_str = try topic.encode();
             try topics_list.append(self.allocator, std.mem.span(topic_str.ptr));
@@ -180,13 +180,13 @@ pub const EthLibp2p = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
-        var topic = try data.getTopic(self.allocator, self.params.network_name);
+        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
         defer topic.deinit();
         const topic_str = try topic.encode();
         defer self.allocator.free(topic_str);
 
         // TODO: deinit the message later ob once done
-        const message = switch (topic.kind) {
+        const message = switch (topic.gossip_topic) {
             .block => blockbytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
                 try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
@@ -204,7 +204,7 @@ pub const EthLibp2p = struct {
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, message.ptr, message.len);
     }
 
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.TopicKind, handler: interface.OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.subscribe(topics, handler);
     }
