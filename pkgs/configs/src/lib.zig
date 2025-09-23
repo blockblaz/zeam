@@ -26,6 +26,7 @@ pub const ChainConfig = struct {
             .custom => {
                 if (chainOptsOrNull) |*chainOpts| {
                     const genesis = utils.Cast(types.GenesisSpec, chainOpts);
+                    // transfer ownership of any allocated memory in chainOpts to spec
                     const spec = utils.Cast(types.ChainSpec, chainOpts);
 
                     return Self{
@@ -38,6 +39,10 @@ pub const ChainConfig = struct {
                 }
             },
         }
+    }
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        self.spec.deinit(allocator);
     }
 };
 

@@ -5,6 +5,8 @@ const types = @import("@zeam/types");
 const xev = @import("xev");
 const zeam_utils = @import("@zeam/utils");
 
+const topic_prefix = "leanconsensus";
+
 pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
@@ -44,20 +46,86 @@ pub const OnGossipCbHandler = struct {
     }
 };
 
+pub const GossipEncoding = enum {
+    ssz_snappy,
+
+    pub fn encode(self: GossipEncoding) []const u8 {
+        return std.enums.tagName(GossipEncoding, self).?;
+    }
+
+    pub fn decode(encoded: []const u8) !GossipEncoding {
+        for (std.enums.values(GossipEncoding)) |variant| {
+            if (std.mem.eql(u8, encoded, variant.encode())) {
+                return variant;
+            }
+        }
+        return error.InvalidDecoding;
+    }
+};
+
+pub const GossipTopic = struct {
+    kind: TopicKind,
+    encoding: GossipEncoding,
+    network: []const u8,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, kind: TopicKind, encoding: GossipEncoding, network: []const u8) !GossipTopic {
+        return GossipTopic{
+            .allocator = allocator,
+            .kind = kind,
+            .encoding = encoding,
+            .network = try allocator.dupe(u8, network),
+        };
+    }
+
+    pub fn encode(self: *const GossipTopic) ![:0]u8 {
+        return try std.fmt.allocPrintZ(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.kind.encode(), self.encoding.encode() });
+    }
+
+    // topic format: /leanconsensus/<network>/<kind>/<encoding>
+    pub fn decode(allocator: Allocator, topic_str: [*:0]const u8) !GossipTopic {
+        const topic = std.mem.span(topic_str);
+        var iter = std.mem.splitSequence(u8, topic, "/");
+        _ = iter.next() orelse return error.InvalidTopic; // skip empty
+        const prefix = iter.next() orelse return error.InvalidTopic;
+        if (!std.mem.eql(u8, prefix, topic_prefix)) {
+            return error.InvalidTopic;
+        }
+        const network_slice = iter.next() orelse return error.InvalidTopic;
+        const kind_slice = iter.next() orelse return error.InvalidTopic;
+        const encoding_slice = iter.next() orelse return error.InvalidTopic;
+
+        const kind = try TopicKind.decode(kind_slice);
+        const encoding = try GossipEncoding.decode(encoding_slice);
+
+        return GossipTopic{
+            .allocator = allocator,
+            .kind = kind,
+            .encoding = encoding,
+            .network = try allocator.dupe(u8, network_slice),
+        };
+    }
+
+    pub fn deinit(self: *GossipTopic) void {
+        self.allocator.free(self.network);
+    }
+};
+
 pub const TopicKind = enum {
     block,
     vote,
 
-    pub fn parseTopic(topic_str: [*:0]const u8) ?TopicKind {
-        const topic: []const u8 = std.mem.span(topic_str);
+    pub fn encode(self: TopicKind) []const u8 {
+        return std.enums.tagName(TopicKind, self).?;
+    }
 
+    pub fn decode(encoded: []const u8) !TopicKind {
         for (std.enums.values(TopicKind)) |variant| {
-            if (std.mem.eql(u8, topic, @ptrCast(@tagName(variant)))) {
+            if (std.mem.eql(u8, encoded, variant.encode())) {
                 return variant;
             }
         }
-
-        return null;
+        return error.InvalidDecoding;
     }
 };
 
@@ -66,8 +134,13 @@ pub const GossipMessage = union(TopicKind) {
     vote: types.SignedVote,
 
     const Self = @This();
-    // figureout is there a generic way to find active enum
-    pub fn getTopic(self: *const Self) TopicKind {
+
+    pub fn getTopic(self: *const Self, allocator: Allocator, network_name: []const u8) !GossipTopic {
+        const kind = std.meta.activeTag(self.*);
+        return try GossipTopic.init(allocator, kind, .ssz_snappy, network_name);
+    }
+
+    pub fn getTopicKind(self: *const Self) TopicKind {
         return std.meta.activeTag(self.*);
     }
 
@@ -112,11 +185,20 @@ pub const GenericGossipHandler = struct {
     const Self = @This();
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
+        errdefer timer.deinit();
 
         var onGossipHandlers = std.AutoHashMap(TopicKind, std.ArrayList(OnGossipCbHandler)).init(allocator);
+        errdefer onGossipHandlers.deinit();
         for (std.enums.values(TopicKind)) |topic| {
+            errdefer {
+                var it = onGossipHandlers.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.deinit();
+                }
+            }
             try onGossipHandlers.put(topic, std.ArrayList(OnGossipCbHandler).init(allocator));
         }
+
         return Self{
             .allocator = allocator,
             .loop = loop,
@@ -127,10 +209,19 @@ pub const GenericGossipHandler = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        self.timer.deinit();
+        var it = self.onGossipHandlers.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.onGossipHandlers.deinit();
+    }
+
     pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
-        const topic = data.getTopic();
-        const handlerArr = self.onGossipHandlers.get(topic).?;
-        self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, topic });
+        const topic_kind = data.getTopicKind();
+        const handlerArr = self.onGossipHandlers.get(topic_kind).?;
+        self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, topic_kind });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -151,7 +242,7 @@ pub const GenericGossipHandler = struct {
                     .networkId = self.networkId,
                     .logger = self.logger,
                 };
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, topic, publishWrapper });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, topic_kind, publishWrapper });
 
                 self.timer.run(
                     self.loop,
@@ -195,3 +286,42 @@ pub const GenericGossipHandler = struct {
         }
     }
 };
+
+test GossipEncoding {
+    const enc = GossipEncoding.ssz_snappy;
+    try std.testing.expect(std.mem.eql(u8, enc.encode(), "ssz_snappy"));
+    try std.testing.expectEqual(enc, try GossipEncoding.decode("ssz_snappy"));
+
+    try std.testing.expectError(error.InvalidDecoding, GossipEncoding.decode("invalid"));
+}
+
+test TopicKind {
+    const kind = TopicKind.block;
+    try std.testing.expect(std.mem.eql(u8, kind.encode(), "block"));
+    try std.testing.expectEqual(kind, try TopicKind.decode("block"));
+
+    const kind2 = TopicKind.vote;
+    try std.testing.expect(std.mem.eql(u8, kind2.encode(), "vote"));
+    try std.testing.expectEqual(kind2, try TopicKind.decode("vote"));
+
+    try std.testing.expectError(error.InvalidDecoding, TopicKind.decode("invalid"));
+}
+
+test GossipTopic {
+    const allocator = std.testing.allocator;
+
+    var topic = try GossipTopic.init(allocator, .block, .ssz_snappy, "devnet0");
+    defer topic.deinit();
+
+    const topic_str = try topic.encode();
+    defer allocator.free(topic_str);
+
+    try std.testing.expect(std.mem.eql(u8, topic_str, "/leanconsensus/devnet0/block/ssz_snappy"));
+
+    var decoded_topic = try GossipTopic.decode(allocator, topic_str.ptr);
+    defer decoded_topic.deinit();
+
+    try std.testing.expectEqual(topic.kind, decoded_topic.kind);
+    try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
+    try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+}

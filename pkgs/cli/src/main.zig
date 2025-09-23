@@ -227,7 +227,9 @@ pub fn main() !void {
 
             chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
-            const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+            // transfer ownership of the chain_options to ChainConfig
+            var chain_config = try ChainConfig.init(Chain.custom, chain_options);
+            defer chain_config.deinit(gpa.allocator());
             const anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
@@ -265,7 +267,9 @@ pub fn main() !void {
                 const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
                 // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
                 defer for (listen_addresses1) |addr| addr.deinit();
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, logger1_config.logger(.network));
+                const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
+                errdefer allocator.free(network_name1);
+                network1.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 0, .network_name = network_name1, .local_private_key = &priv_key1, .listen_addresses = listen_addresses1, .connect_peers = null }, logger1_config.logger(.network));
                 try network1.run();
                 backend1 = network1.getNetworkInterface();
 
@@ -278,7 +282,9 @@ pub fn main() !void {
                 defer for (listen_addresses2) |addr| addr.deinit();
                 const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
                 defer for (connect_peers) |addr| addr.deinit();
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, logger2_config.logger(.network));
+                const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
+                errdefer allocator.free(network_name2);
+                network2.* = try networks.EthLibp2p.init(allocator, loop, .{ .networkId = 1, .network_name = network_name2, .local_private_key = &priv_key2, .listen_addresses = listen_addresses2, .connect_peers = connect_peers }, logger2_config.logger(.network));
                 try network2.run();
                 backend2 = network2.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
@@ -345,8 +351,8 @@ pub fn main() !void {
             try node.buildStartOptions(allocator, leancmd, &start_options);
 
             var lean_node: node.Node = undefined;
-
             try lean_node.init(allocator, &start_options);
+            std.debug.print("lean_node1111 {any}\n", .{lean_node});
             defer lean_node.deinit();
             try lean_node.run();
         },

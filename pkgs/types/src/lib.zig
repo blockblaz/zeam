@@ -134,7 +134,14 @@ pub const BeamSTFProof = struct {
 };
 
 pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
-pub const ChainSpec = struct { preset: params.Preset, name: []u8 };
+pub const ChainSpec = struct {
+    preset: params.Preset,
+    name: []u8,
+
+    pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
+        allocator.free(self.name);
+    }
+};
 
 pub const BeamSTFProverInput = struct {
     block: SignedBeamBlock,
