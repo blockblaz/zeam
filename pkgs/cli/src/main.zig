@@ -228,8 +228,7 @@ pub fn main() !void {
             chain_options.genesis_time = time_now;
             chain_options.num_validators = num_validators;
             // transfer ownership of the chain_options to ChainConfig
-            var chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            defer chain_config.deinit(gpa.allocator());
+            const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             const anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
@@ -352,7 +351,6 @@ pub fn main() !void {
 
             var lean_node: node.Node = undefined;
             try lean_node.init(allocator, &start_options);
-            std.debug.print("lean_node1111 {any}\n", .{lean_node});
             defer lean_node.deinit();
             try lean_node.run();
         },

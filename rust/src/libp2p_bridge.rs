@@ -36,6 +36,7 @@ pub unsafe fn create_and_run_network(
     local_private_key: *const c_char,
     listen_addresses: *const c_char,
     connect_addresses: *const c_char,
+    topics_str: *const c_char,
 ) {
     let listen_multiaddrs = CStr::from_ptr(listen_addresses)
         .to_string_lossy()
@@ -48,6 +49,13 @@ pub unsafe fn create_and_run_network(
         .split(",")
         .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
         .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
+        .collect::<Vec<_>>();
+
+    let topics = CStr::from_ptr(topics_str)
+        .to_string_lossy()
+        .split(",")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
 
     let local_private_key_hex = CStr::from_ptr(local_private_key)
@@ -71,6 +79,7 @@ pub unsafe fn create_and_run_network(
         local_private_key,
         listen_addresses,
         connect_addresses,
+        topics_str,
     );
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
@@ -78,7 +87,12 @@ pub unsafe fn create_and_run_network(
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
         p2p_net
-            .start_network(local_key_pair, listen_multiaddrs, connect_multiaddrs)
+            .start_network(
+                local_key_pair,
+                listen_multiaddrs,
+                connect_multiaddrs,
+                topics,
+            )
             .await;
         p2p_net.run_eventloop().await;
     });
@@ -143,6 +157,7 @@ extern "C" {
         local_private_key: *const c_char,
         listen_addresses: *const c_char,
         connect_addresses: *const c_char,
+        topics: *const c_char,
     );
 }
 
@@ -165,8 +180,9 @@ impl Network {
         key_pair: Keypair,
         listen_addresses: Vec<Multiaddr>,
         connect_addresses: Vec<Multiaddr>,
+        topics: Vec<String>,
     ) {
-        let mut swarm = new_swarm(key_pair);
+        let mut swarm = new_swarm(key_pair, topics);
         println!("starting listener");
 
         for mut addr in listen_addresses {
@@ -328,7 +344,7 @@ impl Behaviour {
     }
 }
 
-fn new_swarm(local_keypair: Keypair) -> libp2p::swarm::Swarm<Behaviour> {
+fn new_swarm(local_keypair: Keypair, topics: Vec<String>) -> libp2p::swarm::Swarm<Behaviour> {
     let transport = build_transport(local_keypair.clone(), true).unwrap();
     println!("build the transport");
 
@@ -343,20 +359,15 @@ fn new_swarm(local_keypair: Keypair) -> libp2p::swarm::Swarm<Behaviour> {
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
 
-    // get all the topics to subscribe. infact impl the subscribe call from zig
-    let block_topic = gossipsub::IdentTopic::new("block");
-    let vote_topic = gossipsub::IdentTopic::new("vote");
-    // subscribes to our topic
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&block_topic)
-        .unwrap();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&vote_topic)
-        .unwrap();
+    // subscribe all the topics
+    for topic in topics {
+        let gossipsub_topic = gossipsub::IdentTopic::new(topic);
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&gossipsub_topic)
+            .unwrap();
+    }
 
     swarm
 }

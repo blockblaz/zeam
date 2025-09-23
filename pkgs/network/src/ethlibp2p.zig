@@ -93,18 +93,21 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 }
 
-export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void {
+export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
     const listen_slice = std.mem.span(listen_addresses);
     zig_handler.allocator.free(listen_slice);
 
     const connect_slice = std.mem.span(connect_addresses);
     zig_handler.allocator.free(connect_slice);
 
+    const topics_slice = std.mem.span(topics);
+    zig_handler.allocator.free(topics_slice);
+
     const private_key_slice = std.mem.span(local_private_key);
     zig_handler.allocator.free(private_key_slice);
 }
 
-pub extern fn create_and_run_network(network_id: u32, handle: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8) void;
+pub extern fn create_and_run_network(network_id: u32, handle: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void;
 pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
@@ -154,7 +157,24 @@ pub const EthLibp2p = struct {
         else
             try self.allocator.dupeZ(u8, "");
         const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr });
+
+        var topics_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (topics_list.items) |topic_str| {
+                self.allocator.free(topic_str);
+            }
+            topics_list.deinit(self.allocator);
+        }
+
+        for (std.enums.values(interface.TopicKind)) |kind| {
+            var topic = try interface.GossipTopic.init(self.allocator, kind, .ssz_snappy, self.params.network_name);
+            defer topic.deinit();
+            const topic_str = try topic.encode();
+            try topics_list.append(self.allocator, std.mem.span(topic_str.ptr));
+        }
+        const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
+
+        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
