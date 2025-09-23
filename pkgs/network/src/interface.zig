@@ -54,12 +54,7 @@ pub const GossipEncoding = enum {
     }
 
     pub fn decode(encoded: []const u8) !GossipEncoding {
-        for (std.enums.values(GossipEncoding)) |variant| {
-            if (std.mem.eql(u8, encoded, variant.encode())) {
-                return variant;
-            }
-        }
-        return error.InvalidDecoding;
+        return std.meta.stringToEnum(GossipEncoding, encoded) orelse error.InvalidDecoding;
     }
 };
 
@@ -120,12 +115,7 @@ pub const TopicKind = enum {
     }
 
     pub fn decode(encoded: []const u8) !TopicKind {
-        for (std.enums.values(TopicKind)) |variant| {
-            if (std.mem.eql(u8, encoded, variant.encode())) {
-                return variant;
-            }
-        }
-        return error.InvalidDecoding;
+        return std.meta.stringToEnum(TopicKind, encoded) orelse error.InvalidDecoding;
     }
 };
 
