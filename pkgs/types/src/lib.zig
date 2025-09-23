@@ -11,8 +11,7 @@ pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 
-//update signature size to 4000 after ssz is fixed
-pub const SIGSIZE = 40;
+pub const SIGSIZE = 4000;
 pub const Bytes4000 = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
