@@ -4,7 +4,7 @@ const fcFactory = @import("./forkchoice.zig");
 
 /// Builds a tree visualization of the fork choice tree with optional depth limit
 pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.ProtoNode, max_depth: ?usize) ![]const u8 {
-    var tree_lines = std.ArrayList(u8).init(allocator);
+    var tree_lines = std.ArrayListUnmanaged(u8).init(allocator);
     defer tree_lines.deinit();
 
     // Find root nodes (nodes with no parent)
