@@ -28,7 +28,7 @@ pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.Pro
 /// Recursively builds a tree branch visualization
 fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8, max_depth: ?usize) !void {
     const node = nodes[node_idx];
-    const hex_root = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])});
+    const hex_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..4])});
     defer allocator.free(hex_root);
 
     const node_line = try std.fmt.allocPrint(allocator, "{s}{s}({d})", .{ prefix, hex_root, node.slot });
