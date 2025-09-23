@@ -178,7 +178,7 @@ pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
     allocator: Allocator,
-    onGossipHandlers: std.AutoHashMap(TopicKind, std.ArrayList(OnGossipCbHandler)),
+    onGossipHandlers: std.AutoHashMapUnmanaged(TopicKind, std.ArrayListUnmanaged(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
 
@@ -187,16 +187,20 @@ pub const GenericGossipHandler = struct {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
-        var onGossipHandlers = std.AutoHashMap(TopicKind, std.ArrayList(OnGossipCbHandler)).init(allocator);
-        errdefer onGossipHandlers.deinit();
-        for (std.enums.values(TopicKind)) |topic| {
-            errdefer {
-                var it = onGossipHandlers.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.deinit();
-                }
+        var onGossipHandlers: std.AutoHashMapUnmanaged(TopicKind, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
+        errdefer {
+            var it = onGossipHandlers.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(allocator);
             }
-            try onGossipHandlers.put(topic, std.ArrayList(OnGossipCbHandler).init(allocator));
+            onGossipHandlers.deinit(allocator);
+        }
+        try onGossipHandlers.ensureTotalCapacity(allocator, @intCast(std.enums.values(TopicKind).len));
+
+        for (std.enums.values(TopicKind)) |topic| {
+            var arr: std.ArrayListUnmanaged(OnGossipCbHandler) = .empty;
+            errdefer arr.deinit(allocator);
+            try onGossipHandlers.put(allocator, topic, arr);
         }
 
         return Self{
@@ -213,9 +217,9 @@ pub const GenericGossipHandler = struct {
         self.timer.deinit();
         var it = self.onGossipHandlers.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
-        self.onGossipHandlers.deinit();
+        self.onGossipHandlers.deinit(self.allocator);
     }
 
     pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
@@ -281,8 +285,8 @@ pub const GenericGossipHandler = struct {
         for (topics) |topic| {
             // handlerarr should already be there
             var handlerArr = self.onGossipHandlers.get(topic).?;
-            try handlerArr.append(handler);
-            try self.onGossipHandlers.put(topic, handlerArr);
+            try handlerArr.append(self.allocator, handler);
+            try self.onGossipHandlers.put(self.allocator, topic, handlerArr);
         }
     }
 };
