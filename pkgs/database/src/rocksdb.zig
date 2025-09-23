@@ -100,21 +100,11 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             try callRocksDB(self.logger, rocksdb.DB.put, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key, value });
         }
 
-        pub fn get(self: *Self, cn: ColumnNamespace, key: cn.Key) anyerror!?cn.Value {
+        pub fn get(self: *Self, cn: ColumnNamespace, key: cn.Key) anyerror!?rocksdb.Data {
             const result: ?rocksdb.Data = try callRocksDB(self.logger, rocksdb.DB.get, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key });
 
             if (result) |data| {
-                defer data.deinit();
-
-                // Todo: Should ideally return the data directly, instead of copying it to a stack buffer
-                // but we need to implement a way to free the data when it's no longer needed
-                // and we need to be able to use the data in the caller's context
-                // `defer data.deinit()` will free the data when the function returns
-                // that's why we need to copy the data to a stack buffer
-
-                // Copy the data to a stack buffer
-                var stack_buf = try std.BoundedArray(u8, 1024).fromSlice(data.data);
-                return @ptrCast(stack_buf.slice());
+                return data;
             } else {
                 return null;
             }
@@ -345,7 +335,10 @@ test "test_rocksdb_with_default_cn" {
 
     // Get values from the default column family
     const value = try db.get(column_namespaces[0], "default_key");
-    std.debug.assert(std.mem.eql(u8, value.?, "default_value"));
+    if (value) |v| {
+        defer v.deinit();
+        std.debug.assert(std.mem.eql(u8, v.data, "default_value"));
+    }
 
     // Delete values from the default column family
     try db.delete(column_namespaces[0], "default_key");
@@ -386,10 +379,16 @@ test "test_column_families_with_multiple_cns" {
 
     // Get values from the column families
     const value = try db.get(column_namespace[1], "cn1_key");
-    std.debug.assert(std.mem.eql(u8, value.?, "cn1_value"));
+    if (value) |v| {
+        defer v.deinit();
+        std.debug.assert(std.mem.eql(u8, v.data, "cn1_value"));
+    }
 
     const value2 = try db.get(column_namespace[2], "cn2_key");
-    std.debug.assert(std.mem.eql(u8, value2.?, "cn2_value"));
+    if (value2) |v2| {
+        defer v2.deinit();
+        std.debug.assert(std.mem.eql(u8, v2.data, "cn2_value"));
+    }
 
     // Delete values from the column families
     try db.delete(column_namespace[1], "cn1_key");
@@ -474,13 +473,21 @@ test "test_batch_write_function" {
     try db.commit(&batch);
 
     // Verify entry is now visible in database
-    std.debug.assert(std.mem.eql(u8, (try db.get(column_namespace[0], "default_key1")).?, "default_value1"));
+    const value1 = try db.get(column_namespace[0], "default_key1");
+    if (value1) |v1| {
+        defer v1.deinit();
+        std.debug.assert(std.mem.eql(u8, v1.data, "default_value1"));
+    }
 
     // Add delete operation to batch but don't commit yet
     try batch.delete(column_namespace[0], "default_key1");
 
     // Verify entry is still visible before commit
-    std.debug.assert(std.mem.eql(u8, (try db.get(column_namespace[0], "default_key1")).?, "default_value1"));
+    const value2 = try db.get(column_namespace[0], "default_key1");
+    if (value2) |v2| {
+        defer v2.deinit();
+        std.debug.assert(std.mem.eql(u8, v2.data, "default_value1"));
+    }
 
     // Commit the delete operation
     try db.commit(&batch);

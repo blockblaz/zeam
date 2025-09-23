@@ -296,8 +296,8 @@ pub fn main() !void {
                 .anchorState = &anchorState,
                 .backend = backend1,
                 .clock = clock,
-                .db = .{},
                 .validator_ids = &validator_ids_1,
+                .db_path = "./data/node0",
                 .logger_config = &logger1_config,
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
@@ -307,8 +307,8 @@ pub fn main() !void {
                 .anchorState = &anchorState,
                 .backend = backend2,
                 .clock = clock,
-                .db = .{},
                 .validator_ids = &validator_ids_2,
+                .db_path = "./data/node1",
                 .logger_config = &logger2_config,
             });
 

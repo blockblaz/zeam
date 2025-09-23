@@ -101,8 +101,8 @@ pub const Node = struct {
             .anchorState = &anchorState,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
-            .db = .{},
             .validator_ids = options.validator_indices,
+            .db_path = "./data/node",
             .logger_config = options.logger_config,
         });
 

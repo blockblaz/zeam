@@ -9,6 +9,17 @@ const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 const metrics = @import("@zeam/metrics");
+const database = @import("@zeam/database");
+
+const DbColumnNamespaces = [_]database.ColumnNamespace{
+    .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
+    .{ .namespace = "blocks", .Key = []const u8, .Value = []const u8 },
+    .{ .namespace = "states", .Key = []const u8, .Value = []const u8 },
+    .{ .namespace = "votes", .Key = []const u8, .Value = []const u8 },
+    .{ .namespace = "checkpoints", .Key = []const u8, .Value = []const u8 },
+};
+
+const RocksDB = database.RocksDB(&DbColumnNamespaces);
 
 const zeam_utils = @import("@zeam/utils");
 
@@ -29,6 +40,7 @@ pub const ChainOpts = struct {
     anchorState: *const types.BeamState,
     nodeId: u32,
     logger_config: *zeam_utils.ZeamLoggerConfig,
+    db_path: []const u8,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -55,6 +67,7 @@ pub const BeamChain = struct {
     stf_logger: zeam_utils.ModuleLogger,
     block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
+    db: RocksDB,
 
     const Self = @This();
     pub fn init(
@@ -67,6 +80,10 @@ pub const BeamChain = struct {
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, opts.anchorState.*);
 
+        // Initialize the database
+        const db = try RocksDB.open(allocator, logger_config.logger(.database), opts.db_path);
+        errdefer db.deinit();
+
         return Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
@@ -77,6 +94,7 @@ pub const BeamChain = struct {
             .module_logger = logger_config.logger(.chain),
             .stf_logger = logger_config.logger(.state_transition),
             .block_building_logger = logger_config.logger(.state_transition_block_building),
+            .db = db,
         };
     }
 
@@ -86,6 +104,104 @@ pub const BeamChain = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.states.deinit();
+        self.db.deinit();
+    }
+
+    // Database column namespaces for type safety
+    const blocks_cn = DbColumnNamespaces[1];
+    const states_cn = DbColumnNamespaces[2];
+    const votes_cn = DbColumnNamespaces[3];
+    const checkpoints_cn = DbColumnNamespaces[4];
+
+    /// Helper function to format block keys consistently
+    fn formatBlockKey(self: *Self, block_root: types.Root) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "block:{any}", .{std.fmt.fmtSliceHexLower(&block_root)});
+    }
+
+    /// Helper function to format state keys consistently
+    fn formatStateKey(self: *Self, state_root: types.Root) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "state:{any}", .{std.fmt.fmtSliceHexLower(&state_root)});
+    }
+
+    /// Save a block to the database
+    pub fn saveBlock(self: *Self, block_root: types.Root, block: types.BeamBlock) !void {
+        const key = try self.formatBlockKey(block_root);
+        defer self.allocator.free(key);
+
+        var value = std.ArrayList(u8).init(self.allocator);
+        defer value.deinit();
+
+        try ssz.serialize(types.BeamBlock, block, &value);
+
+        try self.db.put(blocks_cn, key, value.items);
+        self.module_logger.debug("Saved block to database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&block_root)});
+    }
+
+    /// Load a block from the database
+    pub fn loadBlock(self: *Self, block_root: types.Root) !?types.BeamBlock {
+        const key = self.formatBlockKey(block_root) catch return null;
+        defer self.allocator.free(key);
+
+        const value = try self.db.get(blocks_cn, key);
+        if (value) |encoded_block| {
+            defer encoded_block.deinit();
+            const block = try ssz.decode(self.allocator, types.BeamBlock, encoded_block.data);
+            self.module_logger.debug("Loaded block from database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&block_root)});
+            return block;
+        }
+        return null;
+    }
+
+    /// Save a state to the database
+    pub fn saveState(self: *Self, state_root: types.Root, state: types.BeamState) !void {
+        const key = try self.formatStateKey(state_root);
+        defer self.allocator.free(key);
+
+        var value = std.ArrayList(u8).init(self.allocator);
+        defer value.deinit();
+
+        try ssz.serialize(types.BeamState, state, &value);
+
+        try self.db.put(states_cn, key, value.items);
+        self.module_logger.debug("Saved state to database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&state_root)});
+    }
+
+    /// Load a state from the database
+    pub fn loadState(self: *Self, state_root: types.Root) !?types.BeamState {
+        const key = self.formatStateKey(state_root) catch return null;
+        defer self.allocator.free(key);
+
+        const value = try self.db.get(states_cn, key);
+        if (value) |encoded_state| {
+            defer encoded_state.deinit();
+            const state = try ssz.decode(self.allocator, types.BeamState, encoded_state.data);
+            self.module_logger.debug("Loaded state from database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&state_root)});
+            return state;
+        }
+        return null;
+    }
+
+    /// Save a vote to the database
+    pub fn saveVote(self: *Self, vote_key: []const u8, vote: types.SignedVote) !void {
+        var value = std.ArrayList(u8).init(self.allocator);
+        defer value.deinit();
+
+        try ssz.serialize(types.SignedVote, vote, &value);
+
+        try self.db.put(votes_cn, vote_key, value);
+        self.module_logger.debug("Saved vote to database: key={s}", .{vote_key});
+    }
+
+    /// Load a vote from the database
+    pub fn loadVote(self: *Self, vote_key: []const u8) !?types.SignedVote {
+        const value = try self.db.get(votes_cn, vote_key);
+        if (value) |encoded_vote| {
+            defer encoded_vote.deinit();
+            const vote = try ssz.decode(self.allocator, types.SignedVote, encoded_vote.data);
+            self.module_logger.debug("Loaded vote from database: key={s}", .{vote_key});
+            return vote;
+        }
+        return null;
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -165,6 +281,10 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
         try self.states.put(block_root, post_state);
+
+        // 4. Save produced block and state to database
+        try self.saveBlock(block_root, block);
+        try self.saveState(block_root, post_state);
 
         return .{
             .block = block,
@@ -345,7 +465,11 @@ pub const BeamChain = struct {
         });
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 4. fc onvotes
+        // 4. Save block and state to database
+        try self.saveBlock(fcBlock.blockRoot, block);
+        try self.saveState(fcBlock.blockRoot, post_state);
+
+        // 5. fc onvotes
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -356,7 +480,7 @@ pub const BeamChain = struct {
             };
         }
 
-        // 5. fc update head
+        // 6. fc update head
         _ = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
@@ -396,7 +520,13 @@ test "process and add mock blocks into a node's chain" {
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db_path = db_path });
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
@@ -460,8 +590,14 @@ test "printSlot output demonstration" {
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
 
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db_path = db_path });
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
