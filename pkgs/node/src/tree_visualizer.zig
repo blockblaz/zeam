@@ -39,7 +39,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     // Check if we've reached the maximum depth
     if (max_depth) |max| {
         if (depth >= max) {
-            const truncated_comment = try std.fmt.allocPrint(allocator, " // ... (truncated at depth {d})", .{max});
+            const truncated_comment = try std.fmt.allocPrint(allocator, " ... (truncated at depth {d})", .{max});
             defer allocator.free(truncated_comment);
             try tree_lines.appendSlice(truncated_comment);
             try tree_lines.append('\n');
@@ -59,7 +59,7 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     }
 
     if (children.items.len > 0) {
-        const child_count_comment = try std.fmt.allocPrint(allocator, " // has {d} child branch{s}", .{ children.items.len, if (children.items.len == 1) "" else "es" });
+        const child_count_comment = try std.fmt.allocPrint(allocator, " has {d} child branch{s}", .{ children.items.len, if (children.items.len == 1) "" else "es" });
         defer allocator.free(child_count_comment);
         try tree_lines.appendSlice(child_count_comment);
     }
