@@ -69,16 +69,16 @@ pub const Node = struct {
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
-            \\{"preset": "mainnet", "name": "beamdev"}
+            \\{"preset": "mainnet", "name": "devnet0"}
         ;
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
-
         chain_options.genesis_time = options.genesis_spec.genesis_time;
         chain_options.num_validators = options.genesis_spec.num_validators;
+        // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
         var anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
         errdefer anchorState.deinit();
@@ -89,7 +89,15 @@ pub const Node = struct {
         self.loop = try xev.Loop.init(.{});
 
         const addresses = try self.constructMultiaddrs();
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{ .networkId = 0, .listen_addresses = addresses.listen_addresses, .connect_peers = addresses.connect_peers, .local_private_key = options.local_priv_key }, options.logger_config.logger(.network));
+        const network_name = try allocator.dupe(u8, chain_config.spec.name);
+        errdefer allocator.free(network_name);
+        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
+            .networkId = 0,
+            .network_name = network_name,
+            .listen_addresses = addresses.listen_addresses,
+            .connect_peers = addresses.connect_peers,
+            .local_private_key = options.local_priv_key,
+        }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
         errdefer self.clock.deinit(allocator);

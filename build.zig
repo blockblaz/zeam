@@ -265,6 +265,27 @@ pub fn build(b: *Builder) !void {
 
     const test_step = b.step("test", "Run zeam core tests");
 
+    // CLI integration tests (separate target) - always create this test target
+    const cli_integration_tests = b.addTest(.{
+        .root_source_file = b.path("pkgs/cli/test/integration.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const integration_build_options = b.addOptions();
+    cli_integration_tests.step.dependOn(&cli_exe.step);
+    integration_build_options.addOptionPath("cli_exe_path", cli_exe.getEmittedBin());
+    const integration_build_options_module = integration_build_options.createModule();
+    cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
+
+    // Add CLI constants module to integration tests
+    const cli_constants = b.addModule("cli_constants", .{
+        .root_source_file = b.path("pkgs/cli/src/constants.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
+
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
         .optimize = optimize,
@@ -310,6 +331,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_tests.step.dependOn(&cli_exe.step);
     addRustGlueLib(b, cli_tests, target);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -377,6 +399,11 @@ pub fn build(b: *Builder) !void {
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
     test_step.dependOn(tools_test_step);
+
+    // Create simtest step that runs only integration tests
+    const simtests = b.step("simtest", "Run integration tests");
+    const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
+    simtests.dependOn(&run_cli_integration_test.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {

@@ -104,6 +104,8 @@ pub const BeamChain = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.states.deinit();
+        // assume the allocator of config is same as self.allocator
+        self.config.deinit(self.allocator);
         self.db.deinit();
     }
 
