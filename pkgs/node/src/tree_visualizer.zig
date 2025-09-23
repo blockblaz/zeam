@@ -74,7 +74,11 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
 
         // Check for missing slots between parent and child
         if (child_node.slot > node.slot + 1) {
-            const missing_line = try std.fmt.allocPrint(allocator, "{s}[slots {d}..{d}] ─┘ ", .{ indent, node.slot + 1, child_node.slot - 1 });
+            const missing_slots = child_node.slot - node.slot - 1;
+            const missing_line = if (missing_slots == 1)
+                try std.fmt.allocPrint(allocator, "{s}[{d}] ─┘ ", .{ indent, node.slot + 1 })
+            else
+                try std.fmt.allocPrint(allocator, "{s}[{d}..{d}] ─┘ ", .{ indent, node.slot + 1, child_node.slot - 1 });
             defer allocator.free(missing_line);
             try tree_lines.appendSlice(missing_line);
         } else {
