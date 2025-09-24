@@ -129,6 +129,7 @@ pub const BeamChain = struct {
         defer serialized_value.deinit();
 
         try ssz.serialize(T, value, &serialized_value);
+
         try self.db.put(column_namespace, key, serialized_value.items);
         self.module_logger.debug(log_message, log_args);
     }
@@ -145,7 +146,10 @@ pub const BeamChain = struct {
         const value = try self.db.get(column_namespace, key);
         if (value) |encoded_value| {
             defer encoded_value.deinit();
-            const decoded_value = try ssz.decode(self.allocator, T, encoded_value.data);
+
+            var decoded_value: T = undefined;
+            try ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator);
+
             self.module_logger.debug(log_message, log_args);
             return decoded_value;
         }
@@ -169,7 +173,7 @@ pub const BeamChain = struct {
 
     /// Load a block from the database
     pub fn loadBlock(self: *Self, block_root: types.Root) !?types.BeamBlock {
-        const key = self.formatBlockKey(block_root) catch return null;
+        const key = try self.formatBlockKey(block_root);
         defer self.allocator.free(key);
 
         return try self.loadFromDatabase(
@@ -198,7 +202,7 @@ pub const BeamChain = struct {
 
     /// Load a state from the database
     pub fn loadState(self: *Self, state_root: types.Root) !?types.BeamState {
-        const key = self.formatStateKey(state_root) catch return null;
+        const key = try self.formatStateKey(state_root);
         defer self.allocator.free(key);
 
         return try self.loadFromDatabase(
@@ -657,4 +661,119 @@ test "printSlot output demonstration" {
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
     try std.testing.expect(beam_chain.registered_validator_ids.len == 3);
+}
+
+test "save and load block" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const nodeId = 10; // random value
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db_path = db_path });
+
+    // Test saving and loading multiple blocks
+    for (mock_chain.blocks, mock_chain.blockRoots) |signed_block, block_root| {
+        const block = signed_block.message;
+
+        // Save the block
+        try beam_chain.saveBlock(block_root, block);
+
+        // Load the block back
+        const loaded_block = try beam_chain.loadBlock(block_root);
+        try std.testing.expect(loaded_block != null);
+
+        const loaded = loaded_block.?;
+
+        // Verify all block fields match
+        try std.testing.expect(loaded.slot == block.slot);
+        try std.testing.expect(loaded.proposer_index == block.proposer_index);
+        try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &block.parent_root));
+        try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &block.state_root));
+
+        // Verify attestations
+        try std.testing.expect(loaded.body.attestations.len() == block.body.attestations.len());
+        for (loaded.body.attestations.constSlice(), block.body.attestations.constSlice()) |loaded_att, orig_att| {
+            try std.testing.expect(loaded_att.message.slot == orig_att.message.slot);
+            try std.testing.expect(std.mem.eql(u8, &loaded_att.message.head.root, &orig_att.message.head.root));
+            try std.testing.expect(loaded_att.message.head.slot == orig_att.message.head.slot);
+            try std.testing.expect(std.mem.eql(u8, &loaded_att.message.target.root, &orig_att.message.target.root));
+            try std.testing.expect(loaded_att.message.target.slot == orig_att.message.target.slot);
+            try std.testing.expect(std.mem.eql(u8, &loaded_att.message.source.root, &orig_att.message.source.root));
+            try std.testing.expect(loaded_att.message.source.slot == orig_att.message.source.slot);
+            try std.testing.expect(std.mem.eql(u8, &loaded_att.signature, &orig_att.signature));
+        }
+    }
+}
+
+test "save and load state" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const nodeId = 10;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db_path = db_path });
+
+    // Test saving and loading genesis state
+    var genesis_state_root: types.Root = undefined;
+    try ssz.hashTreeRoot(types.BeamState, beam_state, &genesis_state_root, allocator);
+
+    try beam_chain.saveState(genesis_state_root, beam_state);
+    const loaded_genesis_state = try beam_chain.loadState(genesis_state_root);
+    try std.testing.expect(loaded_genesis_state != null);
+
+    // Verify state fields match
+    const loaded_state = loaded_genesis_state.?;
+    try std.testing.expect(loaded_state.slot == beam_state.slot);
+    try std.testing.expect(loaded_state.latest_justified.slot == beam_state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded_state.latest_justified.root, &beam_state.latest_justified.root));
+    try std.testing.expect(loaded_state.latest_finalized.slot == beam_state.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded_state.latest_finalized.root, &beam_state.latest_finalized.root));
+    try std.testing.expect(loaded_state.historical_block_hashes.len() == beam_state.historical_block_hashes.len());
+    try std.testing.expect(loaded_state.justified_slots.len() == beam_state.justified_slots.len());
+
+    // Test loading a non-existent state root
+    var non_existent_root: types.Root = undefined;
+    @memset(&non_existent_root, 0xFF);
+    const loaded_non_existent_state = try beam_chain.loadState(non_existent_root);
+    try std.testing.expect(loaded_non_existent_state == null);
 }
