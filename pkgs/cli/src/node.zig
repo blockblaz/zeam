@@ -21,6 +21,7 @@ const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
 const zeam_utils = @import("@zeam/utils");
+const constants = @import("constants.zig");
 
 const prefix = "zeam_";
 
@@ -110,7 +111,7 @@ pub const Node = struct {
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = options.validator_indices,
-            .db_path = "./data/node",
+            .db_path = constants.DEFAULT_DB_PATH,
             .logger_config = options.logger_config,
         });
 

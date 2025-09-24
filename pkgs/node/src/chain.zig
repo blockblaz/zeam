@@ -9,22 +9,12 @@ const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 const metrics = @import("@zeam/metrics");
-const database = @import("@zeam/database");
-
-const DbColumnNamespaces = [_]database.ColumnNamespace{
-    .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
-    .{ .namespace = "blocks", .Key = []const u8, .Value = []const u8 },
-    .{ .namespace = "states", .Key = []const u8, .Value = []const u8 },
-    .{ .namespace = "votes", .Key = []const u8, .Value = []const u8 },
-    .{ .namespace = "checkpoints", .Key = []const u8, .Value = []const u8 },
-};
-
-const RocksDB = database.RocksDB(&DbColumnNamespaces);
 
 const zeam_utils = @import("@zeam/utils");
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
+const database = @import("./database.zig");
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -67,7 +57,7 @@ pub const BeamChain = struct {
     stf_logger: zeam_utils.ModuleLogger,
     block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
-    db: RocksDB,
+    db: database.RocksDB,
 
     const Self = @This();
     pub fn init(
@@ -81,7 +71,7 @@ pub const BeamChain = struct {
         try states.put(fork_choice.head.blockRoot, opts.anchorState.*);
 
         // Initialize the database
-        const db = try RocksDB.open(allocator, logger_config.logger(.database), opts.db_path);
+        const db = try database.RocksDB.open(allocator, logger_config.logger(.database), opts.db_path);
         errdefer db.deinit();
 
         return Self{
@@ -110,10 +100,10 @@ pub const BeamChain = struct {
     }
 
     // Database column namespaces for type safety
-    const blocks_cn = DbColumnNamespaces[1];
-    const states_cn = DbColumnNamespaces[2];
-    const votes_cn = DbColumnNamespaces[3];
-    const checkpoints_cn = DbColumnNamespaces[4];
+    const blocks_cn = database.DbColumnNamespaces[1];
+    const states_cn = database.DbColumnNamespaces[2];
+    const votes_cn = database.DbColumnNamespaces[3];
+    const checkpoints_cn = database.DbColumnNamespaces[4];
 
     /// Helper function to format block keys consistently
     fn formatBlockKey(self: *Self, block_root: types.Root) ![]const u8 {
@@ -125,18 +115,56 @@ pub const BeamChain = struct {
         return std.fmt.allocPrint(self.allocator, "state:{any}", .{std.fmt.fmtSliceHexLower(&state_root)});
     }
 
+    /// Generic save function for database operations
+    fn saveToDatabase(
+        self: *Self,
+        comptime T: type,
+        key: []const u8,
+        value: T,
+        column_namespace: database.ColumnNamespace,
+        comptime log_message: []const u8,
+        log_args: anytype,
+    ) !void {
+        var serialized_value = std.ArrayList(u8).init(self.allocator);
+        defer serialized_value.deinit();
+
+        try ssz.serialize(T, value, &serialized_value);
+        try self.db.put(column_namespace, key, serialized_value.items);
+        self.module_logger.debug(log_message, log_args);
+    }
+
+    /// Generic load function for database operations
+    fn loadFromDatabase(
+        self: *Self,
+        comptime T: type,
+        key: []const u8,
+        column_namespace: database.ColumnNamespace,
+        comptime log_message: []const u8,
+        log_args: anytype,
+    ) !?T {
+        const value = try self.db.get(column_namespace, key);
+        if (value) |encoded_value| {
+            defer encoded_value.deinit();
+            const decoded_value = try ssz.decode(self.allocator, T, encoded_value.data);
+            self.module_logger.debug(log_message, log_args);
+            return decoded_value;
+        }
+        return null;
+    }
+
     /// Save a block to the database
     pub fn saveBlock(self: *Self, block_root: types.Root, block: types.BeamBlock) !void {
         const key = try self.formatBlockKey(block_root);
         defer self.allocator.free(key);
 
-        var value = std.ArrayList(u8).init(self.allocator);
-        defer value.deinit();
-
-        try ssz.serialize(types.BeamBlock, block, &value);
-
-        try self.db.put(blocks_cn, key, value.items);
-        self.module_logger.debug("Saved block to database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&block_root)});
+        try self.saveToDatabase(
+            types.BeamBlock,
+            key,
+            block,
+            blocks_cn,
+            "Saved block to database: root=0x{s}",
+            .{std.fmt.fmtSliceHexLower(&block_root)},
+        );
     }
 
     /// Load a block from the database
@@ -144,14 +172,13 @@ pub const BeamChain = struct {
         const key = self.formatBlockKey(block_root) catch return null;
         defer self.allocator.free(key);
 
-        const value = try self.db.get(blocks_cn, key);
-        if (value) |encoded_block| {
-            defer encoded_block.deinit();
-            const block = try ssz.decode(self.allocator, types.BeamBlock, encoded_block.data);
-            self.module_logger.debug("Loaded block from database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&block_root)});
-            return block;
-        }
-        return null;
+        return try self.loadFromDatabase(
+            types.BeamBlock,
+            key,
+            blocks_cn,
+            "Loaded block from database: root=0x{s}",
+            .{std.fmt.fmtSliceHexLower(&block_root)},
+        );
     }
 
     /// Save a state to the database
@@ -159,13 +186,14 @@ pub const BeamChain = struct {
         const key = try self.formatStateKey(state_root);
         defer self.allocator.free(key);
 
-        var value = std.ArrayList(u8).init(self.allocator);
-        defer value.deinit();
-
-        try ssz.serialize(types.BeamState, state, &value);
-
-        try self.db.put(states_cn, key, value.items);
-        self.module_logger.debug("Saved state to database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&state_root)});
+        try self.saveToDatabase(
+            types.BeamState,
+            key,
+            state,
+            states_cn,
+            "Saved state to database: root=0x{s}",
+            .{std.fmt.fmtSliceHexLower(&state_root)},
+        );
     }
 
     /// Load a state from the database
@@ -173,37 +201,36 @@ pub const BeamChain = struct {
         const key = self.formatStateKey(state_root) catch return null;
         defer self.allocator.free(key);
 
-        const value = try self.db.get(states_cn, key);
-        if (value) |encoded_state| {
-            defer encoded_state.deinit();
-            const state = try ssz.decode(self.allocator, types.BeamState, encoded_state.data);
-            self.module_logger.debug("Loaded state from database: root=0x{s}", .{std.fmt.fmtSliceHexLower(&state_root)});
-            return state;
-        }
-        return null;
+        return try self.loadFromDatabase(
+            types.BeamState,
+            key,
+            states_cn,
+            "Loaded state from database: root=0x{s}",
+            .{std.fmt.fmtSliceHexLower(&state_root)},
+        );
     }
 
     /// Save a vote to the database
     pub fn saveVote(self: *Self, vote_key: []const u8, vote: types.SignedVote) !void {
-        var value = std.ArrayList(u8).init(self.allocator);
-        defer value.deinit();
-
-        try ssz.serialize(types.SignedVote, vote, &value);
-
-        try self.db.put(votes_cn, vote_key, value);
-        self.module_logger.debug("Saved vote to database: key={s}", .{vote_key});
+        try self.saveToDatabase(
+            types.SignedVote,
+            vote_key,
+            vote,
+            votes_cn,
+            "Saved vote to database: key={s}",
+            .{vote_key},
+        );
     }
 
     /// Load a vote from the database
     pub fn loadVote(self: *Self, vote_key: []const u8) !?types.SignedVote {
-        const value = try self.db.get(votes_cn, vote_key);
-        if (value) |encoded_vote| {
-            defer encoded_vote.deinit();
-            const vote = try ssz.decode(self.allocator, types.SignedVote, encoded_vote.data);
-            self.module_logger.debug("Loaded vote from database: key={s}", .{vote_key});
-            return vote;
-        }
-        return null;
+        return try self.loadFromDatabase(
+            types.SignedVote,
+            vote_key,
+            votes_cn,
+            "Loaded vote from database: key={s}",
+            .{vote_key},
+        );
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {

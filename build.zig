@@ -380,8 +380,6 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    database_tests.root_module.addImport("rocksdb", rocksdb);
-    database_tests.root_module.addImport("@zeam/utils", zeam_utils);
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
 
