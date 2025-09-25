@@ -86,15 +86,6 @@ pub fn build(b: *Builder) !void {
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
 
-    // add zeam-database
-    const zeam_database = b.addModule("@zeam/database", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/database/src/lib.zig"),
-    });
-    zeam_database.addImport("rocksdb", rocksdb);
-    zeam_database.addImport("@zeam/utils", zeam_utils);
-
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
@@ -160,6 +151,17 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     b.installArtifact(st_lib);
+
+    // add zeam-database
+    const zeam_database = b.addModule("@zeam/database", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/database/src/lib.zig"),
+    });
+    zeam_database.addImport("rocksdb", rocksdb);
+    zeam_database.addImport("ssz", ssz);
+    zeam_database.addImport("@zeam/utils", zeam_utils);
+    zeam_database.addImport("@zeam/types", zeam_types);
 
     // add network
     const zeam_network = b.addModule("@zeam/network", .{

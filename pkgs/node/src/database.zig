@@ -11,3 +11,9 @@ pub const DbColumnNamespaces = [_]database.ColumnNamespace{
 };
 
 pub const RocksDB = database.RocksDB(&DbColumnNamespaces);
+
+pub const DbDefaultNamespace = DbColumnNamespaces[0];
+pub const DbBlocksNamespace = DbColumnNamespaces[1];
+pub const DbStatesNamespace = DbColumnNamespaces[2];
+pub const DbVotesNamespace = DbColumnNamespaces[3];
+pub const DbCheckpointsNamespace = DbColumnNamespaces[4];

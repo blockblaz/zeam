@@ -99,144 +99,6 @@ pub const BeamChain = struct {
         self.db.deinit();
     }
 
-    // Database column namespaces for type safety
-    const blocks_cn = database.DbColumnNamespaces[1];
-    const states_cn = database.DbColumnNamespaces[2];
-    const votes_cn = database.DbColumnNamespaces[3];
-    const checkpoints_cn = database.DbColumnNamespaces[4];
-
-    /// Helper function to format block keys consistently
-    fn formatBlockKey(self: *Self, block_root: types.Root) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "block:{any}", .{std.fmt.fmtSliceHexLower(&block_root)});
-    }
-
-    /// Helper function to format state keys consistently
-    fn formatStateKey(self: *Self, state_root: types.Root) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "state:{any}", .{std.fmt.fmtSliceHexLower(&state_root)});
-    }
-
-    /// Generic save function for database operations
-    fn saveToDatabase(
-        self: *Self,
-        comptime T: type,
-        key: []const u8,
-        value: T,
-        column_namespace: database.ColumnNamespace,
-        comptime log_message: []const u8,
-        log_args: anytype,
-    ) !void {
-        var serialized_value = std.ArrayList(u8).init(self.allocator);
-        defer serialized_value.deinit();
-
-        try ssz.serialize(T, value, &serialized_value);
-
-        try self.db.put(column_namespace, key, serialized_value.items);
-        self.module_logger.debug(log_message, log_args);
-    }
-
-    /// Generic load function for database operations
-    fn loadFromDatabase(
-        self: *Self,
-        comptime T: type,
-        key: []const u8,
-        column_namespace: database.ColumnNamespace,
-        comptime log_message: []const u8,
-        log_args: anytype,
-    ) !?T {
-        const value = try self.db.get(column_namespace, key);
-        if (value) |encoded_value| {
-            defer encoded_value.deinit();
-
-            var decoded_value: T = undefined;
-            try ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator);
-
-            self.module_logger.debug(log_message, log_args);
-            return decoded_value;
-        }
-        return null;
-    }
-
-    /// Save a block to the database
-    pub fn saveBlock(self: *Self, block_root: types.Root, block: types.BeamBlock) !void {
-        const key = try self.formatBlockKey(block_root);
-        defer self.allocator.free(key);
-
-        try self.saveToDatabase(
-            types.BeamBlock,
-            key,
-            block,
-            blocks_cn,
-            "Saved block to database: root=0x{s}",
-            .{std.fmt.fmtSliceHexLower(&block_root)},
-        );
-    }
-
-    /// Load a block from the database
-    pub fn loadBlock(self: *Self, block_root: types.Root) !?types.BeamBlock {
-        const key = try self.formatBlockKey(block_root);
-        defer self.allocator.free(key);
-
-        return try self.loadFromDatabase(
-            types.BeamBlock,
-            key,
-            blocks_cn,
-            "Loaded block from database: root=0x{s}",
-            .{std.fmt.fmtSliceHexLower(&block_root)},
-        );
-    }
-
-    /// Save a state to the database
-    pub fn saveState(self: *Self, state_root: types.Root, state: types.BeamState) !void {
-        const key = try self.formatStateKey(state_root);
-        defer self.allocator.free(key);
-
-        try self.saveToDatabase(
-            types.BeamState,
-            key,
-            state,
-            states_cn,
-            "Saved state to database: root=0x{s}",
-            .{std.fmt.fmtSliceHexLower(&state_root)},
-        );
-    }
-
-    /// Load a state from the database
-    pub fn loadState(self: *Self, state_root: types.Root) !?types.BeamState {
-        const key = try self.formatStateKey(state_root);
-        defer self.allocator.free(key);
-
-        return try self.loadFromDatabase(
-            types.BeamState,
-            key,
-            states_cn,
-            "Loaded state from database: root=0x{s}",
-            .{std.fmt.fmtSliceHexLower(&state_root)},
-        );
-    }
-
-    /// Save a vote to the database
-    pub fn saveVote(self: *Self, vote_key: []const u8, vote: types.SignedVote) !void {
-        try self.saveToDatabase(
-            types.SignedVote,
-            vote_key,
-            vote,
-            votes_cn,
-            "Saved vote to database: key={s}",
-            .{vote_key},
-        );
-    }
-
-    /// Load a vote from the database
-    pub fn loadVote(self: *Self, vote_key: []const u8) !?types.SignedVote {
-        return try self.loadFromDatabase(
-            types.SignedVote,
-            vote_key,
-            votes_cn,
-            "Loaded vote from database: key={s}",
-            .{vote_key},
-        );
-    }
-
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
         // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
@@ -314,10 +176,6 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
         try self.states.put(block_root, post_state);
-
-        // 4. Save produced block and state to database
-        try self.saveBlock(block_root, block);
-        try self.saveState(block_root, post_state);
 
         return .{
             .block = block,
@@ -499,8 +357,13 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. Save block and state to database
-        try self.saveBlock(fcBlock.blockRoot, block);
-        try self.saveState(fcBlock.blockRoot, post_state);
+        var batch = try self.db.initWriteBatch();
+        defer batch.deinit();
+
+        try batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
+        try batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state);
+
+        try self.db.commit(&batch);
 
         // 5. fc onvotes
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
@@ -696,13 +559,13 @@ test "save and load block" {
         const block = signed_block.message;
 
         // Save the block
-        try beam_chain.saveBlock(block_root, block);
+        try beam_chain.db.saveBlock(database.DbBlocksNamespace, block_root, signed_block);
 
         // Load the block back
-        const loaded_block = try beam_chain.loadBlock(block_root);
+        const loaded_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, block_root);
         try std.testing.expect(loaded_block != null);
 
-        const loaded = loaded_block.?;
+        const loaded = loaded_block.?.message;
 
         // Verify all block fields match
         try std.testing.expect(loaded.slot == block.slot);
@@ -757,8 +620,8 @@ test "save and load state" {
     var genesis_state_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamState, beam_state, &genesis_state_root, allocator);
 
-    try beam_chain.saveState(genesis_state_root, beam_state);
-    const loaded_genesis_state = try beam_chain.loadState(genesis_state_root);
+    try beam_chain.db.saveState(database.DbStatesNamespace, genesis_state_root, beam_state);
+    const loaded_genesis_state = try beam_chain.db.loadState(database.DbStatesNamespace, genesis_state_root);
     try std.testing.expect(loaded_genesis_state != null);
 
     // Verify state fields match
@@ -774,6 +637,63 @@ test "save and load state" {
     // Test loading a non-existent state root
     var non_existent_root: types.Root = undefined;
     @memset(&non_existent_root, 0xFF);
-    const loaded_non_existent_state = try beam_chain.loadState(non_existent_root);
+    const loaded_non_existent_state = try beam_chain.db.loadState(database.DbStatesNamespace, non_existent_root);
     try std.testing.expect(loaded_non_existent_state == null);
+}
+
+test "batch write and commit" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const chain_spec =
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+    ;
+    const options = json.ParseOptions{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    };
+    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
+    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const beam_state = mock_chain.genesis_state;
+    const nodeId = 10;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db_path = db_path });
+
+    // Test batch write and commit
+    var batch = try beam_chain.db.initWriteBatch();
+    defer batch.deinit();
+
+    // Test loading the block back
+    const loaded_null_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
+    try std.testing.expect(loaded_null_block == null);
+
+    // batch.put(database.DbBlocksNamespace, beam_chain.db.formatBlockKey(mock_chain.blockRoots[0]), mock_chain.blocks[0]);
+    try batch.putBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0], mock_chain.blocks[0]);
+
+    try beam_chain.db.commit(&batch);
+
+    // Test loading the block back
+    const loaded_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
+    try std.testing.expect(loaded_block != null);
+
+    const loaded = loaded_block.?.message;
+
+    // Verify all block fields match
+    try std.testing.expect(loaded.slot == mock_chain.blocks[0].message.slot);
+    try std.testing.expect(loaded.proposer_index == mock_chain.blocks[0].message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &mock_chain.blocks[0].message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &mock_chain.blocks[0].message.state_root));
+
+    // Verify attestations
+    try std.testing.expect(loaded.body.attestations.len() == mock_chain.blocks[0].message.body.attestations.len());
 }

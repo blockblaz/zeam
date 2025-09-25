@@ -1,5 +1,17 @@
 const rocksdb = @import("rocksdb");
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const types = @import("@zeam/types");
+
+/// Helper function to format block keys consistently
+pub fn formatBlockKey(allocator: Allocator, block_root: types.Root) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "block:{any}", .{std.fmt.fmtSliceHexLower(&block_root)});
+}
+
+/// Helper function to format state keys consistently
+pub fn formatStateKey(allocator: Allocator, state_root: types.Root) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "state:{any}", .{std.fmt.fmtSliceHexLower(&state_root)});
+}
 
 /// Gets the return type of a function or function pointer
 pub fn ReturnType(comptime FnPtr: type) type {
@@ -20,7 +32,7 @@ pub const ColumnNamespace = struct {
 
     const Self = @This();
 
-    pub fn Entry(self: Self) type {
+    pub fn Entry(comptime self: Self) type {
         return struct { self.Key, self.Value };
     }
 

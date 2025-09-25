@@ -4,6 +4,8 @@ const rocksdb = @import("rocksdb");
 const ColumnNamespace = interface.ColumnNamespace;
 const Allocator = std.mem.Allocator;
 const zeam_utils = @import("@zeam/utils");
+const ssz = @import("ssz");
+const types = @import("@zeam/types");
 
 pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
     return struct {
@@ -31,9 +33,11 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 .create_missing_column_families = true,
             };
 
-            // assert that the first cn is the default column family
-            if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {
-                return error.DefaultColumnNamespaceNotFound;
+            comptime {
+                // assert that the first cn is the default column family
+                if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {
+                    @compileError("Default column namespace not found: first column namespace must be 'default'");
+                }
             }
 
             // allocate cf descriptions
@@ -95,20 +99,20 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             self.allocator.free(self.path);
         }
 
-        pub fn put(self: Self, comptime cn: ColumnNamespace, key: cn.Key, value: cn.Value) anyerror!void {
+        pub fn put(self: Self, comptime cn: ColumnNamespace, key: cn.Key, value: cn.Value) !void {
             try callRocksDB(self.logger, rocksdb.DB.put, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key, value });
         }
 
-        pub fn get(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) anyerror!?rocksdb.Data {
+        pub fn get(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) !?rocksdb.Data {
             const result: ?rocksdb.Data = try callRocksDB(self.logger, rocksdb.DB.get, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key });
             return result;
         }
 
-        pub fn delete(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) anyerror!void {
+        pub fn delete(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) !void {
             try callRocksDB(self.logger, rocksdb.DB.delete, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key });
         }
 
-        pub fn deleteFilesInRange(self: *Self, comptime cn: ColumnNamespace, start_key: cn.Key, end_key: cn.Key) anyerror!void {
+        pub fn deleteFilesInRange(self: *Self, comptime cn: ColumnNamespace, start_key: cn.Key, end_key: cn.Key) !void {
             try callRocksDB(self.logger, rocksdb.DB.deleteFilesInRange, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], start_key, end_key });
         }
 
@@ -117,6 +121,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 .allocator = self.allocator,
                 .inner = rocksdb.WriteBatch.init(),
                 .cf_handles = self.cf_handles,
+                .logger = self.logger,
             };
         }
 
@@ -138,6 +143,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             allocator: Allocator,
             inner: rocksdb.WriteBatch,
             cf_handles: []const rocksdb.ColumnFamilyHandle,
+            logger: zeam_utils.ModuleLogger,
 
             pub fn deinit(self: *WriteBatch) void {
                 self.inner.deinit();
@@ -148,8 +154,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 key: cn.Key,
                 value: cn.Value,
-            ) anyerror!void {
-                try self.inner.put(
+            ) void {
+                self.inner.put(
                     self.cf_handles[cn.find(column_namespaces)],
                     key,
                     value,
@@ -160,8 +166,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
                 key: cn.Key,
-            ) anyerror!void {
-                try self.inner.delete(self.cf_handles[cn.find(column_namespaces)], key);
+            ) void {
+                self.inner.delete(self.cf_handles[cn.find(column_namespaces)], key);
             }
 
             pub fn deleteRange(
@@ -169,11 +175,87 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 start: cn.Key,
                 end: cn.Key,
-            ) anyerror!void {
+            ) void {
                 self.inner.deleteRange(
                     self.cf_handles[cn.find(column_namespaces)],
                     start,
                     end,
+                );
+            }
+
+            /// Generic put function for batch operations
+            fn putToBatch(
+                self: *WriteBatch,
+                comptime T: type,
+                key: []const u8,
+                value: T,
+                comptime cn: ColumnNamespace,
+                comptime log_message: []const u8,
+                log_args: anytype,
+            ) !void {
+                var serialized_value = std.ArrayList(u8).init(self.allocator);
+                defer serialized_value.deinit();
+
+                try ssz.serialize(T, value, &serialized_value);
+
+                self.put(cn, key, serialized_value.items);
+                self.logger.debug(log_message, log_args);
+            }
+
+            /// Put a block to this write batch
+            pub fn putBlock(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                block_root: types.Root,
+                block: types.SignedBeamBlock,
+            ) !void {
+                const key = try interface.formatBlockKey(self.allocator, block_root);
+                defer self.allocator.free(key);
+
+                try self.putToBatch(
+                    types.SignedBeamBlock,
+                    key,
+                    block,
+                    cn,
+                    "Added block to batch: root=0x{s}",
+                    .{std.fmt.fmtSliceHexLower(&block_root)},
+                );
+            }
+
+            /// Put a state to this write batch
+            pub fn putState(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                state_root: types.Root,
+                state: types.BeamState,
+            ) !void {
+                const key = try interface.formatStateKey(self.allocator, state_root);
+                defer self.allocator.free(key);
+
+                try self.putToBatch(
+                    types.BeamState,
+                    key,
+                    state,
+                    cn,
+                    "Added state to batch: root=0x{s}",
+                    .{std.fmt.fmtSliceHexLower(&state_root)},
+                );
+            }
+
+            /// Put a vote to this write batch
+            pub fn putVote(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                vote_key: []const u8,
+                vote: types.SignedVote,
+            ) !void {
+                try self.putToBatch(
+                    types.SignedVote,
+                    vote_key,
+                    vote,
+                    cn,
+                    "Added vote to batch: key={s}",
+                    .{vote_key},
                 );
             }
         };
@@ -183,7 +265,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime cn: ColumnNamespace,
             comptime direction: interface.IteratorDirection,
             start: ?cn.Key,
-        ) anyerror!Iterator(cn, direction) {
+        ) !Iterator(cn, direction) {
             return .{
                 .allocator = self.allocator,
                 .inner = self.db.iterator(
@@ -209,12 +291,15 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     self.inner.deinit();
                 }
 
-                pub fn next(self: *@This()) anyerror!?cf.Entry() {
+                pub fn next(self: *@This()) !?cf.Entry() {
                     const entry = try callRocksDB(self.logger, rocksdb.Iterator.next, .{&self.inner});
-                    return if (entry) |kv| .{ kv[0].data, kv[1].data } orelse null;
+                    return if (entry) |kv|
+                        .{ kv[0].data, kv[1].data }
+                    else
+                        null;
                 }
 
-                pub fn nextKey(self: *@This()) anyerror!?cf.Key {
+                pub fn nextKey(self: *@This()) !?cf.Key {
                     const entry = try callRocksDB(self.logger, rocksdb.Iterator.next, .{&self.inner});
                     return if (entry) |kv|
                         kv[0].data
@@ -222,7 +307,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                         null;
                 }
 
-                pub fn nextValue(self: *@This()) anyerror!?cf.Value {
+                pub fn nextValue(self: *@This()) !?cf.Value {
                     const entry = try callRocksDB(self.logger, rocksdb.Iterator.next, .{&self.inner});
                     return if (entry) |kv|
                         kv[1].data
@@ -237,6 +322,128 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self.logger,
                 rocksdb.DB.flush,
                 .{ &self.db, self.cf_handles[cn.find(column_namespaces)] },
+            );
+        }
+
+        /// Generic save function for database operations
+        fn saveToDatabase(
+            self: *Self,
+            comptime T: type,
+            key: []const u8,
+            value: T,
+            comptime cn: ColumnNamespace,
+            comptime log_message: []const u8,
+            log_args: anytype,
+        ) !void {
+            var serialized_value = std.ArrayList(u8).init(self.allocator);
+            defer serialized_value.deinit();
+
+            try ssz.serialize(T, value, &serialized_value);
+
+            try self.put(cn, key, serialized_value.items);
+            self.logger.debug(log_message, log_args);
+        }
+
+        /// Generic load function for database operations
+        fn loadFromDatabase(
+            self: *Self,
+            comptime T: type,
+            key: []const u8,
+            comptime cn: ColumnNamespace,
+            comptime log_message: []const u8,
+            log_args: anytype,
+        ) !?T {
+            const value = try self.get(cn, key);
+            if (value) |encoded_value| {
+                defer encoded_value.deinit();
+
+                var decoded_value: T = undefined;
+                try ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator);
+
+                self.logger.debug(log_message, log_args);
+                return decoded_value;
+            }
+            return null;
+        }
+
+        /// Save a block to the database
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBeamBlock) !void {
+            const key = try interface.formatBlockKey(self.allocator, block_root);
+            defer self.allocator.free(key);
+
+            try self.saveToDatabase(
+                types.SignedBeamBlock,
+                key,
+                block,
+                cn,
+                "Saved block to database: root=0x{s}",
+                .{std.fmt.fmtSliceHexLower(&block_root)},
+            );
+        }
+
+        /// Load a block from the database
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) !?types.SignedBeamBlock {
+            const key = try interface.formatBlockKey(self.allocator, block_root);
+            defer self.allocator.free(key);
+
+            return try self.loadFromDatabase(
+                types.SignedBeamBlock,
+                key,
+                cn,
+                "Loaded block from database: root=0x{s}",
+                .{std.fmt.fmtSliceHexLower(&block_root)},
+            );
+        }
+
+        /// Save a state to the database
+        pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) !void {
+            const key = try interface.formatStateKey(self.allocator, state_root);
+            defer self.allocator.free(key);
+
+            try self.saveToDatabase(
+                types.BeamState,
+                key,
+                state,
+                cn,
+                "Saved state to database: root=0x{s}",
+                .{std.fmt.fmtSliceHexLower(&state_root)},
+            );
+        }
+
+        /// Load a state from the database
+        pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) !?types.BeamState {
+            const key = try interface.formatStateKey(self.allocator, state_root);
+            defer self.allocator.free(key);
+
+            return try self.loadFromDatabase(
+                types.BeamState,
+                key,
+                cn,
+                "Loaded state from database: root=0x{s}",
+                .{std.fmt.fmtSliceHexLower(&state_root)},
+            );
+        }
+
+        /// Save a vote to the database
+        pub fn saveVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8, vote: types.SignedVote) !void {
+            try self.saveToDatabase(
+                types.SignedVote,
+                vote_key,
+                vote,
+                cn,
+                "Saved vote to database: key={s}",
+                .{vote_key},
+            );
+        }
+
+        /// Load a vote from the database
+        pub fn loadVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8) !?types.SignedVote {
+            return try self.loadFromDatabase(
+                types.SignedVote,
+                vote_key,
+                cn,
+                "Loaded vote from database: key={s}",
+                .{vote_key},
             );
         }
 
@@ -263,7 +470,7 @@ fn callRocksDB(logger: zeam_utils.ModuleLogger, func: anytype, args: anytype) in
     };
 }
 
-test "column_namespaces" {
+test "test_column_namespaces" {
     const cn = [_]ColumnNamespace{
         .{ .namespace = "default", .Key = u8, .Value = u8 },
         .{ .namespace = "cn1", .Key = u8, .Value = u8 },
@@ -273,29 +480,6 @@ test "column_namespaces" {
     try std.testing.expectEqual(@as(comptime_int, 0), cn[0].find(&cn));
     try std.testing.expectEqual(@as(comptime_int, 1), cn[1].find(&cn));
     try std.testing.expectEqual(@as(comptime_int, 2), cn[2].find(&cn));
-}
-
-test "test_rocksdb_with_empty_cn" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
-
-    const column_namespaces = [_]ColumnNamespace{};
-
-    // Create a test logger
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
-
-    // Should fail to initialize RocksDB with empty column namespaces
-    const db = RocksDB(&column_namespaces);
-    const result = db.open(allocator, module_logger, db_path);
-    try std.testing.expectError(error.DefaultColumnNamespaceNotFound, result);
 }
 
 test "test_rocksdb_with_default_cn" {
@@ -314,7 +498,7 @@ test "test_rocksdb_with_default_cn" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
+    const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespaces);
     var db = try rdb.open(allocator, module_logger, db_path);
@@ -357,7 +541,7 @@ test "test_column_families_with_multiple_cns" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
+    const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
     var db = try rdb.open(allocator, module_logger, db_path);
@@ -408,7 +592,7 @@ test "test_count_function" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
+    const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
     var db = try rdb.open(allocator, module_logger, db_path);
@@ -444,7 +628,7 @@ test "test_batch_write_function" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
+    const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
     var db = try rdb.open(allocator, module_logger, db_path);
@@ -454,7 +638,7 @@ test "test_batch_write_function" {
     defer batch.deinit();
 
     // Add entry to batch but don't commit yet
-    try batch.put(column_namespace[0], "default_key1", "default_value1");
+    batch.put(column_namespace[0], "default_key1", "default_value1");
 
     // Verify entry is not yet visible in database
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
@@ -470,7 +654,7 @@ test "test_batch_write_function" {
     }
 
     // Add delete operation to batch but don't commit yet
-    try batch.delete(column_namespace[0], "default_key1");
+    batch.delete(column_namespace[0], "default_key1");
 
     // Verify entry is still visible before commit
     const value2 = try db.get(column_namespace[0], "default_key1");
@@ -502,7 +686,7 @@ test "test_iterator_functionality" {
     };
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network_test);
+    const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
     var db = try rdb.open(allocator, module_logger, db_path);
