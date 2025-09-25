@@ -56,19 +56,24 @@ pub const Mock = struct {
     }
 };
 
-// Helper functions and structs for testing
-const SubscriberData = struct {
-    calls: *u32,
-    received: *?interface.GossipMessage,
-};
-
-fn common_onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
-    const data: *SubscriberData = @ptrCast(@alignCast(ptr));
-    data.calls.* += 1;
-    data.received.* = message.*;
-}
-
 test "Mock messaging across two subscribers" {
+    const TestSubscriber = struct {
+        calls: u32 = 0,
+        received_message: ?interface.GossipMessage = null,
+
+        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.received_message = message.*;
+        }
+
+        fn getCallbackHandler(self: *@This()) interface.OnGossipCbHandler {
+            return .{
+                .ptr = self,
+                .onGossipCb = onGossip,
+            };
+        }
+    };
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -79,28 +84,15 @@ test "Mock messaging across two subscribers" {
     var logger = zeam_utils.getTestLogger();
     var mock = try Mock.init(allocator, &loop, &logger);
 
-    // Track calls and capture received messages
-    var subscriber1_calls: u32 = 0;
-    var subscriber2_calls: u32 = 0;
-    var subscriber1_received_message: ?interface.GossipMessage = null;
-    var subscriber2_received_message: ?interface.GossipMessage = null;
+    // Create test subscribers with embedded data
+    var subscriber1 = TestSubscriber{};
+    var subscriber2 = TestSubscriber{};
 
-    const subscriber1_callback = common_onGossip;
-    const subscriber2_callback = common_onGossip;
-
-    // Both subscribers subscribe to the same block topic
+    // Both subscribers subscribe to the same block topic using the complete network interface
     var topics = [_]interface.GossipTopic{.block};
-    var subscriber1_data = SubscriberData{ .calls = &subscriber1_calls, .received = &subscriber1_received_message };
-    var subscriber2_data = SubscriberData{ .calls = &subscriber2_calls, .received = &subscriber2_received_message };
-
-    try Mock.subscribe(@ptrCast(&mock), &topics, .{
-        .ptr = &subscriber1_data,
-        .onGossipCb = subscriber1_callback,
-    });
-    try Mock.subscribe(@ptrCast(&mock), &topics, .{
-        .ptr = &subscriber2_data,
-        .onGossipCb = subscriber2_callback,
-    });
+    const network = mock.getNetworkInterface();
+    try network.gossip.subscribe(&topics, subscriber1.getCallbackHandler());
+    try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
     const block_message = try allocator.create(interface.GossipMessage);
@@ -118,22 +110,22 @@ test "Mock messaging across two subscribers" {
         .signature = [_]u8{3} ** types.SIGSIZE,
     } };
 
-    // Publish the message - both subscribers should receive it
-    try Mock.publish(@ptrCast(&mock), block_message);
+    // Publish the message using the network interface - both subscribers should receive it
+    try network.gossip.publish(block_message);
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);
 
     // Verify both subscribers received the message
-    try std.testing.expect(subscriber1_calls == 1);
-    try std.testing.expect(subscriber2_calls == 1);
+    try std.testing.expect(subscriber1.calls == 1);
+    try std.testing.expect(subscriber2.calls == 1);
 
     // Verify both subscribers received the same message content
-    try std.testing.expect(subscriber1_received_message != null);
-    try std.testing.expect(subscriber2_received_message != null);
+    try std.testing.expect(subscriber1.received_message != null);
+    try std.testing.expect(subscriber2.received_message != null);
 
-    const received1 = subscriber1_received_message.?;
-    const received2 = subscriber2_received_message.?;
+    const received1 = subscriber1.received_message.?;
+    const received2 = subscriber2.received_message.?;
 
     // Verify both received block messages
     try std.testing.expect(received1 == .block);
