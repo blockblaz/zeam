@@ -16,7 +16,7 @@ pub const StateTransitionOpts = struct {
     // represents such dependancy and assumption for STF
     validSignatures: bool = true,
     validateResult: bool = true,
-    logger: *zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 };
 
 // pub fn process_epoch(state: types.BeamState) void {
@@ -26,7 +26,7 @@ pub const StateTransitionOpts = struct {
 // }
 
 // prepare the state to be the post-state of the slot
-pub fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
+fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 
     // update state root in latest block header if its zero hash
     // i.e. just after processing the latest block of latest block header
@@ -40,7 +40,7 @@ pub fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 }
 
 // prepare the state to be pre state of the slot
-pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: *zeam_utils.ZeamLogger) !void {
+fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
     if (slot <= state.slot) {
         logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, state.slot });
         return StateTransitionError.InvalidPreState;
@@ -73,7 +73,7 @@ pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     return false;
 }
 
-fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process block header\n", .{});
 
     // 1. match state and block slot
@@ -110,27 +110,19 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
         state.latest_finalized.root = block.parent_root;
     }
 
-    // extend historical block hashes and justified slots structures
-    // can optimize to have a "cached" state where these sttructures are already in consimable format
-    var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
-
-    try historical_block_hashes.append(block.parent_root);
+    // extend historical block hashes and justified slots structures using SSZ Lists directly
+    try state.historical_block_hashes.append(block.parent_root);
     // if parent is genesis it is already justified
-    try justified_slots.append(if (state.latest_block_header.slot == 0) 1 else 0);
+    try state.justified_slots.append(if (state.latest_block_header.slot == 0) true else false);
 
     const block_slot: usize = @intCast(block.slot);
     const missed_slots: usize = @intCast(block_slot - state.latest_block_header.slot - 1);
     for (0..missed_slots) |i| {
         _ = i;
-        try historical_block_hashes.append(utils.ZERO_HASH);
-        try justified_slots.append(0);
+        try state.historical_block_hashes.append(utils.ZERO_HASH);
+        try state.justified_slots.append(false);
     }
-    logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, justified_slots.items, historical_block_hashes.items });
-
-    // again "cached" state would optimize make this avoidable till the very end of state root calc
-    state.historical_block_hashes = try historical_block_hashes.toOwnedSlice();
-    state.justified_slots = try justified_slots.toOwnedSlice();
+    logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, state.justified_slots.len(), state.historical_block_hashes.len() });
 
     state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
 }
@@ -143,43 +135,31 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // 1. process attestations
     try process_attestations(allocator, state, block.body.attestations, logger);
 }
 
-fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: []types.SignedVote, logger: *zeam_utils.ZeamLogger) !void {
-    logger.debug("\n\n===================\nprocess opetationg slot={d} \n prestate:historical hashes={d} justified slots ={any}, ", .{ state.slot, state.historical_block_hashes.len, state.justified_slots });
-    logger.debug("prestate justified={any} finalized={any}\n.........\n\n", .{ state.latest_justified, state.latest_finalized });
+fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
+    logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
+    logger.debug("prestate justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 
-    // transform state data into consumable format, generally one would keep a `cached`/consumable
-    // copy of state but we will get to that later especially w.r.t. proving
-    // prep data
-    var historical_block_hashes = std.ArrayList(types.Root).fromOwnedSlice(allocator, state.historical_block_hashes);
-    var justified_slots = std.ArrayList(u8).fromOwnedSlice(allocator, state.justified_slots);
+    // work directly with SSZ types
+    // historical_block_hashes and justified_slots are already SSZ types in state
 
-    // prep the justifications map
-    var justifications = std.AutoHashMap(types.Root, []u8).init(allocator);
-    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-    const num_validators: usize = @intCast(state.config.num_validators);
-    for (state.justifications_roots) |blockRoot| {
-        for (0..num_validators) |i| {
-            justifications.put(blockRoot, state.justifications_validators[i * num_validators .. (i + 1) * num_validators]) catch |e| {
-                logger.err("Invalid justifications parsing justification entries={d} num_validators={d} access range (i={d}): {d}..{d} err={any}", .{
-                    //
-                    state.justifications_validators.len,
-                    num_validators,
-                    i,
-                    i * num_validators,
-                    (i + 1) * num_validators,
-                    e,
-                });
-                return e;
-            };
+    var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer {
+        var iterator = justifications.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.value_ptr.*);
         }
     }
+    errdefer justifications.deinit(allocator);
+    try loadJustifications(allocator, &justifications, state, logger);
 
-    for (attestations) |signed_vote| {
+    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+    const num_validators: usize = @intCast(state.config.num_validators);
+    for (attestations.constSlice()) |signed_vote| {
         const validator_id: usize = @intCast(signed_vote.validator_id);
         const vote = signed_vote.message;
         // check if vote is sane
@@ -187,10 +167,23 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         const target_slot: usize = @intCast(vote.target.slot);
         logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
 
-        const is_source_justified = justified_slots.items[source_slot] == 1;
-        const is_target_already_justified = justified_slots.items[target_slot] == 1;
-        const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &historical_block_hashes.items[source_slot]);
-        const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &historical_block_hashes.items[target_slot]);
+        if (source_slot >= state.justified_slots.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (target_slot >= state.justified_slots.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (source_slot >= state.historical_block_hashes.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+        if (target_slot >= state.historical_block_hashes.len()) {
+            return StateTransitionError.InvalidSlotIndex;
+        }
+
+        const is_source_justified = state.justified_slots.get(source_slot);
+        const is_target_already_justified = state.justified_slots.get(target_slot);
+        const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &state.historical_block_hashes.get(source_slot));
+        const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &state.historical_block_hashes.get(target_slot));
         const target_not_ahead = target_slot <= source_slot;
         const is_target_justifiable = try is_justifiable_slot(state.latest_finalized.slot, target_slot);
 
@@ -223,12 +216,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             for (0..targetjustifications.len) |i| {
                 targetjustifications[i] = 0;
             }
-            try justifications.put(vote.target.root, targetjustifications);
+            try justifications.put(allocator, vote.target.root, targetjustifications);
             break :targetjustifications targetjustifications;
         };
 
         target_justifications[validator_id] = 1;
-        try justifications.put(vote.target.root, target_justifications);
+        try justifications.put(allocator, vote.target.root, target_justifications);
         var target_justifications_count: usize = 0;
         for (target_justifications) |justified| {
             if (justified == 1) {
@@ -244,7 +237,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         // requring floar division, can be further optimized
         if (3 * target_justifications_count >= 2 * num_validators) {
             state.latest_justified = vote.target;
-            justified_slots.items[target_slot] = 1;
+            state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
             logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_justified});
 
@@ -264,32 +257,76 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         }
     }
 
-    // reconstiture back the state vectors
-    state.historical_block_hashes = try historical_block_hashes.toOwnedSlice();
-    state.justified_slots = try justified_slots.toOwnedSlice();
+    try flattenJustifications(allocator, &justifications, state);
 
-    var justifications_roots = std.ArrayList(types.Root).init(allocator);
-    var justifications_validators = std.ArrayList(u8).init(allocator);
-    var iterator = justifications.iterator();
-    while (iterator.next()) |kv| {
-        try justifications_roots.append(kv.key_ptr.*);
-        try justifications_validators.appendSlice(kv.value_ptr.*);
-    }
-
-    allocator.free(state.justifications_roots);
-    allocator.free(state.justifications_validators);
-    state.justifications_roots = try justifications_roots.toOwnedSlice();
-    state.justifications_validators = try justifications_validators.toOwnedSlice();
-
-    for (state.justifications_roots) |root| {
-        _ = justifications.remove(root);
-    }
-
-    logger.debug("\n---------------\npoststate:historical hashes={d} justified slots ={any}\n justifications_roots:{any}\n justifications_validators= {any}\n", .{ state.historical_block_hashes.len, state.justified_slots, state.justifications_roots, state.justifications_validators });
-    logger.debug("poststate: justified={any} finalized={any}\n---------------\n------------\n\n\n", .{ state.latest_justified, state.latest_finalized });
+    logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
+    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
 }
 
-pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+/// Helper function to load justifications from state into a map
+fn loadJustifications(allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(types.Root, []u8), state: *types.BeamState, logger: zeam_utils.ModuleLogger) !void {
+    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+    const num_validators: usize = @intCast(state.config.num_validators);
+    // Initialize justifications from state
+    for (state.justifications_roots.constSlice(), 0..) |blockRoot, i| {
+        const validator_data = try allocator.alloc(u8, num_validators);
+        // Copy existing justification data if available, otherwise return error
+        for (validator_data, 0..) |*byte, j| {
+            const bit_index = i * num_validators + j;
+            if (bit_index >= state.justifications_validators.len()) {
+                logger.err("Invalid bit_index={d} parsing justification roots={d} justification entries={d} num_validators={d} access  range (i={d}): {d}..{d} err={any}", .{
+                    bit_index,
+                    state.justifications_roots.len(),
+                    state.justifications_validators.len(),
+                    num_validators,
+                    bit_index,
+                    i,
+                    i * num_validators,
+                    (i + 1) * num_validators,
+                });
+                return StateTransitionError.InvalidJustificationIndex;
+            }
+            byte.* = if (state.justifications_validators.get(bit_index)) 1 else 0;
+        }
+        try justifications.put(allocator, blockRoot, validator_data);
+    }
+}
+
+/// Helper function to flatten justifications map back to state arrays
+fn flattenJustifications(allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(types.Root, []u8), state: *types.BeamState) !void {
+    // Lists are now heap allocated ArrayLists using the allocator
+    // Deinit existing lists and reinitialize
+    state.justifications_roots.deinit();
+    state.justifications_validators.deinit();
+    state.justifications_roots = try types.JustificationsRoots.init(allocator);
+    state.justifications_validators = try types.JustificationsValidators.init(allocator);
+
+    // First, collect all keys
+    var iterator = justifications.iterator();
+    while (iterator.next()) |kv| {
+        try state.justifications_roots.append(kv.key_ptr.*);
+    }
+
+    // Sort the roots, confirm this sorting via a test
+    std.mem.sortUnstable(types.Root, state.justifications_roots.slice(), {}, struct {
+        fn lessThanFn(_: void, a: types.Root, b: types.Root) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lessThanFn);
+
+    // Now iterate over sorted roots and flatten validators in order
+    for (state.justifications_roots.constSlice()) |root| {
+        const rootSlice = justifications.get(root) orelse unreachable;
+        // append individual bits for validator justifications
+        // have a batch set method to set it since eventual num vals are div by 8
+        // and hence the vector can be fully appeneded as bytes
+        for (rootSlice) |validator_bit| {
+            try state.justifications_validators.append(validator_bit == 1);
+        }
+    }
+}
+
+fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // start block processing
     try process_block_header(allocator, state, block, logger);
     // PQ devner-0 has no execution
@@ -297,7 +334,7 @@ pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types
     try process_operations(allocator, state, block, logger);
 }
 
-pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: *zeam_utils.ZeamLogger) !void {
+pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
     try process_slots(allocator, state, block.slot, logger);
 
@@ -318,9 +355,8 @@ pub fn verify_signatures(signedBlock: types.SignedBeamBlock) !void {
 
 // TODO(gballet) check if beam block needs to be a pointer
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlock: types.SignedBeamBlock, opts: StateTransitionOpts) !void {
-    const logger = opts.logger;
     const block = signedBlock.message;
-    logger.debug("applying  state transition state-slot={d} block-slot={d}\n", .{ state.slot, block.slot });
+    opts.logger.debug("applying  state transition state-slot={d} block-slot={d}\n", .{ state.slot, block.slot });
 
     // client is supposed to call verify_signatures outside STF to make STF prover friendly
     const validSignatures = opts.validSignatures;
@@ -329,9 +365,9 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 
     // prepare the pre state for this block slot
-    try process_slots(allocator, state, block.slot, logger);
+    try process_slots(allocator, state, block.slot, opts.logger);
     // process the block
-    try process_block(allocator, state, block, logger);
+    try process_block(allocator, state, block, opts.logger);
 
     const validateResult = opts.validateResult;
     if (validateResult) {
@@ -339,10 +375,10 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
+            opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;
         }
     }
 }
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex };

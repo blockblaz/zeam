@@ -12,7 +12,7 @@ pub const Mock = struct {
     gossipHandler: interface.GenericGossipHandler,
     const Self = @This();
 
-    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: *const zeam_utils.ZeamLogger) !Self {
+    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger) !Self {
         return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger) };
     }
 

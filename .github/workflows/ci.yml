@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# only one can run at a time in PRs
+concurrency:
+  # If PR, cancel prev commits. head_ref = source branch name on pull_request, null if push
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 name: CI
 
 jobs:
@@ -46,7 +52,10 @@ jobs:
       run: zig fmt --check .
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v2
 
@@ -71,10 +80,12 @@ jobs:
       uses: mlugg/setup-zig@v2.0.5
       with:
         version: 0.14.1
-    
-    - name: Test
-      # figure out how to build the monorepo builds
+
+    - name: Run all unit tests
       run: zig build test --summary all
+
+    - name: Run all sim tests
+      run: zig build simtest --summary all
 
   docker-build:
     name: docker-build

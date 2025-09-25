@@ -14,7 +14,7 @@ const NetworkInterface = interface.NetworkInterface;
 /// Writes failed deserialization bytes to disk for debugging purposes
 /// Returns the filename if the file was successfully created, null otherwise
 /// If timestamp is null, generates a new timestamp automatically
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: *const zeam_utils.ZeamLogger) ?[]const u8 {
+fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) ?[]const u8 {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
         error.PathAlreadyExists => {}, // Directory already exists, continue
@@ -49,13 +49,13 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
-    const topic = interface.GossipTopic.parseTopic(topic_str) orelse {
-        zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge", .{std.mem.span(topic_str)});
+    const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
+        zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
         return;
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
-    const message: interface.GossipMessage = switch (topic) {
+    const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
             ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
@@ -93,23 +93,27 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 }
 
-export fn releaseAddresses(zigHandler: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void {
-    const listen_slice = std.mem.span(listenAddresses);
-    zigHandler.allocator.free(listen_slice);
+export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
+    const listen_slice = std.mem.span(listen_addresses);
+    zig_handler.allocator.free(listen_slice);
 
-    const connect_slice = std.mem.span(connectAddresses);
-    // because connectAddresses can be empty string "" which not allocate memory in the heap
-    if (connect_slice.len > 0) {
-        zigHandler.allocator.free(connect_slice);
-    }
+    const connect_slice = std.mem.span(connect_addresses);
+    zig_handler.allocator.free(connect_slice);
+
+    const topics_slice = std.mem.span(topics);
+    zig_handler.allocator.free(topics_slice);
+
+    const private_key_slice = std.mem.span(local_private_key);
+    zig_handler.allocator.free(private_key_slice);
 }
 
-// TODO: change listen port and connect port both to list of multiaddrs
-pub extern fn create_and_run_network(networkId: u32, a: *EthLibp2p, listenAddresses: [*:0]const u8, connectAddresses: [*:0]const u8) void;
+pub extern fn create_and_run_network(network_id: u32, handle: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void;
 pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
+    network_name: []const u8,
+    local_private_key: []const u8,
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
 };
@@ -119,7 +123,7 @@ pub const EthLibp2p = struct {
     gossipHandler: interface.GenericGossipHandler,
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
 
@@ -127,9 +131,23 @@ pub const EthLibp2p = struct {
         allocator: Allocator,
         loop: *xev.Loop,
         params: EthLibp2pParams,
-        logger: *const zeam_utils.ZeamLogger,
+        logger: zeam_utils.ModuleLogger,
     ) !Self {
         return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger), .logger = logger };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.gossipHandler.deinit();
+
+        for (self.params.listen_addresses) |addr| addr.deinit();
+        self.allocator.free(self.params.listen_addresses);
+
+        if (self.params.connect_peers) |peers| {
+            for (peers) |addr| addr.deinit();
+            self.allocator.free(peers);
+        }
+
+        self.allocator.free(self.params.network_name);
     }
 
     pub fn run(self: *Self) !void {
@@ -137,18 +155,38 @@ pub const EthLibp2p = struct {
         const connect_peers_str = if (self.params.connect_peers) |peers|
             try multiaddrsToString(self.allocator, peers)
         else
-            "";
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, listen_addresses_str.ptr, connect_peers_str.ptr });
+            try self.allocator.dupeZ(u8, "");
+        const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
+
+        var topics_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (topics_list.items) |topic_str| {
+                self.allocator.free(topic_str);
+            }
+            topics_list.deinit(self.allocator);
+        }
+
+        for (std.enums.values(interface.GossipTopic)) |gossip_topic| {
+            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+            defer topic.deinit();
+            const topic_str = try topic.encode();
+            try topics_list.append(self.allocator, std.mem.span(topic_str.ptr));
+        }
+        const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
+
+        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
-        const topic = data.getTopic();
-        const topic_str: [*:0]const u8 = @ptrCast(@tagName(topic));
+        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
+        defer topic.deinit();
+        const topic_str = try topic.encode();
+        defer self.allocator.free(topic_str);
 
         // TODO: deinit the message later ob once done
-        const message = switch (topic) {
+        const message = switch (topic.gossip_topic) {
             .block => blockbytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
                 try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
@@ -162,8 +200,8 @@ pub const EthLibp2p = struct {
                 break :votebytes serialized.items;
             },
         };
-        self.gossipHandler.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, message, data });
-        publish_msg_to_rust_bridge(self.params.networkId, topic_str, message.ptr, message.len);
+        self.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, message, data });
+        publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, message.ptr, message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -231,7 +269,8 @@ test "writeFailedBytes creates file with correct content" {
     const allocator = testing.allocator;
 
     // Create a test logger
-    var test_logger = zeam_utils.getTestLogger();
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.network);
 
     // Ensure directory exists before test (CI-safe)
     std.fs.cwd().makeDir("deserialization_dumps") catch {};
@@ -241,7 +280,7 @@ test "writeFailedBytes creates file with correct content" {
 
     // Test case 1: Valid data that should succeed
     const valid_bytes = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 };
-    const result1 = writeFailedBytes(&valid_bytes, "test", allocator, test_timestamp, &test_logger);
+    const result1 = writeFailedBytes(&valid_bytes, "test", allocator, test_timestamp, module_logger);
     testing.expect(result1 != null) catch {
         std.debug.print("writeFailedBytes should return filename for valid data\n", .{});
     };
@@ -270,7 +309,7 @@ test "writeFailedBytes creates file with correct content" {
 
     // Test case 2: Empty data that should still succeed
     const empty_bytes = [_]u8{};
-    const result2 = writeFailedBytes(&empty_bytes, "empty", allocator, test_timestamp, &test_logger);
+    const result2 = writeFailedBytes(&empty_bytes, "empty", allocator, test_timestamp, module_logger);
     testing.expect(result2 != null) catch {
         std.debug.print("writeFailedBytes should return filename for empty data\n", .{});
     };

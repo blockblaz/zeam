@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
+const params = @import("@zeam/params");
 const ssz = @import("ssz");
 
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
@@ -63,14 +64,14 @@ pub fn genGenesisBlock(allocator: Allocator, genesis_state: types.BeamState) !ty
         .body = types.BeamBlockBody{
             // .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini
-            .attestations = &[_]types.SignedVote{},
+            .attestations = try types.SignedVotes.init(allocator),
         },
     };
 
     return genesis_latest_block;
 }
 
-pub fn genGenesisLatestBlock() !types.BeamBlock {
+pub fn genGenesisLatestBlock(allocator: Allocator) !types.BeamBlock {
     const genesis_latest_block = types.BeamBlock{
         .slot = 0,
         .proposer_index = 0,
@@ -79,7 +80,7 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
         .body = types.BeamBlockBody{
             // .execution_payload_header = .{ .timestamp = 0 },
             // 3sf mini votes
-            .attestations = &[_]types.SignedVote{},
+            .attestations = try types.SignedVotes.init(allocator),
         },
     };
 
@@ -87,11 +88,7 @@ pub fn genGenesisLatestBlock() !types.BeamBlock {
 }
 
 pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.BeamState {
-    const genesis_latest_block = try genGenesisLatestBlock();
-    // historical hashes and justified slots are slices so we need to alloc them
-    // for them to exist outside this fn scope
-    var historical_hashes_array = std.ArrayList(types.Root).init(allocator);
-    var justified_slots_array = std.ArrayList(u8).init(allocator);
+    const genesis_latest_block = try genGenesisLatestBlock(allocator);
 
     const state = types.BeamState{
         .config = .{
@@ -103,11 +100,11 @@ pub fn genGenesisState(allocator: Allocator, genesis: types.GenesisSpec) !types.
         // mini3sf
         .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
         .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .historical_block_hashes = try historical_hashes_array.toOwnedSlice(),
-        .justified_slots = try justified_slots_array.toOwnedSlice(),
+        .historical_block_hashes = try types.HistoricalBlockHashes.init(allocator),
+        .justified_slots = try types.JustifiedSlots.init(allocator),
         // justifications map is empty
-        .justifications_roots = &[_]types.Root{},
-        .justifications_validators = &[_]u8{},
+        .justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator),
+        .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
     };
 
     return state;

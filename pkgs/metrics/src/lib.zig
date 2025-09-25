@@ -46,7 +46,7 @@ pub const Timer = struct {
     is_chain: bool,
 
     /// Stops the timer and records the duration in the histogram.
-    pub fn observe(self: Timer) void {
+    pub fn observe(self: Timer) f32 {
         const end_time = getTimestamp();
         const duration_ns = end_time - self.start_time;
 
@@ -58,6 +58,8 @@ pub const Timer = struct {
         } else {
             metrics.block_processing_duration_seconds.observe(duration_seconds);
         }
+
+        return duration_seconds;
     }
 };
 

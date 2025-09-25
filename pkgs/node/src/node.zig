@@ -20,13 +20,13 @@ const LevelDB = struct {};
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: types.BeamState,
+    anchorState: *const types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     db: LevelDB,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
-    logger: *zeam_utils.ZeamLogger,
+    logger_config: *zeam_utils.ZeamLoggerConfig,
 };
 
 pub const BeamNode = struct {
@@ -36,7 +36,7 @@ pub const BeamNode = struct {
     network: networkFactory.Network,
     validator: ?validators.BeamValidator = null,
     nodeId: u32,
-    logger: *const zeam_utils.ZeamLogger,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: NodeOpts) !Self {
@@ -45,9 +45,17 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         const network = networkFactory.Network.init(opts.backend);
 
-        chain.* = try chainFactory.BeamChain.init(allocator, opts.config, opts.anchorState, opts.nodeId, opts.logger);
+        chain.* = try chainFactory.BeamChain.init(
+            allocator,
+            chainFactory.ChainOpts{
+                .config = opts.config,
+                .anchorState = opts.anchorState,
+                .nodeId = opts.nodeId,
+                .logger_config = opts.logger_config,
+            },
+        );
         if (opts.validator_ids) |ids| {
-            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger });
+            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
             chain.registerValidatorIds(ids);
         }
 
@@ -58,8 +66,12 @@ pub const BeamNode = struct {
             .network = network,
             .validator = validator,
             .nodeId = opts.nodeId,
-            .logger = opts.logger,
+            .logger = opts.logger_config.logger(.node),
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self.chain);
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage) anyerror!void {

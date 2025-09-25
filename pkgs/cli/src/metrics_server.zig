@@ -5,6 +5,7 @@ const metrics = @import("@zeam/metrics");
 pub fn startMetricsServer(allocator: std.mem.Allocator, port: u16) !void {
     // Create a simple HTTP server context
     const ctx = try allocator.create(SimpleMetricsServer);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .port = port,
@@ -23,8 +24,10 @@ const SimpleMetricsServer = struct {
     port: u16,
 
     fn run(self: *SimpleMetricsServer) !void {
+        // `startMetricsServer` creates this, so we need to free it here
+        defer self.allocator.destroy(self);
         const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
-        var server = try address.listen(.{});
+        var server = try address.listen(.{ .reuse_address = true });
         defer server.deinit();
 
         std.log.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});

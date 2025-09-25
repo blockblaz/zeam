@@ -249,6 +249,27 @@ pub fn build(b: *Builder) !void {
 
     const test_step = b.step("test", "Run zeam core tests");
 
+    // CLI integration tests (separate target) - always create this test target
+    const cli_integration_tests = b.addTest(.{
+        .root_source_file = b.path("pkgs/cli/test/integration.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const integration_build_options = b.addOptions();
+    cli_integration_tests.step.dependOn(&cli_exe.step);
+    integration_build_options.addOptionPath("cli_exe_path", cli_exe.getEmittedBin());
+    const integration_build_options_module = integration_build_options.createModule();
+    cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
+
+    // Add CLI constants module to integration tests
+    const cli_constants = b.addModule("cli_constants", .{
+        .root_source_file = b.path("pkgs/cli/src/constants.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
+
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
         .optimize = optimize,
@@ -294,6 +315,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_tests.step.dependOn(&cli_exe.step);
     addRustGlueLib(b, cli_tests, target);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -317,6 +339,26 @@ pub fn build(b: *Builder) !void {
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
+    const configs_tests = b.addTest(.{
+        .root_module = zeam_configs,
+        .optimize = optimize,
+        .target = target,
+    });
+    configs_tests.root_module.addImport("@zeam/utils", zeam_utils);
+    configs_tests.root_module.addImport("@zeam/types", zeam_types);
+    configs_tests.root_module.addImport("@zeam/params", zeam_params);
+    configs_tests.root_module.addImport("yaml", yaml);
+    const run_configs_tests = b.addRunArtifact(configs_tests);
+    test_step.dependOn(&run_configs_tests.step);
+
+    const utils_tests = b.addTest(.{
+        .root_module = zeam_utils,
+        .optimize = optimize,
+        .target = target,
+    });
+    const run_utils_tests = b.addRunArtifact(utils_tests);
+    test_step.dependOn(&run_utils_tests.step);
+
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
 
@@ -331,6 +373,11 @@ pub fn build(b: *Builder) !void {
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
     test_step.dependOn(tools_test_step);
+
+    // Create simtest step that runs only integration tests
+    const simtests = b.step("simtest", "Run integration tests");
+    const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
+    simtests.dependOn(&run_cli_integration_test.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
@@ -372,6 +419,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/types/src/lib.zig"),
         });
+        zeam_types.addImport("ssz", ssz);
         zeam_types.addImport("@zeam/params", zeam_params);
 
         // add zeam-params

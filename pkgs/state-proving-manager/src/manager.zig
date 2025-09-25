@@ -43,12 +43,11 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
 
-    const logger = opts.logger;
-    logger.debug("prove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
+    opts.logger.debug("prove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
 
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
-    logger.debug("should deserialize to={any}", .{prover_input_deserialized.state});
+    opts.logger.debug("should deserialize to={any}", .{prover_input_deserialized.state});
 
     // allocate a megabyte of data so that we have enough space for the proof.
     // XXX not deallocated yet
@@ -62,7 +61,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     const proof = types.BeamSTFProof{
         .proof = output[0..output_len],
     };
-    logger.debug("proof len={}\n", .{output_len});
+    opts.logger.debug("proof len={}\n", .{output_len});
 
     return proof;
 }
