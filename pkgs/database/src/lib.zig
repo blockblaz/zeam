@@ -1,5 +1,6 @@
 const rocksDB = @import("./rocksdb.zig");
-pub usingnamespace rocksDB;
-
 const interface = @import("./interface.zig");
-pub usingnamespace interface;
+
+// Export the main types that are used by consumers
+pub const ColumnNamespace = interface.ColumnNamespace;
+pub const RocksDB = rocksDB.RocksDB;

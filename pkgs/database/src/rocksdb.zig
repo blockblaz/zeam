@@ -46,7 +46,6 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 column_family_descriptions[i] = .{ .name = cn.namespace, .options = .{} };
             }
 
-            // Open rocksdb with default column family only
             const db: rocksdb.DB, //
             const cfs: []const rocksdb.ColumnFamily //
             = try callRocksDB(logger, rocksdb.DB.open, .{
@@ -96,25 +95,20 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             self.allocator.free(self.path);
         }
 
-        pub fn put(self: Self, cn: ColumnNamespace, key: cn.Key, value: cn.Value) anyerror!void {
+        pub fn put(self: Self, comptime cn: ColumnNamespace, key: cn.Key, value: cn.Value) anyerror!void {
             try callRocksDB(self.logger, rocksdb.DB.put, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key, value });
         }
 
-        pub fn get(self: *Self, cn: ColumnNamespace, key: cn.Key) anyerror!?rocksdb.Data {
+        pub fn get(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) anyerror!?rocksdb.Data {
             const result: ?rocksdb.Data = try callRocksDB(self.logger, rocksdb.DB.get, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key });
-
-            if (result) |data| {
-                return data;
-            } else {
-                return null;
-            }
+            return result;
         }
 
-        pub fn delete(self: *Self, cn: ColumnNamespace, key: cn.Key) anyerror!void {
+        pub fn delete(self: *Self, comptime cn: ColumnNamespace, key: cn.Key) anyerror!void {
             try callRocksDB(self.logger, rocksdb.DB.delete, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], key });
         }
 
-        pub fn deleteFilesInRange(self: *Self, cn: ColumnNamespace, start_key: cn.Key, end_key: cn.Key) anyerror!void {
+        pub fn deleteFilesInRange(self: *Self, comptime cn: ColumnNamespace, start_key: cn.Key, end_key: cn.Key) anyerror!void {
             try callRocksDB(self.logger, rocksdb.DB.deleteFilesInRange, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], start_key, end_key });
         }
 
@@ -155,7 +149,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key: cn.Key,
                 value: cn.Value,
             ) anyerror!void {
-                self.inner.put(
+                try self.inner.put(
                     self.cf_handles[cn.find(column_namespaces)],
                     key,
                     value,
@@ -167,7 +161,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 key: cn.Key,
             ) anyerror!void {
-                self.inner.delete(self.cf_handles[cn.find(column_namespaces)], key);
+                try self.inner.delete(self.cf_handles[cn.find(column_namespaces)], key);
             }
 
             pub fn deleteRange(
@@ -217,12 +211,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
                 pub fn next(self: *@This()) anyerror!?cf.Entry() {
                     const entry = try callRocksDB(self.logger, rocksdb.Iterator.next, .{&self.inner});
-                    return if (entry) |kv| {
-                        return .{
-                            kv[0].data,
-                            kv[1].data,
-                        };
-                    } else null;
+                    return if (entry) |kv| .{ kv[0].data, kv[1].data } orelse null;
                 }
 
                 pub fn nextKey(self: *@This()) anyerror!?cf.Key {
@@ -268,7 +257,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 fn callRocksDB(logger: zeam_utils.ModuleLogger, func: anytype, args: anytype) interface.ReturnType(@TypeOf(func)) {
     var err_str: ?rocksdb.Data = null;
     return @call(.auto, func, args ++ .{&err_str}) catch |e| {
-        logger.err("Failed to call RocksDB function: {any}", .{e});
+        const func_name = @typeName(@TypeOf(func));
+        logger.err("Failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
         return e;
     };
 }
@@ -280,9 +270,9 @@ test "column_namespaces" {
         .{ .namespace = "cn2", .Key = u8, .Value = u8 },
     };
 
-    std.debug.assert(cn[0].find(&cn) == 0);
-    std.debug.assert(cn[1].find(&cn) == 1);
-    std.debug.assert(cn[2].find(&cn) == 2);
+    try std.testing.expectEqual(@as(comptime_int, 0), cn[0].find(&cn));
+    try std.testing.expectEqual(@as(comptime_int, 1), cn[1].find(&cn));
+    try std.testing.expectEqual(@as(comptime_int, 2), cn[2].find(&cn));
 }
 
 test "test_rocksdb_with_empty_cn" {
@@ -337,7 +327,7 @@ test "test_rocksdb_with_default_cn" {
     const value = try db.get(column_namespaces[0], "default_key");
     if (value) |v| {
         defer v.deinit();
-        std.debug.assert(std.mem.eql(u8, v.data, "default_value"));
+        try std.testing.expectEqualStrings("default_value", v.data);
     }
 
     // Delete values from the default column family
@@ -345,7 +335,7 @@ test "test_rocksdb_with_default_cn" {
 
     // Verify deletion
     const value2 = try db.get(column_namespaces[0], "default_key");
-    std.debug.assert(value2 == null);
+    try std.testing.expect(value2 == null);
 }
 
 test "test_column_families_with_multiple_cns" {
@@ -381,13 +371,13 @@ test "test_column_families_with_multiple_cns" {
     const value = try db.get(column_namespace[1], "cn1_key");
     if (value) |v| {
         defer v.deinit();
-        std.debug.assert(std.mem.eql(u8, v.data, "cn1_value"));
+        try std.testing.expectEqualStrings("cn1_value", v.data);
     }
 
     const value2 = try db.get(column_namespace[2], "cn2_key");
     if (value2) |v2| {
         defer v2.deinit();
-        std.debug.assert(std.mem.eql(u8, v2.data, "cn2_value"));
+        try std.testing.expectEqualStrings("cn2_value", v2.data);
     }
 
     // Delete values from the column families
@@ -396,10 +386,10 @@ test "test_column_families_with_multiple_cns" {
 
     // Verify deletion
     const value3 = try db.get(column_namespace[1], "cn1_key");
-    std.debug.assert(value3 == null);
+    try std.testing.expect(value3 == null);
 
     const value4 = try db.get(column_namespace[2], "cn2_key");
-    std.debug.assert(value4 == null);
+    try std.testing.expect(value4 == null);
 }
 
 test "test_count_function" {
@@ -425,7 +415,7 @@ test "test_count_function" {
     defer db.deinit();
 
     // Initially, the column family should have 0 entries
-    std.debug.assert(try db.count(column_namespace[0]) == 0);
+    try std.testing.expectEqual(@as(u64, 0), try db.count(column_namespace[0]));
 
     // Add some entries to the default column family
     try db.put(column_namespace[0], "default_key1", "default_value1");
@@ -435,7 +425,7 @@ test "test_count_function" {
     try db.flush(column_namespace[0]);
 
     // Check count after adding entries
-    std.debug.assert(try db.count(column_namespace[0]) == 2);
+    try std.testing.expectEqual(@as(u64, 2), try db.count(column_namespace[0]));
 }
 
 test "test_batch_write_function" {
@@ -467,7 +457,7 @@ test "test_batch_write_function" {
     try batch.put(column_namespace[0], "default_key1", "default_value1");
 
     // Verify entry is not yet visible in database
-    std.debug.assert((try db.get(column_namespace[0], "default_key1")) == null);
+    try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 
     // Commit the batch to make changes visible
     try db.commit(&batch);
@@ -476,7 +466,7 @@ test "test_batch_write_function" {
     const value1 = try db.get(column_namespace[0], "default_key1");
     if (value1) |v1| {
         defer v1.deinit();
-        std.debug.assert(std.mem.eql(u8, v1.data, "default_value1"));
+        try std.testing.expectEqualStrings("default_value1", v1.data);
     }
 
     // Add delete operation to batch but don't commit yet
@@ -486,14 +476,14 @@ test "test_batch_write_function" {
     const value2 = try db.get(column_namespace[0], "default_key1");
     if (value2) |v2| {
         defer v2.deinit();
-        std.debug.assert(std.mem.eql(u8, v2.data, "default_value1"));
+        try std.testing.expectEqualStrings("default_value1", v2.data);
     }
 
     // Commit the delete operation
     try db.commit(&batch);
 
     // Verify entry is now deleted from database
-    std.debug.assert((try db.get(column_namespace[0], "default_key1")) == null);
+    try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 }
 
 test "test_iterator_functionality" {
@@ -531,34 +521,34 @@ test "test_iterator_functionality" {
 
     // Test next() method - should return key-value pairs in order
     const entry1 = try forward_iter.next();
-    std.debug.assert(entry1 != null);
-    std.debug.assert(std.mem.eql(u8, entry1.?.@"0", "key1"));
-    std.debug.assert(std.mem.eql(u8, entry1.?.@"1", "value1"));
+    try std.testing.expect(entry1 != null);
+    try std.testing.expectEqualStrings("key1", entry1.?.@"0");
+    try std.testing.expectEqualStrings("value1", entry1.?.@"1");
 
     const entry2 = try forward_iter.next();
-    std.debug.assert(entry2 != null);
-    std.debug.assert(std.mem.eql(u8, entry2.?.@"0", "key2"));
-    std.debug.assert(std.mem.eql(u8, entry2.?.@"1", "value2"));
+    try std.testing.expect(entry2 != null);
+    try std.testing.expectEqualStrings("key2", entry2.?.@"0");
+    try std.testing.expectEqualStrings("value2", entry2.?.@"1");
 
     // Test nextKey() method
     const key3 = try forward_iter.nextKey();
-    std.debug.assert(key3 != null);
-    std.debug.assert(std.mem.eql(u8, key3.?, "key3"));
+    try std.testing.expect(key3 != null);
+    try std.testing.expectEqualStrings("key3", key3.?);
 
     // Test nextValue() method
     const value4 = try forward_iter.nextValue();
-    std.debug.assert(value4 != null);
-    std.debug.assert(std.mem.eql(u8, value4.?, "value4"));
+    try std.testing.expect(value4 != null);
+    try std.testing.expectEqualStrings("value4", value4.?);
 
     // Get the last entry
     const entry5 = try forward_iter.next();
-    std.debug.assert(entry5 != null);
-    std.debug.assert(std.mem.eql(u8, entry5.?.@"0", "key5"));
-    std.debug.assert(std.mem.eql(u8, entry5.?.@"1", "value5"));
+    try std.testing.expect(entry5 != null);
+    try std.testing.expectEqualStrings("key5", entry5.?.@"0");
+    try std.testing.expectEqualStrings("value5", entry5.?.@"1");
 
     // Should return null when no more entries
     const end_entry = try forward_iter.next();
-    std.debug.assert(end_entry == null);
+    try std.testing.expect(end_entry == null);
 
     // Test reverse iterator
     var reverse_iter = try db.iterator(column_namespace[0], .reverse, null);
@@ -566,14 +556,14 @@ test "test_iterator_functionality" {
 
     // Test reverse iteration - should return entries in reverse order
     const rev_entry1 = try reverse_iter.next();
-    std.debug.assert(rev_entry1 != null);
-    std.debug.assert(std.mem.eql(u8, rev_entry1.?.@"0", "key5"));
-    std.debug.assert(std.mem.eql(u8, rev_entry1.?.@"1", "value5"));
+    try std.testing.expect(rev_entry1 != null);
+    try std.testing.expectEqualStrings("key5", rev_entry1.?.@"0");
+    try std.testing.expectEqualStrings("value5", rev_entry1.?.@"1");
 
     const rev_entry2 = try reverse_iter.next();
-    std.debug.assert(rev_entry2 != null);
-    std.debug.assert(std.mem.eql(u8, rev_entry2.?.@"0", "key4"));
-    std.debug.assert(std.mem.eql(u8, rev_entry2.?.@"1", "value4"));
+    try std.testing.expect(rev_entry2 != null);
+    try std.testing.expectEqualStrings("key4", rev_entry2.?.@"0");
+    try std.testing.expectEqualStrings("value4", rev_entry2.?.@"1");
 
     // Test iterator with start key
     var start_iter = try db.iterator(column_namespace[0], .forward, "key3");
@@ -581,13 +571,13 @@ test "test_iterator_functionality" {
 
     // Should start from key3
     const start_entry = try start_iter.next();
-    std.debug.assert(start_entry != null);
-    std.debug.assert(std.mem.eql(u8, start_entry.?.@"0", "key3"));
-    std.debug.assert(std.mem.eql(u8, start_entry.?.@"1", "value3"));
+    try std.testing.expect(start_entry != null);
+    try std.testing.expectEqualStrings("key3", start_entry.?.@"0");
+    try std.testing.expectEqualStrings("value3", start_entry.?.@"1");
 
     // Next should be key4
     const start_entry2 = try start_iter.next();
-    std.debug.assert(start_entry2 != null);
-    std.debug.assert(std.mem.eql(u8, start_entry2.?.@"0", "key4"));
-    std.debug.assert(std.mem.eql(u8, start_entry2.?.@"1", "value4"));
+    try std.testing.expect(start_entry2 != null);
+    try std.testing.expectEqualStrings("key4", start_entry2.?.@"0");
+    try std.testing.expectEqualStrings("value4", start_entry2.?.@"1");
 }

@@ -45,7 +45,7 @@ test "verify_find_function_for_column_namespaces" {
         .{ .namespace = "cn2", .Key = u8, .Value = u8 },
     };
 
-    std.debug.assert(cn[0].find(&cn) == 0);
-    std.debug.assert(cn[1].find(&cn) == 1);
-    std.debug.assert(cn[2].find(&cn) == 2);
+    try std.testing.expectEqual(@as(comptime_int, 0), cn[0].find(&cn));
+    try std.testing.expectEqual(@as(comptime_int, 1), cn[1].find(&cn));
+    try std.testing.expectEqual(@as(comptime_int, 2), cn[2].find(&cn));
 }
