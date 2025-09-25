@@ -8,8 +8,8 @@
             .hash = "ssz-0.0.4-Lfwd60qdAgDXXMYkQzFYYArXl7IldYDL1JkHUjDBOER-",
         },
         .zigcli = .{
-            .url = "https://github.com/jiacai2050/zigcli/archive/v0.2.3.tar.gz",
-            .hash = "zigcli-0.2.3-ORC7jGKRAgAYW8y8hO3S4v2DsqbnyOrgximDYNgfB_Bw",
+            .url = "git+https://github.com/jiacai2050/zigcli?ref=main#dcbc59d70b4787671c8a4e484ffd2b725aa17af5",
+            .hash = "zigcli-0.2.3-ORC7jMGUAgC0S6M5tL0RTW1gn-3wFj9tmckO7g2iZB0k",
         },
         .xev = .{
             .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
