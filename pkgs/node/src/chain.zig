@@ -174,8 +174,6 @@ pub const BeamChain = struct {
         };
     }
 
-    // TODO: right now validator indepdently publishes to the network but move gossip message
-    // construction and publishing from there to here
     pub fn publishBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, signedBlock.message, &block_root, self.allocator);
@@ -202,8 +200,6 @@ pub const BeamChain = struct {
         return vote;
     }
 
-    // TODO: right now validator indepdently publishes to the network but move the gossip
-    // message construction and publish at a refactor PR
     pub fn publishVote(self: *Self, signedVote: types.SignedVote) !void {
         // no need to see if we produced this vote as everything is trusted in-process lifecycle
         // validate when validator is separated out
