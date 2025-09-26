@@ -13,6 +13,7 @@ slog = { version = "2", features = ["max_level_debug", "release_max_level_debug"
 snap = "1"
 sha2 = "0.9"
 hex = "0.4.3"
+openvm = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0", features = ["std"] }
 
 [dependencies.libp2p]
 version = "0.54"

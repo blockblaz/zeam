@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 #[no_mangle]
@@ -80,6 +81,8 @@ extern "C" fn openvm_prove(
         .io(Default::default())
         .build();
     let sdk = Sdk::new();
+
+    let elf_bytes = fs::read(binary_path).unwrap();
 
     let elf = Elf::decode(&elf_bytes, MEM_SIZE as u32).unwrap();
 
