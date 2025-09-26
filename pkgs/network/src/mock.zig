@@ -81,8 +81,9 @@ test "Mock messaging across two subscribers" {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var logger = zeam_utils.getTestLogger();
-    var mock = try Mock.init(allocator, &loop, &logger);
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger);
 
     // Create test subscribers with embedded data
     var subscriber1 = TestSubscriber{};
@@ -104,7 +105,7 @@ test "Mock messaging across two subscribers" {
             .parent_root = [_]u8{1} ** 32,
             .state_root = [_]u8{2} ** 32,
             .body = .{
-                .attestations = &[_]types.SignedVote{},
+                .attestations = try types.SignedVotes.init(allocator),
             },
         },
         .signature = [_]u8{3} ** types.SIGSIZE,
