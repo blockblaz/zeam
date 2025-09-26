@@ -117,6 +117,10 @@ pub fn writeMetrics(writer: anytype) !void {
 // Routes module for setting up metrics endpoints
 pub const routes = @import("./routes.zig");
 
+// Event system modules
+pub const events = @import("./events.zig");
+pub const event_broadcaster = @import("./event_broadcaster.zig");
+
 // Compatibility functions for the old API
 pub fn chain_onblock_duration_seconds_start() Timer {
     return chain_onblock_duration_seconds.start();
