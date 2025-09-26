@@ -174,15 +174,6 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn publishBlock(self: *Self, signedBlock: types.SignedBeamBlock) !void {
-        var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, signedBlock.message, &block_root, self.allocator);
-        try self.onBlock(signedBlock, .{
-            .postState = self.states.get(block_root),
-            .blockRoot = block_root,
-        });
-    }
-
     pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
         const slot = opts.slot;
 
@@ -198,12 +189,6 @@ pub const BeamChain = struct {
         };
 
         return vote;
-    }
-
-    pub fn publishVote(self: *Self, signedVote: types.SignedVote) !void {
-        // no need to see if we produced this vote as everything is trusted in-process lifecycle
-        // validate when validator is separated out
-        return self.onAttestation(signedVote);
     }
 
     pub fn printSlot(self: *Self, slot: usize) void {
@@ -303,7 +288,7 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     //
     // TODO: move self.states cache to pointer of states along with blockInfo's poststate
-    fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, blockInfo: CachedProcessedBlockInfo) !void {
+    pub fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, blockInfo: CachedProcessedBlockInfo) !void {
         const onblock_timer = metrics.chain_onblock_duration_seconds.start();
 
         const block = signedBlock.message;
@@ -366,7 +351,7 @@ pub const BeamChain = struct {
         });
     }
 
-    fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
+    pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
         return self.forkChoice.onAttestation(signedVote, false);
     }
 };

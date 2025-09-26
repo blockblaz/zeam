@@ -6,6 +6,7 @@ const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
+const ssz = @import("ssz");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -151,7 +152,12 @@ pub const BeamNode = struct {
         });
 
         // 2. Process locally through chain
-        try self.chain.publishBlock(signed_block);
+        var block_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
+        try self.chain.onBlock(signed_block, .{
+            .postState = self.chain.states.get(block_root),
+            .blockRoot = block_root,
+        });
     }
 
     pub fn publishVote(self: *Self, signed_vote: types.SignedVote) !void {
@@ -165,7 +171,9 @@ pub const BeamNode = struct {
         });
 
         // 2. Process locally through chain
-        try self.chain.publishVote(signed_vote);
+        // no need to see if we produced this vote as everything is trusted in-process lifecycle
+        // validate when validator is separated out
+        return self.chain.onAttestation(signed_vote);
     }
 
     pub fn run(self: *Self) !void {
