@@ -1,13 +1,18 @@
-# Zeam Metrics Package
+# Zeam API Package
 
 ## Overview
 
-This package provides Prometheus metrics for the `zeam` application. It allows for instrumentation of the code to expose key performance indicators and health statistics.
+This package provides the application API facilities for the `zeam` node:
+
+- Server-Sent Events (SSE) stream for real-time chain events at `/events`
+- Prometheus metrics at `/metrics`
+- Health check at `/health`
 
 The primary components are:
-- A metrics service implemented in `src/lib.zig`.
-- The underlying Prometheus client library: [karlseguin/metrics.zig](https://github.com/karlseguin/metrics.zig).
-- A dedicated HTTP metrics server in `pkgs/cli/src/metrics_server.zig`.
+- Core API surface implemented in `src/lib.zig` (`@zeam/api`)
+- Event system: `src/events.zig` and `src/event_broadcaster.zig`
+- The underlying Prometheus client library: [karlseguin/metrics.zig](https://github.com/karlseguin/metrics.zig)
+- A dedicated HTTP API server in `pkgs/cli/src/api_server.zig` (serves SSE, metrics, health)
 
 ## Metrics Exposed
 
@@ -23,19 +28,23 @@ The following metrics are currently available:
 
 ## How It Works
 
-The metrics system is initialized at application startup in `pkgs/cli/src/main.zig`. 
+The API system is initialized at application startup in `pkgs/cli/src/main.zig`. 
 
-1.  `metrics.init()` is called once to set up the metric registry and define all histograms, counters, and gauges.
-2.  A dedicated HTTP metrics server is started via `metricsServer.startMetricsServer()` to serve metrics on the specified port.
-3.  This server runs in a background thread and exposes metrics at the `/metrics` endpoint and health at `/health` endpoint, making them available for a Prometheus server to scrape.
+1.  `api.init()` is called once to set up histograms used by the node.
+2.  A dedicated HTTP API server is started via `startAPIServer()` to serve SSE, metrics, and health.
+3.  This server runs in a background thread and exposes:
+    - SSE at `/events`
+    - Metrics at `/metrics`
+    - Health at `/health`
 
-**Note**: For freestanding targets (zkvm runs), the metrics system operates in no-op mode and does not start an HTTP server.
+**Note**: For freestanding targets (zkvm runs), the API metrics operate in no-op mode and the HTTP server is disabled.
 
 ## Architecture
 
-The metrics system uses a dedicated HTTP server implementation (`pkgs/cli/src/metrics_server.zig`) that:
+The API uses a dedicated HTTP server implementation (`pkgs/cli/src/api_server.zig`) that:
 
 - Runs independently of the main application
+- Serves SSE at `/events`
 - Serves Prometheus-formatted metrics at `/metrics`
 - Provides health checks at `/health`
 - Automatically handles ZKVM targets (no HTTP server for freestanding environments)
@@ -43,7 +52,7 @@ The metrics system uses a dedicated HTTP server implementation (`pkgs/cli/src/me
 
 ## Freestanding Target Support
 
-The metrics library automatically detects freestanding targets (like zkvm runs) and operates in no-op mode:
+The API library automatically detects freestanding targets (like zkvm runs) and operates in no-op mode:
 
 - **Host targets**: Full metrics functionality with HTTP server
 - **Freestanding targets**: No-op metrics that don't use system calls like `std.net` or `std.Thread`
@@ -57,25 +66,25 @@ The dashboards and monitoring infrastructure have been moved to a separate repos
 ### Quick Setup
 
 1. **Clone the dashboard repository**:
-   ```sh
-   git clone https://github.com/blockblaz/zeam-dashboards.git
-   cd zeam-dashboards
-   ```
+```sh
+git clone https://github.com/blockblaz/zeam-dashboards.git
+cd zeam-dashboards
+```
 
 2. **Generate Prometheus configuration**:
-   ```sh
-   # From your Zeam repository
-   ./zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
-   ```
+```sh
+# From your Zeam repository
+./zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
+```
 
 3. **Start the monitoring stack**:
-   ```sh
-   docker-compose up -d
-   ```
+```sh
+docker-compose up -d
+```
 
 4. **Access dashboards**:
-   - Grafana: http://localhost:3001 (admin/admin)
-   - Prometheus: http://localhost:9090
+- Grafana: http://localhost:3001 (admin/admin)
+- Prometheus: http://localhost:9090
 
 For detailed setup instructions and troubleshooting, see the [zeam-dashboards repository](https://github.com/blockblaz/zeam-dashboards).
 
@@ -85,9 +94,9 @@ For detailed setup instructions and troubleshooting, see the [zeam-dashboards re
 
 1.  **Check Prometheus Targets**: Open the Prometheus UI at [http://localhost:9090/targets](http://localhost:9090/targets). The `zeam_app` job should be **UP**.
 2.  **Build a Grafana Dashboard**: Create a new dashboard and panel. Use a query like the following to visualize the 95th percentile of block processing time:
-    ```promql
-    histogram_quantile(0.95, sum(rate(chain_onblock_duration_seconds_bucket[5m])) by (le))
-    ```
+```promql
+histogram_quantile(0.95, sum(rate(chain_onblock_duration_seconds_bucket[5m])) by (le))
+```
 
 ## CLI Commands
 
@@ -118,29 +127,34 @@ Generate a Prometheus configuration file that matches your metrics settings:
 ./zig-out/bin/zeam prometheus genconfig --metricsPort 8080 -f prometheus.yml
 ```
 
-## Testing the Metrics Server
+## Testing the API Server
 
-You can test that the metrics server is working by:
+You can test that the API server is working by:
 
 1. **Starting the beam node**:
-   ```sh
-   ./zig-out/bin/zeam beam --mockNetwork --metricsPort 9668
-   ```
+```sh
+./zig-out/bin/zeam beam --mockNetwork --metricsPort 9668
+```
 
-2. **Checking the metrics endpoint**:
-   ```sh
-   curl http://localhost:9668/metrics
-   ```
+2. **Checking the SSE endpoint**:
+```sh
+curl -N http://localhost:9668/events
+```
 
-3. **Checking the health endpoint**:
-   ```sh
-   curl http://localhost:9668/health
-   ```
+3. **Checking the metrics endpoint**:
+```sh
+curl http://localhost:9668/metrics
+```
+
+4. **Checking the health endpoint**:
+```sh
+curl http://localhost:9668/health
+```
 
 ## Adding New Metrics
 
 To add a new metric, follow the existing pattern:
 
-1.  **Declare it**: Add a new global variable for your metric in `pkgs/metrics/src/lib.zig`.
+1.  **Declare it**: Add a new global variable for your metric in `pkgs/api/src/lib.zig`.
 2.  **Initialize it**: In the `init()` function in `lib.zig`, initialize the metric with its name, help text, and any labels or buckets.
 3.  **Use it**: Import the metrics package in your application code and record observations (e.g., `metrics.my_new_metric.observe(value)`).

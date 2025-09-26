@@ -10,14 +10,7 @@ const stf = @import("@zeam/state-transition");
 
 const constants = @import("./constants.zig");
 
-pub const ProtoBlock = struct {
-    slot: types.Slot,
-    // we can keep these in hex not hex strings because stringhashmap just relies on []
-    blockRoot: types.Root,
-    parentRoot: types.Root,
-    stateRoot: types.Root,
-    timeliness: bool,
-};
+const ProtoBlock = types.ProtoBlock;
 const ProtoMeta = struct {
     parent: ?usize,
     weight: isize,

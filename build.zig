@@ -108,12 +108,14 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("yaml", yaml);
 
     // add zeam-metrics
-    const zeam_metrics = b.addModule("@zeam/metrics", .{
-        .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+    // Rename metrics module to api (keeps same source path for now)
+    const zeam_api = b.addModule("@zeam/api", .{
+        .root_source_file = b.path("pkgs/api/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zeam_metrics.addImport("metrics", metrics);
+    zeam_api.addImport("metrics", metrics);
+    zeam_api.addImport("@zeam/types", zeam_types);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -125,7 +127,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
-    zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
+    zeam_state_transition.addImport("@zeam/api", zeam_api);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -172,7 +174,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
-    zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
+    zeam_beam_node.addImport("@zeam/api", zeam_api);
 
     // Create build options
     const build_options = b.addOptions();
@@ -199,7 +201,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
-    cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    cli_exe.root_module.addImport("@zeam/api", zeam_api);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("enr", enr);

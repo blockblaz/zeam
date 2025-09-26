@@ -55,3 +55,87 @@ pub const Mock = struct {
         } };
     }
 };
+
+test "Mock messaging across two subscribers" {
+    const TestSubscriber = struct {
+        calls: u32 = 0,
+        received_message: ?interface.GossipMessage = null,
+
+        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.received_message = message.*;
+        }
+
+        fn getCallbackHandler(self: *@This()) interface.OnGossipCbHandler {
+            return .{
+                .ptr = self,
+                .onGossipCb = onGossip,
+            };
+        }
+    };
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(.mock);
+    var mock = try Mock.init(allocator, &loop, logger);
+
+    // Create test subscribers with embedded data
+    var subscriber1 = TestSubscriber{};
+    var subscriber2 = TestSubscriber{};
+
+    // Both subscribers subscribe to the same block topic using the complete network interface
+    var topics = [_]interface.GossipTopic{.block};
+    const network = mock.getNetworkInterface();
+    try network.gossip.subscribe(&topics, subscriber1.getCallbackHandler());
+    try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
+
+    // Create a simple block message
+    const block_message = try allocator.create(interface.GossipMessage);
+    defer allocator.destroy(block_message);
+    block_message.* = .{ .block = .{
+        .message = .{
+            .slot = 1,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body = .{
+                .attestations = try types.SignedVotes.init(allocator),
+            },
+        },
+        .signature = [_]u8{3} ** types.SIGSIZE,
+    } };
+
+    // Publish the message using the network interface - both subscribers should receive it
+    try network.gossip.publish(block_message);
+
+    // Run the event loop to process scheduled callbacks
+    try loop.run(.until_done);
+
+    // Verify both subscribers received the message
+    try std.testing.expect(subscriber1.calls == 1);
+    try std.testing.expect(subscriber2.calls == 1);
+
+    // Verify both subscribers received the same message content
+    try std.testing.expect(subscriber1.received_message != null);
+    try std.testing.expect(subscriber2.received_message != null);
+
+    const received1 = subscriber1.received_message.?;
+    const received2 = subscriber2.received_message.?;
+
+    // Verify both received block messages
+    try std.testing.expect(received1 == .block);
+    try std.testing.expect(received2 == .block);
+
+    // Verify the block content is identical
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
+    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
+    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &received1.block.signature, &received2.block.signature));
+}
