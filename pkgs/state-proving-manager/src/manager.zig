@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 // extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
 extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32;
 extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
+extern fn openvm_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
+extern fn openvm_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
 
 const PowdrConfig = struct {
     program_path: []const u8,
@@ -20,9 +22,15 @@ const Risc0Config = struct {
     program_path: []const u8,
 };
 
+const OpenVMConfig = struct {
+    program_path: []const u8,
+    result_path: []const u8,
+};
+
 const ZKVMConfig = union(enum) {
     powdr: PowdrConfig,
     risc0: Risc0Config,
+    openvm: OpenVMConfig,
 };
 pub const ZKVMs = std.meta.Tag(ZKVMConfig);
 
@@ -56,6 +64,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
         // .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
         .powdr => return error.RiscVPowdrIsDeprecated,
         .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
+        .openvm => |openvmcfg| openvm_prove(serialized.items.ptr, serialized.items.len, output.ptr, output.len, openvmcfg.program_path.ptr, openvmcfg.program_path.len, openvmcfg.result_path.ptr, openvmcfg.result_path.len),
         // else => @panic("prover isn't enabled"),
     };
     const proof = types.BeamSTFProof{
@@ -72,6 +81,7 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
 
     const valid = switch (opts.zkvm) {
         .risc0 => |risc0cfg| risc0_verify(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        .openvm => |openvmcfg| openvm_verify(openvmcfg.program_path.ptr, openvmcfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         else => return error.UnsupportedVerifier,
     };
 

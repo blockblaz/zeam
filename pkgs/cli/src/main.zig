@@ -178,6 +178,10 @@ pub fn main() !void {
                 .zkvm = blk: switch (provecmd.zkvm) {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
+                    .openvm => break :blk .{ .openvm = .{
+                        .program_path = "zig-out/bin/zeam-stf-openvm",
+                        .result_path = "/tmp/openvm-results"
+                    } },
                 },
                 .logger = logger,
             };

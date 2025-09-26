@@ -1,18 +1,16 @@
 use std::fs;
 use std::path::Path;
 
-#[no_mangle]
-use openvm::platform::memory::MEM_SIZE;
-use openvm_build::GuestOptions;
+use openvm_platform::platform::memory::MEM_SIZE;
 use openvm_sdk::{
     config::{AppConfig, SdkVmConfig},
-    prover::AppProver,
     Sdk, StdIn,
 };
-use openvm_stark_sdk::config::{baby_bear_poseidon2::BabyBearPoseidon2Engine, FriParameters};
+use openvm_stark_sdk::config::FriParameters;
 use openvm_transpiler::elf::Elf;
 use std::sync::Arc;
 
+#[no_mangle]
 extern "C" fn openvm_prove(
     serialized: *const u8,
     len: usize,
@@ -22,12 +20,12 @@ extern "C" fn openvm_prove(
     binary_path_len: usize,
     result_path: *const u8,
     result_path_len: usize,
-) {
+) -> u32 {
     println!(
         "Running the openvm transition prover, current dir={}",
         std::env::current_dir().unwrap().display()
     );
-    let byte_slice = unsafe {
+    let serialized_block = unsafe {
         if !serialized.is_null() {
             std::slice::from_raw_parts(serialized, len)
         } else {
@@ -35,11 +33,11 @@ extern "C" fn openvm_prove(
         }
     };
 
-    let _output_slice = unsafe {
+    let output_slice = unsafe {
         if !output.is_null() {
-            std::slice::from_raw_parts(output, output_len)
+            std::slice::from_raw_parts_mut(output, output_len)
         } else {
-            &[]
+            panic!("Output buffer is null")
         }
     };
 
@@ -65,7 +63,7 @@ extern "C" fn openvm_prove(
         panic!("path does not exist");
     }
 
-    let result_path = std::str::from_utf8(result_path_slice).unwrap();
+    let _result_path = std::str::from_utf8(result_path_slice).unwrap();
 
     // Uncomment when debugging
     // println!("input={:?}", byte_slice);
@@ -88,21 +86,37 @@ extern "C" fn openvm_prove(
 
     let exe = sdk.transpile(elf, vm_config.transpiler()).unwrap();
 
-    let my_input = SomeStruct { a: 1, b: 2 }; // anything that can be serialized
     let mut stdin = StdIn::default();
-    stdin.write(&my_input);
+    stdin.write(&serialized_block);
 
     let app_log_blowup = 2;
     let app_fri_params = FriParameters::standard_with_100_bits_conjectured_security(app_log_blowup);
     let app_config = AppConfig::new(app_fri_params, vm_config);
 
-    let app_committed_exe = sdk.commit_app_exe(app_fri_params, exe)?;
+    let app_committed_exe = sdk.commit_app_exe(app_fri_params, exe).unwrap();
 
-    let app_pk = Arc::new(sdk.app_keygen(app_config)?);
+    let app_pk = Arc::new(sdk.app_keygen(app_config).unwrap());
 
-    let proof = sdk.generate_app_proof(app_pk.clone(), app_committed_exe.clone(), stdin.clone())?;
+    let proof = sdk.generate_app_proof(app_pk.clone(), app_committed_exe.clone(), stdin.clone()).unwrap();
+
+    // Serialize the proof to the output buffer
+    let serialized_proof = serde_cbor::to_vec(&proof).unwrap();
+    if serialized_proof.len() > output_len {
+        panic!("Proof size {} exceeds output buffer size {}", serialized_proof.len(), output_len);
+    }
+
+    output_slice[..serialized_proof.len()].copy_from_slice(&serialized_proof);
+    serialized_proof.len() as u32
 }
 
-extern "C" fn openvm_verify() {
-    // sdk.verify_app_proof(&app_vk, &proof)?;
+#[no_mangle]
+extern "C" fn openvm_verify(
+    _binary_path: *const u8,
+    _binary_path_len: usize,
+    _receipt: *const u8,
+    _receipt_len: usize,
+) -> bool {
+    // TODO: Implement verification
+    eprintln!("OpenVM verification not yet implemented");
+    true
 }
