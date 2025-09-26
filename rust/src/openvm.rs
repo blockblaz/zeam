@@ -9,7 +9,7 @@ use openvm_sdk::{
 use openvm_stark_sdk::config::FriParameters;
 use openvm_transpiler::elf::Elf;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Digest, Sha256};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 // Structure to hold proof data for verification
