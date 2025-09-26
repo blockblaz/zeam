@@ -118,7 +118,7 @@ pub const BeamNode = struct {
             if (validator_output) |output| {
                 var mutable_output = output;
                 defer mutable_output.deinit();
-                for (output.gossip_messages.items) |gossip_msg| {
+                for (mutable_output.gossip_messages.items) |gossip_msg| {
 
                     // Process based on message type
                     switch (gossip_msg) {
