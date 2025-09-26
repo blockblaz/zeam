@@ -158,10 +158,32 @@ pub const ReqRespRequest = union(ReqRespMethod) {
 };
 
 const MessagePublishWrapper = struct {
+    allocator: Allocator,
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+
+    const Self = @This();
+
+    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
+        const cloned_data = try data.clone(allocator);
+
+        const self = try allocator.create(Self);
+        self.* = MessagePublishWrapper{
+            .allocator = allocator,
+            .handler = handler,
+            .data = cloned_data,
+            .networkId = networkId,
+            .logger = logger,
+        };
+        return self;
+    }
+
+    fn deinit(self: *Self) void {
+        self.allocator.destroy(self.data);
+        self.allocator.destroy(self);
+    }
 };
 
 pub const GenericGossipHandler = struct {
@@ -171,11 +193,15 @@ pub const GenericGossipHandler = struct {
     onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+    completion: *xev.Completion,
 
     const Self = @This();
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
+
+        const c = try allocator.create(xev.Completion);
+        c.* = undefined;
 
         var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
         errdefer {
@@ -200,11 +226,13 @@ pub const GenericGossipHandler = struct {
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
             .logger = logger,
+            .completion = c,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.timer.deinit();
+        self.allocator.destroy(self.completion);
         var it = self.onGossipHandlers.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -221,26 +249,13 @@ pub const GenericGossipHandler = struct {
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
             // remove this option once resolved
             if (scheduleOnLoop) {
-                // TODO: track and dealloc the structures
-                const c = try self.allocator.create(xev.Completion);
-                c.* = undefined;
+                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, self.networkId, self.logger);
 
-                const publishWrapper = try self.allocator.create(MessagePublishWrapper);
-                const cloned_data = try data.clone(self.allocator);
-
-                publishWrapper.* = MessagePublishWrapper{
-                    .handler = handler,
-                    // clone the data to be independently deallocated as the mock network publish will
-                    // return the callflow back and it might dealloc the data before loop and process it
-                    .data = cloned_data,
-                    .networkId = self.networkId,
-                    .logger = self.logger,
-                };
                 self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
 
                 self.timer.run(
                     self.loop,
-                    c,
+                    self.completion,
                     1,
                     MessagePublishWrapper,
                     publishWrapper,
@@ -255,9 +270,8 @@ pub const GenericGossipHandler = struct {
                             if (ud) |pwrap| {
                                 pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
                                 _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                                defer pwrap.deinit();
                             }
-                            // TODO defer freeing the publishwrapper and its data but need handle to the allocator
-                            // also figure out how and when to best dealloc the completion
                             return .disarm;
                         }
                     }).callback,
