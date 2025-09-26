@@ -8,7 +8,22 @@ use openvm_sdk::{
 };
 use openvm_stark_sdk::config::FriParameters;
 use openvm_transpiler::elf::Elf;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Digest, Sha256};
 use std::sync::Arc;
+
+// Structure to hold proof data for verification
+#[derive(Serialize, Deserialize)]
+struct OpenVMProofPackage {
+    // We store the raw bytes since the actual types are complex with generics
+    proof_bytes: Vec<u8>,
+    // Store the verification key bytes for proof verification
+    vk_bytes: Vec<u8>,
+    // Store configuration parameters to reconstruct verification context
+    app_log_blowup: usize,
+    // Store a hash/commitment of the ELF for verification
+    elf_hash: Vec<u8>,
+}
 
 #[no_mangle]
 extern "C" fn openvm_prove(
@@ -97,12 +112,30 @@ extern "C" fn openvm_prove(
 
     let app_pk = Arc::new(sdk.app_keygen(app_config).unwrap());
 
-    let proof = sdk.generate_app_proof(app_pk.clone(), app_committed_exe.clone(), stdin.clone()).unwrap();
+    let app_vk = app_pk.get_app_vk();
 
-    // Serialize the proof to the output buffer
-    let serialized_proof = serde_cbor::to_vec(&proof).unwrap();
+    let proof = sdk
+        .generate_app_proof(app_pk.clone(), app_committed_exe.clone(), stdin.clone())
+        .unwrap();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&elf_bytes);
+    let elf_hash = hasher.finalize().to_vec();
+
+    let proof_package = OpenVMProofPackage {
+        proof_bytes: bincode::serialize(&proof).unwrap(),
+        vk_bytes: bincode::serialize(&app_vk).unwrap(),
+        app_log_blowup,
+        elf_hash,
+    };
+
+    let serialized_proof = bincode::serialize(&proof_package).unwrap();
     if serialized_proof.len() > output_len {
-        panic!("Proof size {} exceeds output buffer size {}", serialized_proof.len(), output_len);
+        panic!(
+            "Proof size {} exceeds output buffer size {}",
+            serialized_proof.len(),
+            output_len
+        );
     }
 
     output_slice[..serialized_proof.len()].copy_from_slice(&serialized_proof);

@@ -6181,6 +6181,7 @@ dependencies = [
 name = "rustglue"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "futures",
  "hex",
  "libp2p",
