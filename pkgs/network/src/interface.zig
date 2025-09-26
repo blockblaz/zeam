@@ -73,8 +73,12 @@ pub const LeanNetworkTopic = struct {
         };
     }
 
-    pub fn encode(self: *const LeanNetworkTopic) ![:0]u8 {
+    pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
         return try std.fmt.allocPrintZ(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
+    }
+
+    pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
     }
 
     // topic format: /leanconsensus/<network>/<name>/<encoding>
@@ -307,7 +311,7 @@ test LeanNetworkTopic {
     var topic = try LeanNetworkTopic.init(allocator, .block, .ssz_snappy, "devnet0");
     defer topic.deinit();
 
-    const topic_str = try topic.encode();
+    const topic_str = try topic.encodeZ();
     defer allocator.free(topic_str);
 
     try std.testing.expect(std.mem.eql(u8, topic_str, "/leanconsensus/devnet0/block/ssz_snappy"));

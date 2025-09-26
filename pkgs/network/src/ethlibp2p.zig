@@ -170,7 +170,7 @@ pub const EthLibp2p = struct {
             var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
             defer topic.deinit();
             const topic_str = try topic.encode();
-            try topics_list.append(self.allocator, std.mem.span(topic_str.ptr));
+            try topics_list.append(self.allocator, topic_str);
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
@@ -182,7 +182,7 @@ pub const EthLibp2p = struct {
         // publish
         var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
         defer topic.deinit();
-        const topic_str = try topic.encode();
+        const topic_str = try topic.encodeZ();
         defer self.allocator.free(topic_str);
 
         // TODO: deinit the message later ob once done
