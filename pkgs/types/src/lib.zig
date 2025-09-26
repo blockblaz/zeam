@@ -53,6 +53,15 @@ pub const SignedVote = struct {
 pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, params.VALIDATOR_REGISTRY_LIMIT);
 pub const SignedVotes = ssz.utils.List(SignedVote, params.VALIDATOR_REGISTRY_LIMIT);
 
+/// Canonical lightweight forkchoice proto block used across modules
+pub const ProtoBlock = struct {
+    slot: Slot,
+    blockRoot: Root,
+    parentRoot: Root,
+    stateRoot: Root,
+    timeliness: bool,
+};
+
 pub const BeamBlockBody = struct {
     // some form of APS - to be activated later - disabled for PQ devnet0
     // execution_payload_header: ExecutionPayloadHeader,

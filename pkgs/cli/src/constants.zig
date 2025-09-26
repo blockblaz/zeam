@@ -11,3 +11,6 @@ pub const DEFAULT_SERVER_STARTUP_TIMEOUT_MS: i64 = 120000;
 
 /// Default retry interval between connection attempts (in milliseconds)
 pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000;
+
+/// SSE heartbeat interval (seconds)
+pub const SSE_HEARTBEAT_SECONDS: u64 = 30;
