@@ -71,6 +71,13 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
+    // add rocksdb
+    const rocksdb = b.dependency("rocksdb", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("bindings");
+
+    // add snappyz
     const snappyz = b.dependency("zig_snappy", .{
         .target = target,
         .optimize = optimize,
@@ -153,6 +160,17 @@ pub fn build(b: *Builder) !void {
     });
     b.installArtifact(st_lib);
 
+    // add zeam-database
+    const zeam_database = b.addModule("@zeam/database", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/database/src/lib.zig"),
+    });
+    zeam_database.addImport("rocksdb", rocksdb);
+    zeam_database.addImport("ssz", ssz);
+    zeam_database.addImport("@zeam/utils", zeam_utils);
+    zeam_database.addImport("@zeam/types", zeam_types);
+
     // add network
     const zeam_network = b.addModule("@zeam/network", .{
         .target = target,
@@ -180,6 +198,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/configs", zeam_configs);
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
+    zeam_beam_node.addImport("@zeam/database", zeam_database);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
 
     // Create build options
@@ -366,6 +385,14 @@ pub fn build(b: *Builder) !void {
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
     test_step.dependOn(&run_utils_tests.step);
+
+    const database_tests = b.addTest(.{
+        .root_module = zeam_database,
+        .optimize = optimize,
+        .target = target,
+    });
+    const run_database_tests = b.addRunArtifact(database_tests);
+    test_step.dependOn(&run_database_tests.step);
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);

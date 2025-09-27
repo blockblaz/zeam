@@ -31,6 +31,10 @@
             .url = "git+https://github.com/kubkon/zig-yaml#a37be441b042d8aa119213f82f715c0dd1019655",
             .hash = "zig_yaml-0.1.0-C1161hmEAgBeNkAzDaTpcf-2HBydmS1KpJ6FVfGIZfr_",
         },
+        .rocksdb = .{
+            .url = "https://github.com/Syndica/rocksdb-zig/archive/70137101ad89640e0fc2e5ddbe60a26c522c7ae7.tar.gz",
+            .hash = "rocksdb-9.7.4-z_CUTmO5AAD0CQ2ZvShSDZHjC2x9MKrTnpvbNAIU7ah0",
+        },
         .zig_snappy = .{
             .url = "git+https://github.com/blockblaz/zig-snappy#dd63108bd8e41c7cd799385dd9aa5085314eeafa",
             .hash = "zig_snappy-0.0.1-bDFzXpJWAAA3c5bLc8JZK_HCwd0mGLTuFgz4LndjnVao",
