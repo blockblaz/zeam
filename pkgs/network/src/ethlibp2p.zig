@@ -10,6 +10,7 @@ const zeam_utils = @import("@zeam/utils");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
+const snappyframesz = @import("snappyframesz");
 
 /// Writes failed deserialization bytes to disk for debugging purposes
 /// Returns the filename if the file was successfully created, null otherwise
@@ -55,12 +56,35 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
+
+    var uncompressed: std.ArrayListUnmanaged(u8) = .empty;
+    defer uncompressed.deinit(zigHandler.allocator);
+
+    snappyframesz.decode(zigHandler.allocator, uncompressed.writer(zigHandler.allocator), message_bytes) catch |err| {
+        zigHandler.logger.err("Error in snappyframesz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), err });
+        if (writeFailedBytes(message_bytes, "snappyframesz_decoding", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+            zigHandler.logger.err("Snappyframesz decoding failed - debug file created: {s}", .{filename});
+        } else {
+            zigHandler.logger.err("Snappyframesz decoding failed - could not create debug file", .{});
+        }
+        return;
+    };
+    const uncompressed_message = uncompressed.toOwnedSlice(zigHandler.allocator) catch |err| {
+        zigHandler.logger.err("Error in allocating uncompressed message slice for topic={s}: {any}", .{ std.mem.span(topic_str), err });
+        if (writeFailedBytes(message_bytes, "uncompressed_allocation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+            zigHandler.logger.err("Uncompressed message allocation failed - debug file created: {s}", .{filename});
+        } else {
+            zigHandler.logger.err("Uncompressed message allocation failed - could not create debug file", .{});
+        }
+        return;
+    };
+    defer zigHandler.allocator.free(uncompressed_message);
     const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
             var message_data: types.SignedBeamBlock = undefined;
-            ssz.deserialize(types.SignedBeamBlock, message_bytes, &message_data, zigHandler.allocator) catch |e| {
+            ssz.deserialize(types.SignedBeamBlock, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
-                if (writeFailedBytes(message_bytes, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
                     zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
                 } else {
                     zigHandler.logger.err("Block deserialization failed - could not create debug file", .{});
@@ -72,9 +96,9 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
         .vote => votemessage: {
             var message_data: types.SignedVote = undefined;
-            ssz.deserialize(types.SignedVote, message_bytes, &message_data, zigHandler.allocator) catch |e| {
+            ssz.deserialize(types.SignedVote, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed vote message: {any}", .{e});
-                if (writeFailedBytes(message_bytes, "vote", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                if (writeFailedBytes(uncompressed_message, "vote", zigHandler.allocator, null, zigHandler.logger)) |filename| {
                     zigHandler.logger.err("Vote deserialization failed - debug file created: {s}", .{filename});
                 } else {
                     zigHandler.logger.err("Vote deserialization failed - could not create debug file", .{});
@@ -189,19 +213,27 @@ pub const EthLibp2p = struct {
         const message = switch (topic.gossip_topic) {
             .block => blockbytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
+                defer serialized.deinit();
                 try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
 
-                break :blockbytes serialized.items;
+                break :blockbytes try serialized.toOwnedSlice();
             },
             .vote => votebytes: {
                 var serialized = std.ArrayList(u8).init(self.allocator);
+                defer serialized.deinit();
                 try ssz.serialize(types.SignedVote, data.vote, &serialized);
 
-                break :votebytes serialized.items;
+                break :votebytes try serialized.toOwnedSlice();
             },
         };
-        self.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, message, data });
-        publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, message.ptr, message.len);
+        defer self.allocator.free(message);
+        var compressed: std.ArrayListUnmanaged(u8) = .empty;
+        defer compressed.deinit(self.allocator);
+
+        try snappyframesz.encode(self.allocator, compressed.writer(self.allocator), message);
+        const compressed_message = try compressed.toOwnedSlice(self.allocator);
+        self.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, compressed_message, data });
+        publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {

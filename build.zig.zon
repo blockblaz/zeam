@@ -31,6 +31,10 @@
             .url = "git+https://github.com/kubkon/zig-yaml#a37be441b042d8aa119213f82f715c0dd1019655",
             .hash = "zig_yaml-0.1.0-C1161hmEAgBeNkAzDaTpcf-2HBydmS1KpJ6FVfGIZfr_",
         },
+        .snappyframesz = .{
+            .url = "git+https://github.com/blockblaz/snappyframesz#416f93e110c934107a9f2e80bc5637ad65eed2fb",
+            .hash = "snappyframesz-0.0.1-COCLy_4tAAD8bqTGdkqyEMS60Dzt5lGnfeDe3iwiVtvE",
+        },
     },
     .paths = .{""},
 }
