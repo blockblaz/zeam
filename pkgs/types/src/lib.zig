@@ -123,12 +123,14 @@ pub const BeamState = struct {
 
     pub fn withJustifications(self: *BeamState, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
         var new_justifications_roots = try JustificationsRoots.init(allocator);
+        errdefer new_justifications_roots.deinit();
         var new_justifications_validators = try JustificationsValidators.init(allocator);
+        errdefer new_justifications_validators.deinit();
 
         // First, collect all keys
         var iterator = justifications.iterator();
         while (iterator.next()) |kv| {
-            if(kv.value_ptr.len != params.VALIDATOR_REGISTRY_LIMIT) {
+            if (kv.value_ptr.*.len != self.config.num_validators) {
                 return error.InvalidJustificationLength;
             }
             try new_justifications_roots.append(kv.key_ptr.*);

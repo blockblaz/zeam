@@ -186,7 +186,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/configs", zeam_configs);
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
-    
+
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
