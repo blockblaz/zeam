@@ -14,3 +14,6 @@ pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000;
 
 /// Default path for the database
 pub const DEFAULT_DB_PATH: []const u8 = "./data";
+
+/// SSE heartbeat interval (seconds)
+pub const SSE_HEARTBEAT_SECONDS: u64 = 30;

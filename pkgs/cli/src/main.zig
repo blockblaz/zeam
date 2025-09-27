@@ -21,8 +21,8 @@ const ChainOptions = configs.ChainOptions;
 const utils_lib = @import("@zeam/utils");
 
 const sft_factory = @import("@zeam/state-transition");
-const metrics = @import("@zeam/metrics");
-const metrics_server = @import("metrics_server.zig");
+const api = @import("@zeam/api");
+const api_server = @import("api_server.zig");
 
 const networks = @import("@zeam/network");
 
@@ -179,6 +179,7 @@ pub fn main() !void {
                 .zkvm = blk: switch (provecmd.zkvm) {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
+                    .openvm => break :blk .{ .openvm = .{ .program_path = "zig-out/bin/zeam-stf-openvm", .result_path = "/tmp/openvm-results" } },
                 },
                 .logger = logger,
             };
@@ -204,10 +205,10 @@ pub fn main() !void {
             }
         },
         .beam => |beamcmd| {
-            try metrics.init(allocator);
+            try api.init(allocator);
 
             // Start metrics HTTP server
-            try metrics_server.startMetricsServer(allocator, beamcmd.metricsPort);
+            try api_server.startAPIServer(allocator, beamcmd.metricsPort);
 
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
@@ -305,6 +306,7 @@ pub fn main() !void {
             var clock = try allocator.create(Clock);
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
 
+            //one missing validator is by design
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 

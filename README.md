@@ -64,7 +64,9 @@ out for this space for annoucements on the same or reach out to us via our [comm
 
  - Zeam requires zig version 0.14.1 to build.
  - Zeam requires Rust 1.85+ to be able to build the rust connections to various zkvms
- - The default prover is now [risc0](github.com/risc0/risc0) and it needs to be [installed](https://dev.risczero.com/api/zkvm/install).
+ - Both [risc0](https://github.com/risc0/risc0) (v3.0.3) and OpenVM provers are supported:
+   - risc0 requires the toolchain to be [installed](https://dev.risczero.com/api/zkvm/install): `rzup install r0vm 3.0.3`
+   - OpenVM is self-contained (no external toolchain needed)
 
 #### Build
 

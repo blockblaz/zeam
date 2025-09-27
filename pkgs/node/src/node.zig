@@ -6,6 +6,7 @@ const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
+const ssz = @import("ssz");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -108,11 +109,69 @@ pub const BeamNode = struct {
         if (self.validator) |*validator| {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
-            validator.onInterval(interval) catch |e| {
+            const validator_output = validator.onInterval(interval) catch |e| {
                 self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
+
+            if (validator_output) |output| {
+                var mutable_output = output;
+                defer mutable_output.deinit();
+                for (mutable_output.gossip_messages.items) |gossip_msg| {
+
+                    // Process based on message type
+                    switch (gossip_msg) {
+                        .block => |signed_block| {
+                            self.publishBlock(signed_block) catch |e| {
+                                self.logger.err("Error publishing block from validator: err={any}", .{e});
+                                return e;
+                            };
+                        },
+                        .vote => |signed_vote| {
+                            self.publishVote(signed_vote) catch |e| {
+                                self.logger.err("Error publishing vote from validator: err={any}", .{e});
+                                return e;
+                            };
+                        },
+                    }
+                }
+            }
         }
+    }
+
+    pub fn publishBlock(self: *Self, signed_block: types.SignedBeamBlock) !void {
+        // 1. publish gossip message
+        const gossip_msg = networks.GossipMessage{ .block = signed_block };
+        try self.network.publish(&gossip_msg);
+
+        self.logger.info("Published block to network: slot={d} proposer={d}", .{
+            signed_block.message.slot,
+            signed_block.message.proposer_index,
+        });
+
+        // 2. Process locally through chain
+        var block_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
+        try self.chain.onBlock(signed_block, .{
+            .postState = self.chain.states.get(block_root),
+            .blockRoot = block_root,
+        });
+    }
+
+    pub fn publishVote(self: *Self, signed_vote: types.SignedVote) !void {
+        // 1. publish gossip message
+        const gossip_msg = networks.GossipMessage{ .vote = signed_vote };
+        try self.network.publish(&gossip_msg);
+
+        self.logger.info("Published vote to network: slot={d} validator={d}", .{
+            signed_vote.message.slot,
+            signed_vote.validator_id,
+        });
+
+        // 2. Process locally through chain
+        // no need to see if we produced this vote as everything is trusted in-process lifecycle
+        // validate when validator is separated out
+        return self.chain.onAttestation(signed_vote);
     }
 
     pub fn run(self: *Self) !void {

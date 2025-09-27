@@ -4,8 +4,8 @@ const ENR = enr_lib.ENR;
 const utils_lib = @import("@zeam/utils");
 const Yaml = @import("yaml").Yaml;
 const configs = @import("@zeam/configs");
-const metrics = @import("@zeam/metrics");
-const metrics_server = @import("metrics_server.zig");
+const api = @import("@zeam/api");
+const api_server = @import("api_server.zig");
 const json = std.json;
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
@@ -64,8 +64,8 @@ pub const Node = struct {
         const node_id = options.node_id;
 
         if (options.metrics_enable) {
-            try metrics.init(allocator);
-            try metrics_server.startMetricsServer(allocator, options.metrics_port);
+            try api.init(allocator);
+            try api_server.startAPIServer(allocator, options.metrics_port);
         }
 
         // some base mainnet spec would be loaded to build this up
@@ -131,15 +131,39 @@ pub const Node = struct {
         try self.beam_node.run();
 
         const ascii_art =
+            \\  ███████████████████████████████████████████████████████
+            \\  ██████████████                         ████  ██████████
+            \\  ███████████        ████████████████       █████████████
+            \\  █████████      ████████████████████████     ███████████
+            \\  ██████    █████████████████████████████████     ███████
+            \\  █████    █████████████████████  █████████████    ██████
+            \\  ███     ██████████       █   █████   █████████    █████
+            \\  ███    ███████████  █████ █ █ █ ███████████████     ███
+            \\  ██    ██████████ ██ ██ ████ ███ ██    ██████████   ████
+            \\  ██   ██████████         ███ ████       █████████    ███
+            \\  ██   ███████████  █  ██████ ████        █████████   ███
+            \\  █    █████████ ████ █████     █████ █████████████   ███
+            \\  █    ██████████ █   ████     ██   █████   ███████   ███
+            \\  ██   ██████████       ████████ ██    █    ██████    ███
+            \\  ██    █████████       ███████ █       ██████████    ███
+            \\  ███   ██████████      ███   ███       █████████    █ ██
+            \\  ███    ████████████ ███ ██ ███ █     █ ███████    █████
+            \\  ███     ████████████ ████   █████   █████████    ██████
+            \\  █████     █████████   ███   █████   ████████    ███████
+            \\  ████████      ██████████████████████████     ██████████
+            \\  ████████  █      ████████████████████      ████████████
+            \\  █████  ██████         ██████████         ██████████████
+            \\  █████████████████                    ██████████████████
+            \\  ███████████████████████████████████████████████████████
             \\
-            \\  ███████╗███████╗ █████╗ ███╗   ███╗
-            \\  ╚══███╔╝██╔════╝██╔══██╗████╗ ████║
-            \\    ███╔╝ █████╗  ███████║██╔████╔██║
-            \\   ███╔╝  ██╔══╝  ██╔══██║██║╚██╔╝██║
-            \\  ███████╗███████╗██║  ██║██║ ╚═╝ ██║
-            \\  ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝
+            \\           ███████╗███████╗ █████╗ ███╗   ███╗
+            \\           ╚══███╔╝██╔════╝██╔══██╗████╗ ████║
+            \\             ███╔╝ █████╗  ███████║██╔████╔██║
+            \\            ███╔╝  ██╔══╝  ██╔══██║██║╚██╔╝██║
+            \\           ███████╗███████╗██║  ██║██║ ╚═╝ ██║
+            \\           ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝
             \\
-            \\ a blazing fast lean consensus client
+            \\          A blazing fast lean consensus client
         ;
 
         var encoded_txt_buf: [1000]u8 = undefined;
