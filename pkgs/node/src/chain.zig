@@ -356,16 +356,7 @@ pub const BeamChain = struct {
         });
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 4. Save block and state to database
-        var batch = try self.db.initWriteBatch();
-        defer batch.deinit();
-
-        try batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
-        try batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state);
-
-        try self.db.commit(&batch);
-
-        // 5. fc onvotes
+        // 4. fc onvotes
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -375,6 +366,15 @@ pub const BeamChain = struct {
                 self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
             };
         }
+
+        // 5. Save block and state to database
+        var batch = try self.db.initWriteBatch();
+        defer batch.deinit();
+
+        try batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
+        try batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state);
+
+        try self.db.commit(&batch);
 
         // 6. fc update head
         _ = try self.forkChoice.updateHead();
