@@ -193,15 +193,11 @@ pub const GenericGossipHandler = struct {
     onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
-    completion: *xev.Completion,
 
     const Self = @This();
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
-
-        const c = try allocator.create(xev.Completion);
-        c.* = undefined;
 
         var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
         errdefer {
@@ -226,13 +222,11 @@ pub const GenericGossipHandler = struct {
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
             .logger = logger,
-            .completion = c,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.timer.deinit();
-        self.allocator.destroy(self.completion);
         var it = self.onGossipHandlers.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -253,9 +247,13 @@ pub const GenericGossipHandler = struct {
 
                 self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
 
+                // Create a separate completion object for each handler to avoid conflicts
+                const completion = try self.allocator.create(xev.Completion);
+                completion.* = undefined;
+
                 self.timer.run(
                     self.loop,
-                    self.completion,
+                    completion,
                     1,
                     MessagePublishWrapper,
                     publishWrapper,
@@ -263,7 +261,7 @@ pub const GenericGossipHandler = struct {
                         fn callback(
                             ud: ?*MessagePublishWrapper,
                             _: *xev.Loop,
-                            _: *xev.Completion,
+                            c: *xev.Completion,
                             r: xev.Timer.RunError!void,
                         ) xev.CallbackAction {
                             _ = r catch unreachable;
@@ -271,6 +269,8 @@ pub const GenericGossipHandler = struct {
                                 pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
                                 _ = pwrap.handler.onGossip(pwrap.data) catch void;
                                 defer pwrap.deinit();
+                                // Clean up the completion object
+                                pwrap.allocator.destroy(c);
                             }
                             return .disarm;
                         }
