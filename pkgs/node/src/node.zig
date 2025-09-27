@@ -154,10 +154,20 @@ pub const BeamNode = struct {
         // 2. Process locally through chain
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
-        try self.chain.onBlock(signed_block, .{
-            .postState = self.chain.states.get(block_root),
-            .blockRoot = block_root,
-        });
+
+        // check if the block has not already been recieved through the network
+        const hasBlock = self.chain.forkChoice.hasBlock(block_root);
+        if (!hasBlock) {
+            try self.chain.onBlock(signed_block, .{
+                .postState = self.chain.states.get(block_root),
+                .blockRoot = block_root,
+            });
+        } else {
+            self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
+                signed_block.message.slot,
+                signed_block.message.proposer_index,
+            });
+        }
     }
 
     pub fn publishVote(self: *Self, signed_vote: types.SignedVote) !void {
