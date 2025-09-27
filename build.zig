@@ -201,6 +201,17 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/database", zeam_database);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
 
+    const zeam_spectests = b.addModule("zeam_spectests", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/spectest/src/lib.zig"),
+    });
+    zeam_spectests.addImport("@zeam/utils", zeam_utils);
+    zeam_spectests.addImport("@zeam/types", zeam_types);
+    zeam_spectests.addImport("@zeam/configs", zeam_configs);
+    zeam_spectests.addImport("@zeam/params", zeam_params);
+    zeam_spectests.addImport("ssz", ssz);
+
     // Create build options
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", git_version);
@@ -394,6 +405,19 @@ pub fn build(b: *Builder) !void {
     });
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
+
+    const spectests = b.addTest(.{
+        .root_module = zeam_spectests,
+        .optimize = optimize,
+        .target = target,
+    });
+    spectests.root_module.addImport("@zeam/utils", zeam_utils);
+    spectests.root_module.addImport("@zeam/types", zeam_types);
+    spectests.root_module.addImport("@zeam/configs", zeam_configs);
+    spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    spectests.root_module.addImport("ssz", ssz);
+    const run_spectests = b.addRunArtifact(spectests);
+    test_step.dependOn(&run_spectests.step);
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
