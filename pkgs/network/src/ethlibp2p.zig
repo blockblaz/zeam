@@ -160,6 +160,7 @@ pub const EthLibp2p = struct {
         }
 
         self.allocator.free(self.params.network_name);
+        self.allocator.free(self.params.local_private_key);
     }
 
     pub fn run(self: *Self) !void {
