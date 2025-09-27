@@ -218,6 +218,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("build_options", build_options_module);
     cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
+    cli_exe.root_module.addImport("@zeam/database", zeam_database);
     cli_exe.root_module.addImport("@zeam/utils", zeam_utils);
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);

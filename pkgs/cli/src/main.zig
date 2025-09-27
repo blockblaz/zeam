@@ -20,6 +20,8 @@ const ChainOptions = configs.ChainOptions;
 
 const utils_lib = @import("@zeam/utils");
 
+const database = @import("@zeam/database");
+
 const sft_factory = @import("@zeam/state-transition");
 const api = @import("@zeam/api");
 const api_server = @import("api_server.zig");
@@ -315,6 +317,11 @@ pub fn main() !void {
             const db_path_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.db_path});
             defer allocator.free(db_path_2);
 
+            var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), db_path_1);
+            defer db_1.deinit();
+            var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), db_path_2);
+            defer db_2.deinit();
+
             var beam_node_1 = try BeamNode.init(allocator, .{
                 // options
                 .nodeId = 0,
@@ -323,7 +330,7 @@ pub fn main() !void {
                 .backend = backend1,
                 .clock = clock,
                 .validator_ids = &validator_ids_1,
-                .db_path = db_path_1,
+                .db = db_1,
                 .logger_config = &logger1_config,
             });
             var beam_node_2 = try BeamNode.init(allocator, .{
@@ -334,7 +341,7 @@ pub fn main() !void {
                 .backend = backend2,
                 .clock = clock,
                 .validator_ids = &validator_ids_2,
-                .db_path = db_path_2,
+                .db = db_2,
                 .logger_config = &logger2_config,
             });
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const database = @import("@zeam/database");
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
@@ -23,7 +24,7 @@ const NodeOpts = struct {
     clock: *clockFactory.Clock,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
-    db_path: []const u8,
+    db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
 };
 
@@ -49,7 +50,7 @@ pub const BeamNode = struct {
                 .config = opts.config,
                 .anchorState = opts.anchorState,
                 .nodeId = opts.nodeId,
-                .db_path = opts.db_path,
+                .db = opts.db,
                 .logger_config = opts.logger_config,
             },
         );
