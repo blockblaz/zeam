@@ -10,6 +10,7 @@ const json = std.json;
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
+const params = @import("@zeam/params");
 const sft = @import("@zeam/state-transition");
 const xev = @import("xev");
 const networks = @import("@zeam/network");
@@ -33,6 +34,7 @@ pub const NodeOptions = struct {
     metrics_port: u16,
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
+    preset: params.Preset,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -67,10 +69,11 @@ pub const Node = struct {
             try api_server.startAPIServer(allocator, options.metrics_port);
         }
 
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
-            \\{"preset": "mainnet", "name": "devnet0"}
-        ;
+        // Create chain spec based on selected preset
+        const preset_name = @tagName(options.preset);
+        const chain_spec = try std.fmt.allocPrint(allocator, "{{\"preset\": \"{s}\", \"name\": \"beamdev\"}}", .{preset_name});
+        defer allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
@@ -99,7 +102,7 @@ pub const Node = struct {
             .local_private_key = options.local_priv_key,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
-        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.preset);
         errdefer self.clock.deinit(allocator);
 
         self.beam_node = try BeamNode.init(allocator, .{

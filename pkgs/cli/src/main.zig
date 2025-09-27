@@ -17,6 +17,8 @@ const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
+const params = @import("@zeam/params");
+const Preset = params.Preset;
 
 const utils_lib = @import("@zeam/utils");
 
@@ -76,6 +78,8 @@ const ZeamArgs = struct {
             help: bool = false,
             mockNetwork: bool = false,
             metricsPort: u16 = constants.DEFAULT_METRICS_PORT,
+
+            pub const __messages__ = .{};
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -163,7 +167,7 @@ pub fn main() !void {
     switch (opts.args.__commands__) {
         .clock => {
             var loop = try xev.Loop.init(.{});
-            var clock = try Clock.init(gpa.allocator(), genesis, &loop);
+            var clock = try Clock.init(gpa.allocator(), genesis, &loop, params.activePreset);
             std.debug.print("clock {any}\n", .{clock});
 
             try clock.run();
@@ -213,10 +217,11 @@ pub fn main() !void {
 
             const mock_network = beamcmd.mockNetwork;
 
-            // some base mainnet spec would be loaded to build this up
-            const chain_spec =
-                \\{"preset": "mainnet", "name": "beamdev"}
-            ;
+            // Create chain spec based on compile-time preset
+            const preset_name = @tagName(params.activePreset);
+            const chain_spec = try std.fmt.allocPrint(allocator, "{{\"preset\": \"{s}\", \"name\": \"beamdev\"}}", .{preset_name});
+            defer allocator.free(chain_spec);
+
             const options = json.ParseOptions{
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
@@ -303,7 +308,7 @@ pub fn main() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, params.activePreset);
 
             //one missing validator is by design
             var validator_ids_1 = [_]usize{1};
@@ -357,6 +362,7 @@ pub fn main() !void {
                 .validator_indices = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
+                .preset = params.activePreset,
             };
 
             defer start_options.deinit(allocator);
