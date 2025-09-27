@@ -6,6 +6,8 @@ const Allocator = std.mem.Allocator;
 const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
+const database = @import("./database.zig");
+const test_helpers = @import("./test_helpers.zig");
 
 pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
     return struct {
@@ -800,4 +802,162 @@ test "test_iterator_functionality" {
     try std.testing.expect(start_entry2 != null);
     try std.testing.expectEqualStrings("key4", start_entry2.?.@"0");
     try std.testing.expectEqualStrings("value4", start_entry2.?.@"1");
+}
+
+test "save and load block" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    defer db.deinit();
+
+    // Create test data using helper functions
+    const test_block_root = test_helpers.createDummyRoot(0xAB);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, 0x12);
+    defer signed_block.deinit();
+
+    // Save the block
+    db.saveBlock(database.DbBlocksNamespace, test_block_root, signed_block);
+
+    // Load the block back
+    const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
+    try std.testing.expect(loaded_block != null);
+
+    const loaded = loaded_block.?.message;
+
+    // Verify all block fields match
+    try std.testing.expect(loaded.slot == signed_block.message.slot);
+    try std.testing.expect(loaded.proposer_index == signed_block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &signed_block.message.state_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block.?.signature, &signed_block.signature));
+
+    // Verify attestations list is empty as expected
+    try std.testing.expect(loaded.body.attestations.len() == 0);
+
+    // Test loading a non-existent block
+    const non_existent_root = test_helpers.createDummyRoot(0xFF);
+    const loaded_non_existent_block = db.loadBlock(database.DbBlocksNamespace, non_existent_root);
+    try std.testing.expect(loaded_non_existent_block == null);
+}
+
+test "save and load state" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    defer db.deinit();
+
+    // Create test data using helper functions
+    const test_state_root = test_helpers.createDummyRoot(0x11);
+    var test_state = try test_helpers.createDummyState(allocator, 1, 4, 93, 0, 0, 0x22, 0x33);
+    defer test_state.deinit();
+
+    // Save the state
+    db.saveState(database.DbStatesNamespace, test_state_root, test_state);
+
+    // Load the state back
+    const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);
+    try std.testing.expect(loaded_state != null);
+
+    const loaded = loaded_state.?;
+
+    // Verify state fields match
+    try std.testing.expect(loaded.slot == test_state.slot);
+    try std.testing.expect(loaded.latest_justified.slot == test_state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded.latest_justified.root, &test_state.latest_justified.root));
+    try std.testing.expect(loaded.latest_finalized.slot == test_state.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded.latest_finalized.root, &test_state.latest_finalized.root));
+    try std.testing.expect(loaded.historical_block_hashes.len() == test_state.historical_block_hashes.len());
+    try std.testing.expect(loaded.justified_slots.len() == test_state.justified_slots.len());
+
+    // Test loading a non-existent state root
+    const non_existent_root = test_helpers.createDummyRoot(0xFF);
+    const loaded_non_existent_state = db.loadState(database.DbStatesNamespace, non_existent_root);
+    try std.testing.expect(loaded_non_existent_state == null);
+}
+
+test "batch write and commit" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    defer db.deinit();
+
+    // Create test data using helper functions
+    const test_block_root = test_helpers.createDummyRoot(0xAA);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, 0xDD);
+    defer signed_block.deinit();
+
+    const test_state_root = test_helpers.createDummyRoot(0xEE);
+    var test_state = try test_helpers.createDummyState(allocator, 2, 4, 93, 1, 0, 0xFF, 0x00);
+    defer test_state.deinit();
+
+    // Test batch write and commit
+    var batch = db.initWriteBatch();
+    defer batch.deinit();
+
+    // Verify block doesn't exist before batch commit
+    const loaded_null_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
+    try std.testing.expect(loaded_null_block == null);
+
+    // Verify state doesn't exist before batch commit
+    const loaded_null_state = db.loadState(database.DbStatesNamespace, test_state_root);
+    try std.testing.expect(loaded_null_state == null);
+
+    // Add block and state to batch
+    batch.putBlock(database.DbBlocksNamespace, test_block_root, signed_block);
+    batch.putState(database.DbStatesNamespace, test_state_root, test_state);
+
+    // Commit the batch
+    db.commit(&batch);
+
+    // Verify block was saved and can be loaded
+    const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
+    try std.testing.expect(loaded_block != null);
+
+    const loaded_block_data = loaded_block.?.message;
+    try std.testing.expect(loaded_block_data.slot == signed_block.message.slot);
+    try std.testing.expect(loaded_block_data.proposer_index == signed_block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.message.state_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block.?.signature, &signed_block.signature));
+
+    // Verify state was saved and can be loaded
+    const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);
+    try std.testing.expect(loaded_state != null);
+
+    const loaded_state_data = loaded_state.?;
+    try std.testing.expect(loaded_state_data.slot == test_state.slot);
+    try std.testing.expect(loaded_state_data.latest_justified.slot == test_state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_justified.root, &test_state.latest_justified.root));
+    try std.testing.expect(loaded_state_data.latest_finalized.slot == test_state.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_finalized.root, &test_state.latest_finalized.root));
 }
