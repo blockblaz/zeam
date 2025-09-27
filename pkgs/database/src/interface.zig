@@ -2,6 +2,7 @@ const rocksdb = @import("rocksdb");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
+const zeam_utils = @import("@zeam/utils");
 
 /// Helper function to format block keys consistently
 pub fn formatBlockKey(allocator: Allocator, block_root: types.Root) ![]const u8 {

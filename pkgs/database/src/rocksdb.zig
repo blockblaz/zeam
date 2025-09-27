@@ -116,7 +116,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             try callRocksDB(self.logger, rocksdb.DB.deleteFilesInRange, .{ &self.db, self.cf_handles[cn.find(column_namespaces)], start_key, end_key });
         }
 
-        pub fn initWriteBatch(self: *Self) Error!WriteBatch {
+        pub fn initWriteBatch(self: *Self) WriteBatch {
             return .{
                 .allocator = self.allocator,
                 .inner = rocksdb.WriteBatch.init(),
@@ -125,8 +125,11 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             };
         }
 
-        pub fn commit(self: *Self, batch: *WriteBatch) Error!void {
-            return callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner });
+        pub fn commit(self: *Self, batch: *WriteBatch) void {
+            callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner }) catch |err| {
+                self.logger.err("Failed to commit write batch: {any}", .{err});
+                return;
+            };
         }
 
         /// A write batch is a sequence of operations that execute atomically.
@@ -192,11 +195,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 comptime log_message: []const u8,
                 log_args: anytype,
-            ) !void {
+            ) void {
                 var serialized_value = std.ArrayList(u8).init(self.allocator);
                 defer serialized_value.deinit();
 
-                try ssz.serialize(T, value, &serialized_value);
+                ssz.serialize(T, value, &serialized_value) catch |err| {
+                    self.logger.err("Failed to serialize value for putToBatch: {any}", .{err});
+                    return;
+                };
 
                 self.put(cn, key, serialized_value.items);
                 self.logger.debug(log_message, log_args);
@@ -208,11 +214,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 block_root: types.Root,
                 block: types.SignedBeamBlock,
-            ) !void {
-                const key = try interface.formatBlockKey(self.allocator, block_root);
+            ) void {
+                const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+                    self.logger.err("Failed to format block key for putBlock: {any}", .{err});
+                    return;
+                };
                 defer self.allocator.free(key);
 
-                try self.putToBatch(
+                self.putToBatch(
                     types.SignedBeamBlock,
                     key,
                     block,
@@ -228,11 +237,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 state_root: types.Root,
                 state: types.BeamState,
-            ) !void {
-                const key = try interface.formatStateKey(self.allocator, state_root);
+            ) void {
+                const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+                    self.logger.err("Failed to format state key for putState: {any}", .{err});
+                    return;
+                };
                 defer self.allocator.free(key);
 
-                try self.putToBatch(
+                self.putToBatch(
                     types.BeamState,
                     key,
                     state,
@@ -248,8 +260,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime cn: ColumnNamespace,
                 vote_key: []const u8,
                 vote: types.SignedVote,
-            ) !void {
-                try self.putToBatch(
+            ) void {
+                self.putToBatch(
                     types.SignedVote,
                     vote_key,
                     vote,
@@ -334,13 +346,19 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime cn: ColumnNamespace,
             comptime log_message: []const u8,
             log_args: anytype,
-        ) !void {
+        ) void {
             var serialized_value = std.ArrayList(u8).init(self.allocator);
             defer serialized_value.deinit();
 
-            try ssz.serialize(T, value, &serialized_value);
+            ssz.serialize(T, value, &serialized_value) catch |err| {
+                self.logger.err("Failed to serialize value for saveToDatabase: {any}", .{err});
+                return;
+            };
 
-            try self.put(cn, key, serialized_value.items);
+            self.put(cn, key, serialized_value.items) catch |err| {
+                self.logger.err("Failed to put value to database in saveToDatabase: {any}", .{err});
+                return;
+            };
             self.logger.debug(log_message, log_args);
         }
 
@@ -352,13 +370,19 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime cn: ColumnNamespace,
             comptime log_message: []const u8,
             log_args: anytype,
-        ) !?T {
-            const value = try self.get(cn, key);
+        ) ?T {
+            const value = self.get(cn, key) catch |err| {
+                self.logger.err("Failed to get value from database in loadFromDatabase: {any}", .{err});
+                return null;
+            };
             if (value) |encoded_value| {
                 defer encoded_value.deinit();
 
                 var decoded_value: T = undefined;
-                try ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator);
+                ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator) catch |err| {
+                    self.logger.err("Failed to deserialize value in loadFromDatabase: {any}", .{err});
+                    return null;
+                };
 
                 self.logger.debug(log_message, log_args);
                 return decoded_value;
@@ -367,11 +391,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a block to the database
-        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBeamBlock) !void {
-            const key = try interface.formatBlockKey(self.allocator, block_root);
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBeamBlock) void {
+            const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+                self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
+                return;
+            };
             defer self.allocator.free(key);
 
-            try self.saveToDatabase(
+            self.saveToDatabase(
                 types.SignedBeamBlock,
                 key,
                 block,
@@ -382,11 +409,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a block from the database
-        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) !?types.SignedBeamBlock {
-            const key = try interface.formatBlockKey(self.allocator, block_root);
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBeamBlock {
+            const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+                self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
+                return null;
+            };
             defer self.allocator.free(key);
 
-            return try self.loadFromDatabase(
+            return self.loadFromDatabase(
                 types.SignedBeamBlock,
                 key,
                 cn,
@@ -396,11 +426,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a state to the database
-        pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) !void {
-            const key = try interface.formatStateKey(self.allocator, state_root);
+        pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
+            const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+                self.logger.err("Failed to format state key for saveState: {any}", .{err});
+                return;
+            };
             defer self.allocator.free(key);
 
-            try self.saveToDatabase(
+            self.saveToDatabase(
                 types.BeamState,
                 key,
                 state,
@@ -411,11 +444,14 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a state from the database
-        pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) !?types.BeamState {
-            const key = try interface.formatStateKey(self.allocator, state_root);
+        pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) ?types.BeamState {
+            const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+                self.logger.err("Failed to format state key for loadState: {any}", .{err});
+                return null;
+            };
             defer self.allocator.free(key);
 
-            return try self.loadFromDatabase(
+            return self.loadFromDatabase(
                 types.BeamState,
                 key,
                 cn,
@@ -425,8 +461,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a vote to the database
-        pub fn saveVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8, vote: types.SignedVote) !void {
-            try self.saveToDatabase(
+        pub fn saveVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8, vote: types.SignedVote) void {
+            self.saveToDatabase(
                 types.SignedVote,
                 vote_key,
                 vote,
@@ -437,8 +473,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a vote from the database
-        pub fn loadVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8) !?types.SignedVote {
-            return try self.loadFromDatabase(
+        pub fn loadVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8) ?types.SignedVote {
+            return self.loadFromDatabase(
                 types.SignedVote,
                 vote_key,
                 cn,
@@ -634,7 +670,7 @@ test "test_batch_write_function" {
     var db = try rdb.open(allocator, module_logger, db_path);
     defer db.deinit();
 
-    var batch = try db.initWriteBatch();
+    var batch = db.initWriteBatch();
     defer batch.deinit();
 
     // Add entry to batch but don't commit yet
@@ -644,7 +680,7 @@ test "test_batch_write_function" {
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 
     // Commit the batch to make changes visible
-    try db.commit(&batch);
+    db.commit(&batch);
 
     // Verify entry is now visible in database
     const value1 = try db.get(column_namespace[0], "default_key1");
@@ -664,7 +700,7 @@ test "test_batch_write_function" {
     }
 
     // Commit the delete operation
-    try db.commit(&batch);
+    db.commit(&batch);
 
     // Verify entry is now deleted from database
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);

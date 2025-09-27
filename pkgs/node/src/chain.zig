@@ -350,16 +350,7 @@ pub const BeamChain = struct {
             };
         }
 
-        // 5. Save block and state to database
-        var batch = try self.db.initWriteBatch();
-        defer batch.deinit();
-
-        try batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
-        try batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state);
-
-        try self.db.commit(&batch);
-
-        // 6. fc update head
+        // 5. fc update head
         const new_head = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
 
@@ -406,6 +397,15 @@ pub const BeamChain = struct {
                 self.module_logger.warn("Failed to create finalization event: {any}", .{err});
             }
         }
+
+        // 8. Save block and state to database
+        var batch = self.db.initWriteBatch();
+        defer batch.deinit();
+
+        batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
+        batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state);
+
+        self.db.commit(&batch);
 
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
@@ -596,10 +596,10 @@ test "save and load block" {
         const block = signed_block.message;
 
         // Save the block
-        try beam_chain.db.saveBlock(database.DbBlocksNamespace, block_root, signed_block);
+        beam_chain.db.saveBlock(database.DbBlocksNamespace, block_root, signed_block);
 
         // Load the block back
-        const loaded_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, block_root);
+        const loaded_block = beam_chain.db.loadBlock(database.DbBlocksNamespace, block_root);
         try std.testing.expect(loaded_block != null);
 
         const loaded = loaded_block.?.message;
@@ -660,8 +660,8 @@ test "save and load state" {
     var genesis_state_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamState, beam_state, &genesis_state_root, allocator);
 
-    try beam_chain.db.saveState(database.DbStatesNamespace, genesis_state_root, beam_state);
-    const loaded_genesis_state = try beam_chain.db.loadState(database.DbStatesNamespace, genesis_state_root);
+    beam_chain.db.saveState(database.DbStatesNamespace, genesis_state_root, beam_state);
+    const loaded_genesis_state = beam_chain.db.loadState(database.DbStatesNamespace, genesis_state_root);
     try std.testing.expect(loaded_genesis_state != null);
 
     // Verify state fields match
@@ -677,7 +677,7 @@ test "save and load state" {
     // Test loading a non-existent state root
     var non_existent_root: types.Root = undefined;
     @memset(&non_existent_root, 0xFF);
-    const loaded_non_existent_state = try beam_chain.db.loadState(database.DbStatesNamespace, non_existent_root);
+    const loaded_non_existent_state = beam_chain.db.loadState(database.DbStatesNamespace, non_existent_root);
     try std.testing.expect(loaded_non_existent_state == null);
 }
 
@@ -713,20 +713,19 @@ test "batch write and commit" {
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
 
     // Test batch write and commit
-    var batch = try beam_chain.db.initWriteBatch();
+    var batch = beam_chain.db.initWriteBatch();
     defer batch.deinit();
 
     // Test loading the block back
-    const loaded_null_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
+    const loaded_null_block = beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
     try std.testing.expect(loaded_null_block == null);
 
-    // batch.put(database.DbBlocksNamespace, beam_chain.db.formatBlockKey(mock_chain.blockRoots[0]), mock_chain.blocks[0]);
-    try batch.putBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0], mock_chain.blocks[0]);
+    batch.putBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0], mock_chain.blocks[0]);
 
-    try beam_chain.db.commit(&batch);
+    beam_chain.db.commit(&batch);
 
     // Test loading the block back
-    const loaded_block = try beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
+    const loaded_block = beam_chain.db.loadBlock(database.DbBlocksNamespace, mock_chain.blockRoots[0]);
     try std.testing.expect(loaded_block != null);
 
     const loaded = loaded_block.?.message;
