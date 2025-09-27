@@ -1,4 +1,3 @@
-
 test {
-    _=@import("./containers/state.zig");
+    _ = @import("./containers/state.zig");
 }

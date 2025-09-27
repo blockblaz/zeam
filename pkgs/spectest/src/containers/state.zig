@@ -29,7 +29,7 @@ fn sampleCheckpoint() types.Mini3SFCheckpoint {
     };
 }
 
-fn baseState(allocator:Allocator) types.BeamState {
+fn baseState(allocator: Allocator) types.BeamState {
     return .{
         .config = sampleConfig(),
         .slot = 0,
@@ -50,7 +50,7 @@ test "test_with_justifications_invalid_length" {
 
     const root1 = [_]u8{1} ** 32;
     var invalid_justification = [_]u8{1} ** (params.VALIDATOR_REGISTRY_LIMIT - 1);
-    var justifications:std.AutoHashMapUnmanaged(types.Root, []u8)=.empty;
+    var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications.deinit(allocator);
     try justifications.put(allocator, root1, &invalid_justification);
 
