@@ -257,7 +257,8 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         }
     }
 
-    try flattenJustifications(allocator, &justifications, state);
+    //  try flattenJustifications(allocator, &justifications, state);
+    try state.withJustifications(allocator, &justifications);
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
     logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
