@@ -33,7 +33,7 @@ pub const ChainOpts = struct {
 };
 
 pub const CachedProcessedBlockInfo = struct {
-    postState: ?types.BeamState = null,
+    postState: ?*types.BeamState = null,
     blockRoot: ?types.Root = null,
 };
 
@@ -47,7 +47,7 @@ pub const BeamChain = struct {
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
     // from finalized onwards to recent
-    states: std.AutoHashMap(types.Root, types.BeamState),
+    states: std.AutoHashMap(types.Root, *types.BeamState),
     nodeId: u32,
     // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
     // For all other modules, we just need module_logger
@@ -68,8 +68,10 @@ pub const BeamChain = struct {
         const logger_config = opts.logger_config;
         const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, logger_config.logger(.forkchoice));
 
-        var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
-        try states.put(fork_choice.head.blockRoot, opts.anchorState.*);
+        var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
+        const anchor_state_ptr = try allocator.create(types.BeamState);
+        anchor_state_ptr.* = opts.anchorState.*;
+        try states.put(fork_choice.head.blockRoot, anchor_state_ptr);
 
         return Self{
             .nodeId = opts.nodeId,
@@ -89,7 +91,8 @@ pub const BeamChain = struct {
     pub fn deinit(self: *Self) void {
         var it = self.states.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
         // assume the allocator of config is same as self.allocator
@@ -146,8 +149,8 @@ pub const BeamChain = struct {
         const votes = try self.forkChoice.getProposalVotes();
         const parent_root = chainHead.blockRoot;
 
-        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
-        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+        const pre_state_ptr = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        var post_state = try types.sszClone(self.allocator, types.BeamState, pre_state_ptr.*);
 
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
@@ -172,7 +175,9 @@ pub const BeamChain = struct {
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
-        try self.states.put(block_root, post_state);
+        const post_state_ptr = try self.allocator.create(types.BeamState);
+        post_state_ptr.* = post_state;
+        try self.states.put(block_root, post_state_ptr);
 
         return .{
             .block = block,
@@ -292,8 +297,6 @@ pub const BeamChain = struct {
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
-    //
-    // TODO: move self.states cache to pointer of states along with blockInfo's poststate
     pub fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, blockInfo: CachedProcessedBlockInfo) !void {
         const onblock_timer = api.chain_onblock_duration_seconds.start();
 
@@ -308,10 +311,10 @@ pub const BeamChain = struct {
             block.slot,
         });
 
-        const post_state = blockInfo.postState orelse computedstate: {
+        const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr.* else computedstate: {
             // 1. get parent state
-            const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
-            var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state);
+            const pre_state_ptr = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+            var cpost_state = try types.sszClone(self.allocator, types.BeamState, pre_state_ptr.*);
 
             // 2. apply STF to get post state
             var validSignatures = true;
@@ -332,7 +335,9 @@ pub const BeamChain = struct {
             .blockDelayMs = 0,
             .blockRoot = block_root,
         });
-        try self.states.put(fcBlock.blockRoot, post_state);
+        const post_state_ptr = try self.allocator.create(types.BeamState);
+        post_state_ptr.* = post_state;
+        try self.states.put(fcBlock.blockRoot, post_state_ptr);
 
         // 4. fc onvotes
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
@@ -453,9 +458,9 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(searched_idx == i);
 
         // should have matching states in the state
-        const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
+        const block_state_ptr = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, block_state, &state_root, allocator);
+        try ssz.hashTreeRoot(types.BeamState, block_state_ptr.*, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
 
         // fcstore checkpoints should match
