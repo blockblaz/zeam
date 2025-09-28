@@ -14,7 +14,9 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         db: rocksdb.DB,
         allocator: Allocator,
         cf_handles: []const rocksdb.ColumnFamilyHandle,
-        path: []const u8,
+        // Keep this as a null terminated string to avoid issues with the RocksDB API
+        // As the path gets converted to ptr before being passed to the C API binding
+        path: [:0]const u8,
         logger: zeam_utils.ModuleLogger,
 
         const Self = @This();
@@ -24,7 +26,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("Initializing RocksDB", .{});
 
-            const owned_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{path});
+            const owned_path = try std.fmt.allocPrintZ(allocator, "{s}/rocksdb", .{path});
             errdefer allocator.free(owned_path);
 
             try std.fs.cwd().makePath(owned_path);
