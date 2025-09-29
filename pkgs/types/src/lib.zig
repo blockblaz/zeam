@@ -164,6 +164,22 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
+    pub fn getJustification(self: *const BeamState, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
+        // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+        const num_validators: usize = @intCast(self.config.num_validators);
+        // Initialize justifications from state
+        for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
+            const validator_data = try allocator.alloc(u8, num_validators);
+            errdefer allocator.free(validator_data);
+            // Copy existing justification data if available, otherwise return error
+            for (validator_data, 0..) |*byte, j| {
+                const bit_index = i * num_validators + j;
+                byte.* = if (self.justifications_validators.get(bit_index)) 1 else 0;
+            }
+            try justifications.put(allocator, blockRoot, validator_data);
+        }
+    }
+
     pub fn deinit(self: *BeamState) void {
         // Deinit heap allocated ArrayLists
         self.historical_block_hashes.deinit();

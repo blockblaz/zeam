@@ -416,8 +416,6 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
-    const run_spectests = b.addRunArtifact(spectests);
-    test_step.dependOn(&run_spectests.step);
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
@@ -438,6 +436,11 @@ pub fn build(b: *Builder) !void {
     const simtests = b.step("simtest", "Run integration tests");
     const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
     simtests.dependOn(&run_cli_integration_test.step);
+
+    // Create spectest step that runs spec tests
+    const spectests_step = b.step("spectest", "Run spec tests");
+    const run_spectests = b.addRunArtifact(spectests);
+    spectests_step.dependOn(&run_spectests.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
