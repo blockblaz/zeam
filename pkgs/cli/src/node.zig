@@ -93,11 +93,10 @@ pub const Node = struct {
         self.loop = try xev.Loop.init(.{});
 
         const addresses = try self.constructMultiaddrs();
-        const network_name = try allocator.dupe(u8, chain_config.spec.name);
-        errdefer allocator.free(network_name);
+
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
             .networkId = 0,
-            .network_name = network_name,
+            .network_name = chain_config.spec.name,
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,

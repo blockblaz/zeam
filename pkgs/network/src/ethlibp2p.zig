@@ -145,7 +145,19 @@ pub const EthLibp2p = struct {
         params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
     ) !Self {
-        return Self{ .allocator = allocator, .params = params, .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger), .logger = logger };
+        const owned_network_name = try allocator.dupe(u8, params.network_name);
+        errdefer allocator.free(owned_network_name);
+
+        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger);
+        errdefer gossip_handler.deinit();
+
+        return Self{ .allocator = allocator, .params = .{
+            .networkId = params.networkId,
+            .network_name = owned_network_name,
+            .local_private_key = params.local_private_key,
+            .listen_addresses = params.listen_addresses,
+            .connect_peers = params.connect_peers,
+        }, .gossipHandler = gossip_handler, .logger = logger };
     }
 
     pub fn deinit(self: *Self) void {
