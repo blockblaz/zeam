@@ -21,7 +21,7 @@ const LevelDB = struct {};
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: *const types.BeamState,
+    anchorState: types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     db: LevelDB,

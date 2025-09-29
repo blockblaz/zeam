@@ -164,14 +164,13 @@ pub const BlockByRootRequest = struct {
 
 // TODO: a super hacky cloning utility for ssz container structs
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
-pub fn sszClone(allocator: Allocator, comptime T: type, data: T) !T {
+// pass a pointer where you want to clone the data
+pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
     var bytes = std.ArrayList(u8).init(allocator);
     defer bytes.deinit();
 
     try ssz.serialize(T, data, &bytes);
-    var cloned: T = undefined;
-    try ssz.deserialize(T, bytes.items[0..], &cloned, allocator);
-    return cloned;
+    try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
 test "ssz import" {
