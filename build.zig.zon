@@ -1,15 +1,15 @@
 .{
     .name = .zeam,
-    .fingerprint = 0x243fd12c24350f93,
+    .fingerprint = 0x243fd12cec623508,
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
-            .url = "https://github.com/blockblaz/ssz.zig/archive/98cd12602e9a0125d76a6a93456dcfeaa30f9950.tar.gz",
-            .hash = "ssz-0.0.4-Lfwd60qdAgDXXMYkQzFYYArXl7IldYDL1JkHUjDBOER-",
+            .url = "https://github.com/blockblaz/ssz.zig/archive/c61bf8613018788f495f27bd885af5e737140b20.tar.gz",
+            .hash = "ssz-0.0.4-Lfwd686cAgBsqtmSJii3-3MpIQGDMNJIk3evm8_pmPr1",
         },
         .zigcli = .{
-            .url = "https://github.com/jiacai2050/zigcli/archive/v0.2.3.tar.gz",
-            .hash = "zigcli-0.2.3-ORC7jGKRAgAYW8y8hO3S4v2DsqbnyOrgximDYNgfB_Bw",
+            .url = "git+https://github.com/jiacai2050/zigcli?ref=main#dcbc59d70b4787671c8a4e484ffd2b725aa17af5",
+            .hash = "zigcli-0.2.3-ORC7jMGUAgC0S6M5tL0RTW1gn-3wFj9tmckO7g2iZB0k",
         },
         .xev = .{
             .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
@@ -30,6 +30,10 @@
         .zig_yaml = .{
             .url = "git+https://github.com/kubkon/zig-yaml#a37be441b042d8aa119213f82f715c0dd1019655",
             .hash = "zig_yaml-0.1.0-C1161hmEAgBeNkAzDaTpcf-2HBydmS1KpJ6FVfGIZfr_",
+        },
+        .rocksdb = .{
+            .url = "https://github.com/Syndica/rocksdb-zig/archive/70137101ad89640e0fc2e5ddbe60a26c522c7ae7.tar.gz",
+            .hash = "rocksdb-9.7.4-z_CUTmO5AAD0CQ2ZvShSDZHjC2x9MKrTnpvbNAIU7ah0",
         },
         .zig_snappy = .{
             .url = "git+https://github.com/blockblaz/zig-snappy#dd63108bd8e41c7cd799385dd9aa5085314eeafa",

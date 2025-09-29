@@ -1,4 +1,4 @@
-.section .text._start
+.section .text
 .globl _start
 
 _start:
@@ -7,5 +7,4 @@ _start:
     la gp, __global_pointer$
     .option pop
     la sp, STACK_TOP
-    lw sp, 0(sp)
     call main

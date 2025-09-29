@@ -9,6 +9,8 @@ const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 const api = @import("@zeam/api");
+const database = @import("@zeam/database");
+
 const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
@@ -30,6 +32,7 @@ pub const ChainOpts = struct {
     anchorState: types.BeamState,
     nodeId: u32,
     logger_config: *zeam_utils.ZeamLoggerConfig,
+    db: database.Db,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -58,6 +61,7 @@ pub const BeamChain = struct {
     stf_logger: zeam_utils.ModuleLogger,
     block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
+    db: database.Db,
     // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam)
     last_emitted_justified_slot: u64 = 0,
     last_emitted_finalized_slot: u64 = 0,
@@ -86,6 +90,7 @@ pub const BeamChain = struct {
             .module_logger = logger_config.logger(.chain),
             .stf_logger = logger_config.logger(.state_transition),
             .block_building_logger = logger_config.logger(.state_transition_block_building),
+            .db = opts.db,
             .last_emitted_justified_slot = 0,
             .last_emitted_finalized_slot = 0,
         };
@@ -400,6 +405,15 @@ pub const BeamChain = struct {
             }
         }
 
+        // 8. Save block and state to database
+        var batch = self.db.initWriteBatch();
+        defer batch.deinit();
+
+        batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
+        batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state.*);
+
+        self.db.commit(&batch);
+
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -437,7 +451,16 @@ test "process and add mock blocks into a node's chain" {
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    defer db.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
@@ -501,8 +524,17 @@ test "printSlot output demonstration" {
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
 
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    defer db.deinit();
+
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {

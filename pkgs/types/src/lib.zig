@@ -121,6 +121,63 @@ pub const BeamState = struct {
     justifications_roots: JustificationsRoots,
     justifications_validators: JustificationsValidators,
 
+    pub fn withJustifications(self: *BeamState, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
+        var new_justifications_roots = try JustificationsRoots.init(allocator);
+        errdefer new_justifications_roots.deinit();
+        var new_justifications_validators = try JustificationsValidators.init(allocator);
+        errdefer new_justifications_validators.deinit();
+
+        // First, collect all keys
+        var iterator = justifications.iterator();
+        while (iterator.next()) |kv| {
+            if (kv.value_ptr.*.len != self.config.num_validators) {
+                return error.InvalidJustificationLength;
+            }
+            try new_justifications_roots.append(kv.key_ptr.*);
+        }
+
+        // Sort the roots, confirm this sorting via a test
+        std.mem.sortUnstable(Root, new_justifications_roots.slice(), {}, struct {
+            fn lessThanFn(_: void, a: Root, b: Root) bool {
+                return std.mem.order(u8, &a, &b) == .lt;
+            }
+        }.lessThanFn);
+
+        // Now iterate over sorted roots and flatten validators in order
+        for (new_justifications_roots.constSlice()) |root| {
+            const rootSlice = justifications.get(root) orelse unreachable;
+            // append individual bits for validator justifications
+            // have a batch set method to set it since eventual num vals are div by 8
+            // and hence the vector can be fully appeneded as bytes
+            for (rootSlice) |validator_bit| {
+                try new_justifications_validators.append(validator_bit == 1);
+            }
+        }
+
+        // Lists are now heap allocated ArrayLists using the allocator
+        // Deinit existing lists and reinitialize
+        self.justifications_roots.deinit();
+        self.justifications_validators.deinit();
+        self.justifications_roots = new_justifications_roots;
+        self.justifications_validators = new_justifications_validators;
+    }
+
+    pub fn getJustification(self: *const BeamState, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
+        // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+        const num_validators: usize = @intCast(self.config.num_validators);
+        // Initialize justifications from state
+        for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
+            const validator_data = try allocator.alloc(u8, num_validators);
+            errdefer allocator.free(validator_data);
+            // Copy existing justification data if available, otherwise return error
+            for (validator_data, 0..) |*byte, j| {
+                const bit_index = i * num_validators + j;
+                byte.* = if (try self.justifications_validators.get(bit_index)) 1 else 0;
+            }
+            try justifications.put(allocator, blockRoot, validator_data);
+        }
+    }
+
     pub fn deinit(self: *BeamState) void {
         // Deinit heap allocated ArrayLists
         self.historical_block_hashes.deinit();

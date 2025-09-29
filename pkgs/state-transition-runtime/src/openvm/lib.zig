@@ -1,8 +1,32 @@
 pub const io = @import("./io.zig");
 const std = @import("std");
 
-pub fn get_input(_: std.mem.Allocator) []const u8 {
-    @panic("not implemented");
+pub extern var _heap_start: usize;
+var fixed_allocator: std.heap.FixedBufferAllocator = undefined;
+var fixed_allocator_initialized = false;
+
+pub fn get_allocator() std.mem.Allocator {
+    if (!fixed_allocator_initialized) {
+        const heap_start: [*]u8 = @ptrCast(&_heap_start);
+        const heap_end: [*]u8 = @ptrFromInt(0x10000000);
+        const heap_size: usize = @intFromPtr(heap_end) - @intFromPtr(heap_start);
+        const heap_area: []u8 = heap_start[0..heap_size];
+        asm volatile ("" ::: "memory");
+
+        fixed_allocator = std.heap.FixedBufferAllocator.init(heap_area);
+        fixed_allocator_initialized = true;
+    }
+    return fixed_allocator.allocator();
+}
+
+pub fn get_input(allocator: std.mem.Allocator) []const u8 {
+    var input: []u8 = allocator.alloc(u8, 1024) catch @panic("could not allocate space for the input slice");
+    const input_size = io.read_input(input[0..]);
+    return input[0..input_size];
+}
+
+pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
+    allocator.free(input);
 }
 
 pub fn halt(exit_code: u32) noreturn {

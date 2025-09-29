@@ -21,6 +21,8 @@ const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
 const zeam_utils = @import("@zeam/utils");
+const constants = @import("constants.zig");
+const database = @import("@zeam/database");
 
 const prefix = "zeam_";
 
@@ -33,6 +35,7 @@ pub const NodeOptions = struct {
     metrics_port: u16,
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
+    database_path: []const u8,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -53,6 +56,7 @@ pub const Node = struct {
     options: *const NodeOptions,
     allocator: std.mem.Allocator,
     logger: zeam_utils.ModuleLogger,
+    db: database.Db,
 
     const Self = @This();
 
@@ -89,11 +93,10 @@ pub const Node = struct {
         self.loop = try xev.Loop.init(.{});
 
         const addresses = try self.constructMultiaddrs();
-        const network_name = try allocator.dupe(u8, chain_config.spec.name);
-        errdefer allocator.free(network_name);
+
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
             .networkId = 0,
-            .network_name = network_name,
+            .network_name = chain_config.spec.name,
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
@@ -102,6 +105,9 @@ pub const Node = struct {
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
         errdefer self.clock.deinit(allocator);
 
+        var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+        errdefer db.deinit();
+
         self.beam_node = try BeamNode.init(allocator, .{
             // options
             .nodeId = node_id,
@@ -109,8 +115,8 @@ pub const Node = struct {
             .anchorState = anchorState,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
-            .db = .{},
             .validator_ids = options.validator_indices,
+            .db = db,
             .logger_config = options.logger_config,
         });
 
@@ -122,6 +128,7 @@ pub const Node = struct {
         self.beam_node.deinit();
         self.network.deinit();
         self.enr.deinit();
+        self.db.deinit();
         self.loop.deinit();
     }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const database = @import("@zeam/database");
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
@@ -16,17 +17,14 @@ pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validators = @import("./validator.zig");
 
-// TODO: find a in mem level db for this
-const LevelDB = struct {};
-
 const NodeOpts = struct {
     config: configs.ChainConfig,
     anchorState: types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
-    db: LevelDB,
     validator_ids: ?[]usize = null,
     nodeId: u32 = 0,
+    db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
 };
 
@@ -52,6 +50,7 @@ pub const BeamNode = struct {
                 .config = opts.config,
                 .anchorState = opts.anchorState,
                 .nodeId = opts.nodeId,
+                .db = opts.db,
                 .logger_config = opts.logger_config,
             },
         );
