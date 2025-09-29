@@ -38,8 +38,8 @@ fn baseState(allocator: Allocator) types.BeamState {
         .latest_finalized = sampleCheckpoint(),
         .historical_block_hashes = try types.HistoricalBlockHashes.init(allocator),
         .justified_slots = try types.JustifiedSlots.init(allocator),
-        .justifications_roots = try ssz.utils.List(types.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator),
-        .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+        .justifications_roots = try types.JustificationsRoots.init(allocator),
+        .justifications_validators = try types.JustificationsValidators.init(allocator),
     };
 }
 
@@ -187,10 +187,13 @@ test "test_with_justifications_invalid_length" {
     defer base_state.deinit();
 
     const root1 = [_]u8{1} ** 32;
-    var invalid_justification = [_]u8{1} ** (params.VALIDATOR_REGISTRY_LIMIT - 1);
+    const invalid_len = base_state.config.num_validators - 1;
+    const invalid_justification = try allocator.alloc(u8, invalid_len);
+    defer allocator.free(invalid_justification);
+    @memset(invalid_justification, 1); // Set all bytes to 1
     var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications.deinit(allocator);
-    try justifications.put(allocator, root1, &invalid_justification);
+    try justifications.put(allocator, root1, invalid_justification);
 
     const result = base_state.withJustifications(allocator, &justifications);
     try std.testing.expect(result == error.InvalidJustificationLength);

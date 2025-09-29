@@ -156,10 +156,8 @@ pub const BeamState = struct {
 
         // Lists are now heap allocated ArrayLists using the allocator
         // Deinit existing lists and reinitialize
-        var old_justifications_roots = self.justifications_roots;
-        defer old_justifications_roots.deinit();
-        var old_justifications_validators = self.justifications_validators;
-        defer old_justifications_validators.deinit();
+        self.justifications_roots.deinit();
+        self.justifications_validators.deinit();
         self.justifications_roots = new_justifications_roots;
         self.justifications_validators = new_justifications_validators;
     }
