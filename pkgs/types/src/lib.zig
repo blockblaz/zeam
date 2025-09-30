@@ -194,6 +194,16 @@ pub const BeamBlock = struct {
             .body_root = body_root,
         };
     }
+
+    pub fn toJson(self: *const BeamBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put("body", try self.body.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const SignedBeamBlock = struct {
