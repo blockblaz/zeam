@@ -131,6 +131,19 @@ pub const BeamBlockBody = struct {
         // Deinit heap allocated ArrayLists
         self.attestations.deinit();
     }
+
+    pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+
+        // Serialize attestations list
+        var attestations_array = json.Array.init(allocator);
+        for (self.attestations.constSlice()) |attestation| {
+            try attestations_array.append(try attestation.toJson(allocator));
+        }
+        try obj.put("attestations", json.Value{ .array = attestations_array });
+
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const BeamBlock = struct {
