@@ -471,6 +471,13 @@ pub const ChainSpec = struct {
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
     }
+
+    pub fn toJson(self: *const ChainSpec, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
+        try obj.put("name", json.Value{ .string = self.name });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const BeamSTFProverInput = struct {
