@@ -108,6 +108,16 @@ pub const ProtoBlock = struct {
     parentRoot: Root,
     stateRoot: Root,
     timeliness: bool,
+
+    pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
+        try obj.put("parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
+        try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
+        try obj.put("timeliness", json.Value{ .bool = self.timeliness });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const BeamBlockBody = struct {
