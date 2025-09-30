@@ -235,7 +235,9 @@ pub fn main() !void {
             chain_options.num_validators = num_validators;
             // transfer ownership of the chain_options to ChainConfig
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            const anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
+            var anchorState: types.BeamState = undefined;
+            try anchorState.genGenesisState(gpa.allocator(), chain_config.genesis);
+            defer anchorState.deinit();
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
             // in the order to which they have been added even with the an appropriate delay added
