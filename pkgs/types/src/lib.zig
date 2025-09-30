@@ -483,6 +483,13 @@ pub const ChainSpec = struct {
 pub const BeamSTFProverInput = struct {
     block: SignedBeamBlock,
     state: BeamState,
+
+    pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("block", try self.block.toJson(allocator));
+        try obj.put("state", try self.state.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
 };
 
 // some p2p containers
