@@ -89,6 +89,14 @@ pub const SignedVote = struct {
     message: Mini3SFVote,
     // TODO signature objects to be updated in a followup PR
     signature: Bytes4000,
+
+    pub fn toJson(self: *const SignedVote, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
+        try obj.put("message", try self.message.toJson(allocator));
+        try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
+        return json.Value{ .object = obj };
+    }
 };
 pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, params.VALIDATOR_REGISTRY_LIMIT);
 pub const SignedVotes = ssz.utils.List(SignedVote, params.VALIDATOR_REGISTRY_LIMIT);
