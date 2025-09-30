@@ -227,6 +227,13 @@ pub const SignedBeamBlock = struct {
 pub const BeamStateConfig = struct {
     num_validators: u64,
     genesis_time: u64,
+
+    pub fn toJson(self: *const BeamStateConfig, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
+        try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const HistoricalBlockHashes = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
