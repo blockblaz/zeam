@@ -4,8 +4,8 @@ const fcFactory = @import("./forkchoice.zig");
 
 /// Builds a tree visualization of the fork choice tree with optional depth limit
 pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.ProtoNode, max_depth: ?usize) ![]const u8 {
-    var tree_lines = std.ArrayListUnmanaged(u8).init(allocator);
-    defer tree_lines.deinit();
+    var tree_lines = std.ArrayListUnmanaged(u8){};
+    defer tree_lines.deinit(allocator);
 
     // Find root nodes (nodes with no parent)
     var root_indices = std.ArrayList(usize).init(allocator);
@@ -22,11 +22,11 @@ pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.Pro
         try visualizeTreeBranch(allocator, &tree_lines, nodes, root_idx, 0, "", max_depth);
     }
 
-    return tree_lines.toOwnedSlice();
+    return tree_lines.toOwnedSlice(allocator);
 }
 
 /// Recursively builds a tree branch visualization
-fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8, max_depth: ?usize) !void {
+fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, prefix: []const u8, max_depth: ?usize) !void {
     const node = nodes[node_idx];
     const hex_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..2])});
     defer allocator.free(hex_root);
@@ -34,15 +34,15 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     const node_line = try std.fmt.allocPrint(allocator, "{s}{s}({d})", .{ prefix, hex_root, node.slot });
     defer allocator.free(node_line);
 
-    try tree_lines.appendSlice(node_line);
+    try tree_lines.appendSlice(allocator, node_line);
 
     // Check if we've reached the maximum depth
     if (max_depth) |max| {
         if (depth >= max) {
             const truncated_comment = try std.fmt.allocPrint(allocator, " ... (truncated at depth {d})", .{max});
             defer allocator.free(truncated_comment);
-            try tree_lines.appendSlice(truncated_comment);
-            try tree_lines.append('\n');
+            try tree_lines.appendSlice(allocator, truncated_comment);
+            try tree_lines.append(allocator, '\n');
             return;
         }
     }
@@ -61,9 +61,9 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
     if (children.items.len > 0) {
         const child_count_comment = try std.fmt.allocPrint(allocator, " has {d} child branch{s}", .{ children.items.len, if (children.items.len == 1) "" else "es" });
         defer allocator.free(child_count_comment);
-        try tree_lines.appendSlice(child_count_comment);
+        try tree_lines.appendSlice(allocator, child_count_comment);
     }
-    try tree_lines.append('\n');
+    try tree_lines.append(allocator, '\n');
 
     for (children.items, 0..) |child_idx, child_i| {
         const child_node = nodes[child_idx];
@@ -80,9 +80,9 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayList(u8), nod
             else
                 try std.fmt.allocPrint(allocator, "{s}[{d}..{d}] ─┘ ", .{ indent, node.slot + 1, child_node.slot - 1 });
             defer allocator.free(missing_line);
-            try tree_lines.appendSlice(missing_line);
+            try tree_lines.appendSlice(allocator, missing_line);
         } else {
-            try tree_lines.appendSlice(indent);
+            try tree_lines.appendSlice(allocator, indent);
         }
 
         // Recursively process child
