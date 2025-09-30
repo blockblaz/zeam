@@ -29,7 +29,8 @@ export fn main() noreturn {
     logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
-    logger.debug("deserialized input={any}\n", .{prover_input.state});
+    const state_json = prover_input.state.toJson(allocator) catch @panic("could not convert state to JSON");
+    logger.debug("deserialized input={}\n", .{state_json});
 
     // apply the state transition to modify the state
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = stf_runtime_logger }) catch |e| {
