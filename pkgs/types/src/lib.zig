@@ -454,7 +454,9 @@ pub const BeamSTFProof = struct {
     }
 };
 
-pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64,
+pub const GenesisSpec = struct {
+    genesis_time: u64,
+    num_validators: u64,
 
     pub fn toJson(self: *const GenesisSpec, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
