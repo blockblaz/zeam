@@ -214,6 +214,13 @@ pub const SignedBeamBlock = struct {
         // Deinit heap allocated ArrayLists
         self.message.body.attestations.deinit();
     }
+
+    pub fn toJson(self: *const SignedBeamBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("message", try self.message.toJson(allocator));
+        try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
+        return json.Value{ .object = obj };
+    }
 };
 
 // PQ devnet0 config
