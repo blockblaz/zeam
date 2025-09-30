@@ -97,7 +97,17 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     };
 
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message, message_bytes });
+    const message_json = switch (message) {
+        .block => |block| block.toJson(zigHandler.allocator) catch |e| {
+            zigHandler.logger.err("Failed to convert block to JSON: {any}", .{e});
+            return;
+        },
+        .vote => |vote| vote.toJson(zigHandler.allocator) catch |e| {
+            zigHandler.logger.err("Failed to convert vote to JSON: {any}", .{e});
+            return;
+        },
+    };
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_json, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {

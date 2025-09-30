@@ -285,9 +285,10 @@ pub const BeamChain = struct {
             .vote => |signed_vote| {
                 const vote = signed_vote.message;
                 const hasHead = self.forkChoice.hasBlock(vote.head.root);
+                const signed_vote_json = try signed_vote.toJson(self.allocator);
                 self.module_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
                     //
-                    signed_vote,
+                    signed_vote_json,
                     hasHead,
                 });
 
