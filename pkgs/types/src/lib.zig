@@ -32,6 +32,16 @@ pub const BeamBlockHeader = struct {
     parent_root: Bytes32,
     state_root: Bytes32,
     body_root: Bytes32,
+
+    pub fn toJson(self: *const BeamBlockHeader, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
+        return json.Value{ .object = obj };
+    }
 };
 
 // basic payload header for some sort of APS
