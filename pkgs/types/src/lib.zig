@@ -47,6 +47,12 @@ pub const BeamBlockHeader = struct {
 // basic payload header for some sort of APS
 pub const ExecutionPayloadHeader = struct {
     timestamp: u64,
+
+    pub fn toJson(self: *const ExecutionPayloadHeader, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("timestamp", json.Value{ .integer = @as(i64, @intCast(self.timestamp)) });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const Mini3SFCheckpoint = struct {
