@@ -495,6 +495,16 @@ pub const BeamSTFProverInput = struct {
 // some p2p containers
 pub const BlockByRootRequest = struct {
     roots: ssz.utils.List(Root, params.MAX_REQUEST_BLOCKS),
+
+    pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        var roots_array = json.Array.init(allocator);
+        for (self.roots.constSlice()) |root| {
+            try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
+        }
+        try obj.put("roots", json.Value{ .array = roots_array });
+        return json.Value{ .object = obj };
+    }
 };
 
 // TODO: a super hacky cloning utility for ssz container structs
