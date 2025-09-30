@@ -169,11 +169,13 @@ pub const BeamChain = struct {
             },
         };
 
-        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
+        var block_json = try block.toJson(self.allocator);
+        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={}", .{ self.nodeId, opts, block_json });
 
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, &post_state, &block, self.block_building_logger);
-        self.module_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
+        block_json = try block.toJson(self.allocator);
+        self.module_logger.debug("applied raw block opts={any} raw block={}", .{ opts, block_json });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
