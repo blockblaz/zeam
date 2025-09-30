@@ -142,7 +142,9 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
-    logger.debug("prestate justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+    var justified_json = try state.latest_justified.toJson(allocator);
+    var finalized_json = try state.latest_finalized.toJson(allocator);
+    logger.debug("prestate justified={} finalized={}", .{ justified_json, finalized_json });
 
     // work directly with SSZ types
     // historical_block_hashes and justified_slots are already SSZ types in state
@@ -239,7 +241,8 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             state.latest_justified = vote.target;
             try state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
-            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_justified});
+            justified_json = try state.latest_justified.toJson(allocator);
+            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_json});
 
             // source is finalized if target is the next valid justifiable hash
             var can_target_finalize = true;
@@ -252,7 +255,8 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
             if (can_target_finalize == true) {
                 state.latest_finalized = vote.source;
-                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_finalized});
+                finalized_json = try state.latest_finalized.toJson(allocator);
+                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_json});
             }
         }
     }
@@ -260,7 +264,9 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     try state.withJustifications(allocator, &justifications);
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
-    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+    justified_json = try state.latest_justified.toJson(allocator);
+    finalized_json = try state.latest_finalized.toJson(allocator);
+    logger.debug("poststate: justified={} finalized={}", .{ justified_json, finalized_json });
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
