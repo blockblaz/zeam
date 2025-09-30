@@ -445,6 +445,12 @@ pub const ZkVm = enum {
 pub const BeamSTFProof = struct {
     // zk_vm: ZkVm,
     proof: []const u8,
+
+    pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
