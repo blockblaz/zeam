@@ -437,7 +437,8 @@ pub const ZkVm = enum {
     powdr,
     sp1,
 
-    pub fn toJson(self: *const ZkVm) !json.Value {
+    pub fn toJson(self: *const ZkVm, allocator: Allocator) !json.Value {
+        _ = allocator; // allocator is unused, but included for API consistency
         return json.Value{ .string = @tagName(self.*) };
     }
 };
