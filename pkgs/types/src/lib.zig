@@ -72,6 +72,15 @@ pub const Mini3SFVote = struct {
     head: Mini3SFCheckpoint,
     target: Mini3SFCheckpoint,
     source: Mini3SFCheckpoint,
+
+    pub fn toJson(self: *const Mini3SFVote, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("head", try self.head.toJson(allocator));
+        try obj.put("target", try self.target.toJson(allocator));
+        try obj.put("source", try self.source.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
 };
 
 // this will be updated to correct impl in the followup PR to reflect latest spec changes
