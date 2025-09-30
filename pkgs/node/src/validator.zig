@@ -92,7 +92,8 @@ pub const BeamValidator = struct {
                 .message = produced_block.block,
                 .signature = [_]u8{0} ** types.SIGSIZE,
             };
-            self.logger.info("validator produced block slot={d} block={any}", .{ slot, signed_block });
+            const signed_block_json = try signed_block.toJson(self.allocator);
+            self.logger.info("validator produced block slot={d} block={}", .{ slot, signed_block_json });
 
             // Create ValidatorOutput
             var result = ValidatorOutput.init(self.allocator);

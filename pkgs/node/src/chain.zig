@@ -264,9 +264,10 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
+                const signed_block_json = try signed_block.toJson(self.allocator);
                 self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
                     //
-                    signed_block,
+                    signed_block_json,
                     block_root,
                     hasBlock,
                 });
