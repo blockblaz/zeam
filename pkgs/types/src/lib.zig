@@ -90,7 +90,7 @@ pub const BeamBlock = struct {
         self.body.deinit();
     }
 
-    pub fn genGenesisLatestBlock(self: *Self, allocator: Allocator) !void {
+    pub fn genGenesisBlock(self: *Self, allocator: Allocator) !void {
         const attestations = try SignedVotes.init(allocator);
         errdefer attestations.deinit();
 
@@ -237,7 +237,7 @@ pub const BeamState = struct {
 
     pub fn genGenesisState(self: *BeamState, allocator: Allocator, genesis: GenesisSpec) !void {
         var genesis_block: BeamBlock = undefined;
-        try genesis_block.genGenesisLatestBlock(allocator);
+        try genesis_block.genGenesisBlock(allocator);
         errdefer genesis_block.deinit();
 
         var genesis_block_header: BeamBlockHeader = undefined;
