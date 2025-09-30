@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -107,7 +108,14 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             return;
         },
     };
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_json, message_bytes });
+    var message_str = std.ArrayList(u8).init(zigHandler.allocator);
+    defer message_str.deinit();
+    json.stringify(message_json, .{}, message_str.writer()) catch |e| {
+        zigHandler.logger.err("Failed to stringify message JSON: {any}", .{e});
+        return;
+    };
+
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str.items, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {

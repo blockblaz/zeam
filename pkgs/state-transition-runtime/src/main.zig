@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 
 const zkvm = @import("zkvm");
 const ssz = @import("ssz");
@@ -30,7 +31,12 @@ export fn main() noreturn {
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
     const state_json = prover_input.state.toJson(allocator) catch @panic("could not convert state to JSON");
-    logger.debug("deserialized input={}\n", .{state_json});
+
+    var state_str = std.ArrayList(u8).init(allocator);
+    defer state_str.deinit();
+    json.stringify(state_json, .{}, state_str.writer()) catch @panic("could not stringify state JSON");
+
+    logger.debug("deserialized input={s}\n", .{state_str.items});
 
     // apply the state transition to modify the state
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = stf_runtime_logger }) catch |e| {

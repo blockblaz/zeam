@@ -1,5 +1,6 @@
 const ssz = @import("ssz");
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 pub const utils = @import("./utils.zig");
@@ -144,7 +145,16 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
     var justified_json = try state.latest_justified.toJson(allocator);
     var finalized_json = try state.latest_finalized.toJson(allocator);
-    logger.debug("prestate justified={} finalized={}", .{ justified_json, finalized_json });
+
+    var justified_str = std.ArrayList(u8).init(allocator);
+    defer justified_str.deinit();
+    try json.stringify(justified_json, .{}, justified_str.writer());
+
+    var finalized_str = std.ArrayList(u8).init(allocator);
+    defer finalized_str.deinit();
+    try json.stringify(finalized_json, .{}, finalized_str.writer());
+
+    logger.debug("prestate justified={s} finalized={s}", .{ justified_str.items, finalized_str.items });
 
     // work directly with SSZ types
     // historical_block_hashes and justified_slots are already SSZ types in state
@@ -168,7 +178,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
         const vote_json = try vote.toJson(allocator);
-        logger.debug("processing vote={} validator_id={d}\n....\n", .{ vote_json, validator_id });
+
+        var vote_str = std.ArrayList(u8).init(allocator);
+        defer vote_str.deinit();
+        try json.stringify(vote_json, .{}, vote_str.writer());
+
+        logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str.items, validator_id });
 
         if (source_slot >= state.justified_slots.len()) {
             return StateTransitionError.InvalidSlotIndex;
@@ -243,7 +258,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             try state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
             justified_json = try state.latest_justified.toJson(allocator);
-            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_json});
+
+            justified_str = std.ArrayList(u8).init(allocator);
+            defer justified_str.deinit();
+            try json.stringify(justified_json, .{}, justified_str.writer());
+
+            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str.items});
 
             // source is finalized if target is the next valid justifiable hash
             var can_target_finalize = true;
@@ -257,7 +277,13 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             if (can_target_finalize == true) {
                 state.latest_finalized = vote.source;
                 finalized_json = try state.latest_finalized.toJson(allocator);
-                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_json});
+
+                // Convert JSON value to string for proper logging
+                finalized_str = std.ArrayList(u8).init(allocator);
+                defer finalized_str.deinit();
+                try json.stringify(finalized_json, .{}, finalized_str.writer());
+
+                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str.items});
             }
         }
     }
@@ -267,7 +293,17 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
     justified_json = try state.latest_justified.toJson(allocator);
     finalized_json = try state.latest_finalized.toJson(allocator);
-    logger.debug("poststate: justified={} finalized={}", .{ justified_json, finalized_json });
+
+    // Convert JSON values to strings for proper logging
+    justified_str = std.ArrayList(u8).init(allocator);
+    defer justified_str.deinit();
+    try json.stringify(justified_json, .{}, justified_str.writer());
+
+    finalized_str = std.ArrayList(u8).init(allocator);
+    defer finalized_str.deinit();
+    try json.stringify(finalized_json, .{}, finalized_str.writer());
+
+    logger.debug("poststate: justified={s} finalized={s}", .{ justified_str.items, finalized_str.items });
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
