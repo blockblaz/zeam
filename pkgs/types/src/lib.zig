@@ -1,8 +1,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json = std.json;
 
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
+
+// Helper function to convert bytes to hex string
+fn bytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
+}
 
 // just dummy type right now to test imports
 pub const Bytes32 = [32]u8;
