@@ -8,6 +8,7 @@ const types = @import("@zeam/types");
 const xev = @import("xev");
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -108,14 +109,13 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             return;
         },
     };
-    var message_str = std.ArrayList(u8).init(zigHandler.allocator);
-    defer message_str.deinit();
-    json.stringify(message_json, .{}, message_str.writer()) catch |e| {
+    const message_str = jsonToString(zigHandler.allocator, message_json) catch |e| {
         zigHandler.logger.err("Failed to stringify message JSON: {any}", .{e});
         return;
     };
+    defer zigHandler.allocator.free(message_str);
 
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str.items, message_bytes });
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {

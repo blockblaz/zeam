@@ -4,6 +4,7 @@ const ssz = @import("ssz");
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const utils = @import("@zeam/utils");
+const jsonToString = utils.jsonToString;
 
 const Allocator = std.mem.Allocator;
 
@@ -58,11 +59,10 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
 
     const state_json = try prover_input_deserialized.state.toJson(allocator);
-    var state_str = std.ArrayList(u8).init(allocator);
-    defer state_str.deinit();
-    try json.stringify(state_json, .{}, state_str.writer());
+    const state_str = try jsonToString(allocator, state_json);
+    defer allocator.free(state_str);
 
-    opts.logger.debug("should deserialize to={s}", .{state_str.items});
+    opts.logger.debug("should deserialize to={s}", .{state_str});
 
     // allocate a megabyte of data so that we have enough space for the proof.
     // XXX not deallocated yet

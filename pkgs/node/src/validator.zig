@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 const chains = @import("./chain.zig");
 const networkFactory = @import("./network.zig");
@@ -95,11 +96,10 @@ pub const BeamValidator = struct {
             };
 
             const signed_block_json = try signed_block.toJson(self.allocator);
-            var block_str = std.ArrayList(u8).init(self.allocator);
-            defer block_str.deinit();
-            try json.stringify(signed_block_json, .{}, block_str.writer());
+            const block_str = try jsonToString(self.allocator, signed_block_json);
+            defer self.allocator.free(block_str);
 
-            self.logger.info("validator produced block slot={d} block={s}", .{ slot, block_str.items });
+            self.logger.info("validator produced block slot={d} block={s}", .{ slot, block_str });
 
             // Create ValidatorOutput
             var result = ValidatorOutput.init(self.allocator);
