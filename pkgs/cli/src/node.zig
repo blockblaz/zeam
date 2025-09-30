@@ -84,7 +84,7 @@ pub const Node = struct {
         chain_options.num_validators = options.genesis_spec.num_validators;
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-        var anchorState = try sft.genGenesisState(allocator, chain_config.genesis);
+        var anchorState = try types.genGenesisState(allocator, chain_config.genesis);
         errdefer anchorState.deinit();
 
         // TODO we seem to be needing one loop because then the events added to loop are not being fired

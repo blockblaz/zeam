@@ -1,0 +1,255 @@
+const std = @import("std");
+const ssz = @import("ssz");
+
+const params = @import("@zeam/params");
+const zeam_utils = @import("@zeam/utils");
+
+const block = @import("./block.zig");
+const utils = @import("./utils.zig");
+const mini_3sf = @import("./mini_3sf.zig");
+
+const Allocator = std.mem.Allocator;
+const Root = utils.Root;
+const Mini3SFCheckpoint = mini_3sf.Mini3SFCheckpoint;
+const HistoricalBlockHashes = utils.HistoricalBlockHashes;
+const JustifiedSlots = utils.JustifiedSlots;
+const JustificationsRoots = utils.JustificationsRoots;
+const JustificationsValidators = utils.JustificationsValidators;
+const StateTransitionError = utils.StateTransitionError;
+
+// PQ devnet0 config
+pub const BeamStateConfig = struct {
+    num_validators: u64,
+    genesis_time: u64,
+};
+
+pub const BeamState = struct {
+    config: BeamStateConfig,
+    slot: u64,
+    latest_block_header: block.BeamBlockHeader,
+
+    latest_justified: Mini3SFCheckpoint,
+    latest_finalized: Mini3SFCheckpoint,
+
+    historical_block_hashes: HistoricalBlockHashes,
+    justified_slots: JustifiedSlots,
+
+    // a flat representation of the justifications map
+    justifications_roots: JustificationsRoots,
+    justifications_validators: JustificationsValidators,
+
+    pub fn withJustifications(self: *BeamState, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
+        var new_justifications_roots = try JustificationsRoots.init(allocator);
+        errdefer new_justifications_roots.deinit();
+        var new_justifications_validators = try JustificationsValidators.init(allocator);
+        errdefer new_justifications_validators.deinit();
+
+        // First, collect all keys
+        var iterator = justifications.iterator();
+        while (iterator.next()) |kv| {
+            if (kv.value_ptr.*.len != self.config.num_validators) {
+                return error.InvalidJustificationLength;
+            }
+            try new_justifications_roots.append(kv.key_ptr.*);
+        }
+
+        // Sort the roots, confirm this sorting via a test
+        std.mem.sortUnstable(Root, new_justifications_roots.slice(), {}, struct {
+            fn lessThanFn(_: void, a: Root, b: Root) bool {
+                return std.mem.order(u8, &a, &b) == .lt;
+            }
+        }.lessThanFn);
+
+        // Now iterate over sorted roots and flatten validators in order
+        for (new_justifications_roots.constSlice()) |root| {
+            const rootSlice = justifications.get(root) orelse unreachable;
+            // append individual bits for validator justifications
+            // have a batch set method to set it since eventual num vals are div by 8
+            // and hence the vector can be fully appeneded as bytes
+            for (rootSlice) |validator_bit| {
+                try new_justifications_validators.append(validator_bit == 1);
+            }
+        }
+
+        // Lists are now heap allocated ArrayLists using the allocator
+        // Deinit existing lists and reinitialize
+        self.justifications_roots.deinit();
+        self.justifications_validators.deinit();
+        self.justifications_roots = new_justifications_roots;
+        self.justifications_validators = new_justifications_validators;
+    }
+
+    pub fn getJustification(self: *const BeamState, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
+        // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+        const num_validators: usize = @intCast(self.config.num_validators);
+        // Initialize justifications from state
+        for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
+            const validator_data = try allocator.alloc(u8, num_validators);
+            errdefer allocator.free(validator_data);
+            // Copy existing justification data if available, otherwise return error
+            for (validator_data, 0..) |*byte, j| {
+                const bit_index = i * num_validators + j;
+                byte.* = if (try self.justifications_validators.get(bit_index)) 1 else 0;
+            }
+            try justifications.put(allocator, blockRoot, validator_data);
+        }
+    }
+
+    pub fn process_block_header(self: *BeamState, allocator: Allocator, staged_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+        logger.debug("processing beam block header\n", .{});
+
+        // 1. match state and block slot
+        if (self.slot != staged_block.slot) {
+            logger.err("process-block-header: invalid mismatching state-slot={} != block-slot={}", .{ self.slot, staged_block.slot });
+            return StateTransitionError.InvalidPreState;
+        }
+
+        // 2. match state's latest block header and block slot
+        if (self.latest_block_header.slot >= staged_block.slot) {
+            logger.err("process-block-header: invalid future latest_block_header-slot={} >= block-slot={}", .{ self.latest_block_header.slot, staged_block.slot });
+            return StateTransitionError.InvalidLatestBlockHeader;
+        }
+
+        // 3. check proposer is correct
+        const correct_proposer_index = staged_block.slot % self.config.num_validators;
+        if (staged_block.proposer_index != correct_proposer_index) {
+            logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ staged_block.proposer_index, staged_block.slot, correct_proposer_index });
+            return StateTransitionError.InvalidProposer;
+        }
+
+        // 4. verify latest block header is the parent
+        var head_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
+            logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
+            return StateTransitionError.InvalidParentRoot;
+        }
+
+        // update justified and finalized with parent root in state if this is the first block post genesis
+        if (self.latest_block_header.slot == 0) {
+            // fixed  length array structures should just be copied over
+            self.latest_justified.root = staged_block.parent_root;
+            self.latest_finalized.root = staged_block.parent_root;
+        }
+
+        // extend historical block hashes and justified slots structures using SSZ Lists directly
+        try self.historical_block_hashes.append(staged_block.parent_root);
+        // if parent is genesis it is already justified
+        try self.justified_slots.append(if (self.latest_block_header.slot == 0) true else false);
+
+        const block_slot: usize = @intCast(staged_block.slot);
+        const missed_slots: usize = @intCast(block_slot - self.latest_block_header.slot - 1);
+        for (0..missed_slots) |i| {
+            _ = i;
+            try self.historical_block_hashes.append(utils.ZERO_HASH);
+            try self.justified_slots.append(false);
+        }
+        logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
+
+        self.latest_block_header = try block.blockToLatestBlockHeader(allocator, staged_block);
+    }
+
+    pub fn deinit(self: *BeamState) void {
+        // Deinit heap allocated ArrayLists
+        self.historical_block_hashes.deinit();
+        self.justified_slots.deinit();
+        self.justifications_roots.deinit();
+        self.justifications_validators.deinit();
+    }
+};
+
+pub fn genGenesisState(allocator: Allocator, genesis: utils.GenesisSpec) !BeamState {
+    const genesis_latest_block = try block.genGenesisLatestBlock(allocator);
+
+    const state = BeamState{
+        .config = .{
+            .num_validators = genesis.num_validators,
+            .genesis_time = genesis.genesis_time,
+        },
+        .slot = 0,
+        .latest_block_header = try block.blockToLatestBlockHeader(allocator, genesis_latest_block),
+        // mini3sf
+        .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        .historical_block_hashes = try utils.HistoricalBlockHashes.init(allocator),
+        .justified_slots = try utils.JustifiedSlots.init(allocator),
+        // justifications map is empty
+        .justifications_roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator),
+        .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+    };
+
+    return state;
+}
+
+pub fn genStateBlockHeader(allocator: Allocator, state: BeamState) !block.BeamBlockHeader {
+    // check does it need cloning?
+    var beam_block_header = state.latest_block_header;
+    var state_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(
+        BeamState,
+        state,
+        &state_root,
+        allocator,
+    );
+    beam_block_header.state_root = state_root;
+
+    return beam_block_header;
+}
+
+test "ssz seralize/deserialize signed beam state" {
+    const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
+    const genesis_root = [_]u8{9} ** 32;
+
+    var state = BeamState{
+        .config = config,
+        .slot = 99,
+        .latest_block_header = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body_root = [_]u8{3} ** 32,
+        },
+        // mini3sf
+        .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
+        .latest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
+        .historical_block_hashes = try utils.HistoricalBlockHashes.init(std.testing.allocator),
+        .justified_slots = try JustifiedSlots.init(std.testing.allocator),
+        .justifications_roots = blk: {
+            var roots = try ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT).init(std.testing.allocator);
+            try roots.append(genesis_root);
+            break :blk roots;
+        },
+        .justifications_validators = blk: {
+            var validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(std.testing.allocator);
+            try validators.append(true);
+            try validators.append(false);
+            try validators.append(true);
+            break :blk validators;
+        },
+    };
+    defer state.deinit();
+
+    var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
+    defer serialized_state.deinit();
+    try ssz.serialize(BeamState, state, &serialized_state);
+    std.debug.print("\n\n\nserialized_state ({d})", .{serialized_state.items.len});
+
+    // we need to use arena allocator because deserialization allocs without providing for
+    // a way to deinit, this needs to be probably addressed in ssz
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+
+    var deserialized_state: BeamState = undefined;
+    try ssz.deserialize(BeamState, serialized_state.items[0..], &deserialized_state, arena_allocator.allocator());
+    try std.testing.expect(state.justifications_validators.eql(&deserialized_state.justifications_validators));
+
+    // successful merklization
+    var state_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(
+        BeamState,
+        state,
+        &state_root,
+        std.testing.allocator,
+    );
+}
