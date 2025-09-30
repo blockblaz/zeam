@@ -453,7 +453,17 @@ pub const BeamSTFProof = struct {
     }
 };
 
-pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
+pub const GenesisSpec = struct { 
+    genesis_time: u64, 
+    num_validators: u64,
+
+    pub fn toJson(self: *const GenesisSpec, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
+        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
+        return json.Value{ .object = obj };
+    }
+};
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
