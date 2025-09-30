@@ -167,7 +167,8 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         // check if vote is sane
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
-        logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
+        const vote_json = try vote.toJson(allocator);
+        logger.debug("processing vote={} validator_id={d}\n....\n", .{ vote_json, validator_id });
 
         if (source_slot >= state.justified_slots.len()) {
             return StateTransitionError.InvalidSlotIndex;
