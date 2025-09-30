@@ -62,7 +62,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var beam_state: types.BeamState = undefined;
     try beam_state.genGenesisState(allocator, genesis_config);
     defer beam_state.deinit();
-    const genesis_block = try utils.genGenesisBlock(allocator, beam_state);
+    var genesis_block: types.BeamBlock = undefined;
+    try beam_state.genGenesisBlock(allocator, &genesis_block);
 
     const gen_signed_block = types.SignedBeamBlock{
         .message = genesis_block,

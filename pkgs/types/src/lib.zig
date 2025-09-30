@@ -272,6 +272,31 @@ pub const BeamState = struct {
             .justifications_validators = justifications_validators,
         };
     }
+
+    pub fn genGenesisBlock(self: *const BeamState, allocator: Allocator, genesis_block: *BeamBlock) !void {
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamState,
+            self.*,
+            &state_root,
+            allocator,
+        );
+
+        const attestations = try SignedVotes.init(allocator);
+        errdefer attestations.deinit();
+
+        genesis_block.* = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = ZERO_HASH,
+            .state_root = state_root,
+            .body = .{
+                // .execution_payload_header = .{ .timestamp = 0 },
+                // 3sf mini
+                .attestations = attestations,
+            },
+        };
+    }
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
