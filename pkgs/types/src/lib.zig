@@ -58,6 +58,13 @@ pub const ExecutionPayloadHeader = struct {
 pub const Mini3SFCheckpoint = struct {
     root: Root,
     slot: Slot,
+
+    pub fn toJson(self: *const Mini3SFCheckpoint, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("root", json.Value{ .string = try bytesToHex(allocator, &self.root) });
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        return json.Value{ .object = obj };
+    }
 };
 
 pub const Mini3SFVote = struct {
