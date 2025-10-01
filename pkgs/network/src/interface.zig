@@ -154,18 +154,17 @@ pub const GossipMessage = union(GossipTopic) {
         return cloned_data;
     }
 
-    pub fn toJson(self: *const Self, allocator: Allocator) ![]u8 {
-        const message_json = switch (self.*) {
+    pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
+        return switch (self.*) {
             .block => |block| block.toJson(allocator) catch |e| {
-                allocator.err("Failed to convert block to JSON: {any}", .{e});
-                return;
+                std.log.err("Failed to convert block to JSON: {any}", .{e});
+                return e;
             },
             .vote => |vote| vote.toJson(allocator) catch |e| {
-                allocator.err("Failed to convert vote to JSON: {any}", .{e});
-                return;
+                std.log.err("Failed to convert vote to JSON: {any}", .{e});
+                return e;
             },
         };
-        return message_json;
     }
 
     pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
