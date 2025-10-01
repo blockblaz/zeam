@@ -38,11 +38,11 @@ pub const BeamBlock = struct {
 
     const Self = @This();
 
-    pub fn genGenesisBlock(allocator: Allocator) !Self {
+    pub fn genGenesisBlock(self: *Self, allocator: Allocator) !void {
         const attestations = try SignedVotes.init(allocator);
         errdefer attestations.deinit();
 
-        const genesis_block = Self{
+        self.* = .{
             .slot = 0,
             .proposer_index = 0,
             .parent_root = ZERO_HASH,
@@ -53,8 +53,6 @@ pub const BeamBlock = struct {
                 .attestations = attestations,
             },
         };
-
-        return genesis_block;
     }
 
     pub fn blockToHeader(self: *const Self, allocator: Allocator) !BeamBlockHeader {

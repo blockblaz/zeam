@@ -447,10 +447,10 @@ test "process and add mock blocks into a node's chain" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
@@ -520,10 +520,10 @@ test "printSlot output demonstration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Initialize the beam chain

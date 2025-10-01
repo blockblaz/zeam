@@ -532,8 +532,8 @@ test "test_rocksdb_with_default_cn" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
     const column_namespaces = [_]ColumnNamespace{
         .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
@@ -543,7 +543,7 @@ test "test_rocksdb_with_default_cn" {
     const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespaces);
-    var db = try rdb.open(allocator, module_logger, db_path);
+    var db = try rdb.open(allocator, module_logger, data_dir);
     defer db.deinit();
 
     // Put values into the default column family
@@ -572,8 +572,8 @@ test "test_column_families_with_multiple_cns" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
     // Default column family is necessary for the RocksDB API to work
     const column_namespace = [_]ColumnNamespace{
@@ -586,7 +586,7 @@ test "test_column_families_with_multiple_cns" {
     const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
-    var db = try rdb.open(allocator, module_logger, db_path);
+    var db = try rdb.open(allocator, module_logger, data_dir);
     defer db.deinit();
 
     // Put values into the column families
@@ -626,8 +626,8 @@ test "test_count_function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
         .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
@@ -637,7 +637,7 @@ test "test_count_function" {
     const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
-    var db = try rdb.open(allocator, module_logger, db_path);
+    var db = try rdb.open(allocator, module_logger, data_dir);
     defer db.deinit();
 
     // Initially, the column family should have 0 entries
@@ -662,8 +662,8 @@ test "test_batch_write_function" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
         .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
@@ -673,7 +673,7 @@ test "test_batch_write_function" {
     const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
-    var db = try rdb.open(allocator, module_logger, db_path);
+    var db = try rdb.open(allocator, module_logger, data_dir);
     defer db.deinit();
 
     var batch = db.initWriteBatch();
@@ -720,8 +720,8 @@ test "test_iterator_functionality" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
         .{ .namespace = "default", .Key = []const u8, .Value = []const u8 },
@@ -731,7 +731,7 @@ test "test_iterator_functionality" {
     const module_logger = zeam_logger_config.logger(.database_test);
 
     const rdb = RocksDB(&column_namespace);
-    var db = try rdb.open(allocator, module_logger, db_path);
+    var db = try rdb.open(allocator, module_logger, data_dir);
     defer db.deinit();
 
     // Add multiple entries to test iteration
@@ -818,10 +818,10 @@ test "save and load block" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions
@@ -864,10 +864,10 @@ test "save and load state" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions
@@ -909,10 +909,10 @@ test "batch write and commit" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Create test data using helper functions

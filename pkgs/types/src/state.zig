@@ -152,8 +152,9 @@ pub const BeamState = struct {
         self.latest_block_header = try staged_block.blockToHeader(allocator);
     }
 
-    pub fn genGenesisState(allocator: Allocator, genesis: utils.GenesisSpec) !Self {
-        var genesis_block = try block.BeamBlock.genGenesisBlock(allocator);
+    pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
+        var genesis_block: block.BeamBlock = undefined;
+        try genesis_block.genGenesisBlock(allocator);
         defer genesis_block.deinit();
 
         var latest_block_header = try genesis_block.blockToHeader(allocator);
@@ -171,7 +172,7 @@ pub const BeamState = struct {
         var justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator);
         errdefer justifications_validators.deinit();
 
-        const state = Self{
+        self.* = .{
             .config = .{
                 .num_validators = genesis.num_validators,
                 .genesis_time = genesis.genesis_time,
@@ -187,14 +188,12 @@ pub const BeamState = struct {
             .justifications_roots = justifications_roots,
             .justifications_validators = justifications_validators,
         };
-
-        return state;
     }
 
-    pub fn genGenesisBlock(self: *const Self, allocator: Allocator) !block.BeamBlock {
+    pub fn genGenesisBlock(self: *const Self, allocator: Allocator, genesis_block: *block.BeamBlock) !void {
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
-            Self,
+            BeamState,
             self.*,
             &state_root,
             allocator,
@@ -203,19 +202,17 @@ pub const BeamState = struct {
         const attestations = try mini_3sf.SignedVotes.init(allocator);
         errdefer attestations.deinit();
 
-        const genesis_latest_block = block.BeamBlock{
+        genesis_block.* = .{
             .slot = 0,
             .proposer_index = 0,
             .parent_root = utils.ZERO_HASH,
             .state_root = state_root,
-            .body = block.BeamBlockBody{
+            .body = .{
                 // .execution_payload_header = .{ .timestamp = 0 },
                 // 3sf mini
                 .attestations = attestations,
             },
         };
-
-        return genesis_latest_block;
     }
 
     pub fn genStateBlockHeader(self: *const Self, allocator: Allocator) !block.BeamBlockHeader {
