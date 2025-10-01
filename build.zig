@@ -107,6 +107,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_types.addImport("ssz", ssz);
     zeam_types.addImport("@zeam/params", zeam_params);
+    zeam_types.addImport("@zeam/utils", zeam_utils);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -128,6 +129,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_api.addImport("metrics", metrics);
     zeam_api.addImport("@zeam/types", zeam_types);
+    zeam_api.addImport("@zeam/utils", zeam_utils);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -476,6 +478,13 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .root_source_file = b.path("pkgs/params/src/lib.zig"),
         });
 
+        // add zeam-utils
+        const zeam_utils = b.addModule("@zeam/utils", .{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/utils/src/lib.zig"),
+        });
+
         // add zeam-types
         const zeam_types = b.addModule("@zeam/types", .{
             .target = target,
@@ -484,13 +493,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         });
         zeam_types.addImport("ssz", ssz);
         zeam_types.addImport("@zeam/params", zeam_params);
-
-        // add zeam-params
-        const zeam_utils = b.addModule("@zeam/utils", .{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("pkgs/utils/src/lib.zig"),
-        });
+        zeam_types.addImport("@zeam/utils", zeam_utils);
 
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
