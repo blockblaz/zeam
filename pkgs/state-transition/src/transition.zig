@@ -144,12 +144,9 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
-    var justified_json = try state.latest_justified.toJson(allocator);
-    var finalized_json = try state.latest_finalized.toJson(allocator);
-
-    const justified_str = try jsonToString(allocator, justified_json);
+    const justified_str = try state.latest_justified.toJsonString(allocator);
     defer allocator.free(justified_str);
-    const finalized_str = try jsonToString(allocator, finalized_json);
+    const finalized_str = try state.latest_finalized.toJsonString(allocator);
     defer allocator.free(finalized_str);
 
     logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
@@ -175,9 +172,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         // check if vote is sane
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
-        const vote_json = try vote.toJson(allocator);
-
-        const vote_str = try jsonToString(allocator, vote_json);
+        const vote_str = try vote.toJsonString(allocator);
         defer allocator.free(vote_str);
 
         logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str, validator_id });
@@ -254,9 +249,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             state.latest_justified = vote.target;
             try state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
-            justified_json = try state.latest_justified.toJson(allocator);
-
-            const justified_str_new = try jsonToString(allocator, justified_json);
+            const justified_str_new = try state.latest_justified.toJsonString(allocator);
             defer allocator.free(justified_str_new);
 
             logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
@@ -272,10 +265,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
             if (can_target_finalize == true) {
                 state.latest_finalized = vote.source;
-                finalized_json = try state.latest_finalized.toJson(allocator);
-
-                // Convert JSON value to string for proper logging
-                const finalized_str_new = try jsonToString(allocator, finalized_json);
+                const finalized_str_new = try state.latest_finalized.toJsonString(allocator);
                 defer allocator.free(finalized_str_new);
 
                 logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
@@ -286,13 +276,9 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     try state.withJustifications(allocator, &justifications);
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
-    justified_json = try state.latest_justified.toJson(allocator);
-    finalized_json = try state.latest_finalized.toJson(allocator);
-
-    // Convert JSON values to strings for proper logging
-    const justified_str_final = try jsonToString(allocator, justified_json);
+    const justified_str_final = try state.latest_justified.toJsonString(allocator);
     defer allocator.free(justified_str_final);
-    const finalized_str_final = try jsonToString(allocator, finalized_json);
+    const finalized_str_final = try state.latest_finalized.toJsonString(allocator);
     defer allocator.free(finalized_str_final);
 
     logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });

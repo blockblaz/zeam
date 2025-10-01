@@ -31,9 +31,7 @@ export fn main() noreturn {
     logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
-    const state_json = prover_input.state.toJson(allocator) catch @panic("could not convert state to JSON");
-
-    const state_str = jsonToString(allocator, state_json) catch @panic("could not stringify state JSON");
+    const state_str = prover_input.state.toJsonString(allocator) catch @panic("could not convert state to JSON string");
     defer allocator.free(state_str);
 
     logger.debug("deserialized input={s}\n", .{state_str});

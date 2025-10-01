@@ -58,8 +58,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
 
-    const state_json = try prover_input_deserialized.state.toJson(allocator);
-    const state_str = try jsonToString(allocator, state_json);
+    const state_str = try prover_input_deserialized.state.toJsonString(allocator);
     defer allocator.free(state_str);
 
     opts.logger.debug("should deserialize to={s}", .{state_str});

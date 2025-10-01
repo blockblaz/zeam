@@ -152,16 +152,19 @@ pub fn serializeEventToJson(allocator: std.mem.Allocator, event: ChainEvent) ![]
     // Serialize the data based on event type
     switch (event) {
         .new_head => |head_event| {
-            const data_value = try head_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try head_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
         .new_justification => |just_event| {
-            const data_value = try just_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try just_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
         .new_finalization => |final_event| {
-            const data_value = try final_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try final_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
     }
 
