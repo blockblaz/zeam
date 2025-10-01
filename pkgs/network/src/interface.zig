@@ -152,6 +152,20 @@ pub const GossipMessage = union(GossipTopic) {
 
         return cloned_data;
     }
+
+    pub fn toJson(self: *const Self, allocator: Allocator) ![]u8 {
+        const message_json = switch (self.*) {
+            .block => |block| block.toJson(allocator) catch |e| {
+                allocator.err("Failed to convert block to JSON: {any}", .{e});
+                return;
+            },
+            .vote => |vote| vote.toJson(allocator) catch |e| {
+                allocator.err("Failed to convert vote to JSON: {any}", .{e});
+                return;
+            },
+        };
+        return message_json;
+    }
 };
 
 pub const ReqRespMethod = enum {

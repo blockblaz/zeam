@@ -99,17 +99,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     };
 
-    const message_json = switch (message) {
-        .block => |block| block.toJson(zigHandler.allocator) catch |e| {
-            zigHandler.logger.err("Failed to convert block to JSON: {any}", .{e});
-            return;
-        },
-        .vote => |vote| vote.toJson(zigHandler.allocator) catch |e| {
-            zigHandler.logger.err("Failed to convert vote to JSON: {any}", .{e});
-            return;
-        },
-    };
-    const message_str = jsonToString(zigHandler.allocator, message_json) catch |e| {
+    const message_str = jsonToString(zigHandler.allocator, message.toJson(zigHandler.allocator)) catch |e| {
         zigHandler.logger.err("Failed to stringify message JSON: {any}", .{e});
         return;
     };
