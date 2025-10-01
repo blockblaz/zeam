@@ -70,7 +70,11 @@ pub const BeamChain = struct {
         opts: ChainOpts,
     ) !Self {
         const logger_config = opts.logger_config;
-        const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, logger_config.logger(.forkchoice));
+        const fork_choice = try fcFactory.ForkChoice.init(allocator, .{
+            .config = opts.config,
+            .anchorState = opts.anchorState.*,
+            .logger = logger_config.logger(.forkchoice),
+        });
 
         var states = std.AutoHashMap(types.Root, types.BeamState).init(allocator);
         try states.put(fork_choice.head.blockRoot, opts.anchorState.*);
