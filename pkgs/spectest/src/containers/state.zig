@@ -528,7 +528,8 @@ test "test_state_transition_full" {
         .genesis_time = 0,
         .num_validators = params.VALIDATOR_REGISTRY_LIMIT,
     };
-    var state = try state_transition.genGenesisState(allocator, genesis_spec);
+    var state: types.BeamState = undefined;
+    try state.genGenesisState(allocator, genesis_spec);
     defer state.deinit();
 
     // Move to slot 1 so we can propose a block - use slot processing like Python
