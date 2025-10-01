@@ -228,7 +228,7 @@ pub const ForkChoice = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: zeam_utils.ModuleLogger) !Self {
-        const anchor_block_header = try types.genStateBlockHeader(allocator, anchorState);
+        const anchor_block_header = try anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
             types.BeamBlockHeader,

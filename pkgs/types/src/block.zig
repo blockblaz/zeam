@@ -35,6 +35,50 @@ pub const BeamBlock = struct {
     parent_root: Bytes32,
     state_root: Bytes32,
     body: BeamBlockBody,
+
+    const Self = @This();
+
+    pub fn genGenesisBlock(allocator: Allocator) !Self {
+        const attestations = try SignedVotes.init(allocator);
+        errdefer attestations.deinit();
+
+        const genesis_block = Self{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = ZERO_HASH,
+            .state_root = ZERO_HASH,
+            .body = BeamBlockBody{
+                // .execution_payload_header = .{ .timestamp = 0 },
+                // 3sf mini votes
+                .attestations = attestations,
+            },
+        };
+
+        return genesis_block;
+    }
+
+    pub fn blockToHeader(self: *const Self, allocator: Allocator) !BeamBlockHeader {
+        var body_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamBlockBody,
+            self.body,
+            &body_root,
+            allocator,
+        );
+
+        const header = BeamBlockHeader{
+            .slot = self.slot,
+            .proposer_index = self.proposer_index,
+            .parent_root = self.parent_root,
+            .state_root = utils.ZERO_HASH,
+            .body_root = body_root,
+        };
+        return header;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.body.deinit();
+    }
 };
 
 pub const BeamBlockHeader = struct {
@@ -51,6 +95,10 @@ pub const BeamBlockBody = struct {
 
     // mini 3sf simplified votes
     attestations: SignedVotes,
+
+    pub fn deinit(self: *BeamBlockBody) void {
+        self.attestations.deinit();
+    }
 };
 
 pub const SignedBeamBlock = struct {
@@ -62,85 +110,6 @@ pub const SignedBeamBlock = struct {
         self.message.body.attestations.deinit();
     }
 };
-
-// computing latest block header to be assigned to the state for processing the block
-pub fn blockToLatestBlockHeader(allocator: Allocator, test_block: BeamBlock) !BeamBlockHeader {
-    var body_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(
-        BeamBlockBody,
-        test_block.body,
-        &body_root,
-        allocator,
-    );
-
-    const header = BeamBlockHeader{
-        .slot = test_block.slot,
-        .proposer_index = test_block.proposer_index,
-        .parent_root = test_block.parent_root,
-        .state_root = utils.ZERO_HASH,
-        .body_root = body_root,
-    };
-    return header;
-}
-
-pub fn genGenesisLatestBlock(allocator: Allocator) !BeamBlock {
-    const genesis_latest_block = BeamBlock{
-        .slot = 0,
-        .proposer_index = 0,
-        .parent_root = ZERO_HASH,
-        .state_root = ZERO_HASH,
-        .body = BeamBlockBody{
-            // .execution_payload_header = .{ .timestamp = 0 },
-            // 3sf mini votes
-            .attestations = try SignedVotes.init(allocator),
-        },
-    };
-
-    return genesis_latest_block;
-}
-
-pub fn blockToHeader(allocator: Allocator, beam_block: BeamBlock) !BeamBlockHeader {
-    var body_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(
-        BeamBlockBody,
-        beam_block.body,
-        &body_root,
-        allocator,
-    );
-
-    const header = BeamBlockHeader{
-        .slot = beam_block.slot,
-        .proposer_index = beam_block.proposer_index,
-        .parent_root = beam_block.parent_root,
-        .state_root = beam_block.state_root,
-        .body_root = body_root,
-    };
-    return header;
-}
-
-pub fn genGenesisBlock(allocator: Allocator, genesis_state: state.BeamState) !BeamBlock {
-    var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(
-        state.BeamState,
-        genesis_state,
-        &state_root,
-        allocator,
-    );
-
-    const genesis_latest_block = BeamBlock{
-        .slot = 0,
-        .proposer_index = 0,
-        .parent_root = ZERO_HASH,
-        .state_root = state_root,
-        .body = BeamBlockBody{
-            // .execution_payload_header = .{ .timestamp = 0 },
-            // 3sf mini
-            .attestations = try mini_3sf.SignedVotes.init(allocator),
-        },
-    };
-
-    return genesis_latest_block;
-}
 
 test "ssz seralize/deserialize signed beam block" {
     var signed_block = SignedBeamBlock{

@@ -28,7 +28,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         .num_validators = 4,
     };
 
-    const genesis_state = try types.genGenesisState(allocator, genesis_config);
+    const genesis_state = try types.BeamState.genGenesisState(allocator, genesis_config);
     var blockList = std.ArrayList(types.SignedBeamBlock).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
 
@@ -41,8 +41,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var headList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
 
     // figure out a way to clone genesis_state
-    var beam_state = try types.genGenesisState(allocator, genesis_config);
-    const genesis_block = try types.genGenesisBlock(allocator, beam_state);
+    var beam_state = try types.BeamState.genGenesisState(allocator, genesis_config);
+    const genesis_block = try beam_state.genGenesisBlock(allocator);
 
     const gen_signed_block = types.SignedBeamBlock{
         .message = genesis_block,

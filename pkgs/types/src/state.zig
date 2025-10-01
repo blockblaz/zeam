@@ -38,9 +38,12 @@ pub const BeamState = struct {
     justifications_roots: JustificationsRoots,
     justifications_validators: JustificationsValidators,
 
-    pub fn withJustifications(self: *BeamState, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
+    const Self = @This();
+
+    pub fn withJustifications(self: *Self, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
         var new_justifications_roots = try JustificationsRoots.init(allocator);
         errdefer new_justifications_roots.deinit();
+
         var new_justifications_validators = try JustificationsValidators.init(allocator);
         errdefer new_justifications_validators.deinit();
 
@@ -79,7 +82,7 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
-    pub fn getJustification(self: *const BeamState, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
+    pub fn getJustification(self: *const Self, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.config.num_validators);
         // Initialize justifications from state
@@ -95,7 +98,7 @@ pub const BeamState = struct {
         }
     }
 
-    pub fn process_block_header(self: *BeamState, allocator: Allocator, staged_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    pub fn process_block_header(self: *Self, allocator: Allocator, staged_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
         logger.debug("processing beam block header\n", .{});
 
         // 1. match state and block slot
@@ -146,10 +149,91 @@ pub const BeamState = struct {
         }
         logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
 
-        self.latest_block_header = try block.blockToLatestBlockHeader(allocator, staged_block);
+        self.latest_block_header = try staged_block.blockToHeader(allocator);
     }
 
-    pub fn deinit(self: *BeamState) void {
+    pub fn genGenesisState(allocator: Allocator, genesis: utils.GenesisSpec) !Self {
+        var genesis_block = try block.BeamBlock.genGenesisBlock(allocator);
+        defer genesis_block.deinit();
+
+        var latest_block_header = try genesis_block.blockToHeader(allocator);
+        errdefer latest_block_header.deinit();
+
+        var historical_block_hashes = try utils.HistoricalBlockHashes.init(allocator);
+        errdefer historical_block_hashes.deinit();
+
+        var justified_slots = try utils.JustifiedSlots.init(allocator);
+        errdefer justified_slots.deinit();
+
+        var justifications_roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator);
+        errdefer justifications_roots.deinit();
+
+        var justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator);
+        errdefer justifications_validators.deinit();
+
+        const state = Self{
+            .config = .{
+                .num_validators = genesis.num_validators,
+                .genesis_time = genesis.genesis_time,
+            },
+            .slot = 0,
+            .latest_block_header = latest_block_header,
+            // mini3sf
+            .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .historical_block_hashes = historical_block_hashes,
+            .justified_slots = justified_slots,
+            // justifications map is empty
+            .justifications_roots = justifications_roots,
+            .justifications_validators = justifications_validators,
+        };
+
+        return state;
+    }
+
+    pub fn genGenesisBlock(self: *const Self, allocator: Allocator) !block.BeamBlock {
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            Self,
+            self.*,
+            &state_root,
+            allocator,
+        );
+
+        const attestations = try mini_3sf.SignedVotes.init(allocator);
+        errdefer attestations.deinit();
+
+        const genesis_latest_block = block.BeamBlock{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = utils.ZERO_HASH,
+            .state_root = state_root,
+            .body = block.BeamBlockBody{
+                // .execution_payload_header = .{ .timestamp = 0 },
+                // 3sf mini
+                .attestations = attestations,
+            },
+        };
+
+        return genesis_latest_block;
+    }
+
+    pub fn genStateBlockHeader(self: *const Self, allocator: Allocator) !block.BeamBlockHeader {
+        // check does it need cloning?
+        var beam_block_header = self.latest_block_header;
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamState,
+            self.*,
+            &state_root,
+            allocator,
+        );
+        beam_block_header.state_root = state_root;
+
+        return beam_block_header;
+    }
+
+    pub fn deinit(self: *Self) void {
         // Deinit heap allocated ArrayLists
         self.historical_block_hashes.deinit();
         self.justified_slots.deinit();
@@ -157,44 +241,6 @@ pub const BeamState = struct {
         self.justifications_validators.deinit();
     }
 };
-
-pub fn genGenesisState(allocator: Allocator, genesis: utils.GenesisSpec) !BeamState {
-    const genesis_latest_block = try block.genGenesisLatestBlock(allocator);
-
-    const state = BeamState{
-        .config = .{
-            .num_validators = genesis.num_validators,
-            .genesis_time = genesis.genesis_time,
-        },
-        .slot = 0,
-        .latest_block_header = try block.blockToLatestBlockHeader(allocator, genesis_latest_block),
-        // mini3sf
-        .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        .historical_block_hashes = try utils.HistoricalBlockHashes.init(allocator),
-        .justified_slots = try utils.JustifiedSlots.init(allocator),
-        // justifications map is empty
-        .justifications_roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(allocator),
-        .justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
-    };
-
-    return state;
-}
-
-pub fn genStateBlockHeader(allocator: Allocator, state: BeamState) !block.BeamBlockHeader {
-    // check does it need cloning?
-    var beam_block_header = state.latest_block_header;
-    var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(
-        BeamState,
-        state,
-        &state_root,
-        allocator,
-    );
-    beam_block_header.state_root = state_root;
-
-    return beam_block_header;
-}
 
 test "ssz seralize/deserialize signed beam state" {
     const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
