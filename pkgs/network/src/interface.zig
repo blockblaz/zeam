@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json = std.json;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
@@ -165,6 +166,11 @@ pub const GossipMessage = union(GossipTopic) {
             },
         };
         return message_json;
+    }
+
+    pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
+        const message_json = try self.toJson(allocator);
+        return zeam_utils.jsonToString(allocator, message_json);
     }
 };
 

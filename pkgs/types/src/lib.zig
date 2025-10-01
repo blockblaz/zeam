@@ -4,6 +4,7 @@ const json = std.json;
 
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
+const utils = @import("@zeam/utils");
 
 // Helper function to convert bytes to hex string
 fn bytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
@@ -42,6 +43,11 @@ pub const BeamBlockHeader = struct {
         try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const BeamBlockHeader, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 // basic payload header for some sort of APS
@@ -52,6 +58,11 @@ pub const ExecutionPayloadHeader = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("timestamp", json.Value{ .integer = @as(i64, @intCast(self.timestamp)) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ExecutionPayloadHeader, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -64,6 +75,11 @@ pub const Mini3SFCheckpoint = struct {
         try obj.put("root", json.Value{ .string = try bytesToHex(allocator, &self.root) });
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const Mini3SFCheckpoint, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -81,6 +97,11 @@ pub const Mini3SFVote = struct {
         try obj.put("source", try self.source.toJson(allocator));
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const Mini3SFVote, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 // this will be updated to correct impl in the followup PR to reflect latest spec changes
@@ -96,6 +117,11 @@ pub const SignedVote = struct {
         try obj.put("message", try self.message.toJson(allocator));
         try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const SignedVote, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 pub const Mini3SFVotes = ssz.utils.List(Mini3SFVote, params.VALIDATOR_REGISTRY_LIMIT);
@@ -117,6 +143,11 @@ pub const ProtoBlock = struct {
         try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
         try obj.put("timeliness", json.Value{ .bool = self.timeliness });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ProtoBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -143,6 +174,11 @@ pub const BeamBlockBody = struct {
         try obj.put("attestations", json.Value{ .array = attestations_array });
 
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamBlockBody, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -204,6 +240,11 @@ pub const BeamBlock = struct {
         try obj.put("body", try self.body.toJson(allocator));
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const BeamBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const SignedBeamBlock = struct {
@@ -221,6 +262,11 @@ pub const SignedBeamBlock = struct {
         try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const SignedBeamBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 // PQ devnet0 config
@@ -233,6 +279,11 @@ pub const BeamStateConfig = struct {
         try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
         try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamStateConfig, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -429,6 +480,11 @@ pub const BeamState = struct {
 
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
@@ -441,6 +497,11 @@ pub const ZkVm = enum {
         _ = allocator; // allocator is unused, but included for API consistency
         return json.Value{ .string = @tagName(self.*) };
     }
+
+    pub fn toJsonString(self: *const ZkVm, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamSTFProof = struct {
@@ -451,6 +512,11 @@ pub const BeamSTFProof = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamSTFProof, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -463,6 +529,11 @@ pub const GenesisSpec = struct {
         try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
         try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const GenesisSpec, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 pub const ChainSpec = struct {
@@ -479,6 +550,11 @@ pub const ChainSpec = struct {
         try obj.put("name", json.Value{ .string = self.name });
         return json.Value{ .object = obj };
     }
+
+    pub fn toJsonString(self: *const ChainSpec, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamSTFProverInput = struct {
@@ -490,6 +566,11 @@ pub const BeamSTFProverInput = struct {
         try obj.put("block", try self.block.toJson(allocator));
         try obj.put("state", try self.state.toJson(allocator));
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamSTFProverInput, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
@@ -505,6 +586,11 @@ pub const BlockByRootRequest = struct {
         }
         try obj.put("roots", json.Value{ .array = roots_array });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 
