@@ -4,6 +4,8 @@ const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
+const state_transition = @import("@zeam/state-transition");
+const utils = @import("@zeam/utils");
 
 fn sampleConfig() types.BeamStateConfig {
     return .{
@@ -479,4 +481,40 @@ test "test_generate_genesis" {
     try std.testing.expectEqual(@as(usize, 0), state.justified_slots.len());
     try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
     try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}
+
+// STATE_TRANSITION_FULL //
+
+const TEST_SLOT: types.Slot = 1;
+const PROPOSER_MODULUS: u64 = 10; // Round-robin proposer selection modulus
+
+fn createBlock(slot: types.Slot, parent_header: types.BeamBlockHeader, votes: ?[]const types.SignedVote) types.SignedBeamBlock {
+    // Create a block body with the provided votes or an empty list
+    var attestations = types.SignedVotes.init(std.testing.allocator) catch @panic("Failed to init attestations");
+    if (votes) |vote_list| {
+        for (vote_list) |vote| {
+            attestations.append(vote) catch @panic("Failed to append vote");
+        }
+    }
+
+    // Compute parent root hash
+    var parent_root: [32]u8 = undefined;
+    ssz.hashTreeRoot(types.BeamBlockHeader, parent_header, &parent_root, std.testing.allocator) catch @panic("Failed to hash parent header");
+
+    // Construct the inner block message with correct parent_root linkage
+    const block_message = types.BeamBlock{
+        .slot = slot,
+        .proposer_index = @intCast(slot % PROPOSER_MODULUS), // Round-robin proposer selection
+        .parent_root = parent_root,
+        .state_root = [_]u8{0} ** 32, // Placeholder, to be filled in by STF
+        .body = .{
+            .attestations = attestations,
+        },
+    };
+
+    // Wrap the block in a SignedBlock with a zero signature for Devnet0
+    return .{
+        .message = block_message,
+        .signature = [_]u8{0} ** types.SIGSIZE, // Zero signature for Devnet0
+    };
 }
