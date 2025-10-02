@@ -1,0 +1,3 @@
+[submodule "lean-quickstart"]
+	path = lean-quickstart
+	url = git@github.com:blockblaz/lean-quickstart.git

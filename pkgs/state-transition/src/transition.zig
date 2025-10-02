@@ -124,7 +124,7 @@ fn process_block_header(allocator: Allocator, state: *types.BeamState, block: ty
     }
     logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, state.justified_slots.len(), state.historical_block_hashes.len() });
 
-    state.latest_block_header = try utils.blockToLatestBlockHeader(allocator, block);
+    try block.blockToLatestBlockHeader(allocator, &state.latest_block_header);
 }
 
 // not active in PQ devnet0 - zig will automatically prune this from code

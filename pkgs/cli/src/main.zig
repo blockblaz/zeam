@@ -36,12 +36,20 @@ const enr_lib = @import("enr");
 pub const NodeCommand = struct {
     help: bool = false,
     custom_genesis: []const u8,
-    node_id: u32 = 0,
+    // internal libp2p network id, only matters when two or more nodes are run in same process
+    network_id: u32 = 0,
+    // the node key in validators.yaml
+    node_key: []const u8,
+    // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
+    //   the configuration is to be picked from genesis
+    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
+    //   and one must use all the nodes in genesis nodes.yaml as peers
+    validator_config: []const u8,
     metrics_enable: bool = false,
     metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
     network_dir: []const u8 = "./network",
-    db_path: []const u8 = constants.DEFAULT_DB_PATH,
+    data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -49,12 +57,13 @@ pub const NodeCommand = struct {
 
     pub const __messages__ = .{
         .custom_genesis = "Custom genesis directory path",
-        .node_id = "Node id for this lean node",
+        .network_id = "Internal libp2p network id relevant when running nodes in same process",
+        .node_key = "The node key in the genesis config for this lean node",
         .metrics_port = "Port to use for publishing metrics",
         .metrics_enable = "Enable metrics endpoint",
         .network_dir = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
-        .db_path = "Path to the database directory",
+        .data_dir = "Path to the data directory",
         .help = "Show help information for the node command",
     };
 };
@@ -80,7 +89,7 @@ const ZeamArgs = struct {
             help: bool = false,
             mockNetwork: bool = false,
             metricsPort: u16 = constants.DEFAULT_METRICS_PORT,
-            db_path: []const u8 = constants.DEFAULT_DB_PATH,
+            data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -235,7 +244,9 @@ pub fn main() !void {
             chain_options.num_validators = num_validators;
             // transfer ownership of the chain_options to ChainConfig
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-            var anchorState = try sft_factory.genGenesisState(gpa.allocator(), chain_config.genesis);
+            var anchorState: types.BeamState = undefined;
+            try anchorState.genGenesisState(gpa.allocator(), chain_config.genesis);
+            defer anchorState.deinit();
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
             // in the order to which they have been added even with the an appropriate delay added
@@ -314,14 +325,14 @@ pub fn main() !void {
             var validator_ids_1 = [_]usize{1};
             var validator_ids_2 = [_]usize{2};
 
-            const db_path_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.db_path});
-            defer allocator.free(db_path_1);
-            const db_path_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.db_path});
-            defer allocator.free(db_path_2);
+            const data_dir_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.data_dir});
+            defer allocator.free(data_dir_1);
+            const data_dir_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.data_dir});
+            defer allocator.free(data_dir_2);
 
-            var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), db_path_1);
+            var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), data_dir_1);
             defer db_1.deinit();
-            var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), db_path_2);
+            var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
             var beam_node_1 = try BeamNode.init(allocator, .{
@@ -364,7 +375,10 @@ pub fn main() !void {
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
 
             var start_options: node.NodeOptions = .{
-                .node_id = leancmd.node_id,
+                .network_id = leancmd.network_id,
+                .node_key = leancmd.node_key,
+                .validator_config = leancmd.validator_config,
+                .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
                 .bootnodes = undefined,
@@ -372,7 +386,7 @@ pub fn main() !void {
                 .validator_indices = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
-                .database_path = leancmd.db_path,
+                .database_path = leancmd.data_dir,
             };
 
             defer start_options.deinit(allocator);

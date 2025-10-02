@@ -84,6 +84,12 @@ at the root of the repository.
 > zig build -Doptimize=ReleaseFast install run -- prove
 ```
 
+### Local Lean Devnet
+
+To run a local devnet with multiple nodes for testing and development, see the [Local Devnet Setup Guide](./pkgs/cli/test/fixtures/README.md) which provides detailed instructions for running a 2-node setup with finalization.
+
+or checkout the [lean-quickstart](https://github.com/blockblaz/lean-quickstart) submodule (`git submodule update --init lean-quickstart`) use the handy command line tool to spin up two nodes for local interop.
+
 ### Reporting Issues
 
 Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH).

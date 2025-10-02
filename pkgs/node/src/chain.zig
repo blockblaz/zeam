@@ -47,7 +47,7 @@ pub const ProducedBlock = struct {
 
 pub const BeamChain = struct {
     config: configs.ChainConfig,
-    anchor_state: *types.BeamState,
+    anchor_state: types.BeamState,
 
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
@@ -85,7 +85,7 @@ pub const BeamChain = struct {
             .forkChoice = fork_choice,
             .allocator = allocator,
             .states = states,
-            .anchor_state = opts.anchorState,
+            .anchor_state = opts.anchorState.*,
             .zeam_logger_config = logger_config,
             .module_logger = logger_config.logger(.chain),
             .stf_logger = logger_config.logger(.state_transition),
@@ -99,7 +99,7 @@ pub const BeamChain = struct {
     pub fn deinit(self: *Self) void {
         var it = self.states.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.allocator);
+            entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
@@ -141,7 +141,8 @@ pub const BeamChain = struct {
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
-            self.printSlot(slot);
+            const islot: isize = @intCast(slot);
+            self.printSlot(islot);
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
@@ -210,29 +211,31 @@ pub const BeamChain = struct {
         return vote;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) void {
+    pub fn printSlot(self: *Self, islot: isize) void {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
-        const fc_head = self.forkChoice.updateHead() catch |err| {
-            self.module_logger.err("forkchoice updatehead error={any}", .{err});
-            return;
-        };
+        const fc_head = if (islot > 0)
+            self.forkChoice.updateHead() catch |err| {
+                self.module_logger.err("forkchoice updatehead error={any}", .{err});
+                return;
+            }
+        else
+            self.forkChoice.head;
 
         // Get additional chain information
         const justified = self.forkChoice.fcStore.latest_justified;
         const finalized = self.forkChoice.fcStore.latest_finalized;
 
         // Calculate chain progress
+        const slot: usize = if (islot < 0) 0 else @intCast(islot);
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
         self.module_logger.info(
             \\
             \\+===============================================================+
-            \\                         CHAIN STATUS                            
-            \\+===============================================================+
-            \\  Current Slot: {d} | Head Slot: {d} | Behind: {d}
+            \\  CHAIN STATUS: Current Slot: {d} | Head Slot: {d} | Behind: {d}
             \\+---------------------------------------------------------------+
             \\  Head Block Root:    0x{any}
             \\  Parent Block Root:  0x{any}
@@ -244,7 +247,7 @@ pub const BeamChain = struct {
             \\+===============================================================+
             \\
         , .{
-            slot,
+            islot,
             fc_head.slot,
             blocks_behind,
             std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
@@ -454,13 +457,14 @@ test "process and add mock blocks into a node's chain" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
+    defer beam_chain.deinit();
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
@@ -527,10 +531,10 @@ test "printSlot output demonstration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const db_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(db_path);
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
     // Initialize the beam chain

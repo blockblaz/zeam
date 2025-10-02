@@ -16,6 +16,7 @@ pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validators = @import("./validator.zig");
+const constants = @import("./constants.zig");
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -98,9 +99,21 @@ pub const BeamNode = struct {
         return cb_ptr;
     }
 
-    pub fn onInterval(ptr: *anyopaque, iinterval: isize) !void {
+    pub fn onInterval(ptr: *anyopaque, itime_intervals: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const interval: usize = @intCast(iinterval);
+
+        // till its time to attest atleast for first time don't run onInterval,
+        // just print chain status i.e avoid zero slot zero interval block production
+        if (itime_intervals < 1) {
+            const islot = @divFloor(itime_intervals, constants.INTERVALS_PER_SLOT);
+            const interval = @mod(itime_intervals, constants.INTERVALS_PER_SLOT);
+
+            if (interval == 1) {
+                self.chain.printSlot(islot);
+            }
+            return;
+        }
+        const interval: usize = @intCast(itime_intervals);
 
         self.chain.onInterval(interval) catch |e| {
             self.logger.err("Error ticking chain to time(intervals)={d} err={any}", .{ interval, e });

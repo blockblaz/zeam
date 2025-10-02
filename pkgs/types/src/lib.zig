@@ -18,6 +18,8 @@ pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
 pub const RootHex = [64]u8;
 
+pub const ZERO_HASH = [_]u8{0x00} ** 32;
+
 pub const BeamBlockHeader = struct {
     slot: Slot,
     proposer_index: ValidatorIndex,
@@ -68,6 +70,11 @@ pub const BeamBlockBody = struct {
 
     // mini 3sf simplified votes
     attestations: SignedVotes,
+
+    pub fn deinit(self: *BeamBlockBody) void {
+        // Deinit heap allocated ArrayLists
+        self.attestations.deinit();
+    }
 };
 
 pub const BeamBlock = struct {
@@ -76,6 +83,48 @@ pub const BeamBlock = struct {
     parent_root: Bytes32,
     state_root: Bytes32,
     body: BeamBlockBody,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self) void {
+        self.body.deinit();
+    }
+
+    pub fn genGenesisBlock(self: *Self, allocator: Allocator) !void {
+        const attestations = try SignedVotes.init(allocator);
+        errdefer attestations.deinit();
+
+        self.* = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = ZERO_HASH,
+            .state_root = ZERO_HASH,
+            .body = .{
+                // .execution_payload_header = .{ .timestamp = 0 },
+                // 3sf mini votes
+                .attestations = attestations,
+            },
+        };
+    }
+
+    // computing latest block header to be assigned to the state for processing the block
+    pub fn blockToLatestBlockHeader(self: *const Self, allocator: Allocator, header: *BeamBlockHeader) !void {
+        var body_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamBlockBody,
+            self.body,
+            &body_root,
+            allocator,
+        );
+
+        header.* = .{
+            .slot = self.slot,
+            .proposer_index = self.proposer_index,
+            .parent_root = self.parent_root,
+            .state_root = ZERO_HASH,
+            .body_root = body_root,
+        };
+    }
 };
 
 pub const SignedBeamBlock = struct {
@@ -120,6 +169,14 @@ pub const BeamState = struct {
     // a flat representation of the justifications map
     justifications_roots: JustificationsRoots,
     justifications_validators: JustificationsValidators,
+
+    pub fn deinit(self: *BeamState) void {
+        // Deinit heap allocated ArrayLists
+        self.historical_block_hashes.deinit();
+        self.justified_slots.deinit();
+        self.justifications_roots.deinit();
+        self.justifications_validators.deinit();
+    }
 
     pub fn withJustifications(self: *BeamState, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
         var new_justifications_roots = try JustificationsRoots.init(allocator);
@@ -178,12 +235,67 @@ pub const BeamState = struct {
         }
     }
 
-    pub fn deinit(self: *BeamState) void {
-        // Deinit heap allocated ArrayLists
-        self.historical_block_hashes.deinit();
-        self.justified_slots.deinit();
-        self.justifications_roots.deinit();
-        self.justifications_validators.deinit();
+    pub fn genGenesisState(self: *BeamState, allocator: Allocator, genesis: GenesisSpec) !void {
+        var genesis_block: BeamBlock = undefined;
+        try genesis_block.genGenesisBlock(allocator);
+        errdefer genesis_block.deinit();
+
+        var genesis_block_header: BeamBlockHeader = undefined;
+        try genesis_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
+
+        var historical_block_hashes = try HistoricalBlockHashes.init(allocator);
+        errdefer historical_block_hashes.deinit();
+
+        var justified_slots = try JustifiedSlots.init(allocator);
+        errdefer justified_slots.deinit();
+
+        var justifications_roots = try JustificationsRoots.init(allocator);
+        errdefer justifications_roots.deinit();
+
+        var justifications_validators = try JustificationsValidators.init(allocator);
+        errdefer justifications_validators.deinit();
+
+        self.* = .{
+            .config = .{
+                .num_validators = genesis.num_validators,
+                .genesis_time = genesis.genesis_time,
+            },
+            .slot = 0,
+            .latest_block_header = genesis_block_header,
+            // mini3sf
+            .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .historical_block_hashes = historical_block_hashes,
+            .justified_slots = justified_slots,
+            // justifications map is empty
+            .justifications_roots = justifications_roots,
+            .justifications_validators = justifications_validators,
+        };
+    }
+
+    pub fn genGenesisBlock(self: *const BeamState, allocator: Allocator, genesis_block: *BeamBlock) !void {
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamState,
+            self.*,
+            &state_root,
+            allocator,
+        );
+
+        const attestations = try SignedVotes.init(allocator);
+        errdefer attestations.deinit();
+
+        genesis_block.* = .{
+            .slot = 0,
+            .proposer_index = 0,
+            .parent_root = ZERO_HASH,
+            .state_root = state_root,
+            .body = .{
+                // .execution_payload_header = .{ .timestamp = 0 },
+                // 3sf mini
+                .attestations = attestations,
+            },
+        };
     }
 };
 
