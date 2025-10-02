@@ -112,7 +112,7 @@ pub const Node = struct {
             // options
             .nodeId = node_id,
             .config = chain_config,
-            .anchorState = anchorState,
+            .anchorState = &anchorState,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = options.validator_indices,

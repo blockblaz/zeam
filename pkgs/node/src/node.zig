@@ -19,7 +19,7 @@ pub const validators = @import("./validator.zig");
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: types.BeamState,
+    anchorState: *types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     validator_ids: ?[]usize = null,

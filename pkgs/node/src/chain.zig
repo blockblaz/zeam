@@ -29,7 +29,7 @@ pub const VoteConstructionParams = struct {
 
 pub const ChainOpts = struct {
     config: configs.ChainConfig,
-    anchorState: types.BeamState,
+    anchorState: *types.BeamState,
     nodeId: u32,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
@@ -47,7 +47,7 @@ pub const ProducedBlock = struct {
 
 pub const BeamChain = struct {
     config: configs.ChainConfig,
-    anchor_state: types.BeamState,
+    anchor_state: *types.BeamState,
 
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
@@ -72,11 +72,11 @@ pub const BeamChain = struct {
         opts: ChainOpts,
     ) !Self {
         const logger_config = opts.logger_config;
-        const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState, logger_config.logger(.forkchoice));
+        const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, logger_config.logger(.forkchoice));
 
         var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
         const cloned_anchor_state = try allocator.create(types.BeamState);
-        try types.sszClone(allocator, types.BeamState, opts.anchorState, cloned_anchor_state);
+        try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
         try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
 
         return Self{
@@ -447,7 +447,7 @@ test "process and add mock blocks into a node's chain" {
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
     const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
-    const beam_state = mock_chain.genesis_state;
+    var beam_state = mock_chain.genesis_state;
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -460,7 +460,7 @@ test "process and add mock blocks into a node's chain" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), db_path);
     defer db.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
@@ -520,7 +520,7 @@ test "printSlot output demonstration" {
 
     // Create a mock chain with some blocks
     const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
-    const beam_state = mock_chain.genesis_state;
+    var beam_state = mock_chain.genesis_state;
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
 
@@ -534,7 +534,7 @@ test "printSlot output demonstration" {
     defer db.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
