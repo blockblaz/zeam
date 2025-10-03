@@ -145,6 +145,9 @@ ENTRYPOINT ["/app/zig-out/bin/zeam"]
 #    with additional capabilities. This appears to be a limitation of running
 #    the xev-based event loop in a containerized environment.
 #
+#    Hint: Use '--security-opt seccomp=unconfined' extra docker run arg to
+#    circumvent the issue.
+#
 # 2. The scratch image has no users, shells, or package managers - only
 #    the binary and required libraries.
 #
