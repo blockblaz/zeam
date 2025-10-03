@@ -210,6 +210,12 @@ const VoteTracker = struct {
     latestNew: ?ProtoVote = null,
 };
 
+pub const ForkChoiceParams = struct {
+    config: configs.ChainConfig,
+    anchorState: types.BeamState,
+    logger: zeam_utils.ModuleLogger,
+};
+
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
     anchorState: types.BeamState,
@@ -227,8 +233,8 @@ pub const ForkChoice = struct {
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, config: configs.ChainConfig, anchorState: types.BeamState, logger: zeam_utils.ModuleLogger) !Self {
-        const anchor_block_header = try stf.genStateBlockHeader(allocator, anchorState);
+    pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
+        const anchor_block_header = try stf.genStateBlockHeader(allocator, opts.anchorState);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
             types.BeamBlockHeader,
@@ -238,17 +244,17 @@ pub const ForkChoice = struct {
         );
 
         const anchor_block = ProtoBlock{
-            .slot = anchorState.slot,
+            .slot = opts.anchorState.slot,
             .blockRoot = anchor_block_root,
             .parentRoot = anchor_block_header.parent_root,
             .stateRoot = anchor_block_header.state_root,
             .timeliness = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
-        const anchorCP = types.Mini3SFCheckpoint{ .slot = anchorState.slot, .root = anchor_block_root };
+        const anchorCP = types.Mini3SFCheckpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
-            .time = anchorState.slot * constants.INTERVALS_PER_SLOT,
-            .timeSlots = anchorState.slot,
+            .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
+            .timeSlots = opts.anchorState.slot,
             .latest_justified = anchorCP,
             .latest_finalized = anchorCP,
         };
@@ -258,14 +264,14 @@ pub const ForkChoice = struct {
         var fc = Self{
             .allocator = allocator,
             .protoArray = proto_array,
-            .anchorState = anchorState,
-            .config = config,
+            .anchorState = opts.anchorState,
+            .config = opts.config,
             .fcStore = fc_store,
             .votes = votes,
             .head = anchor_block,
             .safeTarget = anchor_block,
             .deltas = deltas,
-            .logger = logger,
+            .logger = opts.logger,
         };
         _ = try fc.updateHead();
         return fc;
@@ -599,7 +605,11 @@ test "forkchoice block tree" {
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);
-    var fork_choice = try ForkChoice.init(allocator, chain_config, beam_state, module_logger);
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = beam_state,
+        .logger = module_logger,
+    });
 
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
