@@ -335,7 +335,8 @@ pub fn main() !void {
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
-            var beam_node_1 = try BeamNode.init(allocator, .{
+            var beam_node_1: BeamNode = undefined;
+            try beam_node_1.init(allocator, .{
                 // options
                 .nodeId = 0,
                 .config = chain_config,
@@ -346,7 +347,9 @@ pub fn main() !void {
                 .db = db_1,
                 .logger_config = &logger1_config,
             });
-            var beam_node_2 = try BeamNode.init(allocator, .{
+
+            var beam_node_2: BeamNode = undefined;
+            try beam_node_2.init(allocator, .{
                 // options
                 .nodeId = 1,
                 .config = chain_config,

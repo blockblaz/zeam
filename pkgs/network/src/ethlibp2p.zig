@@ -105,6 +105,24 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 }
 
+export fn handlePeerConnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+    const peer_id_slice = std.mem.span(peer_id);
+    zigHandler.logger.info("network-{d}:: Peer connected: {s}", .{ zigHandler.params.networkId, peer_id_slice });
+
+    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice) catch |e| {
+        zigHandler.logger.err("network-{d}:: Error handling peer connected event: {any}", .{ zigHandler.params.networkId, e });
+    };
+}
+
+export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+    const peer_id_slice = std.mem.span(peer_id);
+    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}", .{ zigHandler.params.networkId, peer_id_slice });
+
+    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice) catch |e| {
+        zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
+    };
+}
+
 export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
     const listen_slice = std.mem.span(listen_addresses);
     zig_handler.allocator.free(listen_slice);
@@ -133,6 +151,7 @@ pub const EthLibp2pParams = struct {
 pub const EthLibp2p = struct {
     allocator: Allocator,
     gossipHandler: interface.GenericGossipHandler,
+    peerEventHandler: interface.PeerEventHandler,
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
     logger: zeam_utils.ModuleLogger,
@@ -151,17 +170,27 @@ pub const EthLibp2p = struct {
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger);
         errdefer gossip_handler.deinit();
 
-        return Self{ .allocator = allocator, .params = .{
-            .networkId = params.networkId,
-            .network_name = owned_network_name,
-            .local_private_key = params.local_private_key,
-            .listen_addresses = params.listen_addresses,
-            .connect_peers = params.connect_peers,
-        }, .gossipHandler = gossip_handler, .logger = logger };
+        const peer_event_handler = try interface.PeerEventHandler.init(allocator, params.networkId, logger);
+        errdefer peer_event_handler.deinit();
+
+        return Self{
+            .allocator = allocator,
+            .params = .{
+                .networkId = params.networkId,
+                .network_name = owned_network_name,
+                .local_private_key = params.local_private_key,
+                .listen_addresses = params.listen_addresses,
+                .connect_peers = params.connect_peers,
+            },
+            .gossipHandler = gossip_handler,
+            .peerEventHandler = peer_event_handler,
+            .logger = logger,
+        };
     }
 
     pub fn deinit(self: *Self) void {
         self.gossipHandler.deinit();
+        self.peerEventHandler.deinit();
 
         for (self.params.listen_addresses) |addr| addr.deinit();
         self.allocator.free(self.params.listen_addresses);
@@ -254,17 +283,29 @@ pub const EthLibp2p = struct {
         _ = data;
     }
 
+    pub fn subscribePeerEvents(ptr: *anyopaque, handler: interface.OnPeerEventCbHandler) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.peerEventHandler.subscribe(handler);
+    }
+
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
-        return .{ .gossip = .{
-            .ptr = self,
-            .publishFn = publish,
-            .subscribeFn = subscribe,
-            .onGossipFn = onGossip,
-        }, .reqresp = .{
-            .ptr = self,
-            .reqRespFn = reqResp,
-            .onReqFn = onReq,
-        } };
+        return .{
+            .gossip = .{
+                .ptr = self,
+                .publishFn = publish,
+                .subscribeFn = subscribe,
+                .onGossipFn = onGossip,
+            },
+            .reqresp = .{
+                .ptr = self,
+                .reqRespFn = reqResp,
+                .onReqFn = onReq,
+            },
+            .peers = .{
+                .ptr = self,
+                .subscribeFn = subscribePeerEvents,
+            },
+        };
     }
 
     fn multiaddrsToString(allocator: Allocator, addrs: []const Multiaddr) ![:0]u8 {

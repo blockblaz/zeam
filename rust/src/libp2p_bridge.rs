@@ -152,6 +152,14 @@ extern "C" {
 }
 
 extern "C" {
+    fn handlePeerConnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+}
+
+extern "C" {
+    fn handlePeerDisconnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+}
+
+extern "C" {
     fn releaseStartNetworkParams(
         zig_handler: u64,
         local_private_key: *const c_char,
@@ -235,6 +243,51 @@ impl Network {
             match swarm.select_next_some().await {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("\nListening on {address:?}\n");
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    let peer_id = peer_id.to_string();
+                    let peer_id = peer_id.as_str();
+                    println!(
+                        "\nrustbridge{}:: Connection established with peer: {}\n",
+                        self.network_id, peer_id
+                    );
+                    let peer_id_cstr = match CString::new(peer_id) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            eprintln!(
+                                "rustbridge{}:: invalid_peer_id_string={}",
+                                self.network_id, peer_id
+                            );
+                            continue;
+                        }
+                    };
+                    unsafe {
+                        handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                    };
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    let peer_id = peer_id.to_string();
+                    let peer_id = peer_id.as_str();
+                    println!(
+                        "\nrustbridge{}:: Connection closed with peer: {}\n",
+                        self.network_id, peer_id
+                    );
+                    let peer_id_cstr = match CString::new(peer_id) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            eprintln!(
+                                "rustbridge{}:: invalid_peer_id_string={}",
+                                self.network_id, peer_id
+                            );
+                            continue;
+                        }
+                    };
+                    unsafe {
+                        handlePeerDisconnectedFromRustBridge(
+                            self.zig_handler,
+                            peer_id_cstr.as_ptr(),
+                        )
+                    };
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     message,
