@@ -17,3 +17,6 @@ pub const DEFAULT_DATA_DIR: []const u8 = "./data";
 
 /// SSE heartbeat interval (seconds)
 pub const SSE_HEARTBEAT_SECONDS: u64 = 30;
+
+/// Default node key file path
+pub const DEFAULT_NODE_KEY: []const u8 = "./key";
