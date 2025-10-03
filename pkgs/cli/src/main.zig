@@ -40,6 +40,7 @@ pub const NodeCommand = struct {
     network_id: u32 = 0,
     // the node key in validators.yaml
     @"node-id": []const u8,
+    @"node-key": []const u8 = constants.DEFAULT_NODE_KEY,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
     // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
@@ -59,6 +60,8 @@ pub const NodeCommand = struct {
         .custom_genesis = "Custom genesis directory path",
         .network_id = "Internal libp2p network id relevant when running nodes in same process",
         .@"node-id" = "The node id in the genesis config for this lean node",
+        .@"node-key" = "Path to the node key file",
+        .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
         .metrics_port = "Port to use for publishing metrics",
         .metrics_enable = "Enable metrics endpoint",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
