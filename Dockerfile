@@ -135,7 +135,7 @@ COPY --from=builder /app/zig-out/ /app/zig-out/
 COPY --from=builder /app/resources/ /app/resources/
 
 # Set the zeam binary as the entrypoint with beam parameter by default
-ENTRYPOINT ["/app/zig-out/bin/zeam", "beam"]
+ENTRYPOINT ["/app/zig-out/bin/zeam"]
 
 # IMPORTANT NOTES:
 #
