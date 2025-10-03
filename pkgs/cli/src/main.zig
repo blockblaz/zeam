@@ -38,8 +38,10 @@ pub const NodeCommand = struct {
     custom_genesis: []const u8,
     // internal libp2p network id, only matters when two or more nodes are run in same process
     network_id: u32 = 0,
-    // the node key in validators.yaml
+    // the string id to pick configuration in validators.yaml/validator_config.yaml
     @"node-id": []const u8,
+    // the private libp2p key arg currently ignored but supported to be cross client compatible for
+    // lean-quickstart standard args 1. data-dir 2. node-id 3. node-key
     @"node-key": []const u8 = constants.DEFAULT_NODE_KEY,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
