@@ -396,7 +396,7 @@ pub const ForkChoice = struct {
             }
         }
 
-        while (!try stf.is_justifiable_slot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
+        while (!try types.BeamState.isJustifiableSlot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
@@ -473,6 +473,56 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.num_validators, 3);
         self.safeTarget = try self.computeFCHead(false, cutoff_weight);
         return self.safeTarget;
+    }
+
+    /// Validate attestation before processing
+    /// Following leanSpec pattern: validates blocks exist, slot relationships, and checkpoint consistency
+    pub fn validateAttestation(self: *Self, signed_vote: types.SignedVote) !void {
+        const vote = signed_vote.message;
+
+        // 1. Validate that referenced blocks exist in the fork choice store
+        const source_exists = self.protoArray.indices.contains(vote.source.root);
+        const target_exists = self.protoArray.indices.contains(vote.target.root);
+
+        if (!source_exists) {
+            self.logger.debug("Unknown source block: 0x{s}", .{std.fmt.fmtSliceHexLower(&vote.source.root)});
+            return ForkChoiceError.UnknownSourceBlock;
+        }
+        if (!target_exists) {
+            self.logger.debug("Unknown target block: 0x{s}", .{std.fmt.fmtSliceHexLower(&vote.target.root)});
+            return ForkChoiceError.UnknownTargetBlock;
+        }
+
+        // 2. Get the blocks to validate slot relationships
+        const source_block = self.protoArray.getNode(vote.source.root) orelse unreachable;
+        const target_block = self.protoArray.getNode(vote.target.root) orelse unreachable;
+
+        // 3. Validate slot relationships
+        if (source_block.slot > target_block.slot) {
+            self.logger.debug("Source slot {} exceeds target slot {}", .{ source_block.slot, target_block.slot });
+            return ForkChoiceError.SourceSlotExceedsTarget;
+        }
+        if (vote.source.slot > vote.target.slot) {
+            self.logger.debug("Source checkpoint slot {} exceeds target checkpoint slot {}", .{ vote.source.slot, vote.target.slot });
+            return ForkChoiceError.SourceCheckpointExceedsTarget;
+        }
+
+        // 4. Validate checkpoint slots match block slots
+        if (source_block.slot != vote.source.slot) {
+            self.logger.debug("Source checkpoint slot {} does not match block slot {}", .{ vote.source.slot, source_block.slot });
+            return ForkChoiceError.SourceCheckpointSlotMismatch;
+        }
+        if (target_block.slot != vote.target.slot) {
+            self.logger.debug("Target checkpoint slot {} does not match block slot {}", .{ vote.target.slot, target_block.slot });
+            return ForkChoiceError.TargetCheckpointSlotMismatch;
+        }
+
+        // 5. Validate attestation is not too far in the future
+        const current_slot = self.fcStore.timeSlots;
+        if (vote.slot > current_slot + 1) {
+            self.logger.debug("Attestation slot {} too far in future (current: {})", .{ vote.slot, current_slot });
+            return ForkChoiceError.AttestationTooFarInFuture;
+        }
     }
 
     pub fn onAttestation(self: *Self, signed_vote: types.SignedVote, is_from_block: bool) !void {
@@ -574,11 +624,29 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, InvalidFutureAttestation,
-    //
-    InvalidOnChainAttestation, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas,
-    //
-    InvalidJustifiedRoot, InvalidBestDescendant, InvalidHeadIndex, InvalidTargetSearch };
+const ForkChoiceError = error{
+    NotImplemented,
+    UnknownParent,
+    FutureSlot,
+    InvalidFutureAttestation,
+    InvalidOnChainAttestation,
+    PreFinalizedSlot,
+    NotFinalizedDesendant,
+    InvalidAttestation,
+    InvalidDeltas,
+    InvalidJustifiedRoot,
+    InvalidBestDescendant,
+    InvalidHeadIndex,
+    InvalidTargetSearch,
+    // New validation errors
+    UnknownSourceBlock,
+    UnknownTargetBlock,
+    SourceSlotExceedsTarget,
+    SourceCheckpointExceedsTarget,
+    SourceCheckpointSlotMismatch,
+    TargetCheckpointSlotMismatch,
+    AttestationTooFarInFuture,
+};
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
