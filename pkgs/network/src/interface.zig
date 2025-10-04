@@ -143,10 +143,12 @@ pub const GossipMessage = union(GossipTopic) {
 
         switch (self.*) {
             .block => {
-                cloned_data.* = .{ .block = try types.sszClone(allocator, types.SignedBeamBlock, self.block) };
+                cloned_data.* = .{ .block = undefined };
+                try types.sszClone(allocator, types.SignedBeamBlock, self.block, &cloned_data.block);
             },
             .vote => {
-                cloned_data.* = .{ .vote = try types.sszClone(allocator, types.SignedVote, self.vote) };
+                cloned_data.* = .{ .vote = undefined };
+                try types.sszClone(allocator, types.SignedVote, self.vote, &cloned_data.vote);
             },
         }
 

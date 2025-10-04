@@ -20,7 +20,7 @@ const constants = @import("./constants.zig");
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
-    anchorState: *const types.BeamState,
+    anchorState: *types.BeamState,
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     validator_ids: ?[]usize = null,

@@ -34,7 +34,7 @@ fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 
     if (std.mem.eql(u8, &state.latest_block_header.state_root, &utils.ZERO_HASH)) {
         var prev_state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, state.*, &prev_state_root, allocator);
+        try ssz.hashTreeRoot(*types.BeamState, state, &prev_state_root, allocator);
         state.latest_block_header.state_root = prev_state_root;
     }
 }
@@ -281,7 +281,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     logger.debug("extracting state root\n", .{});
     // extract the post state root
     var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+    try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
     block.state_root = state_root;
 }
 
@@ -310,7 +310,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     if (validateResult) {
         // verify the post state root
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+        try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
             opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;
