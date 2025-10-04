@@ -30,6 +30,10 @@ pub fn startListener(allocator: std.mem.Allocator, port: u16) !void {
     _ = port;
 }
 
+pub fn setLeanHeadSlot(slot: u64) void {
+    _ = slot;
+}
+
 pub fn chain_onblock_duration_seconds_start() Timer {
     return chain_onblock_duration_seconds.start();
 }

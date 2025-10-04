@@ -34,9 +34,11 @@ var g_initialized: bool = false;
 const Metrics = struct {
     chain_onblock_duration_seconds: ChainHistogram,
     block_processing_duration_seconds: BlockProcessingHistogram,
+    lean_head_slot: LeanHeadSlotGauge,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
+    const LeanHeadSlotGauge = metrics_lib.Gauge(u64);
 };
 
 /// Timer struct returned to the application.
@@ -96,6 +98,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics = .{
         .chain_onblock_duration_seconds = Metrics.ChainHistogram.init("chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .block_processing_duration_seconds = Metrics.BlockProcessingHistogram.init("block_processing_duration_seconds", .{ .help = "Time taken to process a block in the state transition function." }, .{}),
+        .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain." }, .{}),
     };
 
     g_initialized = true;
@@ -120,6 +123,13 @@ pub const routes = @import("./routes.zig");
 // Event system modules
 pub const events = @import("./events.zig");
 pub const event_broadcaster = @import("./event_broadcaster.zig");
+
+/// Sets the lean head slot metric.
+/// This should be called whenever the fork choice head is updated.
+pub fn setLeanHeadSlot(slot: u64) void {
+    if (!g_initialized or isZKVM()) return;
+    metrics.lean_head_slot.set(slot);
+}
 
 // Compatibility functions for the old API
 pub fn chain_onblock_duration_seconds_start() Timer {

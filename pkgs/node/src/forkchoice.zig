@@ -7,6 +7,7 @@ const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const zeam_utils = @import("@zeam/utils");
 const stf = @import("@zeam/state-transition");
+const api = @import("@zeam/api");
 
 const constants = @import("./constants.zig");
 
@@ -466,6 +467,8 @@ pub const ForkChoice = struct {
 
     pub fn updateHead(self: *Self) !ProtoBlock {
         self.head = try self.computeFCHead(true, 0);
+        // Update the lean_head_slot metric
+        api.setLeanHeadSlot(self.head.slot);
         return self.head;
     }
 
