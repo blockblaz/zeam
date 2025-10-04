@@ -28,30 +28,13 @@ pub const StateTransitionOpts = struct {
 // }
 
 // prepare the state to be the post-state of the slot
-fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
-
-    // update state root in latest block header if its zero hash
-    // i.e. just after processing the latest block of latest block header
-    // this completes latest block header for parentRoot checks of new block
-
-    if (std.mem.eql(u8, &state.latest_block_header.state_root, &utils.ZERO_HASH)) {
-        var prev_state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, state.*, &prev_state_root, allocator);
-        state.latest_block_header.state_root = prev_state_root;
-    }
+pub fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
+    return state.process_slot(allocator);
 }
 
 // prepare the state to be pre state of the slot
-fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
-    if (slot <= state.slot) {
-        logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, state.slot });
-        return StateTransitionError.InvalidPreState;
-    }
-
-    while (state.slot < slot) {
-        try process_slot(allocator, state);
-        state.slot += 1;
-    }
+pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
+    return state.process_slots(allocator, slot, logger);
 }
 
 pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
@@ -294,7 +277,7 @@ fn process_block(allocator: Allocator, state: *types.BeamState, block: types.Bea
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
-    try process_slots(allocator, state, block.slot, logger);
+    try state.process_slots(allocator, block.slot, logger);
 
     // process block and modify the pre state to post state
     try process_block(allocator, state, block.*, logger);
@@ -323,7 +306,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 
     // prepare the pre state for this block slot
-    try process_slots(allocator, state, block.slot, opts.logger);
+    try state.process_slots(allocator, block.slot, opts.logger);
     // process the block
     try process_block(allocator, state, block, opts.logger);
 

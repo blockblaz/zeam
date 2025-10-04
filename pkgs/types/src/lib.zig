@@ -441,7 +441,6 @@ pub const BeamState = struct {
             },
         };
     }
-
     pub fn toJson(self: *const BeamState, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("config", try self.config.toJson(allocator));
@@ -484,6 +483,32 @@ pub const BeamState = struct {
     pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+    /// Process a single slot, backfilling the state_root if zero.
+    /// This prepares the state to be the post-state of the slot.
+    pub fn process_slot(self: *BeamState, allocator: Allocator) !void {
+        // update state root in latest block header if its zero hash
+        // i.e. just after processing the latest block of latest block header
+        // this completes latest block header for parentRoot checks of new block
+        if (std.mem.eql(u8, &self.latest_block_header.state_root, &ZERO_HASH)) {
+            var prev_state_root: [32]u8 = undefined;
+            try ssz.hashTreeRoot(BeamState, self.*, &prev_state_root, allocator);
+            self.latest_block_header.state_root = prev_state_root;
+        }
+    }
+
+    /// Process multiple slots, advancing the state to the target slot.
+    /// This prepares the state to be the pre-state of the target slot.
+    pub fn process_slots(self: *BeamState, allocator: Allocator, target_slot: Slot, logger: anytype) !void {
+        if (target_slot <= self.slot) {
+            logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ target_slot, self.slot });
+            return error.InvalidPreState;
+        }
+
+        while (self.slot < target_slot) {
+            try self.process_slot(allocator);
+            self.slot += 1;
+        }
     }
 };
 
