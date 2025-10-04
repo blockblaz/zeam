@@ -47,7 +47,7 @@ pub const ProducedBlock = struct {
 
 pub const BeamChain = struct {
     config: configs.ChainConfig,
-    anchor_state: types.BeamState,
+    anchor_state: *types.BeamState,
 
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
@@ -85,7 +85,7 @@ pub const BeamChain = struct {
             .forkChoice = fork_choice,
             .allocator = allocator,
             .states = states,
-            .anchor_state = opts.anchorState.*,
+            .anchor_state = opts.anchorState,
             .zeam_logger_config = logger_config,
             .module_logger = logger_config.logger(.chain),
             .stf_logger = logger_config.logger(.state_transition),
@@ -487,9 +487,9 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(searched_idx == i);
 
         // should have matching states in the state
-        const block_state_ptr = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
+        const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, block_state_ptr.*, &state_root, allocator);
+        try ssz.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
 
         // fcstore checkpoints should match
