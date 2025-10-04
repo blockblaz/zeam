@@ -134,7 +134,8 @@ pub const BeamChain = struct {
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block recieved and processed
-            self.printSlot(slot);
+            const islot: isize = @intCast(slot);
+            self.printSlot(islot);
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
@@ -202,29 +203,31 @@ pub const BeamChain = struct {
         return vote;
     }
 
-    pub fn printSlot(self: *Self, slot: usize) void {
+    pub fn printSlot(self: *Self, islot: isize) void {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though processs block
         // logs show it has been updated. debug and fix the call below
-        const fc_head = self.forkChoice.updateHead() catch |err| {
-            self.module_logger.err("forkchoice updatehead error={any}", .{err});
-            return;
-        };
+        const fc_head = if (islot > 0)
+            self.forkChoice.updateHead() catch |err| {
+                self.module_logger.err("forkchoice updatehead error={any}", .{err});
+                return;
+            }
+        else
+            self.forkChoice.head;
 
         // Get additional chain information
         const justified = self.forkChoice.fcStore.latest_justified;
         const finalized = self.forkChoice.fcStore.latest_finalized;
 
         // Calculate chain progress
+        const slot: usize = if (islot < 0) 0 else @intCast(islot);
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
         self.module_logger.info(
             \\
             \\+===============================================================+
-            \\                         CHAIN STATUS                            
-            \\+===============================================================+
-            \\  Current Slot: {d} | Head Slot: {d} | Behind: {d}
+            \\  CHAIN STATUS: Current Slot: {d} | Head Slot: {d} | Behind: {d}
             \\+---------------------------------------------------------------+
             \\  Head Block Root:    0x{any}
             \\  Parent Block Root:  0x{any}
@@ -236,7 +239,7 @@ pub const BeamChain = struct {
             \\+===============================================================+
             \\
         , .{
-            slot,
+            islot,
             fc_head.slot,
             blocks_behind,
             std.fmt.fmtSliceHexLower(&fc_head.blockRoot),

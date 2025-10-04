@@ -38,8 +38,11 @@ pub const NodeCommand = struct {
     custom_genesis: []const u8,
     // internal libp2p network id, only matters when two or more nodes are run in same process
     network_id: u32 = 0,
-    // the node key in validators.yaml
-    node_key: []const u8,
+    // the string id to pick configuration in validators.yaml/validator_config.yaml
+    @"node-id": []const u8,
+    // the private libp2p key arg currently ignored but supported to be cross client compatible for
+    // lean-quickstart standard args 1. data-dir 2. node-id 3. node-key
+    @"node-key": []const u8 = constants.DEFAULT_NODE_KEY,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
     // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
@@ -48,8 +51,8 @@ pub const NodeCommand = struct {
     metrics_enable: bool = false,
     metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
-    network_dir: []const u8 = "./network",
-    data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
+    @"network-dir": []const u8 = "./network",
+    @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -58,12 +61,14 @@ pub const NodeCommand = struct {
     pub const __messages__ = .{
         .custom_genesis = "Custom genesis directory path",
         .network_id = "Internal libp2p network id relevant when running nodes in same process",
-        .node_key = "The node key in the genesis config for this lean node",
+        .@"node-id" = "The node id in the genesis config for this lean node",
+        .@"node-key" = "Path to the node key file",
+        .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
         .metrics_port = "Port to use for publishing metrics",
         .metrics_enable = "Enable metrics endpoint",
-        .network_dir = "Directory to store network related information, e.g., peer ids, keys, etc.",
+        .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
-        .data_dir = "Path to the data directory",
+        .@"data-dir" = "Path to the data directory",
         .help = "Show help information for the node command",
     };
 };
@@ -376,7 +381,7 @@ pub fn main() !void {
 
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,
-                .node_key = leancmd.node_key,
+                .node_key = leancmd.@"node-id",
                 .validator_config = leancmd.validator_config,
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
@@ -386,7 +391,7 @@ pub fn main() !void {
                 .validator_indices = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
-                .database_path = leancmd.data_dir,
+                .database_path = leancmd.@"data-dir",
             };
 
             defer start_options.deinit(allocator);
