@@ -135,7 +135,7 @@ COPY --from=builder /app/zig-out/ /app/zig-out/
 COPY --from=builder /app/resources/ /app/resources/
 
 # Set the zeam binary as the entrypoint with beam parameter by default
-ENTRYPOINT ["/app/zig-out/bin/zeam", "beam"]
+ENTRYPOINT ["/app/zig-out/bin/zeam"]
 
 # IMPORTANT NOTES:
 #
@@ -144,6 +144,9 @@ ENTRYPOINT ["/app/zig-out/bin/zeam", "beam"]
 #    container compatibility issues. The PermissionDenied error occurs even
 #    with additional capabilities. This appears to be a limitation of running
 #    the xev-based event loop in a containerized environment.
+#
+#    Hint: Use '--security-opt seccomp=unconfined' extra docker run arg to
+#    circumvent the issue.
 #
 # 2. The scratch image has no users, shells, or package managers - only
 #    the binary and required libraries.

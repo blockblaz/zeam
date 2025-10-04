@@ -126,10 +126,10 @@ Open a new terminal window and run:
 ```bash
 ./zig-out/bin/zeam node \
   --custom_genesis ./genesis \
-  --node_key "zeam_0" \
-  --network_dir ./data/test_node0 \
+  --node-id "zeam_0" \
+  --validator_config genesis_bootnode \
   --override_genesis_time $GENESIS_TIME \
-  --data_dir ./data/test_node0
+  --data-dir ./data/test_node0
 ```
 
 Replace `$GENESIS_TIME` with the actual timestamp from Step 0.
@@ -141,10 +141,10 @@ Open another terminal window and run:
 ```bash
 ./zig-out/bin/zeam node \
   --custom_genesis ./genesis \
-  --node_key "zeam_1" \
-  --network_dir ./data/test_node1 \
+  --node-id "zeam_1" \
+  --validator_config genesis_bootnode \
   --override_genesis_time $GENESIS_TIME \
-  --data_dir ./data/test_node1
+  --data-dir ./data/test_node1
 ```
 
 Use the **SAME** `$GENESIS_TIME` value from Step 0.
@@ -211,16 +211,16 @@ No additional setup is required - you can start using the fixtures immediately w
 
 ### "InvalidValidatorConfig" error
 
-- Check that `validators.yaml` node names match the `--node_key` parameter
+- Check that `validators.yaml` node names match the `--node-id` parameter
 - Ensure `VALIDATOR_COUNT` in `config.yaml` matches total validators in `validators.yaml`
-- Verify that the `node_key` exists in `validator-config.yaml` with a `privkey` field
+- Verify that the `node-id` exists in `validator-config.yaml` with a `privkey` field
 
 ### Finalization not happening
 
 - You need at least 2/3 validators voting
 - With the default setup (9 validators), you need 6 validators to finalize
 - Check that both nodes are on the same slot number
-- Ensure the `--node_key` values match the entries in `validators.yaml`
+- Ensure the `--node-id` values match the entries in `validators.yaml`
 
 ### Clean restart
 
@@ -237,7 +237,7 @@ mkdir -p data/test_node0 data/test_node1
 - **Pre-configured Setup:** All private keys, ENRs, and settings are pre-configured in the YAML files
 - **Same Timestamp:** Both nodes MUST use the exact same `--override_genesis_time` value
 - **Separate Terminals:** Run each node in its own terminal window to see live output
-- **Node Keys:** Use `--node_key` with values from `validators.yaml` (zeam_0, quadrivium_0, ream_0)
+- **Node IDs:** Use `--node-id` with values from `validators.yaml` (zeam_0, quadrivium_0, ream_0)
 - **Data Directories:** Each node needs its own database path to avoid conflicts
 
 ## Command Summary
@@ -246,12 +246,12 @@ For quick reference, here are the commands assuming `GENESIS_TIME=1759210782`:
 
 **Terminal 1 (zeam_0):**
 ```bash
-./zig-out/bin/zeam node --custom_genesis ./genesis --node_key "zeam_0" --network_dir ./data/test_node0 --override_genesis_time 1759210782 --data_dir ./data/test_node0
+./zig-out/bin/zeam node --custom_genesis ./genesis --node-id "zeam_0" --validator_config genesis_bootnode --override_genesis_time 1759210782 --data-dir ./data/test_node0
 ```
 
 **Terminal 2 (zeam_1):**
 ```bash
-./zig-out/bin/zeam node --custom_genesis ./genesis --node_key "zeam_1" --network_dir ./data/test_node1 --override_genesis_time 1759210782 --data_dir ./data/test_node1
+./zig-out/bin/zeam node --custom_genesis ./genesis --node-id "zeam_1" --validator_config genesis_bootnode --override_genesis_time 1759210782 --data-dir ./data/test_node1
 ```
 
 Replace `1759210782` with your actual `GENESIS_TIME` from `date +%s`.
