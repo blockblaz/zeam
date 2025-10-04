@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
+const utils = @import("@zeam/utils");
 
 /// SSE Event types for chain state changes
 pub const ChainEventType = enum {
@@ -41,6 +42,11 @@ pub const NewHeadEvent = struct {
         return json.Value{ .object = obj };
     }
 
+    pub fn toJsonString(self: *const NewHeadEvent, allocator: std.mem.Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+
     pub fn deinit(self: *NewHeadEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.block_root);
         allocator.free(self.parent_root);
@@ -72,6 +78,11 @@ pub const NewJustificationEvent = struct {
         return json.Value{ .object = obj };
     }
 
+    pub fn toJsonString(self: *const NewJustificationEvent, allocator: std.mem.Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+
     pub fn deinit(self: *NewJustificationEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.root);
     }
@@ -99,6 +110,11 @@ pub const NewFinalizationEvent = struct {
         try obj.put("root", json.Value{ .string = self.root });
         try obj.put("finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
         return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const NewFinalizationEvent, allocator: std.mem.Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 
     pub fn deinit(self: *NewFinalizationEvent, allocator: std.mem.Allocator) void {
@@ -136,16 +152,19 @@ pub fn serializeEventToJson(allocator: std.mem.Allocator, event: ChainEvent) ![]
     // Serialize the data based on event type
     switch (event) {
         .new_head => |head_event| {
-            const data_value = try head_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try head_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
         .new_justification => |just_event| {
-            const data_value = try just_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try just_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
         .new_finalization => |final_event| {
-            const data_value = try final_event.toJson(allocator);
-            try json.stringify(data_value, .{}, json_str.writer(allocator));
+            const data_str = try final_event.toJsonString(allocator);
+            defer allocator.free(data_str);
+            try json_str.appendSlice(allocator, data_str);
         },
     }
 

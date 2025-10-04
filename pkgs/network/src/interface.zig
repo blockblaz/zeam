@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json = std.json;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
@@ -162,6 +163,24 @@ pub const GossipMessage = union(GossipTopic) {
         }
 
         return cloned_data;
+    }
+
+    pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
+        return switch (self.*) {
+            .block => |block| block.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert block to JSON: {any}", .{e});
+                return e;
+            },
+            .vote => |vote| vote.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert vote to JSON: {any}", .{e});
+                return e;
+            },
+        };
+    }
+
+    pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
+        const message_json = try self.toJson(allocator);
+        return zeam_utils.jsonToString(allocator, message_json);
     }
 };
 

@@ -14,6 +14,7 @@ const database = @import("@zeam/database");
 const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
@@ -175,11 +176,20 @@ pub const BeamChain = struct {
             },
         };
 
-        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
+        var block_json = try block.toJson(self.allocator);
+        const block_str = try jsonToString(self.allocator, block_json);
+        defer self.allocator.free(block_str);
+
+        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, &post_state, &block, self.block_building_logger);
-        self.module_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
+
+        block_json = try block.toJson(self.allocator);
+        const block_str_2 = try jsonToString(self.allocator, block_json);
+        defer self.allocator.free(block_str_2);
+
+        self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -271,9 +281,15 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
+                const signed_block_json = try signed_block.toJson(self.allocator);
+
+                // Convert JSON value to string for proper logging
+                const signed_block_str = try jsonToString(self.allocator, signed_block_json);
+                defer self.allocator.free(signed_block_str);
+
                 self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
                     //
-                    signed_block,
+                    signed_block_str,
                     block_root,
                     hasBlock,
                 });
@@ -291,9 +307,15 @@ pub const BeamChain = struct {
             .vote => |signed_vote| {
                 const vote = signed_vote.message;
                 const hasHead = self.forkChoice.hasBlock(vote.head.root);
+                const signed_vote_json = try signed_vote.toJson(self.allocator);
+
+                // Convert JSON value to string for proper logging
+                const signed_vote_str = try jsonToString(self.allocator, signed_vote_json);
+                defer self.allocator.free(signed_vote_str);
+
                 self.module_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
                     //
-                    signed_vote,
+                    signed_vote_str,
                     hasHead,
                 });
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 
 const zkvm = @import("zkvm");
 const ssz = @import("ssz");
@@ -6,6 +7,7 @@ const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 // by default logger's activeLevel should be the default active level of the build
 var zeam_logger_config = zeam_utils.getLoggerConfig(null, null);
 const logger = zeam_logger_config.logger(.runtime);
@@ -29,7 +31,10 @@ export fn main() noreturn {
     logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
-    logger.debug("deserialized input={any}\n", .{prover_input.state});
+    const state_str = prover_input.state.toJsonString(allocator) catch @panic("could not convert state to JSON string");
+    defer allocator.free(state_str);
+
+    logger.debug("deserialized input={s}\n", .{state_str});
 
     // apply the state transition to modify the state
     state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = stf_runtime_logger }) catch |e| {

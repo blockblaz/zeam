@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -7,6 +8,7 @@ const types = @import("@zeam/types");
 const xev = @import("xev");
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -97,7 +99,13 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     };
 
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={any} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message, message_bytes });
+    const message_str = message.toJsonString(zigHandler.allocator) catch |e| {
+        zigHandler.logger.err("Failed to convert message to JSON string: {any}", .{e});
+        return;
+    };
+    defer zigHandler.allocator.free(message_str);
+
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes });
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
