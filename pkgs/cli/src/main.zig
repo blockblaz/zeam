@@ -397,9 +397,8 @@ pub fn main() !void {
                 .database_path = leancmd.@"data-dir",
             };
 
-            defer start_options.deinit(allocator);
-
             try node.buildStartOptions(allocator, leancmd, &start_options);
+            defer start_options.deinit(allocator);
 
             var lean_node: node.Node = undefined;
             try lean_node.init(allocator, &start_options);

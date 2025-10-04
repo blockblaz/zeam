@@ -339,12 +339,16 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
         return error.InvalidValidatorConfig;
     }
     const local_priv_key = try getPrivateKeyFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
+    errdefer allocator.free(local_priv_key);
 
+    const node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+
+    // All operations succeeded, now transfer ownership (no try statements after this point)
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
     opts.local_priv_key = local_priv_key;
     opts.genesis_spec = genesis_spec;
-    opts.node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+    opts.node_key_index = node_key_index;
 }
 
 /// Parses the nodes from a YAML configuration.
