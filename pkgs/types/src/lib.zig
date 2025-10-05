@@ -27,6 +27,13 @@ pub const RootHex = [64]u8;
 
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
 
+pub const Status = struct {
+    finalized_root: Bytes32,
+    finalized_slot: Slot,
+    head_root: Bytes32,
+    head_slot: Slot,
+};
+
 pub const BeamBlockHeader = struct {
     slot: Slot,
     proposer_index: ValidatorIndex,
