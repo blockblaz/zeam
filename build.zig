@@ -17,6 +17,8 @@ const zkvm_targets: []const zkvmTarget = &.{
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
     comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+    comp.linkLibC();
+    comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
     if (target.result.os.tag == .macos) {
         comp.linkFramework("CoreFoundation");
