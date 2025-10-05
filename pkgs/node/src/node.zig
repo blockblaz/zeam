@@ -109,7 +109,7 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn onReqResp(ptr: *anyopaque, data: *const networks.ReqRespRequest) anyerror!networks.ReqRespResponse {
+    pub fn onReqRespRequest(ptr: *anyopaque, data: *const networks.ReqRespRequest) anyerror!networks.ReqRespResponse {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         switch (data.*) {
@@ -120,6 +120,12 @@ pub const BeamNode = struct {
                 return .{ .status = self.chain.getStatus() };
             },
         }
+    }
+    pub fn getOnReqRespRequestCbHandler(self: *Self) !networks.OnReqRespCbHandler {
+        return .{
+            .ptr = self,
+            .onReqRespRequestCb = onReqRespRequest,
+        };
     }
 
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {

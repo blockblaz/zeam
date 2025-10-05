@@ -199,6 +199,53 @@ pub const ReqRespResponse = union(ReqRespMethod) {
     status: types.Status,
 };
 
+const OnReqRespRequestCbType = *const fn (*anyopaque, *const ReqRespRequest) anyerror!ReqRespResponse;
+pub const OnReqRespRequestCbHandler = struct {
+    ptr: *anyopaque,
+    onReqRespRequestCb: OnReqRespRequestCbType,
+    // c: xev.Completion = undefined,
+
+    pub fn onReqRespRequest(self: OnGossipCbHandler, data: *const ReqRespRequest) anyerror!ReqRespResponse {
+        return self.onReqRespRequestCb(self.ptr, data);
+    }
+};
+pub const ReqRespRequestHandler = struct {
+    allocator: Allocator,
+    handlers: std.ArrayListUnmanaged(OnReqRespRequestCbHandler),
+    networkId: u32,
+    logger: zeam_utils.ModuleLogger,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+        return Self{
+            .allocator = allocator,
+            .handlers = .empty,
+            .networkId = networkId,
+            .logger = logger,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.handlers.deinit(self.allocator);
+    }
+
+    pub fn subscribe(self: *Self, handler: OnPeerEventCbHandler) !void {
+        try self.handlers.append(self.allocator, handler);
+    }
+
+    pub fn onReqRespRequest(self: *Self, req: *const ReqRespRequest) anyerror!ReqRespResponse {
+        self.logger.debug("network-{d}:: onReqRespRequest={any}, handlers={d}", .{ self.networkId, req, self.handlers.items.len });
+        for (self.handlers.items) |handler| {
+            // return from the first handler, there are anyway going to be just 1 in a normal real scenario
+            // but needs to be handled for mock network where we will have 2 handlers subscribed
+            // and we need to pass request to the other one
+            return handler.onReqRespRequest(req);
+        }
+        return error.NoHandlerSubscribed;
+    }
+};
+
 const MessagePublishWrapper = struct {
     allocator: Allocator,
     handler: OnGossipCbHandler,
