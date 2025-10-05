@@ -57,6 +57,7 @@ pub unsafe fn create_and_run_network(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
+    dbg!(&topics);
 
     let local_private_key_hex = CStr::from_ptr(local_private_key)
         .to_string_lossy()
