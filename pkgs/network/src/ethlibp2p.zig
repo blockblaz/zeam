@@ -160,6 +160,7 @@ pub const EthLibp2p = struct {
     allocator: Allocator,
     gossipHandler: interface.GenericGossipHandler,
     peerEventHandler: interface.PeerEventHandler,
+    reqrespHandler: interface.ReqRespRequestHandler,
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
     logger: zeam_utils.ModuleLogger,
@@ -181,6 +182,9 @@ pub const EthLibp2p = struct {
         const peer_event_handler = try interface.PeerEventHandler.init(allocator, params.networkId, logger);
         errdefer peer_event_handler.deinit();
 
+        const reqresp_handler = try interface.ReqRespRequestHandler.init(allocator, params.networkId, logger);
+        errdefer reqresp_handler.deinit();
+
         return Self{
             .allocator = allocator,
             .params = .{
@@ -192,6 +196,7 @@ pub const EthLibp2p = struct {
             },
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
+            .reqrespHandler = reqresp_handler,
             .logger = logger,
         };
     }
@@ -281,14 +286,21 @@ pub const EthLibp2p = struct {
         return self.gossipHandler.onGossip(data, false);
     }
 
-    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
+    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
         _ = ptr;
         _ = obj;
+        // TODO implement in a followup PR
+        return error.NotImplemented;
     }
 
-    pub fn onReq(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!void {
-        _ = ptr;
-        _ = data;
+    pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.reqrespHandler.onReqRespRequest(data);
+    }
+
+    pub fn subscribeReqResp(ptr: *anyopaque, handler: interface.OnReqRespRequestCbHandler) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.reqrespHandler.subscribe(handler);
     }
 
     pub fn subscribePeerEvents(ptr: *anyopaque, handler: interface.OnPeerEventCbHandler) anyerror!void {
@@ -307,7 +319,8 @@ pub const EthLibp2p = struct {
             .reqresp = .{
                 .ptr = self,
                 .reqRespFn = reqResp,
-                .onReqFn = onReq,
+                .onReqRespRequestFn = onReqRespRequest,
+                .subscribeFn = subscribeReqResp,
             },
             .peers = .{
                 .ptr = self,

@@ -27,8 +27,13 @@ pub const GossipSub = struct {
 pub const ReqResp = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    reqRespFn: *const fn (ptr: *anyopaque, obj: *ReqRespRequest) anyerror!void,
-    onReqFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!void,
+    reqRespFn: *const fn (ptr: *anyopaque, obj: *ReqRespRequest) anyerror!ReqRespResponse,
+    onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!ReqRespResponse,
+    subscribeFn: *const fn (ptr: *anyopaque, handler: OnReqRespRequestCbHandler) anyerror!void,
+
+    pub fn subscribe(self: ReqResp, handler: OnReqRespRequestCbHandler) anyerror!void {
+        return self.subscribeFn(self.ptr, handler);
+    }
 };
 
 pub const PeerEvents = struct {
@@ -205,7 +210,7 @@ pub const OnReqRespRequestCbHandler = struct {
     onReqRespRequestCb: OnReqRespRequestCbType,
     // c: xev.Completion = undefined,
 
-    pub fn onReqRespRequest(self: OnGossipCbHandler, data: *const ReqRespRequest) anyerror!ReqRespResponse {
+    pub fn onReqRespRequest(self: OnReqRespRequestCbHandler, data: *const ReqRespRequest) anyerror!ReqRespResponse {
         return self.onReqRespRequestCb(self.ptr, data);
     }
 };
@@ -230,7 +235,7 @@ pub const ReqRespRequestHandler = struct {
         self.handlers.deinit(self.allocator);
     }
 
-    pub fn subscribe(self: *Self, handler: OnPeerEventCbHandler) !void {
+    pub fn subscribe(self: *Self, handler: OnReqRespRequestCbHandler) !void {
         try self.handlers.append(self.allocator, handler);
     }
 

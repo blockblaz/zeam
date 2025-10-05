@@ -473,7 +473,7 @@ pub const BeamChain = struct {
             .finalized_root = finalized.root,
             .finalized_slot = finalized.slot,
             .head_root = head.blockRoot,
-            .slot = head.slot,
+            .head_slot = head.slot,
         };
     }
 };

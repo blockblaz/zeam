@@ -47,14 +47,27 @@ pub const Mock = struct {
         return self.gossipHandler.onGossip(data, true);
     }
 
-    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!void {
+    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
         _ = ptr;
         _ = obj;
+
+        // TODO implement in a followup PR
+        return error.NotImplemented;
     }
 
-    pub fn onReq(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!void {
+    pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
         _ = ptr;
         _ = data;
+
+        // TODO implement in a followup PR
+        return error.NotImplemented;
+    }
+
+    pub fn subscribeReqResp(ptr: *anyopaque, handler: interface.OnReqRespRequestCbHandler) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        _ = self;
+        _ = handler;
+        // TODO implement in a followup PR
     }
 
     pub fn subscribePeerEvents(ptr: *anyopaque, handler: interface.OnPeerEventCbHandler) anyerror!void {
@@ -73,7 +86,8 @@ pub const Mock = struct {
             .reqresp = .{
                 .ptr = self,
                 .reqRespFn = reqResp,
-                .onReqFn = onReq,
+                .onReqRespRequestFn = onReqRespRequest,
+                .subscribeFn = subscribeReqResp,
             },
             .peers = .{
                 .ptr = self,

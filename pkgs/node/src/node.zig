@@ -121,7 +121,7 @@ pub const BeamNode = struct {
             },
         }
     }
-    pub fn getOnReqRespRequestCbHandler(self: *Self) !networks.OnReqRespCbHandler {
+    pub fn getOnReqRespRequestCbHandler(self: *Self) networks.OnReqRespRequestCbHandler {
         return .{
             .ptr = self,
             .onReqRespRequestCb = onReqRespRequest,
@@ -279,9 +279,11 @@ pub const BeamNode = struct {
         var topics = [_]networks.GossipTopic{ .block, .vote };
         try self.network.backend.gossip.subscribe(&topics, handler);
 
-        // Subscribe to peer events
         const peer_handler = self.getPeerEventHandler();
         try self.network.backend.peers.subscribe(peer_handler);
+
+        const req_handler = self.getOnReqRespRequestCbHandler();
+        try self.network.backend.reqresp.subscribe(req_handler);
 
         const chainOnSlot = try self.getOnIntervalCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
@@ -348,9 +350,6 @@ test "Node peer tracking on connect/disconnect" {
         .logger_config = &logger_config,
     });
     defer node.deinit();
-
-    const peer_handler = node.getPeerEventHandler();
-    try backend.peers.subscribe(peer_handler);
 
     // Verify initial state: 0 peers
     try std.testing.expectEqual(@as(usize, 0), node.connected_peers.count());
