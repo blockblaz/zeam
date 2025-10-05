@@ -49,11 +49,7 @@ pub const Mock = struct {
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest) anyerror!u64 {
         _ = ptr;
-        _ = peer_id;
-        _ = req;
-
-        // TODO implement in a followup PR
-        return error.NotImplemented;
+        _ = obj;
     }
 
     pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
