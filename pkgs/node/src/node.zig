@@ -109,6 +109,19 @@ pub const BeamNode = struct {
         };
     }
 
+    pub fn onReqResp(ptr: *anyopaque, data: *const networks.ReqRespRequest) anyerror!networks.ReqRespResponse {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        switch (data.*) {
+            .block_by_root => {
+                return error.NotImplemented;
+            },
+            .status => {
+                return .{ .status = self.chain.getStatus() };
+            },
+        }
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 

@@ -464,6 +464,18 @@ pub const BeamChain = struct {
     pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
         return self.forkChoice.onAttestation(signedVote, false);
     }
+
+    pub fn getStatus(self: *Self) types.Status {
+        const finalized = self.forkChoice.fcStore.latest_finalized;
+        const head = self.forkChoice.head;
+
+        return .{
+            .finalized_root = finalized.root,
+            .finalized_slot = finalized.slot,
+            .head_root = head.blockRoot,
+            .slot = head.slot,
+        };
+    }
 };
 
 const BlockProcessingError = error{MissingPreState};

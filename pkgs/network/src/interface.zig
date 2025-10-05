@@ -188,9 +188,15 @@ pub const GossipMessage = union(GossipTopic) {
 
 pub const ReqRespMethod = enum {
     block_by_root,
+    status,
 };
 pub const ReqRespRequest = union(ReqRespMethod) {
     block_by_root: types.BlockByRootRequest,
+    status: void,
+};
+pub const ReqRespResponse = union(ReqRespMethod) {
+    block_by_root: []types.BeamBlock,
+    status: types.Status,
 };
 
 const MessagePublishWrapper = struct {
