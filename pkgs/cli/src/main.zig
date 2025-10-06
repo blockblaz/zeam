@@ -76,7 +76,6 @@ pub const NodeCommand = struct {
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     log_filename: []const u8 = "consensus", // Default logger filename
-    log_filepath: []const u8 = "./log", // Default logger filepath
     log_file_active_level: std.log.Level = .debug, //default log file ActiveLevel
     monocolor_file_log: bool = false, //dont log colors in log files
     console_log_level: std.log.Level = .info, //default console log level
@@ -150,7 +149,6 @@ const ZeamArgs = struct {
         .genesis = "Genesis time for the chain",
         .num_validators = "Number of validators",
         .log_filename = "Log Filename",
-        .log_filepath = "Log Filepath - must exist",
         .log_file_active_level = "Log File Active Level, May be separate from console log level",
         .monocolor_file_log = "Dont Log color formatted log in files for use in non color supported editors",
         .console_log_level = "Log Level for console logging",
@@ -172,7 +170,6 @@ pub fn main() !void {
     const genesis = opts.args.genesis;
     const num_validators = opts.args.num_validators;
     const log_filename = opts.args.log_filename;
-    const log_filepath = opts.args.log_filepath;
     const log_file_active_level = opts.args.log_file_active_level;
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
@@ -259,19 +256,11 @@ pub fn main() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            // Ensure log directory exists if log_filepath is not provided or is the default "./log"
-            if (std.mem.eql(u8, log_filepath, "./log")) {
-                var cwd = std.fs.cwd();
-                if (cwd.openDir(log_filepath, .{})) |_| {} else |_| {
-                    cwd.makeDir(log_filepath) catch |err| {
-                        std.debug.print("ERROR : Failed to create log directory: {any}\n", .{err});
-                    };
-                }
-            }
+            try std.fs.cwd().makePath(beamcmd.data_dir);
 
             // Create loggers first so they can be passed to network implementations
-            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
@@ -380,7 +369,8 @@ pub fn main() !void {
             },
         },
         .node => |leancmd| {
-            var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = log_filepath, .fileName = log_filename });
+            try std.fs.cwd().makePath(leancmd.@"data-dir");
+            var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,
