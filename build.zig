@@ -445,6 +445,25 @@ pub fn build(b: *Builder) !void {
     const spectests_step = b.step("spectest", "Run spec tests");
     const run_spectests = b.addRunArtifact(spectests);
     spectests_step.dependOn(&run_spectests.step);
+
+    // Create spectests step (with 's') that builds the transition executable
+    const spectests_build_step = b.step("spectests", "Build spectest transition executable");
+    
+    // Add the transition executable for spectests
+    const transition_exe = b.addExecutable(.{
+        .name = "spectest-transition",
+        .root_source_file = b.path("pkgs/spectest/src/transition.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    transition_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    transition_exe.root_module.addImport("@zeam/types", zeam_types);
+    transition_exe.root_module.addImport("@zeam/params", zeam_params);
+    transition_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    transition_exe.root_module.addImport("ssz", ssz);
+    
+    const install_transition = b.addInstallArtifact(transition_exe, .{});
+    spectests_build_step.dependOn(&install_transition.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
