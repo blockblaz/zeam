@@ -1,0 +1,23 @@
+[package]
+name = "rustglue"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Common dependencies for libp2p bridge
+libc = "0.2"
+futures = "0.3.31"
+tokio = { version = "1", features = ["full"] }
+snap = "1"
+sha2 = "0.9"
+hex = "0.4.3"
+libp2p-mplex = "0.42"
+slog = { version = "2", features = ["max_level_debug", "release_max_level_debug", "nested-values"] }
+
+[dependencies.libp2p]
+version = "0.54"
+default-features = false
+features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]

@@ -14,9 +14,43 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
-// Add the glue libs to a compile target
+// Add the Rust static libraries to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
+    // Fix duplicate Rust runtime symbols by renaming them in the zkVM libraries
+    // This is necessary because each static library includes its own copy of the Rust runtime
+    // TODO: there is a discrepancy between what zkvm targets we support, and what bindings we
+    // have. For the moment, define a second table.
+    const zkvm_prover_libs = [_][]const u8{ "risc0", "openvm" };
+
+    // Loop through each zkVM prover library and fix symbols
+    for (zkvm_prover_libs) |zkvm| {
+        const lib_name = b.fmt("libzeam_{s}.a", .{zkvm});
+        const lib_path = b.fmt("rust/target/release/{s}", .{lib_name});
+
+        std.fs.cwd().access(lib_path, .{}) catch continue;
+
+        const lib_fixed = b.fmt("libzeam_{s}_fixed.a", .{zkvm});
+        const fixed_path = b.fmt("rust/target/release/{s}", .{lib_fixed});
+
+        // Create the shell command to rename symbols dynamically
+        const cmd = b.fmt(
+            \\nm {s} 2>/dev/null | grep -E "T.*___rustc" | awk '{{print $3}}' | 
+            \\while read sym; do 
+            \\  echo "--redefine-sym \"${{sym}}={s}_${{sym}}\""; 
+            \\done | xargs -r objcopy {s} {s}
+        , .{ lib_path, zkvm, lib_path, fixed_path });
+
+        const fix_symbols = b.addSystemCommand(&.{ "sh", "-c", cmd });
+        comp.step.dependOn(&fix_symbols.step);
+
+        // Add the fixed library
+        comp.addObjectFile(b.path(fixed_path));
+    }
+
+    // Add the main rustglue library (doesn't need fixing)
     comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+    // Powdr excluded from build - code kept as reference only
+
     // Add macOS framework linking for CLI tests
     if (target.result.os.tag == .macos) {
         comp.linkFramework("CoreFoundation");
@@ -226,6 +260,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+        cli_exe.want_lto = true;
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);

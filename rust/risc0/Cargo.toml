@@ -1,0 +1,13 @@
+[package]
+name = "zeam-risc0"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zeam_risc0"
+crate-type = ["staticlib"]
+
+[dependencies]
+risc0-zkvm = { version = "3.0.3" }
+serde_cbor = "0.11"
+libc = "0.2"
