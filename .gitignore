@@ -24,3 +24,6 @@ prometheus.yml
 # Data files (RocksDB)
 data/
 .DS_Store
+
+# VSCode files
+.vscode/

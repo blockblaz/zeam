@@ -81,10 +81,6 @@ pub const BeamNode = struct {
             .logger = opts.logger_config.logger(.node),
             .connected_peers = connected_peers,
         };
-
-        // Subscribe to peer events
-        const peer_handler = self.getPeerEventHandler();
-        try opts.backend.peers.subscribe(peer_handler);
     }
 
     pub fn deinit(self: *Self) void {
@@ -263,6 +259,10 @@ pub const BeamNode = struct {
         const handler = try self.getOnGossipCbHandler();
         var topics = [_]networks.GossipTopic{ .block, .vote };
         try self.network.backend.gossip.subscribe(&topics, handler);
+
+        // Subscribe to peer events
+        const peer_handler = self.getPeerEventHandler();
+        try self.network.backend.peers.subscribe(peer_handler);
 
         const chainOnSlot = try self.getOnIntervalCbWrapper();
         try self.clock.subscribeOnSlot(chainOnSlot);
