@@ -14,9 +14,13 @@ const database = @import("@zeam/database");
 const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
+
+const node = @import("./node.zig");
+const PeerInfo = node.PeerInfo;
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -65,11 +69,13 @@ pub const BeamChain = struct {
     // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam)
     last_emitted_justified_slot: u64 = 0,
     last_emitted_finalized_slot: u64 = 0,
+    connected_peers: *const std.StringHashMap(PeerInfo),
 
     const Self = @This();
     pub fn init(
         allocator: Allocator,
         opts: ChainOpts,
+        connected_peers: *const std.StringHashMap(PeerInfo),
     ) !Self {
         const logger_config = opts.logger_config;
         const fork_choice = try fcFactory.ForkChoice.init(allocator, opts.config, opts.anchorState.*, logger_config.logger(.forkchoice));
@@ -93,6 +99,7 @@ pub const BeamChain = struct {
             .db = opts.db,
             .last_emitted_justified_slot = 0,
             .last_emitted_finalized_slot = 0,
+            .connected_peers = connected_peers,
         };
     }
 
@@ -140,9 +147,9 @@ pub const BeamChain = struct {
         try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
             // interval to vote so we should put out the chain status information to the user along with
-            // latest head which most likely should be the new block recieved and processed
+            // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
-            self.printSlot(islot);
+            self.printSlot(islot, self.connected_peers.count());
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
@@ -177,11 +184,20 @@ pub const BeamChain = struct {
             },
         };
 
-        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={any}", .{ self.nodeId, opts, block });
+        var block_json = try block.toJson(self.allocator);
+        const block_str = try jsonToString(self.allocator, block_json);
+        defer self.allocator.free(block_str);
+
+        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
-        self.module_logger.debug("applied raw block opts={any} raw block={any}", .{ opts, block });
+
+        block_json = try block.toJson(self.allocator);
+        const block_str_2 = try jsonToString(self.allocator, block_json);
+        defer self.allocator.free(block_str_2);
+
+        self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -211,9 +227,9 @@ pub const BeamChain = struct {
         return vote;
     }
 
-    pub fn printSlot(self: *Self, islot: isize) void {
+    pub fn printSlot(self: *Self, islot: isize, peer_count: usize) void {
         // head should be auto updated if receieved a block or block proposal done
-        // however it doesn't get updated unless called updatehead even though processs block
+        // however it doesn't get updated unless called updatehead even though process block
         // logs show it has been updated. debug and fix the call below
         const fc_head = if (islot > 0)
             self.forkChoice.updateHead() catch |err| {
@@ -237,6 +253,8 @@ pub const BeamChain = struct {
             \\+===============================================================+
             \\  CHAIN STATUS: Current Slot: {d} | Head Slot: {d} | Behind: {d}
             \\+---------------------------------------------------------------+
+            \\  Connected Peers:    {d}
+            \\+---------------------------------------------------------------+
             \\  Head Block Root:    0x{any}
             \\  Parent Block Root:  0x{any}
             \\  State Root:         0x{any}
@@ -250,6 +268,7 @@ pub const BeamChain = struct {
             islot,
             fc_head.slot,
             blocks_behind,
+            peer_count,
             std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
             std.fmt.fmtSliceHexLower(&fc_head.parentRoot),
             std.fmt.fmtSliceHexLower(&fc_head.stateRoot),
@@ -270,9 +289,15 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
+                const signed_block_json = try signed_block.toJson(self.allocator);
+
+                // Convert JSON value to string for proper logging
+                const signed_block_str = try jsonToString(self.allocator, signed_block_json);
+                defer self.allocator.free(signed_block_str);
+
                 self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
                     //
-                    signed_block,
+                    signed_block_str,
                     block_root,
                     hasBlock,
                 });
@@ -290,9 +315,15 @@ pub const BeamChain = struct {
             .vote => |signed_vote| {
                 const vote = signed_vote.message;
                 const hasHead = self.forkChoice.hasBlock(vote.head.root);
+                const signed_vote_json = try signed_vote.toJson(self.allocator);
+
+                // Convert JSON value to string for proper logging
+                const signed_vote_str = try jsonToString(self.allocator, signed_vote_json);
+                defer self.allocator.free(signed_vote_str);
+
                 self.module_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
                     //
-                    signed_vote,
+                    signed_vote_str,
                     hasHead,
                 });
 
@@ -463,7 +494,10 @@ test "process and add mock blocks into a node's chain" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
     defer beam_chain.deinit();
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
@@ -538,7 +572,7 @@ test "printSlot output demonstration" {
     defer db.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db });
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db }, &std.StringHashMap(PeerInfo).init(allocator));
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
@@ -555,16 +589,16 @@ test "printSlot output demonstration" {
 
     // Test printSlot at different slots to see the output
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
-    beam_chain.printSlot(0);
+    beam_chain.printSlot(0, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
-    beam_chain.printSlot(1);
+    beam_chain.printSlot(1, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
-    beam_chain.printSlot(2);
+    beam_chain.printSlot(2, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
-    beam_chain.printSlot(5);
+    beam_chain.printSlot(5, beam_chain.connected_peers.count());
 
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);

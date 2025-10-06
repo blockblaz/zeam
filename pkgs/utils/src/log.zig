@@ -354,7 +354,7 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
 pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?std.fs.File {
     // try to create/open a file
     // do not close here .. will be closed when log file is rotated and new log file is created
-    // directory must exist already - if dir does not exist we will not write - default ./log is created in main() not here
+    // directory must exist already - if dir does not exist log will not write
 
     var dir = std.fs.cwd().openDir(filePath, .{}) catch |err| {
         std.debug.print("ERROR: Failed to open directory '{s}': {any}\n", .{ filePath, err });

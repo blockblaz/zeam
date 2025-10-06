@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json = std.json;
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
@@ -30,9 +31,20 @@ pub const ReqResp = struct {
     onReqFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!void,
 };
 
+pub const PeerEvents = struct {
+    // ptr to the implementation
+    ptr: *anyopaque,
+    subscribeFn: *const fn (ptr: *anyopaque, handler: OnPeerEventCbHandler) anyerror!void,
+
+    pub fn subscribe(self: PeerEvents, handler: OnPeerEventCbHandler) anyerror!void {
+        return self.subscribeFn(self.ptr, handler);
+    }
+};
+
 pub const NetworkInterface = struct {
     gossip: GossipSub,
     reqresp: ReqResp,
+    peers: PeerEvents,
 };
 
 const OnGossipCbType = *const fn (*anyopaque, *const GossipMessage) anyerror!void;
@@ -154,6 +166,24 @@ pub const GossipMessage = union(GossipTopic) {
 
         return cloned_data;
     }
+
+    pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
+        return switch (self.*) {
+            .block => |block| block.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert block to JSON: {any}", .{e});
+                return e;
+            },
+            .vote => |vote| vote.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert vote to JSON: {any}", .{e});
+                return e;
+            },
+        };
+    }
+
+    pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
+        const message_json = try self.toJson(allocator);
+        return zeam_utils.jsonToString(allocator, message_json);
+    }
 };
 
 pub const ReqRespMethod = enum {
@@ -189,6 +219,65 @@ const MessagePublishWrapper = struct {
     fn deinit(self: *Self) void {
         self.allocator.destroy(self.data);
         self.allocator.destroy(self);
+    }
+};
+
+pub const OnPeerEventCbType = *const fn (*anyopaque, peer_id: []const u8) anyerror!void;
+pub const OnPeerEventCbHandler = struct {
+    ptr: *anyopaque,
+    onPeerConnectedCb: OnPeerEventCbType,
+    onPeerDisconnectedCb: OnPeerEventCbType,
+
+    pub fn onPeerConnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
+        return self.onPeerConnectedCb(self.ptr, peer_id);
+    }
+
+    pub fn onPeerDisconnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
+        return self.onPeerDisconnectedCb(self.ptr, peer_id);
+    }
+};
+
+pub const PeerEventHandler = struct {
+    allocator: Allocator,
+    handlers: std.ArrayListUnmanaged(OnPeerEventCbHandler),
+    networkId: u32,
+    logger: zeam_utils.ModuleLogger,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+        return Self{
+            .allocator = allocator,
+            .handlers = .empty,
+            .networkId = networkId,
+            .logger = logger,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.handlers.deinit(self.allocator);
+    }
+
+    pub fn subscribe(self: *Self, handler: OnPeerEventCbHandler) !void {
+        try self.handlers.append(self.allocator, handler);
+    }
+
+    pub fn onPeerConnected(self: *Self, peer_id: []const u8) anyerror!void {
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}, handlers={d}", .{ self.networkId, peer_id, self.handlers.items.len });
+        for (self.handlers.items) |handler| {
+            handler.onPeerConnected(peer_id) catch |e| {
+                self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
+            };
+        }
+    }
+
+    pub fn onPeerDisconnected(self: *Self, peer_id: []const u8) anyerror!void {
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}, handlers={d}", .{ self.networkId, peer_id, self.handlers.items.len });
+        for (self.handlers.items) |handler| {
+            handler.onPeerDisconnected(peer_id) catch |e| {
+                self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
+            };
+        }
     }
 };
 
