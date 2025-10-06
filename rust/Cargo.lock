@@ -1293,6 +1293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delay_map"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88e365f083a5cb5972d50ce8b1b2c9f125dc5ec0f50c0248cfb568ae59efcf0b"
+dependencies = [
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2916,6 +2927,7 @@ dependencies = [
  "libp2p-ping",
  "libp2p-plaintext",
  "libp2p-quic",
+ "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -3210,6 +3222,26 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "libp2p-request-response"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1356c9e376a94a75ae830c42cdaea3d4fe1290ba409a22c809033d1b7dcab0a6"
+dependencies = [
+ "async-trait",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.5",
+ "smallvec",
+ "tracing",
+ "void",
+ "web-time",
 ]
 
 [[package]]
@@ -6181,9 +6213,12 @@ dependencies = [
 name = "rustglue"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
+ "delay_map",
  "futures",
  "hex",
+ "lazy_static",
  "libp2p",
  "libp2p-mplex",
  "openvm",
@@ -6986,6 +7021,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
