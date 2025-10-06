@@ -27,12 +27,16 @@ pub const GossipSub = struct {
 pub const ReqResp = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    reqRespFn: *const fn (ptr: *anyopaque, obj: *ReqRespRequest) anyerror!ReqRespResponse,
+    sendRequestFn: *const fn (ptr: *anyopaque, peer_id: []const u8, req: *const ReqRespRequest) anyerror!u64,
     onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!ReqRespResponse,
     subscribeFn: *const fn (ptr: *anyopaque, handler: OnReqRespRequestCbHandler) anyerror!void,
 
     pub fn subscribe(self: ReqResp, handler: OnReqRespRequestCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, handler);
+    }
+
+    pub fn send_request(self: ReqResp, peer_id: []const u8, req: *const ReqRespRequest) anyerror!void {
+        return self.sendReqesutFn(self.ptr, peer_id, req);
     }
 };
 
@@ -197,11 +201,37 @@ pub const ReqRespMethod = enum {
 };
 pub const ReqRespRequest = union(ReqRespMethod) {
     block_by_root: types.BlockByRootRequest,
-    status: void,
+    status: types.Status,
 };
 pub const ReqRespResponse = union(ReqRespMethod) {
     block_by_root: []types.BeamBlock,
     status: types.Status,
+};
+pub const ReqRespRequestCallback = struct {
+    response_data: ?[]const u8,
+    response_code: u32,
+    allocator: Allocator,
+
+    pub fn deinit(self: *ReqRespRequestCallback) void {
+        if (self.response_data) |data| {
+            self.allocator.free(data);
+        }
+    }
+
+    pub fn onRPCResponse(self: *ReqRespRequestCallback, data: ?[]const u8, code: u32) void {
+        self.response_data = data;
+        self.response_code = code;
+    }
+};
+
+const OnReqRespResponseCbType = *const fn (*anyopaque, *const ReqRespResponse) anyerror!void;
+pub const OnReqRespResponseCbHandler = struct {
+    ptr: *anyopaque,
+    onReqRespResponseCb: OnReqRespResponseCbType,
+
+    pub fn onReqRespResponse(self: OnReqRespResponseCbHandler, data: *const ReqRespResponse) anyerror!void {
+        return self.onReqRespResponseCb(self.ptr, data);
+    }
 };
 
 const OnReqRespRequestCbType = *const fn (*anyopaque, *const ReqRespRequest) anyerror!ReqRespResponse;

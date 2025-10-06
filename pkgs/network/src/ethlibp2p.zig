@@ -145,8 +145,26 @@ export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: 
     zig_handler.allocator.free(private_key_slice);
 }
 
-pub extern fn create_and_run_network(network_id: u32, handle: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void;
-pub extern fn publish_msg_to_rust_bridge(networkId: u32, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void;
+pub extern fn create_and_run_network(
+    network_id: u32,
+    handle: *EthLibp2p,
+    local_private_key: [*:0]const u8,
+    listen_addresses: [*:0]const u8,
+    connect_addresses: [*:0]const u8,
+    topics: [*:0]const u8,
+) void;
+pub extern fn publish_msg_to_rust_bridge(
+    networkId: u32,
+    topic_str: [*:0]const u8,
+    message_ptr: [*]const u8,
+    message_len: usize,
+) void;
+pub extern fn send_rpc_request(
+    networkId: u32,
+    peer_id: [*:0]const u8,
+    request_ptr: [*]const u8,
+    request_len: usize,
+) callconv(.c) u64;
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -163,6 +181,7 @@ pub const EthLibp2p = struct {
     reqrespHandler: interface.ReqRespRequestHandler,
     params: EthLibp2pParams,
     rustBridgeThread: ?Thread = null,
+    rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
@@ -197,6 +216,7 @@ pub const EthLibp2p = struct {
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
             .reqrespHandler = reqresp_handler,
+            .rpcCallbacks = std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback).empty,
             .logger = logger,
         };
     }
@@ -214,6 +234,12 @@ pub const EthLibp2p = struct {
         }
 
         self.allocator.free(self.params.network_name);
+
+        var it = self.rpcCallbacks.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.rpcCallbacks.deinit(self.allocator);
     }
 
     pub fn run(self: *Self) !void {
@@ -286,11 +312,29 @@ pub const EthLibp2p = struct {
         return self.gossipHandler.onGossip(data, false);
     }
 
-    pub fn reqResp(ptr: *anyopaque, obj: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
-        _ = ptr;
-        _ = obj;
-        // TODO implement in a followup PR
-        return error.NotImplemented;
+    pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest) !u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const peer_id_cstr = try self.allocator.dupeZ(u8, peer_id);
+        defer self.allocator.free(peer_id_cstr);
+
+        const encoded_message = switch (req.*) {
+            .status => |status_req| statusbytes: {
+                var serialized = std.ArrayList(u8).init(self.allocator);
+                try ssz.serialize(types.Status, status_req, &serialized);
+
+                break :statusbytes try serialized.toOwnedSlice();
+            },
+            .block_by_root => |_| {
+                return error.NotImplemented;
+            },
+        };
+
+        defer self.allocator.free(encoded_message);
+
+        const compressed_message = try snappyz.encode(self.allocator, encoded_message);
+        defer self.allocator.free(compressed_message);
+        return send_rpc_request(self.params.networkId, peer_id_cstr.ptr, compressed_message.ptr, compressed_message.len);
     }
 
     pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
@@ -318,7 +362,7 @@ pub const EthLibp2p = struct {
             },
             .reqresp = .{
                 .ptr = self,
-                .reqRespFn = reqResp,
+                .sendRequestFn = sendRequest,
                 .onReqRespRequestFn = onReqRespRequest,
                 .subscribeFn = subscribeReqResp,
             },

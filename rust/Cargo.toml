@@ -15,6 +15,9 @@ slog = { version = "2", features = ["max_level_debug", "release_max_level_debug"
 snap = "1"
 sha2 = "0.9"
 hex = "0.4.3"
+async-trait = "0.1.86"
+lazy_static = "1.5.0"
+delay_map = "0.4.1"
 openvm-platform = { package = "openvm", git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0", features = ["std"] }
 openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" }
 openvm-build = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" }
@@ -24,7 +27,7 @@ openvm-transpiler = { git = "https://github.com/openvm-org/openvm.git", tag = "v
 [dependencies.libp2p]
 version = "0.54"
 default-features = false
-features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]
+features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub","request-response"]
 
 [lib]
 crate-type = ["staticlib"]

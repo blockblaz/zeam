@@ -5,7 +5,9 @@ use libp2p::core::{
 };
 
 use libp2p::identity::{secp256k1, Keypair};
+use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::StreamProtocol;
 use libp2p::{
     core, gossipsub, identify, identity, noise, ping, yamux, PeerId, SwarmBuilder, Transport,
 };
@@ -17,6 +19,13 @@ use sha2::Digest;
 use snap::raw::Decoder;
 use std::ffi::{CStr, CString};
 
+use delay_map::HashMapDelay;
+use futures::future::poll_fn;
+use futures::Stream;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 // TODO: protect the access by mutex
@@ -25,6 +34,14 @@ static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 // a hack to start a second network for self testing purposes
 #[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+
+lazy_static::lazy_static! {
+    static ref REQUEST_ID_MAP: Mutex<HashMapDelay<OutboundRequestId, u64>> = Mutex::new(HashMapDelay::new(Duration::from_secs(10)));
+    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, request_response::ResponseChannel<Vec<u8>>>> = Mutex::new(HashMap::new());
+}
+
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// # Safety
 ///
@@ -142,6 +159,89 @@ pub unsafe fn publish_msg_to_rust_bridge(
     }
 }
 
+/// # Safety
+///
+/// The caller must ensure that `peer_id` points to a valid null-terminated C string.
+/// The caller must ensure that `request_data` points to valid memory of `request_len` bytes.
+#[no_mangle]
+pub unsafe fn send_rpc_request(
+    network_id: u32,
+    peer_id: *const c_char,
+    request_data: *const u8,
+    request_len: usize,
+) -> u64 {
+    let peer_id_str = CStr::from_ptr(peer_id).to_string_lossy().to_string();
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Invalid peer ID: {}", e);
+            return 0;
+        }
+    };
+
+    let request_slice = std::slice::from_raw_parts(request_data, request_len);
+    let request_bytes = request_slice.to_vec();
+
+    #[allow(static_mut_refs)]
+    let swarm = if network_id < 1 {
+        SWARM_STATE.as_mut().unwrap()
+    } else {
+        SWARM_STATE1.as_mut().unwrap()
+    };
+
+    let libp2p_request_id = swarm
+        .behaviour_mut()
+        .reqresp
+        .send_request(&peer_id, request_bytes);
+
+    let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+
+    REQUEST_ID_MAP
+        .lock()
+        .unwrap()
+        .insert(libp2p_request_id, request_id);
+
+    println!(
+        "reqresp:: Sent request to {} (id: {:?})",
+        peer_id, request_id
+    );
+
+    request_id
+}
+
+/// # Safety
+/// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
+/// The caller must ensure that `channel_id` corresponds to a valid response channel.
+pub unsafe fn send_rpc_response(
+    network_id: u32,
+    channel_id: u64,
+    response_data: *const u8,
+    response_len: usize,
+) {
+    let response_slice = std::slice::from_raw_parts(response_data, response_len);
+    let response_bytes = response_slice.to_vec();
+    let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+    if let Some(channel) = response_map.remove(&channel_id) {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
+        } else {
+            SWARM_STATE1.as_mut().unwrap()
+        };
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .reqresp
+            .send_response(channel, response_bytes)
+        {
+            eprintln!("Failed to send response: {:?}", e);
+        } else {
+            println!("Sent response on channel {}", channel_id);
+        }
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
 extern "C" {
     fn handleMsgFromRustBridge(
         zig_handler: u64,
@@ -240,84 +340,174 @@ impl Network {
         };
 
         loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("\nListening on {address:?}\n");
+            tokio::select! {
+
+            Some(timeout_result) = poll_fn(|cx| {
+                let mut map = REQUEST_ID_MAP.lock().unwrap();
+                std::pin::Pin::new(&mut *map).poll_next(cx)
+            }) => {
+                match timeout_result {
+                    Ok((libp2p_id, request_id)) => {
+                        println!(
+                            "reqresp:: Request {} (libp2p_id: {:?}) timed out after 10 seconds",
+                            request_id, libp2p_id
+                        );
+
+                        // unsafe {
+                        //     handleReqRespResult(
+                        //         self.zig_handler,
+                        //         request_id,
+                        //         1, // Timeout error code
+                        //         std::ptr::null(),
+                        //         0,
+                        //     );
+                        // }
+                    }
+                    Err(e) => {
+                        eprintln!("reqresp:: Error in delay map: {}", e);
+                    }
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    let peer_id = peer_id.to_string();
-                    let peer_id = peer_id.as_str();
-                    println!(
-                        "\nrustbridge{}:: Connection established with peer: {}\n",
-                        self.network_id, peer_id
-                    );
-                    let peer_id_cstr = match CString::new(peer_id) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_peer_id_string={}",
+            }
+
+                event = swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("\nListening on {address:?}\n");
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            let peer_id = peer_id.to_string();
+                            let peer_id = peer_id.as_str();
+                            println!(
+                                "\nrustbridge{}:: Connection established with peer: {}\n",
                                 self.network_id, peer_id
                             );
-                            continue;
+                            let peer_id_cstr = match CString::new(peer_id) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_peer_id_string={}",
+                                        self.network_id, peer_id
+                                    );
+                                    continue;
+                                }
+                            };
+                            unsafe {
+                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                            };
                         }
-                    };
-                    unsafe {
-                        handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
-                    };
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    let peer_id = peer_id.to_string();
-                    let peer_id = peer_id.as_str();
-                    println!(
-                        "\nrustbridge{}:: Connection closed with peer: {}\n",
-                        self.network_id, peer_id
-                    );
-                    let peer_id_cstr = match CString::new(peer_id) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_peer_id_string={}",
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            let peer_id = peer_id.to_string();
+                            let peer_id = peer_id.as_str();
+                            println!(
+                                "\nrustbridge{}:: Connection closed with peer: {}\n",
                                 self.network_id, peer_id
                             );
-                            continue;
+                            let peer_id_cstr = match CString::new(peer_id) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_peer_id_string={}",
+                                        self.network_id, peer_id
+                                    );
+                                    continue;
+                                }
+                            };
+                            unsafe {
+                                handlePeerDisconnectedFromRustBridge(
+                                    self.zig_handler,
+                                    peer_id_cstr.as_ptr(),
+                                )
+                            };
                         }
-                    };
-                    unsafe {
-                        handlePeerDisconnectedFromRustBridge(
-                            self.zig_handler,
-                            peer_id_cstr.as_ptr(),
-                        )
-                    };
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    message,
-                    ..
-                })) => {
-                    let topic = message.topic.as_str();
-                    let topic = match CString::new(topic) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_topic_string={}",
-                                self.network_id, topic
+                        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            message,
+                            ..
+                        })) => {
+                            let topic = message.topic.as_str();
+                            let topic = match CString::new(topic) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_topic_string={}",
+                                        self.network_id, topic
+                                    );
+                                    continue;
+                                }
+                            };
+                            let topic = topic.as_ptr();
+
+                            let message_ptr = message.data.as_ptr();
+                            let message_len = message.data.len();
+
+                            unsafe {
+                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
+                            };
+                            println!(
+                                "\nrustbridge{0}:: zig callback completed\n",
+                                self.network_id
                             );
-                            return;
                         }
-                    };
-                    let topic = topic.as_ptr();
+                        SwarmEvent::Behaviour(BehaviourEvent::Reqresp(
+                            request_response::Event::Message { peer, message },
+                        )) => match message {
+                            request_response::Message::Request {
+                                request_id: _,
+                                request,
+                                channel,
+                            } => {
+                                println!(
+                                    "reqresp:: Received request from {} ({} bytes)",
+                                    peer,
+                                    request.len()
+                                );
 
-                    let message_ptr = message.data.as_ptr();
-                    let message_len = message.data.len();
+                                let channel_id = RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(channel_id, channel);
 
-                    unsafe {
-                        handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
-                    };
-                    println!(
-                        "\nrustbridge{0}:: zig callback completed\n",
-                        self.network_id
-                    );
+                                // unsafe {
+                                //     handleReqRespRequest(
+                                //         self.zig_handler,
+                                //         channel_id,
+                                //         request.as_ptr(),
+                                //         request.len(),
+                                //     );
+                                // }
+                            }
+                            request_response::Message::Response {
+                                request_id,
+                                response,
+                            } => {
+                                let maybe_request_id = REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                if let Some(mapped_id) = maybe_request_id {
+                                    println!(
+                                        "reqresp:: Received response from {} for request id {} ({} bytes)",
+                                        peer,
+                                        mapped_id,
+                                        response.len()
+                                    );
+
+                                    // unsafe {
+                                    //     handleReqRespResult(
+                                    //         self.zig_handler,
+                                    //         mapped_id,
+                                    //         0, // success
+                                    //         response.as_ptr(),
+                                    //         response.len(),
+                                    //     );
+                                    // }
+                                } else {
+                                    println!(
+                                        "reqresp:: Received response from {} for unknown request id {:?} ({} bytes)",
+                                        peer,
+                                        request_id,
+                                        response.len()
+                                    );
+                                }
+                            }
+                        },
+                        e => println!("{e:?}"),
+                    }
                 }
-                e => println!("{e:?}"),
             }
         }
     }
@@ -328,6 +518,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
+    reqresp: request_response::Behaviour<BytesCodec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -389,6 +580,20 @@ impl Behaviour {
             gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
                 .unwrap();
 
+        let reqresp = {
+            let protocols = vec![
+                "/leanconsensus/req/status/1/ssz_snappy",
+                "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy",
+            ]
+            .into_iter()
+            .map(|protocol| (StreamProtocol::new(protocol), ProtocolSupport::Full));
+
+            let cfg =
+                request_response::Config::default().with_request_timeout(Duration::from_secs(10));
+
+            request_response::Behaviour::new(protocols, cfg)
+        };
+
         Self {
             identify: identify::Behaviour::new(identify::Config::new(
                 "/ipfs/0.1.0".into(),
@@ -396,6 +601,7 @@ impl Behaviour {
             )),
             ping: ping::Behaviour::default(),
             gossipsub,
+            reqresp,
         }
     }
 }
@@ -483,6 +689,72 @@ fn strip_peer_id(addr: &mut Multiaddr) {
         Some(Protocol::P2p(_)) => {}
         Some(other) => addr.push(other),
         _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BytesCodec;
+
+#[async_trait::async_trait]
+impl request_response::Codec for BytesCodec {
+    type Protocol = StreamProtocol;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: futures::AsyncRead + Unpin + Send,
+    {
+        use futures::AsyncReadExt;
+        let mut data = Vec::new();
+        io.read_to_end(&mut data).await?;
+        Ok(data)
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: futures::AsyncRead + Unpin + Send,
+    {
+        use futures::AsyncReadExt;
+        let mut data = Vec::new();
+        io.read_to_end(&mut data).await?;
+        Ok(data)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> std::io::Result<()>
+    where
+        T: futures::AsyncWrite + Unpin + Send,
+    {
+        use futures::AsyncWriteExt;
+        io.write_all(&req).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> std::io::Result<()>
+    where
+        T: futures::AsyncWrite + Unpin + Send,
+    {
+        use futures::AsyncWriteExt;
+        io.write_all(&res).await?;
+        io.close().await
     }
 }
 
