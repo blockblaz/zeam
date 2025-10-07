@@ -212,13 +212,13 @@ const VoteTracker = struct {
 
 pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
-    anchorState: types.BeamState,
+    anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
 };
 
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
-    anchorState: types.BeamState,
+    anchorState: *const types.BeamState,
     config: configs.ChainConfig,
     fcStore: ForkChoiceStore,
     allocator: Allocator,
@@ -234,7 +234,7 @@ pub const ForkChoice = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
-        const anchor_block_header = try stf.genStateBlockHeader(allocator, opts.anchorState);
+        const anchor_block_header = try stf.genStateBlockHeader(allocator, opts.anchorState.*);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
             types.BeamBlockHeader,
@@ -607,7 +607,7 @@ test "forkchoice block tree" {
     const module_logger = zeam_logger_config.logger(.forkchoice);
     var fork_choice = try ForkChoice.init(allocator, .{
         .config = chain_config,
-        .anchorState = beam_state,
+        .anchorState = &beam_state,
         .logger = module_logger,
     });
 

@@ -72,7 +72,7 @@ pub const BeamChain = struct {
         const logger_config = opts.logger_config;
         const fork_choice = try fcFactory.ForkChoice.init(allocator, .{
             .config = opts.config,
-            .anchorState = opts.anchorState.*,
+            .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
         });
 
