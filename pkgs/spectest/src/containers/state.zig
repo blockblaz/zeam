@@ -273,3 +273,210 @@ test "test_with_justifications_deterministic_order" {
         try std.testing.expect(vote);
     }
 }
+
+// Helper function to create votes array with specific indices set to True
+fn createVotes(allocator: Allocator, true_indices: []const usize, total_count: usize) ![]u8 {
+    const votes = try allocator.alloc(u8, total_count);
+    @memset(votes, 0); // Initialize all to False
+
+    for (true_indices) |idx| {
+        if (idx < total_count) {
+            votes[idx] = 1; // Set to True
+        }
+    }
+
+    return votes;
+}
+
+// Helper function to verify roundtrip equality
+fn verifyRoundtrip(allocator: Allocator, base_state: *types.BeamState, original_justifications: *std.AutoHashMapUnmanaged(types.Root, []u8)) !void {
+    // Flatten the provided map into the state
+    try base_state.withJustifications(allocator, original_justifications);
+
+    // Reconstruct the map from the flattened representation
+    var reconstructed_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer {
+        var it = reconstructed_map.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.value_ptr.*);
+        }
+        reconstructed_map.deinit(allocator);
+    }
+    try base_state.getJustification(allocator, &reconstructed_map);
+
+    // Verify the maps have the same number of entries
+    try std.testing.expectEqual(original_justifications.count(), reconstructed_map.count());
+
+    // Verify each entry matches (the implementation should handle sorting internally)
+    var original_it = original_justifications.iterator();
+    while (original_it.next()) |original_entry| {
+        const reconstructed_votes = reconstructed_map.get(original_entry.key_ptr.*);
+        try std.testing.expect(reconstructed_votes != null);
+
+        const original_votes = original_entry.value_ptr.*;
+        const reconstructed_slice = reconstructed_votes.?;
+
+        try std.testing.expectEqual(original_votes.len, reconstructed_slice.len);
+        for (original_votes, reconstructed_slice) |orig, recon| {
+            try std.testing.expectEqual(orig, recon);
+        }
+    }
+}
+
+test "test_justifications_roundtrip_empty" {
+    const allocator = std.testing.allocator;
+    var base_state = baseState(allocator);
+    defer base_state.deinit();
+
+    // Empty justifications map
+    var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer justifications_map.deinit(allocator);
+
+    try verifyRoundtrip(allocator, &base_state, &justifications_map);
+}
+
+test "test_justifications_roundtrip_single_root" {
+    const allocator = std.testing.allocator;
+    var base_state = baseState(allocator);
+    defer base_state.deinit();
+
+    const root1: types.Root = [_]u8{1} ** 32;
+    const true_indices = [_]usize{0};
+    const votes1 = try createVotes(allocator, &true_indices, base_state.config.num_validators);
+    defer allocator.free(votes1);
+
+    var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer justifications_map.deinit(allocator);
+    try justifications_map.put(allocator, root1, votes1);
+
+    try verifyRoundtrip(allocator, &base_state, &justifications_map);
+}
+
+test "test_justifications_roundtrip_multiple_roots_sorted" {
+    const allocator = std.testing.allocator;
+    var base_state = baseState(allocator);
+    defer base_state.deinit();
+
+    const root1: types.Root = [_]u8{1} ** 32;
+    const root2: types.Root = [_]u8{2} ** 32;
+
+    const true_indices_1 = [_]usize{0};
+    const true_indices_2 = [_]usize{ 1, 2 };
+    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(votes1);
+    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(votes2);
+
+    var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer justifications_map.deinit(allocator);
+    // Insert in sorted order
+    try justifications_map.put(allocator, root1, votes1);
+    try justifications_map.put(allocator, root2, votes2);
+
+    try verifyRoundtrip(allocator, &base_state, &justifications_map);
+}
+
+test "test_justifications_roundtrip_multiple_roots_unsorted" {
+    const allocator = std.testing.allocator;
+    var base_state = baseState(allocator);
+    defer base_state.deinit();
+
+    const root1: types.Root = [_]u8{1} ** 32;
+    const root2: types.Root = [_]u8{2} ** 32;
+
+    const true_indices_1 = [_]usize{0};
+    const true_indices_2 = [_]usize{ 1, 2 };
+    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(votes1);
+    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(votes2);
+
+    var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer justifications_map.deinit(allocator);
+    // Insert in unsorted order (root2 first, then root1)
+    try justifications_map.put(allocator, root2, votes2);
+    try justifications_map.put(allocator, root1, votes1);
+
+    try verifyRoundtrip(allocator, &base_state, &justifications_map);
+}
+
+test "test_justifications_roundtrip_complex_unsorted" {
+    const allocator = std.testing.allocator;
+    var base_state = baseState(allocator);
+    defer base_state.deinit();
+
+    const root1: types.Root = [_]u8{1} ** 32;
+    const root2: types.Root = [_]u8{2} ** 32;
+    const root3: types.Root = [_]u8{3} ** 32;
+
+    const true_indices_1 = [_]usize{0};
+    const true_indices_2 = [_]usize{ 1, 2 };
+    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(votes1);
+    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(votes2);
+
+    // votes3: all validators vote True (unanimous)
+    const votes3 = try allocator.alloc(u8, base_state.config.num_validators);
+    defer allocator.free(votes3);
+    @memset(votes3, 1);
+
+    var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+    defer justifications_map.deinit(allocator);
+    // Insert in unsorted order (root3, root1, root2)
+    try justifications_map.put(allocator, root3, votes3);
+    try justifications_map.put(allocator, root1, votes1);
+    try justifications_map.put(allocator, root2, votes2);
+
+    try verifyRoundtrip(allocator, &base_state, &justifications_map);
+}
+
+test "test_generate_genesis" {
+    const allocator = std.testing.allocator;
+
+    // Create a sample config for testing
+    const sample_config = types.BeamStateConfig{
+        .num_validators = 64,
+        .genesis_time = 1000,
+    };
+
+    // Create genesis spec
+    const genesis_spec = types.GenesisSpec{
+        .num_validators = sample_config.num_validators,
+        .genesis_time = sample_config.genesis_time,
+    };
+
+    // Produce a genesis state from the sample config
+    var state: types.BeamState = undefined;
+    try state.genGenesisState(allocator, genesis_spec);
+    defer state.deinit();
+
+    // Config in state should match the input
+    try std.testing.expectEqual(sample_config.num_validators, state.config.num_validators);
+    try std.testing.expectEqual(sample_config.genesis_time, state.config.genesis_time);
+
+    // Slot should start at 0
+    try std.testing.expectEqual(@as(u64, 0), state.slot);
+
+    // Body root must commit to an empty body at genesis
+    var expected_body = types.BeamBlockBody{
+        .attestations = try types.SignedVotes.init(allocator),
+    };
+    defer expected_body.deinit();
+
+    var expected_body_root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.BeamBlockBody, expected_body, &expected_body_root, allocator);
+
+    try std.testing.expectEqual(expected_body_root, state.latest_block_header.body_root);
+
+    var hex_buf: [64]u8 = undefined;
+    const hex_string = try std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&state.latest_block_header.body_root)});
+    // Check against body root generated by python spec test for empty body root
+    try std.testing.expectEqualStrings("dba9671bac9513c9482f1416a53aabd2c6ce90d5a5f865ce5a55c775325c9136", hex_string);
+
+    // History and justifications must be empty initially
+    try std.testing.expectEqual(@as(usize, 0), state.historical_block_hashes.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_roots.len());
+    try std.testing.expectEqual(@as(usize, 0), state.justifications_validators.len());
+}

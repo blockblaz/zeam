@@ -1,8 +1,10 @@
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 const configs = @import("@zeam/configs");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
+const jsonToString = zeam_utils.jsonToString;
 
 const chains = @import("./chain.zig");
 const networkFactory = @import("./network.zig");
@@ -92,7 +94,12 @@ pub const BeamValidator = struct {
                 .message = produced_block.block,
                 .signature = [_]u8{0} ** types.SIGSIZE,
             };
-            self.logger.info("validator produced block slot={d} block={any}", .{ slot, signed_block });
+
+            const signed_block_json = try signed_block.toJson(self.allocator);
+            const block_str = try jsonToString(self.allocator, signed_block_json);
+            defer self.allocator.free(block_str);
+
+            self.logger.info("validator produced block slot={d} block={s}", .{ slot, block_str });
 
             // Create ValidatorOutput
             var result = ValidatorOutput.init(self.allocator);

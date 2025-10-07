@@ -152,6 +152,14 @@ extern "C" {
 }
 
 extern "C" {
+    fn handlePeerConnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+}
+
+extern "C" {
+    fn handlePeerDisconnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+}
+
+extern "C" {
     fn releaseStartNetworkParams(
         zig_handler: u64,
         local_private_key: *const c_char,
@@ -236,6 +244,51 @@ impl Network {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("\nListening on {address:?}\n");
                 }
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    let peer_id = peer_id.to_string();
+                    let peer_id = peer_id.as_str();
+                    println!(
+                        "\nrustbridge{}:: Connection established with peer: {}\n",
+                        self.network_id, peer_id
+                    );
+                    let peer_id_cstr = match CString::new(peer_id) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            eprintln!(
+                                "rustbridge{}:: invalid_peer_id_string={}",
+                                self.network_id, peer_id
+                            );
+                            continue;
+                        }
+                    };
+                    unsafe {
+                        handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                    };
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    let peer_id = peer_id.to_string();
+                    let peer_id = peer_id.as_str();
+                    println!(
+                        "\nrustbridge{}:: Connection closed with peer: {}\n",
+                        self.network_id, peer_id
+                    );
+                    let peer_id_cstr = match CString::new(peer_id) {
+                        Ok(cstr) => cstr,
+                        Err(_) => {
+                            eprintln!(
+                                "rustbridge{}:: invalid_peer_id_string={}",
+                                self.network_id, peer_id
+                            );
+                            continue;
+                        }
+                    };
+                    unsafe {
+                        handlePeerDisconnectedFromRustBridge(
+                            self.zig_handler,
+                            peer_id_cstr.as_ptr(),
+                        )
+                    };
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     message,
                     ..
@@ -318,20 +371,23 @@ impl Behaviour {
 
         // Set a custom gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()
-            // .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-            .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
-            // signing)
+            .mesh_n(8)
+            .mesh_n_low(6)
+            .mesh_n_high(12)
+            .gossip_lazy(6)
+            .heartbeat_interval(Duration::from_millis(700))
+            .validation_mode(gossipsub::ValidationMode::Anonymous)
+            .history_length(6)
+            .duplicate_cache_time(Duration::from_secs(3 * 4 * 2))
             .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
             .build()
             .unwrap();
         // .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
 
         // build a gossipsub network behaviour
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()),
-            gossipsub_config,
-        )
-        .unwrap();
+        let gossipsub =
+            gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
+                .unwrap();
 
         Self {
             identify: identify::Behaviour::new(identify::Config::new(
