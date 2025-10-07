@@ -22,6 +22,20 @@ const MockChainData = struct {
     // did justification/finalization happen
     justification: []bool,
     finalization: []bool,
+
+    pub fn deinit(self: *MockChainData, allocator: Allocator) void {
+        self.genesis_state.deinit(allocator);
+        for (self.blocks) |*b| {
+            b.deinit(allocator);
+        }
+        allocator.free(self.blocks);
+        allocator.free(self.blockRoots);
+        allocator.free(self.latestJustified);
+        allocator.free(self.latestFinalized);
+        allocator.free(self.latestHead);
+        allocator.free(self.justification);
+        allocator.free(self.finalization);
+    }
 };
 
 pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
@@ -30,7 +44,9 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         .num_validators = 4,
     };
 
-    const genesis_state = try utils.genGenesisState(allocator, genesis_config);
+    var genesis_state: types.BeamState = undefined;
+    try genesis_state.genGenesisState(allocator, genesis_config);
+    errdefer genesis_state.deinit();
     var blockList = std.ArrayList(types.SignedBeamBlock).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
 
@@ -43,8 +59,11 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var headList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
 
     // figure out a way to clone genesis_state
-    var beam_state = try utils.genGenesisState(allocator, genesis_config);
-    const genesis_block = try utils.genGenesisBlock(allocator, beam_state);
+    var beam_state: types.BeamState = undefined;
+    try beam_state.genGenesisState(allocator, genesis_config);
+    defer beam_state.deinit();
+    var genesis_block: types.BeamBlock = undefined;
+    try beam_state.genGenesisBlock(allocator, &genesis_block);
 
     const gen_signed_block = types.SignedBeamBlock{
         .message = genesis_block,

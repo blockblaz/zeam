@@ -10,10 +10,25 @@ const NetworkInterface = interface.NetworkInterface;
 
 pub const Mock = struct {
     gossipHandler: interface.GenericGossipHandler,
+    peerEventHandler: interface.PeerEventHandler,
     const Self = @This();
 
     pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger) !Self {
-        return Self{ .gossipHandler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger) };
+        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger);
+        errdefer gossip_handler.deinit();
+
+        const peer_event_handler = try interface.PeerEventHandler.init(allocator, 0, logger);
+        errdefer peer_event_handler.deinit();
+
+        return Self{
+            .gossipHandler = gossip_handler,
+            .peerEventHandler = peer_event_handler,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.gossipHandler.deinit();
+        self.peerEventHandler.deinit();
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
@@ -42,17 +57,29 @@ pub const Mock = struct {
         _ = data;
     }
 
+    pub fn subscribePeerEvents(ptr: *anyopaque, handler: interface.OnPeerEventCbHandler) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.peerEventHandler.subscribe(handler);
+    }
+
     pub fn getNetworkInterface(self: *Self) NetworkInterface {
-        return .{ .gossip = .{
-            .ptr = self,
-            .publishFn = publish,
-            .subscribeFn = subscribe,
-            .onGossipFn = onGossip,
-        }, .reqresp = .{
-            .ptr = self,
-            .reqRespFn = reqResp,
-            .onReqFn = onReq,
-        } };
+        return .{
+            .gossip = .{
+                .ptr = self,
+                .publishFn = publish,
+                .subscribeFn = subscribe,
+                .onGossipFn = onGossip,
+            },
+            .reqresp = .{
+                .ptr = self,
+                .reqRespFn = reqResp,
+                .onReqFn = onReq,
+            },
+            .peers = .{
+                .ptr = self,
+                .subscribeFn = subscribePeerEvents,
+            },
+        };
     }
 };
 
