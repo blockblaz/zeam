@@ -264,6 +264,23 @@ pub fn main() !void {
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
+
+            // These are owned by the network implementations and will be freed in their deinit functions
+            // We will run network1 and network2 after the nodes are running to avoid race conditions
+            var network1: *networks.EthLibp2p = undefined;
+            var network2: *networks.EthLibp2p = undefined;
+            var listen_addresses1: []Multiaddr = undefined;
+            var listen_addresses2: []Multiaddr = undefined;
+            var connect_peers: []Multiaddr = undefined;
+            defer {
+                for (listen_addresses1) |addr| addr.deinit();
+                allocator.free(listen_addresses1);
+                for (listen_addresses2) |addr| addr.deinit();
+                allocator.free(listen_addresses2);
+                for (connect_peers) |addr| addr.deinit();
+                allocator.free(connect_peers);
+            }
+
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
                 network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network));
@@ -271,12 +288,10 @@ pub fn main() !void {
                 backend2 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
-                var network1: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
                 const priv_key1 = key_pair1.v4.toString();
-                const listen_addresses1 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")};
-                // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
-                defer for (listen_addresses1) |addr| addr.deinit();
+                listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{
@@ -286,18 +301,14 @@ pub fn main() !void {
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
                 }, logger1_config.logger(.network));
-                try network1.run();
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
-                var network2: *networks.EthLibp2p = try allocator.create(networks.EthLibp2p);
+                network2 = try allocator.create(networks.EthLibp2p);
                 const key_pair2 = enr_lib.KeyPair.generate();
                 const priv_key2 = key_pair2.v4.toString();
-                // these addresses are converted to a slice in the `run` function of `EthLibp2p` so it can be freed safely after `run` returns
-                const listen_addresses2 = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")};
-                defer for (listen_addresses2) |addr| addr.deinit();
-                const connect_peers = &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")};
-                defer for (connect_peers) |addr| addr.deinit();
+                listen_addresses2 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")});
+                connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{
@@ -307,7 +318,6 @@ pub fn main() !void {
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
                 }, logger2_config.logger(.network));
-                try network2.run();
                 backend2 = network2.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
             }
@@ -357,6 +367,12 @@ pub fn main() !void {
 
             try beam_node_1.run();
             try beam_node_2.run();
+
+            if (!mock_network) {
+                try network1.run();
+                try network2.run();
+            }
+
             try clock.run();
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
