@@ -1,7 +1,8 @@
 const ssz = @import("ssz");
 const std = @import("std");
-
+const json = std.json;
 const types = @import("@zeam/types");
+
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
 
@@ -34,7 +35,7 @@ fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 
     if (std.mem.eql(u8, &state.latest_block_header.state_root, &types.ZERO_HASH)) {
         var prev_state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, state.*, &prev_state_root, allocator);
+        try ssz.hashTreeRoot(*types.BeamState, state, &prev_state_root, allocator);
         state.latest_block_header.state_root = prev_state_root;
     }
 }
@@ -88,7 +89,12 @@ fn process_operations(allocator: Allocator, state: *types.BeamState, block: type
 
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
-    logger.debug("prestate justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+    const justified_str = try state.latest_justified.toJsonString(allocator);
+    defer allocator.free(justified_str);
+    const finalized_str = try state.latest_finalized.toJsonString(allocator);
+    defer allocator.free(finalized_str);
+
+    logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
 
     // work directly with SSZ types
     // historical_block_hashes and justified_slots are already SSZ types in state
@@ -111,7 +117,10 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         // check if vote is sane
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
-        logger.debug("processing vote={any} validator_id={d}\n....\n", .{ vote, validator_id });
+        const vote_str = try vote.toJsonString(allocator);
+        defer allocator.free(vote_str);
+
+        logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str, validator_id });
 
         if (source_slot >= state.justified_slots.len()) {
             return StateTransitionError.InvalidSlotIndex;
@@ -185,7 +194,10 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             state.latest_justified = vote.target;
             try state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
-            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_justified});
+            const justified_str_new = try state.latest_justified.toJsonString(allocator);
+            defer allocator.free(justified_str_new);
+
+            logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
 
             // source is finalized if target is the next valid justifiable hash
             var can_target_finalize = true;
@@ -198,7 +210,10 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
             if (can_target_finalize == true) {
                 state.latest_finalized = vote.source;
-                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{any}\n--------------\n---------------\n-------------------------\n\n\n", .{state.latest_finalized});
+                const finalized_str_new = try state.latest_finalized.toJsonString(allocator);
+                defer allocator.free(finalized_str_new);
+
+                logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
             }
         }
     }
@@ -206,7 +221,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     try state.withJustifications(allocator, &justifications);
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
-    logger.debug("poststate: justified={any} finalized={any}", .{ state.latest_justified, state.latest_finalized });
+    const justified_str_final = try state.latest_justified.toJsonString(allocator);
+    defer allocator.free(justified_str_final);
+    const finalized_str_final = try state.latest_finalized.toJsonString(allocator);
+    defer allocator.free(finalized_str_final);
+
+    logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
@@ -227,7 +247,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     logger.debug("extracting state root\n", .{});
     // extract the post state root
     var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+    try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
     block.state_root = state_root;
 }
 
@@ -256,7 +276,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     if (validateResult) {
         // verify the post state root
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+        try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
             opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;

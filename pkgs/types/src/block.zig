@@ -15,9 +15,27 @@ const Root = utils.Root;
 const SignedVotes = mini_3sf.SignedVotes;
 const ZERO_HASH = utils.ZERO_HASH;
 
+const bytesToHex = utils.BytesToHex;
+const json = std.json;
+
 // some p2p containers
 pub const BlockByRootRequest = struct {
     roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
+
+    pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        var roots_array = json.Array.init(allocator);
+        for (self.roots.constSlice()) |root| {
+            try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
+        }
+        try obj.put("roots", json.Value{ .array = roots_array });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 /// Canonical lightweight forkchoice proto block used across modules
@@ -27,6 +45,21 @@ pub const ProtoBlock = struct {
     parentRoot: Root,
     stateRoot: Root,
     timeliness: bool,
+
+    pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
+        try obj.put("parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
+        try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
+        try obj.put("timeliness", json.Value{ .bool = self.timeliness });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ProtoBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamBlock = struct {
@@ -77,6 +110,37 @@ pub const BeamBlock = struct {
     pub fn deinit(self: *Self) void {
         self.body.deinit();
     }
+
+    pub fn toJson(self: *const BeamBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put("body", try self.body.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+// basic payload header for some sort of APS
+pub const ExecutionPayloadHeader = struct {
+    timestamp: u64,
+
+    pub fn toJson(self: *const ExecutionPayloadHeader, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("timestamp", json.Value{ .integer = @as(i64, @intCast(self.timestamp)) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ExecutionPayloadHeader, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamBlockHeader = struct {
@@ -85,6 +149,21 @@ pub const BeamBlockHeader = struct {
     parent_root: Bytes32,
     state_root: Bytes32,
     body_root: Bytes32,
+
+    pub fn toJson(self: *const BeamBlockHeader, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamBlockHeader, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamBlockBody = struct {
@@ -97,6 +176,24 @@ pub const BeamBlockBody = struct {
     pub fn deinit(self: *BeamBlockBody) void {
         self.attestations.deinit();
     }
+
+    pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+
+        // Serialize attestations list
+        var attestations_array = json.Array.init(allocator);
+        for (self.attestations.constSlice()) |attestation| {
+            try attestations_array.append(try attestation.toJson(allocator));
+        }
+        try obj.put("attestations", json.Value{ .array = attestations_array });
+
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamBlockBody, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const SignedBeamBlock = struct {
@@ -106,6 +203,18 @@ pub const SignedBeamBlock = struct {
     pub fn deinit(self: *SignedBeamBlock) void {
         // Deinit heap allocated ArrayLists
         self.message.body.attestations.deinit();
+    }
+
+    pub fn toJson(self: *const SignedBeamBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("message", try self.message.toJson(allocator));
+        try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const SignedBeamBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 

@@ -137,7 +137,7 @@ pub const Node = struct {
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
 
-        self.beam_node = try BeamNode.init(allocator, .{
+        try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
             .anchorState = &anchorState,

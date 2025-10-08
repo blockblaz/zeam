@@ -17,10 +17,25 @@ const JustificationsRoots = utils.JustificationsRoots;
 const JustificationsValidators = utils.JustificationsValidators;
 const StateTransitionError = utils.StateTransitionError;
 
+const bytesToHex = utils.BytesToHex;
+const json = std.json;
+
 // PQ devnet0 config
 pub const BeamStateConfig = struct {
     num_validators: u64,
     genesis_time: u64,
+
+    pub fn toJson(self: *const BeamStateConfig, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
+        try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamStateConfig, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamState = struct {
@@ -236,6 +251,50 @@ pub const BeamState = struct {
         self.justified_slots.deinit();
         self.justifications_roots.deinit();
         self.justifications_validators.deinit();
+    }
+
+    pub fn toJson(self: *const BeamState, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("config", try self.config.toJson(allocator));
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("latest_block_header", try self.latest_block_header.toJson(allocator));
+        try obj.put("latest_justified", try self.latest_justified.toJson(allocator));
+        try obj.put("latest_finalized", try self.latest_finalized.toJson(allocator));
+
+        // Serialize historical_block_hashes
+        var historical_hashes_array = json.Array.init(allocator);
+        for (self.historical_block_hashes.constSlice()) |hash| {
+            try historical_hashes_array.append(json.Value{ .string = try bytesToHex(allocator, &hash) });
+        }
+        try obj.put("historical_block_hashes", json.Value{ .array = historical_hashes_array });
+
+        // Serialize justified_slots as array of booleans
+        var justified_slots_array = json.Array.init(allocator);
+        for (0..self.justified_slots.len()) |i| {
+            try justified_slots_array.append(json.Value{ .bool = try self.justified_slots.get(i) });
+        }
+        try obj.put("justified_slots", json.Value{ .array = justified_slots_array });
+
+        // Serialize justifications_roots
+        var justifications_roots_array = json.Array.init(allocator);
+        for (self.justifications_roots.constSlice()) |root| {
+            try justifications_roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
+        }
+        try obj.put("justifications_roots", json.Value{ .array = justifications_roots_array });
+
+        // Serialize justifications_validators as array of booleans
+        var justifications_validators_array = json.Array.init(allocator);
+        for (0..self.justifications_validators.len()) |i| {
+            try justifications_validators_array.append(json.Value{ .bool = try self.justifications_validators.get(i) });
+        }
+        try obj.put("justifications_validators", json.Value{ .array = justifications_validators_array });
+
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
     }
 };
 

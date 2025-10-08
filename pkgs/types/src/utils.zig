@@ -3,9 +3,11 @@ const Allocator = std.mem.Allocator;
 
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
+const utils = @import("@zeam/utils");
 
 const block = @import("./block.zig");
 const types = @import("./lib.zig");
+pub const jsonToString = utils.jsonToString;
 
 // just dummy type right now to test imports
 pub const Bytes32 = [32]u8;
@@ -31,10 +33,12 @@ pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
 pub const JustificationsRoots = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
 pub const JustificationsValidators = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
 
-// basic payload header for some sort of APS
-pub const ExecutionPayloadHeader = struct {
-    timestamp: u64,
-};
+const json = std.json;
+
+// Helper function to convert bytes to hex string
+pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
+}
 
 pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
 pub const ChainSpec = struct {
@@ -44,18 +48,29 @@ pub const ChainSpec = struct {
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
     }
+
+    pub fn toJson(self: *const ChainSpec, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
+        try obj.put("name", json.Value{ .string = self.name });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ChainSpec, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return jsonToString(allocator, json_value);
+    }
 };
 
 // TODO: a super hacky cloning utility for ssz container structs
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
-pub fn sszClone(allocator: Allocator, comptime T: type, data: T) !T {
+// pass a pointer where you want to clone the data
+pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
     var bytes = std.ArrayList(u8).init(allocator);
     defer bytes.deinit();
 
     try ssz.serialize(T, data, &bytes);
-    var cloned: T = undefined;
-    try ssz.deserialize(T, bytes.items[0..], &cloned, allocator);
-    return cloned;
+    try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
 test "ssz import" {

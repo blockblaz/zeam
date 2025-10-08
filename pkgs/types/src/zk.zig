@@ -2,7 +2,11 @@ const std = @import("std");
 const ssz = @import("ssz");
 const params = @import("@zeam/params");
 
+const Allocator = std.mem.Allocator;
+
 const block = @import("./block.zig");
+const bytesToHex = utils.BytesToHex;
+const json = std.json;
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
@@ -12,16 +16,49 @@ pub const ZkVm = enum {
     ceno,
     powdr,
     sp1,
+
+    pub fn toJson(self: *const ZkVm, allocator: Allocator) !json.Value {
+        _ = allocator; // allocator is unused, but included for API consistency
+        return json.Value{ .string = @tagName(self.*) };
+    }
+
+    pub fn toJsonString(self: *const ZkVm, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamSTFProof = struct {
     // zk_vm: ZkVm,
     proof: []const u8,
+
+    pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamSTFProof, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 pub const BeamSTFProverInput = struct {
     block: block.SignedBeamBlock,
     state: state.BeamState,
+
+    pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("block", try self.block.toJson(allocator));
+        try obj.put("state", try self.state.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BeamSTFProverInput, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
 };
 
 test "ssz seralize/deserialize signed stf prover input" {
