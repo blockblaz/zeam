@@ -47,17 +47,19 @@ pub const Mock = struct {
         return self.gossipHandler.onGossip(data, true);
     }
 
-    pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest) anyerror!u64 {
+    pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
         _ = ptr;
         _ = peer_id;
         _ = req;
+        _ = callback;
 
         return error.NotImplemented;
     }
 
-    pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest) anyerror!interface.ReqRespResponse {
+    pub fn onReqRespRequest(ptr: *anyopaque, data: *interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
         _ = ptr;
         _ = data;
+        _ = stream;
 
         // TODO implement in a followup PR
         return error.NotImplemented;

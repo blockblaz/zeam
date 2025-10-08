@@ -7,6 +7,8 @@ const xev = @import("xev");
 const zeam_utils = @import("@zeam/utils");
 
 const topic_prefix = "leanconsensus";
+const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
+const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
 pub const GossipSub = struct {
     // ptr to the implementation
@@ -27,16 +29,16 @@ pub const GossipSub = struct {
 pub const ReqResp = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    sendRequestFn: *const fn (ptr: *anyopaque, peer_id: []const u8, req: *const ReqRespRequest) anyerror!u64,
-    onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest) anyerror!ReqRespResponse,
+    sendRequestFn: *const fn (ptr: *anyopaque, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64,
+    onReqRespRequestFn: *const fn (ptr: *anyopaque, data: *ReqRespRequest, stream: ReqRespServerStream) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, handler: OnReqRespRequestCbHandler) anyerror!void,
 
     pub fn subscribe(self: ReqResp, handler: OnReqRespRequestCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, handler);
     }
 
-    pub fn send_request(self: ReqResp, peer_id: []const u8, req: *const ReqRespRequest) anyerror!void {
-        return self.sendReqesutFn(self.ptr, peer_id, req);
+    pub fn sendRequest(self: ReqResp, peer_id: []const u8, req: *const ReqRespRequest, callback: ?OnReqRespResponseCbHandler) anyerror!u64 {
+        return self.sendRequestFn(self.ptr, peer_id, req, callback);
     }
 };
 
@@ -64,6 +66,16 @@ pub const OnGossipCbHandler = struct {
 
     pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage) anyerror!void {
         return self.onGossipCb(self.ptr, data);
+    }
+};
+
+const OnRPCRequestCbType = *const fn (*anyopaque, *const ReqRespRequest) anyerror!void;
+pub const OnRPCRequestCbHandler = struct {
+    ptr: *anyopaque,
+    onRPCRequestCb: OnRPCRequestCbType,
+
+    pub fn onRPCRequest(self: OnRPCRequestCbHandler, data: *const ReqRespRequest) anyerror!void {
+        return self.onRPCRequestCb(self.ptr, data);
     }
 };
 
@@ -199,49 +211,214 @@ pub const ReqRespMethod = enum {
     block_by_root,
     status,
 };
+
+pub const LeanSupportedProtocol = enum {
+    blocks_by_root_v1,
+    status_v1,
+
+    pub fn protocolId(self: LeanSupportedProtocol) []const u8 {
+        return switch (self) {
+            .blocks_by_root_v1 => lean_blocks_by_root_protocol,
+            .status_v1 => lean_status_protocol,
+        };
+    }
+
+    pub fn method(self: LeanSupportedProtocol) ReqRespMethod {
+        return switch (self) {
+            .blocks_by_root_v1 => .block_by_root,
+            .status_v1 => .status,
+        };
+    }
+
+    pub fn fromMethod(req_method: ReqRespMethod) LeanSupportedProtocol {
+        return switch (req_method) {
+            .block_by_root => .blocks_by_root_v1,
+            .status => .status_v1,
+        };
+    }
+
+    pub fn fromProtocolId(protocol_id: []const u8) !LeanSupportedProtocol {
+        if (std.mem.eql(u8, protocol_id, lean_status_protocol)) {
+            return .status_v1;
+        }
+
+        if (std.mem.eql(u8, protocol_id, lean_blocks_by_root_protocol)) {
+            return .blocks_by_root_v1;
+        }
+
+        return error.UnsupportedProtocol;
+    }
+};
+
 pub const ReqRespRequest = union(ReqRespMethod) {
     block_by_root: types.BlockByRootRequest,
     status: types.Status,
-};
-pub const ReqRespResponse = union(ReqRespMethod) {
-    block_by_root: []types.BeamBlock,
-    status: types.Status,
-};
-pub const ReqRespRequestCallback = struct {
-    response_data: ?[]const u8,
-    response_code: u32,
-    allocator: Allocator,
 
-    pub fn deinit(self: *ReqRespRequestCallback) void {
-        if (self.response_data) |data| {
-            self.allocator.free(data);
+    pub fn toJson(self: *const ReqRespRequest, allocator: Allocator) !json.Value {
+        return switch (self.*) {
+            .status => |status| status.toJson(allocator),
+            .block_by_root => |request| request.toJson(allocator),
+        };
+    }
+
+    pub fn toJsonString(self: *const ReqRespRequest, allocator: Allocator) ![]const u8 {
+        const message_json = try self.toJson(allocator);
+        return zeam_utils.jsonToString(allocator, message_json);
+    }
+
+    pub fn deinit(self: *ReqRespRequest) void {
+        switch (self.*) {
+            .status => {},
+            .block_by_root => |*request| request.roots.deinit(),
         }
     }
+};
+pub const ReqRespResponse = union(ReqRespMethod) {
+    block_by_root: types.SignedBeamBlock,
+    status: types.Status,
 
-    pub fn onRPCResponse(self: *ReqRespRequestCallback, data: ?[]const u8, code: u32) void {
-        self.response_data = data;
-        self.response_code = code;
+    pub fn toJson(self: *const ReqRespResponse, allocator: Allocator) !json.Value {
+        return switch (self.*) {
+            .status => |status| status.toJson(allocator),
+            .block_by_root => |block| block.toJson(allocator),
+        };
+    }
+
+    pub fn toJsonString(self: *const ReqRespResponse, allocator: Allocator) ![]const u8 {
+        const message_json = try self.toJson(allocator);
+        return zeam_utils.jsonToString(allocator, message_json);
+    }
+
+    pub fn deinit(self: *ReqRespResponse) void {
+        switch (self.*) {
+            .status => {},
+            .block_by_root => |*block| block.deinit(),
+        }
     }
 };
 
-const OnReqRespResponseCbType = *const fn (*anyopaque, *const ReqRespResponse) anyerror!void;
+pub const ReqRespServerStream = struct {
+    ptr: *anyopaque,
+    sendResponseFn: *const fn (ptr: *anyopaque, response: *const ReqRespResponse) anyerror!void,
+    sendErrorFn: *const fn (ptr: *anyopaque, code: u32, message: []const u8) anyerror!void,
+    finishFn: *const fn (ptr: *anyopaque) anyerror!void,
+    isFinishedFn: *const fn (ptr: *anyopaque) bool,
+
+    const Self = @This();
+
+    pub const Error = error{ServerStreamUnsupported};
+
+    pub fn sendResponse(self: Self, response: *const ReqRespResponse) anyerror!void {
+        return self.sendResponseFn(self.ptr, response);
+    }
+
+    pub fn sendError(self: Self, code: u32, message: []const u8) anyerror!void {
+        return self.sendErrorFn(self.ptr, code, message);
+    }
+
+    pub fn finish(self: Self) anyerror!void {
+        return self.finishFn(self.ptr);
+    }
+
+    pub fn isFinished(self: Self) bool {
+        return self.isFinishedFn(self.ptr);
+    }
+};
+pub const ReqRespResponseError = struct {
+    code: u32,
+    message: []const u8,
+
+    pub fn deinit(self: *ReqRespResponseError, allocator: Allocator) void {
+        allocator.free(self.message);
+    }
+};
+
+pub const ReqRespResponseEvent = struct {
+    method: ReqRespMethod,
+    request_id: u64,
+    payload: Payload,
+
+    const Payload = union(enum) {
+        success: ReqRespResponse,
+        failure: ReqRespResponseError,
+        completed,
+    };
+
+    pub fn initSuccess(request_id: u64, method: ReqRespMethod, response: ReqRespResponse) ReqRespResponseEvent {
+        return ReqRespResponseEvent{
+            .method = method,
+            .request_id = request_id,
+            .payload = .{ .success = response },
+        };
+    }
+
+    pub fn initError(request_id: u64, method: ReqRespMethod, err: ReqRespResponseError) ReqRespResponseEvent {
+        return ReqRespResponseEvent{
+            .method = method,
+            .request_id = request_id,
+            .payload = .{ .failure = err },
+        };
+    }
+
+    pub fn initCompleted(request_id: u64, method: ReqRespMethod) ReqRespResponseEvent {
+        return ReqRespResponseEvent{
+            .method = method,
+            .request_id = request_id,
+            .payload = .completed,
+        };
+    }
+
+    pub fn deinit(self: *ReqRespResponseEvent, allocator: Allocator) void {
+        switch (self.payload) {
+            .success => |*resp| resp.deinit(),
+            .failure => |*err| err.deinit(allocator),
+            .completed => {},
+        }
+    }
+};
+
+pub const ReqRespRequestCallback = struct {
+    method: ReqRespMethod,
+    allocator: Allocator,
+    handler: ?OnReqRespResponseCbHandler,
+
+    pub fn init(method: ReqRespMethod, allocator: Allocator, handler: ?OnReqRespResponseCbHandler) ReqRespRequestCallback {
+        return ReqRespRequestCallback{
+            .method = method,
+            .allocator = allocator,
+            .handler = handler,
+        };
+    }
+
+    pub fn deinit(self: *ReqRespRequestCallback) void {
+        _ = self;
+    }
+
+    pub fn notify(self: *ReqRespRequestCallback, event: *const ReqRespResponseEvent) anyerror!void {
+        if (self.handler) |handler| {
+            try handler.onReqRespResponse(event);
+        }
+    }
+};
+
+const OnReqRespResponseCbType = *const fn (*anyopaque, *const ReqRespResponseEvent) anyerror!void;
 pub const OnReqRespResponseCbHandler = struct {
     ptr: *anyopaque,
     onReqRespResponseCb: OnReqRespResponseCbType,
 
-    pub fn onReqRespResponse(self: OnReqRespResponseCbHandler, data: *const ReqRespResponse) anyerror!void {
+    pub fn onReqRespResponse(self: OnReqRespResponseCbHandler, data: *const ReqRespResponseEvent) anyerror!void {
         return self.onReqRespResponseCb(self.ptr, data);
     }
 };
 
-const OnReqRespRequestCbType = *const fn (*anyopaque, *const ReqRespRequest) anyerror!ReqRespResponse;
+const OnReqRespRequestCbType = *const fn (*anyopaque, *const ReqRespRequest, ReqRespServerStream) anyerror!void;
 pub const OnReqRespRequestCbHandler = struct {
     ptr: *anyopaque,
     onReqRespRequestCb: OnReqRespRequestCbType,
     // c: xev.Completion = undefined,
 
-    pub fn onReqRespRequest(self: OnReqRespRequestCbHandler, data: *const ReqRespRequest) anyerror!ReqRespResponse {
-        return self.onReqRespRequestCb(self.ptr, data);
+    pub fn onReqRespRequest(self: OnReqRespRequestCbHandler, data: *const ReqRespRequest, stream: ReqRespServerStream) anyerror!void {
+        return self.onReqRespRequestCb(self.ptr, data, stream);
     }
 };
 pub const ReqRespRequestHandler = struct {
@@ -269,13 +446,13 @@ pub const ReqRespRequestHandler = struct {
         try self.handlers.append(self.allocator, handler);
     }
 
-    pub fn onReqRespRequest(self: *Self, req: *const ReqRespRequest) anyerror!ReqRespResponse {
+    pub fn onReqRespRequest(self: *Self, req: *const ReqRespRequest, stream: ReqRespServerStream) anyerror!void {
         self.logger.debug("network-{d}:: onReqRespRequest={any}, handlers={d}", .{ self.networkId, req, self.handlers.items.len });
         for (self.handlers.items) |handler| {
             // return from the first handler, there are anyway going to be just 1 in a normal real scenario
             // but needs to be handled for mock network where we will have 2 handlers subscribed
             // and we need to pass request to the other one
-            return handler.onReqRespRequest(req);
+            return handler.onReqRespRequest(req, stream);
         }
         return error.NoHandlerSubscribed;
     }

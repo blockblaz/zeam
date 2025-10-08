@@ -32,6 +32,37 @@ const NodeOpts = struct {
 pub const PeerInfo = struct {
     peer_id: []const u8,
     connected_at: i64, // timestamp in seconds
+    latest_status: ?types.Status = null,
+};
+
+const StatusRequestContext = struct {
+    peer_id: []const u8,
+
+    fn deinit(self: *StatusRequestContext, allocator: Allocator) void {
+        allocator.free(self.peer_id);
+    }
+};
+
+const BlockByRootContext = struct {
+    peer_id: []const u8,
+    requested_roots: []types.Root,
+
+    fn deinit(self: *BlockByRootContext, allocator: Allocator) void {
+        allocator.free(self.peer_id);
+        allocator.free(self.requested_roots);
+    }
+};
+
+const PendingRPC = union(enum) {
+    status: StatusRequestContext,
+    block_by_root: BlockByRootContext,
+
+    fn deinit(self: *PendingRPC, allocator: Allocator) void {
+        switch (self.*) {
+            .status => |*ctx| ctx.deinit(allocator),
+            .block_by_root => |*ctx| ctx.deinit(allocator),
+        }
+    }
 };
 
 pub const BeamNode = struct {
@@ -43,6 +74,8 @@ pub const BeamNode = struct {
     nodeId: u32,
     logger: zeam_utils.ModuleLogger,
     connected_peers: *std.StringHashMap(PeerInfo),
+    pending_rpc_requests: std.AutoHashMap(u64, PendingRPC),
+    pending_block_roots: std.AutoHashMap(types.Root, void),
 
     const Self = @This();
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
@@ -80,11 +113,21 @@ pub const BeamNode = struct {
             .nodeId = opts.nodeId,
             .logger = opts.logger_config.logger(.node),
             .connected_peers = connected_peers,
+            .pending_rpc_requests = std.AutoHashMap(u64, PendingRPC).init(allocator),
+            .pending_block_roots = std.AutoHashMap(types.Root, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.destroy(self.chain);
+
+        var rpc_it = self.pending_rpc_requests.iterator();
+        while (rpc_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.pending_rpc_requests.deinit();
+
+        self.pending_block_roots.deinit();
 
         // Clean up peer info
         var iter = self.connected_peers.iterator();
@@ -99,7 +142,236 @@ pub const BeamNode = struct {
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        switch (data.*) {
+            .block => |signed_block| {
+                const parent_root = signed_block.message.parent_root;
+                if (!self.chain.forkChoice.hasBlock(parent_root)) {
+                    self.requestBlocksByRoot(&[_]types.Root{parent_root});
+                }
+
+                var block_root: types.Root = undefined;
+                if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator)) |_| {
+                    _ = self.pending_block_roots.remove(block_root);
+                } else |err| {
+                    self.logger.warn("Failed to compute block root for incoming gossip block: {any}", .{err});
+                }
+            },
+            else => {},
+        }
+
         try self.chain.onGossip(data);
+    }
+
+    fn getReqRespResponseHandler(self: *Self) networks.OnReqRespResponseCbHandler {
+        return .{
+            .ptr = self,
+            .onReqRespResponseCb = onReqRespResponse,
+        };
+    }
+
+    fn sendStatusToPeer(self: *Self, peer_id: []const u8) void {
+        const peer_copy = self.allocator.dupe(u8, peer_id) catch |err| {
+            self.logger.warn("Failed to duplicate peer id for status request: {any}", .{err});
+            return;
+        };
+
+        var pending = PendingRPC{ .status = .{ .peer_id = peer_copy } };
+        const handler = self.getReqRespResponseHandler();
+        const status = self.chain.getStatus();
+
+        const request_id = self.network.sendStatus(peer_id, status, handler) catch |err| {
+            self.logger.warn("Failed to send status request to peer {s}: {any}", .{ peer_id, err });
+            pending.deinit(self.allocator);
+            return;
+        };
+
+        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+            self.logger.warn("Failed to track status request {d} for peer {s}: {any}", .{ request_id, peer_id, err });
+            pending.deinit(self.allocator);
+        };
+    }
+
+    fn selectPeerForRequest(self: *Self) ?[]const u8 {
+        var it = self.connected_peers.iterator();
+        if (it.next()) |entry| {
+            return entry.value_ptr.peer_id;
+        }
+        return null;
+    }
+
+    fn requestBlocksByRoot(self: *Self, roots: []const types.Root) void {
+        if (roots.len == 0) return;
+
+        var requires_request = false;
+        for (roots) |root| {
+            if (self.pending_block_roots.get(root) == null) {
+                requires_request = true;
+                break;
+            }
+        }
+        if (!requires_request) return;
+
+        const peer = self.selectPeerForRequest() orelse {
+            self.logger.warn("No peers available to request {d} block(s) by root", .{roots.len});
+            return;
+        };
+
+        const peer_copy = self.allocator.dupe(u8, peer) catch |err| {
+            self.logger.warn("Failed to duplicate peer id for blocks-by-root request: {any}", .{err});
+            return;
+        };
+
+        const roots_copy = self.allocator.alloc(types.Root, roots.len) catch |err| {
+            self.logger.warn("Failed to allocate root buffer for RPC request: {any}", .{err});
+            self.allocator.free(peer_copy);
+            return;
+        };
+        std.mem.copyForwards(types.Root, roots_copy, roots);
+
+        const handler = self.getReqRespResponseHandler();
+        const request_id = self.network.requestBlocksByRoot(self.allocator, peer, roots, handler) catch |err| {
+            self.logger.warn("Failed to send blocks-by-root request to peer {s}: {any}", .{ peer, err });
+            self.allocator.free(roots_copy);
+            self.allocator.free(peer_copy);
+            return;
+        };
+
+        var pending = PendingRPC{ .block_by_root = .{
+            .peer_id = peer_copy,
+            .requested_roots = roots_copy,
+        } };
+
+        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+            self.logger.warn(
+                "Failed to track blocks-by-root request {d} for peer {s}: {any}",
+                .{ request_id, peer, err },
+            );
+            pending.deinit(self.allocator);
+            return;
+        };
+
+        for (roots) |root| {
+            if (self.pending_block_roots.get(root) != null) continue;
+            self.pending_block_roots.put(root, {}) catch |err| {
+                self.logger.warn(
+                    "Failed to track pending block root 0x{s}: {any}",
+                    .{ std.fmt.fmtSliceHexLower(root[0..]), err },
+                );
+                self.finalizePendingRequest(request_id);
+                return;
+            };
+        }
+
+        self.logger.debug(
+            "Requested {d} block(s) by root from peer {s}, request_id={d}",
+            .{ roots.len, peer, request_id },
+        );
+    }
+
+    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, block: *const types.SignedBeamBlock) void {
+        var block_root: types.Root = undefined;
+        if (ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator)) |_| {
+            const removed = self.pending_block_roots.remove(block_root);
+            if (!removed) {
+                self.logger.warn(
+                    "Received unexpected block root 0x{s} from peer {s}",
+                    .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id },
+                );
+            }
+
+            self.chain.onBlock(block.*, .{}) catch |err| {
+                self.logger.warn(
+                    "Failed to import block fetched via RPC 0x{s} from peer {s}: {any}",
+                    .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id, err },
+                );
+            };
+        } else |err| {
+            self.logger.warn("Failed to compute block root from RPC response: {any}", .{err});
+        }
+    }
+
+    fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) void {
+        const request_id = event.request_id;
+        const ctx_ptr = self.pending_rpc_requests.getPtr(request_id) orelse {
+            self.logger.warn("Received RPC response for unknown request_id={d}", .{request_id});
+            return;
+        };
+
+        switch (event.payload) {
+            .success => |resp| switch (resp) {
+                .status => |status_resp| {
+                    switch (ctx_ptr.*) {
+                        .status => |*status_ctx| {
+                            self.logger.info(
+                                "Received status response from peer {s}: head_slot={d}, finalized_slot={d}",
+                                .{ status_ctx.peer_id, status_resp.head_slot, status_resp.finalized_slot },
+                            );
+                            if (self.connected_peers.getPtr(status_ctx.peer_id)) |peer_info| {
+                                peer_info.latest_status = status_resp;
+                            }
+                        },
+                        else => {
+                            self.logger.warn("Status response did not match tracked request_id={d}", .{request_id});
+                        },
+                    }
+                },
+                .block_by_root => |block_resp| {
+                    switch (ctx_ptr.*) {
+                        .block_by_root => |*block_ctx| {
+                            self.logger.info(
+                                "Received blocks-by-root chunk from peer {s}",
+                                .{block_ctx.peer_id},
+                            );
+
+                            self.processBlockByRootChunk(block_ctx, &block_resp);
+                        },
+                        else => {
+                            self.logger.warn("Blocks-by-root response did not match tracked request_id={d}", .{request_id});
+                        },
+                    }
+                },
+            },
+            .failure => |err_payload| {
+                switch (ctx_ptr.*) {
+                    .status => |status_ctx| {
+                        self.logger.warn(
+                            "Status request to peer {s} failed ({d}): {s}",
+                            .{ status_ctx.peer_id, err_payload.code, err_payload.message },
+                        );
+                    },
+                    .block_by_root => |block_ctx| {
+                        self.logger.warn(
+                            "Blocks-by-root request to peer {s} failed ({d}): {s}",
+                            .{ block_ctx.peer_id, err_payload.code, err_payload.message },
+                        );
+                    },
+                }
+                self.finalizePendingRequest(request_id);
+            },
+            .completed => {
+                self.finalizePendingRequest(request_id);
+            },
+        }
+    }
+
+    fn finalizePendingRequest(self: *Self, request_id: u64) void {
+        if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
+            var ctx = entry.value;
+            switch (ctx) {
+                .block_by_root => |block_ctx| {
+                    for (block_ctx.requested_roots) |root| {
+                        _ = self.pending_block_roots.remove(root);
+                    }
+                },
+                .status => {},
+            }
+            ctx.deinit(self.allocator);
+        }
+    }
+
+    pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.handleReqRespResponse(event);
     }
 
     pub fn getOnGossipCbHandler(self: *Self) !networks.OnGossipCbHandler {
@@ -109,15 +381,42 @@ pub const BeamNode = struct {
         };
     }
 
-    pub fn onReqRespRequest(ptr: *anyopaque, data: *const networks.ReqRespRequest) anyerror!networks.ReqRespResponse {
+    pub fn onReqRespRequest(ptr: *anyopaque, data: *const networks.ReqRespRequest, responder: networks.ReqRespServerStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         switch (data.*) {
-            .block_by_root => {
-                return error.NotImplemented;
+            .block_by_root => |request| {
+                const roots = request.roots.constSlice();
+
+                self.logger.debug(
+                    "node-{d}:: Handling block_by_root request for {d} roots",
+                    .{ self.nodeId, roots.len },
+                );
+
+                for (roots) |root| {
+                    if (self.chain.db.loadBlock(database.DbBlocksNamespace, root)) |signed_block_value| {
+                        var signed_block = signed_block_value;
+                        defer signed_block.deinit();
+
+                        var response = networks.ReqRespResponse{ .block_by_root = undefined };
+                        try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block, &response.block_by_root);
+                        defer response.deinit();
+
+                        try responder.sendResponse(&response);
+                    } else {
+                        self.logger.warn(
+                            "node-{d}:: Requested block root=0x{s} not found",
+                            .{ self.nodeId, std.fmt.fmtSliceHexLower(root[0..]) },
+                        );
+                    }
+                }
+
+                try responder.finish();
             },
             .status => {
-                return .{ .status = self.chain.getStatus() };
+                var response = networks.ReqRespResponse{ .status = self.chain.getStatus() };
+                try responder.sendResponse(&response);
+                try responder.finish();
             },
         }
     }
@@ -144,6 +443,8 @@ pub const BeamNode = struct {
 
         try self.connected_peers.put(owned_key, peer_info);
         self.logger.info("Peer connected: {s}, total peers: {d}", .{ peer_id, self.connected_peers.count() });
+
+        self.sendStatusToPeer(peer_id);
     }
 
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
@@ -350,6 +651,8 @@ test "Node peer tracking on connect/disconnect" {
         .logger_config = &logger_config,
     });
     defer node.deinit();
+
+    try node.run();
 
     // Verify initial state: 0 peers
     try std.testing.expectEqual(@as(usize, 0), node.connected_peers.count());

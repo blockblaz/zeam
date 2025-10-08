@@ -1,16 +1,16 @@
 use futures::future::Either;
+use futures::Stream;
 use futures::StreamExt;
 use libp2p::core::{
     multiaddr::Multiaddr, multiaddr::Protocol, muxing::StreamMuxerBox, transport::Boxed,
 };
 
 use libp2p::identity::{secp256k1, Keypair};
-use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::StreamProtocol;
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     core, gossipsub, identify, identity, noise, ping, yamux, PeerId, SwarmBuilder, Transport,
 };
+use std::convert::TryFrom;
 use std::os::raw::c_char;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -21,10 +21,15 @@ use std::ffi::{CStr, CString};
 
 use delay_map::HashMapDelay;
 use futures::future::poll_fn;
-use futures::Stream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+use crate::req_resp::error::ReqRespError;
+use crate::req_resp::{
+    configurations::REQUEST_TIMEOUT, LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage,
+    ReqRespMessageError, ReqRespMessageReceived, RequestMessage, RespMessage, ResponseMessage,
+};
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
@@ -36,12 +41,21 @@ static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 lazy_static::lazy_static! {
-    static ref REQUEST_ID_MAP: Mutex<HashMapDelay<OutboundRequestId, u64>> = Mutex::new(HashMapDelay::new(Duration::from_secs(10)));
-    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, request_response::ResponseChannel<Vec<u8>>>> = Mutex::new(HashMap::new());
+    static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
+    static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
+    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
 }
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct PendingResponse {
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    stream_id: u64,
+    protocol: ProtocolId,
+}
 
 /// # Safety
 ///
@@ -167,6 +181,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
 pub unsafe fn send_rpc_request(
     network_id: u32,
     peer_id: *const c_char,
+    protocol_tag: u32,
     request_data: *const u8,
     request_len: usize,
 ) -> u64 {
@@ -182,6 +197,19 @@ pub unsafe fn send_rpc_request(
     let request_slice = std::slice::from_raw_parts(request_data, request_len);
     let request_bytes = request_slice.to_vec();
 
+    let protocol = match LeanSupportedProtocol::try_from(protocol_tag) {
+        Ok(protocol) => protocol,
+        Err(_) => {
+            eprintln!(
+                "Invalid protocol tag {} provided for RPC request to {}",
+                protocol_tag, peer_id
+            );
+            return 0;
+        }
+    };
+
+    let protocol_id: ProtocolId = protocol.into();
+
     #[allow(static_mut_refs)]
     let swarm = if network_id < 1 {
         SWARM_STATE.as_mut().unwrap()
@@ -189,21 +217,24 @@ pub unsafe fn send_rpc_request(
         SWARM_STATE1.as_mut().unwrap()
     };
 
-    let libp2p_request_id = swarm
-        .behaviour_mut()
-        .reqresp
-        .send_request(&peer_id, request_bytes);
-
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
 
-    REQUEST_ID_MAP
+    let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
+
+    swarm
+        .behaviour_mut()
+        .reqresp
+        .send_request(peer_id.clone(), request_id, request_message);
+
+    REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
+    REQUEST_PROTOCOL_MAP
         .lock()
         .unwrap()
-        .insert(libp2p_request_id, request_id);
+        .insert(request_id, protocol_id.clone());
 
     println!(
-        "reqresp:: Sent request to {} (id: {:?})",
-        peer_id, request_id
+        "reqresp:: Sent {:?} request to {} (id: {:?})",
+        protocol, peer_id, request_id
     );
 
     request_id
@@ -212,7 +243,26 @@ pub unsafe fn send_rpc_request(
 /// # Safety
 /// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
 /// The caller must ensure that `channel_id` corresponds to a valid response channel.
+#[no_mangle]
 pub unsafe fn send_rpc_response(
+    network_id: u32,
+    channel_id: u64,
+    response_data: *const u8,
+    response_len: usize,
+) {
+    send_rpc_response_chunk(
+        network_id,
+        channel_id,
+        response_data,
+        response_len,
+    );
+    send_rpc_end_of_stream(network_id, channel_id);
+}
+
+/// # Safety
+/// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
+#[no_mangle]
+pub unsafe fn send_rpc_response_chunk(
     network_id: u32,
     channel_id: u64,
     response_data: *const u8,
@@ -220,23 +270,116 @@ pub unsafe fn send_rpc_response(
 ) {
     let response_slice = std::slice::from_raw_parts(response_data, response_len);
     let response_bytes = response_slice.to_vec();
-    let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-    if let Some(channel) = response_map.remove(&channel_id) {
+
+    let channel = {
+        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.get(&channel_id).cloned()
+    };
+
+    if let Some(channel) = channel {
         #[allow(static_mut_refs)]
         let swarm = if network_id < 1 {
             SWARM_STATE.as_mut().unwrap()
         } else {
             SWARM_STATE1.as_mut().unwrap()
         };
-        if let Err(e) = swarm
-            .behaviour_mut()
-            .reqresp
-            .send_response(channel, response_bytes)
-        {
-            eprintln!("Failed to send response: {:?}", e);
+
+        let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
+
+        swarm.behaviour_mut().reqresp.send_response(
+            channel.peer_id.clone(),
+            channel.connection_id,
+            channel.stream_id,
+            RespMessage::Response(Box::new(response_message)),
+        );
+        println!(
+            "Sent response payload on channel {} (peer: {})",
+            channel_id, channel.peer_id
+        );
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
+/// # Safety
+/// The caller must ensure the channel id is valid for a pending response.
+#[no_mangle]
+pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
+    let channel = {
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.remove(&channel_id)
+    };
+
+    if let Some(channel) = channel {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
         } else {
-            println!("Sent response on channel {}", channel_id);
-        }
+            SWARM_STATE1.as_mut().unwrap()
+        };
+
+        swarm.behaviour_mut().reqresp.send_response(
+            channel.peer_id.clone(),
+            channel.connection_id,
+            channel.stream_id,
+            RespMessage::EndOfStream,
+        );
+        println!(
+            "Sent end-of-stream on channel {} (peer: {})",
+            channel_id, channel.peer_id
+        );
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
+/// # Safety
+/// The caller must ensure `message_ptr` points to a valid null-terminated C string.
+#[no_mangle]
+pub unsafe fn send_rpc_error_response(
+    network_id: u32,
+    channel_id: u64,
+    message_ptr: *const c_char,
+) {
+    if message_ptr.is_null() {
+        eprintln!(
+            "Attempted to send RPC error response with null message pointer for channel {}",
+            channel_id
+        );
+        return;
+    }
+
+    let message = CStr::from_ptr(message_ptr).to_string_lossy().to_string();
+
+    let channel = {
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.remove(&channel_id)
+    };
+
+    if let Some(channel) = channel {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
+        } else {
+            SWARM_STATE1.as_mut().unwrap()
+        };
+
+        swarm.behaviour_mut().reqresp.send_response(
+            channel.peer_id.clone(),
+            channel.connection_id,
+            channel.stream_id,
+            RespMessage::Error(ReqRespError::RawError(message.clone())),
+        );
+        swarm.behaviour_mut().reqresp.send_response(
+            channel.peer_id,
+            channel.connection_id,
+            channel.stream_id,
+            RespMessage::EndOfStream,
+        );
+        println!(
+            "Sent error response on channel {} (peer: {}): {}",
+            channel_id, channel.peer_id, message
+        );
     } else {
         eprintln!("No response channel found for id {}", channel_id);
     }
@@ -248,6 +391,39 @@ extern "C" {
         topic: *const c_char,
         message_ptr: *const u8,
         message_len: usize,
+    );
+}
+
+extern "C" {
+    fn handleRPCRequestFromRustBridge(
+        zig_handler: u64,
+        channel_id: u64,
+        peer_id: *const c_char,
+        protocol_id: *const c_char,
+        request_ptr: *const u8,
+        request_len: usize,
+    );
+
+    fn handleRPCResponseFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+        response_ptr: *const u8,
+        response_len: usize,
+    );
+
+    fn handleRPCEndOfStreamFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+    );
+
+    fn handleRPCErrorFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+        code: u32,
+        message: *const c_char,
     );
 }
 
@@ -347,21 +523,31 @@ impl Network {
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
                 match timeout_result {
-                    Ok((libp2p_id, request_id)) => {
+                    Ok((request_id, ())) => {
                         println!(
-                            "reqresp:: Request {} (libp2p_id: {:?}) timed out after 10 seconds",
-                            request_id, libp2p_id
+                            "reqresp:: Request {} timed out after {:?}",
+                            request_id, REQUEST_TIMEOUT
                         );
-
-                        // unsafe {
-                        //     handleReqRespResult(
-                        //         self.zig_handler,
-                        //         request_id,
-                        //         1, // Timeout error code
-                        //         std::ptr::null(),
-                        //         0,
-                        //     );
-                        // }
+                        if let Some(protocol_id) = REQUEST_PROTOCOL_MAP
+                            .lock()
+                            .unwrap()
+                            .remove(&request_id)
+                        {
+                            if let (Ok(protocol_cstring), Ok(message_cstring)) = (
+                                CString::new(protocol_id.as_str()),
+                                CString::new("request timed out"),
+                            ) {
+                                unsafe {
+                                    handleRPCErrorFromRustBridge(
+                                        self.zig_handler,
+                                        request_id,
+                                        protocol_cstring.as_ptr(),
+                                        408,
+                                        message_cstring.as_ptr(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("reqresp:: Error in delay map: {}", e);
@@ -447,62 +633,176 @@ impl Network {
                                 self.network_id
                             );
                         }
-                        SwarmEvent::Behaviour(BehaviourEvent::Reqresp(
-                            request_response::Event::Message { peer, message },
-                        )) => match message {
-                            request_response::Message::Request {
-                                request_id: _,
-                                request,
-                                channel,
-                            } => {
+                        SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
+                            peer_id,
+                            connection_id,
+                            message,
+                        })) => match message {
+                            Ok(ReqRespMessageReceived::Request { stream_id, message }) => {
+                                let request_message = *message;
+                                let protocol = request_message.protocol.clone();
+                                let payload = request_message.payload;
                                 println!(
-                                    "reqresp:: Received request from {} ({} bytes)",
-                                    peer,
-                                    request.len()
+                                    "reqresp:: Received request from {} for protocol {} ({} bytes)",
+                                    peer_id,
+                                    protocol.as_str(),
+                                    payload.len()
                                 );
 
-                                let channel_id = RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(channel_id, channel);
+                                let channel_id =
+                                    RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(
+                                    channel_id,
+                                    PendingResponse {
+                                        peer_id: peer_id.clone(),
+                                        connection_id,
+                                        stream_id,
+                                        protocol: protocol.clone(),
+                                    },
+                                );
 
-                                // unsafe {
-                                //     handleReqRespRequest(
-                                //         self.zig_handler,
-                                //         channel_id,
-                                //         request.as_ptr(),
-                                //         request.len(),
-                                //     );
-                                // }
-                            }
-                            request_response::Message::Response {
-                                request_id,
-                                response,
-                            } => {
-                                let maybe_request_id = REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
-                                if let Some(mapped_id) = maybe_request_id {
-                                    println!(
-                                        "reqresp:: Received response from {} for request id {} ({} bytes)",
-                                        peer,
-                                        mapped_id,
-                                        response.len()
-                                    );
+                                let peer_id_string = peer_id.to_string();
+                                let peer_id_cstring = match CString::new(peer_id_string) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for peer id {}: {}",
+                                            peer_id, err
+                                        );
+                                        continue;
+                                    }
+                                };
 
-                                    // unsafe {
-                                    //     handleReqRespResult(
-                                    //         self.zig_handler,
-                                    //         mapped_id,
-                                    //         0, // success
-                                    //         response.as_ptr(),
-                                    //         response.len(),
-                                    //     );
-                                    // }
-                                } else {
-                                    println!(
-                                        "reqresp:: Received response from {} for unknown request id {:?} ({} bytes)",
-                                        peer,
-                                        request_id,
-                                        response.len()
+                                let protocol_cstring = match CString::new(protocol.as_str()) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for protocol {}: {}",
+                                            protocol.as_str(), err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                unsafe {
+                                    handleRPCRequestFromRustBridge(
+                                        self.zig_handler,
+                                        channel_id,
+                                        peer_id_cstring.as_ptr(),
+                                        protocol_cstring.as_ptr(),
+                                        payload.as_ptr(),
+                                        payload.len(),
                                     );
                                 }
+                            }
+                            Ok(ReqRespMessageReceived::Response { request_id, message }) => {
+                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                let response_message = *message;
+                                println!(
+                                    "reqresp:: Received response from {} for request id {} ({} bytes)",
+                                    peer_id,
+                                    request_id,
+                                    response_message.payload.len()
+                                );
+                                let protocol_cstring = match CString::new(
+                                    response_message.protocol.as_str(),
+                                ) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for protocol {}: {}",
+                                            response_message.protocol.as_str(),
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                unsafe {
+                                    handleRPCResponseFromRustBridge(
+                                        self.zig_handler,
+                                        request_id,
+                                        protocol_cstring.as_ptr(),
+                                        response_message.payload.as_ptr(),
+                                        response_message.payload.len(),
+                                    );
+                                }
+                            }
+                            Ok(ReqRespMessageReceived::EndOfStream { request_id }) => {
+                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                let protocol = REQUEST_PROTOCOL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&request_id);
+
+                                if let Some(protocol_id) = protocol {
+                                    let protocol_cstring = match CString::new(protocol_id.as_str()) {
+                                        Ok(cstring) => cstring,
+                                        Err(err) => {
+                                            eprintln!(
+                                                "reqresp:: Failed to create C string for protocol {} on end-of-stream: {}",
+                                                protocol_id.as_str(),
+                                                err
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    unsafe {
+                                        handleRPCEndOfStreamFromRustBridge(
+                                            self.zig_handler,
+                                            request_id,
+                                            protocol_cstring.as_ptr(),
+                                        );
+                                    }
+                                } else {
+                                    println!(
+                                        "reqresp:: Received end-of-stream for request id {} without protocol mapping",
+                                        request_id
+                                    );
+                                }
+                            }
+                            Err(ReqRespMessageError::Inbound { stream_id, err }) => {
+                                println!(
+                                    "reqresp:: Inbound error from {} on stream {}: {:?}",
+                                    peer_id, stream_id, err
+                                );
+                                RESPONSE_CHANNEL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .retain(|_, pending| {
+                                        !(pending.peer_id == peer_id
+                                            && pending.connection_id == connection_id
+                                            && pending.stream_id == stream_id)
+                                    });
+                            }
+                            Err(ReqRespMessageError::Outbound { request_id, err }) => {
+                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                let protocol = REQUEST_PROTOCOL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&request_id);
+
+                                if let Some(protocol_id) = protocol {
+                                    if let (Ok(protocol_cstring), Ok(message_cstring)) = (
+                                        CString::new(protocol_id.as_str()),
+                                        CString::new(format!("{:?}", err)),
+                                    ) {
+                                        unsafe {
+                                            handleRPCErrorFromRustBridge(
+                                                self.zig_handler,
+                                                request_id,
+                                                protocol_cstring.as_ptr(),
+                                                3,
+                                                message_cstring.as_ptr(),
+                                            );
+                                        }
+                                    }
+                                }
+                                println!(
+                                    "reqresp:: Outbound error for request {} with {}: {:?}",
+                                    request_id, peer_id, err
+                                );
                             }
                         },
                         e => println!("{e:?}"),
@@ -518,7 +818,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
-    reqresp: request_response::Behaviour<BytesCodec>,
+    reqresp: ReqResp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -580,19 +880,10 @@ impl Behaviour {
             gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
                 .unwrap();
 
-        let reqresp = {
-            let protocols = vec![
-                "/leanconsensus/req/status/1/ssz_snappy",
-                "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy",
-            ]
-            .into_iter()
-            .map(|protocol| (StreamProtocol::new(protocol), ProtocolSupport::Full));
-
-            let cfg =
-                request_response::Config::default().with_request_timeout(Duration::from_secs(10));
-
-            request_response::Behaviour::new(protocols, cfg)
-        };
+        let reqresp = ReqResp::new(vec![
+            LeanSupportedProtocol::StatusV1.into(),
+            LeanSupportedProtocol::BlocksByRootV1.into(),
+        ]);
 
         Self {
             identify: identify::Behaviour::new(identify::Config::new(
@@ -689,72 +980,6 @@ fn strip_peer_id(addr: &mut Multiaddr) {
         Some(Protocol::P2p(_)) => {}
         Some(other) => addr.push(other),
         _ => {}
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BytesCodec;
-
-#[async_trait::async_trait]
-impl request_response::Codec for BytesCodec {
-    type Protocol = StreamProtocol;
-    type Request = Vec<u8>;
-    type Response = Vec<u8>;
-
-    async fn read_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Request>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        use futures::AsyncReadExt;
-        let mut data = Vec::new();
-        io.read_to_end(&mut data).await?;
-        Ok(data)
-    }
-
-    async fn read_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Response>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        use futures::AsyncReadExt;
-        let mut data = Vec::new();
-        io.read_to_end(&mut data).await?;
-        Ok(data)
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        req: Self::Request,
-    ) -> std::io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        use futures::AsyncWriteExt;
-        io.write_all(&req).await?;
-        io.close().await
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        res: Self::Response,
-    ) -> std::io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        use futures::AsyncWriteExt;
-        io.write_all(&res).await?;
-        io.close().await
     }
 }
 

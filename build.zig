@@ -85,6 +85,13 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("snappyz");
 
+    const snappyframesz = b.addModule("snappyframesz", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/snappyframesz/src/lib.zig"),
+    });
+    snappyframesz.addImport("snappyz", snappyz);
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -183,9 +190,11 @@ pub fn build(b: *Builder) !void {
     });
     zeam_network.addImport("@zeam/types", zeam_types);
     zeam_network.addImport("@zeam/utils", zeam_utils);
+    zeam_network.addImport("@zeam/params", zeam_params);
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
+    zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
 
     // add beam node
@@ -379,6 +388,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
+    addRustGlueLib(b, network_tests, target);
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
