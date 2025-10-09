@@ -293,7 +293,7 @@ impl ConnectionHandler for ReqRespConnectionHandler {
                                         self.behaviour_events.push(HandlerEvent::Err(
                                             ReqRespMessageError::Inbound {
                                                 stream_id: *stream_id,
-                                                err: err.into(),
+                                                err,
                                             },
                                         ));
                                     }

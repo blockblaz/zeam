@@ -225,7 +225,7 @@ pub unsafe fn send_rpc_request(
     swarm
         .behaviour_mut()
         .reqresp
-        .send_request(peer_id.clone(), request_id, request_message);
+        .send_request(peer_id, request_id, request_message);
 
     REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
     REQUEST_PROTOCOL_MAP
@@ -269,7 +269,7 @@ pub unsafe fn send_rpc_response_chunk(
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
 
         swarm.behaviour_mut().reqresp.send_response(
-            channel.peer_id.clone(),
+            channel.peer_id,
             channel.connection_id,
             channel.stream_id,
             response_message,
@@ -301,7 +301,7 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
         };
 
         swarm.behaviour_mut().reqresp.finish_response_stream(
-            channel.peer_id.clone(),
+            channel.peer_id,
             channel.connection_id,
             channel.stream_id,
         );
@@ -361,16 +361,16 @@ pub unsafe fn send_rpc_error_response(
 
         let response_message = ResponseMessage::new(channel.protocol.clone(), payload);
 
-        let peer_id = channel.peer_id.clone();
+        let peer_id = channel.peer_id;
 
         swarm.behaviour_mut().reqresp.send_response(
-            peer_id.clone(),
+            peer_id,
             channel.connection_id,
             channel.stream_id,
             response_message,
         );
         swarm.behaviour_mut().reqresp.finish_response_stream(
-            peer_id.clone(),
+            peer_id,
             channel.connection_id,
             channel.stream_id,
         );
@@ -652,7 +652,7 @@ impl Network {
                                 RESPONSE_CHANNEL_MAP.lock().unwrap().insert(
                                     channel_id,
                                     PendingResponse {
-                                        peer_id: peer_id.clone(),
+                                        peer_id,
                                         connection_id,
                                         stream_id,
                                         protocol: protocol.clone(),
