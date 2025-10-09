@@ -404,7 +404,8 @@ pub const BeamNode = struct {
                         var signed_block = signed_block_value;
                         defer signed_block.deinit();
 
-                        const cloned_block = try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block);
+                        var cloned_block: types.SignedBeamBlock = undefined;
+                        try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block, &cloned_block);
                         var response = networks.ReqRespResponse{ .block_by_root = cloned_block };
                         defer response.deinit();
 

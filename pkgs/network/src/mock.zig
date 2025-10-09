@@ -316,14 +316,22 @@ pub const Mock = struct {
     fn cloneResponse(self: *Self, response: *const interface.ReqRespResponse) !interface.ReqRespResponse {
         return switch (response.*) {
             .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
-            .block_by_root => |block_resp| interface.ReqRespResponse{ .block_by_root = try types.sszClone(self.allocator, types.SignedBeamBlock, block_resp) },
+            .block_by_root => |block_resp| blk: {
+                var cloned_block: types.SignedBeamBlock = undefined;
+                try types.sszClone(self.allocator, types.SignedBeamBlock, block_resp, &cloned_block);
+                break :blk interface.ReqRespResponse{ .block_by_root = cloned_block };
+            },
         };
     }
 
     fn cloneRequest(self: *Self, request: *const interface.ReqRespRequest) !interface.ReqRespRequest {
         return switch (request.*) {
             .status => |status_req| interface.ReqRespRequest{ .status = status_req },
-            .block_by_root => |block_req| interface.ReqRespRequest{ .block_by_root = try types.sszClone(self.allocator, types.BlockByRootRequest, block_req) },
+            .block_by_root => |block_req| blk: {
+                var cloned_request: types.BlockByRootRequest = undefined;
+                try types.sszClone(self.allocator, types.BlockByRootRequest, block_req, &cloned_request);
+                break :blk interface.ReqRespRequest{ .block_by_root = cloned_request };
+            },
         };
     }
 
