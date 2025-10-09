@@ -393,7 +393,7 @@ pub fn build(b: *Builder) !void {
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
-    const configs_tests = b.addTest(.{
+    const configs_tests = b.addTest(
         .root_module = zeam_configs,
         .optimize = optimize,
         .target = target,
@@ -434,6 +434,7 @@ pub fn build(b: *Builder) !void {
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    network_tests.step.dependOn(&zkvm_host_cmd.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
