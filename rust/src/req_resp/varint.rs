@@ -7,7 +7,6 @@ pub const MAX_VARINT_BYTES: usize = 10;
 /// convenience `Uvi` codec so callers can inspect the prefix without mutating the input buffer.
 /// `decode_varint_prefix` reports incomplete prefixes via `Ok(None)` and lets Zig continue to own
 /// the actual frame assembly.
-
 /// Attempts to decode an unsigned varint prefix from the provided slice without consuming it.
 ///
 /// Returns `Ok(Some((value, prefix_len)))` when a complete varint is present, where `value` is the
