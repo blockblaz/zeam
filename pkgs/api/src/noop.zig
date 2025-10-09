@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// Reason for an attestation being invalid (no-op version)
+pub const AttestationInvalidReason = enum {
+    from_future_gossip,
+    unknown_head_gossip,
+    unknown_head_block,
+};
+
 pub const Timer = struct {
     pub fn observe(self: Timer) f32 {
         _ = self;
@@ -32,6 +39,10 @@ pub fn startListener(allocator: std.mem.Allocator, port: u16) !void {
 
 pub fn setLeanHeadSlot(slot: u64) void {
     _ = slot;
+}
+
+pub fn incrementLeanAttestationsInvalid(reason: AttestationInvalidReason) void {
+    _ = reason;
 }
 
 pub fn chain_onblock_duration_seconds_start() Timer {
