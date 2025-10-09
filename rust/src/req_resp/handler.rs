@@ -18,7 +18,7 @@ use tracing::{error, trace};
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
     error::ReqRespError,
-    inbound_protocol::{InboundFramed, InboundOutput, InboundReqRespProtocol, ResponseCode},
+    inbound_protocol::{InboundFramed, InboundOutput, InboundReqRespProtocol},
     messages::{RequestMessage, ResponseMessage},
     outbound_protocol::{OutboundFramed, OutboundReqRespProtocol},
 };
@@ -38,32 +38,6 @@ pub enum ReqRespMessageReceived {
     },
 }
 
-#[derive(Debug, Clone)]
-pub enum RespMessage {
-    Response(Box<ResponseMessage>),
-    Error(ReqRespError),
-    EndOfStream,
-}
-
-impl RespMessage {
-    pub fn as_response_code(&self) -> Option<ResponseCode> {
-        match self {
-            RespMessage::Response(_) => Some(ResponseCode::Success),
-            RespMessage::Error(err) => match err {
-                ReqRespError::InvalidData(_) => Some(ResponseCode::InvalidRequest),
-                ReqRespError::StreamTimedOut | ReqRespError::Disconnected => {
-                    Some(ResponseCode::ResourceUnavailable)
-                }
-                ReqRespError::IoError(_) | ReqRespError::RawError(_) => {
-                    Some(ResponseCode::ServerError)
-                }
-                ReqRespError::IncompleteStream => Some(ResponseCode::ServerError),
-            },
-            RespMessage::EndOfStream => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum HandlerEvent {
     Ok(Box<ReqRespMessageReceived>),
@@ -81,7 +55,12 @@ enum InboundStreamState {
 
 struct InboundStream {
     state: Option<InboundStreamState>,
-    response_queue: VecDeque<RespMessage>,
+    response_queue: VecDeque<ResponseAction>,
+}
+
+enum ResponseAction {
+    Message(ResponseMessage),
+    CloseStream,
 }
 
 enum OutboundStreamState {
@@ -205,25 +184,30 @@ impl ReqRespConnectionHandler {
         }
     }
 
-    fn response(&mut self, stream_id: u64, message: RespMessage) {
+    fn response(&mut self, stream_id: u64, message: ResponseMessage) {
         let Some(inbound_stream) = self.inbound_streams.get_mut(&stream_id) else {
             error!("REQRESP: Inbound stream not found: {stream_id}");
             return;
         };
 
-        if let RespMessage::Error(err) = &message {
-            self.behaviour_events
-                .push(HandlerEvent::Err(ReqRespMessageError::Inbound {
-                    stream_id,
-                    err: ReqRespError::RawError(err.to_string()),
-                }));
-        }
-
         if let ConnectionState::Closed = self.connection_state {
             return;
         }
 
-        inbound_stream.response_queue.push_back(message);
+        inbound_stream
+            .response_queue
+            .push_back(ResponseAction::Message(message));
+    }
+
+    fn close_stream(&mut self, stream_id: u64) {
+        let Some(inbound_stream) = self.inbound_streams.get_mut(&stream_id) else {
+            error!("REQRESP: Inbound stream not found for close: {stream_id}");
+            return;
+        };
+
+        inbound_stream
+            .response_queue
+            .push_back(ResponseAction::CloseStream);
     }
 
     fn shutdown(&mut self) {
@@ -321,15 +305,13 @@ impl ConnectionHandler for ReqRespConnectionHandler {
                             break;
                         }
 
-                        let Some(response_message) = inbound_stream.response_queue.pop_front()
-                        else {
+                        let Some(action) = inbound_stream.response_queue.pop_front() else {
                             inbound_stream.state = Some(InboundStreamState::Idle(framed));
                             break;
                         };
 
                         inbound_stream.state = Some(InboundStreamState::Busy(Box::pin(
-                            send_response_message_to_inbound_stream(framed, response_message)
-                                .boxed(),
+                            send_response_message_to_inbound_stream(framed, action).boxed(),
                         )));
                     }
                     InboundStreamState::Busy(mut pin) => match pin.poll_unpin(context) {
@@ -348,15 +330,9 @@ impl ConnectionHandler for ReqRespConnectionHandler {
                                 break;
                             }
 
-                            if let Some(response_message) =
-                                inbound_stream.response_queue.pop_front()
-                            {
+                            if let Some(action) = inbound_stream.response_queue.pop_front() {
                                 inbound_stream.state = Some(InboundStreamState::Busy(Box::pin(
-                                    send_response_message_to_inbound_stream(
-                                        framed,
-                                        response_message,
-                                    )
-                                    .boxed(),
+                                    send_response_message_to_inbound_stream(framed, action).boxed(),
                                 )));
                             }
                         }
@@ -441,33 +417,15 @@ impl ConnectionHandler for ReqRespConnectionHandler {
                                 }
                             };
 
-                            if matches!(
-                                response_message,
-                                RespMessage::Error(_) | RespMessage::EndOfStream
-                            ) {
-                                entry.get_mut().state = Some(OutboundStreamState::Closing(stream));
-                            } else {
-                                self.outbound_stream_timeouts.insert(stream_id);
-                                entry.get_mut().state =
-                                    Some(OutboundStreamState::PendingResponse { stream });
-                            }
+                            self.outbound_stream_timeouts.insert(stream_id);
+                            entry.get_mut().state =
+                                Some(OutboundStreamState::PendingResponse { stream });
 
                             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                match response_message {
-                                    RespMessage::Response(message) => HandlerEvent::Ok(Box::new(
-                                        ReqRespMessageReceived::Response {
-                                            request_id,
-                                            message,
-                                        },
-                                    )),
-                                    RespMessage::Error(err) => {
-                                        HandlerEvent::Err(ReqRespMessageError::Outbound {
-                                            request_id,
-                                            err,
-                                        })
-                                    }
-                                    RespMessage::EndOfStream => HandlerEvent::Close,
-                                },
+                                HandlerEvent::Ok(Box::new(ReqRespMessageReceived::Response {
+                                    request_id,
+                                    message: Box::new(response_message),
+                                })),
                             ));
                         }
                         Poll::Pending => {
@@ -528,6 +486,7 @@ impl ConnectionHandler for ReqRespConnectionHandler {
             ConnectionRequest::Response { stream_id, message } => {
                 self.response(stream_id, *message)
             }
+            ConnectionRequest::CloseStream { stream_id } => self.close_stream(stream_id),
             ConnectionRequest::Shutdown => self.shutdown(),
         }
     }
@@ -568,23 +527,17 @@ impl ConnectionHandler for ReqRespConnectionHandler {
 
 async fn send_response_message_to_inbound_stream(
     mut inbound_stream: InboundFramed<Stream>,
-    response_message: RespMessage,
+    action: ResponseAction,
 ) -> Result<Option<InboundFramed<Stream>>, ReqRespError> {
-    if matches!(response_message, RespMessage::EndOfStream) {
-        inbound_stream.close().await?;
-        return Ok(None);
-    }
-
-    let is_error = matches!(response_message, RespMessage::Error(_));
-    let result = inbound_stream.send(response_message).await;
-    if is_error || result.is_err() {
-        inbound_stream.close().await?;
-    }
-
-    match result {
-        Ok(_) if !is_error => Ok(Some(inbound_stream)),
-        Ok(_) => Ok(None),
-        Err(err) => Err(err),
+    match action {
+        ResponseAction::Message(message) => {
+            inbound_stream.send(message).await?;
+            Ok(Some(inbound_stream))
+        }
+        ResponseAction::CloseStream => {
+            inbound_stream.close().await?;
+            Ok(None)
+        }
     }
 }
 
@@ -609,7 +562,10 @@ pub enum ConnectionRequest {
     },
     Response {
         stream_id: u64,
-        message: Box<RespMessage>,
+        message: Box<ResponseMessage>,
+    },
+    CloseStream {
+        stream_id: u64,
     },
     Shutdown,
 }

@@ -28,20 +28,10 @@ impl RequestMessage {
 pub struct ResponseMessage {
     pub protocol: ProtocolId,
     pub payload: Vec<u8>,
-    pub context_bytes: Option<[u8; 4]>,
 }
 
 impl ResponseMessage {
     pub fn new(protocol: ProtocolId, payload: Vec<u8>) -> Self {
-        Self {
-            protocol,
-            payload,
-            context_bytes: None,
-        }
-    }
-
-    pub fn with_context_bytes(mut self, context_bytes: [u8; 4]) -> Self {
-        self.context_bytes = Some(context_bytes);
-        self
+        Self { protocol, payload }
     }
 }
