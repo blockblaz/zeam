@@ -25,10 +25,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::req_resp::error::ReqRespError;
 use crate::req_resp::{
-    configurations::REQUEST_TIMEOUT, LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage,
-    ReqRespMessageError, ReqRespMessageReceived, RequestMessage, RespMessage, ResponseMessage,
+    configurations::REQUEST_TIMEOUT,
+    varint::{encode_varint, MAX_VARINT_BYTES},
+    LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage, ReqRespMessageError,
+    ReqRespMessageReceived, RequestMessage, ResponseMessage,
 };
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
@@ -242,25 +243,6 @@ pub unsafe fn send_rpc_request(
 
 /// # Safety
 /// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
-/// The caller must ensure that `channel_id` corresponds to a valid response channel.
-#[no_mangle]
-pub unsafe fn send_rpc_response(
-    network_id: u32,
-    channel_id: u64,
-    response_data: *const u8,
-    response_len: usize,
-) {
-    send_rpc_response_chunk(
-        network_id,
-        channel_id,
-        response_data,
-        response_len,
-    );
-    send_rpc_end_of_stream(network_id, channel_id);
-}
-
-/// # Safety
-/// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
 #[no_mangle]
 pub unsafe fn send_rpc_response_chunk(
     network_id: u32,
@@ -290,7 +272,7 @@ pub unsafe fn send_rpc_response_chunk(
             channel.peer_id.clone(),
             channel.connection_id,
             channel.stream_id,
-            RespMessage::Response(Box::new(response_message)),
+            response_message,
         );
         println!(
             "Sent response payload on channel {} (peer: {})",
@@ -318,11 +300,10 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
             SWARM_STATE1.as_mut().unwrap()
         };
 
-        swarm.behaviour_mut().reqresp.send_response(
+        swarm.behaviour_mut().reqresp.finish_response_stream(
             channel.peer_id.clone(),
             channel.connection_id,
             channel.stream_id,
-            RespMessage::EndOfStream,
         );
         println!(
             "Sent end-of-stream on channel {} (peer: {})",
@@ -350,6 +331,15 @@ pub unsafe fn send_rpc_error_response(
     }
 
     let message = CStr::from_ptr(message_ptr).to_string_lossy().to_string();
+    let message_bytes = message.as_bytes();
+
+    if message_bytes.len() > crate::req_resp::configurations::max_message_size() {
+        eprintln!(
+            "Attempted to send RPC error payload exceeding maximum size on channel {}",
+            channel_id
+        );
+        return;
+    }
 
     let channel = {
         let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
@@ -364,21 +354,29 @@ pub unsafe fn send_rpc_error_response(
             SWARM_STATE1.as_mut().unwrap()
         };
 
+        let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
+        payload.push(2);
+        encode_varint(message_bytes.len(), &mut payload);
+        payload.extend_from_slice(message_bytes);
+
+        let response_message = ResponseMessage::new(channel.protocol.clone(), payload);
+
+        let peer_id = channel.peer_id.clone();
+
         swarm.behaviour_mut().reqresp.send_response(
-            channel.peer_id.clone(),
+            peer_id.clone(),
             channel.connection_id,
             channel.stream_id,
-            RespMessage::Error(ReqRespError::RawError(message.clone())),
+            response_message,
         );
-        swarm.behaviour_mut().reqresp.send_response(
-            channel.peer_id,
+        swarm.behaviour_mut().reqresp.finish_response_stream(
+            peer_id.clone(),
             channel.connection_id,
             channel.stream_id,
-            RespMessage::EndOfStream,
         );
         println!(
             "Sent error response on channel {} (peer: {}): {}",
-            channel_id, channel.peer_id, message
+            channel_id, peer_id, message
         );
     } else {
         eprintln!("No response channel found for id {}", channel_id);

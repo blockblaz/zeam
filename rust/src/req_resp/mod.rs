@@ -5,10 +5,11 @@ pub mod inbound_protocol;
 pub mod messages;
 pub mod outbound_protocol;
 pub mod protocol_id;
+pub(crate) mod varint;
 
 pub use handler::{
     ConnectionRequest, HandlerEvent, ReqRespConnectionHandler, ReqRespMessageError,
-    ReqRespMessageReceived, RespMessage,
+    ReqRespMessageReceived,
 };
 pub use messages::{RequestMessage, ResponseMessage};
 pub use protocol_id::{LeanSupportedProtocol, ProtocolId};
@@ -67,7 +68,7 @@ impl ReqResp {
         peer_id: PeerId,
         connection_id: ConnectionId,
         stream_id: u64,
-        message: RespMessage,
+        message: ResponseMessage,
     ) {
         self.events.push(ToSwarm::NotifyHandler {
             peer_id,
@@ -76,6 +77,19 @@ impl ReqResp {
                 stream_id,
                 message: Box::new(message),
             },
+        });
+    }
+
+    pub fn finish_response_stream(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream_id: u64,
+    ) {
+        self.events.push(ToSwarm::NotifyHandler {
+            peer_id,
+            handler: NotifyHandler::One(connection_id),
+            event: ConnectionRequest::CloseStream { stream_id },
         });
     }
 

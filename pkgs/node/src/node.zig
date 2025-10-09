@@ -188,7 +188,13 @@ pub const BeamNode = struct {
         self.pending_rpc_requests.put(request_id, pending) catch |err| {
             self.logger.warn("Failed to track status request {d} for peer {s}: {any}", .{ request_id, peer_id, err });
             pending.deinit(self.allocator);
+            return;
         };
+
+        self.logger.info(
+            "Sent status request to peer {s}: request_id={d}, head_slot={d}, finalized_slot={d}",
+            .{ peer_id, request_id, status.head_slot, status.finalized_slot },
+        );
     }
 
     fn selectPeerForRequest(self: *Self) ?[]const u8 {
