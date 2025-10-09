@@ -393,7 +393,7 @@ pub fn build(b: *Builder) !void {
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
-    const configs_tests = b.addTest(
+    const configs_tests = b.addTest(.{
         .root_module = zeam_configs,
         .optimize = optimize,
         .target = target,
