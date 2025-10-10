@@ -14,7 +14,7 @@ const FrameError = error{
     EmptyStream,
 };
 
-const stream_identifier = "\xff\x06\x00\x73NaPpY"; // type + length + "sNaPpY"
+const stream_identifier = "\xff\x06\x00\x00sNaPpY"; // type + length + "sNaPpY"
 const identifier_payload = "sNaPpY";
 const masked_crc_constant: u32 = 0xa282ead8;
 const max_chunk_len: usize = (1 << 24) - 1; // 24-bit length field
@@ -45,12 +45,17 @@ pub fn encode(allocator: Allocator, data: []const u8) ![]u8 {
 
         const compressed = try snappyz.encode(allocator, chunk_input);
         defer allocator.free(compressed);
-        if (compressed.len > max_chunk_len - 4) {
+        const use_uncompressed = compressed.len >= chunk_input.len;
+        const payload = if (use_uncompressed) chunk_input else compressed;
+        const chunk_type: u8 = if (use_uncompressed) 0x01 else 0x00;
+
+        if (payload.len > max_chunk_len - 4) {
             return error.ChunkTooLarge;
         }
-        try chunk_buf.appendSlice(compressed);
 
-        try appendChunk(&output, 0x00, chunk_buf.items);
+        try chunk_buf.appendSlice(payload);
+
+        try appendChunk(&output, chunk_type, chunk_buf.items);
 
         index = end_index;
     }
@@ -74,16 +79,24 @@ pub fn encodeToWriter(allocator: Allocator, reader: anytype, writer: anytype) !v
         const compressed = try snappyz.encode(allocator, chunk_input);
         defer allocator.free(compressed);
 
-        if (compressed.len > max_chunk_len - 4) {
+        const use_uncompressed = compressed.len >= chunk_input.len;
+        const payload_len = if (use_uncompressed) chunk_input.len else compressed.len;
+        const chunk_type: u8 = if (use_uncompressed) 0x01 else 0x00;
+
+        if (payload_len > max_chunk_len - 4) {
             return error.ChunkTooLarge;
         }
 
-        try writeChunkHeader(writer, 0x00, compressed.len + 4);
+        try writeChunkHeader(writer, chunk_type, payload_len + 4);
 
         var checksum_bytes: [4]u8 = undefined;
         std.mem.writeIntLittle(u32, checksum_bytes[0..], checksum);
         try writer.writeAll(&checksum_bytes);
-        try writer.writeAll(compressed);
+        if (use_uncompressed) {
+            try writer.writeAll(chunk_input);
+        } else {
+            try writer.writeAll(compressed);
+        }
     }
 }
 
@@ -322,6 +335,29 @@ fn readByte(reader: anytype) !?u8 {
     return byte[0];
 }
 
+const go_writer_golden_frame =
+    "\xff\x06\x00\x00sNaPpY" ++
+    "\x01\x08\x00\x00" ++
+    "\x68\x10\xe6\xb6" ++
+    "\x61\x62\x63\x64" ++
+    "\x00\x11\x00\x00" ++
+    "\x5f\xeb\xf2\x10" ++
+    "\x96\x01" ++
+    "\x00\x41" ++
+    "\xfe\x01\x00" ++
+    "\xfe\x01\x00" ++
+    "\x52\x01\x00" ++
+    "\x00\x18\x00\x00" ++
+    "\x30\x85\x69\xeb" ++
+    "\x70" ++
+    "\x00\x42" ++
+    "\xee\x01\x00" ++
+    "\x0d\x01" ++
+    "\x08\x65\x66\x43" ++
+    "\x4e\x01\x00" ++
+    "\x4e\x5a\x00" ++
+    "\x00\x67";
+
 test "encodeToWriter matches encode" {
     const allocator = std.testing.allocator;
     const sample = "frame-streaming-testframe-streaming-test";
@@ -444,4 +480,96 @@ test "decode detects checksum mismatch" {
     corrupted[first_chunk + 4] ^= 0xff; // flip a checksum byte
 
     try std.testing.expectError(FrameError.BadChecksum, decode(allocator, corrupted));
+}
+
+test "decode compatibility with go snappy writer golden output" {
+    const allocator = std.testing.allocator;
+    const decoded = try decode(allocator, go_writer_golden_frame);
+    defer allocator.free(decoded);
+
+    const expected_total_len = 4 + 150 + 68 + 3 + 20 + 20 + 1;
+    try std.testing.expectEqual(@as(usize, expected_total_len), decoded.len);
+    try std.testing.expectEqualSlices(u8, "abcd", decoded[0..4]);
+
+    var cursor: usize = 4;
+    try std.testing.expect(std.mem.allEqual(u8, 'A', decoded[cursor .. cursor + 150]));
+    cursor += 150;
+    try std.testing.expect(std.mem.allEqual(u8, 'B', decoded[cursor .. cursor + 68]));
+    cursor += 68;
+    try std.testing.expectEqualSlices(u8, "efC", decoded[cursor .. cursor + 3]);
+    cursor += 3;
+    try std.testing.expect(std.mem.allEqual(u8, 'C', decoded[cursor .. cursor + 20]));
+    cursor += 20;
+    try std.testing.expect(std.mem.allEqual(u8, 'B', decoded[cursor .. cursor + 20]));
+    cursor += 20;
+    try std.testing.expectEqual(@as(u8, 'g'), decoded[cursor]);
+}
+
+test "encode compatibility with go snappy writer golden output" {
+    const allocator = std.testing.allocator;
+
+    const SegmentSpec = union(enum) {
+        literal: []const u8,
+        repeat: struct { ch: u8, len: usize },
+    };
+
+    const segment_specs = [_]SegmentSpec{
+        SegmentSpec{ .literal = "abcd" },
+        SegmentSpec{ .repeat = .{ .ch = @as(u8, 'A'), .len = 150 } },
+        SegmentSpec{ .repeat = .{ .ch = @as(u8, 'B'), .len = 68 } },
+        SegmentSpec{ .literal = "efC" },
+        SegmentSpec{ .repeat = .{ .ch = @as(u8, 'C'), .len = 20 } },
+        SegmentSpec{ .repeat = .{ .ch = @as(u8, 'B'), .len = 20 } },
+        SegmentSpec{ .literal = "g" },
+    };
+
+    var payload_builder = std.ArrayList(u8).init(allocator);
+    defer payload_builder.deinit();
+
+    for (segment_specs) |spec| switch (spec) {
+        .literal => |lit| try payload_builder.appendSlice(lit),
+        .repeat => |rep| {
+            try payload_builder.ensureUnusedCapacity(rep.len);
+            var i: usize = 0;
+            while (i < rep.len) : (i += 1) try payload_builder.append(rep.ch);
+        },
+    };
+
+    const payload = try payload_builder.toOwnedSlice();
+    defer allocator.free(payload);
+
+    const segments = try allocator.alloc([]const u8, segment_specs.len);
+    defer allocator.free(segments);
+
+    var offset: usize = 0;
+    for (segment_specs, 0..) |spec, idx| {
+        const len = switch (spec) {
+            .literal => |lit| lit.len,
+            .repeat => |rep| rep.len,
+        };
+        segments[idx] = payload[offset .. offset + len];
+        offset += len;
+    }
+
+    const SegmentedReader = struct {
+        segments: []const []const u8,
+        index: usize = 0,
+
+        pub fn read(self: *@This(), buffer: []u8) !usize {
+            if (self.index >= self.segments.len) return 0;
+            const segment = self.segments[self.index];
+            std.debug.assert(buffer.len >= segment.len);
+            std.mem.copy(u8, buffer[0..segment.len], segment);
+            self.index += 1;
+            return segment.len;
+        }
+    };
+
+    var segmented_reader = SegmentedReader{ .segments = segments };
+    var encoded = std.ArrayList(u8).init(allocator);
+    defer encoded.deinit();
+
+    try encodeToWriter(allocator, &segmented_reader, encoded.writer());
+
+    try std.testing.expectEqualSlices(u8, go_writer_golden_frame, encoded.items);
 }
