@@ -171,6 +171,7 @@ pub const BeamChain = struct {
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        const parent_slot = pre_state.slot;
         const post_state = try self.allocator.create(types.BeamState);
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
@@ -195,7 +196,22 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
+        const stf_timer = api.startStateTransitionTimer();
+        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, .{
+            .logger = self.block_building_logger,
+            .recordSlotsProcessingTime = &api.observeSlotsProcessingTime,
+            .recordBlockProcessingTime = &api.observeBlockProcessingTime,
+            .recordAttestationsProcessingTime = &api.observeAttestationsProcessingTime,
+        });
+        _ = stf_timer.observe();
+
+        // Update metrics after state transition
+        const slots_processed = post_state.slot - parent_slot;
+        const attestations_count = block.body.attestations.constSlice().len;
+        api.addSlotsProcessed(slots_processed);
+        api.addAttestationsProcessed(attestations_count);
+        api.setLeanLatestJustifiedSlot(post_state.latest_justified.slot);
+        api.setLeanLatestFinalizedSlot(post_state.latest_finalized.slot);
 
         block_json = try block.toJson(self.allocator);
         const block_str_2 = try jsonToString(self.allocator, block_json);
@@ -357,24 +373,40 @@ pub const BeamChain = struct {
             block.slot,
         });
 
+        // Get parent state to calculate slots processed
+        const parent_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+        const parent_slot = parent_state.slot;
+
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
-            // 1. get parent state
-            const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+            // 1. get parent state (already retrieved above)
             const cpost_state = try self.allocator.create(types.BeamState);
-            try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
+            try types.sszClone(self.allocator, types.BeamState, parent_state.*, cpost_state);
 
             // 2. apply STF to get post state
             var validSignatures = true;
             stf.verify_signatures(signedBlock) catch {
                 validSignatures = false;
             };
+            const stf_timer = api.startStateTransitionTimer();
             try stf.apply_transition(self.allocator, cpost_state, signedBlock, .{
                 //
                 .logger = self.stf_logger,
                 .validSignatures = validSignatures,
+                .recordSlotsProcessingTime = &api.observeSlotsProcessingTime,
+                .recordBlockProcessingTime = &api.observeBlockProcessingTime,
+                .recordAttestationsProcessingTime = &api.observeAttestationsProcessingTime,
             });
+            _ = stf_timer.observe();
             break :computedstate cpost_state;
         };
+
+        // Update metrics after state transition
+        const slots_processed = post_state.slot - parent_slot;
+        const attestations_count = block.body.attestations.constSlice().len;
+        api.addSlotsProcessed(slots_processed);
+        api.addAttestationsProcessed(attestations_count);
+        api.setLeanLatestJustifiedSlot(post_state.latest_justified.slot);
+        api.setLeanLatestFinalizedSlot(post_state.latest_finalized.slot);
 
         // 3. fc onblock
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{

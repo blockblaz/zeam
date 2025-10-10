@@ -34,6 +34,45 @@ pub fn setLeanHeadSlot(slot: u64) void {
     _ = slot;
 }
 
+pub fn setLeanLatestJustifiedSlot(slot: u64) void {
+    _ = slot;
+}
+
+pub fn setLeanLatestFinalizedSlot(slot: u64) void {
+    _ = slot;
+}
+
+pub fn addSlotsProcessed(count: u64) void {
+    _ = count;
+}
+
+pub fn addAttestationsProcessed(count: u64) void {
+    _ = count;
+}
+
+pub fn observeSlotsProcessingTime(duration_seconds: f32) void {
+    _ = duration_seconds;
+}
+
+pub fn observeBlockProcessingTime(duration_seconds: f32) void {
+    _ = duration_seconds;
+}
+
+pub fn observeAttestationsProcessingTime(duration_seconds: f32) void {
+    _ = duration_seconds;
+}
+
+pub const StateTransitionTimer = struct {
+    pub fn observe(self: StateTransitionTimer) f32 {
+        _ = self;
+        return 0;
+    }
+};
+
+pub fn startStateTransitionTimer() StateTransitionTimer {
+    return StateTransitionTimer{};
+}
+
 pub fn chain_onblock_duration_seconds_start() Timer {
     return chain_onblock_duration_seconds.start();
 }

@@ -31,6 +31,50 @@ The following metrics are currently available:
   - **Labels**: None.
   - **Sample Collection Event**: Updated on every fork choice head update.
 
+- **`lean_latest_justified_slot`** (Gauge)
+  - **Description**: Latest justified slot.
+  - **Labels**: None.
+  - **Sample Collection Event**: Updated on state transition completion.
+
+- **`lean_latest_finalized_slot`** (Gauge)
+  - **Description**: Latest finalized slot.
+  - **Labels**: None.
+  - **Sample Collection Event**: Updated on state transition completion.
+
+- **`lean_state_transition_time_seconds`** (Histogram)
+  - **Description**: Time to process state transition.
+  - **Labels**: None.
+  - **Buckets**: 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4
+  - **Sample Collection Event**: On state transition.
+
+- **`lean_state_transition_slots_processed_total`** (Counter)
+  - **Description**: Total number of processed slots (including empty slots).
+  - **Labels**: None.
+  - **Sample Collection Event**: On state transition process slots.
+
+- **`lean_state_transition_slots_processing_time_seconds`** (Histogram)
+  - **Description**: Time taken to process slots.
+  - **Labels**: None.
+  - **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+  - **Sample Collection Event**: On state transition process slots.
+
+- **`lean_state_transition_block_processing_time_seconds`** (Histogram)
+  - **Description**: Time taken to process block.
+  - **Labels**: None.
+  - **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+  - **Sample Collection Event**: On state transition process block.
+
+- **`lean_state_transition_attestations_processed_total`** (Counter)
+  - **Description**: Total number of processed attestations.
+  - **Labels**: None.
+  - **Sample Collection Event**: On state transition process attestations.
+
+- **`lean_state_transition_attestations_processing_time_seconds`** (Histogram)
+  - **Description**: Time taken to process attestations.
+  - **Labels**: None.
+  - **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+  - **Sample Collection Event**: On state transition process attestations.
+
 ## How It Works
 
 The API system is initialized at application startup in `pkgs/cli/src/main.zig`. 
