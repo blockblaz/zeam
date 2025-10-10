@@ -694,7 +694,12 @@ impl Network {
                                 }
                             }
                             Ok(ReqRespMessageReceived::Response { request_id, message }) => {
-                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                {
+                                    let mut map = REQUEST_ID_MAP.lock().unwrap();
+                                    if !map.update_timeout(&request_id, REQUEST_TIMEOUT) {
+                                        map.insert(request_id, ());
+                                    }
+                                }
                                 let response_message = *message;
                                 println!(
                                     "reqresp:: Received response from {} for request id {} ({} bytes)",

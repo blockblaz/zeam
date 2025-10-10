@@ -15,6 +15,7 @@ const jsonToString = zeam_utils.jsonToString;
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 const snappyz = @import("snappyz");
+const snappyframesz = @import("snappyframesz");
 const consensus_params = @import("@zeam/params");
 
 const ServerStreamError = error{
@@ -168,7 +169,16 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
             const encoded = try serialized.toOwnedSlice();
             defer allocator.free(encoded);
 
-            const frame = try buildResponseFrame(allocator, 0, encoded);
+            const framed = snappyframesz.encode(allocator, encoded) catch |err| {
+                ctx.zigHandler.logger.err(
+                    "network-{d}:: Failed to snappy-frame status response for peer={s} channel={d}: {any}",
+                    .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id, err },
+                );
+                return err;
+            };
+            defer allocator.free(framed);
+
+            const frame = try buildResponseFrame(allocator, 0, framed);
             defer allocator.free(frame);
 
             ctx.zigHandler.logger.debug(
@@ -200,7 +210,16 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
             const encoded = try serialized.toOwnedSlice();
             defer allocator.free(encoded);
 
-            const frame = try buildResponseFrame(allocator, 0, encoded);
+            const framed = snappyframesz.encode(allocator, encoded) catch |err| {
+                ctx.zigHandler.logger.err(
+                    "network-{d}:: Failed to snappy-frame block_by_root response for peer={s} channel={d}: {any}",
+                    .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id, err },
+                );
+                return err;
+            };
+            defer allocator.free(framed);
+
+            const frame = try buildResponseFrame(allocator, 0, framed);
             defer allocator.free(frame);
 
             ctx.zigHandler.logger.debug(
@@ -378,13 +397,22 @@ export fn handleRPCRequestFromRustBridge(
     }
 
     const request_frame: []const u8 = request_ptr[0..request_len];
-    const request_bytes = parseRequestFrame(request_frame) catch |err| {
+    const request_payload = parseRequestFrame(request_frame) catch |err| {
         zigHandler.logger.err(
             "network-{d}:: Invalid RPC request frame from peer={s} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, protocol_slice, err },
         );
         return;
     };
+
+    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_payload) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to decode snappy-framed RPC request from peer={s} protocol={s}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, protocol_slice, err },
+        );
+        return;
+    };
+    defer zigHandler.allocator.free(request_bytes);
 
     var request: interface.ReqRespRequest = undefined;
     if (std.mem.eql(u8, protocol_slice, status_protocol)) {
@@ -440,8 +468,8 @@ export fn handleRPCRequestFromRustBridge(
     defer zigHandler.allocator.free(request_str);
 
     zigHandler.logger.debug(
-        "network-{d}:: !!!handleRPCRequestFromRustBridge peer={s} protocol={s} channel={d}:: request={s} from bytes={any} \n",
-        .{ zigHandler.params.networkId, peer_id_slice, protocol_slice, channel_id, request_str, request_bytes },
+        "network-{d}:: !!!handleRPCRequestFromRustBridge peer={s} protocol={s} channel={d}:: request={s}",
+        .{ zigHandler.params.networkId, peer_id_slice, protocol_slice, channel_id, request_str },
     );
 
     const request_method = std.meta.activeTag(request);
@@ -560,7 +588,17 @@ export fn handleRPCResponseFromRustBridge(
         return;
     }
 
-    const response_bytes = parsed_frame.payload;
+    const response_bytes = snappyframesz.decode(zigHandler.allocator, parsed_frame.payload) catch |err| {
+        zigHandler.notifyRpcErrorFmt(
+            request_id,
+            method,
+            2,
+            "Failed to decode snappy-framed response (protocol={s}): {any}",
+            .{ protocol_slice, err },
+        );
+        return;
+    };
+    defer zigHandler.allocator.free(response_bytes);
 
     var response_union: interface.ReqRespResponse = undefined;
     switch (method) {
@@ -940,7 +978,16 @@ pub const EthLibp2p = struct {
 
         defer self.allocator.free(encoded_message);
 
-        const frame = buildRequestFrame(self.allocator, encoded_message) catch |err| {
+        const framed_payload = snappyframesz.encode(self.allocator, encoded_message) catch |err| {
+            self.logger.err(
+                "network-{d}:: Failed to snappy-frame RPC request payload for peer={s} protocol_tag={d}: {any}",
+                .{ self.params.networkId, peer_id, protocol_tag, err },
+            );
+            return err;
+        };
+        defer self.allocator.free(framed_payload);
+
+        const frame = buildRequestFrame(self.allocator, framed_payload) catch |err| {
             self.logger.err(
                 "network-{d}:: Failed to build RPC request frame for peer={s} protocol_tag={d}: {any}",
                 .{ self.params.networkId, peer_id, protocol_tag, err },

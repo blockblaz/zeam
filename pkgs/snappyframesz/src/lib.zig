@@ -17,7 +17,6 @@ const FrameError = error{
 const stream_identifier = "\xff\x06\x00\x73NaPpY"; // type + length + "sNaPpY"
 const identifier_payload = "sNaPpY";
 const masked_crc_constant: u32 = 0xa282ead8;
-const crc32c_polynomial: u32 = 0x82f63b78;
 const max_chunk_len: usize = (1 << 24) - 1; // 24-bit length field
 const recommended_chunk: usize = 1 << 16; // 64KiB
 
@@ -304,19 +303,7 @@ fn validateChecksum(data: []const u8, expected_masked: u32) !void {
 }
 
 fn crc32c(data: []const u8) u32 {
-    var crc: u32 = 0xffffffff;
-    for (data) |byte| {
-        crc ^= @as(u32, byte);
-        var bit: usize = 0;
-        while (bit < 8) : (bit += 1) {
-            if ((crc & 1) != 0) {
-                crc = (crc >> 1) ^ crc32c_polynomial;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return ~crc;
+    return std.hash.crc.Crc32Iscsi.hash(data);
 }
 
 fn readExact(reader: anytype, buffer: []u8) !void {
@@ -365,4 +352,96 @@ test "decodeFromReader matches decode" {
     try decodeFromReader(allocator, reader_stream.reader(), decoded_buffer.writer());
 
     try std.testing.expectEqualSlices(u8, sample, decoded_buffer.items);
+}
+
+test "frame roundtrip samples" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "",
+        "a",
+        "hello snappy",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0123456789abcdefghijklmnopqrstuvwxyz",
+    };
+
+    for (cases) |case_data| {
+        const encoded = try encode(allocator, case_data);
+        defer allocator.free(encoded);
+
+        const decoded = decode(allocator, encoded) catch |err| {
+            std.debug.print("decode failed for case '{s}' with error={any}\n", .{ case_data, err });
+            return err;
+        };
+        defer allocator.free(decoded);
+
+        try std.testing.expectEqualSlices(u8, case_data, decoded);
+    }
+}
+
+test "frame encode splits large payload into multiple chunks" {
+    const allocator = std.testing.allocator;
+    const large_len = (recommended_chunk * 2) + 123;
+    const large_data = try allocator.alloc(u8, large_len);
+    defer allocator.free(large_data);
+
+    for (large_data, 0..) |*byte, idx| {
+        byte.* = @intCast((idx * 31) % 251);
+    }
+
+    const encoded = try encode(allocator, large_data);
+    defer allocator.free(encoded);
+
+    var chunk_count: usize = 0;
+    var cursor: usize = stream_identifier.len;
+    while (cursor + 4 <= encoded.len) {
+        chunk_count += 1;
+        const length = readChunkLength(encoded[cursor + 1 .. cursor + 4]);
+        cursor += 4 + length;
+    }
+
+    try std.testing.expect(chunk_count >= 2);
+
+    const decoded = try decode(allocator, encoded);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, large_data, decoded);
+}
+
+test "decode falls back to raw snappy payloads" {
+    const allocator = std.testing.allocator;
+    const sample = "raw snappy payload";
+    const raw = try snappyz.encode(allocator, sample);
+    defer allocator.free(raw);
+
+    const decoded = try decode(allocator, raw);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(u8, sample, decoded);
+}
+
+test "decode rejects invalid stream identifier" {
+    const allocator = std.testing.allocator;
+    const sample = "identifier";
+    const encoded = try encode(allocator, sample);
+    defer allocator.free(encoded);
+
+    var invalid = try allocator.dupe(u8, encoded);
+    defer allocator.free(invalid);
+    invalid[4] ^= 0xff; // corrupt the identifier payload
+
+    try std.testing.expectError(FrameError.InvalidStreamIdentifier, decode(allocator, invalid));
+}
+
+test "decode detects checksum mismatch" {
+    const allocator = std.testing.allocator;
+    const sample = "checksum";
+    const encoded = try encode(allocator, sample);
+    defer allocator.free(encoded);
+
+    var corrupted = try allocator.dupe(u8, encoded);
+    defer allocator.free(corrupted);
+
+    const first_chunk = stream_identifier.len;
+    corrupted[first_chunk + 4] ^= 0xff; // flip a checksum byte
+
+    try std.testing.expectError(FrameError.BadChecksum, decode(allocator, corrupted));
 }
