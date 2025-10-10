@@ -26,6 +26,11 @@ The following metrics are currently available:
   - **Description**: Measures the time taken to process a block in the state transition function.
   - **Labels**: None.
 
+- **`lean_head_slot`** (Gauge)
+  - **Description**: Latest slot of the lean chain (canonical chain head as determined by fork choice).
+  - **Labels**: None.
+  - **Sample Collection Event**: Updated on every fork choice head update.
+
 ## How It Works
 
 The API system is initialized at application startup in `pkgs/cli/src/main.zig`. 
