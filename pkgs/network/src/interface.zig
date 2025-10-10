@@ -448,13 +448,30 @@ pub const ReqRespRequestHandler = struct {
 
     pub fn onReqRespRequest(self: *Self, req: *const ReqRespRequest, stream: ReqRespServerStream) anyerror!void {
         self.logger.debug("network-{d}:: onReqRespRequest={any}, handlers={d}", .{ self.networkId, req, self.handlers.items.len });
-        for (self.handlers.items) |handler| {
-            // return from the first handler, there are anyway going to be just 1 in a normal real scenario
-            // but needs to be handled for mock network where we will have 2 handlers subscribed
-            // and we need to pass request to the other one
-            return handler.onReqRespRequest(req, stream);
+        if (self.handlers.items.len == 0) {
+            return error.NoHandlerSubscribed;
         }
-        return error.NoHandlerSubscribed;
+
+        var handled = false;
+        var last_err: ?anyerror = null;
+
+        for (self.handlers.items) |handler| {
+            handler.onReqRespRequest(req, stream) catch |err| {
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any}", .{ self.networkId, err });
+                last_err = err;
+                continue;
+            };
+
+            handled = true;
+
+            if (stream.isFinished()) {
+                break;
+            }
+        }
+
+        if (!handled) {
+            return last_err orelse error.NoHandlerSubscribed;
+        }
     }
 };
 
