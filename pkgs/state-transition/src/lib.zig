@@ -3,9 +3,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
-
-const utils = @import("./utils.zig");
-pub usingnamespace utils;
 const zeam_utils = @import("@zeam/utils");
 
 const transition = @import("./transition.zig");
@@ -85,7 +82,7 @@ test "genStateBlockHeader" {
         var applied_block_root: types.Root = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, applied_block.message, &applied_block_root, allocator);
 
-        const state_block_header = try utils.genStateBlockHeader(allocator, beam_state);
+        const state_block_header = try beam_state.genStateBlockHeader(allocator);
         var state_block_header_root: types.Root = undefined;
         try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &state_block_header_root, allocator);
 

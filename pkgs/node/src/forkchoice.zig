@@ -235,7 +235,7 @@ pub const ForkChoice = struct {
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
-        const anchor_block_header = try stf.genStateBlockHeader(allocator, opts.anchorState.*);
+        const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
             types.BeamBlockHeader,

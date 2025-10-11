@@ -1,15 +1,14 @@
 const ssz = @import("ssz");
 const std = @import("std");
 const json = std.json;
-const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
-pub const utils = @import("./utils.zig");
-
-const zeam_utils = @import("@zeam/utils");
-const debugLog = zeam_utils.zeamLog;
-const jsonToString = zeam_utils.jsonToString;
 
 const params = @import("@zeam/params");
+const zeam_utils = @import("@zeam/utils");
+
+const Allocator = std.mem.Allocator;
+const debugLog = zeam_utils.zeamLog;
+const StateTransitionError = types.StateTransitionError;
 
 // put the active logs at debug level for now by default
 pub const StateTransitionOpts = struct {
@@ -34,7 +33,7 @@ fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
     // i.e. just after processing the latest block of latest block header
     // this completes latest block header for parentRoot checks of new block
 
-    if (std.mem.eql(u8, &state.latest_block_header.state_root, &utils.ZERO_HASH)) {
+    if (std.mem.eql(u8, &state.latest_block_header.state_root, &types.ZERO_HASH)) {
         var prev_state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(*types.BeamState, state, &prev_state_root, allocator);
         state.latest_block_header.state_root = prev_state_root;
@@ -73,60 +72,6 @@ pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
     }
 
     return false;
-}
-
-fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
-    logger.debug("process block header\n", .{});
-
-    // 1. match state and block slot
-    if (state.slot != block.slot) {
-        logger.err("process-block-header: invalid mismatching state-slot={} != block-slot={}", .{ state.slot, block.slot });
-        return StateTransitionError.InvalidPreState;
-    }
-
-    // 2. match state's latest block header and block slot
-    if (state.latest_block_header.slot >= block.slot) {
-        logger.err("process-block-header: invalid future latest_block_header-slot={} >= block-slot={}", .{ state.latest_block_header.slot, block.slot });
-        return StateTransitionError.InvalidLatestBlockHeader;
-    }
-
-    // 3. check proposer is correct
-    const correct_proposer_index = block.slot % state.config.num_validators;
-    if (block.proposer_index != correct_proposer_index) {
-        logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ block.proposer_index, block.slot, correct_proposer_index });
-        return StateTransitionError.InvalidProposer;
-    }
-
-    // 4. verify latest block header is the parent
-    var head_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &head_root, allocator);
-    if (!std.mem.eql(u8, &head_root, &block.parent_root)) {
-        logger.err("state root={x:02} block root={x:02}\n", .{ head_root, block.parent_root });
-        return StateTransitionError.InvalidParentRoot;
-    }
-
-    // update justified and finalized with parent root in state if this is the first block post genesis
-    if (state.latest_block_header.slot == 0) {
-        // fixed  length array structures should just be copied over
-        state.latest_justified.root = block.parent_root;
-        state.latest_finalized.root = block.parent_root;
-    }
-
-    // extend historical block hashes and justified slots structures using SSZ Lists directly
-    try state.historical_block_hashes.append(block.parent_root);
-    // if parent is genesis it is already justified
-    try state.justified_slots.append(if (state.latest_block_header.slot == 0) true else false);
-
-    const block_slot: usize = @intCast(block.slot);
-    const missed_slots: usize = @intCast(block_slot - state.latest_block_header.slot - 1);
-    for (0..missed_slots) |i| {
-        _ = i;
-        try state.historical_block_hashes.append(utils.ZERO_HASH);
-        try state.justified_slots.append(false);
-    }
-    logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, state.justified_slots.len(), state.historical_block_hashes.len() });
-
-    try block.blockToLatestBlockHeader(allocator, &state.latest_block_header);
 }
 
 // not active in PQ devnet0 - zig will automatically prune this from code
@@ -286,7 +231,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // start block processing
-    try process_block_header(allocator, state, block, logger);
+    try state.process_block_header(allocator, block, logger);
     // PQ devner-0 has no execution
     // try process_execution_payload_header(state, block);
     try process_operations(allocator, state, block, logger);
@@ -338,5 +283,3 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
         }
     }
 }
-
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex };
