@@ -101,10 +101,29 @@ pub const BeamBlock = struct {
             .slot = self.slot,
             .proposer_index = self.proposer_index,
             .parent_root = self.parent_root,
-            .state_root = utils.ZERO_HASH,
+            .state_root = self.state_root,
             .body_root = body_root,
         };
         return header;
+    }
+
+    // computing latest block header to be assigned to the state for processing the block
+    pub fn blockToLatestBlockHeader(self: *const Self, allocator: Allocator, header: *BeamBlockHeader) !void {
+        var body_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(
+            BeamBlockBody,
+            self.body,
+            &body_root,
+            allocator,
+        );
+
+        header.* = .{
+            .slot = self.slot,
+            .proposer_index = self.proposer_index,
+            .parent_root = self.parent_root,
+            .state_root = ZERO_HASH,
+            .body_root = body_root,
+        };
     }
 
     pub fn deinit(self: *Self) void {
@@ -256,4 +275,32 @@ test "ssz seralize/deserialize signed beam block" {
         &block_root,
         std.testing.allocator,
     );
+}
+
+test "blockToLatestBlockHeader and blockToHeader" {
+    var block = BeamBlock{
+        .slot = 9,
+        .proposer_index = 3,
+        .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
+        .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
+        .body = .{
+            //
+            // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
+            .attestations = try SignedVotes.init(std.testing.allocator),
+        },
+    };
+    defer block.deinit();
+
+    // test blockToLatestBlockHeader
+    var lastest_block_header: BeamBlockHeader = undefined;
+    try block.blockToLatestBlockHeader(std.testing.allocator, &lastest_block_header);
+    try std.testing.expect(lastest_block_header.proposer_index == block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &block.parent_root, &lastest_block_header.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &ZERO_HASH, &lastest_block_header.state_root));
+
+    // test blockToHeader
+    var block_header: BeamBlockHeader = try block.blockToHeader(std.testing.allocator);
+    try std.testing.expect(block_header.proposer_index == block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &block.parent_root, &block_header.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &block.state_root, &block_header.state_root));
 }

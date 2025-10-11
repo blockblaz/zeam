@@ -164,7 +164,7 @@ pub const BeamState = struct {
         }
         logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
 
-        self.latest_block_header = try staged_block.blockToHeader(allocator);
+        try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
@@ -172,8 +172,8 @@ pub const BeamState = struct {
         try genesis_block.genGenesisBlock(allocator);
         defer genesis_block.deinit();
 
-        var latest_block_header = try genesis_block.blockToHeader(allocator);
-        errdefer latest_block_header.deinit();
+        var genesis_block_header: block.BeamBlockHeader = undefined;
+        try genesis_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
 
         var historical_block_hashes = try utils.HistoricalBlockHashes.init(allocator);
         errdefer historical_block_hashes.deinit();
@@ -193,7 +193,7 @@ pub const BeamState = struct {
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
-            .latest_block_header = latest_block_header,
+            .latest_block_header = genesis_block_header,
             // mini3sf
             .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
             .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
