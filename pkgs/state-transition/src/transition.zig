@@ -54,27 +54,6 @@ fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot
     }
 }
 
-pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
-    if (candidate < finalized) {
-        return StateTransitionError.InvalidJustifiableSlot;
-    }
-
-    const delta: f32 = @floatFromInt(candidate - finalized);
-    if (delta <= 5) {
-        return true;
-    }
-    const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
-    if (delta_x2 == 0) {
-        return true;
-    }
-    const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
-    if (delta_x2_x == 0.5) {
-        return true;
-    }
-
-    return false;
-}
-
 fn process_block_header(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process block header\n", .{});
 
@@ -137,11 +116,31 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
-    // 1. process attestations
-    try process_attestations(allocator, state, block.body.attestations, logger);
+/// Helper function to check if a slot is justifiable after finalization
+/// Exported for use by other modules (forkchoice, validator, etc.)
+pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
+    if (candidate < finalized) {
+        return StateTransitionError.InvalidJustifiableSlot;
+    }
+
+    const delta: f32 = @floatFromInt(candidate - finalized);
+    if (delta <= 5) {
+        return true;
+    }
+    const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
+    if (delta_x2 == 0) {
+        return true;
+    }
+    const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
+    if (delta_x2_x == 0.5) {
+        return true;
+    }
+
+    return false;
 }
 
+/// Process attestations and update justification/finalization state
+/// Implements attestation validation as per the leanSpec
 fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
     const justified_str = try state.latest_justified.toJsonString(allocator);
@@ -151,9 +150,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
     logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
 
-    // work directly with SSZ types
-    // historical_block_hashes and justified_slots are already SSZ types in state
-
+    // Get current justifications from state
     var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer {
         var iterator = justifications.iterator();
@@ -164,12 +161,14 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     errdefer justifications.deinit(allocator);
     try state.getJustification(allocator, &justifications);
 
-    // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
     const num_validators: usize = @intCast(state.config.num_validators);
+
+    // Process each attestation
     for (attestations.constSlice()) |signed_vote| {
         const validator_id: usize = @intCast(signed_vote.validator_id);
         const vote = signed_vote.message;
-        // check if vote is sane
+
+        // Validate vote structure
         const source_slot: usize = @intCast(vote.source.slot);
         const target_slot: usize = @intCast(vote.target.slot);
         const vote_str = try vote.toJsonString(allocator);
@@ -177,6 +176,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
 
         logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str, validator_id });
 
+        // Check slot indices are within bounds
         if (source_slot >= state.justified_slots.len()) {
             return StateTransitionError.InvalidSlotIndex;
         }
@@ -190,16 +190,16 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             return StateTransitionError.InvalidSlotIndex;
         }
 
+        // Validate vote conditions
         const is_source_justified = try state.justified_slots.get(source_slot);
         const is_target_already_justified = try state.justified_slots.get(target_slot);
         const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &(try state.historical_block_hashes.get(source_slot)));
         const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &(try state.historical_block_hashes.get(target_slot)));
-        const target_not_ahead = target_slot <= source_slot;
+        const target_not_ahead = target_slot <= source_slot; // Skip if target <= source (invalid)
         const is_target_justifiable = try is_justifiable_slot(state.latest_finalized.slot, target_slot);
 
+        // Skip invalid votes
         if (!is_source_justified or
-            // not present in 3sf mini but once a target is justified no need to run loop
-            // as we remove the target from justifications map as soon as its justified
             is_target_already_justified or
             !has_correct_source_root or
             !has_correct_target_root or
@@ -217,10 +217,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             continue;
         }
 
+        // Validate validator ID
         if (validator_id >= num_validators) {
             return StateTransitionError.InvalidValidatorId;
         }
 
+        // Get or create justification tracking for target
         var target_justifications = justifications.get(vote.target.root) orelse targetjustifications: {
             var targetjustifications = try allocator.alloc(u8, num_validators);
             for (0..targetjustifications.len) |i| {
@@ -230,8 +232,11 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
             break :targetjustifications targetjustifications;
         };
 
+        // Record this validator's vote for the target
         target_justifications[validator_id] = 1;
         try justifications.put(allocator, vote.target.root, target_justifications);
+
+        // Count votes for this target
         var target_justifications_count: usize = 0;
         for (target_justifications) |justified| {
             if (justified == 1) {
@@ -240,21 +245,17 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
         }
         logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, vote.target.root, target_justifications });
 
-        // as soon as we hit the threshold do justifications
-        // note that this simplification works if weight of each validator is 1
-        //
-        // ceilDiv is not available so this seems like a less compute intesive way without
-        // requring floar division, can be further optimized
+        // Check if target has reached 2/3 majority (justification threshold)
         if (3 * target_justifications_count >= 2 * num_validators) {
             state.latest_justified = vote.target;
             try state.justified_slots.set(target_slot, true);
             _ = justifications.remove(vote.target.root);
+
             const justified_str_new = try state.latest_justified.toJsonString(allocator);
             defer allocator.free(justified_str_new);
-
             logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
 
-            // source is finalized if target is the next valid justifiable hash
+            // Check for finalization: source is finalized if target is the next valid justifiable slot
             var can_target_finalize = true;
             for (source_slot + 1..target_slot) |check_slot| {
                 if (try is_justifiable_slot(state.latest_finalized.slot, check_slot)) {
@@ -262,17 +263,18 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
                     break;
                 }
             }
+
             logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
             if (can_target_finalize == true) {
                 state.latest_finalized = vote.source;
                 const finalized_str_new = try state.latest_finalized.toJsonString(allocator);
                 defer allocator.free(finalized_str_new);
-
                 logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
             }
         }
     }
 
+    // Update state with final justifications
     try state.withJustifications(allocator, &justifications);
 
     logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ state.historical_block_hashes.len(), state.justified_slots.len(), state.justifications_roots.len(), state.justifications_validators.len() });
@@ -280,8 +282,12 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     defer allocator.free(justified_str_final);
     const finalized_str_final = try state.latest_finalized.toJsonString(allocator);
     defer allocator.free(finalized_str_final);
-
     logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+}
+
+fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    // 1. process attestations
+    try process_attestations(allocator, state, block.body.attestations, logger);
 }
 
 fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
