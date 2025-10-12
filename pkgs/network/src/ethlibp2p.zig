@@ -33,10 +33,10 @@ const FrameDecodeError = error{
     Incomplete,
 } || uvarint.VarintParseError;
 
-fn encodeVarint(buffer: *std.ArrayList(u8), value: usize) !void {
+fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, value, &scratch);
-    try buffer.appendSlice(encoded);
+    try buffer.appendSlice(allocator, encoded);
 }
 
 fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usize, length: usize } {
@@ -52,13 +52,13 @@ fn buildRequestFrame(allocator: Allocator, payload: []const u8) ![]u8 {
         return error.PayloadTooLarge;
     }
 
-    var frame = std.ArrayList(u8).init(allocator);
-    errdefer frame.deinit();
+    var frame = std.ArrayListUnmanaged(u8).empty;
+    errdefer frame.deinit(allocator);
 
-    try encodeVarint(&frame, payload.len);
-    try frame.appendSlice(payload);
+    try encodeVarint(&frame, allocator, payload.len);
+    try frame.appendSlice(allocator, payload);
 
-    return frame.toOwnedSlice();
+    return frame.toOwnedSlice(allocator);
 }
 
 fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8 {
@@ -66,14 +66,14 @@ fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8
         return error.PayloadTooLarge;
     }
 
-    var frame = std.ArrayList(u8).init(allocator);
-    errdefer frame.deinit();
+    var frame = std.ArrayListUnmanaged(u8).empty;
+    errdefer frame.deinit(allocator);
 
-    try frame.append(code);
-    try encodeVarint(&frame, payload.len);
-    try frame.appendSlice(payload);
+    try frame.append(allocator, code);
+    try encodeVarint(&frame, allocator, payload.len);
+    try frame.appendSlice(allocator, payload);
 
-    return frame.toOwnedSlice();
+    return frame.toOwnedSlice(allocator);
 }
 
 fn parseRequestFrame(bytes: []const u8) FrameDecodeError![]const u8 {
@@ -1105,17 +1105,17 @@ pub const EthLibp2p = struct {
             return try allocator.dupeZ(u8, "");
         }
 
-        var addr_strings = std.ArrayList([]const u8).init(allocator);
+        var addr_strings = std.ArrayListUnmanaged([]const u8).empty;
         defer {
             for (addr_strings.items) |addr_str| {
                 allocator.free(addr_str);
             }
-            addr_strings.deinit();
+            addr_strings.deinit(allocator);
         }
 
         for (addrs) |addr| {
             const addr_str = try addr.toString(allocator);
-            try addr_strings.append(addr_str);
+            try addr_strings.append(allocator, addr_str);
         }
 
         const joined = try std.mem.join(allocator, ",", addr_strings.items);
