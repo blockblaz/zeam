@@ -26,17 +26,12 @@ const ServerStreamError = error{
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
-const VarintDecodeError = error{
-    Incomplete,
-    Overflow,
-    NotMinimal,
-};
-
 const FrameDecodeError = error{
     EmptyFrame,
     PayloadTooLarge,
     LengthMismatch,
-} || VarintDecodeError;
+    Incomplete,
+} || uvarint.VarintParseError;
 
 fn encodeVarint(buffer: *std.ArrayList(u8), value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
@@ -44,12 +39,8 @@ fn encodeVarint(buffer: *std.ArrayList(u8), value: usize) !void {
     try buffer.appendSlice(encoded);
 }
 
-fn decodeVarint(bytes: []const u8) VarintDecodeError!struct { value: usize, length: usize } {
-    const result = uvarint.decode(usize, bytes) catch |err| switch (err) {
-        uvarint.VarintParseError.Insufficient => return VarintDecodeError.Incomplete,
-        uvarint.VarintParseError.Overflow => return VarintDecodeError.Overflow,
-        uvarint.VarintParseError.NotMinimal => return VarintDecodeError.NotMinimal,
-    };
+fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usize, length: usize } {
+    const result = try uvarint.decode(usize, bytes);
     return .{
         .value = result.value,
         .length = bytes.len - result.remaining.len,

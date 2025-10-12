@@ -2927,7 +2927,6 @@ dependencies = [
  "libp2p-ping",
  "libp2p-plaintext",
  "libp2p-quic",
- "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -3222,26 +3221,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "libp2p-request-response"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1356c9e376a94a75ae830c42cdaea3d4fe1290ba409a22c809033d1b7dcab0a6"
-dependencies = [
- "async-trait",
- "futures",
- "futures-bounded",
- "futures-timer",
- "libp2p-core",
- "libp2p-identity",
- "libp2p-swarm",
- "rand 0.8.5",
- "smallvec",
- "tracing",
- "void",
- "web-time",
 ]
 
 [[package]]
@@ -6233,7 +6212,7 @@ dependencies = [
  "sha2 0.9.9",
  "slog",
  "snap",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tokio",
  "tokio-io-timeout",
  "tokio-util",
