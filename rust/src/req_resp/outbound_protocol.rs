@@ -1,3 +1,6 @@
+/// The code originally comes from Ream https://github.com/ReamLabs/ream/blob/5a4b3cb42d5646a0d12ec1825ace03645dbfd59b/crates/networking/p2p/src/req_resp/outbound_protocol.rs
+/// as we still need rust-libp2p until we fully migrate to zig-libp2p. It needs the custom RPC protocol implementation.
+/// we changed the encode/decode logic to delegate the framing to zig side, but we still need to inspect the varint prefix to determine the frame length.
 use super::varint::{decode_varint_prefix, MAX_VARINT_BYTES};
 use crate::req_resp::{
     configurations::max_message_size,
