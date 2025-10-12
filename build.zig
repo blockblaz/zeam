@@ -85,12 +85,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("snappyz");
 
-    const snappyframesz = b.addModule("snappyframesz", .{
+    const snappyframesz_dep = b.dependency("snappyframesz", .{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("pkgs/snappyframesz/src/lib.zig"),
     });
-    snappyframesz.addImport("snappyz", snappyz);
+    const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
