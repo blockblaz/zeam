@@ -175,6 +175,13 @@ pub fn build(b: *Builder) !void {
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
+    });
+
     // add network
     const zeam_network = b.addModule("@zeam/network", .{
         .target = target,
@@ -409,6 +416,16 @@ pub fn build(b: *Builder) !void {
     });
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
+
+    const xmss_tests = b.addTest(.{
+        .root_module = zeam_xmss,
+        .optimize = optimize,
+        .target = target,
+    });
+
+    addRustGlueLib(b, xmss_tests, target);
+    const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    test_step.dependOn(&run_xmss_tests.step);
 
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
