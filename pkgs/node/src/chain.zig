@@ -166,7 +166,7 @@ pub const BeamChain = struct {
         // called post ticking the chain to the correct time, but once validator is separated
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
-        const chainHead = try self.forkChoice.getProposalHead();
+        const chainHead = try self.forkChoice.getProposalHead(opts.slot);
         const votes = try self.forkChoice.getProposalVotes();
         const parent_root = chainHead.blockRoot;
 
@@ -217,13 +217,13 @@ pub const BeamChain = struct {
     pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
         const slot = opts.slot;
 
-        const head = try self.forkChoice.head;
+        const fcHead = self.forkChoice.head;
         const target = try self.forkChoice.getVoteTarget();
 
         const vote = types.Mini3SFVote{
             //
             .slot = slot,
-            .head = head,
+            .head = .{ .root = fcHead.blockRoot, .slot = slot },
             .target = target,
             .source = self.forkChoice.fcStore.latest_justified,
         };

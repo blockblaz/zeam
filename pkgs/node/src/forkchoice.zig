@@ -354,7 +354,7 @@ pub const ForkChoice = struct {
         return self.updateHead();
     }
 
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Mini3SFCheckpoint {
+    pub fn getProposalHead(self: *Self, slot: types.Slot) !ProtoBlock {
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
@@ -363,12 +363,7 @@ pub const ForkChoice = struct {
         try self.onInterval(time_intervals, true);
         // accept any new votes in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new votes
-        const head = try self.acceptNewVotes();
-
-        return types.Mini3SFCheckpoint{
-            .root = head.blockRoot,
-            .slot = head.slot,
-        };
+        return try self.acceptNewVotes();
     }
 
     pub fn getProposalVotes(self: *Self) !types.SignedVotes {
