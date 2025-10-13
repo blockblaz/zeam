@@ -145,3 +145,64 @@ pub const Signature = struct {
         hashsig_signature_free(self.handle);
     }
 };
+
+test "HashSig: generate keypair" {
+    const allocator = std.testing.allocator;
+
+    var keypair = try KeyPair.generate(allocator, "test_seed", 0, 2);
+    defer keypair.deinit();
+
+    try std.testing.expect(@intFromPtr(keypair.handle) != 0);
+}
+
+test "HashSig: sign and verify" {
+    const allocator = std.testing.allocator;
+
+    var keypair = try KeyPair.generate(allocator, "test_seed", 0, 2);
+    defer keypair.deinit();
+
+    // Create a message of the correct length
+    const msg_len = KeyPair.messageLength();
+    const message = try allocator.alloc(u8, msg_len);
+    defer allocator.free(message);
+
+    // Fill with test data
+    for (message, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+
+    const epoch: u32 = 0;
+
+    // Sign the message
+    var signature = try keypair.sign(message, epoch);
+    defer signature.deinit();
+
+    // Verify the signature
+    const is_valid = try keypair.verify(message, &signature, epoch);
+    try std.testing.expect(is_valid);
+
+    // Test with wrong epoch
+    const is_invalid_epoch = try keypair.verify(message, &signature, epoch + 100);
+    try std.testing.expect(!is_invalid_epoch);
+
+    // Test with wrong message
+    message[0] = message[0] + 1; // Modify message
+    const is_invalid = try keypair.verify(message, &signature, epoch);
+    try std.testing.expect(!is_invalid);
+}
+
+test "HashSig: invalid message length" {
+    const allocator = std.testing.allocator;
+
+    var keypair = try KeyPair.generate(allocator, "test_seed", 0, 2);
+    defer keypair.deinit();
+
+    const wrong_message = try allocator.alloc(u8, 10);
+    defer allocator.free(wrong_message);
+
+    const epoch: u32 = 0;
+
+    // Should fail with invalid message length
+    const result = keypair.sign(wrong_message, epoch);
+    try std.testing.expectError(HashSigError.InvalidMessageLength, result);
+}
