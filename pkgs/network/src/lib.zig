@@ -1,8 +1,23 @@
 const interfaceFactory = @import("./interface.zig");
-pub usingnamespace interfaceFactory;
+pub const GossipSub = interfaceFactory.GossipSub;
+pub const ReqResp = interfaceFactory.ReqResp;
+pub const PeerEvents = interfaceFactory.PeerEvents;
+pub const NetworkInterface = interfaceFactory.NetworkInterface;
+pub const OnGossipCbHandler = interfaceFactory.OnGossipCbHandler;
+pub const GossipEncoding = interfaceFactory.GossipEncoding;
+pub const LeanNetworkTopic = interfaceFactory.LeanNetworkTopic;
+pub const GossipTopic = interfaceFactory.GossipTopic;
+pub const GossipMessage = interfaceFactory.GossipMessage;
+pub const ReqRespMethod = interfaceFactory.ReqRespMethod;
+pub const ReqRespRequest = interfaceFactory.ReqRespRequest;
+pub const OnPeerEventCbType = interfaceFactory.OnPeerEventCbType;
+pub const OnPeerEventCbHandler = interfaceFactory.OnPeerEventCbHandler;
+pub const PeerEventHandler = interfaceFactory.PeerEventHandler;
+pub const GenericGossipHandler = interfaceFactory.GenericGossipHandler;
 
 const mockFactory = @import("./mock.zig");
-pub usingnamespace mockFactory;
+pub const Mock = mockFactory.Mock;
 
 const ethlibp2pFactory = @import("./ethlibp2p.zig");
-pub usingnamespace ethlibp2pFactory;
+pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
+pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
