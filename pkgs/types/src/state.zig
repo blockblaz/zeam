@@ -458,8 +458,8 @@ pub const BeamState = struct {
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
             //
-            // ceilDiv is not available so this seems like a less compute intesive way without
-            // requring floar division, can be further optimized
+            // ceilDiv is not available so this seems like a less compute intensive way without
+            // requiring floor division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
                 self.latest_justified = vote.target;
                 try self.justified_slots.set(target_slot, true);
