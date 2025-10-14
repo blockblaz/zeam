@@ -5,15 +5,6 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 
-const transition = @import("./transition.zig");
-
-pub const apply_transition = transition.apply_transition;
-pub const apply_raw_block = transition.apply_raw_block;
-pub const StateTransitionError = transition.StateTransitionError;
-pub const StateTransitionOpts = transition.StateTransitionOpts;
-pub const is_justifiable_slot = transition.is_justifiable_slot;
-pub const verify_signatures = transition.verify_signatures;
-
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
 

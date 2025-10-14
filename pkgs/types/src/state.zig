@@ -321,12 +321,12 @@ pub const BeamState = struct {
     }
 
     // Check if a slot is justifiable
-    pub fn isJustifiableSlot(self: *const Self, candidate: utils.Slot) !bool {
-        if (candidate < self.latest_finalized.slot) {
+    pub fn isJustifiableSlot(_: *const Self, finalized: utils.Slot, candidate: utils.Slot) !bool {
+        if (candidate < finalized) {
             return StateTransitionError.InvalidJustifiableSlot;
         }
 
-        const delta: f32 = @floatFromInt(candidate - self.latest_finalized.slot);
+        const delta: f32 = @floatFromInt(candidate - finalized);
         if (delta <= 5) {
             return true;
         }
@@ -410,7 +410,7 @@ pub const BeamState = struct {
             const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &(try self.historical_block_hashes.get(source_slot)));
             const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &(try self.historical_block_hashes.get(target_slot)));
             const target_not_ahead = target_slot <= source_slot;
-            const is_target_justifiable = try self.isJustifiableSlot(target_slot);
+            const is_target_justifiable = try self.isJustifiableSlot(self.latest_finalized.slot, target_slot);
 
             if (!is_source_justified or
                 // not present in 3sf mini but once a target is justified no need to run loop
@@ -472,7 +472,7 @@ pub const BeamState = struct {
                 // source is finalized if target is the next valid justifiable hash
                 var can_target_finalize = true;
                 for (source_slot + 1..target_slot) |check_slot| {
-                    if (try self.isJustifiableSlot(check_slot)) {
+                    if (try self.isJustifiableSlot(self.latest_finalized.slot, check_slot)) {
                         can_target_finalize = false;
                         break;
                     }

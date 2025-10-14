@@ -403,7 +403,7 @@ pub const ForkChoice = struct {
             }
         }
 
-        while (!try self.anchorState.isJustifiableSlot(nodes[target_idx].slot)) {
+        while (!try self.anchorState.isJustifiableSlot(self.anchorState.latest_finalized.slot, nodes[target_idx].slot)) {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
