@@ -69,16 +69,6 @@ pub const OnGossipCbHandler = struct {
     }
 };
 
-const OnRPCRequestCbType = *const fn (*anyopaque, *const ReqRespRequest) anyerror!void;
-pub const OnRPCRequestCbHandler = struct {
-    ptr: *anyopaque,
-    onRPCRequestCb: OnRPCRequestCbType,
-
-    pub fn onRPCRequest(self: OnRPCRequestCbHandler, data: *const ReqRespRequest) anyerror!void {
-        return self.onRPCRequestCb(self.ptr, data);
-    }
-};
-
 pub const GossipEncoding = enum {
     ssz_snappy,
 
