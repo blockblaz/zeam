@@ -403,7 +403,7 @@ pub const ForkChoice = struct {
             }
         }
 
-        while (!try stf.is_justifiable_slot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
+        while (!try self.anchorState.isJustifiableSlot(nodes[target_idx].slot)) {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
@@ -623,7 +623,7 @@ test "forkchoice block tree" {
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const block = mock_chain.blocks[i];
-        try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+        try beam_state.applyTransition(allocator, block, .{ .logger = module_logger });
 
         // shouldn't accept a future slot
         const current_slot = block.message.slot;

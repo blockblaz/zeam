@@ -38,7 +38,7 @@ pub const ZKVMs = std.meta.Tag(ZKVMConfig);
 
 const ZKVMOpts = struct { zkvm: ZKVMConfig };
 
-pub const ZKStateTransitionOpts = utils.MixIn(state_transition.StateTransitionOpts, ZKVMOpts);
+pub const ZKStateTransitionOpts = utils.MixIn(types.StateTransitionOpts, ZKVMOpts);
 
 pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
     // TODO:  we should also serialize StateTransitionOpts from ZKStateTransitionOpts and feed it to apply
