@@ -397,6 +397,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    node_tests.root_module.addImport("rocksdb", rocksdb);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -405,6 +406,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_tests.root_module.addImport("rocksdb", rocksdb);
     cli_tests.step.dependOn(&cli_exe.step);
 
     cli_tests.step.dependOn(&rust_builds.networking.step);
@@ -456,6 +458,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    database_tests.root_module.addImport("rocksdb", rocksdb);
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
 
