@@ -39,6 +39,12 @@ pub enum SigningError {
     SigningFailed(hashsig::signature::SigningError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum VerificationError {
+    #[error("Verification failed")]
+    VerificationFailed,
+}
+
 impl PrivateKey {
     pub fn new(inner: HashSigPrivateKey) -> Self {
         Self { inner }
@@ -60,7 +66,7 @@ impl PrivateKey {
         rng: &mut R,
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
-    ) -> anyhow::Result<Signature, SigningError> {
+    ) -> Result<Signature, SigningError> {
         Ok(Signature::new(
             <HashSigScheme as SignatureScheme>::sign(rng, &self.inner, epoch, message)
                 .map_err(SigningError::SigningFailed)?,
@@ -84,13 +90,8 @@ impl Signature {
         message: &[u8; MESSAGE_LENGTH],
         public_key: &PublicKey,
         epoch: u32,
-    ) -> anyhow::Result<bool> {
-        Ok(<HashSigScheme as SignatureScheme>::verify(
-            &public_key.inner,
-            epoch,
-            message,
-            &self.inner,
-        ))
+    ) -> bool {
+        <HashSigScheme as SignatureScheme>::verify(&public_key.inner, epoch, message, &self.inner)
     }
 }
 
@@ -104,11 +105,6 @@ pub extern "C" fn hashsig_keypair_generate(
     activation_epoch: usize,
     num_active_epochs: usize,
 ) -> *mut KeyPair {
-    println!(
-        "Generating hashsig keypair with activation_epoch: {}, num_active_epochs: {}",
-        activation_epoch, num_active_epochs
-    );
-
     let seed_phrase = unsafe { CStr::from_ptr(seed_phrase).to_string_lossy().into_owned() };
 
     // Hash the seed phrase to get a 32-byte seed
@@ -159,8 +155,7 @@ pub extern "C" fn hashsig_sign(
         // Convert slice to array
         let message_array: &[u8; MESSAGE_LENGTH] = match message_slice.try_into() {
             Ok(arr) => arr,
-            Err(e) => {
-                println!("Message conversion failed: {:?}", e);
+            Err(_) => {
                 return ptr::null_mut();
             }
         };
@@ -168,8 +163,7 @@ pub extern "C" fn hashsig_sign(
         let mut rng = rand::rng();
         let signature = match keypair_ref.private_key.sign(&mut rng, message_array, epoch) {
             Ok(sig) => sig,
-            Err(e) => {
-                println!("Signature generation failed: {:?}", e);
+            Err(_) => {
                 return ptr::null_mut();
             }
         };
@@ -209,19 +203,14 @@ pub extern "C" fn hashsig_verify(
         // Convert slice to array
         let message_array: &[u8; MESSAGE_LENGTH] = match message_slice.try_into() {
             Ok(arr) => arr,
-            Err(e) => {
-                println!("Message conversion failed: {:?}", e);
+            Err(_) => {
                 return -1;
             }
         };
 
         match signature_ref.verify(message_array, &keypair_ref.public_key, epoch) {
-            Ok(true) => 1,
-            Ok(false) => 0,
-            Err(e) => {
-                println!("Signature verification failed: {:?}", e);
-                -1
-            }
+            true => 1,
+            false => 0,
         }
     }
 }
