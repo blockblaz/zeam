@@ -50,7 +50,7 @@ test "apply transition on mocked chain" {
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+        try beam_state.applyTransition(allocator, block, .{ .logger = module_logger });
     }
 
     // check the post state root to be equal to block2's stateroot
@@ -91,7 +91,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+            try beam_state.applyTransition(allocator, block, .{ .logger = module_logger });
         }
     }
 }
