@@ -38,6 +38,16 @@ pub const BeamStateConfig = struct {
     }
 };
 
+// State transition options
+pub const StateTransitionOpts = struct {
+    // signatures are validated outside for keeping life simple for the STF prover
+    // we will trust client will validate them however the flag here
+    // represents such dependancy and assumption for STF
+    validSignatures: bool = true,
+    validateResult: bool = true,
+    logger: zeam_utils.ModuleLogger,
+};
+
 pub const BeamState = struct {
     config: BeamStateConfig,
     slot: u64,
@@ -295,6 +305,269 @@ pub const BeamState = struct {
     pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    // Helper function to process a single slot
+    fn process_slot(self: *Self, allocator: Allocator) !void {
+        // update state root in latest block header if its zero hash
+        // i.e. just after processing the latest block of latest block header
+        // this completes latest block header for parentRoot checks of new block
+
+        if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
+            var prev_state_root: [32]u8 = undefined;
+            try ssz.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            self.latest_block_header.state_root = prev_state_root;
+        }
+    }
+
+    // Check if a slot is justifiable
+    pub fn isJustifiableSlot(self: *const Self, candidate: utils.Slot) !bool {
+        if (candidate < self.latest_finalized.slot) {
+            return StateTransitionError.InvalidJustifiableSlot;
+        }
+
+        const delta: f32 = @floatFromInt(candidate - self.latest_finalized.slot);
+        if (delta <= 5) {
+            return true;
+        }
+        const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
+        if (delta_x2 == 0) {
+            return true;
+        }
+        const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
+        if (delta_x2_x == 0.5) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // Process execution payload header (not active in PQ devnet0)
+    fn process_execution_payload_header(self: *Self, beam_block: block.BeamBlock) !void {
+        const expected_timestamp = self.config.genesis_time + beam_block.slot * params.SECONDS_PER_SLOT;
+        if (expected_timestamp != beam_block.body.execution_payload_header.timestamp) {
+            return StateTransitionError.InvalidExecutionPayloadHeaderTimestamp;
+        }
+    }
+
+    // Process operations (attestations, etc.)
+    fn process_operations(self: *Self, allocator: Allocator, beam_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+        // 1. process attestations
+        try self.process_attestations(allocator, beam_block.body.attestations, logger);
+    }
+
+    // Process attestations
+    fn process_attestations(self: *Self, allocator: Allocator, attestations: mini_3sf.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
+        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
+        const justified_str = try self.latest_justified.toJsonString(allocator);
+        defer allocator.free(justified_str);
+        const finalized_str = try self.latest_finalized.toJsonString(allocator);
+        defer allocator.free(finalized_str);
+
+        logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
+
+        // work directly with SSZ types
+        // historical_block_hashes and justified_slots are already SSZ types in state
+
+        var justifications: std.AutoHashMapUnmanaged(Root, []u8) = .empty;
+        defer {
+            var iterator = justifications.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.value_ptr.*);
+            }
+        }
+        errdefer justifications.deinit(allocator);
+        try self.getJustification(allocator, &justifications);
+
+        // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
+        const num_validators: usize = @intCast(self.config.num_validators);
+        for (attestations.constSlice()) |signed_vote| {
+            const validator_id: usize = @intCast(signed_vote.validator_id);
+            const vote = signed_vote.message;
+            // check if vote is sane
+            const source_slot: usize = @intCast(vote.source.slot);
+            const target_slot: usize = @intCast(vote.target.slot);
+            const vote_str = try vote.toJsonString(allocator);
+            defer allocator.free(vote_str);
+
+            logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str, validator_id });
+
+            if (source_slot >= self.justified_slots.len()) {
+                return StateTransitionError.InvalidSlotIndex;
+            }
+            if (target_slot >= self.justified_slots.len()) {
+                return StateTransitionError.InvalidSlotIndex;
+            }
+            if (source_slot >= self.historical_block_hashes.len()) {
+                return StateTransitionError.InvalidSlotIndex;
+            }
+            if (target_slot >= self.historical_block_hashes.len()) {
+                return StateTransitionError.InvalidSlotIndex;
+            }
+
+            const is_source_justified = try self.justified_slots.get(source_slot);
+            const is_target_already_justified = try self.justified_slots.get(target_slot);
+            const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &(try self.historical_block_hashes.get(source_slot)));
+            const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &(try self.historical_block_hashes.get(target_slot)));
+            const target_not_ahead = target_slot <= source_slot;
+            const is_target_justifiable = try self.isJustifiableSlot(target_slot);
+
+            if (!is_source_justified or
+                // not present in 3sf mini but once a target is justified no need to run loop
+                // as we remove the target from justifications map as soon as its justified
+                is_target_already_justified or
+                !has_correct_source_root or
+                !has_correct_target_root or
+                target_not_ahead or
+                !is_target_justifiable)
+            {
+                logger.debug("skipping the vote as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                    is_source_justified,
+                    is_target_already_justified,
+                    has_correct_source_root,
+                    has_correct_target_root,
+                    target_not_ahead,
+                    is_target_justifiable,
+                });
+                continue;
+            }
+
+            if (validator_id >= num_validators) {
+                return StateTransitionError.InvalidValidatorId;
+            }
+
+            var target_justifications = justifications.get(vote.target.root) orelse targetjustifications: {
+                var targetjustifications = try allocator.alloc(u8, num_validators);
+                for (0..targetjustifications.len) |i| {
+                    targetjustifications[i] = 0;
+                }
+                try justifications.put(allocator, vote.target.root, targetjustifications);
+                break :targetjustifications targetjustifications;
+            };
+
+            target_justifications[validator_id] = 1;
+            try justifications.put(allocator, vote.target.root, target_justifications);
+            var target_justifications_count: usize = 0;
+            for (target_justifications) |justified| {
+                if (justified == 1) {
+                    target_justifications_count += 1;
+                }
+            }
+            logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, vote.target.root, target_justifications });
+
+            // as soon as we hit the threshold do justifications
+            // note that this simplification works if weight of each validator is 1
+            //
+            // ceilDiv is not available so this seems like a less compute intesive way without
+            // requring floar division, can be further optimized
+            if (3 * target_justifications_count >= 2 * num_validators) {
+                self.latest_justified = vote.target;
+                try self.justified_slots.set(target_slot, true);
+                _ = justifications.remove(vote.target.root);
+                const justified_str_new = try self.latest_justified.toJsonString(allocator);
+                defer allocator.free(justified_str_new);
+
+                logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
+
+                // source is finalized if target is the next valid justifiable hash
+                var can_target_finalize = true;
+                for (source_slot + 1..target_slot) |check_slot| {
+                    if (try self.isJustifiableSlot(check_slot)) {
+                        can_target_finalize = false;
+                        break;
+                    }
+                }
+                logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
+                if (can_target_finalize == true) {
+                    self.latest_finalized = vote.source;
+                    const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
+                    defer allocator.free(finalized_str_new);
+
+                    logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
+                }
+            }
+        }
+
+        try self.withJustifications(allocator, &justifications);
+
+        logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
+        const justified_str_final = try self.latest_justified.toJsonString(allocator);
+        defer allocator.free(justified_str_final);
+        const finalized_str_final = try self.latest_finalized.toJsonString(allocator);
+        defer allocator.free(finalized_str_final);
+
+        logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+    }
+
+    // Process slots - prepare the state to be pre state of the slot
+    pub fn processSlots(self: *Self, allocator: Allocator, slot: utils.Slot, logger: zeam_utils.ModuleLogger) !void {
+        if (slot <= self.slot) {
+            logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, self.slot });
+            return StateTransitionError.InvalidPreState;
+        }
+
+        while (self.slot < slot) {
+            try self.process_slot(allocator);
+            self.slot += 1;
+        }
+    }
+
+    // Process a block
+    pub fn processBlock(self: *Self, allocator: Allocator, beam_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+        // start block processing
+        try self.process_block_header(allocator, beam_block, logger);
+        // PQ devner-0 has no execution
+        // try self.process_execution_payload_header(beam_block);
+        try self.process_operations(allocator, beam_block, logger);
+    }
+
+    // Apply raw block
+    pub fn applyRawBlock(self: *Self, allocator: Allocator, beam_block: *block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+        // prepare pre state to process block for that slot, may be rename prepare_pre_state
+        try self.processSlots(allocator, beam_block.slot, logger);
+
+        // process block and modify the pre state to post state
+        try self.processBlock(allocator, beam_block.*, logger);
+
+        logger.debug("extracting state root\n", .{});
+        // extract the post state root
+        var state_root: [32]u8 = undefined;
+        try ssz.hashTreeRoot(*BeamState, self, &state_root, allocator);
+        beam_block.state_root = state_root;
+    }
+
+    // Verify signatures (placeholder implementation)
+    pub fn verifySignatures(self: *const Self, signedBlock: block.SignedBeamBlock) !void {
+        _ = self;
+        _ = signedBlock;
+    }
+
+    // Apply state transition
+    pub fn applyTransition(self: *Self, allocator: Allocator, signedBlock: block.SignedBeamBlock, opts: StateTransitionOpts) !void {
+        const beam_block = signedBlock.message;
+        opts.logger.debug("applying  state transition state-slot={d} block-slot={d}\n", .{ self.slot, beam_block.slot });
+
+        // client is supposed to call verify_signatures outside STF to make STF prover friendly
+        const validSignatures = opts.validSignatures;
+        if (!validSignatures) {
+            return StateTransitionError.InvalidBlockSignatures;
+        }
+
+        // prepare the pre state for this block slot
+        try self.processSlots(allocator, beam_block.slot, opts.logger);
+        // process the block
+        try self.processBlock(allocator, beam_block, opts.logger);
+
+        const validateResult = opts.validateResult;
+        if (validateResult) {
+            // verify the post state root
+            var state_root: [32]u8 = undefined;
+            try ssz.hashTreeRoot(*BeamState, self, &state_root, allocator);
+            if (!std.mem.eql(u8, &state_root, &beam_block.state_root)) {
+                opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, beam_block.state_root });
+                return StateTransitionError.InvalidPostState;
+            }
+        }
     }
 };
 
