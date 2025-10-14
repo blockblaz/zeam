@@ -488,18 +488,18 @@ test "test_generate_genesis" {
 const TEST_SLOT: types.Slot = 1;
 const PROPOSER_MODULUS: u64 = 10; // Round-robin proposer selection modulus
 
-fn createBlock(slot: types.Slot, parent_header: types.BeamBlockHeader, votes: ?[]const types.SignedVote) types.SignedBeamBlock {
+fn createBlock(slot: types.Slot, parent_header: types.BeamBlockHeader, votes: ?[]const types.SignedVote) !types.SignedBeamBlock {
     // Create a block body with the provided votes or an empty list
-    var attestations = types.SignedVotes.init(std.testing.allocator) catch @panic("Failed to init attestations");
+    var attestations = types.SignedVotes.init(std.testing.allocator) catch return error.OutOfMemory;
     if (votes) |vote_list| {
         for (vote_list) |vote| {
-            attestations.append(vote) catch @panic("Failed to append vote");
+            attestations.append(vote) catch return error.OutOfMemory;
         }
     }
 
     // Compute parent root hash
     var parent_root: [32]u8 = undefined;
-    ssz.hashTreeRoot(types.BeamBlockHeader, parent_header, &parent_root, std.testing.allocator) catch @panic("Failed to hash parent header");
+    try ssz.hashTreeRoot(types.BeamBlockHeader, parent_header, &parent_root, std.testing.allocator);
 
     // Construct the inner block message with correct parent_root linkage
     const block_message = types.BeamBlock{
@@ -538,7 +538,7 @@ test "test_state_transition_full" {
     try state_transition.process_slots(allocator, &state_at_slot_1, TEST_SLOT, logger);
 
     // Build a valid signed block linked to the current latest header
-    var signed_block = createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
+    var signed_block = try createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
     defer signed_block.deinit();
     const block = signed_block.message;
 
@@ -553,7 +553,7 @@ test "test_state_transition_full" {
     try ssz.hashTreeRoot(types.BeamState, expected_state, &state_root, allocator);
 
     // Keep the original signature wrapper
-    var final_signed_block = createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
+    var final_signed_block = try createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
     defer final_signed_block.deinit();
     // Update the state root to the correct one
     final_signed_block.message.state_root = state_root;
@@ -578,7 +578,7 @@ test "test_state_transition_full" {
     try std.testing.expectEqual(expected_state.latest_block_header.parent_root, final_state.latest_block_header.parent_root);
     try std.testing.expectEqual(expected_state.latest_block_header.state_root, final_state.latest_block_header.state_root);
 
-    // Invalid signatures must cause the STF to assert
+    // Invalid signatures must cause the STF to return an error
     // Clone the original state to ensure test isolation
     var state_for_invalid_sig = try types.sszClone(allocator, types.BeamState, state);
     defer state_for_invalid_sig.deinit();
@@ -590,12 +590,12 @@ test "test_state_transition_full" {
     });
     try std.testing.expectError(state_transition.StateTransitionError.InvalidBlockSignatures, invalid_sig_result);
 
-    // A block that commits to a wrong state_root must also assert
+    // A block that commits to a wrong state_root must also return an error
     // Clone the original state to ensure test isolation
     var state_for_bad_root = try types.sszClone(allocator, types.BeamState, state);
     defer state_for_bad_root.deinit();
 
-    var signed_block_with_bad_root = createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
+    var signed_block_with_bad_root = try createBlock(TEST_SLOT, state_at_slot_1.latest_block_header, null);
     defer signed_block_with_bad_root.deinit();
     signed_block_with_bad_root.message.state_root = [_]u8{0} ** 32; // Zero hash (bad state root)
 
