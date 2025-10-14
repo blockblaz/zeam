@@ -516,7 +516,7 @@ pub const BeamState = struct {
     pub fn processBlock(self: *Self, allocator: Allocator, beam_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
         // start block processing
         try self.process_block_header(allocator, beam_block, logger);
-        // PQ devner-0 has no execution
+        // PQ devnet-0 has no execution
         // try self.process_execution_payload_header(beam_block);
         try self.process_operations(allocator, beam_block, logger);
     }
