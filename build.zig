@@ -205,6 +205,36 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/database", zeam_database);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
 
+    // Create build options
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+    const build_options_module = build_options.createModule();
+
+    // add zeam-cli library module (for testing and external use)
+    const zeam_cli = b.addModule("@zeam/cli", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/cli/src/lib.zig"),
+    });
+    zeam_cli.addImport("ssz", ssz);
+    zeam_cli.addImport("build_options", build_options_module);
+    zeam_cli.addImport("simargs", simargs);
+    zeam_cli.addImport("xev", xev);
+    zeam_cli.addImport("@zeam/database", zeam_database);
+    zeam_cli.addImport("@zeam/utils", zeam_utils);
+    zeam_cli.addImport("@zeam/params", zeam_params);
+    zeam_cli.addImport("@zeam/types", zeam_types);
+    zeam_cli.addImport("@zeam/configs", zeam_configs);
+    zeam_cli.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_cli.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
+    zeam_cli.addImport("@zeam/network", zeam_network);
+    zeam_cli.addImport("@zeam/node", zeam_beam_node);
+    zeam_cli.addImport("@zeam/api", zeam_api);
+    zeam_cli.addImport("metrics", metrics);
+    zeam_cli.addImport("multiformats", multiformats);
+    zeam_cli.addImport("enr", enr);
+    zeam_cli.addImport("yaml", yaml);
+
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
         .optimize = optimize,
@@ -215,11 +245,6 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/configs", zeam_configs);
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
-
-    // Create build options
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", git_version);
-    const build_options_module = build_options.createModule();
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -305,13 +330,22 @@ pub fn build(b: *Builder) !void {
     const integration_build_options_module = integration_build_options.createModule();
     cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
 
-    // Add CLI constants module to integration tests
-    const cli_constants = b.addModule("cli_constants", .{
-        .root_source_file = b.path("pkgs/cli/src/constants.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
+    // Add all dependencies needed by integration tests
+    cli_integration_tests.root_module.addImport("@zeam/cli", zeam_cli);
+    cli_integration_tests.root_module.addImport("@zeam/node", zeam_beam_node);
+    cli_integration_tests.root_module.addImport("@zeam/utils", zeam_utils);
+    cli_integration_tests.root_module.addImport("@zeam/configs", zeam_configs);
+    cli_integration_tests.root_module.addImport("@zeam/network", zeam_network);
+    cli_integration_tests.root_module.addImport("enr", enr);
+    cli_integration_tests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    cli_integration_tests.root_module.addImport("@zeam/api", zeam_api);
+    cli_integration_tests.root_module.addImport("xev", xev);
+    cli_integration_tests.root_module.addImport("multiformats", multiformats);
+    cli_integration_tests.root_module.addImport("yaml", yaml);
+    cli_integration_tests.root_module.addImport("ssz", ssz);
+    cli_integration_tests.root_module.addImport("@zeam/types", zeam_types);
+    cli_integration_tests.root_module.addImport("@zeam/database", zeam_database);
+    addRustGlueLib(b, cli_integration_tests, target);
 
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
@@ -423,6 +457,7 @@ pub fn build(b: *Builder) !void {
 
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    cli_integration_tests.step.dependOn(&zkvm_host_cmd.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
