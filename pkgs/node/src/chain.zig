@@ -195,7 +195,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
+        try post_state.applyRawBlock(self.allocator, &block, self.block_building_logger);
 
         block_json = try block.toJson(self.allocator);
         const block_str_2 = try jsonToString(self.allocator, block_json);
@@ -365,10 +365,10 @@ pub const BeamChain = struct {
 
             // 2. apply STF to get post state
             var validSignatures = true;
-            stf.verify_signatures(signedBlock) catch {
+            cpost_state.verifySignatures(signedBlock) catch {
                 validSignatures = false;
             };
-            try stf.apply_transition(self.allocator, cpost_state, signedBlock, .{
+            try cpost_state.applyTransition(self.allocator, signedBlock, .{
                 //
                 .logger = self.stf_logger,
                 .validSignatures = validSignatures,

@@ -6,8 +6,6 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 
-const transition = @import("./transition.zig");
-
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
@@ -261,7 +259,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         };
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
-        try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger);
+        try beam_state.applyRawBlock(allocator, &block, block_building_logger);
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list
