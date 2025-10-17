@@ -485,9 +485,13 @@ pub const ForkChoice = struct {
     }
 
     pub fn onAttestation(self: *Self, signed_vote: types.SignedVote, is_from_block: bool) !void {
+        // Attestation validation is done by the caller (chain layer)
+        // This function assumes the attestation has already been validated
+
         // vote has to be of an ancestor of the current slot
         const validator_id = signed_vote.validator_id;
         const vote = signed_vote.message;
+        // This get should never fail after validation, but we keep the check for safety
         const new_head_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
 
         var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
@@ -583,11 +587,21 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{ NotImplemented, UnknownParent, FutureSlot, InvalidFutureAttestation,
-    //
-    InvalidOnChainAttestation, PreFinalizedSlot, NotFinalizedDesendant, InvalidAttestation, InvalidDeltas,
-    //
-    InvalidJustifiedRoot, InvalidBestDescendant, InvalidHeadIndex, InvalidTargetSearch };
+const ForkChoiceError = error{
+    NotImplemented,
+    UnknownParent,
+    FutureSlot,
+    InvalidFutureAttestation,
+    InvalidOnChainAttestation,
+    PreFinalizedSlot,
+    NotFinalizedDesendant,
+    InvalidAttestation,
+    InvalidDeltas,
+    InvalidJustifiedRoot,
+    InvalidBestDescendant,
+    InvalidHeadIndex,
+    InvalidTargetSearch,
+};
 
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
