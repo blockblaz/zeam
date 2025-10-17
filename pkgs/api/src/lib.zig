@@ -90,7 +90,6 @@ pub var block_processing_duration_seconds: Histogram = Histogram{ .is_chain = fa
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
-    _ = allocator;
     if (g_initialized) return;
 
     // For ZKVM targets, use no-op metrics
