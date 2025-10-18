@@ -309,7 +309,7 @@ test "Node peer tracking on connect/disconnect" {
         .id = configs.Chain.custom,
         .genesis = genesis_config,
         .spec = .{
-            .preset = params.Preset.minimal,
+            .preset = params.activePreset,
             .name = spec_name,
         },
     };

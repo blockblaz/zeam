@@ -94,12 +94,22 @@ pub fn build(b: *Builder) !void {
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+
+    // Add preset as a build option
+    const preset_option = b.option([]const u8, "preset", "Preset configuration (mainnet or minimal)") orelse "mainnet";
+    build_options.addOption([]const u8, "preset", preset_option);
+
+    const build_options_module = build_options.createModule();
+
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
+    zeam_params.addImport("build_options", build_options_module);
 
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
@@ -216,11 +226,6 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
 
-    // Create build options
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", git_version);
-    const build_options_module = build_options.createModule();
-
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
@@ -254,7 +259,7 @@ pub fn build(b: *Builder) !void {
 
     b.installArtifact(cli_exe);
 
-    try build_zkvm_targets(b, &cli_exe.step, target);
+    try build_zkvm_targets(b, &cli_exe.step, target, build_options_module);
 
     var zkvm_host_cmd = build_rust_project(b, "rust");
     cli_exe.step.dependOn(&zkvm_host_cmd.step);
@@ -460,7 +465,7 @@ fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
     });
 }
 
-fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
+fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget, build_options_module: *std.Build.Module) !void {
     const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
@@ -479,6 +484,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/params/src/lib.zig"),
         });
+        zeam_params.addImport("build_options", build_options_module);
 
         // add zeam-utils
         const zeam_utils = b.addModule("@zeam/utils", .{
