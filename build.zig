@@ -14,9 +14,36 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
+// Rust feature enum for type safety
+const RustFeatures = enum {
+    networking,
+    zkvms,
+    crypto,
+
+    pub fn toString(self: RustFeatures) []const u8 {
+        return switch (self) {
+            .networking => "networking",
+            .zkvms => "zkvms",
+            .crypto => "crypto",
+        };
+    }
+};
+
+// Helper function to get build command by feature
+fn getRustBuild(builds: anytype, feature: RustFeatures) *Builder.Step.Run {
+    return switch (feature) {
+        .networking => builds.networking,
+        .zkvms => builds.zkvms,
+        .crypto => builds.crypto,
+    };
+}
+
 // Add the glue libs to a compile target
-fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
-    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, feature: RustFeatures) void {
+    const feature_str = feature.toString();
+    const target_dir = b.fmt("rust/target/{s}/release/librustglue.a", .{feature_str});
+
+    comp.addObjectFile(b.path(target_dir));
     comp.linkLibC();
     comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
@@ -33,6 +60,17 @@ pub fn build(b: *Builder) !void {
 
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
+
+    // build rust project for different features
+    const rust_builds = struct {
+        networking: *Builder.Step.Run,
+        zkvms: *Builder.Step.Run,
+        crypto: *Builder.Step.Run,
+    }{
+        .networking = build_rust_project(b, "rust", .networking),
+        .zkvms = build_rust_project(b, "rust", .zkvms),
+        .crypto = build_rust_project(b, "rust", .crypto),
+    };
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -175,6 +213,13 @@ pub fn build(b: *Builder) !void {
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
+    });
+
     // add network
     const zeam_network = b.addModule("@zeam/network", .{
         .target = target,
@@ -248,7 +293,8 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
 
-    addRustGlueLib(b, cli_exe, target);
+    cli_exe.step.dependOn(&rust_builds.networking.step);
+    addRustGlueLib(b, cli_exe, target, .networking);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
 
@@ -256,8 +302,7 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    var zkvm_host_cmd = build_rust_project(b, "rust");
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
+    cli_exe.step.dependOn(&rust_builds.zkvms.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -341,7 +386,9 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
-    addRustGlueLib(b, manager_tests, target);
+
+    manager_tests.step.dependOn(&rust_builds.zkvms.step);
+    addRustGlueLib(b, manager_tests, target, .zkvms);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
@@ -350,6 +397,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    node_tests.root_module.addImport("rocksdb", rocksdb);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -358,8 +406,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_tests.root_module.addImport("rocksdb", rocksdb);
     cli_tests.step.dependOn(&cli_exe.step);
-    addRustGlueLib(b, cli_tests, target);
+
+    cli_tests.step.dependOn(&rust_builds.networking.step);
+    addRustGlueLib(b, cli_tests, target, .networking);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -407,8 +458,20 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    database_tests.root_module.addImport("rocksdb", rocksdb);
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
+
+    const xmss_tests = b.addTest(.{
+        .root_module = zeam_xmss,
+        .optimize = optimize,
+        .target = target,
+    });
+
+    xmss_tests.step.dependOn(&rust_builds.crypto.step);
+    addRustGlueLib(b, xmss_tests, target, .crypto);
+    const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    test_step.dependOn(&run_xmss_tests.step);
 
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
@@ -420,9 +483,8 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
-
-    manager_tests.step.dependOn(&zkvm_host_cmd.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    manager_tests.step.dependOn(&rust_builds.zkvms.step);
+    cli_tests.step.dependOn(&rust_builds.networking.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
@@ -447,7 +509,10 @@ pub fn build(b: *Builder) !void {
     spectests_step.dependOn(&run_spectests.step);
 }
 
-fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
+fn build_rust_project(b: *Builder, path: []const u8, feature: RustFeatures) *Builder.Step.Run {
+    const feature_str = feature.toString();
+    const target_dir = b.fmt("./target/{s}", .{feature_str});
+
     return b.addSystemCommand(&.{
         "cargo",
         "+nightly",
@@ -457,6 +522,11 @@ fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
         "unstable-options",
         "build",
         "--release",
+        "--no-default-features",
+        "--features",
+        feature_str,
+        "--target-dir",
+        target_dir,
     });
 }
 
