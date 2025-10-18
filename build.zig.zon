@@ -1,6 +1,6 @@
 .{
     .name = .zeam,
-    .fingerprint = 0x243fd12cec623508,
+    .fingerprint = 0x243fd12cc5f554a5,
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
@@ -38,6 +38,10 @@
         .zig_snappy = .{
             .url = "git+https://github.com/blockblaz/zig-snappy#dd63108bd8e41c7cd799385dd9aa5085314eeafa",
             .hash = "zig_snappy-0.0.1-bDFzXpJWAAA3c5bLc8JZK_HCwd0mGLTuFgz4LndjnVao",
+        },
+        .snappyframesz = .{
+            .url = "https://github.com/blockblaz/snappyframesz/archive/78e66c2d42dc44dd1177ad007e28838a82157aa3.tar.gz",
+            .hash = "snappyframesz-0.0.1-COCLy9EQBADDWj8BS-OdrIFOwHfiY9KUUiClsyBHgETn",
         },
     },
     .paths = .{""},

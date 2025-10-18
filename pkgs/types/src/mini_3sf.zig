@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
+const Bytes32 = utils.Bytes32;
+const Slot = utils.Slot;
 
 pub const Mini3SFCheckpoint = struct {
     root: utils.Root,
@@ -64,6 +66,27 @@ pub const SignedVote = struct {
     }
 
     pub fn toJsonString(self: *const SignedVote, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+pub const Status = struct {
+    finalized_root: Bytes32,
+    finalized_slot: Slot,
+    head_root: Bytes32,
+    head_slot: Slot,
+
+    pub fn toJson(self: *const Status, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("finalized_root", json.Value{ .string = try bytesToHex(allocator, &self.finalized_root) });
+        try obj.put("finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
+        try obj.put("head_root", json.Value{ .string = try bytesToHex(allocator, &self.head_root) });
+        try obj.put("head_slot", json.Value{ .integer = @as(i64, @intCast(self.head_slot)) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const Status, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
     }
