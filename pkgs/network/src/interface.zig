@@ -3,8 +3,10 @@ const Allocator = std.mem.Allocator;
 const json = std.json;
 
 const types = @import("@zeam/types");
+const ssz = @import("ssz");
 const xev = @import("xev");
 const zeam_utils = @import("@zeam/utils");
+const consensus_params = @import("@zeam/params");
 
 const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
@@ -161,6 +163,20 @@ pub const GossipMessage = union(GossipTopic) {
         return std.meta.activeTag(self.*);
     }
 
+    pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
+        var serialized = std.ArrayList(u8).init(allocator);
+        errdefer serialized.deinit();
+
+        switch (self.*) {
+            inline else => |payload, tag| {
+                const PayloadType = std.meta.TagPayload(Self, tag);
+                try ssz.serialize(PayloadType, payload, &serialized);
+            },
+        }
+
+        return serialized.toOwnedSlice();
+    }
+
     pub fn clone(self: *const Self, allocator: Allocator) !*Self {
         const cloned_data = try allocator.create(Self);
 
@@ -198,8 +214,12 @@ pub const GossipMessage = union(GossipTopic) {
 };
 
 pub const ReqRespMethod = enum {
-    block_by_root,
+    blocks_by_root,
     status,
+
+    pub fn name(self: ReqRespMethod) []const u8 {
+        return @tagName(self);
+    }
 };
 
 pub const LeanSupportedProtocol = enum {
@@ -215,14 +235,14 @@ pub const LeanSupportedProtocol = enum {
 
     pub fn method(self: LeanSupportedProtocol) ReqRespMethod {
         return switch (self) {
-            .blocks_by_root_v1 => .block_by_root,
+            .blocks_by_root_v1 => .blocks_by_root,
             .status_v1 => .status,
         };
     }
 
     pub fn fromMethod(req_method: ReqRespMethod) LeanSupportedProtocol {
         return switch (req_method) {
-            .block_by_root => .blocks_by_root_v1,
+            .blocks_by_root => .blocks_by_root_v1,
             .status => .status_v1,
         };
     }
@@ -240,14 +260,54 @@ pub const LeanSupportedProtocol = enum {
     }
 };
 
+pub const RpcProtocol = enum {
+    status,
+    blocks_by_root,
+
+    pub fn protocolId(self: RpcProtocol) []const u8 {
+        return switch (self) {
+            .status => lean_status_protocol,
+            .blocks_by_root => lean_blocks_by_root_protocol,
+        };
+    }
+
+    pub fn method(self: RpcProtocol) ReqRespMethod {
+        return switch (self) {
+            .status => .status,
+            .blocks_by_root => .blocks_by_root,
+        };
+    }
+
+    pub fn fromSlice(slice: []const u8) ?RpcProtocol {
+        const protocols = comptime std.enums.values(RpcProtocol);
+        inline for (protocols) |value| {
+            if (std.mem.eql(u8, slice, value.protocolId())) return value;
+        }
+        return null;
+    }
+
+    pub fn fromMethod(req_method: ReqRespMethod) RpcProtocol {
+        return switch (req_method) {
+            .status => .status,
+            .blocks_by_root => .blocks_by_root,
+        };
+    }
+
+    pub fn leanProtocol(self: RpcProtocol) LeanSupportedProtocol {
+        return LeanSupportedProtocol.fromMethod(self.method());
+    }
+};
+
 pub const ReqRespRequest = union(ReqRespMethod) {
-    block_by_root: types.BlockByRootRequest,
+    blocks_by_root: types.BlockByRootRequest,
     status: types.Status,
+
+    const Self = @This();
 
     pub fn toJson(self: *const ReqRespRequest, allocator: Allocator) !json.Value {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
-            .block_by_root => |request| request.toJson(allocator),
+            .blocks_by_root => |request| request.toJson(allocator),
         };
     }
 
@@ -256,21 +316,56 @@ pub const ReqRespRequest = union(ReqRespMethod) {
         return zeam_utils.jsonToString(allocator, message_json);
     }
 
+    pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
+        var serialized = std.ArrayList(u8).init(allocator);
+        errdefer serialized.deinit();
+
+        switch (self.*) {
+            inline else => |payload, tag| {
+                const PayloadType = std.meta.TagPayload(Self, tag);
+                try ssz.serialize(PayloadType, payload, &serialized);
+            },
+        }
+
+        return serialized.toOwnedSlice();
+    }
+
+    pub fn deserialize(allocator: Allocator, method: ReqRespMethod, bytes: []const u8) !Self {
+        return switch (method) {
+            .status => {
+                var payload: types.Status = undefined;
+                try ssz.deserialize(types.Status, bytes, &payload, allocator);
+                return .{ .status = payload };
+            },
+            .blocks_by_root => {
+                var request = types.BlockByRootRequest{
+                    .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
+                };
+                errdefer request.roots.deinit();
+
+                try ssz.deserialize(types.BlockByRootRequest, bytes, &request, allocator);
+                return .{ .blocks_by_root = request };
+            },
+        };
+    }
+
     pub fn deinit(self: *ReqRespRequest) void {
         switch (self.*) {
             .status => {},
-            .block_by_root => |*request| request.roots.deinit(),
+            .blocks_by_root => |*request| request.roots.deinit(),
         }
     }
 };
 pub const ReqRespResponse = union(ReqRespMethod) {
-    block_by_root: types.SignedBeamBlock,
+    blocks_by_root: types.SignedBeamBlock,
     status: types.Status,
+
+    const Self = @This();
 
     pub fn toJson(self: *const ReqRespResponse, allocator: Allocator) !json.Value {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
-            .block_by_root => |block| block.toJson(allocator),
+            .blocks_by_root => |block| block.toJson(allocator),
         };
     }
 
@@ -279,10 +374,35 @@ pub const ReqRespResponse = union(ReqRespMethod) {
         return zeam_utils.jsonToString(allocator, message_json);
     }
 
+    pub fn serialize(self: *const ReqRespResponse, allocator: Allocator) ![]u8 {
+        var serialized = std.ArrayList(u8).init(allocator);
+        errdefer serialized.deinit();
+
+        switch (self.*) {
+            inline else => |payload, tag| {
+                const PayloadType = std.meta.TagPayload(Self, tag);
+                try ssz.serialize(PayloadType, payload, &serialized);
+            },
+        }
+
+        return serialized.toOwnedSlice();
+    }
+
+    pub fn deserialize(allocator: Allocator, method: ReqRespMethod, bytes: []const u8) !ReqRespResponse {
+        return switch (method) {
+            inline else => |tag| {
+                const PayloadType = std.meta.TagPayload(Self, tag);
+                var payload: PayloadType = undefined;
+                try ssz.deserialize(PayloadType, bytes, &payload, allocator);
+                return @unionInit(Self, @tagName(tag), payload);
+            },
+        };
+    }
+
     pub fn deinit(self: *ReqRespResponse) void {
         switch (self.*) {
             .status => {},
-            .block_by_root => |*block| block.deinit(),
+            .blocks_by_root => |*block| block.deinit(),
         }
     }
 };

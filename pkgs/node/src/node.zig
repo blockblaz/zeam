@@ -55,12 +55,12 @@ const BlockByRootContext = struct {
 
 const PendingRPC = union(enum) {
     status: StatusRequestContext,
-    block_by_root: BlockByRootContext,
+    blocks_by_root: BlockByRootContext,
 
     fn deinit(self: *PendingRPC, allocator: Allocator) void {
         switch (self.*) {
             .status => |*ctx| ctx.deinit(allocator),
-            .block_by_root => |*ctx| ctx.deinit(allocator),
+            .blocks_by_root => |*ctx| ctx.deinit(allocator),
         }
     }
 };
@@ -242,7 +242,7 @@ pub const BeamNode = struct {
             return;
         };
 
-        var pending = PendingRPC{ .block_by_root = .{
+        var pending = PendingRPC{ .blocks_by_root = .{
             .peer_id = peer_copy,
             .requested_roots = roots_copy,
         } };
@@ -321,9 +321,9 @@ pub const BeamNode = struct {
                         },
                     }
                 },
-                .block_by_root => |block_resp| {
+                .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
-                        .block_by_root => |*block_ctx| {
+                        .blocks_by_root => |*block_ctx| {
                             self.logger.info(
                                 "Received blocks-by-root chunk from peer {s}",
                                 .{block_ctx.peer_id},
@@ -345,7 +345,7 @@ pub const BeamNode = struct {
                             .{ status_ctx.peer_id, err_payload.code, err_payload.message },
                         );
                     },
-                    .block_by_root => |block_ctx| {
+                    .blocks_by_root => |block_ctx| {
                         self.logger.warn(
                             "Blocks-by-root request to peer {s} failed ({d}): {s}",
                             .{ block_ctx.peer_id, err_payload.code, err_payload.message },
@@ -364,7 +364,7 @@ pub const BeamNode = struct {
         if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
             var ctx = entry.value;
             switch (ctx) {
-                .block_by_root => |block_ctx| {
+                .blocks_by_root => |block_ctx| {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.pending_block_roots.remove(root);
                     }
@@ -391,11 +391,11 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         switch (data.*) {
-            .block_by_root => |request| {
+            .blocks_by_root => |request| {
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
-                    "node-{d}:: Handling block_by_root request for {d} roots",
+                    "node-{d}:: Handling blocks_by_root request for {d} roots",
                     .{ self.nodeId, roots.len },
                 );
 
@@ -404,8 +404,8 @@ pub const BeamNode = struct {
                         var signed_block = signed_block_value;
                         defer signed_block.deinit();
 
-                        var response = networks.ReqRespResponse{ .block_by_root = undefined };
-                        try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block, &response.block_by_root);
+                        var response = networks.ReqRespResponse{ .blocks_by_root = undefined };
+                        try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block, &response.blocks_by_root);
                         defer response.deinit();
 
                         try responder.sendResponse(&response);

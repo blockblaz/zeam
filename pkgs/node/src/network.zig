@@ -47,12 +47,12 @@ pub const Network = struct {
         if (roots.len == 0) return error.NoBlockRootsRequested;
 
         var request = networks.ReqRespRequest{
-            .block_by_root = .{ .roots = try ssz.utils.List(types.Root, params.MAX_REQUEST_BLOCKS).init(allocator) },
+            .blocks_by_root = .{ .roots = try ssz.utils.List(types.Root, params.MAX_REQUEST_BLOCKS).init(allocator) },
         };
         errdefer request.deinit();
 
         for (roots) |root| {
-            try request.block_by_root.roots.append(root);
+            try request.blocks_by_root.roots.append(root);
         }
 
         const request_id = try self.backend.reqresp.sendRequest(peer_id, &request, callback);

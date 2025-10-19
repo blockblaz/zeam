@@ -16,7 +16,6 @@ const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
 const snappyz = @import("snappyz");
 const snappyframesz = @import("snappyframesz");
-const consensus_params = @import("@zeam/params");
 
 const ServerStreamError = error{
     StreamAlreadyFinished,
@@ -32,6 +31,8 @@ const FrameDecodeError = error{
     LengthMismatch,
     Incomplete,
 } || uvarint.VarintParseError;
+
+const RpcProtocol = interface.RpcProtocol;
 
 fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
@@ -137,95 +138,52 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
 
     const allocator = ctx.zigHandler.allocator;
     const response_method = std.meta.activeTag(response.*);
+    const response_method_name = @tagName(response_method);
     ctx.zigHandler.logger.debug(
         "network-{d}:: serverStreamSendResponse ctx.method={s} response.tag={s}",
         .{ ctx.zigHandler.params.networkId, @tagName(ctx.method), @tagName(response_method) },
     );
 
-    switch (response.*) {
-        .status => |status_resp| {
-            if (ctx.method != .status) {
-                ctx.zigHandler.logger.err(
-                    "network-{d}:: serverStreamSendResponse status mismatch: ctx.method={s}",
-                    .{ ctx.zigHandler.params.networkId, @tagName(ctx.method) },
-                );
-                return ServerStreamError.InvalidResponseVariant;
-            }
-
-            var serialized = std.ArrayList(u8).init(allocator);
-            defer serialized.deinit();
-
-            try ssz.serialize(types.Status, status_resp, &serialized);
-
-            const encoded = try serialized.toOwnedSlice();
-            defer allocator.free(encoded);
-
-            const framed = snappyframesz.encode(allocator, encoded) catch |err| {
-                ctx.zigHandler.logger.err(
-                    "network-{d}:: Failed to snappy-frame status response for peer={s} channel={d}: {any}",
-                    .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id, err },
-                );
-                return err;
-            };
-            defer allocator.free(framed);
-
-            const frame = try buildResponseFrame(allocator, 0, framed);
-            defer allocator.free(frame);
-
-            ctx.zigHandler.logger.debug(
-                "network-{d}:: Streaming status response to peer={s} channel={d}",
-                .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id },
-            );
-
-            send_rpc_response_chunk(
-                ctx.zigHandler.params.networkId,
-                ctx.channel_id,
-                frame.ptr,
-                frame.len,
-            );
-        },
-        .block_by_root => |block_resp| {
-            if (ctx.method != .block_by_root) {
-                ctx.zigHandler.logger.err(
-                    "network-{d}:: serverStreamSendResponse block_by_root mismatch: ctx.method={s}",
-                    .{ ctx.zigHandler.params.networkId, @tagName(ctx.method) },
-                );
-                return ServerStreamError.InvalidResponseVariant;
-            }
-
-            var serialized = std.ArrayList(u8).init(allocator);
-            defer serialized.deinit();
-
-            try ssz.serialize(types.SignedBeamBlock, block_resp, &serialized);
-
-            const encoded = try serialized.toOwnedSlice();
-            defer allocator.free(encoded);
-
-            const framed = snappyframesz.encode(allocator, encoded) catch |err| {
-                ctx.zigHandler.logger.err(
-                    "network-{d}:: Failed to snappy-frame block_by_root response for peer={s} channel={d}: {any}",
-                    .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id, err },
-                );
-                return err;
-            };
-            defer allocator.free(framed);
-
-            const frame = try buildResponseFrame(allocator, 0, framed);
-            defer allocator.free(frame);
-
-            ctx.zigHandler.logger.debug(
-                "network-{d}:: Streaming block_by_root chunk to peer={s} channel={d}",
-                .{ ctx.zigHandler.params.networkId, ctx.peer_id, ctx.channel_id },
-            );
-
-            send_rpc_response_chunk(
-                ctx.zigHandler.params.networkId,
-                ctx.channel_id,
-                frame.ptr,
-                frame.len,
-            );
-        },
+    if (ctx.method != response_method) {
+        ctx.zigHandler.logger.err(
+            "network-{d}:: serverStreamSendResponse method mismatch: ctx.method={s} response.tag={s}",
+            .{ ctx.zigHandler.params.networkId, @tagName(ctx.method), response_method_name },
+        );
+        return ServerStreamError.InvalidResponseVariant;
     }
+
+    const encoded = response.serialize(allocator) catch |err| {
+        ctx.zigHandler.logger.err(
+            "network-{d}:: Failed to serialize {s} response for peer={s} channel={d}: {any}",
+            .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, ctx.channel_id, err },
+        );
+        return err;
+    };
+    defer allocator.free(encoded);
+
+    const framed = snappyframesz.encode(allocator, encoded) catch |err| {
+        ctx.zigHandler.logger.err(
+            "network-{d}:: Failed to snappy-frame {s} response for peer={s} channel={d}: {any}",
+            .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, ctx.channel_id, err },
+        );
+        return err;
+    };
+    defer allocator.free(framed);
+
+    const frame = try buildResponseFrame(allocator, 0, framed);
+    defer allocator.free(frame);
+
+    ctx.zigHandler.logger.debug(
+        "network-{d}:: Streaming {s} response to peer={s} channel={d}",
+        .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, ctx.channel_id },
+    );
+
+    send_rpc_response_chunk(
+        ctx.zigHandler.params.networkId,
+        ctx.channel_id,
+        frame.ptr,
+        frame.len,
+    );
 }
 
 fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
@@ -377,15 +335,13 @@ export fn handleRPCRequestFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const protocol_slice = std.mem.span(protocol_id);
 
-    const status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
-    const blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
-    if (!std.mem.eql(u8, protocol_slice, status_protocol) and !std.mem.eql(u8, protocol_slice, blocks_by_root_protocol)) {
+    const rpc_protocol = RpcProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.logger.warn(
             "network-{d}:: Unsupported RPC protocol from peer={s} on channel={d}: {s}",
             .{ zigHandler.params.networkId, peer_id_slice, channel_id, protocol_slice },
         );
         return;
-    }
+    };
 
     const request_frame: []const u8 = request_ptr[0..request_len];
     const request_payload = parseRequestFrame(request_frame) catch |err| {
@@ -405,51 +361,20 @@ export fn handleRPCRequestFromRustBridge(
     };
     defer zigHandler.allocator.free(request_bytes);
 
-    var request: interface.ReqRespRequest = undefined;
-    if (std.mem.eql(u8, protocol_slice, status_protocol)) {
-        var status_request: types.Status = undefined;
-        ssz.deserialize(types.Status, request_bytes, &status_request, zigHandler.allocator) catch |e| {
-            zigHandler.logger.err(
-                "Error in deserializing the status RPC request from peer={s}: {any}",
-                .{ peer_id_slice, e },
-            );
-            if (writeFailedBytes(request_bytes, "rpc_status", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                zigHandler.logger.err("RPC status deserialization failed - debug file created: {s}", .{filename});
-            } else {
-                zigHandler.logger.err("RPC status deserialization failed - could not create debug file", .{});
-            }
-            return;
-        };
-
-        request = .{ .status = status_request };
-    } else {
-        var block_request = types.BlockByRootRequest{
-            .roots = ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(zigHandler.allocator) catch |e| {
-                zigHandler.logger.err(
-                    "Failed to init BlockByRootRequest list for peer={s}: {any}",
-                    .{ peer_id_slice, e },
-                );
-                return;
-            },
-        };
-        errdefer block_request.roots.deinit();
-
-        ssz.deserialize(types.BlockByRootRequest, request_bytes, &block_request, zigHandler.allocator) catch |e| {
-            zigHandler.logger.err(
-                "Error in deserializing the blocks_by_root RPC request from peer={s}: {any}",
-                .{ peer_id_slice, e },
-            );
-            if (writeFailedBytes(request_bytes, "rpc_blocks_by_root", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                zigHandler.logger.err("RPC blocks_by_root deserialization failed - debug file created: {s}", .{filename});
-            } else {
-                zigHandler.logger.err("RPC blocks_by_root deserialization failed - could not create debug file", .{});
-            }
-            return;
-        };
-
-        request = .{ .block_by_root = block_request };
-    }
-
+    const method = rpc_protocol.method();
+    var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
+        const label = method.name();
+        zigHandler.logger.err(
+            "Error in deserializing the {s} RPC request from peer={s}: {any}",
+            .{ label, peer_id_slice, err },
+        );
+        if (writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) |filename| {
+            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s}", .{ label, filename });
+        } else {
+            zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file", .{label});
+        }
+        return;
+    };
     defer request.deinit();
 
     const request_str = request.toJsonString(zigHandler.allocator) catch |e| {
@@ -460,7 +385,7 @@ export fn handleRPCRequestFromRustBridge(
 
     zigHandler.logger.debug(
         "network-{d}:: !!!handleRPCRequestFromRustBridge peer={s} protocol={s} channel={d}:: request={s}",
-        .{ zigHandler.params.networkId, peer_id_slice, protocol_slice, channel_id, request_str },
+        .{ zigHandler.params.networkId, peer_id_slice, rpc_protocol.protocolId(), channel_id, request_str },
     );
 
     const request_method = std.meta.activeTag(request);
@@ -534,8 +459,24 @@ export fn handleRPCResponseFromRustBridge(
         );
         return;
     };
-
+    const protocol = RpcProtocol.fromSlice(protocol_slice) orelse {
+        zigHandler.notifyRpcErrorFmt(
+            request_id,
+            callback_ptr.method,
+            2,
+            "Unsupported RPC protocol in response: {s}",
+            .{protocol_slice},
+        );
+        return;
+    };
     const method = callback_ptr.method;
+    if (protocol.method() != method) {
+        zigHandler.logger.warn(
+            "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s}",
+            .{ zigHandler.params.networkId, request_id, protocol.protocolId(), @tagName(method) },
+        );
+    }
+
     const response_frame = response_ptr[0..response_len];
 
     const parsed_frame = parseResponseFrame(response_frame) catch |err| {
@@ -544,7 +485,7 @@ export fn handleRPCResponseFromRustBridge(
             method,
             2,
             "Invalid response frame (protocol={s}): {any}",
-            .{ protocol_slice, err },
+            .{ protocol.protocolId(), err },
         );
         return;
     };
@@ -552,7 +493,7 @@ export fn handleRPCResponseFromRustBridge(
     if (parsed_frame.code != 0) {
         zigHandler.logger.warn(
             "network-{d}:: RPC error response for request_id={d} protocol={s} code={d}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, parsed_frame.code },
+            .{ zigHandler.params.networkId, request_id, protocol.protocolId(), parsed_frame.code },
         );
 
         const owned_message = zigHandler.allocator.dupe(u8, parsed_frame.payload) catch |dup_err| {
@@ -585,50 +526,29 @@ export fn handleRPCResponseFromRustBridge(
             method,
             2,
             "Failed to decode snappy-framed response (protocol={s}): {any}",
-            .{ protocol_slice, err },
+            .{ protocol.protocolId(), err },
         );
         return;
     };
     defer zigHandler.allocator.free(response_bytes);
 
-    var response_union: interface.ReqRespResponse = undefined;
-    switch (method) {
-        .status => {
-            var status_resp: types.Status = undefined;
-            ssz.deserialize(types.Status, response_bytes, &status_resp, zigHandler.allocator) catch |err| {
-                zigHandler.notifyRpcErrorFmt(
-                    request_id,
-                    method,
-                    2,
-                    "Failed to deserialize status response (protocol={s}): {any}",
-                    .{ protocol_slice, err },
-                );
-                return;
-            };
-            response_union = .{ .status = status_resp };
-        },
-        .block_by_root => {
-            var block: types.SignedBeamBlock = undefined;
-            ssz.deserialize(types.SignedBeamBlock, response_bytes, &block, zigHandler.allocator) catch |err| {
-                zigHandler.notifyRpcErrorFmt(
-                    request_id,
-                    method,
-                    2,
-                    "Failed to deserialize block response (protocol={s}): {any}",
-                    .{ protocol_slice, err },
-                );
-                return;
-            };
-            response_union = .{ .block_by_root = block };
-        },
-    }
+    const response_union = interface.ReqRespResponse.deserialize(zigHandler.allocator, method, response_bytes) catch |err| {
+        zigHandler.notifyRpcErrorFmt(
+            request_id,
+            method,
+            2,
+            "Failed to deserialize RPC response (protocol={s}): {any}",
+            .{ protocol.protocolId(), err },
+        );
+        return;
+    };
 
     var event = interface.ReqRespResponseEvent.initSuccess(request_id, method, response_union);
     defer event.deinit(zigHandler.allocator);
 
     zigHandler.logger.debug(
         "network-{d}:: Received RPC response for request_id={d} protocol={s} size={d}",
-        .{ zigHandler.params.networkId, request_id, protocol_slice, response_bytes.len },
+        .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len },
     );
 
     callback_ptr.notify(&event) catch |notify_err| {
@@ -645,6 +565,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
     protocol_id: [*:0]const u8,
 ) void {
     const protocol_slice = std.mem.span(protocol_id);
+    const protocol_str = if (RpcProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
 
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
         var callback = entry.value;
@@ -655,7 +576,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
 
         zigHandler.logger.debug(
             "network-{d}:: Received RPC end-of-stream for request_id={d} protocol={s}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice },
+            .{ zigHandler.params.networkId, request_id, protocol_str },
         );
 
         callback.notify(&event) catch |notify_err| {
@@ -668,7 +589,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice },
+            .{ zigHandler.params.networkId, request_id, protocol_str },
         );
     }
 }
@@ -681,6 +602,7 @@ export fn handleRPCErrorFromRustBridge(
     message_ptr: [*:0]const u8,
 ) void {
     const protocol_slice = std.mem.span(protocol_id);
+    const protocol_str = if (RpcProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
 
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
@@ -704,7 +626,7 @@ export fn handleRPCErrorFromRustBridge(
 
         zigHandler.logger.warn(
             "network-{d}:: Received RPC error for request_id={d} protocol={s} code={d}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, code },
+            .{ zigHandler.params.networkId, request_id, protocol_str, code },
         );
 
         callback.notify(&event) catch |notify_err| {
@@ -717,7 +639,7 @@ export fn handleRPCErrorFromRustBridge(
     } else {
         zigHandler.logger.warn(
             "network-{d}:: Dropping RPC error for unknown request_id={d} protocol={s} code={d}",
-            .{ zigHandler.params.networkId, request_id, protocol_slice, code },
+            .{ zigHandler.params.networkId, request_id, protocol_str, code },
         );
     }
 }
@@ -900,22 +822,7 @@ pub const EthLibp2p = struct {
         defer self.allocator.free(topic_str);
 
         // TODO: deinit the message later ob once done
-        const message = switch (topic.gossip_topic) {
-            .block => blockbytes: {
-                var serialized = std.ArrayList(u8).init(self.allocator);
-                defer serialized.deinit();
-                try ssz.serialize(types.SignedBeamBlock, data.block, &serialized);
-
-                break :blockbytes try serialized.toOwnedSlice();
-            },
-            .vote => votebytes: {
-                var serialized = std.ArrayList(u8).init(self.allocator);
-                defer serialized.deinit();
-                try ssz.serialize(types.SignedVote, data.vote, &serialized);
-
-                break :votebytes try serialized.toOwnedSlice();
-            },
-        };
+        const message = try data.serialize(self.allocator);
         defer self.allocator.free(message);
 
         const compressed_message = try snappyz.encode(self.allocator, message);
@@ -945,26 +852,16 @@ pub const EthLibp2p = struct {
         const peer_id_cstr = try self.allocator.dupeZ(u8, peer_id);
         defer self.allocator.free(peer_id_cstr);
 
-        const request_value = req.*;
-        const method = std.meta.activeTag(request_value);
+        const method = std.meta.activeTag(req.*);
         const protocol = interface.LeanSupportedProtocol.fromMethod(method);
         const protocol_tag: u32 = @as(u32, @intFromEnum(protocol));
 
-        const encoded_message = switch (request_value) {
-            .status => |status_req| statusbytes: {
-                var serialized = std.ArrayList(u8).init(self.allocator);
-                defer serialized.deinit();
-                try ssz.serialize(types.Status, status_req, &serialized);
-
-                break :statusbytes try serialized.toOwnedSlice();
-            },
-            .block_by_root => |block_req| blockbytes: {
-                var serialized = std.ArrayList(u8).init(self.allocator);
-                defer serialized.deinit();
-                try ssz.serialize(types.BlockByRootRequest, block_req, &serialized);
-
-                break :blockbytes try serialized.toOwnedSlice();
-            },
+        const encoded_message = req.serialize(self.allocator) catch |err| {
+            self.logger.err(
+                "network-{d}:: Failed to serialize RPC request for peer={s} method={s}: {any}",
+                .{ self.params.networkId, peer_id, @tagName(method), err },
+            );
+            return err;
         };
 
         defer self.allocator.free(encoded_message);
@@ -1126,77 +1023,3 @@ pub const EthLibp2p = struct {
         return result;
     }
 };
-
-test "writeFailedBytes creates file with correct content" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    // Create a test logger
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.network);
-
-    // Ensure directory exists before test (CI-safe)
-    std.fs.cwd().makeDir("deserialization_dumps") catch {};
-
-    // Use a predictable timestamp for deterministic filename
-    const test_timestamp: i64 = 1234567890;
-
-    // Test case 1: Valid data that should succeed
-    const valid_bytes = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 };
-    const result1 = writeFailedBytes(&valid_bytes, "test", allocator, test_timestamp, module_logger);
-    testing.expect(result1 != null) catch {
-        std.debug.print("writeFailedBytes should return filename for valid data\n", .{});
-    };
-
-    // Now verify the file was created and contains correct content
-    const expected_filename = "deserialization_dumps/failed_test_1234567890.bin";
-    const file = std.fs.cwd().openFile(expected_filename, .{}) catch |e| {
-        std.debug.print("Failed to open created file: {any}\n", .{e});
-        testing.expect(false) catch {};
-        return;
-    };
-    defer file.close();
-
-    // Read all file contents
-    const file_contents = file.readToEndAlloc(allocator, 1024) catch |e| {
-        std.debug.print("Failed to read file contents: {any}\n", .{e});
-        testing.expect(false) catch {};
-        return;
-    };
-    defer allocator.free(file_contents);
-
-    // Verify the file contains exactly the bytes we provided
-    testing.expectEqualSlices(u8, &valid_bytes, file_contents) catch {
-        std.debug.print("File contents don't match expected bytes. Expected: {any}, Got: {any}\n", .{ &valid_bytes, file_contents });
-    };
-
-    // Test case 2: Empty data that should still succeed
-    const empty_bytes = [_]u8{};
-    const result2 = writeFailedBytes(&empty_bytes, "empty", allocator, test_timestamp, module_logger);
-    testing.expect(result2 != null) catch {
-        std.debug.print("writeFailedBytes should return filename for empty data\n", .{});
-    };
-
-    // Verify empty file was created
-    const empty_filename = "deserialization_dumps/failed_empty_1234567890.bin";
-    const empty_file = std.fs.cwd().openFile(empty_filename, .{}) catch |e| {
-        std.debug.print("Failed to open empty file: {any}\n", .{e});
-        testing.expect(false) catch {};
-        return;
-    };
-    defer empty_file.close();
-
-    const empty_contents = empty_file.readToEndAlloc(allocator, 1024) catch |e| {
-        std.debug.print("Failed to read empty file contents: {any}\n", .{e});
-        testing.expect(false) catch {};
-        return;
-    };
-    defer allocator.free(empty_contents);
-
-    testing.expectEqualSlices(u8, &empty_bytes, empty_contents) catch {
-        std.debug.print("Empty file contents don't match expected bytes. Expected: {any}, Got: {any}\n", .{ &empty_bytes, empty_contents });
-    };
-
-    // Cleanup after we're done with the directory
-    std.fs.cwd().deleteTree("deserialization_dumps") catch {};
-}
