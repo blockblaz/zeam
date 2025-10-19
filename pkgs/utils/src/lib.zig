@@ -1,14 +1,27 @@
 const partialFactory = @import("./partial.zig");
-pub usingnamespace partialFactory;
+pub const Partial = partialFactory.Partial;
 
 const mixFactory = @import("./mixin.zig");
-pub usingnamespace mixFactory;
+pub const Empty = mixFactory.Empty;
+pub const MixIn = mixFactory.MixIn;
 
 const castFactory = @import("./cast.zig");
-pub usingnamespace castFactory;
+pub const Cast = castFactory.Cast;
 
 const logFactory = @import("./log.zig");
-pub usingnamespace logFactory;
+pub const compTimeLog = logFactory.compTimeLog;
+pub const log = logFactory.log;
+pub const ModuleTag = logFactory.ModuleTag;
+pub const FileLogParams = logFactory.FileLogParams;
+pub const FileBehaviourParams = logFactory.FileBehaviourParams;
+pub const FileParams = logFactory.FileParams;
+pub const ZeamLoggerConfig = logFactory.ZeamLoggerConfig;
+pub const ModuleLogger = logFactory.ModuleLogger;
+pub const getScopedLoggerConfig = logFactory.getScopedLoggerConfig;
+pub const getLoggerConfig = logFactory.getLoggerConfig;
+pub const getTestLoggerConfig = logFactory.getTestLoggerConfig;
+pub const getFormattedTimestamp = logFactory.getFormattedTimestamp;
+pub const getFile = logFactory.getFile;
 
 const yaml_factory = @import("./yaml.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
