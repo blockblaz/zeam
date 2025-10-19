@@ -19,8 +19,8 @@ const jsonToString = zeam_utils.jsonToString;
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
 
-const node = @import("./node.zig");
-const PeerInfo = node.PeerInfo;
+const networkFactory = @import("./network.zig");
+const PeerInfo = networkFactory.PeerInfo;
 
 pub const BlockProductionParams = struct {
     slot: usize,
