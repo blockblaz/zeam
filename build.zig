@@ -434,6 +434,7 @@ pub fn build(b: *Builder) !void {
     manager_tests.step.dependOn(&zkvm_host_cmd.step);
     cli_tests.step.dependOn(&zkvm_host_cmd.step);
     network_tests.step.dependOn(&zkvm_host_cmd.step);
+    node_tests.step.dependOn(&zkvm_host_cmd.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
