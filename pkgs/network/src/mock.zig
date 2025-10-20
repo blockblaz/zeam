@@ -51,14 +51,14 @@ pub const Mock = struct {
     const MockServerStream = struct {
         mock: *Mock,
         request_id: u64,
-        method: interface.ReqRespMethod,
+        method: interface.LeanSupportedProtocol,
         finished: bool = false,
     };
 
     const SyntheticResponseTask = struct {
         mock: *Mock,
         request_id: u64,
-        method: interface.ReqRespMethod,
+        method: interface.LeanSupportedProtocol,
         payload: union(enum) {
             success: interface.ReqRespResponse,
             failure: struct {
@@ -67,7 +67,7 @@ pub const Mock = struct {
             },
         },
 
-        fn init(mock: *Mock, request_id: u64, method: interface.ReqRespMethod, request: *const interface.ReqRespRequest) !*SyntheticResponseTask {
+        fn init(mock: *Mock, request_id: u64, method: interface.LeanSupportedProtocol, request: *const interface.ReqRespRequest) !*SyntheticResponseTask {
             const task = try mock.allocator.create(SyntheticResponseTask);
             task.mock = mock;
             task.request_id = request_id;
@@ -246,7 +246,7 @@ pub const Mock = struct {
         return idx;
     }
 
-    fn handleSyntheticRequest(self: *Self, request_id: u64, method: interface.ReqRespMethod, request: *const interface.ReqRespRequest) void {
+    fn handleSyntheticRequest(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol, request: *const interface.ReqRespRequest) void {
         const task = SyntheticResponseTask.init(self, request_id, method, request) catch |err| {
             self.logger.err("mock:: Failed to prepare synthetic response request_id={d}: {any}", .{ request_id, err });
             self.notifyError(request_id, method, 1, "mock peer has no block data");
@@ -335,7 +335,7 @@ pub const Mock = struct {
         };
     }
 
-    fn notifySuccess(self: *Self, request_id: u64, method: interface.ReqRespMethod, response: interface.ReqRespResponse) void {
+    fn notifySuccess(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol, response: interface.ReqRespResponse) void {
         var event = interface.ReqRespResponseEvent.initSuccess(request_id, method, response);
         defer event.deinit(self.allocator);
 
@@ -346,7 +346,7 @@ pub const Mock = struct {
         }
     }
 
-    fn notifyError(self: *Self, request_id: u64, method: interface.ReqRespMethod, code: u32, message: []const u8) void {
+    fn notifyError(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol, code: u32, message: []const u8) void {
         const owned = self.allocator.dupe(u8, message) catch |alloc_err| {
             self.logger.err("mock:: Failed to allocate RPC error message for request_id={d}: {any}", .{ request_id, alloc_err });
             return;
@@ -369,7 +369,7 @@ pub const Mock = struct {
         }
     }
 
-    fn notifyCompleted(self: *Self, request_id: u64, method: interface.ReqRespMethod) void {
+    fn notifyCompleted(self: *Self, request_id: u64, method: interface.LeanSupportedProtocol) void {
         var event = interface.ReqRespResponseEvent.initCompleted(request_id, method);
         defer event.deinit(self.allocator);
 

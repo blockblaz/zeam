@@ -213,92 +213,43 @@ pub const GossipMessage = union(GossipTopic) {
     }
 };
 
-pub const ReqRespMethod = enum {
+pub const LeanSupportedProtocol = enum {
     blocks_by_root,
     status,
-
-    pub fn name(self: ReqRespMethod) []const u8 {
-        return @tagName(self);
-    }
-};
-
-pub const LeanSupportedProtocol = enum {
-    blocks_by_root_v1,
-    status_v1,
 
     pub fn protocolId(self: LeanSupportedProtocol) []const u8 {
         return switch (self) {
-            .blocks_by_root_v1 => lean_blocks_by_root_protocol,
-            .status_v1 => lean_status_protocol,
-        };
-    }
-
-    pub fn method(self: LeanSupportedProtocol) ReqRespMethod {
-        return switch (self) {
-            .blocks_by_root_v1 => .blocks_by_root,
-            .status_v1 => .status,
-        };
-    }
-
-    pub fn fromMethod(req_method: ReqRespMethod) LeanSupportedProtocol {
-        return switch (req_method) {
-            .blocks_by_root => .blocks_by_root_v1,
-            .status => .status_v1,
-        };
-    }
-
-    pub fn fromProtocolId(protocol_id: []const u8) !LeanSupportedProtocol {
-        if (std.mem.eql(u8, protocol_id, lean_status_protocol)) {
-            return .status_v1;
-        }
-
-        if (std.mem.eql(u8, protocol_id, lean_blocks_by_root_protocol)) {
-            return .blocks_by_root_v1;
-        }
-
-        return error.UnsupportedProtocol;
-    }
-};
-
-pub const RpcProtocol = enum {
-    status,
-    blocks_by_root,
-
-    pub fn protocolId(self: RpcProtocol) []const u8 {
-        return switch (self) {
-            .status => lean_status_protocol,
             .blocks_by_root => lean_blocks_by_root_protocol,
+            .status => lean_status_protocol,
         };
     }
 
-    pub fn method(self: RpcProtocol) ReqRespMethod {
-        return switch (self) {
-            .status => .status,
-            .blocks_by_root => .blocks_by_root,
-        };
+    pub fn name(self: LeanSupportedProtocol) []const u8 {
+        return @tagName(self);
     }
 
-    pub fn fromSlice(slice: []const u8) ?RpcProtocol {
-        const protocols = comptime std.enums.values(RpcProtocol);
+    pub fn fromSlice(slice: []const u8) ?LeanSupportedProtocol {
+        const protocols = comptime std.enums.values(LeanSupportedProtocol);
         inline for (protocols) |value| {
             if (std.mem.eql(u8, slice, value.protocolId())) return value;
         }
         return null;
     }
 
-    pub fn fromMethod(req_method: ReqRespMethod) RpcProtocol {
-        return switch (req_method) {
-            .status => .status,
-            .blocks_by_root => .blocks_by_root,
-        };
-    }
+    pub fn fromProtocolId(protocol_id: []const u8) !LeanSupportedProtocol {
+        if (std.mem.eql(u8, protocol_id, lean_status_protocol)) {
+            return .status;
+        }
 
-    pub fn leanProtocol(self: RpcProtocol) LeanSupportedProtocol {
-        return LeanSupportedProtocol.fromMethod(self.method());
+        if (std.mem.eql(u8, protocol_id, lean_blocks_by_root_protocol)) {
+            return .blocks_by_root;
+        }
+
+        return error.UnsupportedProtocol;
     }
 };
 
-pub const ReqRespRequest = union(ReqRespMethod) {
+pub const ReqRespRequest = union(LeanSupportedProtocol) {
     blocks_by_root: types.BlockByRootRequest,
     status: types.Status,
 
@@ -330,33 +281,44 @@ pub const ReqRespRequest = union(ReqRespMethod) {
         return serialized.toOwnedSlice();
     }
 
-    pub fn deserialize(allocator: Allocator, method: ReqRespMethod, bytes: []const u8) !Self {
-        return switch (method) {
-            .status => {
-                var payload: types.Status = undefined;
-                try ssz.deserialize(types.Status, bytes, &payload, allocator);
-                return .{ .status = payload };
+    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
+        const PayloadType = std.meta.TagPayload(Self, tag);
+        return switch (tag) {
+            .blocks_by_root => PayloadType{
+                .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
             },
-            .blocks_by_root => {
-                var request = types.BlockByRootRequest{
-                    .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
-                };
-                errdefer request.roots.deinit();
+            inline else => @as(PayloadType, undefined),
+        };
+    }
 
-                try ssz.deserialize(types.BlockByRootRequest, bytes, &request, allocator);
-                return .{ .blocks_by_root = request };
+    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
+        switch (tag) {
+            .blocks_by_root => payload.roots.deinit(),
+            inline else => {},
+        }
+    }
+
+    pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
+        return switch (method) {
+            inline else => |tag| {
+                const PayloadType = std.meta.TagPayload(Self, tag);
+                var payload = try initPayload(tag, allocator);
+                var succeeded = false;
+                defer if (!succeeded) deinitPayload(tag, &payload);
+                try ssz.deserialize(PayloadType, bytes, &payload, allocator);
+                succeeded = true;
+                return @unionInit(Self, @tagName(tag), payload);
             },
         };
     }
 
     pub fn deinit(self: *ReqRespRequest) void {
         switch (self.*) {
-            .status => {},
-            .blocks_by_root => |*request| request.roots.deinit(),
+            inline else => |*payload, tag| deinitPayload(tag, payload),
         }
     }
 };
-pub const ReqRespResponse = union(ReqRespMethod) {
+pub const ReqRespResponse = union(LeanSupportedProtocol) {
     blocks_by_root: types.SignedBeamBlock,
     status: types.Status,
 
@@ -388,7 +350,7 @@ pub const ReqRespResponse = union(ReqRespMethod) {
         return serialized.toOwnedSlice();
     }
 
-    pub fn deserialize(allocator: Allocator, method: ReqRespMethod, bytes: []const u8) !ReqRespResponse {
+    pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
         return switch (method) {
             inline else => |tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
@@ -444,7 +406,7 @@ pub const ReqRespResponseError = struct {
 };
 
 pub const ReqRespResponseEvent = struct {
-    method: ReqRespMethod,
+    method: LeanSupportedProtocol,
     request_id: u64,
     payload: Payload,
 
@@ -454,7 +416,7 @@ pub const ReqRespResponseEvent = struct {
         completed,
     };
 
-    pub fn initSuccess(request_id: u64, method: ReqRespMethod, response: ReqRespResponse) ReqRespResponseEvent {
+    pub fn initSuccess(request_id: u64, method: LeanSupportedProtocol, response: ReqRespResponse) ReqRespResponseEvent {
         return ReqRespResponseEvent{
             .method = method,
             .request_id = request_id,
@@ -462,7 +424,7 @@ pub const ReqRespResponseEvent = struct {
         };
     }
 
-    pub fn initError(request_id: u64, method: ReqRespMethod, err: ReqRespResponseError) ReqRespResponseEvent {
+    pub fn initError(request_id: u64, method: LeanSupportedProtocol, err: ReqRespResponseError) ReqRespResponseEvent {
         return ReqRespResponseEvent{
             .method = method,
             .request_id = request_id,
@@ -470,7 +432,7 @@ pub const ReqRespResponseEvent = struct {
         };
     }
 
-    pub fn initCompleted(request_id: u64, method: ReqRespMethod) ReqRespResponseEvent {
+    pub fn initCompleted(request_id: u64, method: LeanSupportedProtocol) ReqRespResponseEvent {
         return ReqRespResponseEvent{
             .method = method,
             .request_id = request_id,
@@ -488,11 +450,11 @@ pub const ReqRespResponseEvent = struct {
 };
 
 pub const ReqRespRequestCallback = struct {
-    method: ReqRespMethod,
+    method: LeanSupportedProtocol,
     allocator: Allocator,
     handler: ?OnReqRespResponseCbHandler,
 
-    pub fn init(method: ReqRespMethod, allocator: Allocator, handler: ?OnReqRespResponseCbHandler) ReqRespRequestCallback {
+    pub fn init(method: LeanSupportedProtocol, allocator: Allocator, handler: ?OnReqRespResponseCbHandler) ReqRespRequestCallback {
         return ReqRespRequestCallback{
             .method = method,
             .allocator = allocator,

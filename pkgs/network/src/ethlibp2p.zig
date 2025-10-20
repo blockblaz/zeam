@@ -32,7 +32,7 @@ const FrameDecodeError = error{
     Incomplete,
 } || uvarint.VarintParseError;
 
-const RpcProtocol = interface.RpcProtocol;
+const LeanSupportedProtocol = interface.LeanSupportedProtocol;
 
 fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
@@ -126,7 +126,7 @@ const ServerStreamContext = struct {
     zigHandler: *EthLibp2p,
     channel_id: u64,
     peer_id: []const u8,
-    method: interface.ReqRespMethod,
+    method: interface.LeanSupportedProtocol,
     finished: bool = false,
 };
 
@@ -335,7 +335,7 @@ export fn handleRPCRequestFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const protocol_slice = std.mem.span(protocol_id);
 
-    const rpc_protocol = RpcProtocol.fromSlice(protocol_slice) orelse {
+    const rpc_protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.logger.warn(
             "network-{d}:: Unsupported RPC protocol from peer={s} on channel={d}: {s}",
             .{ zigHandler.params.networkId, peer_id_slice, channel_id, protocol_slice },
@@ -361,7 +361,7 @@ export fn handleRPCRequestFromRustBridge(
     };
     defer zigHandler.allocator.free(request_bytes);
 
-    const method = rpc_protocol.method();
+    const method = rpc_protocol;
     var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
         const label = method.name();
         zigHandler.logger.err(
@@ -459,7 +459,7 @@ export fn handleRPCResponseFromRustBridge(
         );
         return;
     };
-    const protocol = RpcProtocol.fromSlice(protocol_slice) orelse {
+    const protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.notifyRpcErrorFmt(
             request_id,
             callback_ptr.method,
@@ -470,7 +470,7 @@ export fn handleRPCResponseFromRustBridge(
         return;
     };
     const method = callback_ptr.method;
-    if (protocol.method() != method) {
+    if (protocol != method) {
         zigHandler.logger.warn(
             "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s}",
             .{ zigHandler.params.networkId, request_id, protocol.protocolId(), @tagName(method) },
@@ -565,7 +565,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
     protocol_id: [*:0]const u8,
 ) void {
     const protocol_slice = std.mem.span(protocol_id);
-    const protocol_str = if (RpcProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
+    const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
 
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
         var callback = entry.value;
@@ -602,7 +602,7 @@ export fn handleRPCErrorFromRustBridge(
     message_ptr: [*:0]const u8,
 ) void {
     const protocol_slice = std.mem.span(protocol_id);
-    const protocol_str = if (RpcProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
+    const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
 
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
@@ -853,8 +853,7 @@ pub const EthLibp2p = struct {
         defer self.allocator.free(peer_id_cstr);
 
         const method = std.meta.activeTag(req.*);
-        const protocol = interface.LeanSupportedProtocol.fromMethod(method);
-        const protocol_tag: u32 = @as(u32, @intFromEnum(protocol));
+        const protocol_tag: u32 = @as(u32, @intFromEnum(method));
 
         const encoded_message = req.serialize(self.allocator) catch |err| {
             self.logger.err(
@@ -915,7 +914,7 @@ pub const EthLibp2p = struct {
     fn notifyRpcErrorWithOwnedMessage(
         self: *Self,
         request_id: u64,
-        method: interface.ReqRespMethod,
+        method: interface.LeanSupportedProtocol,
         code: u32,
         message: []u8,
     ) void {
@@ -945,7 +944,7 @@ pub const EthLibp2p = struct {
     fn notifyRpcErrorFmt(
         self: *Self,
         request_id: u64,
-        method: interface.ReqRespMethod,
+        method: interface.LeanSupportedProtocol,
         code: u32,
         comptime fmt: []const u8,
         args: anytype,
