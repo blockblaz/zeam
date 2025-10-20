@@ -145,7 +145,7 @@ pub const Network = struct {
         if (peer_count == 0) return null;
 
         const target_index = std.crypto.random.uintLessThan(usize, peer_count);
-        
+
         var it = self.connected_peers.iterator();
         var current_index: usize = 0;
         while (it.next()) |entry| : (current_index += 1) {
