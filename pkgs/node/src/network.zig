@@ -141,10 +141,19 @@ pub const Network = struct {
     }
 
     pub fn selectPeer(self: *Self) ?[]const u8 {
+        const peer_count = self.connected_peers.count();
+        if (peer_count == 0) return null;
+
+        const target_index = std.crypto.random.uintLessThan(usize, peer_count);
+        
         var it = self.connected_peers.iterator();
-        if (it.next()) |entry| {
-            return entry.value_ptr.peer_id;
+        var current_index: usize = 0;
+        while (it.next()) |entry| : (current_index += 1) {
+            if (current_index == target_index) {
+                return entry.value_ptr.peer_id;
+            }
         }
+
         return null;
     }
 
