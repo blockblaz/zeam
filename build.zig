@@ -100,6 +100,12 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("snappyz");
 
+    const snappyframesz_dep = b.dependency("snappyframesz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -205,9 +211,11 @@ pub fn build(b: *Builder) !void {
     });
     zeam_network.addImport("@zeam/types", zeam_types);
     zeam_network.addImport("@zeam/utils", zeam_utils);
+    zeam_network.addImport("@zeam/params", zeam_params);
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
+    zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
 
     // add beam node
@@ -375,6 +383,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     node_tests.root_module.addImport("rocksdb", rocksdb);
+    addRustGlueLib(b, node_tests, target, .networking);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -407,6 +416,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
+    addRustGlueLib(b, network_tests, target, .networking);
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
@@ -448,7 +458,6 @@ pub fn build(b: *Builder) !void {
     // xmss_tests.step.dependOn(&networking_build.step);
     xmss_tests.step.dependOn(&zkvms_build.step);
     addRustGlueLib(b, xmss_tests, target, .zkvms);
-    // addRustGlueLib(b, xmss_tests, target, .crypto);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
@@ -464,6 +473,8 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("ssz", ssz);
     manager_tests.step.dependOn(&zkvms_build.step);
     cli_tests.step.dependOn(&networking_build.step);
+    network_tests.step.dependOn(&networking_build.step);
+    node_tests.step.dependOn(&networking_build.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{

@@ -19,8 +19,8 @@ const jsonToString = zeam_utils.jsonToString;
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
 
-const node = @import("./node.zig");
-const PeerInfo = node.PeerInfo;
+const networkFactory = @import("./network.zig");
+const PeerInfo = networkFactory.PeerInfo;
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -463,6 +463,18 @@ pub const BeamChain = struct {
 
     pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
         return self.forkChoice.onAttestation(signedVote, false);
+    }
+
+    pub fn getStatus(self: *Self) types.Status {
+        const finalized = self.forkChoice.fcStore.latest_finalized;
+        const head = self.forkChoice.head;
+
+        return .{
+            .finalized_root = finalized.root,
+            .finalized_slot = finalized.slot,
+            .head_root = head.blockRoot,
+            .head_slot = head.slot,
+        };
     }
 };
 

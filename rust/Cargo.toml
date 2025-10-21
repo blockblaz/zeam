@@ -8,7 +8,11 @@ default = ["libp2p"]
 risc0 = ["dep:risc0-zkvm"]
 openvm = ["dep:openvm-platform", "dep:openvm-sdk", "dep:openvm-build", "dep:openvm-stark-sdk", "dep:openvm-transpiler"]
 hashsig = ["dep:hashsig", "dep:rand", "dep:rand_chacha", "dep:thiserror"]
-libp2p = ["dep:libp2p", "dep:libp2p-mplex", "dep:futures", "dep:tokio"]
+libp2p = [
+    "dep:libp2p", "dep:libp2p-mplex", "dep:futures", "dep:tokio", "dep:tokio-util",
+    "dep:tokio-io-timeout", "dep:unsigned-varint", "dep:async-trait", "dep:lazy_static",
+    "dep:delay_map", "dep:tracing", "dep:bytes", "dep:slog", "dep:thiserror"
+]
 
 # Convenience feature combinations
 networking = ["libp2p"]
@@ -39,6 +43,15 @@ thiserror = { version = "2.0.17", optional = true }
 libp2p-mplex = { version = "0.42", optional = true }
 futures = { version = "0.3.31", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
+tokio-util = { version = "0.7", features = ["codec", "compat"], optional = true }
+tokio-io-timeout = { version = "1.2", optional = true }
+unsigned-varint = { version = "0.7", features = ["codec"], optional = true }
+async-trait = { version = "0.1.86", optional = true }
+lazy_static = { version = "1.5.0", optional = true }
+delay_map = { version = "0.4.1", optional = true }
+tracing = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true } 
+slog = { version = "2", features = ["max_level_debug", "release_max_level_debug", "nested-values"], optional = true  }
 libp2p = { version = "0.54", default-features = false, features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"], optional = true }
 
 [lib]

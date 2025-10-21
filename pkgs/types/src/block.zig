@@ -237,6 +237,8 @@ pub const SignedBeamBlock = struct {
     }
 };
 
+pub const SignedBeamBlockList = ssz.utils.List(SignedBeamBlock, params.MAX_REQUEST_BLOCKS);
+
 test "ssz seralize/deserialize signed beam block" {
     var signed_block = SignedBeamBlock{
         .message = .{

@@ -1,14 +1,16 @@
 use futures::future::Either;
+use futures::Stream;
 use futures::StreamExt;
 use libp2p::core::{
     multiaddr::Multiaddr, multiaddr::Protocol, muxing::StreamMuxerBox, transport::Boxed,
 };
 
 use libp2p::identity::{secp256k1, Keypair};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     core, gossipsub, identify, identity, noise, ping, yamux, PeerId, SwarmBuilder, Transport,
 };
+use std::convert::TryFrom;
 use std::os::raw::c_char;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -16,6 +18,19 @@ use tokio::runtime::Builder;
 use sha2::Digest;
 use snap::raw::Decoder;
 use std::ffi::{CStr, CString};
+
+use delay_map::HashMapDelay;
+use futures::future::poll_fn;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use crate::req_resp::{
+    configurations::REQUEST_TIMEOUT,
+    varint::{encode_varint, MAX_VARINT_BYTES},
+    LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage, ReqRespMessageError,
+    ReqRespMessageReceived, RequestMessage, ResponseMessage,
+};
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
@@ -25,6 +40,23 @@ static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 // a hack to start a second network for self testing purposes
 #[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+
+lazy_static::lazy_static! {
+    static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
+    static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
+    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
+}
+
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct PendingResponse {
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    stream_id: u64,
+    protocol: ProtocolId,
+}
 
 /// # Safety
 ///
@@ -142,12 +174,254 @@ pub unsafe fn publish_msg_to_rust_bridge(
     }
 }
 
+/// # Safety
+///
+/// The caller must ensure that `peer_id` points to a valid null-terminated C string.
+/// The caller must ensure that `request_data` points to valid memory of `request_len` bytes.
+#[no_mangle]
+pub unsafe fn send_rpc_request(
+    network_id: u32,
+    peer_id: *const c_char,
+    protocol_tag: u32,
+    request_data: *const u8,
+    request_len: usize,
+) -> u64 {
+    let peer_id_str = CStr::from_ptr(peer_id).to_string_lossy().to_string();
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Invalid peer ID: {}", e);
+            return 0;
+        }
+    };
+
+    let request_slice = std::slice::from_raw_parts(request_data, request_len);
+    let request_bytes = request_slice.to_vec();
+
+    let protocol = match LeanSupportedProtocol::try_from(protocol_tag) {
+        Ok(protocol) => protocol,
+        Err(_) => {
+            eprintln!(
+                "Invalid protocol tag {} provided for RPC request to {}",
+                protocol_tag, peer_id
+            );
+            return 0;
+        }
+    };
+
+    let protocol_id: ProtocolId = protocol.into();
+
+    #[allow(static_mut_refs)]
+    let swarm = if network_id < 1 {
+        SWARM_STATE.as_mut().unwrap()
+    } else {
+        SWARM_STATE1.as_mut().unwrap()
+    };
+
+    let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
+
+    swarm
+        .behaviour_mut()
+        .reqresp
+        .send_request(peer_id, request_id, request_message);
+
+    REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
+    REQUEST_PROTOCOL_MAP
+        .lock()
+        .unwrap()
+        .insert(request_id, protocol_id.clone());
+
+    println!(
+        "reqresp:: Sent {:?} request to {} (id: {:?})",
+        protocol, peer_id, request_id
+    );
+
+    request_id
+}
+
+/// # Safety
+/// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
+#[no_mangle]
+pub unsafe fn send_rpc_response_chunk(
+    network_id: u32,
+    channel_id: u64,
+    response_data: *const u8,
+    response_len: usize,
+) {
+    let response_slice = std::slice::from_raw_parts(response_data, response_len);
+    let response_bytes = response_slice.to_vec();
+
+    let channel = {
+        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.get(&channel_id).cloned()
+    };
+
+    if let Some(channel) = channel {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
+        } else {
+            SWARM_STATE1.as_mut().unwrap()
+        };
+
+        let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
+
+        swarm.behaviour_mut().reqresp.send_response(
+            channel.peer_id,
+            channel.connection_id,
+            channel.stream_id,
+            response_message,
+        );
+        println!(
+            "Sent response payload on channel {} (peer: {})",
+            channel_id, channel.peer_id
+        );
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
+/// # Safety
+/// The caller must ensure the channel id is valid for a pending response.
+#[no_mangle]
+pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
+    let channel = {
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.remove(&channel_id)
+    };
+
+    if let Some(channel) = channel {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
+        } else {
+            SWARM_STATE1.as_mut().unwrap()
+        };
+
+        swarm.behaviour_mut().reqresp.finish_response_stream(
+            channel.peer_id,
+            channel.connection_id,
+            channel.stream_id,
+        );
+        println!(
+            "Sent end-of-stream on channel {} (peer: {})",
+            channel_id, channel.peer_id
+        );
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
+/// # Safety
+/// The caller must ensure `message_ptr` points to a valid null-terminated C string.
+#[no_mangle]
+pub unsafe fn send_rpc_error_response(
+    network_id: u32,
+    channel_id: u64,
+    message_ptr: *const c_char,
+) {
+    if message_ptr.is_null() {
+        eprintln!(
+            "Attempted to send RPC error response with null message pointer for channel {}",
+            channel_id
+        );
+        return;
+    }
+
+    let message = CStr::from_ptr(message_ptr).to_string_lossy().to_string();
+    let message_bytes = message.as_bytes();
+
+    if message_bytes.len() > crate::req_resp::configurations::max_message_size() {
+        eprintln!(
+            "Attempted to send RPC error payload exceeding maximum size on channel {}",
+            channel_id
+        );
+        return;
+    }
+
+    let channel = {
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.remove(&channel_id)
+    };
+
+    if let Some(channel) = channel {
+        #[allow(static_mut_refs)]
+        let swarm = if network_id < 1 {
+            SWARM_STATE.as_mut().unwrap()
+        } else {
+            SWARM_STATE1.as_mut().unwrap()
+        };
+
+        let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
+        payload.push(2);
+        encode_varint(message_bytes.len(), &mut payload);
+        payload.extend_from_slice(message_bytes);
+
+        let response_message = ResponseMessage::new(channel.protocol.clone(), payload);
+
+        let peer_id = channel.peer_id;
+
+        swarm.behaviour_mut().reqresp.send_response(
+            peer_id,
+            channel.connection_id,
+            channel.stream_id,
+            response_message,
+        );
+        swarm.behaviour_mut().reqresp.finish_response_stream(
+            peer_id,
+            channel.connection_id,
+            channel.stream_id,
+        );
+        println!(
+            "Sent error response on channel {} (peer: {}): {}",
+            channel_id, peer_id, message
+        );
+    } else {
+        eprintln!("No response channel found for id {}", channel_id);
+    }
+}
+
 extern "C" {
     fn handleMsgFromRustBridge(
         zig_handler: u64,
         topic: *const c_char,
         message_ptr: *const u8,
         message_len: usize,
+    );
+}
+
+extern "C" {
+    fn handleRPCRequestFromRustBridge(
+        zig_handler: u64,
+        channel_id: u64,
+        peer_id: *const c_char,
+        protocol_id: *const c_char,
+        request_ptr: *const u8,
+        request_len: usize,
+    );
+
+    fn handleRPCResponseFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+        response_ptr: *const u8,
+        response_len: usize,
+    );
+
+    fn handleRPCEndOfStreamFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+    );
+
+    fn handleRPCErrorFromRustBridge(
+        zig_handler: u64,
+        request_id: u64,
+        protocol_id: *const c_char,
+        code: u32,
+        message: *const c_char,
     );
 }
 
@@ -240,84 +514,303 @@ impl Network {
         };
 
         loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("\nListening on {address:?}\n");
+            tokio::select! {
+
+            Some(timeout_result) = poll_fn(|cx| {
+                let mut map = REQUEST_ID_MAP.lock().unwrap();
+                std::pin::Pin::new(&mut *map).poll_next(cx)
+            }) => {
+                match timeout_result {
+                    Ok((request_id, ())) => {
+                        println!(
+                            "reqresp:: Request {} timed out after {:?}",
+                            request_id, REQUEST_TIMEOUT
+                        );
+                        if let Some(protocol_id) = REQUEST_PROTOCOL_MAP
+                            .lock()
+                            .unwrap()
+                            .remove(&request_id)
+                        {
+                            if let (Ok(protocol_cstring), Ok(message_cstring)) = (
+                                CString::new(protocol_id.as_str()),
+                                CString::new("request timed out"),
+                            ) {
+                                unsafe {
+                                    handleRPCErrorFromRustBridge(
+                                        self.zig_handler,
+                                        request_id,
+                                        protocol_cstring.as_ptr(),
+                                        408,
+                                        message_cstring.as_ptr(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("reqresp:: Error in delay map: {}", e);
+                    }
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    let peer_id = peer_id.to_string();
-                    let peer_id = peer_id.as_str();
-                    println!(
-                        "\nrustbridge{}:: Connection established with peer: {}\n",
-                        self.network_id, peer_id
-                    );
-                    let peer_id_cstr = match CString::new(peer_id) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_peer_id_string={}",
+            }
+
+                event = swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("\nListening on {address:?}\n");
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            let peer_id = peer_id.to_string();
+                            let peer_id = peer_id.as_str();
+                            println!(
+                                "\nrustbridge{}:: Connection established with peer: {}\n",
                                 self.network_id, peer_id
                             );
-                            continue;
+                            let peer_id_cstr = match CString::new(peer_id) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_peer_id_string={}",
+                                        self.network_id, peer_id
+                                    );
+                                    continue;
+                                }
+                            };
+                            unsafe {
+                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                            };
                         }
-                    };
-                    unsafe {
-                        handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
-                    };
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    let peer_id = peer_id.to_string();
-                    let peer_id = peer_id.as_str();
-                    println!(
-                        "\nrustbridge{}:: Connection closed with peer: {}\n",
-                        self.network_id, peer_id
-                    );
-                    let peer_id_cstr = match CString::new(peer_id) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_peer_id_string={}",
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            let peer_id = peer_id.to_string();
+                            let peer_id = peer_id.as_str();
+                            println!(
+                                "\nrustbridge{}:: Connection closed with peer: {}\n",
                                 self.network_id, peer_id
                             );
-                            continue;
+                            let peer_id_cstr = match CString::new(peer_id) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_peer_id_string={}",
+                                        self.network_id, peer_id
+                                    );
+                                    continue;
+                                }
+                            };
+                            unsafe {
+                                handlePeerDisconnectedFromRustBridge(
+                                    self.zig_handler,
+                                    peer_id_cstr.as_ptr(),
+                                )
+                            };
                         }
-                    };
-                    unsafe {
-                        handlePeerDisconnectedFromRustBridge(
-                            self.zig_handler,
-                            peer_id_cstr.as_ptr(),
-                        )
-                    };
-                }
-                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    message,
-                    ..
-                })) => {
-                    let topic = message.topic.as_str();
-                    let topic = match CString::new(topic) {
-                        Ok(cstr) => cstr,
-                        Err(_) => {
-                            eprintln!(
-                                "rustbridge{}:: invalid_topic_string={}",
-                                self.network_id, topic
+                        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            message,
+                            ..
+                        })) => {
+                            let topic = message.topic.as_str();
+                            let topic = match CString::new(topic) {
+                                Ok(cstr) => cstr,
+                                Err(_) => {
+                                    eprintln!(
+                                        "rustbridge{}:: invalid_topic_string={}",
+                                        self.network_id, topic
+                                    );
+                                    continue;
+                                }
+                            };
+                            let topic = topic.as_ptr();
+
+                            let message_ptr = message.data.as_ptr();
+                            let message_len = message.data.len();
+
+                            unsafe {
+                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
+                            };
+                            println!(
+                                "\nrustbridge{0}:: zig callback completed\n",
+                                self.network_id
                             );
-                            return;
                         }
-                    };
-                    let topic = topic.as_ptr();
+                        SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
+                            peer_id,
+                            connection_id,
+                            message,
+                        })) => match message {
+                            Ok(ReqRespMessageReceived::Request { stream_id, message }) => {
+                                let request_message = *message;
+                                let protocol = request_message.protocol.clone();
+                                let payload = request_message.payload;
+                                println!(
+                                    "reqresp:: Received request from {} for protocol {} ({} bytes)",
+                                    peer_id,
+                                    protocol.as_str(),
+                                    payload.len()
+                                );
 
-                    let message_ptr = message.data.as_ptr();
-                    let message_len = message.data.len();
+                                let channel_id =
+                                    RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(
+                                    channel_id,
+                                    PendingResponse {
+                                        peer_id,
+                                        connection_id,
+                                        stream_id,
+                                        protocol: protocol.clone(),
+                                    },
+                                );
 
-                    unsafe {
-                        handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
-                    };
-                    println!(
-                        "\nrustbridge{0}:: zig callback completed\n",
-                        self.network_id
-                    );
+                                let peer_id_string = peer_id.to_string();
+                                let peer_id_cstring = match CString::new(peer_id_string) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for peer id {}: {}",
+                                            peer_id, err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                let protocol_cstring = match CString::new(protocol.as_str()) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for protocol {}: {}",
+                                            protocol.as_str(), err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                unsafe {
+                                    handleRPCRequestFromRustBridge(
+                                        self.zig_handler,
+                                        channel_id,
+                                        peer_id_cstring.as_ptr(),
+                                        protocol_cstring.as_ptr(),
+                                        payload.as_ptr(),
+                                        payload.len(),
+                                    );
+                                }
+                            }
+                            Ok(ReqRespMessageReceived::Response { request_id, message }) => {
+                                {
+                                    let mut map = REQUEST_ID_MAP.lock().unwrap();
+                                    if !map.update_timeout(&request_id, REQUEST_TIMEOUT) {
+                                        map.insert(request_id, ());
+                                    }
+                                }
+                                let response_message = *message;
+                                println!(
+                                    "reqresp:: Received response from {} for request id {} ({} bytes)",
+                                    peer_id,
+                                    request_id,
+                                    response_message.payload.len()
+                                );
+                                let protocol_cstring = match CString::new(
+                                    response_message.protocol.as_str(),
+                                ) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "reqresp:: Failed to create C string for protocol {}: {}",
+                                            response_message.protocol.as_str(),
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                unsafe {
+                                    handleRPCResponseFromRustBridge(
+                                        self.zig_handler,
+                                        request_id,
+                                        protocol_cstring.as_ptr(),
+                                        response_message.payload.as_ptr(),
+                                        response_message.payload.len(),
+                                    );
+                                }
+                            }
+                            Ok(ReqRespMessageReceived::EndOfStream { request_id }) => {
+                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                let protocol = REQUEST_PROTOCOL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&request_id);
+
+                                if let Some(protocol_id) = protocol {
+                                    let protocol_cstring = match CString::new(protocol_id.as_str()) {
+                                        Ok(cstring) => cstring,
+                                        Err(err) => {
+                                            eprintln!(
+                                                "reqresp:: Failed to create C string for protocol {} on end-of-stream: {}",
+                                                protocol_id.as_str(),
+                                                err
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    unsafe {
+                                        handleRPCEndOfStreamFromRustBridge(
+                                            self.zig_handler,
+                                            request_id,
+                                            protocol_cstring.as_ptr(),
+                                        );
+                                    }
+                                } else {
+                                    println!(
+                                        "reqresp:: Received end-of-stream for request id {} without protocol mapping",
+                                        request_id
+                                    );
+                                }
+                            }
+                            Err(ReqRespMessageError::Inbound { stream_id, err }) => {
+                                println!(
+                                    "reqresp:: Inbound error from {} on stream {}: {:?}",
+                                    peer_id, stream_id, err
+                                );
+                                RESPONSE_CHANNEL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .retain(|_, pending| {
+                                        !(pending.peer_id == peer_id
+                                            && pending.connection_id == connection_id
+                                            && pending.stream_id == stream_id)
+                                    });
+                            }
+                            Err(ReqRespMessageError::Outbound { request_id, err }) => {
+                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                let protocol = REQUEST_PROTOCOL_MAP
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&request_id);
+
+                                if let Some(protocol_id) = protocol {
+                                    if let (Ok(protocol_cstring), Ok(message_cstring)) = (
+                                        CString::new(protocol_id.as_str()),
+                                        CString::new(format!("{:?}", err)),
+                                    ) {
+                                        unsafe {
+                                            handleRPCErrorFromRustBridge(
+                                                self.zig_handler,
+                                                request_id,
+                                                protocol_cstring.as_ptr(),
+                                                3,
+                                                message_cstring.as_ptr(),
+                                            );
+                                        }
+                                    }
+                                }
+                                println!(
+                                    "reqresp:: Outbound error for request {} with {}: {:?}",
+                                    request_id, peer_id, err
+                                );
+                            }
+                        },
+                        e => println!("{e:?}"),
+                    }
                 }
-                e => println!("{e:?}"),
             }
         }
     }
@@ -328,6 +821,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
+    reqresp: ReqResp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -389,6 +883,11 @@ impl Behaviour {
             gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
                 .unwrap();
 
+        let reqresp = ReqResp::new(vec![
+            LeanSupportedProtocol::StatusV1.into(),
+            LeanSupportedProtocol::BlocksByRootV1.into(),
+        ]);
+
         Self {
             identify: identify::Behaviour::new(identify::Config::new(
                 "/ipfs/0.1.0".into(),
@@ -396,6 +895,7 @@ impl Behaviour {
             )),
             ping: ping::Behaviour::default(),
             gossipsub,
+            reqresp,
         }
     }
 }

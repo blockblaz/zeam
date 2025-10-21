@@ -1,6 +1,9 @@
 #[cfg(feature = "libp2p")]
 pub mod libp2p_bridge;
 
+#[cfg(feature = "libp2p")]
+pub mod req_resp;
+
 #[cfg(feature = "hashsig")]
 pub mod hashsig;
 
