@@ -388,24 +388,8 @@ pub fn main() !void {
             try std.fs.cwd().makePath(leancmd.@"data-dir");
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
-            var start_options: node.NodeOptions = .{
-                .network_id = leancmd.network_id,
-                .node_key = leancmd.@"node-id",
-                .validator_config = leancmd.validator_config,
-                .node_key_index = undefined,
-                .metrics_enable = leancmd.metrics_enable,
-                .metrics_port = leancmd.metrics_port,
-                .bootnodes = undefined,
-                .genesis_spec = undefined,
-                .validator_indices = undefined,
-                .local_priv_key = undefined,
-                .logger_config = &zeam_logger_config,
-                .database_path = leancmd.@"data-dir",
-            };
-
+            var start_options = try node.buildStartOptions(allocator, leancmd, &zeam_logger_config);
             defer start_options.deinit(allocator);
-
-            try node.buildStartOptions(allocator, leancmd, &start_options);
 
             var lean_node: node.Node = undefined;
             try lean_node.init(allocator, &start_options);
