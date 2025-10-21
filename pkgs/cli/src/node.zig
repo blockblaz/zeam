@@ -282,7 +282,22 @@ pub const Node = struct {
 /// It loads the necessary configuration files, parses them, and populates the
 /// `StartNodeOptions` structure.
 /// The caller is responsible for freeing the allocated resources in `StartNodeOptions`.
-pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, opts: *NodeOptions) !void {
+pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, logger_config: *LoggerConfig) !NodeOptions {
+    var opts: NodeOptions = .{
+        .network_id = node_cmd.network_id,
+        .node_key = node_cmd.@"node-id",
+        .validator_config = node_cmd.validator_config,
+        .node_key_index = undefined,
+        .metrics_enable = node_cmd.metrics_enable,
+        .metrics_port = node_cmd.metrics_port,
+        .bootnodes = undefined,
+        .genesis_spec = undefined,
+        .validator_indices = undefined,
+        .local_priv_key = undefined,
+        .logger_config = logger_config,
+        .database_path = node_cmd.@"data-dir",
+    };
+
     try utils_lib.checkDIRExists(node_cmd.custom_genesis);
 
     const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
@@ -339,12 +354,14 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
         return error.InvalidValidatorConfig;
     }
     const local_priv_key = try getPrivateKeyFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
+    errdefer allocator.free(local_priv_key);
 
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
     opts.local_priv_key = local_priv_key;
     opts.genesis_spec = genesis_spec;
     opts.node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+    return opts;
 }
 
 /// Parses the nodes from a YAML configuration.
