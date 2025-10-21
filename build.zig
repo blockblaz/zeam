@@ -19,28 +19,11 @@ const RustFeatures = enum {
     networking,
     zkvms,
     crypto,
-
-    pub fn toString(self: RustFeatures) []const u8 {
-        return switch (self) {
-            .networking => "networking",
-            .zkvms => "zkvms",
-            .crypto => "crypto",
-        };
-    }
 };
-
-// Helper function to get build command by feature
-fn getRustBuild(builds: anytype, feature: RustFeatures) *Builder.Step.Run {
-    return switch (feature) {
-        .networking => builds.networking,
-        .zkvms => builds.zkvms,
-        .crypto => builds.crypto,
-    };
-}
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, feature: RustFeatures) void {
-    const feature_str = feature.toString();
+    const feature_str = @tagName(feature);
     const target_dir = b.fmt("rust/target/{s}/release/librustglue.a", .{feature_str});
 
     comp.addObjectFile(b.path(target_dir));
@@ -62,15 +45,9 @@ pub fn build(b: *Builder) !void {
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
 
     // build rust project for different features
-    const rust_builds = struct {
-        networking: *Builder.Step.Run,
-        zkvms: *Builder.Step.Run,
-        crypto: *Builder.Step.Run,
-    }{
-        .networking = build_rust_project(b, "rust", .networking),
-        .zkvms = build_rust_project(b, "rust", .zkvms),
-        .crypto = build_rust_project(b, "rust", .crypto),
-    };
+    const networking_build = build_rust_project(b, "rust", .networking);
+    const zkvms_build = build_rust_project(b, "rust", .zkvms);
+    // const crypto_build = build_rust_project(b, "rust", .crypto);
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -293,7 +270,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
 
-    cli_exe.step.dependOn(&rust_builds.networking.step);
+    cli_exe.step.dependOn(&networking_build.step);
     addRustGlueLib(b, cli_exe, target, .networking);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
@@ -302,7 +279,7 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    cli_exe.step.dependOn(&rust_builds.zkvms.step);
+    cli_exe.step.dependOn(&zkvms_build.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -387,7 +364,7 @@ pub fn build(b: *Builder) !void {
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
 
-    manager_tests.step.dependOn(&rust_builds.zkvms.step);
+    manager_tests.step.dependOn(&zkvms_build.step);
     addRustGlueLib(b, manager_tests, target, .zkvms);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
@@ -409,7 +386,7 @@ pub fn build(b: *Builder) !void {
     cli_tests.root_module.addImport("rocksdb", rocksdb);
     cli_tests.step.dependOn(&cli_exe.step);
 
-    cli_tests.step.dependOn(&rust_builds.networking.step);
+    cli_tests.step.dependOn(&networking_build.step);
     addRustGlueLib(b, cli_tests, target, .networking);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -468,8 +445,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
 
-    xmss_tests.step.dependOn(&rust_builds.crypto.step);
-    addRustGlueLib(b, xmss_tests, target, .crypto);
+    // xmss_tests.step.dependOn(&networking_build.step);
+    xmss_tests.step.dependOn(&zkvms_build.step);
+    addRustGlueLib(b, xmss_tests, target, .zkvms);
+    // addRustGlueLib(b, xmss_tests, target, .crypto);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
@@ -483,8 +462,8 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
-    manager_tests.step.dependOn(&rust_builds.zkvms.step);
-    cli_tests.step.dependOn(&rust_builds.networking.step);
+    manager_tests.step.dependOn(&zkvms_build.step);
+    cli_tests.step.dependOn(&networking_build.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
@@ -510,7 +489,7 @@ pub fn build(b: *Builder) !void {
 }
 
 fn build_rust_project(b: *Builder, path: []const u8, feature: RustFeatures) *Builder.Step.Run {
-    const feature_str = feature.toString();
+    const feature_str = @tagName(feature);
     const target_dir = b.fmt("./target/{s}", .{feature_str});
 
     return b.addSystemCommand(&.{

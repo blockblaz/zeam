@@ -12,7 +12,7 @@ libp2p = ["dep:libp2p", "dep:libp2p-mplex", "dep:futures", "dep:tokio"]
 
 # Convenience feature combinations
 networking = ["libp2p"]
-zkvms = ["risc0", "openvm"]
+zkvms = ["risc0", "openvm", "hashsig"]
 crypto = ["hashsig"]
 full = ["libp2p", "hashsig", "risc0", "openvm"]
 

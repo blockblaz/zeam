@@ -103,7 +103,7 @@ pub const KeyPair = struct {
         message: []const u8,
         signature: *const Signature,
         epoch: u32,
-    ) HashSigError!bool {
+    ) HashSigError!void {
         const msg_len = hashsig_message_length();
         if (message.len != msg_len) {
             return HashSigError.InvalidMessageLength;
@@ -116,11 +116,9 @@ pub const KeyPair = struct {
             signature.handle,
         );
 
-        return switch (result) {
-            1 => true,
-            0 => false,
-            else => HashSigError.VerificationFailed,
-        };
+        if (result != 1) {
+            return HashSigError.VerificationFailed;
+        }
     }
 
     /// Get the required message length
@@ -178,17 +176,18 @@ test "HashSig: sign and verify" {
     defer signature.deinit();
 
     // Verify the signature
-    const is_valid = try keypair.verify(message, &signature, epoch);
-    try std.testing.expect(is_valid);
+    try keypair.verify(message, &signature, epoch);
 
     // Test with wrong epoch
-    const is_invalid_epoch = try keypair.verify(message, &signature, epoch + 100);
-    try std.testing.expect(!is_invalid_epoch);
+    keypair.verify(message, &signature, epoch + 100) catch |err| {
+        try std.testing.expect(err == HashSigError.VerificationFailed);
+    };
 
     // Test with wrong message
     message[0] = message[0] + 1; // Modify message
-    const is_invalid = try keypair.verify(message, &signature, epoch);
-    try std.testing.expect(!is_invalid);
+    keypair.verify(message, &signature, epoch) catch |err| {
+        try std.testing.expect(err == HashSigError.VerificationFailed);
+    };
 }
 
 test "HashSig: invalid message length" {
