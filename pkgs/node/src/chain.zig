@@ -450,6 +450,13 @@ pub const BeamChain = struct {
         batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
         batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state.*);
 
+        try self.updateSlotIndices(&batch, block.slot, fcBlock.blockRoot, latest_finalized.slot);
+
+        // Handle cleanup when new finalization occurs
+        if (latest_finalized.slot > self.last_emitted_finalized_slot) {
+            try self.cleanupSlotIndicesOnFinalization(&batch, self.last_emitted_finalized_slot + 1, latest_finalized.slot);
+        }
+
         self.db.commit(&batch);
 
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
@@ -459,6 +466,62 @@ pub const BeamChain = struct {
             blockInfo.blockRoot == null,
             blockInfo.postState == null,
         });
+    }
+
+    /// Update slot indices pointing to blocks
+    fn updateSlotIndices(self: *Self, batch: *database.Db.WriteBatch, slot: types.Slot, blockroot: types.Root, finalized_slot: types.Slot) !void {
+        if (slot <= finalized_slot) {
+            // Add to finalized slot index
+            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockroot);
+        } else {
+            // Add to unfinalized slot index
+            const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
+            defer if (existing_blockroots.len > 0) self.allocator.free(existing_blockroots);
+
+            // Add new blockroot to the list
+            var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+            defer updated_blockroots.deinit();
+
+            try updated_blockroots.appendSlice(existing_blockroots);
+            try updated_blockroots.append(blockroot);
+
+            batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
+        }
+    }
+
+    /// Clean up slot indices when finalization advances
+    fn cleanupSlotIndicesOnFinalization(self: *Self, batch: *database.Db.WriteBatch, start_slot: types.Slot, end_slot: types.Slot) !void {
+        for (start_slot..end_slot + 1) |slot| {
+            // Move canonical block from unfinalized to finalized index
+            const unfinalized_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse continue;
+            defer self.allocator.free(unfinalized_blockroots);
+
+            // Find the canonical block (on the finalized chain)
+            for (unfinalized_blockroots) |blockroot| {
+                if (self.isBlockOnCanonicalChain(blockroot)) {
+                    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockroot);
+                    break;
+                }
+            }
+
+            // Remove from unfinalized index
+            batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+        }
+    }
+
+    /// Check if a block is on the canonical chain
+    fn isBlockOnCanonicalChain(self: *Self, blockroot: types.Root) bool {
+        return self.forkChoice.hasBlock(blockroot);
+    }
+
+    /// get finalized block at slot
+    pub fn getFinalizedBlockAtSlot(self: *Self, slot: types.Slot) ?types.Root {
+        return self.db.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot);
+    }
+
+    /// get unfinalized blocks at slot
+    pub fn getUnfinalizedBlocksAtSlot(self: *Self, slot: types.Slot) ?[]types.Root {
+        return self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot);
     }
 
     pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
