@@ -1293,6 +1293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delay_map"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88e365f083a5cb5972d50ce8b1b2c9f125dc5ec0f50c0248cfb568ae59efcf0b"
+dependencies = [
+ "futures",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6181,9 +6192,13 @@ dependencies = [
 name = "rustglue"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
+ "bytes",
+ "delay_map",
  "futures",
  "hex",
+ "lazy_static",
  "libp2p",
  "libp2p-mplex",
  "openvm",
@@ -6197,7 +6212,12 @@ dependencies = [
  "sha2 0.9.9",
  "slog",
  "snap",
+ "thiserror 2.0.12",
  "tokio",
+ "tokio-io-timeout",
+ "tokio-util",
+ "tracing",
+ "unsigned-varint 0.7.2",
 ]
 
 [[package]]
@@ -6956,6 +6976,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-io-timeout"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bd86198d9ee903fedd2f9a2e72014287c0d9167e4ae43b5853007205dda1b76"
+dependencies = [
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-macros"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6984,8 +7014,10 @@ checksum = "66a539a9ad6d5d281510d5bd368c973d636c02dbf8a67300bfb6b950696ad7df"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
@@ -7254,6 +7286,10 @@ name = "unsigned-varint"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6889a77d49f1f013504cec6bf97a2c730394adedaeb1deb5ea08949a50541105"
+dependencies = [
+ "bytes",
+ "tokio-util",
+]
 
 [[package]]
 name = "unsigned-varint"

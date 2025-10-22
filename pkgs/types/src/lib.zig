@@ -17,6 +17,7 @@ pub const Mini3SFVote = mini_3sf.Mini3SFVote;
 pub const SignedVote = mini_3sf.SignedVote;
 pub const Mini3SFVotes = mini_3sf.Mini3SFVotes;
 pub const SignedVotes = mini_3sf.SignedVotes;
+pub const Status = mini_3sf.Status;
 
 const utils = @import("./utils.zig");
 pub const jsonToString = utils.jsonToString;
