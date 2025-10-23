@@ -41,7 +41,7 @@ fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 }
 
 // prepare the state to be pre state of the slot
-fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
+pub fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
     if (slot <= state.slot) {
         logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, state.slot });
         return StateTransitionError.InvalidPreState;
@@ -229,7 +229,7 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
 }
 
-fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+pub fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
     // start block processing
     try state.process_block_header(allocator, block, logger);
     // PQ devner-0 has no execution
