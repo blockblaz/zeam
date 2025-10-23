@@ -17,6 +17,7 @@ pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validators = @import("./validator.zig");
 const constants = @import("./constants.zig");
+pub const api = @import("@zeam/api");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 
@@ -390,6 +391,7 @@ pub const BeamNode = struct {
                     }
                 }
             }
+            api.setLeanValidatorsCount(validator.ids.len, 0, 0, 0);
         }
     }
 

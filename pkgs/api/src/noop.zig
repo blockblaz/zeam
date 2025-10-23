@@ -34,6 +34,13 @@ pub fn setLeanHeadSlot(slot: u64) void {
     _ = slot;
 }
 
+pub fn setLeanValidatorsCount(active: u64, pending: u64, exited: u64, slashed: u64) void {
+    _ = active;
+    _ = pending;
+    _ = exited;
+    _ = slashed;
+}
+
 pub fn chain_onblock_duration_seconds_start() Timer {
     return chain_onblock_duration_seconds.start();
 }
