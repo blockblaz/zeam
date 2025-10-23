@@ -5,14 +5,63 @@ const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const utils = @import("@zeam/utils");
 const jsonToString = utils.jsonToString;
+const build_options = @import("build_options");
 
 const Allocator = std.mem.Allocator;
 
 // extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
-extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32;
-extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
-extern fn openvm_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
-extern fn openvm_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool;
+
+// Conditionally declare extern functions - these will only be linked if the library is included
+extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) callconv(.C) u32;
+extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.C) bool;
+
+fn risc0_prove_stub(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32 {
+    _ = serialized;
+    _ = len;
+    _ = binary_path;
+    _ = binary_path_length;
+    _ = output;
+    _ = output_len;
+    @panic("RISC0 support not compiled in");
+}
+
+fn risc0_verify_stub(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool {
+    _ = binary_path;
+    _ = binary_path_len;
+    _ = receipt;
+    _ = receipt_len;
+    @panic("RISC0 support not compiled in");
+}
+
+const risc0_prove_fn = if (build_options.has_risc0) risc0_prove else risc0_prove_stub;
+const risc0_verify_fn = if (build_options.has_risc0) risc0_verify else risc0_verify_stub;
+
+// Conditionally declare extern functions - these will only be linked if the library is included
+extern fn openvm_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) callconv(.C) u32;
+extern fn openvm_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.C) bool;
+
+fn openvm_prove_stub(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32 {
+    _ = serialized;
+    _ = len;
+    _ = output;
+    _ = output_len;
+    _ = binary_path;
+    _ = binary_path_length;
+    _ = result_path;
+    _ = result_path_len;
+    @panic("OpenVM support not compiled in");
+}
+
+fn openvm_verify_stub(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool {
+    _ = binary_path;
+    _ = binary_path_len;
+    _ = receipt;
+    _ = receipt_len;
+    @panic("OpenVM support not compiled in");
+}
+
+const openvm_prove_fn = if (build_options.has_openvm) openvm_prove else openvm_prove_stub;
+const openvm_verify_fn = if (build_options.has_openvm) openvm_verify else openvm_verify_stub;
 
 const PowdrConfig = struct {
     program_path: []const u8,
@@ -69,8 +118,8 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     const output_len = switch (opts.zkvm) {
         // .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
         .powdr => return error.RiscVPowdrIsDeprecated,
-        .risc0 => |risc0cfg| risc0_prove(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
-        .openvm => |openvmcfg| openvm_prove(serialized.items.ptr, serialized.items.len, output.ptr, output.len, openvmcfg.program_path.ptr, openvmcfg.program_path.len, openvmcfg.result_path.ptr, openvmcfg.result_path.len),
+        .risc0 => |risc0cfg| risc0_prove_fn(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
+        .openvm => |openvmcfg| openvm_prove_fn(serialized.items.ptr, serialized.items.len, output.ptr, output.len, openvmcfg.program_path.ptr, openvmcfg.program_path.len, openvmcfg.result_path.ptr, openvmcfg.result_path.len),
         // else => @panic("prover isn't enabled"),
     };
     const proof = types.BeamSTFProof{
@@ -86,8 +135,8 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
     _ = block_root;
 
     const valid = switch (opts.zkvm) {
-        .risc0 => |risc0cfg| risc0_verify(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
-        .openvm => |openvmcfg| openvm_verify(openvmcfg.program_path.ptr, openvmcfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        .risc0 => |risc0cfg| risc0_verify_fn(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        .openvm => |openvmcfg| openvm_verify_fn(openvmcfg.program_path.ptr, openvmcfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         else => return error.UnsupportedVerifier,
     };
 

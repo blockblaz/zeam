@@ -14,11 +14,19 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
+const ProverChoice = enum { risc0, openvm, all };
+
 // Add the glue libs to a compile target
-fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
-    comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
+    // Conditionally include prover libraries based on selection
+    if (prover == .risc0 or prover == .all) {
+        comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+    }
+    if (prover == .openvm or prover == .all) {
+        comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+    }
+    // Always include libp2p
     comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
-    comp.addObjectFile(b.path("rust/target/release/libopenvm_glue_noalloc.a"));
     comp.linkLibC();
     comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
@@ -35,6 +43,10 @@ pub fn build(b: *Builder) !void {
 
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
+
+    // Get prover choice (default to risc0)
+    const prover_option = b.option([]const u8, "prover", "Choose prover: risc0, openvm, or all (default: risc0)") orelse "risc0";
+    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .risc0;
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -92,6 +104,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
+
+    // Create build options early so modules can use them
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+    build_options.addOption([]const u8, "prover", @tagName(prover));
+    build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
+    build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    const build_options_module = build_options.createModule();
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -163,6 +183,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_proving_manager.addImport("@zeam/utils", zeam_utils);
     zeam_state_proving_manager.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_state_proving_manager.addImport("ssz", ssz);
+    zeam_state_proving_manager.addImport("build_options", build_options_module);
 
     const st_lib = b.addStaticLibrary(.{
         .name = "zeam-state-transition",
@@ -226,11 +247,6 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
 
-    // Create build options
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", git_version);
-    const build_options_module = build_options.createModule();
-
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
@@ -259,7 +275,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
 
-    addRustGlueLib(b, cli_exe, target);
+    addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
 
@@ -267,7 +283,7 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    var zkvm_host_cmd = build_rust_project(b, "rust");
+    var zkvm_host_cmd = build_rust_project(b, "rust", prover);
     cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
@@ -352,7 +368,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
-    addRustGlueLib(b, manager_tests, target);
+    addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
@@ -361,7 +377,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    addRustGlueLib(b, node_tests, target);
+    addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -371,7 +387,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
-    addRustGlueLib(b, cli_tests, target);
+    addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -391,7 +407,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
-    addRustGlueLib(b, network_tests, target);
+    addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
@@ -462,34 +478,51 @@ pub fn build(b: *Builder) !void {
     spectests_step.dependOn(&run_spectests.step);
 }
 
-fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
-    const cargo_build = b.addSystemCommand(&.{
-        "cargo",
-        "+nightly",
-        "-C",
-        path,
-        "-Z",
-        "unstable-options",
-        "build",
-        "--release",
-        "--all",
-    });
+fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
+    // Build only the selected prover crates
+    const cargo_build = switch (prover) {
+        .risc0 => b.addSystemCommand(&.{
+            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "build", "--release", "-p", "libp2p-glue", "-p", "risc0-glue",
+        }),
+        .openvm => b.addSystemCommand(&.{
+            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "build", "--release", "-p", "libp2p-glue", "-p", "openvm-glue",
+        }),
+        .all => b.addSystemCommand(&.{
+            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "build", "--release", "--all",
+        }),
+    };
 
-    // Create the noalloc version of libopenvm_glue.a after the build
-    // This localizes conflicting allocation symbols to avoid duplicate symbol errors
-    const create_noalloc = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\cp rust/target/release/libopenvm_glue.a rust/target/release/libopenvm_glue_noalloc.a && \
-        \\objcopy \
-        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc12___rust_alloc \
-        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc14___rust_dealloc \
-        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc14___rust_realloc \
-        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc19___rust_alloc_zeroed \
-        \\  rust/target/release/libopenvm_glue_noalloc.a
-    });
-    create_noalloc.step.dependOn(&cargo_build.step);
+    // Weaken allocation symbols in built libraries to avoid duplicate symbol errors
+    // Using wildcards (-w) to match symbols across different Rust versions
+    const libs = switch (prover) {
+        .risc0 => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a",
+        .openvm => "rust/target/release/libopenvm_glue.a rust/target/release/liblibp2p_glue.a",
+        .all => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a rust/target/release/libopenvm_glue.a",
+    };
 
-    return create_noalloc;
+    const weaken_cmd = b.fmt(
+        \\for lib in {s}; do \
+        \\  if [ -f "$lib" ]; then \
+        \\    objcopy -w \
+        \\      --weaken-symbol='*___rust_alloc' \
+        \\      --weaken-symbol='*___rust_dealloc' \
+        \\      --weaken-symbol='*___rust_realloc' \
+        \\      --weaken-symbol='*___rust_alloc_zeroed' \
+        \\      --weaken-symbol='*___rust_alloc_error_handler*' \
+        \\      --weaken-symbol='*___rust_drop_panic' \
+        \\      --weaken-symbol='*___rust_foreign_exception' \
+        \\      "$lib"; \
+        \\  fi; \
+        \\done
+    , .{libs});
+
+    const weaken_symbols = b.addSystemCommand(&.{ "sh", "-c", weaken_cmd });
+    weaken_symbols.step.dependOn(&cargo_build.step);
+
+    return weaken_symbols;
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
