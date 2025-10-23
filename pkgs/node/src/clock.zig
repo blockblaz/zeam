@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 
 const constants = @import("./constants.zig");
+const params = @import("@zeam/params");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -19,6 +20,7 @@ pub const Clock = struct {
     on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
 
     timer: xev.Timer,
+    seconds_per_interval_ms: isize,
 
     const Self = @This();
 
@@ -30,9 +32,12 @@ pub const Clock = struct {
         const events = try utils.EventLoop.init(loop);
         const timer = try xev.Timer.init();
 
+        // Use compile-time constant for seconds per interval
+        const seconds_per_interval_ms = constants.SECONDS_PER_INTERVAL_MS;
+
         const genesis_time_ms: isize = @intCast(genesis_time * std.time.ms_per_s);
-        const current_interval = @divFloor(@as(isize, @intCast(std.time.milliTimestamp())) + CLOCK_DISPARITY_MS - genesis_time_ms, constants.SECONDS_PER_INTERVAL_MS);
-        const current_interval_time_ms = genesis_time_ms + current_interval * constants.SECONDS_PER_INTERVAL_MS;
+        const current_interval = @divFloor(@as(isize, @intCast(std.time.milliTimestamp())) + CLOCK_DISPARITY_MS - genesis_time_ms, seconds_per_interval_ms);
+        const current_interval_time_ms = genesis_time_ms + current_interval * seconds_per_interval_ms;
 
         return Self{
             .genesis_time_ms = genesis_time_ms,
@@ -41,6 +46,7 @@ pub const Clock = struct {
             .events = events,
             .timer = timer,
             .on_interval_cbs = std.ArrayList(*OnIntervalCbWrapper).init(allocator),
+            .seconds_per_interval_ms = seconds_per_interval_ms,
         };
     }
 
@@ -54,12 +60,12 @@ pub const Clock = struct {
 
     pub fn tickInterval(self: *Self) void {
         const time_now_ms: isize = @intCast(std.time.milliTimestamp());
-        while (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {
-            self.current_interval_time_ms += constants.SECONDS_PER_INTERVAL_MS;
+        while (self.current_interval_time_ms + self.seconds_per_interval_ms < time_now_ms + CLOCK_DISPARITY_MS) {
+            self.current_interval_time_ms += self.seconds_per_interval_ms;
             self.current_interval += 1;
         }
 
-        const next_interval_time_ms: isize = self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS;
+        const next_interval_time_ms: isize = self.current_interval_time_ms + self.seconds_per_interval_ms;
         const time_to_next_interval_ms: usize = @intCast(next_interval_time_ms - time_now_ms);
 
         for (0..self.on_interval_cbs.items.len) |i| {

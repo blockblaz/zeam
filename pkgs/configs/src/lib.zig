@@ -8,7 +8,8 @@ const types = @import("@zeam/types");
 const utils = @import("@zeam/utils");
 pub const ChainOptions = utils.Partial(utils.MixIn(types.GenesisSpec, types.ChainSpec));
 
-const configs = @import("./configs/mainnet.zig");
+const mainnetConfig = @import("./configs/mainnet.zig");
+const minimalConfig = @import("./configs/minimal.zig");
 const Yaml = @import("yaml").Yaml;
 
 pub const Chain = enum { custom };
@@ -57,6 +58,13 @@ pub fn genesisConfigFromYAML(config: Yaml, override_genesis_time: ?u64) !types.G
         .num_validators = @intCast(config.docs.items[0].map.get("VALIDATOR_COUNT").?.int),
     };
     return genesis_spec;
+}
+
+pub fn getChainSpecByPreset(preset: params.Preset) types.ChainSpec {
+    return switch (preset) {
+        .mainnet => mainnetConfig.mainnet,
+        .minimal => minimalConfig.minimal,
+    };
 }
 
 test "load genesis config from yaml" {

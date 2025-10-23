@@ -17,6 +17,8 @@ const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
+const params = @import("@zeam/params");
+const Preset = params.Preset;
 
 const utils_lib = @import("@zeam/utils");
 
@@ -94,6 +96,8 @@ const ZeamArgs = struct {
             mockNetwork: bool = false,
             metricsPort: u16 = constants.DEFAULT_METRICS_PORT,
             data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
+
+            pub const __messages__ = .{};
         },
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
@@ -229,10 +233,11 @@ pub fn main() !void {
 
             const mock_network = beamcmd.mockNetwork;
 
-            // some base mainnet spec would be loaded to build this up
-            const chain_spec =
-                \\{"preset": "mainnet", "name": "beamdev"}
-            ;
+            // Create chain spec based on compile-time preset
+            const preset_name = @tagName(params.activePreset);
+            const chain_spec = try std.fmt.allocPrint(allocator, "{{\"preset\": \"{s}\", \"name\": \"beamdev\"}}", .{preset_name});
+            defer allocator.free(chain_spec);
+
             const options = json.ParseOptions{
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
@@ -400,6 +405,7 @@ pub fn main() !void {
                 .validator_indices = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
+                .preset = params.activePreset,
                 .database_path = leancmd.@"data-dir",
             };
 
