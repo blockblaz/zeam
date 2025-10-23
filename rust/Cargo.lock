@@ -1710,15 +1710,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "erased-serde"
-version = "0.3.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c138974f9d5e7fe373eb04df7cae98833802ae4b11c24ac7039a21d5af4b26c"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6021,6 +6012,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "risc0-glue"
+version = "0.1.0"
+dependencies = [
+ "risc0-zkvm",
+ "serde",
+ "serde_cbor",
+]
+
+[[package]]
 name = "risc0-groth16"
 version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6218,31 +6218,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rustglue"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bincode",
- "bytes",
- "delay_map",
- "futures",
- "hex",
- "lazy_static",
- "risc0-zkvm",
- "serde",
- "serde_cbor",
- "sha2 0.9.9",
- "slog",
- "snap",
- "thiserror 2.0.12",
- "tokio",
- "tokio-io-timeout",
- "tokio-util",
- "tracing",
- "unsigned-varint 0.7.2",
 ]
 
 [[package]]
@@ -6611,15 +6586,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f92a496fb766b417c996b9c5e57daf2f7ad3b0bebe1ccfca4856390e3d3bb67"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "slog"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8347046d4ebd943127157b94d63abb990fcf729dc4e9978927fdf4ac3c998d06"
-dependencies = [
- "erased-serde",
 ]
 
 [[package]]

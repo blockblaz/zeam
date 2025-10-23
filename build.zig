@@ -16,7 +16,7 @@ const zkvm_targets: []const zkvmTarget = &.{
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
-    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+    comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
     comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
     comp.addObjectFile(b.path("rust/target/release/libopenvm_glue_noalloc.a"));
     comp.linkLibC();
