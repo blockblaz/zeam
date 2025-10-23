@@ -17,6 +17,8 @@ const zkvm_targets: []const zkvmTarget = &.{
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
     comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+    comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+    comp.addObjectFile(b.path("rust/target/release/libopenvm_glue_noalloc.a"));
     comp.linkLibC();
     comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
@@ -236,6 +238,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_exe.want_lto = true; // Enable LTO
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
@@ -460,7 +463,7 @@ pub fn build(b: *Builder) !void {
 }
 
 fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
-    return b.addSystemCommand(&.{
+    const cargo_build = b.addSystemCommand(&.{
         "cargo",
         "+nightly",
         "-C",
@@ -469,7 +472,24 @@ fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
         "unstable-options",
         "build",
         "--release",
+        "--all",
     });
+
+    // Create the noalloc version of libopenvm_glue.a after the build
+    // This localizes conflicting allocation symbols to avoid duplicate symbol errors
+    const create_noalloc = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\cp rust/target/release/libopenvm_glue.a rust/target/release/libopenvm_glue_noalloc.a && \
+        \\objcopy \
+        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc12___rust_alloc \
+        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc14___rust_dealloc \
+        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc14___rust_realloc \
+        \\  --localize-symbol=_RNvCs978LYV4Em9j_7___rustc19___rust_alloc_zeroed \
+        \\  rust/target/release/libopenvm_glue_noalloc.a
+    });
+    create_noalloc.step.dependOn(&cargo_build.step);
+
+    return create_noalloc;
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
