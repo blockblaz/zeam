@@ -18,7 +18,7 @@ const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
 
-const utils_lib = @import("@zeam/utils");
+const zeam_utils = @import("@zeam/utils");
 
 const database = @import("@zeam/database");
 
@@ -179,14 +179,20 @@ pub fn main() !void {
     switch (opts.args.__commands__) {
         .clock => {
             var loop = try xev.Loop.init(.{});
-            var clock = try Clock.init(gpa.allocator(), genesis, &loop);
+            var event_loop = try zeam_utils.EventLoop.init(gpa.allocator(), &loop);
+            defer {
+                event_loop.stop();
+                event_loop.deinit();
+            }
+            event_loop.startAsyncNotifications();
+            var clock = try Clock.init(gpa.allocator(), genesis, &event_loop);
             std.debug.print("clock {any}\n", .{clock});
 
             try clock.run();
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
-            var zeam_logger_config = utils_lib.getLoggerConfig(null, null);
+            var zeam_logger_config = zeam_utils.getLoggerConfig(null, null);
             const logger = zeam_logger_config.logger(.state_proving_manager);
             const stf_logger = zeam_logger_config.logger(.state_transition);
 
@@ -255,12 +261,22 @@ pub fn main() !void {
             // behavior of this further needs to be investigated but for now we will share the same loop
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
+            defer {
+                loop.deinit();
+                allocator.destroy(loop);
+            }
+            var event_loop = try zeam_utils.EventLoop.init(allocator, loop);
+            defer {
+                event_loop.stop();
+                event_loop.deinit();
+            }
+            event_loop.startAsyncNotifications();
 
             try std.fs.cwd().makePath(beamcmd.data_dir);
 
             // Create loggers first so they can be passed to network implementations
-            var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
-            var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger1_config = zeam_utils.getScopedLoggerConfig(.n1, console_log_level, zeam_utils.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger2_config = zeam_utils.getScopedLoggerConfig(.n2, console_log_level, zeam_utils.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
@@ -283,7 +299,7 @@ pub fn main() !void {
 
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
-                network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network));
+                network.* = try networks.Mock.init(allocator, &event_loop, logger1_config.logger(.network));
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
@@ -294,7 +310,7 @@ pub fn main() !void {
                 listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network1.* = try networks.EthLibp2p.init(allocator, &event_loop, .{
                     .networkId = 0,
                     .network_name = network_name1,
                     .local_private_key = &priv_key1,
@@ -311,7 +327,7 @@ pub fn main() !void {
                 connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{
+                network2.* = try networks.EthLibp2p.init(allocator, &event_loop, .{
                     .networkId = 1,
                     .network_name = network_name2,
                     .local_private_key = &priv_key2,
@@ -323,7 +339,7 @@ pub fn main() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, &event_loop);
 
             //one missing validator is by design
             var validator_ids_1 = [_]usize{1};
@@ -386,7 +402,7 @@ pub fn main() !void {
         },
         .node => |leancmd| {
             try std.fs.cwd().makePath(leancmd.@"data-dir");
-            var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
+            var zeam_logger_config = zeam_utils.getLoggerConfig(console_log_level, zeam_utils.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,

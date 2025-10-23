@@ -127,8 +127,8 @@ pub const Mock = struct {
         return .disarm;
     }
 
-    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger) !Self {
-        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger);
+    pub fn init(allocator: Allocator, event_loop: *zeam_utils.EventLoop, logger: zeam_utils.ModuleLogger) !Self {
+        const gossip_handler = try interface.GenericGossipHandler.init(allocator, event_loop, 0, logger);
         errdefer gossip_handler.deinit();
 
         const peer_event_handler = try interface.PeerEventHandler.init(allocator, 0, logger);
@@ -260,7 +260,7 @@ pub const Mock = struct {
         };
 
         self.timer.run(
-            self.gossipHandler.loop,
+            self.gossipHandler.event_loop.loop,
             completion,
             1,
             SyntheticResponseTask,
@@ -428,7 +428,7 @@ pub const Mock = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -438,7 +438,7 @@ pub const Mock = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data);
     }
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
@@ -738,10 +738,17 @@ test "Mock status RPC between peers" {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
+    var event_loop = try zeam_utils.EventLoop.init(allocator, &loop);
+    defer {
+        event_loop.stop();
+        event_loop.deinit();
+    }
+    event_loop.startAsyncNotifications();
+
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(.mock);
 
-    var mock = try Mock.init(allocator, &loop, logger);
+    var mock = try Mock.init(allocator, &event_loop, logger);
     defer mock.deinit();
 
     const backend_a = mock.getNetworkInterface();

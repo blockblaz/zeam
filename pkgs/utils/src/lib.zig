@@ -36,6 +36,10 @@ const json_factory = @import("./json.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const jsonToString = json_factory.jsonToString;
 
+const event_loop = @import("./event_loop.zig");
+// Avoid to use `usingnamespace` to make upgrade easier in the future.
+pub const EventLoop = event_loop.EventLoop;
+
 test {
     @import("std").testing.refAllDeclsRecursive(@This());
 }

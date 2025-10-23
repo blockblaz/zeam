@@ -78,7 +78,8 @@ pub const NodeOptions = struct {
 /// A Node that encapsulates the networking, blockchain, and validator functionalities.
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
-    loop: xev.Loop,
+    loop: *xev.Loop,
+    event_loop: *zeam_utils.EventLoop,
     network: networks.EthLibp2p,
     beam_node: BeamNode,
     clock: Clock,
@@ -116,14 +117,22 @@ pub const Node = struct {
         try anchorState.genGenesisState(allocator, chain_config.genesis);
         errdefer anchorState.deinit();
 
-        // TODO we seem to be needing one loop because then the events added to loop are not being fired
-        // in the order to which they have been added even with the an appropriate delay added
-        // behavior of this further needs to be investigated but for now we will share the same loop
-        self.loop = try xev.Loop.init(.{});
+        self.loop = try allocator.create(xev.Loop);
+        errdefer allocator.destroy(self.loop);
+        self.loop.* = try xev.Loop.init(.{});
+        errdefer self.loop.deinit();
+
+        self.event_loop = try allocator.create(zeam_utils.EventLoop);
+        errdefer allocator.destroy(self.event_loop);
+        self.event_loop.* = try zeam_utils.EventLoop.init(allocator, self.loop);
+        errdefer self.event_loop.deinit();
+
+        // Start listening for async notifications from other threads
+        self.event_loop.startAsyncNotifications();
 
         const addresses = try self.constructMultiaddrs();
 
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
+        self.network = try networks.EthLibp2p.init(allocator, self.event_loop, .{
             .networkId = options.network_id,
             .network_name = chain_config.spec.name,
             .listen_addresses = addresses.listen_addresses,
@@ -131,7 +140,7 @@ pub const Node = struct {
             .local_private_key = options.local_priv_key,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
-        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, self.event_loop);
         errdefer self.clock.deinit(allocator);
 
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
@@ -152,15 +161,25 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop the event loop first - this disarms async notifications
+        // and processes any pending work before we deinit components
+        self.event_loop.stop();
+
+        // Now it's safe to deinit components that use the loop
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
         self.network.deinit();
         self.enr.deinit();
         self.db.deinit();
+        // Finally clean up the loop infrastructure
+        self.event_loop.deinit();
+        self.allocator.destroy(self.event_loop);
         self.loop.deinit();
+        self.allocator.destroy(self.loop);
     }
 
     pub fn run(self: *Node) !void {
+        try self.event_loop.run(.until_done);
         try self.network.run();
         try self.beam_node.run();
 

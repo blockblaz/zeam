@@ -636,7 +636,7 @@ pub const PeerEventHandler = struct {
 };
 
 pub const GenericGossipHandler = struct {
-    loop: *xev.Loop,
+    event_loop: *zeam_utils.EventLoop,
     timer: xev.Timer,
     allocator: Allocator,
     onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
@@ -644,7 +644,7 @@ pub const GenericGossipHandler = struct {
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+    pub fn init(allocator: Allocator, event_loop: *zeam_utils.EventLoop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
@@ -666,7 +666,7 @@ pub const GenericGossipHandler = struct {
 
         return Self{
             .allocator = allocator,
-            .loop = loop,
+            .event_loop = event_loop,
             .timer = timer,
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
@@ -683,55 +683,33 @@ pub const GenericGossipHandler = struct {
         self.onGossipHandlers.deinit(self.allocator);
     }
 
-    pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
+    pub fn onGossip(self: *Self, data: *const GossipMessage) anyerror!void {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
         self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, gossip_topic });
         for (handlerArr.items) |handler| {
+            const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, self.networkId, self.logger);
 
-            // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
-            // remove this option once resolved
-            if (scheduleOnLoop) {
-                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, self.networkId, self.logger);
+            self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
+            // Create work item for thread-safe scheduling
+            const work_item = zeam_utils.EventLoop.WorkItem{
+                .callback = gossipWorkCallback,
+                .data = publishWrapper,
+            };
 
-                // Create a separate completion object for each handler to avoid conflicts
-                const completion = try self.allocator.create(xev.Completion);
-                completion.* = undefined;
-
-                self.timer.run(
-                    self.loop,
-                    completion,
-                    1,
-                    MessagePublishWrapper,
-                    publishWrapper,
-                    (struct {
-                        fn callback(
-                            ud: ?*MessagePublishWrapper,
-                            _: *xev.Loop,
-                            c: *xev.Completion,
-                            r: xev.Timer.RunError!void,
-                        ) xev.CallbackAction {
-                            _ = r catch unreachable;
-                            if (ud) |pwrap| {
-                                pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
-                                _ = pwrap.handler.onGossip(pwrap.data) catch void;
-                                defer pwrap.deinit();
-                                // Clean up the completion object
-                                pwrap.allocator.destroy(c);
-                            }
-                            return .disarm;
-                        }
-                    }).callback,
-                );
-            } else {
-                handler.onGossip(data) catch |e| {
-                    self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
-                };
-            }
+            // Thread-safe: notify the main event loop from any thread (including Rust thread)
+            try self.event_loop.scheduleWork(work_item);
         }
         // we don't need to run the loop as this is a shared loop and is already being run by the clock
+    }
+
+    fn gossipWorkCallback(data: *anyopaque) anyerror!void {
+        const pwrap: *MessagePublishWrapper = @ptrCast(@alignCast(data));
+        defer pwrap.deinit();
+
+        pwrap.logger.debug("network-{d}:: ONGOSSIP work callback executed", .{pwrap.networkId});
+        try pwrap.handler.onGossip(pwrap.data);
     }
 
     pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
@@ -781,4 +759,134 @@ test LeanNetworkTopic {
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
     try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+}
+
+test "GenericGossipHandler: multiple threads scheduling gossip concurrently" {
+    const allocator = std.testing.allocator;
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var event_loop = try zeam_utils.EventLoop.init(allocator, &loop);
+    defer {
+        event_loop.stop();
+        event_loop.deinit();
+    }
+
+    event_loop.startAsyncNotifications();
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    var gossip_handler = try GenericGossipHandler.init(
+        allocator,
+        &event_loop,
+        0,
+        logger_config.logger(.network),
+    );
+    defer gossip_handler.deinit();
+
+    var received_count: usize = 0;
+    var mutex = std.Thread.Mutex{};
+
+    const TestHandler = struct {
+        count: *usize,
+        mutex: *std.Thread.Mutex,
+
+        pub fn onGossip(ptr: *anyopaque, msg: *const GossipMessage) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.count.* += 1;
+            _ = msg.getGossipTopic();
+        }
+    };
+
+    var test_handler = TestHandler{
+        .count = &received_count,
+        .mutex = &mutex,
+    };
+
+    const handler_cb = OnGossipCbHandler{
+        .ptr = &test_handler,
+        .onGossipFn = TestHandler.onGossip,
+    };
+
+    const topics = [_]GossipTopic{.lean_block};
+    try gossip_handler.subscribe(&topics, handler_cb);
+
+    // Create test messages
+    var test_blocks: [10]types.BeamBlock = undefined;
+    var gossip_msgs: [10]GossipMessage = undefined;
+
+    for (0..10) |i| {
+        test_blocks[i] = types.BeamBlock{
+            .message = .{
+                .slot = @intCast(i + 1),
+                .proposer_index = 0,
+                .parent_root = [_]u8{0} ** 32,
+                .state_root = [_]u8{0} ** 32,
+                .body_root = [_]u8{0} ** 32,
+            },
+            .signature = [_]u8{0} ** 96,
+        };
+        gossip_msgs[i] = GossipMessage{
+            .lean_block = test_blocks[i],
+        };
+    }
+
+    const WorkerThread = struct {
+        fn run(
+            gh: *GenericGossipHandler,
+            msgs: []const GossipMessage,
+            start: usize,
+            count: usize,
+        ) void {
+            for (start..start + count) |i| {
+                gh.onGossip(&msgs[i]) catch unreachable;
+            }
+        }
+    };
+
+    const num_threads = 4;
+    const msgs_per_thread = 2;
+    var threads: [num_threads]std.Thread = undefined;
+
+    // Spawn multiple worker threads
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(
+            .{},
+            WorkerThread.run,
+            .{
+                &gossip_handler,
+                gossip_msgs[0..],
+                i * msgs_per_thread,
+                msgs_per_thread,
+            },
+        );
+    }
+
+    // Wait for all threads to finish
+    for (threads) |thread| {
+        thread.join();
+    }
+
+    // Run the loop multiple times to process all scheduled work
+    var max_iterations: usize = 100;
+    const expected_count = num_threads * msgs_per_thread;
+
+    while (max_iterations > 0) : (max_iterations -= 1) {
+        try event_loop.run(.no_wait);
+
+        mutex.lock();
+        const current_count = received_count;
+        mutex.unlock();
+
+        if (current_count == expected_count) {
+            break;
+        }
+
+        std.time.sleep(1 * std.time.ns_per_ms);
+    }
+
+    // Verify all messages were processed
+    try std.testing.expectEqual(expected_count, received_count);
 }
