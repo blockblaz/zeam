@@ -186,6 +186,7 @@ pub fn main() !void {
             }
             event_loop.startAsyncNotifications();
             var clock = try Clock.init(gpa.allocator(), genesis, &event_loop);
+
             std.debug.print("clock {any}\n", .{clock});
 
             try clock.run();
@@ -261,15 +262,14 @@ pub fn main() !void {
             // behavior of this further needs to be investigated but for now we will share the same loop
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
-            defer {
-                loop.deinit();
-                allocator.destroy(loop);
-            }
             var event_loop = try zeam_utils.EventLoop.init(allocator, loop);
             defer {
                 event_loop.stop();
                 event_loop.deinit();
+                loop.deinit();
+                allocator.destroy(loop);
             }
+
             event_loop.startAsyncNotifications();
 
             try std.fs.cwd().makePath(beamcmd.data_dir);
