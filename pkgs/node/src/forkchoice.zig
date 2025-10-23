@@ -474,7 +474,7 @@ pub const ForkChoice = struct {
     pub fn updateHead(self: *Self) !ProtoBlock {
         self.head = try self.computeFCHead(true, 0);
         // Update the lean_head_slot metric
-        api.setLeanHeadSlot(self.head.slot);
+        api.metrics.lean_head_slot.set(self.head.slot);
         return self.head;
     }
 
