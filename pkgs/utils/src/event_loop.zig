@@ -14,10 +14,11 @@ pub const EventLoop = struct {
     loop: *xev.Loop,
     // events from libp2p or other threads will also be pushed on it
     mutex: Mutex,
-    async_notifier: xev.Async,
-    async_completion: xev.Completion,
+    event_handle: xev.Async,
+    event_completion: xev.Completion,
     pending_work: std.ArrayList(WorkItem),
-    stopping: std.atomic.Value(bool),
+    stop_handle: xev.Async,
+    stop_completion: xev.Completion,
 
     pub const WorkItem = struct {
         callback: *const fn (*anyopaque) anyerror!void,
@@ -25,66 +26,63 @@ pub const EventLoop = struct {
     };
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop) !Self {
-        var async_notifier = try xev.Async.init();
-        errdefer async_notifier.deinit();
+    pub fn init(allocator: Allocator) !Self {
+        const loop = try allocator.create(xev.Loop);
+        errdefer allocator.destroy(loop);
+
+        loop.* = try xev.Loop.init(.{});
+        errdefer loop.deinit();
+
+        var event_handle = try xev.Async.init();
+        errdefer event_handle.deinit();
+
+        var stop_handle = try xev.Async.init();
+        errdefer stop_handle.deinit();
 
         return Self{
             .allocator = allocator,
             .loop = loop,
             .mutex = Mutex{},
-            .async_notifier = async_notifier,
-            .async_completion = undefined,
+            .event_handle = event_handle,
+            .event_completion = undefined,
             .pending_work = std.ArrayList(WorkItem).init(allocator),
-            .stopping = std.atomic.Value(bool).init(false),
+            .stop_handle = stop_handle,
+            .stop_completion = undefined,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.async_notifier.deinit();
+        self.stop_handle.deinit();
+        self.event_handle.deinit();
         self.pending_work.deinit();
+
+        self.loop.deinit();
+        self.allocator.destroy(self.loop);
     }
 
-    /// Initiates graceful shutdown of the event loop.
-    /// This method signals the event loop to stop, sends a notification for pending work,
-    /// and attempts to process it immediately with a best-effort loop run.
-    /// Should be called before deinit().
-    pub fn stop(self: *Self) void {
-        // Signal that we're stopping - the next time the loop runs, it will disarm
-        self.stopping.store(true, .monotonic);
-
-        // Try to trigger a notification if there's pending work
-        self.mutex.lock();
-        const has_work = self.pending_work.items.len > 0;
-        self.mutex.unlock();
-
-        if (has_work) {
-            self.async_notifier.notify() catch |err| {
-                std.log.debug("EventLoop stop: notify failed: {any}", .{err});
-                return;
-            };
-
-            // Best-effort attempt to process pending work immediately
-            // Only run the loop if we successfully notified about pending work
-            // This may fail if the loop has active events (timers, etc.)
-            self.loop.run(.no_wait) catch |err| {
-                std.log.debug("EventLoop stop: immediate processing skipped (may be normal with active timers): {any}", .{err});
-            };
-        }
-    }
-
-    pub fn startAsyncNotifications(self: *Self) void {
-        self.async_notifier.wait(
+    /// Starts both event and stop handlers for the event loop.
+    pub fn startHandlers(self: *Self) void {
+        // Start event notifications for work items
+        self.event_handle.wait(
             self.loop,
-            &self.async_completion,
+            &self.event_completion,
             Self,
             self,
             // wait needs to be rearmed to keep listening for more notifs
-            onAsyncNotify,
+            onEventSignal,
+        );
+
+        // Start stop notifications to stop loop
+        self.stop_handle.wait(
+            self.loop,
+            &self.stop_completion,
+            Self,
+            self,
+            onStopSignal,
         );
     }
 
-    fn onAsyncNotify(
+    fn onEventSignal(
         userdata: ?*Self,
         _: *xev.Loop,
         _: *xev.Completion,
@@ -114,32 +112,35 @@ pub const EventLoop = struct {
             };
         }
 
-        // Check if we should stop accepting new notifications
-        if (self.stopping.load(.monotonic)) {
-            std.log.debug("EventLoop stopping - disarming async notifications", .{});
-            return .disarm;
-        }
-
         return .rearm;
+    }
+
+    fn onStopSignal(
+        userdata: ?*Self,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        result: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = result catch |err| {
+            std.log.err("EventLoop stop signal error: {any}", .{err});
+            return .disarm;
+        };
+
+        const self = userdata orelse return .disarm;
+
+        // Stop the event loop
+        self.loop.stop();
+
+        return .disarm;
     }
 
     // Thread-safe: call from any thread to schedule work on the event loop
     pub fn scheduleWork(self: *Self, work: WorkItem) !void {
-        // Check if we're shutting down before acquiring the lock
-        if (self.stopping.load(.monotonic)) {
-            return EventLoopError.ShuttingDown;
-        }
-
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Double-check after acquiring lock (stop() might have been called concurrently)
-        if (self.stopping.load(.monotonic)) {
-            return EventLoopError.ShuttingDown;
-        }
-
         try self.pending_work.append(work);
-        try self.async_notifier.notify();
+        try self.event_handle.notify();
     }
 
     pub fn run(self: *Self, optMode: ?xev.RunMode) !void {
@@ -147,13 +148,18 @@ pub const EventLoop = struct {
         // clock event should keep rearming itself and never run out
         try self.loop.run(mode);
     }
+
+    pub fn stop(self: *Self) void {
+        self.stop_handle.notify() catch |err| {
+            std.log.debug("EventLoop stop notification error: {any}", .{err});
+            // Fallback to direct stop if notification fails
+            self.loop.stop();
+        };
+    }
 };
 
 test "EventLoop: basic initialization and cleanup" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
@@ -163,16 +169,13 @@ test "EventLoop: basic initialization and cleanup" {
 }
 
 test "EventLoop: single thread work scheduling" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     // Test data
     var counter: usize = 0;
@@ -198,16 +201,13 @@ test "EventLoop: single thread work scheduling" {
 }
 
 test "EventLoop: multiple work items in sequence" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var counter: usize = 0;
     const test_callback = struct {
@@ -239,16 +239,13 @@ test "EventLoop: cross-thread work scheduling" {
         work_thread_id: *std.Thread.Id,
     };
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     // Shared state between threads
     var counter: usize = 0;
@@ -307,16 +304,13 @@ test "EventLoop: multiple threads scheduling work concurrently" {
         mutex: *std.Thread.Mutex,
     };
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var counter: usize = 0;
     var mutex = std.Thread.Mutex{};
@@ -383,16 +377,13 @@ test "EventLoop: multiple threads scheduling work concurrently" {
 }
 
 test "EventLoop: error handling in work callback" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var counter: usize = 0;
 
@@ -430,17 +421,14 @@ test "EventLoop: error handling in work callback" {
     try std.testing.expectEqual(@as(usize, 11), counter);
 }
 
-test "EventLoop: graceful shutdown and rejection of new work" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+test "EventLoop: graceful shutdown with async stop handler" {
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var counter: usize = 0;
 
@@ -463,36 +451,18 @@ test "EventLoop: graceful shutdown and rejection of new work" {
     // Verify the work was executed
     try std.testing.expectEqual(@as(usize, 1), counter);
 
-    // Now stop the event loop (this will process pending work and disarm)
+    // Now stop the event loop (this will notify the stop_handle)
     event_loop.stop();
-
-    // Try to schedule new work after stopping
-    const result = event_loop.scheduleWork(.{
-        .callback = test_callback,
-        .data = &counter,
-    });
-
-    // Should return ShuttingDown error
-    try std.testing.expectError(EventLoopError.ShuttingDown, result);
-
-    // Run the loop again - counter should NOT increase since loop is disarmed
-    try event_loop.run(.no_wait);
-
-    // Counter should still be 1 (no new work was processed)
-    try std.testing.expectEqual(@as(usize, 1), counter);
 }
 
 test "EventLoop: processes pending work during shutdown" {
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try EventLoop.init(std.testing.allocator, &loop);
+    var event_loop = try EventLoop.init(std.testing.allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var counter: usize = 0;
 
@@ -511,18 +481,14 @@ test "EventLoop: processes pending work during shutdown" {
         });
     }
 
-    // Stop the event loop (this will process all pending work)
-    event_loop.stop();
+    // Run the loop to process all work
+    try event_loop.run(.no_wait);
 
-    // All 5 work items should have been processed during stop()
+    // All 5 work items should have been processed
     try std.testing.expectEqual(@as(usize, 5), counter);
 
-    // Try to schedule more work - should fail
-    const result = event_loop.scheduleWork(.{
-        .callback = test_callback,
-        .data = &counter,
-    });
-    try std.testing.expectError(EventLoopError.ShuttingDown, result);
+    // Stop the event loop
+    event_loop.stop();
 
     // Counter should still be 5
     try std.testing.expectEqual(@as(usize, 5), counter);

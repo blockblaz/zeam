@@ -764,16 +764,13 @@ test LeanNetworkTopic {
 test "GenericGossipHandler: multiple threads scheduling gossip concurrently" {
     const allocator = std.testing.allocator;
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try zeam_utils.EventLoop.init(allocator, &loop);
+    var event_loop = try zeam_utils.EventLoop.init(allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
 
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var logger_config = zeam_utils.getTestLoggerConfig();
     var gossip_handler = try GenericGossipHandler.init(

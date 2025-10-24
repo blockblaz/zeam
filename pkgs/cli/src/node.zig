@@ -78,7 +78,6 @@ pub const NodeOptions = struct {
 /// A Node that encapsulates the networking, blockchain, and validator functionalities.
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
-    loop: *xev.Loop,
     event_loop: *zeam_utils.EventLoop,
     network: networks.EthLibp2p,
     beam_node: BeamNode,
@@ -117,18 +116,13 @@ pub const Node = struct {
         try anchorState.genGenesisState(allocator, chain_config.genesis);
         errdefer anchorState.deinit();
 
-        self.loop = try allocator.create(xev.Loop);
-        errdefer allocator.destroy(self.loop);
-        self.loop.* = try xev.Loop.init(.{});
-        errdefer self.loop.deinit();
-
         self.event_loop = try allocator.create(zeam_utils.EventLoop);
         errdefer allocator.destroy(self.event_loop);
-        self.event_loop.* = try zeam_utils.EventLoop.init(allocator, self.loop);
+        self.event_loop.* = try zeam_utils.EventLoop.init(allocator);
         errdefer self.event_loop.deinit();
 
         // Start listening for async notifications from other threads
-        self.event_loop.startAsyncNotifications();
+        self.event_loop.startHandlers();
 
         const addresses = try self.constructMultiaddrs();
 
@@ -174,8 +168,6 @@ pub const Node = struct {
         // Finally clean up the loop infrastructure
         self.event_loop.deinit();
         self.allocator.destroy(self.event_loop);
-        self.loop.deinit();
-        self.allocator.destroy(self.loop);
     }
 
     pub fn run(self: *Node) !void {

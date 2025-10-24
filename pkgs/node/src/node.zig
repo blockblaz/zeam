@@ -461,15 +461,12 @@ test "Node peer tracking on connect/disconnect" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var event_loop = try zeam_utils.EventLoop.init(allocator, &loop);
+    var event_loop = try zeam_utils.EventLoop.init(allocator);
     defer {
         event_loop.stop();
         event_loop.deinit();
     }
-    event_loop.startAsyncNotifications();
+    event_loop.startHandlers();
 
     var logger_config = zeam_utils.getTestLoggerConfig();
     var mock = try networks.Mock.init(allocator, &event_loop, logger_config.logger(.mock));

@@ -178,13 +178,12 @@ pub fn main() !void {
 
     switch (opts.args.__commands__) {
         .clock => {
-            var loop = try xev.Loop.init(.{});
-            var event_loop = try zeam_utils.EventLoop.init(gpa.allocator(), &loop);
+            var event_loop = try zeam_utils.EventLoop.init(gpa.allocator());
             defer {
                 event_loop.stop();
                 event_loop.deinit();
             }
-            event_loop.startAsyncNotifications();
+            event_loop.startHandlers();
             var clock = try Clock.init(gpa.allocator(), genesis, &event_loop);
 
             std.debug.print("clock {any}\n", .{clock});
@@ -257,20 +256,13 @@ pub fn main() !void {
             try anchorState.genGenesisState(gpa.allocator(), chain_config.genesis);
             defer anchorState.deinit();
 
-            // TODO we seem to be needing one loop because then the events added to loop are not being fired
-            // in the order to which they have been added even with the an appropriate delay added
-            // behavior of this further needs to be investigated but for now we will share the same loop
-            const loop = try allocator.create(xev.Loop);
-            loop.* = try xev.Loop.init(.{});
-            var event_loop = try zeam_utils.EventLoop.init(allocator, loop);
+            var event_loop = try zeam_utils.EventLoop.init(allocator);
             defer {
                 event_loop.stop();
                 event_loop.deinit();
-                loop.deinit();
-                allocator.destroy(loop);
             }
 
-            event_loop.startAsyncNotifications();
+            event_loop.startHandlers();
 
             try std.fs.cwd().makePath(beamcmd.data_dir);
 
