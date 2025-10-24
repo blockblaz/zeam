@@ -97,32 +97,10 @@ pub const BeamNode = struct {
             .block => |signed_block| {
                 const parent_root = signed_block.message.parent_root;
                 if (!self.chain.forkChoice.hasBlock(parent_root)) {
-                    const handler = self.getReqRespResponseHandler();
                     const roots = [_]types.Root{parent_root};
-                    const maybe_request = self.network.ensureBlocksByRootRequest(&roots, handler) catch |err| blk: {
-                        switch (err) {
-                            error.NoPeersAvailable => {
-                                self.logger.warn(
-                                    "No peers available to request {d} block(s) by root",
-                                    .{roots.len},
-                                );
-                            },
-                            else => {
-                                self.logger.warn(
-                                    "Failed to send blocks-by-root request to peer: {any}",
-                                    .{err},
-                                );
-                            },
-                        }
-                        break :blk null;
+                    self.fetchBlockByRoots(&roots) catch |err| {
+                        self.logger.warn("Failed to fetch block by root: {any}", .{err});
                     };
-
-                    if (maybe_request) |request_info| {
-                        self.logger.debug(
-                            "Requested {d} block(s) by root from peer {s}, request_id={d}",
-                            .{ roots.len, request_info.peer_id, request_info.request_id },
-                        );
-                    }
                 }
 
                 var block_root: types.Root = undefined;
@@ -156,11 +134,17 @@ pub const BeamNode = struct {
                 );
             }
 
-            self.chain.onBlock(block.*, .{}) catch |err| {
+            const missing_roots = self.chain.onBlock(block.*, .{}) catch |err| {
                 self.logger.warn(
                     "Failed to import block fetched via RPC 0x{s} from peer {s}: {any}",
                     .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id, err },
                 );
+                return;
+            };
+            defer self.allocator.free(missing_roots);
+
+            self.fetchBlockByRoots(missing_roots) catch |err| {
+                self.logger.warn("Failed to fetch {d} missing blocks(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
             self.logger.warn("Failed to compute block root from RPC response: {any}", .{err});
@@ -292,6 +276,51 @@ pub const BeamNode = struct {
         };
     }
 
+    fn fetchBlockByRoots(
+        self: *Self,
+        roots: []const types.Root,
+    ) !void {
+        if (roots.len == 0) return;
+
+        // Check if any of the requested blocks are missing
+        var missing_roots = std.ArrayList(types.Root).init(self.allocator);
+        defer missing_roots.deinit();
+
+        for (roots) |root| {
+            if (!self.chain.forkChoice.hasBlock(root)) {
+                try missing_roots.append(root);
+            }
+        }
+
+        if (missing_roots.items.len == 0) return;
+
+        const handler = self.getReqRespResponseHandler();
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, handler) catch |err| blk: {
+            switch (err) {
+                error.NoPeersAvailable => {
+                    self.logger.warn(
+                        "No peers available to request {d} block(s) by root",
+                        .{missing_roots.items.len},
+                    );
+                },
+                else => {
+                    self.logger.warn(
+                        "Failed to send blocks-by-root request to peer: {any}",
+                        .{err},
+                    );
+                },
+            }
+            break :blk null;
+        };
+
+        if (maybe_request) |request_info| {
+            self.logger.debug(
+                "Requested {d} block(s) by root from peer {s}, request_id={d}",
+                .{ missing_roots.items.len, request_info.peer_id, request_info.request_id },
+            );
+        }
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -410,10 +439,15 @@ pub const BeamNode = struct {
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (!hasBlock) {
-            try self.chain.onBlock(signed_block, .{
+            const missing_roots = try self.chain.onBlock(signed_block, .{
                 .postState = self.chain.states.get(block_root),
                 .blockRoot = block_root,
             });
+            defer self.allocator.free(missing_roots);
+
+            self.fetchBlockByRoots(missing_roots) catch |err| {
+                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+            };
         } else {
             self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
                 signed_block.message.slot,
