@@ -50,11 +50,11 @@ jobs:
 
     - name: Check Rust formatting
       run: |
-        cargo fmt --manifest-path rust/Cargo.toml -- --check
+        cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 
     - name: Run clippy on hosts
       run: |
-        cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
+        cargo clippy --manifest-path rust/Cargo.toml --workspace -- -D warnings
 
     - name: Lint
       run: zig fmt --check .
