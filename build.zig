@@ -19,14 +19,22 @@ const ProverChoice = enum { risc0, openvm, all };
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
-    if (prover == .risc0 or prover == .all) {
-        comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+    // Use profile-specific directories for single-prover builds
+    switch (prover) {
+        .risc0 => {
+            comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
+        },
+        .openvm => {
+            comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
+        },
+        .all => {
+            comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
     }
-    if (prover == .openvm or prover == .all) {
-        comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
-    }
-    // Always include libp2p
-    comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
     comp.linkLibC();
     comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
@@ -480,14 +488,15 @@ pub fn build(b: *Builder) !void {
 
 fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
     // Build only the selected prover crates
+    // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .risc0 => b.addSystemCommand(&.{
             "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "risc0-glue",
+            "build", "--profile", "risc0-release", "-p", "libp2p-glue", "-p", "risc0-glue",
         }),
         .openvm => b.addSystemCommand(&.{
             "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "openvm-glue",
+            "build", "--profile", "openvm-release", "-p", "libp2p-glue", "-p", "openvm-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
@@ -498,8 +507,8 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Weaken allocation symbols in built libraries to avoid duplicate symbol errors
     // Using wildcards (-w) to match symbols across different Rust versions
     const libs = switch (prover) {
-        .risc0 => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a",
-        .openvm => "rust/target/release/libopenvm_glue.a rust/target/release/liblibp2p_glue.a",
+        .risc0 => "rust/target/risc0-release/librisc0_glue.a rust/target/risc0-release/liblibp2p_glue.a",
+        .openvm => "rust/target/openvm-release/libopenvm_glue.a rust/target/openvm-release/liblibp2p_glue.a",
         .all => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a rust/target/release/libopenvm_glue.a",
     };
 
@@ -514,6 +523,9 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         \\      --weaken-symbol='*___rust_alloc_error_handler*' \
         \\      --weaken-symbol='*___rust_drop_panic' \
         \\      --weaken-symbol='*___rust_foreign_exception' \
+        \\      --weaken-symbol='rust_eh_personality' \
+        \\      --weaken-symbol='*ARGV_INIT_ARRAY*' \
+        \\      --weaken-symbol='*EMPTY_PANIC*' \
         \\      "$lib"; \
         \\  fi; \
         \\done
