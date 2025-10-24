@@ -315,7 +315,7 @@ pub const BeamChain = struct {
                             self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
                             return;
                         };
-                        self.allocator.free(missing_roots);
+                        defer self.allocator.free(missing_roots);
                     }
                 }
             },
