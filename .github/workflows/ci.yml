@@ -72,6 +72,20 @@ jobs:
       with:
         version: 0.14.1
 
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Install binutils (for objcopy)
+      run: |
+        if [ "${{ runner.os }}" == "Linux" ]; then
+          sudo apt-get update && sudo apt-get install -y binutils
+        elif [ "${{ runner.os }}" == "macOS" ]; then
+          brew install binutils
+          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
+        fi
+
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
@@ -79,6 +93,12 @@ jobs:
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
 
     - name: build
       run: zig build all
@@ -103,6 +123,15 @@ jobs:
       with:
         toolchain: nightly
         components: clippy, rustfmt
+
+    - name: Install binutils (for objcopy)
+      run: |
+        if [ "${{ runner.os }}" == "Linux" ]; then
+          sudo apt-get update && sudo apt-get install -y binutils
+        elif [ "${{ runner.os }}" == "macOS" ]; then
+          brew install binutils
+          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
+        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
@@ -135,6 +164,20 @@ jobs:
       with:
         version: 0.14.1
 
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Install binutils (for objcopy)
+      run: |
+        if [ "${{ runner.os }}" == "Linux" ]; then
+          sudo apt-get update && sudo apt-get install -y binutils
+        elif [ "${{ runner.os }}" == "macOS" ]; then
+          brew install binutils
+          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
+        fi
+
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
@@ -142,6 +185,12 @@ jobs:
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust/Cargo.lock') }}
 
     - name: Run all unit tests
       run: zig build test --summary all
