@@ -144,7 +144,7 @@ pub const BeamNode = struct {
             defer self.allocator.free(missing_roots);
 
             self.fetchBlockByRoots(missing_roots) catch |err| {
-                self.logger.warn("Failed to fetch {d} missing blocks(s): {any}", .{ missing_roots.len, err });
+                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
             self.logger.warn("Failed to compute block root from RPC response: {any}", .{err});
