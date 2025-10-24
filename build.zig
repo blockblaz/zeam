@@ -14,13 +14,17 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
-const ProverChoice = enum { risc0, openvm, all };
+const ProverChoice = enum { none, risc0, openvm, all };
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
     // Use profile-specific directories for single-prover builds
     switch (prover) {
+        .none => {
+            // Only include libp2p for networking, no prover libraries
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
@@ -52,9 +56,9 @@ pub fn build(b: *Builder) !void {
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
 
-    // Get prover choice (default to risc0)
-    const prover_option = b.option([]const u8, "prover", "Choose prover: risc0, openvm, or all (default: risc0)") orelse "risc0";
-    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .risc0;
+    // Get prover choice (default to none)
+    const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
+    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -490,6 +494,10 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Build only the selected prover crates
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
+        .none => b.addSystemCommand(&.{
+            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "build", "--release", "-p", "libp2p-glue",
+        }),
         .risc0 => b.addSystemCommand(&.{
             "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
             "build", "--profile", "risc0-release", "-p", "libp2p-glue", "-p", "risc0-glue",
@@ -507,6 +515,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Weaken allocation symbols in built libraries to avoid duplicate symbol errors
     // Using wildcards (-w) to match symbols across different Rust versions
     const libs = switch (prover) {
+        .none => "rust/target/release/liblibp2p_glue.a",
         .risc0 => "rust/target/risc0-release/librisc0_glue.a rust/target/risc0-release/liblibp2p_glue.a",
         .openvm => "rust/target/openvm-release/libopenvm_glue.a rust/target/openvm-release/liblibp2p_glue.a",
         .all => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a rust/target/release/libopenvm_glue.a",
