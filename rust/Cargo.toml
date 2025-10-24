@@ -13,3 +13,19 @@ default-members = ["libp2p-glue", "openvm-glue", "risc0-glue"]
 lto = false  # Set to true for single-prover builds to reduce binary size from 108MB to ~46MB
 strip = "symbols"
 codegen-units = 16  # Multiple units keep risc0 and openvm code separate
+
+# Optimized profile for OpenVM-only builds (maximum size reduction)
+[profile.openvm-release]
+inherits = "release"
+lto = true           # Enable LTO since no symbol conflicts with single prover
+opt-level = "z"      # Optimize for size instead of speed
+codegen-units = 1    # Better optimization (slower compilation)
+panic = "abort"      # Remove unwinding code for smaller binary
+
+# Optimized profile for RISC0-only builds (maximum size reduction)
+[profile.risc0-release]
+inherits = "release"
+lto = true           # Enable LTO since no symbol conflicts with single prover
+opt-level = "z"      # Optimize for size instead of speed
+codegen-units = 1    # Better optimization (slower compilation)
+panic = "abort"      # Remove unwinding code for smaller binary
