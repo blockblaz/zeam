@@ -98,7 +98,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: build
       run: zig build all
@@ -145,7 +145,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('rust/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build with all provers
       run: zig build -Dprover=all
@@ -190,7 +190,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run all unit tests
       run: zig build test --summary all
