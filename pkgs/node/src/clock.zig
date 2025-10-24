@@ -2,11 +2,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const xev = @import("xev");
-
 const constants = @import("./constants.zig");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
+
+const zeam_utils = @import("@zeam/utils");
+const EventLoop = zeam_utils.EventLoop;
 
 const CLOCK_DISPARITY_MS: isize = 100;
 
@@ -14,7 +16,7 @@ pub const Clock = struct {
     genesis_time_ms: isize,
     current_interval_time_ms: isize,
     current_interval: isize,
-    events: utils.EventLoop,
+    event_loop: *EventLoop,
     // track those who subscribed for on slot callbacks
     on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
 
@@ -25,9 +27,8 @@ pub const Clock = struct {
     pub fn init(
         allocator: Allocator,
         genesis_time: usize,
-        loop: *xev.Loop,
+        event_loop: *EventLoop,
     ) !Self {
-        const events = try utils.EventLoop.init(loop);
         const timer = try xev.Timer.init();
 
         const genesis_time_ms: isize = @intCast(genesis_time * std.time.ms_per_s);
@@ -38,7 +39,7 @@ pub const Clock = struct {
             .genesis_time_ms = genesis_time_ms,
             .current_interval_time_ms = current_interval_time_ms,
             .current_interval = current_interval,
-            .events = events,
+            .event_loop = event_loop,
             .timer = timer,
             .on_interval_cbs = std.ArrayList(*OnIntervalCbWrapper).init(allocator),
         };
@@ -67,7 +68,7 @@ pub const Clock = struct {
             cbWrapper.interval = self.current_interval + 1;
 
             self.timer.run(
-                self.events.loop,
+                self.event_loop.loop,
                 &cbWrapper.c,
                 time_to_next_interval_ms,
                 OnIntervalCbWrapper,
@@ -93,7 +94,6 @@ pub const Clock = struct {
     pub fn run(self: *Self) !void {
         while (true) {
             self.tickInterval();
-            try self.events.run(.until_done);
         }
     }
 
