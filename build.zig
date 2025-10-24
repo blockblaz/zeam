@@ -495,19 +495,21 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .none => b.addSystemCommand(&.{
-            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
             "build", "--release", "-p", "libp2p-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
-            "build", "--profile", "risc0-release", "-p", "libp2p-glue", "-p", "risc0-glue",
+            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
+            "risc0-glue",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
-            "build", "--profile", "openvm-release", "-p", "libp2p-glue", "-p", "openvm-glue",
+            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
+            "openvm-glue",
         }),
         .all => b.addSystemCommand(&.{
-            "cargo", "+nightly", "-C", path, "-Z", "unstable-options",
+            "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
             "build", "--release", "--all",
         }),
     };
