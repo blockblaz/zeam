@@ -63,7 +63,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     steps:
     - uses: actions/checkout@v2
 
@@ -84,6 +84,7 @@ jobs:
         elif [ "${{ runner.os }}" == "macOS" ]; then
           brew install binutils
           echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
+          ls $(brew --prefix)/opt/binutils/bin
         fi
 
     - name: Cache Zig packages
@@ -101,7 +102,22 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: build
-      run: zig build all
+      run: |
+        cargo +nightly -C rust -Z "unstable-options" build --release -p libp2p-glue
+        ls rust/target/release/liblibp2p_glue.a
+        if [ -f rust/target/release/liblibp2p_glue.a ]; then
+          echo "present"
+          uname -a
+          objcopy --version
+          objcopy rust/target/release/liblibp2p_glue.a copie.a || echo "simple objcopy failed"
+          objcopy -v rust/target/release/liblibp2p_glue.a copie.a || echo "simple objcopy with verbose failed"
+          which objcopy || echo "no objcopy"
+          which llvm-objcopy || echo "no llvm-objcopy"
+          objcopy -v -w --weaken-symbol='*___rust_alloc' rust/target/release/liblibp2p_glue.a || echo "weaken-symbol failed"
+        fi
+        echo $PATH
+        pwd
+        zig build all
 
   build-all-provers:
     name: build-all-provers
@@ -148,7 +164,8 @@ jobs:
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build with all provers
-      run: zig build -Dprover=all
+      run: |
+        zig build -Dprover=all
 
   test:
     name: test

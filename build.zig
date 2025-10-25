@@ -525,7 +525,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
 
     const weaken_cmd = b.fmt(
         \\for lib in {s}; do \
-        \\  if [ -f "$lib" ]; then \
+        \\  if [ -f "./$lib" ]; then \
         \\    objcopy -w \
         \\      --weaken-symbol='*___rust_alloc' \
         \\      --weaken-symbol='*___rust_dealloc' \
@@ -537,12 +537,15 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         \\      --weaken-symbol='rust_eh_personality' \
         \\      --weaken-symbol='*ARGV_INIT_ARRAY*' \
         \\      --weaken-symbol='*EMPTY_PANIC*' \
-        \\      "$lib"; \
+        \\      "./$lib"; \
         \\  fi; \
         \\done
     , .{libs});
 
+    const d1 = b.addSystemCommand(&.{ "sh", "-c", "pwd ; find / -name \"*p2p_glue.a\" 2>/dev/null" });
     const weaken_symbols = b.addSystemCommand(&.{ "sh", "-c", weaken_cmd });
+    d1.step.dependOn(&cargo_build.step);
+    weaken_symbols.step.dependOn(&d1.step);
     weaken_symbols.step.dependOn(&cargo_build.step);
 
     return weaken_symbols;
