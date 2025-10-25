@@ -266,7 +266,6 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    cli_exe.want_lto = true; // Enable LTO
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
@@ -514,38 +513,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         }),
     };
 
-    // Weaken allocation symbols in built libraries to avoid duplicate symbol errors
-    // Using wildcards (-w) to match symbols across different Rust versions
-    const libs = switch (prover) {
-        .none => "rust/target/release/liblibp2p_glue.a",
-        .risc0 => "rust/target/risc0-release/librisc0_glue.a rust/target/risc0-release/liblibp2p_glue.a",
-        .openvm => "rust/target/openvm-release/libopenvm_glue.a rust/target/openvm-release/liblibp2p_glue.a",
-        .all => "rust/target/release/librisc0_glue.a rust/target/release/liblibp2p_glue.a rust/target/release/libopenvm_glue.a",
-    };
-
-    const weaken_cmd = b.fmt(
-        \\for lib in {s}; do \
-        \\  if [ -f "$lib" ]; then \
-        \\    objcopy -w \
-        \\      --weaken-symbol='*___rust_alloc' \
-        \\      --weaken-symbol='*___rust_dealloc' \
-        \\      --weaken-symbol='*___rust_realloc' \
-        \\      --weaken-symbol='*___rust_alloc_zeroed' \
-        \\      --weaken-symbol='*___rust_alloc_error_handler*' \
-        \\      --weaken-symbol='*___rust_drop_panic' \
-        \\      --weaken-symbol='*___rust_foreign_exception' \
-        \\      --weaken-symbol='rust_eh_personality' \
-        \\      --weaken-symbol='*ARGV_INIT_ARRAY*' \
-        \\      --weaken-symbol='*EMPTY_PANIC*' \
-        \\      "$lib"; \
-        \\  fi; \
-        \\done
-    , .{libs});
-
-    const weaken_symbols = b.addSystemCommand(&.{ "sh", "-c", weaken_cmd });
-    weaken_symbols.step.dependOn(&cargo_build.step);
-
-    return weaken_symbols;
+    return cargo_build;
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {

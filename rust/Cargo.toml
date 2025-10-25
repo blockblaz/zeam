@@ -18,7 +18,7 @@ codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 # Optimized profile for OpenVM-only builds (maximum size reduction)
 [profile.openvm-release]
 inherits = "release"
-lto = true           # Enable LTO since no symbol conflicts with single prover
+lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
 opt-level = "z"      # Optimize for size instead of speed
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary
@@ -26,7 +26,7 @@ panic = "abort"      # Remove unwinding code for smaller binary
 # Optimized profile for RISC0-only builds (maximum size reduction)
 [profile.risc0-release]
 inherits = "release"
-lto = true           # Enable LTO since no symbol conflicts with single prover
+lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
 opt-level = "z"      # Optimize for size instead of speed
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary

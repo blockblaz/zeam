@@ -77,14 +77,6 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Install binutils (for objcopy)
-      run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          sudo apt-get update && sudo apt-get install -y binutils
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          brew install binutils
-          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
-        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
@@ -124,14 +116,6 @@ jobs:
         toolchain: nightly
         components: clippy, rustfmt
 
-    - name: Install binutils (for objcopy)
-      run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          sudo apt-get update && sudo apt-get install -y binutils
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          brew install binutils
-          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
-        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
@@ -169,14 +153,6 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Install binutils (for objcopy)
-      run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          sudo apt-get update && sudo apt-get install -y binutils
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          brew install binutils
-          echo "$(brew --prefix)/opt/binutils/bin" >> $GITHUB_PATH
-        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
