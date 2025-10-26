@@ -1,15 +1,17 @@
 const std = @import("std");
 const ssz = @import("ssz");
+
 const params = @import("@zeam/params");
 
-const Allocator = std.mem.Allocator;
-
 const block = @import("./block.zig");
-const bytesToHex = utils.BytesToHex;
-const json = std.json;
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
+
+const Allocator = std.mem.Allocator;
+
+const bytesToHex = utils.BytesToHex;
+const json = std.json;
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
 pub const ZkVm = enum {
@@ -45,7 +47,7 @@ pub const BeamSTFProof = struct {
 };
 
 pub const BeamSTFProverInput = struct {
-    block: block.SignedBeamBlock,
+    block: block.SignedBlockWithAttestations,
     state: state.BeamState,
 
     pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
@@ -103,16 +105,14 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var test_block = block.SignedBeamBlock{
+    var test_block = block.BlockWithAttestation{
         .message = .{
             .slot = 9,
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
             .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
             .body = .{
-                //
-                // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-                .attestations = try mini_3sf.SignedVotes.init(std.testing.allocator),
+                .attestations = try block.Attestations.init(std.testing.allocator),
             },
         },
         .signature = [_]u8{2} ** utils.SIGSIZE,

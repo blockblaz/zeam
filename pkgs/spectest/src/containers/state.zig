@@ -22,14 +22,14 @@ fn sampleBlockHeader() types.BeamBlockHeader {
     };
 }
 
-fn sampleCheckpoint() types.Mini3SFCheckpoint {
+fn sampleCheckpoint() types.Checkpoint {
     return .{
         .root = [_]u8{0} ** 32,
         .slot = 0,
     };
 }
 
-fn baseState(allocator: Allocator) types.BeamState {
+fn baseState(allocator: Allocator) !types.BeamState {
     return .{
         .config = sampleConfig(),
         .slot = 0,
@@ -38,14 +38,15 @@ fn baseState(allocator: Allocator) types.BeamState {
         .latest_finalized = sampleCheckpoint(),
         .historical_block_hashes = try types.HistoricalBlockHashes.init(allocator),
         .justified_slots = try types.JustifiedSlots.init(allocator),
-        .justifications_roots = try types.JustificationsRoots.init(allocator),
-        .justifications_validators = try types.JustificationsValidators.init(allocator),
+        .validators = try types.Validators.init(allocator),
+        .justifications_roots = try types.JustificationRoots.init(allocator),
+        .justifications_validators = try types.JustificationValidators.init(allocator),
     };
 }
 
 test "test_get_justifications_empty" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Sanity: State starts with no justifications data.
@@ -62,7 +63,7 @@ test "test_get_justifications_empty" {
 
 test "test_get_justifications_single_root" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Create a unique root under consideration.
@@ -106,7 +107,7 @@ test "test_get_justifications_single_root" {
 
 test "test_get_justifications_multiple_roots" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Three distinct roots to track.
@@ -183,7 +184,7 @@ test "test_get_justifications_multiple_roots" {
 
 test "test_with_justifications_invalid_length" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1 = [_]u8{1} ** 32;
@@ -202,7 +203,7 @@ test "test_with_justifications_invalid_length" {
 test "test_with_justifications_empty" {
     const allocator = std.testing.allocator;
 
-    var initial_state = baseState(allocator);
+    var initial_state = try baseState(allocator);
     defer initial_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -227,7 +228,7 @@ test "test_with_justifications_empty" {
 
 test "test_with_justifications_deterministic_order" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Two roots to test ordering
@@ -325,7 +326,7 @@ fn verifyRoundtrip(allocator: Allocator, base_state: *types.BeamState, original_
 
 test "test_justifications_roundtrip_empty" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Empty justifications map
@@ -337,7 +338,7 @@ test "test_justifications_roundtrip_empty" {
 
 test "test_justifications_roundtrip_single_root" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -354,7 +355,7 @@ test "test_justifications_roundtrip_single_root" {
 
 test "test_justifications_roundtrip_multiple_roots_sorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -378,7 +379,7 @@ test "test_justifications_roundtrip_multiple_roots_sorted" {
 
 test "test_justifications_roundtrip_multiple_roots_unsorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -402,7 +403,7 @@ test "test_justifications_roundtrip_multiple_roots_unsorted" {
 
 test "test_justifications_roundtrip_complex_unsorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -460,7 +461,7 @@ test "test_generate_genesis" {
 
     // Body root must commit to an empty body at genesis
     var expected_body = types.BeamBlockBody{
-        .attestations = try types.SignedVotes.init(allocator),
+        .attestations = try types.Attestations.init(allocator),
     };
     defer expected_body.deinit();
 

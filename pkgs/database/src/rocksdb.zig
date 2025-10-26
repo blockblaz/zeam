@@ -219,7 +219,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
                 block_root: types.Root,
-                block: types.SignedBeamBlock,
+                block: types.SignedBlockWithAttestations,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                     self.logger.err("Failed to format block key for putBlock: {any}", .{err});
@@ -228,7 +228,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer self.allocator.free(key);
 
                 self.putToBatch(
-                    types.SignedBeamBlock,
+                    types.SignedBlockWithAttestations,
                     key,
                     block,
                     cn,
@@ -260,20 +260,20 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 );
             }
 
-            /// Put a vote to this write batch
-            pub fn putVote(
+            /// Put a attestation to this write batch
+            pub fn putAttestation(
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
-                vote_key: []const u8,
-                vote: types.SignedVote,
+                attestation_key: []const u8,
+                attestation: types.SignedAttestation,
             ) void {
                 self.putToBatch(
-                    types.SignedVote,
-                    vote_key,
-                    vote,
+                    types.SignedAttestation,
+                    attestation_key,
+                    attestation,
                     cn,
-                    "Added vote to batch: key={s}",
-                    .{vote_key},
+                    "Added attestation to batch: key={s}",
+                    .{attestation_key},
                 );
             }
         };
@@ -397,7 +397,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a block to the database
-        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBeamBlock) void {
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestations) void {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
                 return;
@@ -405,7 +405,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             self.saveToDatabase(
-                types.SignedBeamBlock,
+                types.SignedBlockWithAttestations,
                 key,
                 block,
                 cn,
@@ -415,7 +415,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a block from the database
-        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBeamBlock {
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestations {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
                 return null;
@@ -423,7 +423,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             return self.loadFromDatabase(
-                types.SignedBeamBlock,
+                types.SignedBlockWithAttestations,
                 key,
                 cn,
                 "Loaded block from database: root=0x{s}",
@@ -466,26 +466,26 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             );
         }
 
-        /// Save a vote to the database
-        pub fn saveVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8, vote: types.SignedVote) void {
+        /// Save a attestation to the database
+        pub fn saveAttestation(self: *Self, comptime cn: ColumnNamespace, attestation_key: []const u8, attestation: types.SignedAttestation) void {
             self.saveToDatabase(
-                types.SignedVote,
-                vote_key,
-                vote,
+                types.SignedAttestation,
+                attestation_key,
+                attestation,
                 cn,
-                "Saved vote to database: key={s}",
-                .{vote_key},
+                "Saved attestation to database: key={s}",
+                .{attestation_key},
             );
         }
 
-        /// Load a vote from the database
-        pub fn loadVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8) ?types.SignedVote {
+        /// Load a attestation from the database
+        pub fn loadAttestation(self: *Self, comptime cn: ColumnNamespace, attestation_key: []const u8) ?types.SignedAttestation {
             return self.loadFromDatabase(
-                types.SignedVote,
-                vote_key,
+                types.SignedAttestation,
+                attestation_key,
                 cn,
-                "Loaded vote from database: key={s}",
-                .{vote_key},
+                "Loaded attestation from database: key={s}",
+                .{attestation_key},
             );
         }
 

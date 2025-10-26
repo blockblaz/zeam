@@ -1,7 +1,9 @@
 const std = @import("std");
 const ssz = @import("ssz");
+
 const params = @import("@zeam/params");
 
+const attestation = @import("./attestation.zig");
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
@@ -12,51 +14,59 @@ const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
 const Bytes4000 = utils.Bytes4000;
 const Root = utils.Root;
-const SignedVotes = mini_3sf.SignedVotes;
 const ZERO_HASH = utils.ZERO_HASH;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-// some p2p containers
-pub const BlockByRootRequest = struct {
-    roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
+// Types
+pub const Attestations = ssz.utils.List(attestation.SignedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
+pub const BlockSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
 
-    pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
+pub const BeamBlockBody = struct {
+    attestations: Attestations,
+
+    pub fn deinit(self: *BeamBlockBody) void {
+        self.attestations.deinit();
+    }
+
+    pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        var roots_array = json.Array.init(allocator);
-        for (self.roots.constSlice()) |root| {
-            try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
+
+        // Serialize attestations list
+        var attestations_array = json.Array.init(allocator);
+        for (self.attestations.constSlice()) |att| {
+            try attestations_array.append(try att.toJson(allocator));
         }
-        try obj.put("roots", json.Value{ .array = roots_array });
+        try obj.put("attestations", json.Value{ .array = attestations_array });
+
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const BeamBlockBody, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
 
-/// Canonical lightweight forkchoice proto block used across modules
-pub const ProtoBlock = struct {
+pub const BeamBlockHeader = struct {
     slot: Slot,
-    blockRoot: Root,
-    parentRoot: Root,
-    stateRoot: Root,
-    timeliness: bool,
+    proposer_index: ValidatorIndex,
+    parent_root: Bytes32,
+    state_root: Bytes32,
+    body_root: Bytes32,
 
-    pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
+    pub fn toJson(self: *const BeamBlockHeader, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
-        try obj.put("parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
-        try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
-        try obj.put("timeliness", json.Value{ .bool = self.timeliness });
+        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const ProtoBlock, allocator: Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const BeamBlockHeader, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
     }
@@ -72,7 +82,7 @@ pub const BeamBlock = struct {
     const Self = @This();
 
     pub fn genGenesisBlock(self: *Self, allocator: Allocator) !void {
-        const attestations = try SignedVotes.init(allocator);
+        const attestations = try Attestations.init(allocator);
         errdefer attestations.deinit();
 
         self.* = .{
@@ -81,8 +91,6 @@ pub const BeamBlock = struct {
             .parent_root = ZERO_HASH,
             .state_root = ZERO_HASH,
             .body = BeamBlockBody{
-                // .execution_payload_header = .{ .timestamp = 0 },
-                // 3sf mini votes
                 .attestations = attestations,
             },
         };
@@ -146,6 +154,108 @@ pub const BeamBlock = struct {
     }
 };
 
+pub const BlockWithAttestation = struct {
+    block: BeamBlock,
+    proposer_attestations: Attestations,
+
+    pub fn deinit(self: *BlockWithAttestation) void {
+        self.block.deinit();
+        self.proposer_attestations.deinit();
+    }
+
+    pub fn toJson(self: *const BlockWithAttestation, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("block", try self.block.toJson(allocator));
+
+        // Serialize proposer_attestations list
+        var attestations_array = json.Array.init(allocator);
+        for (self.proposer_attestations.constSlice()) |att| {
+            try attestations_array.append(try att.toJson(allocator));
+        }
+        try obj.put("proposer_attestations", json.Value{ .array = attestations_array });
+
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BlockWithAttestation, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+pub const SignedBlockWithAttestations = struct {
+    message: BlockWithAttestation,
+    signatures: BlockSignatures,
+
+    pub fn deinit(self: *SignedBlockWithAttestations) void {
+        self.message.deinit();
+        self.signatures.deinit();
+    }
+
+    pub fn toJson(self: *const SignedBlockWithAttestations, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("message", try self.message.toJson(allocator));
+
+        // Serialize signatures list as array of hex strings
+        var sig_array = json.Array.init(allocator);
+        for (self.signatures.constSlice()) |sig| {
+            try sig_array.append(json.Value{ .string = try bytesToHex(allocator, &sig) });
+        }
+        try obj.put("signatures", json.Value{ .array = sig_array });
+
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const SignedBlockWithAttestations, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+// some p2p containers
+pub const BlockByRootRequest = struct {
+    roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
+
+    pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        var roots_array = json.Array.init(allocator);
+        for (self.roots.constSlice()) |root| {
+            try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
+        }
+        try obj.put("roots", json.Value{ .array = roots_array });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+/// Canonical lightweight forkchoice proto block used across modules
+pub const ProtoBlock = struct {
+    slot: Slot,
+    blockRoot: Root,
+    parentRoot: Root,
+    stateRoot: Root,
+    timeliness: bool,
+
+    pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put("blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
+        try obj.put("parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
+        try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
+        try obj.put("timeliness", json.Value{ .bool = self.timeliness });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const ProtoBlock, allocator: Allocator) ![]const u8 {
+        const json_value = try self.toJson(allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
 // basic payload header for some sort of APS
 pub const ExecutionPayloadHeader = struct {
     timestamp: u64,
@@ -162,85 +272,8 @@ pub const ExecutionPayloadHeader = struct {
     }
 };
 
-pub const BeamBlockHeader = struct {
-    slot: Slot,
-    proposer_index: ValidatorIndex,
-    parent_root: Bytes32,
-    state_root: Bytes32,
-    body_root: Bytes32,
-
-    pub fn toJson(self: *const BeamBlockHeader, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
-        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
-        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
-        try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
-        return json.Value{ .object = obj };
-    }
-
-    pub fn toJsonString(self: *const BeamBlockHeader, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
-
-pub const BeamBlockBody = struct {
-    // some form of APS - to be activated later - disabled for PQ devnet0
-    // execution_payload_header: ExecutionPayloadHeader,
-
-    // mini 3sf simplified votes
-    attestations: SignedVotes,
-
-    pub fn deinit(self: *BeamBlockBody) void {
-        self.attestations.deinit();
-    }
-
-    pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-
-        // Serialize attestations list
-        var attestations_array = json.Array.init(allocator);
-        for (self.attestations.constSlice()) |attestation| {
-            try attestations_array.append(try attestation.toJson(allocator));
-        }
-        try obj.put("attestations", json.Value{ .array = attestations_array });
-
-        return json.Value{ .object = obj };
-    }
-
-    pub fn toJsonString(self: *const BeamBlockBody, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
-
-pub const SignedBeamBlock = struct {
-    message: BeamBlock,
-    // winternitz signature might be of different size depending on num chunks and chunk size
-    signature: Bytes4000,
-    pub fn deinit(self: *SignedBeamBlock) void {
-        // Deinit heap allocated ArrayLists
-        self.message.body.attestations.deinit();
-    }
-
-    pub fn toJson(self: *const SignedBeamBlock, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("message", try self.message.toJson(allocator));
-        try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
-        return json.Value{ .object = obj };
-    }
-
-    pub fn toJsonString(self: *const SignedBeamBlock, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
-
-pub const SignedBeamBlockList = ssz.utils.List(SignedBeamBlock, params.MAX_REQUEST_BLOCKS);
-
 test "ssz seralize/deserialize signed beam block" {
-    var signed_block = SignedBeamBlock{
+    var signed_block = SignedBlockWithAttestations{
         .message = .{
             .slot = 9,
             .proposer_index = 3,
@@ -249,21 +282,21 @@ test "ssz seralize/deserialize signed beam block" {
             .body = .{
                 //
                 // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-                .attestations = try SignedVotes.init(std.testing.allocator),
+                .attestations = try Attestations.init(std.testing.allocator),
             },
         },
         .signature = [_]u8{2} ** utils.SIGSIZE,
     };
     defer signed_block.deinit();
 
-    // check SignedBeamBlock serialization/deserialization
+    // check BlockWithAttestation serialization/deserialization
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
-    try ssz.serialize(SignedBeamBlock, signed_block, &serialized_signed_block);
+    try ssz.serialize(SignedBlockWithAttestations, signed_block, &serialized_signed_block);
     std.debug.print("\n\n\nserialized_signed_block ({d})", .{serialized_signed_block.items.len});
 
-    var deserialized_signed_block: SignedBeamBlock = undefined;
-    try ssz.deserialize(SignedBeamBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
+    var deserialized_signed_block: SignedBlockWithAttestations = undefined;
+    try ssz.deserialize(SignedBlockWithAttestations, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
 
     // try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.state_root, &deserialized_signed_block.message.state_root));
@@ -288,7 +321,7 @@ test "blockToLatestBlockHeader and blockToHeader" {
         .body = .{
             //
             // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-            .attestations = try SignedVotes.init(std.testing.allocator),
+            .attestations = try Attestations.init(std.testing.allocator),
         },
     };
     defer block.deinit();

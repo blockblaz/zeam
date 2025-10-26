@@ -174,15 +174,15 @@ pub const ForkChoiceStore = struct {
     time: types.Interval,
     timeSlots: types.Slot,
 
-    latest_justified: types.Mini3SFCheckpoint,
+    latest_justified: types.Checkpoint,
     // finalized is not tracked the same way in 3sf mini as it corresponds to head's finalized
     // however its unlikely that a finalized can be rolled back in a normal node operation
     // (for example a buggy chain has been finalized in which case node should be started with
     //  anchor of the new non buggy branch)
-    latest_finalized: types.Mini3SFCheckpoint,
+    latest_finalized: types.Checkpoint,
 
     const Self = @This();
-    pub fn update(self: *Self, justified: types.Mini3SFCheckpoint, finalized: types.Mini3SFCheckpoint) void {
+    pub fn update(self: *Self, justified: types.Checkpoint, finalized: types.Checkpoint) void {
         if (justified.slot > self.latest_justified.slot) {
             self.latest_justified = justified;
         }
@@ -199,7 +199,7 @@ const ProtoVote = struct {
     slot: types.Slot = 0,
     // we can construct proto votes from the anchor state justifications but will not exactly know
     // the votes
-    vote: ?types.SignedVote = null,
+    vote: ?types.SignedAttestation = null,
 };
 
 const VoteTracker = struct {
@@ -252,7 +252,7 @@ pub const ForkChoice = struct {
             .timeliness = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
-        const anchorCP = types.Mini3SFCheckpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
+        const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
             .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
             .timeSlots = opts.anchorState.slot,
@@ -354,7 +354,7 @@ pub const ForkChoice = struct {
         return self.updateHead();
     }
 
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Mini3SFCheckpoint {
+    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
@@ -365,14 +365,14 @@ pub const ForkChoice = struct {
         // wasn't registered or there have been new votes
         const head = try self.acceptNewVotes();
 
-        return types.Mini3SFCheckpoint{
+        return types.Checkpoint{
             .root = head.blockRoot,
             .slot = head.slot,
         };
     }
 
-    pub fn getProposalVotes(self: *Self) !types.SignedVotes {
-        var included_votes = try types.SignedVotes.init(self.allocator);
+    pub fn getProposalAttestations(self: *Self) !types.Attestations {
+        var included_attestations = try types.Attestations.init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
 
         // TODO naive strategy to include all votes that are consistent with the latest justified
@@ -384,15 +384,15 @@ pub const ForkChoice = struct {
                 .latestKnown orelse ProtoVote{}).vote;
 
             if (validator_vote) |signed_vote| {
-                if (std.mem.eql(u8, &latest_justified.root, &signed_vote.message.source.root)) {
-                    try included_votes.append(signed_vote);
+                if (std.mem.eql(u8, &latest_justified.root, &signed_vote.message.data.source.root)) {
+                    try included_attestations.append(signed_vote);
                 }
             }
         }
-        return included_votes;
+        return included_attestations;
     }
 
-    pub fn getVoteTarget(self: *Self) !types.Mini3SFCheckpoint {
+    pub fn getVoteTarget(self: *Self) !types.Checkpoint {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;
 
@@ -403,11 +403,11 @@ pub const ForkChoice = struct {
             }
         }
 
-        while (!try stf.is_justifiable_slot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
+        while (!try types.IsJustifiableSlot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
-        return types.Mini3SFCheckpoint{
+        return types.Checkpoint{
             .root = nodes[target_idx].blockRoot,
             .slot = nodes[target_idx].slot,
         };
@@ -484,44 +484,44 @@ pub const ForkChoice = struct {
         return self.safeTarget;
     }
 
-    pub fn onAttestation(self: *Self, signed_vote: types.SignedVote, is_from_block: bool) !void {
+    pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
         // vote has to be of an ancestor of the current slot
-        const validator_id = signed_vote.validator_id;
-        const vote = signed_vote.message;
+        const attestation = signed_attestation.message;
+        const validator_id = attestation.validator_id;
+        const attestation_slot = attestation.data.slot;
+
         // This get should never fail after validation, but we keep the check for safety
-        const new_head_index = self.protoArray.indices.get(vote.head.root) orelse return ForkChoiceError.InvalidAttestation;
+        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse return ForkChoiceError.InvalidAttestation;
 
         var vote_tracker = self.votes.get(validator_id) orelse VoteTracker{};
         // update latest known voted head of the validator if already included on chain
         if (is_from_block) {
             const vote_tracker_latest_known_slot = (vote_tracker.latestKnown orelse ProtoVote{}).slot;
-            if (vote.slot > vote_tracker_latest_known_slot) {
+            if (attestation_slot > vote_tracker_latest_known_slot) {
                 vote_tracker.latestKnown = .{
-                    //
                     .index = new_head_index,
-                    .slot = vote.slot,
-                    .vote = signed_vote,
+                    .slot = attestation_slot,
+                    .vote = signed_attestation,
                 };
             }
 
             // also clear out our latest new non included vote if this is even later than that
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
-            if (vote.slot > vote_tracker_latest_new_slot) {
+            if (attestation_slot >= vote_tracker_latest_new_slot) {
                 vote_tracker.latestNew = null;
             }
         } else {
-            if (vote.slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
+            if (attestation_slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
             // just update latest new voted head of the validator
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
-            if (vote.slot > vote_tracker_latest_new_slot) {
+            if (attestation_slot > vote_tracker_latest_new_slot) {
                 vote_tracker.latestNew = .{
-                    //
                     .index = new_head_index,
-                    .slot = vote.slot,
-                    .vote = signed_vote,
+                    .slot = attestation_slot,
+                    .vote = signed_attestation,
                 };
             }
         }
@@ -585,6 +585,19 @@ pub const ForkChoice = struct {
 
         return false;
     }
+
+    fn validateSignature(signature: types.Bytes4000) bool {
+        return signature == types.Bytes4000.ZERO_HASH;
+    }
+
+    fn validateSignatures(signatures: types.BlockSignatures) bool {
+        for (signatures.constSlice()) |signature| {
+            if (!validateSignature(signature)) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 const ForkChoiceError = error{
@@ -631,20 +644,21 @@ test "forkchoice block tree" {
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
-    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
-        const block = mock_chain.blocks[i];
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
         // shouldn't accept a future slot
-        const current_slot = block.message.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block.message, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+        const current_slot = block.slot;
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
 
         try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        _ = try fork_choice.onBlock(block.message, &beam_state, .{ .currentSlot = block.message.slot, .blockDelayMs = 0 });
+        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
 

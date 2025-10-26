@@ -282,8 +282,8 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     defer zigHandler.allocator.free(uncompressed_message);
     const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
-            var message_data: types.SignedBeamBlock = undefined;
-            ssz.deserialize(types.SignedBeamBlock, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+            var message_data: types.SignedBlockWithAttestations = undefined;
+            ssz.deserialize(types.SignedBlockWithAttestations, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
                 if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
                     zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
@@ -296,8 +296,8 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             break :blockmessage .{ .block = message_data };
         },
         .vote => votemessage: {
-            var message_data: types.SignedVote = undefined;
-            ssz.deserialize(types.SignedVote, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+            var message_data: types.SignedAttestation = undefined;
+            ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed vote message: {any}", .{e});
                 if (writeFailedBytes(uncompressed_message, "vote", zigHandler.allocator, null, zigHandler.logger)) |filename| {
                     zigHandler.logger.err("Vote deserialization failed - debug file created: {s}", .{filename});

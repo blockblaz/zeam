@@ -3,20 +3,20 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signature_fill: u8) !types.SignedBeamBlock {
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signature_fill: u8) !types.BlockWithAttestation {
     var test_block = types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,
         .parent_root = undefined,
         .state_root = undefined,
         .body = types.BeamBlockBody{
-            .attestations = try types.SignedVotes.init(allocator),
+            .attestations = try types.Attestations.init(allocator),
         },
     };
     @memset(&test_block.parent_root, parent_root_fill);
     @memset(&test_block.state_root, state_root_fill);
 
-    var signed_block = types.SignedBeamBlock{
+    var signed_block = types.BlockWithAttestation{
         .message = test_block,
         .signature = undefined,
     };
@@ -33,11 +33,11 @@ pub fn createDummyState(allocator: Allocator, slot: u64, num_validators: u64, ge
             .genesis_time = genesis_time,
         },
         .slot = slot,
-        .latest_justified = types.Mini3SFCheckpoint{
+        .latest_justified = types.Checkpoint{
             .slot = justified_slot,
             .root = undefined,
         },
-        .latest_finalized = types.Mini3SFCheckpoint{
+        .latest_finalized = types.Checkpoint{
             .slot = finalized_slot,
             .root = undefined,
         },

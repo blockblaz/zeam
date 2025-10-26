@@ -317,8 +317,8 @@ pub const Mock = struct {
         return switch (response.*) {
             .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
             .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBeamBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBeamBlock, block_resp, &cloned_block);
+                var cloned_block: types.SignedBlockWithAttestations = undefined;
+                try types.sszClone(self.allocator, types.SignedBlockWithAttestations, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
         };
@@ -602,7 +602,7 @@ test "Mock messaging across two subscribers" {
             .parent_root = [_]u8{1} ** 32,
             .state_root = [_]u8{2} ** 32,
             .body = .{
-                .attestations = try types.SignedVotes.init(allocator),
+                .attestations = try types.Attestations.init(allocator),
             },
         },
         .signature = [_]u8{3} ** types.SIGSIZE,
