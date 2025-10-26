@@ -60,6 +60,9 @@ pub fn build(b: *Builder) !void {
     const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
 
+    // LTO option (disabled by default for faster builds)
+    const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
+
     // add ssz
     const ssz = b.dependency("ssz", .{
         .target = target,
@@ -266,6 +269,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+
+    // Enable LTO if requested and on Linux (disabled by default for faster builds)
+    // Always disabled on macOS due to linker issues with Rust static libraries
+    // (LTO requires LLD but macOS uses its own linker by default)
+    if (enable_lto and target.result.os.tag == .linux) {
+        cli_exe.want_lto = true;
+    }
+
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
