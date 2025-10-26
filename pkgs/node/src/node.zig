@@ -15,7 +15,7 @@ const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
-pub const validators = @import("./validator.zig");
+pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
@@ -36,13 +36,13 @@ pub const BeamNode = struct {
     clock: *clockFactory.Clock,
     chain: *chainFactory.BeamChain,
     network: networkFactory.Network,
-    validator: ?validators.BeamValidator = null,
+    validator: ?validatorClient.ValidatorClient = null,
     nodeId: u32,
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
-        var validator: ?validators.BeamValidator = null;
+        var validator: ?validatorClient.ValidatorClient = null;
 
         var network = try networkFactory.Network.init(allocator, opts.backend);
         var network_init_cleanup = true;
@@ -67,7 +67,7 @@ pub const BeamNode = struct {
             allocator.destroy(chain);
         }
         if (opts.validator_ids) |ids| {
-            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
+            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
             chain.registerValidatorIds(ids);
         }
 
