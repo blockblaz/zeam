@@ -90,9 +90,12 @@ pub const ValidatorClient = struct {
             self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
+            // Construct proposer attestation for the produced block
+            const proposer_attestation = try self.chain.constructAttestation(.{ .slot = slot });
+
             const block_with_attestation = types.BlockWithAttestation{
                 .block = produced_block.block,
-                .proposer_attestations = try types.Attestations.init(self.allocator),
+                .proposer_attestation = proposer_attestation,
             };
             const signed_block = types.SignedBlockWithAttestations{
                 .message = block_with_attestation,

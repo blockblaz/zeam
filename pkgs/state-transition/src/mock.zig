@@ -66,7 +66,15 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     const gen_block_with_attestation = types.BlockWithAttestation{
         .block = genesis_block,
-        .proposer_attestations = try types.Attestations.init(allocator),
+        .proposer_attestation = types.Attestation{
+            .validator_id = 0,
+            .data = types.AttestationData{
+                .slot = 0,
+                .head = .{ .root = types.ZERO_HASH, .slot = 0 },
+                .target = .{ .root = types.ZERO_HASH, .slot = 0 },
+                .source = .{ .root = types.ZERO_HASH, .slot = 0 },
+            },
+        },
     };
     const gen_signed_block = types.SignedBlockWithAttestations{
         .message = gen_block_with_attestation,
@@ -279,13 +287,18 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // generate the signed beam block and add to block list
         const block_with_attestation = types.BlockWithAttestation{
             .block = block,
-            .proposer_attestations = blk: {
-                var attestations_list = try types.Attestations.init(allocator);
-                for (attestations.items) |attestation| {
-                    try attestations_list.append(attestation);
-                }
-                break :blk attestations_list;
-            },
+            .proposer_attestation = if (attestations.items.len > 0)
+                attestations.items[0].message
+            else
+                types.Attestation{
+                    .validator_id = 0,
+                    .data = types.AttestationData{
+                        .slot = slot,
+                        .head = .{ .root = parent_root, .slot = slot },
+                        .target = .{ .root = parent_root, .slot = slot },
+                        .source = latest_justified,
+                    },
+                },
         };
         const signed_block = types.SignedBlockWithAttestations{
             .message = block_with_attestation,

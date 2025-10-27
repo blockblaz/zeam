@@ -9,6 +9,7 @@ const state = @import("./state.zig");
 const utils = @import("./utils.zig");
 
 const Allocator = std.mem.Allocator;
+const Attestation = attestation.Attestation;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
@@ -156,11 +157,10 @@ pub const BeamBlock = struct {
 
 pub const BlockWithAttestation = struct {
     block: BeamBlock,
-    proposer_attestations: Attestations,
+    proposer_attestation: Attestation,
 
     pub fn deinit(self: *BlockWithAttestation) void {
         self.block.deinit();
-        self.proposer_attestations.deinit();
     }
 
     pub fn toJson(self: *const BlockWithAttestation, allocator: Allocator) !json.Value {
@@ -169,10 +169,8 @@ pub const BlockWithAttestation = struct {
 
         // Serialize proposer_attestations list
         var attestations_array = json.Array.init(allocator);
-        for (self.proposer_attestations.constSlice()) |att| {
-            try attestations_array.append(try att.toJson(allocator));
-        }
-        try obj.put("proposer_attestations", json.Value{ .array = attestations_array });
+        try attestations_array.append(try self.proposer_attestation.toJson(allocator));
+        try obj.put("proposer_attestation", json.Value{ .array = attestations_array });
 
         return json.Value{ .object = obj };
     }

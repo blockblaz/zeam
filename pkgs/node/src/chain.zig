@@ -323,23 +323,23 @@ pub const BeamChain = struct {
                     }
                 }
             },
-            .vote => |signed_vote| {
-                const signed_vote_json = try signed_vote.toJson(self.allocator);
+            .vote => |signed_attestation| {
+                const signed_attestation_json = try signed_attestation.toJson(self.allocator);
 
                 // Convert JSON value to string for proper logging
-                const signed_vote_str = try jsonToString(self.allocator, signed_vote_json);
-                defer self.allocator.free(signed_vote_str);
+                const signed_attestation_str = try jsonToString(self.allocator, signed_attestation_json);
+                defer self.allocator.free(signed_attestation_str);
 
-                self.module_logger.debug("chain received vote onGossip cb: {s}", .{signed_vote_str});
+                self.module_logger.debug("chain received vote onGossip cb: {s}", .{signed_attestation_str});
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_vote.message, false) catch |err| {
+                self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.debug("Gossip attestation validation failed: {any}", .{err});
                     return; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
-                self.onAttestation(signed_vote) catch |err| {
+                self.onAttestation(signed_attestation) catch |err| {
                     self.module_logger.debug("Attestation processing error: {any}", .{err});
                 };
             },
@@ -395,16 +395,16 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
         });
-        for (block.body.attestations.constSlice()) |signed_vote| {
+        for (block.body.attestations.constSlice()) |signed_attestation| {
             // Validate attestation before processing (from block = true)
-            self.validateAttestation(signed_vote.message, true) catch |e| {
-                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ signed_vote.message.validator_id, e });
+            self.validateAttestation(signed_attestation.message, true) catch |e| {
+                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ signed_attestation.message.validator_id, e });
                 // Skip invalid attestations but continue processing the block
                 continue;
             };
 
-            self.forkChoice.onAttestation(signed_vote, true) catch |e| {
-                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+            self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
             };
         }
 
@@ -412,7 +412,17 @@ pub const BeamChain = struct {
         const new_head = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
 
-        // 6. Emit new head event via SSE (use forkchoice ProtoBlock directly)
+        // 6. proposer attestation
+        // const proposer_signature = signatures[len(block.body.attestatoins)];
+        const signed_proposer_attestation = types.SignedAttestation{
+            .message = signedBlock.message.proposer_attestation,
+            .signature = types.ZERO_HASH_4000,
+        };
+        self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
+            self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
+        };
+
+        // 7. Emit new head event via SSE (use forkchoice ProtoBlock directly)
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
@@ -423,7 +433,7 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        // 7. Emit justification/finalization events based on forkchoice store
+        // 8. Emit justification/finalization events based on forkchoice store
         const store = self.forkChoice.fcStore;
         const latest_justified = store.latest_justified;
         const latest_finalized = store.latest_finalized;
@@ -456,7 +466,7 @@ pub const BeamChain = struct {
             }
         }
 
-        // 8. Save block and state to database
+        // 9. Save block and state to database
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 

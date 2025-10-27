@@ -381,8 +381,8 @@ pub const BeamNode = struct {
                                 return e;
                             };
                         },
-                        .vote => |signed_vote| {
-                            self.publishAttestation(signed_vote) catch |e| {
+                        .vote => |signed_attestation| {
+                            self.publishAttestation(signed_attestation) catch |e| {
                                 self.logger.err("Error publishing vote from validator: err={any}", .{e});
                                 return e;
                             };

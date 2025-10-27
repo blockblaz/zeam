@@ -383,9 +383,9 @@ pub const ForkChoice = struct {
                 //
                 .latestKnown orelse ProtoVote{}).vote;
 
-            if (validator_vote) |signed_vote| {
-                if (std.mem.eql(u8, &latest_justified.root, &signed_vote.message.data.source.root)) {
-                    try included_attestations.append(signed_vote);
+            if (validator_vote) |signed_attestation| {
+                if (std.mem.eql(u8, &latest_justified.root, &signed_attestation.message.data.source.root)) {
+                    try included_attestations.append(signed_attestation);
                 }
             }
         }
