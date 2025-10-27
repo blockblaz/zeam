@@ -314,7 +314,6 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -541,7 +540,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z",           "unstable-options",
-            "build", "--release", "--all", "-p", "hashsig-glue",
+            "build", "--release", "--all",
         }),
     };
 
