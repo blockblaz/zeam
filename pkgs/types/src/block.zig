@@ -166,11 +166,7 @@ pub const BlockWithAttestation = struct {
     pub fn toJson(self: *const BlockWithAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("block", try self.block.toJson(allocator));
-
-        // Serialize proposer_attestations list
-        var attestations_array = json.Array.init(allocator);
-        try attestations_array.append(try self.proposer_attestation.toJson(allocator));
-        try obj.put("proposer_attestation", json.Value{ .array = attestations_array });
+        try obj.put("proposer_attestation", try self.proposer_attestation.toJson(allocator));
 
         return json.Value{ .object = obj };
     }
@@ -273,17 +269,37 @@ pub const ExecutionPayloadHeader = struct {
 test "ssz seralize/deserialize signed beam block" {
     var signed_block = SignedBlockWithAttestations{
         .message = .{
-            .slot = 9,
-            .proposer_index = 3,
-            .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
-            .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{
-                //
-                // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-                .attestations = try Attestations.init(std.testing.allocator),
+            .block = .{
+                .slot = 9,
+                .proposer_index = 3,
+                .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
+                .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
+                .body = .{
+                    //
+                    // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
+                    .attestations = try Attestations.init(std.testing.allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 3,
+                .data = .{
+                    .slot = 9,
+                    .head = .{
+                        .slot = 9,
+                        .root = [_]u8{1} ** 32,
+                    },
+                    .source = .{
+                        .slot = 0,
+                        .root = [_]u8{0} ** 32,
+                    },
+                    .target = .{
+                        .slot = 9,
+                        .root = [_]u8{1} ** 32,
+                    },
+                },
             },
         },
-        .signature = [_]u8{2} ** utils.SIGSIZE,
+        .signatures = try BlockSignatures.init(std.testing.allocator),
     };
     defer signed_block.deinit();
 
@@ -297,14 +313,14 @@ test "ssz seralize/deserialize signed beam block" {
     try ssz.deserialize(SignedBlockWithAttestations, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
 
     // try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
-    try std.testing.expect(std.mem.eql(u8, &signed_block.message.state_root, &deserialized_signed_block.message.state_root));
-    try std.testing.expect(std.mem.eql(u8, &signed_block.message.parent_root, &deserialized_signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &signed_block.message.block.state_root, &deserialized_signed_block.message.block.state_root));
+    try std.testing.expect(std.mem.eql(u8, &signed_block.message.block.parent_root, &deserialized_signed_block.message.block.parent_root));
 
     // successful merklization
     var block_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(
         BeamBlock,
-        signed_block.message,
+        signed_block.message.block,
         &block_root,
         std.testing.allocator,
     );

@@ -18,7 +18,7 @@ const json = std.json;
 
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
-pub const AggregatedSignatures = ssz.utils.List(Bytes4000, params.ATTESTATION_AGGREGATION_LIMIT);
+pub const AggregatedSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const AttestationData = struct {
     slot: Slot,

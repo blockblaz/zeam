@@ -12,7 +12,7 @@ pub const BlockSignatures = block.BlockSignatures;
 
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;
-pub const AggregatedSignature = attestation.AggregatedSignature;
+pub const AggregatedSignatures = attestation.AggregatedSignatures;
 pub const AttestationData = attestation.AttestationData;
 pub const Attestation = attestation.Attestation;
 pub const SignedAttestation = attestation.SignedAttestation;
@@ -33,8 +33,6 @@ pub const Validators = validator.Validators;
 
 const mini_3sf = @import("./mini_3sf.zig");
 pub const Checkpoint = mini_3sf.Checkpoint;
-pub const Mini3SFVote = mini_3sf.Mini3SFVote;
-pub const Mini3SFVotes = mini_3sf.Mini3SFVotes;
 pub const Status = mini_3sf.Status;
 
 const utils = @import("./utils.zig");
@@ -62,3 +60,11 @@ const zk = @import("./zk.zig");
 pub const ZkVm = zk.ZkVm;
 pub const BeamSTFProof = zk.BeamSTFProof;
 pub const BeamSTFProverInput = zk.BeamSTFProverInput;
+
+// TODO: use refAllDeclsRecursive instead of refAllDecls
+// Avoids refAllDeclsRecursive as ssz lists tests fail
+// SignedAttestation and Validator both have byte array fields
+// sszlibrary should use std.meta.eql instead of std.mem.eql for struct types
+test "get tests" {
+    @import("std").testing.refAllDecls(@This());
+}

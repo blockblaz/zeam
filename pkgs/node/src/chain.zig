@@ -413,7 +413,7 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 6. proposer attestation
-        // const proposer_signature = signatures[len(block.body.attestatoins)];
+        // const proposer_signature = signatures[len(block.body.attestations)];
         const signed_proposer_attestation = types.SignedAttestation{
             .message = signedBlock.message.proposer_attestation,
             .signature = types.ZERO_HASH_4000,

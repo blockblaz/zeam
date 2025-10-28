@@ -510,7 +510,7 @@ pub const ForkChoice = struct {
 
             // also clear out our latest new non included vote if this is even later than that
             const vote_tracker_latest_new_slot = (vote_tracker.latestNew orelse ProtoVote{}).slot;
-            if (attestation_slot >= vote_tracker_latest_new_slot) {
+            if (attestation_slot > vote_tracker_latest_new_slot) {
                 vote_tracker.latestNew = null;
             }
         } else {
@@ -584,19 +584,6 @@ pub const ForkChoice = struct {
         }
 
         return false;
-    }
-
-    fn validateSignature(signature: types.Bytes4000) bool {
-        return signature == types.Bytes4000.ZERO_HASH;
-    }
-
-    fn validateSignatures(signatures: types.BlockSignatures) bool {
-        for (signatures.constSlice()) |signature| {
-            if (!validateSignature(signature)) {
-                return false;
-            }
-        }
-        return true;
     }
 };
 

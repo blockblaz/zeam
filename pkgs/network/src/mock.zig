@@ -597,15 +597,35 @@ test "Mock messaging across two subscribers" {
     defer allocator.destroy(block_message);
     block_message.* = .{ .block = .{
         .message = .{
-            .slot = 1,
-            .proposer_index = 0,
-            .parent_root = [_]u8{1} ** 32,
-            .state_root = [_]u8{2} ** 32,
-            .body = .{
-                .attestations = try types.Attestations.init(allocator),
+            .block = .{
+                .slot = 1,
+                .proposer_index = 0,
+                .parent_root = [_]u8{1} ** 32,
+                .state_root = [_]u8{2} ** 32,
+                .body = .{
+                    .attestations = try types.Attestations.init(allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 1,
+                    .head = .{
+                        .slot = 1,
+                        .root = [_]u8{1} ** 32,
+                    },
+                    .source = .{
+                        .slot = 0,
+                        .root = [_]u8{0} ** 32,
+                    },
+                    .target = .{
+                        .slot = 1,
+                        .root = [_]u8{1} ** 32,
+                    },
+                },
             },
         },
-        .signature = [_]u8{3} ** types.SIGSIZE,
+        .signatures = try types.BlockSignatures.init(allocator),
     } };
 
     // Publish the message using the network interface - both subscribers should receive it
@@ -630,11 +650,10 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(received2 == .block);
 
     // Verify the block content is identical
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
-    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
-    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &received1.block.signature, &received2.block.signature));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.parent_root, &received2.block.message.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.state_root, &received2.block.message.block.state_root));
+    try std.testing.expect(received1.block.message.block.slot == received2.block.message.block.slot);
+    try std.testing.expect(received1.block.message.block.proposer_index == received2.block.message.block.proposer_index);
 }
 
 test "Mock status RPC between peers" {

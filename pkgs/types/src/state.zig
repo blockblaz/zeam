@@ -358,8 +358,8 @@ pub const BeamState = struct {
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
             //
-            // ceilDiv is not available so this seems like a less compute intesive way without
-            // requring floar division, can be further optimized
+            // ceilDiv is not available so this seems like a less compute intensive way without
+            // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
                 self.latest_justified = vote.target;
                 try self.justified_slots.set(target_slot, true);
@@ -515,7 +515,7 @@ test "ssz seralize/deserialize signed beam state" {
         // mini3sf
         .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
         .latest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
-        .historical_block_hashes = try utils.HistoricalBlockHashes.init(std.testing.allocator),
+        .historical_block_hashes = try HistoricalBlockHashes.init(std.testing.allocator),
         .justified_slots = try JustifiedSlots.init(std.testing.allocator),
         .validators = try Validators.init(std.testing.allocator),
         .justifications_roots = blk: {
