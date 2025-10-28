@@ -14,9 +14,31 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
+const ProverChoice = enum { none, risc0, openvm, all };
+
 // Add the glue libs to a compile target
-fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
-    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
+    // Conditionally include prover libraries based on selection
+    // Use profile-specific directories for single-prover builds
+    switch (prover) {
+        .none => {
+            // Only include libp2p for networking, no prover libraries
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
+        .risc0 => {
+            comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
+        },
+        .openvm => {
+            comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
+        },
+        .all => {
+            comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
+    }
     comp.linkLibC();
     comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
     // Add macOS framework linking for CLI tests
@@ -33,6 +55,13 @@ pub fn build(b: *Builder) !void {
 
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
+
+    // Get prover choice (default to none)
+    const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
+    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
+
+    // LTO option (disabled by default for faster builds)
+    const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -90,6 +119,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
+
+    // Create build options early so modules can use them
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+    build_options.addOption([]const u8, "prover", @tagName(prover));
+    build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
+    build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    const build_options_module = build_options.createModule();
 
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
@@ -161,6 +198,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_proving_manager.addImport("@zeam/utils", zeam_utils);
     zeam_state_proving_manager.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_state_proving_manager.addImport("ssz", ssz);
+    zeam_state_proving_manager.addImport("build_options", build_options_module);
 
     const st_lib = b.addStaticLibrary(.{
         .name = "zeam-state-transition",
@@ -224,11 +262,6 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
 
-    // Create build options
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", git_version);
-    const build_options_module = build_options.createModule();
-
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
@@ -236,6 +269,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+
+    // Enable LTO if requested and on Linux (disabled by default for faster builds)
+    // Always disabled on macOS due to linker issues with Rust static libraries
+    // (LTO requires LLD but macOS uses its own linker by default)
+    if (enable_lto and target.result.os.tag == .linux) {
+        cli_exe.want_lto = true;
+    }
+
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
@@ -256,7 +297,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
 
-    addRustGlueLib(b, cli_exe, target);
+    addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
 
@@ -264,7 +305,7 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-    var zkvm_host_cmd = build_rust_project(b, "rust");
+    var zkvm_host_cmd = build_rust_project(b, "rust", prover);
     cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
@@ -349,7 +390,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
-    addRustGlueLib(b, manager_tests, target);
+    addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
@@ -358,7 +399,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    addRustGlueLib(b, node_tests, target);
+    addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -368,7 +409,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
-    addRustGlueLib(b, cli_tests, target);
+    addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -388,7 +429,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
-    addRustGlueLib(b, network_tests, target);
+    addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
@@ -459,17 +500,31 @@ pub fn build(b: *Builder) !void {
     spectests_step.dependOn(&run_spectests.step);
 }
 
-fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
-    return b.addSystemCommand(&.{
-        "cargo",
-        "+nightly",
-        "-C",
-        path,
-        "-Z",
-        "unstable-options",
-        "build",
-        "--release",
-    });
+fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
+    // Build only the selected prover crates
+    // Use optimized profiles for single-prover builds to reduce binary size
+    const cargo_build = switch (prover) {
+        .none => b.addSystemCommand(&.{
+            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
+            "build", "--release", "-p", "libp2p-glue",
+        }),
+        .risc0 => b.addSystemCommand(&.{
+            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
+            "risc0-glue",
+        }),
+        .openvm => b.addSystemCommand(&.{
+            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
+            "openvm-glue",
+        }),
+        .all => b.addSystemCommand(&.{
+            "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
+            "build", "--release", "--all",
+        }),
+    };
+
+    return cargo_build;
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {

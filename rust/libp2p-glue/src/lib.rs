@@ -1,3 +1,5 @@
+pub mod req_resp;
+
 use futures::future::Either;
 use futures::Stream;
 use futures::StreamExt;
