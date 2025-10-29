@@ -314,7 +314,6 @@ pub fn build(b: *Builder) !void {
 
     try build_zkvm_targets(b, &cli_exe.step, target);
 
-
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
     prover_step.dependOn(&run_prover.step);
@@ -539,7 +538,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
             "openvm-glue", "-p",        "hashsig-glue",
         }),
         .all => b.addSystemCommand(&.{
-            "cargo", "+nightly",  "-C",    path, "-Z",           "unstable-options",
+            "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
             "build", "--release", "--all",
         }),
     };

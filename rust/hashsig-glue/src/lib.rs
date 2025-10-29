@@ -99,8 +99,10 @@ impl Signature {
 
 /// Generate a new key pair
 /// Returns a pointer to the KeyPair or null on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
 #[no_mangle]
-pub extern "C" fn hashsig_keypair_generate(
+pub unsafe extern "C" fn hashsig_keypair_generate(
     seed_phrase: *const c_char,
     activation_epoch: usize,
     num_active_epochs: usize,
@@ -127,8 +129,10 @@ pub extern "C" fn hashsig_keypair_generate(
 }
 
 /// Free a key pair
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
 #[no_mangle]
-pub extern "C" fn hashsig_keypair_free(keypair: *mut KeyPair) {
+pub unsafe extern "C" fn hashsig_keypair_free(keypair: *mut KeyPair) {
     if !keypair.is_null() {
         unsafe {
             let _ = Box::from_raw(keypair);
@@ -138,8 +142,10 @@ pub extern "C" fn hashsig_keypair_free(keypair: *mut KeyPair) {
 
 /// Sign a message
 /// Returns pointer to Signature on success, null on error
+/// # Safety
+/// This is meant to be called from zig, so it's safe as the pointer will always exist
 #[no_mangle]
-pub extern "C" fn hashsig_sign(
+pub unsafe extern "C" fn hashsig_sign(
     keypair: *const KeyPair,
     message_ptr: *const u8,
     epoch: u32,
@@ -173,8 +179,10 @@ pub extern "C" fn hashsig_sign(
 }
 
 /// Free a signature
+/// # Safety
+/// This is meant to be called from zig, so it's safe as the pointer will always exist
 #[no_mangle]
-pub extern "C" fn hashsig_signature_free(signature: *mut Signature) {
+pub unsafe extern "C" fn hashsig_signature_free(signature: *mut Signature) {
     if !signature.is_null() {
         unsafe {
             let _ = Box::from_raw(signature);
@@ -184,8 +192,10 @@ pub extern "C" fn hashsig_signature_free(signature: *mut Signature) {
 
 /// Verify a signature
 /// Returns 1 if valid, 0 if invalid, -1 on error
+/// # Safety
+/// This is meant to be called from zig, so it's safe as the pointer will always exist
 #[no_mangle]
-pub extern "C" fn hashsig_verify(
+pub unsafe extern "C" fn hashsig_verify(
     keypair: *const KeyPair,
     message_ptr: *const u8,
     epoch: u32,
@@ -216,6 +226,8 @@ pub extern "C" fn hashsig_verify(
 }
 
 /// Get the message length constant
+/// # Safety
+/// This is meant to be called from zig, so it's safe as the pointer will always exist
 #[no_mangle]
 pub extern "C" fn hashsig_message_length() -> usize {
     MESSAGE_LENGTH
