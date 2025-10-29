@@ -465,15 +465,17 @@ pub const BeamChain = struct {
     }
 
     /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, batch: *database.Db.WriteBatch, signedBlock: types.SignedBeamBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalized_slot: types.Slot) !void {
+    fn updateBlockDb(self: *Self, batch: *database.Db.WriteBatch, signedBlock: types.SignedBeamBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
         // Store block and state
         batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // Update slot indices
-        if (slot <= finalized_slot) {
+        if (slot <= finalizedSlot) {
             // Add to finalized slot index
-            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockRoot);
+            if (self.forkChoice.isFinalizedDescendant(blockRoot)) {
+                batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockRoot);
+            }
         } else {
             // Add to unfinalized slot index
             const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
@@ -490,8 +492,8 @@ pub const BeamChain = struct {
         }
 
         // Handle cleanup when new finalization occurs
-        if (finalized_slot > self.last_emitted_finalized_slot) {
-            try self.cleanupSlotIndicesOnFinalization(batch, self.last_emitted_finalized_slot + 1, finalized_slot);
+        if (finalizedSlot > self.last_emitted_finalized_slot) {
+            try self.cleanupSlotIndicesOnFinalization(batch, self.last_emitted_finalized_slot + 1, finalizedSlot);
         }
     }
 
@@ -504,7 +506,7 @@ pub const BeamChain = struct {
 
             // Find the canonical block (on the finalized chain)
             for (unfinalized_blockroots) |blockroot| {
-                if (self.isBlockOnCanonicalChain(blockroot)) {
+                if (self.forkChoice.isFinalizedDescendant(blockroot)) {
                     batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockroot);
                     break;
                 }
@@ -513,11 +515,6 @@ pub const BeamChain = struct {
             // Remove from unfinalized index
             batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
         }
-    }
-
-    /// Check if a block is on the canonical chain
-    fn isBlockOnCanonicalChain(self: *Self, blockroot: types.Root) bool {
-        return self.forkChoice.hasBlock(blockroot);
     }
 
     /// get finalized block at slot

@@ -284,7 +284,7 @@ pub const ForkChoice = struct {
         return true;
     }
 
-    fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
+    pub fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
         const finalized_slot = self.fcStore.latest_finalized.slot;
         const finalized_root = self.fcStore.latest_finalized.root;
 
