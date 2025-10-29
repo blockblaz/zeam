@@ -18,25 +18,24 @@ const ProverChoice = enum { none, risc0, openvm, all };
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
+    comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+    comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+
     // Conditionally include prover libraries based on selection
     // Use profile-specific directories for single-prover builds
     switch (prover) {
         .none => {
             // Only include libp2p for networking, no prover libraries
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
-            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
-            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
     comp.linkLibC();
@@ -59,6 +58,8 @@ pub fn build(b: *Builder) !void {
     // Get prover choice (default to none)
     const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
+
+    const zkvm_host_cmd = build_rust_project(b, "rust", prover);
 
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
@@ -219,6 +220,13 @@ pub fn build(b: *Builder) !void {
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
+    });
+
     // add network
     const zeam_network = b.addModule("@zeam/network", .{
         .target = target,
@@ -297,6 +305,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
 
+    cli_exe.step.dependOn(&zkvm_host_cmd.step);
     addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
@@ -304,9 +313,6 @@ pub fn build(b: *Builder) !void {
     b.installArtifact(cli_exe);
 
     try build_zkvm_targets(b, &cli_exe.step, target);
-
-    var zkvm_host_cmd = build_rust_project(b, "rust", prover);
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -409,6 +415,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
+    cli_tests.step.dependOn(&zkvm_host_cmd.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -461,6 +468,18 @@ pub fn build(b: *Builder) !void {
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
 
+    const xmss_tests = b.addTest(.{
+        .root_module = zeam_xmss,
+        .optimize = optimize,
+        .target = target,
+    });
+
+    // xmss_tests.step.dependOn(&networking_build.step);
+    xmss_tests.step.dependOn(&zkvm_host_cmd.step);
+    addRustGlueLib(b, xmss_tests, target, prover);
+    const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    test_step.dependOn(&run_xmss_tests.step);
+
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
         .optimize = optimize,
@@ -506,17 +525,17 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     const cargo_build = switch (prover) {
         .none => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue",
+            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
             "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
             "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
-            "risc0-glue",
+            "risc0-glue", "-p",        "hashsig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
             "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
             "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
-            "openvm-glue",
+            "openvm-glue", "-p",        "hashsig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
