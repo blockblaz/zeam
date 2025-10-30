@@ -12,7 +12,7 @@ default-members = ["libp2p-glue", "openvm-glue", "risc0-glue", "hashsig-glue"]
 # LTO (Link Time Optimization) is disabled to avoid symbol conflicts between risc0 and openvm.
 # Both define the same runtime symbols (like sys_alloc_aligned) which collide when LTO merges
 # all code into a single module. Re-enable LTO if building separate binaries for each prover.
-lto = true # Set to true for single-prover builds to reduce binary size from 108MB to ~46MB
+lto = false  # Set to true for single-prover builds to reduce binary size from 108MB to ~46MB
 strip = "symbols"
 codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 
