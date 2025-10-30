@@ -5,6 +5,7 @@ const types = @import("@zeam/types");
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const Allocator = std.mem.Allocator;
 const debugLog = zeam_utils.zeamLog;
@@ -41,16 +42,21 @@ fn process_slot(allocator: Allocator, state: *types.BeamState) !void {
 }
 
 // prepare the state to be pre state of the slot
-fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger) !void {
+fn process_slots(allocator: Allocator, state: *types.BeamState, slot: types.Slot, logger: zeam_utils.ModuleLogger, opts: StateTransitionOpts) !void {
+    _ = opts;
     if (slot <= state.slot) {
         logger.err("Invalid block slot={d} >= pre-state slot={d}\n", .{ slot, state.slot });
         return StateTransitionError.InvalidPreState;
     }
 
+    const timer = zeam_metrics.lean_state_transition_slots_processing_time_seconds.start();
+
     while (state.slot < slot) {
         try process_slot(allocator, state);
         state.slot += 1;
     }
+
+    _ = timer.observe();
 }
 
 pub fn is_justifiable_slot(finalized: types.Slot, candidate: types.Slot) !bool {
@@ -82,12 +88,15 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+fn process_operations(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger, opts: StateTransitionOpts) !void {
     // 1. process attestations
-    try process_attestations(allocator, state, block.body.attestations, logger);
+    try process_attestations(allocator, state, block.body.attestations, logger, opts);
 }
 
-fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger) !void {
+fn process_attestations(allocator: Allocator, state: *types.BeamState, attestations: types.SignedVotes, logger: zeam_utils.ModuleLogger, opts: StateTransitionOpts) !void {
+    _ = opts;
+    const timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
+
     logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ state.slot, state.historical_block_hashes.len(), state.justified_slots.len(), attestations.constSlice().len });
     const justified_str = try state.latest_justified.toJsonString(allocator);
     defer allocator.free(justified_str);
@@ -227,22 +236,28 @@ fn process_attestations(allocator: Allocator, state: *types.BeamState, attestati
     defer allocator.free(finalized_str_final);
 
     logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+
+    _ = timer.observe();
 }
 
-fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+fn process_block(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, logger: zeam_utils.ModuleLogger, opts: StateTransitionOpts) !void {
+    const timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
+
     // start block processing
     try state.process_block_header(allocator, block, logger);
     // PQ devner-0 has no execution
     // try process_execution_payload_header(state, block);
-    try process_operations(allocator, state, block, logger);
+    try process_operations(allocator, state, block, logger, opts);
+
+    _ = timer.observe();
 }
 
-pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger, opts: StateTransitionOpts) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
-    try process_slots(allocator, state, block.slot, logger);
+    try process_slots(allocator, state, block.slot, logger, opts);
 
     // process block and modify the pre state to post state
-    try process_block(allocator, state, block.*, logger);
+    try process_block(allocator, state, block.*, logger, opts);
 
     logger.debug("extracting state root\n", .{});
     // extract the post state root
@@ -268,9 +283,9 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, signedBlo
     }
 
     // prepare the pre state for this block slot
-    try process_slots(allocator, state, block.slot, opts.logger);
+    try process_slots(allocator, state, block.slot, opts.logger, opts);
     // process the block
-    try process_block(allocator, state, block, opts.logger);
+    try process_block(allocator, state, block, opts.logger, opts);
 
     const validateResult = opts.validateResult;
     if (validateResult) {
