@@ -149,7 +149,7 @@ pub const GossipTopic = enum {
 };
 
 pub const GossipMessage = union(GossipTopic) {
-    block: types.SignedBlockWithAttestations,
+    block: types.SignedBlockWithAttestation,
     vote: types.SignedAttestation,
 
     const Self = @This();
@@ -183,7 +183,7 @@ pub const GossipMessage = union(GossipTopic) {
         switch (self.*) {
             .block => {
                 cloned_data.* = .{ .block = undefined };
-                try types.sszClone(allocator, types.SignedBlockWithAttestations, self.block, &cloned_data.block);
+                try types.sszClone(allocator, types.SignedBlockWithAttestation, self.block, &cloned_data.block);
             },
             .vote => {
                 cloned_data.* = .{ .vote = undefined };
@@ -319,7 +319,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 };
 pub const ReqRespResponse = union(LeanSupportedProtocol) {
-    blocks_by_root: types.SignedBlockWithAttestations,
+    blocks_by_root: types.SignedBlockWithAttestation,
     status: types.Status,
 
     const Self = @This();

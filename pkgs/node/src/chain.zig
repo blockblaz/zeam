@@ -349,7 +349,7 @@ pub const BeamChain = struct {
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
-    pub fn onBlock(self: *Self, signedBlock: types.SignedBlockWithAttestations, blockInfo: CachedProcessedBlockInfo) !void {
+    pub fn onBlock(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockInfo: CachedProcessedBlockInfo) !void {
         const onblock_timer = api.chain_onblock_duration_seconds.start();
 
         const block = signedBlock.message.block;
@@ -395,13 +395,17 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
         });
-        for (block.body.attestations.constSlice()) |signed_attestation| {
+
+        const signatures = signedBlock.signature.constSlice();
+        for (block.body.attestations.constSlice(), 0..) |attestation, index| {
             // Validate attestation before processing (from block = true)
-            self.validateAttestation(signed_attestation.message, true) catch |e| {
-                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ signed_attestation.message.validator_id, e });
+            self.validateAttestation(attestation, true) catch |e| {
+                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ attestation.validator_id, e });
                 // Skip invalid attestations but continue processing the block
                 continue;
             };
+
+            const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
 
             self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
                 self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
@@ -413,10 +417,10 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 6. proposer attestation
-        // const proposer_signature = signatures[len(block.body.attestations)];
+        const proposer_signature = signatures[block.body.attestations.len()];
         const signed_proposer_attestation = types.SignedAttestation{
             .message = signedBlock.message.proposer_attestation,
-            .signature = types.ZERO_HASH_4000,
+            .signature = proposer_signature,
         };
         self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });

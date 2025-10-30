@@ -317,8 +317,8 @@ pub const Mock = struct {
         return switch (response.*) {
             .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
             .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBlockWithAttestations = undefined;
-                try types.sszClone(self.allocator, types.SignedBlockWithAttestations, block_resp, &cloned_block);
+                var cloned_block: types.SignedBlockWithAttestation = undefined;
+                try types.sszClone(self.allocator, types.SignedBlockWithAttestation, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
         };
@@ -593,6 +593,8 @@ test "Mock messaging across two subscribers" {
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
+    var attestations = try types.Attestations.init(allocator);
+
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
     block_message.* = .{ .block = .{
@@ -603,7 +605,7 @@ test "Mock messaging across two subscribers" {
                 .parent_root = [_]u8{1} ** 32,
                 .state_root = [_]u8{2} ** 32,
                 .body = .{
-                    .attestations = try types.Attestations.init(allocator),
+                    .attestations = attestations,
                 },
             },
             .proposer_attestation = .{
@@ -625,7 +627,7 @@ test "Mock messaging across two subscribers" {
                 },
             },
         },
-        .signatures = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, attestations.len()),
     } };
 
     // Publish the message using the network interface - both subscribers should receive it

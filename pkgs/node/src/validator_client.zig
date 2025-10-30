@@ -27,7 +27,7 @@ pub const ValidatorClientOutput = struct {
         self.gossip_messages.deinit();
     }
 
-    pub fn addBlock(self: *Self, signed_block: types.SignedBlockWithAttestations) !void {
+    pub fn addBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.gossip_messages.append(gossip_msg);
     }
@@ -97,9 +97,10 @@ pub const ValidatorClient = struct {
                 .block = produced_block.block,
                 .proposer_attestation = proposer_attestation,
             };
-            const signed_block = types.SignedBlockWithAttestations{
+
+            const signed_block = types.SignedBlockWithAttestation{
                 .message = block_with_attestation,
-                .signatures = try types.BlockSignatures.init(self.allocator),
+                .signature = try types.createBlockSignatures(self.allocator, produced_block.block.body.attestations.len()),
             };
 
             const signed_block_json = try signed_block.toJson(self.allocator);

@@ -385,7 +385,7 @@ pub const ForkChoice = struct {
 
             if (validator_vote) |signed_attestation| {
                 if (std.mem.eql(u8, &latest_justified.root, &signed_attestation.message.data.source.root)) {
-                    try included_attestations.append(signed_attestation);
+                    try included_attestations.append(signed_attestation.message);
                 }
             }
         }

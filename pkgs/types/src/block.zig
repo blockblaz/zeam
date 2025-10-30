@@ -21,7 +21,7 @@ const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
 // Types
-pub const Attestations = ssz.utils.List(attestation.SignedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
+pub const Attestations = ssz.utils.List(attestation.Attestation, params.VALIDATOR_REGISTRY_LIMIT);
 pub const BlockSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const BeamBlockBody = struct {
@@ -177,22 +177,22 @@ pub const BlockWithAttestation = struct {
     }
 };
 
-pub const SignedBlockWithAttestations = struct {
+pub const SignedBlockWithAttestation = struct {
     message: BlockWithAttestation,
-    signatures: BlockSignatures,
+    signature: BlockSignatures,
 
-    pub fn deinit(self: *SignedBlockWithAttestations) void {
+    pub fn deinit(self: *SignedBlockWithAttestation) void {
         self.message.deinit();
-        self.signatures.deinit();
+        self.signature.deinit();
     }
 
-    pub fn toJson(self: *const SignedBlockWithAttestations, allocator: Allocator) !json.Value {
+    pub fn toJson(self: *const SignedBlockWithAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("message", try self.message.toJson(allocator));
 
         // Serialize signatures list as array of hex strings
         var sig_array = json.Array.init(allocator);
-        for (self.signatures.constSlice()) |sig| {
+        for (self.signature.constSlice()) |sig| {
             try sig_array.append(json.Value{ .string = try bytesToHex(allocator, &sig) });
         }
         try obj.put("signatures", json.Value{ .array = sig_array });
@@ -200,11 +200,21 @@ pub const SignedBlockWithAttestations = struct {
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const SignedBlockWithAttestations, allocator: Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const SignedBlockWithAttestation, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
+
+// Creates a BlockSignatures list with zero signatures for all attestations plus the proposer attestation
+pub fn createBlockSignatures(allocator: Allocator, num_attestations: usize) !BlockSignatures {
+    var signatures = try BlockSignatures.init(allocator);
+    // +1 for proposer attestation
+    for (0..(num_attestations + 1)) |_| {
+        try signatures.append(utils.ZERO_HASH_4000);
+    }
+    return signatures;
+}
 
 // some p2p containers
 pub const BlockByRootRequest = struct {
@@ -267,7 +277,9 @@ pub const ExecutionPayloadHeader = struct {
 };
 
 test "ssz seralize/deserialize signed beam block" {
-    var signed_block = SignedBlockWithAttestations{
+    var attestations = try Attestations.init(std.testing.allocator);
+
+    var signed_block = SignedBlockWithAttestation{
         .message = .{
             .block = .{
                 .slot = 9,
@@ -277,7 +289,7 @@ test "ssz seralize/deserialize signed beam block" {
                 .body = .{
                     //
                     // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-                    .attestations = try Attestations.init(std.testing.allocator),
+                    .attestations = attestations,
                 },
             },
             .proposer_attestation = .{
@@ -299,18 +311,19 @@ test "ssz seralize/deserialize signed beam block" {
                 },
             },
         },
-        .signatures = try BlockSignatures.init(std.testing.allocator),
+        .signature = try createBlockSignatures(std.testing.allocator, attestations.len()),
     };
     defer signed_block.deinit();
 
     // check BlockWithAttestation serialization/deserialization
     var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_signed_block.deinit();
-    try ssz.serialize(SignedBlockWithAttestations, signed_block, &serialized_signed_block);
+    try ssz.serialize(SignedBlockWithAttestation, signed_block, &serialized_signed_block);
     std.debug.print("\n\n\nserialized_signed_block ({d})", .{serialized_signed_block.items.len});
 
-    var deserialized_signed_block: SignedBlockWithAttestations = undefined;
-    try ssz.deserialize(SignedBlockWithAttestations, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
+    var deserialized_signed_block: SignedBlockWithAttestation = undefined;
+    try ssz.deserialize(SignedBlockWithAttestation, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
+    defer deserialized_signed_block.deinit();
 
     // try std.testing.expect(signed_block.message.body.execution_payload_header.timestamp == deserialized_signed_block.message.body.execution_payload_header.timestamp);
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.block.state_root, &deserialized_signed_block.message.block.state_root));

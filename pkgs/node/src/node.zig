@@ -145,7 +145,7 @@ pub const BeamNode = struct {
         };
     }
 
-    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestations) void {
+    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) void {
         var block_root: types.Root = undefined;
         if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const removed = self.network.removePendingBlockRoot(block_root);
@@ -264,7 +264,7 @@ pub const BeamNode = struct {
                         defer signed_block.deinit();
 
                         var response = networks.ReqRespResponse{ .blocks_by_root = undefined };
-                        try types.sszClone(self.allocator, types.SignedBlockWithAttestations, signed_block, &response.blocks_by_root);
+                        try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &response.blocks_by_root);
                         defer response.deinit();
 
                         try responder.sendResponse(&response);
@@ -393,7 +393,7 @@ pub const BeamNode = struct {
         }
     }
 
-    pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestations) !void {
+    pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         // 1. publish gossip message
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.network.publish(&gossip_msg);

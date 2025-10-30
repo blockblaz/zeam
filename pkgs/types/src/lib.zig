@@ -6,9 +6,10 @@ pub const ExecutionPayloadHeader = block.ExecutionPayloadHeader;
 pub const BeamBlockHeader = block.BeamBlockHeader;
 pub const BeamBlockBody = block.BeamBlockBody;
 pub const BlockWithAttestation = block.BlockWithAttestation;
-pub const SignedBlockWithAttestations = block.SignedBlockWithAttestations;
+pub const SignedBlockWithAttestation = block.SignedBlockWithAttestation;
 pub const Attestations = block.Attestations;
 pub const BlockSignatures = block.BlockSignatures;
+pub const createBlockSignatures = block.createBlockSignatures;
 
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;

@@ -282,8 +282,8 @@ pub const BeamState = struct {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.config.num_validators);
         for (attestations.constSlice()) |attestation| {
-            const validator_id: usize = @intCast(attestation.message.validator_id);
-            const vote = attestation.message.data;
+            const validator_id: usize = @intCast(attestation.validator_id);
+            const vote = attestation.data;
             // check if vote is sane
             const source_slot: usize = @intCast(vote.source.slot);
             const target_slot: usize = @intCast(vote.target.slot);

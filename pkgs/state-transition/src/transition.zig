@@ -49,7 +49,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
 }
 
 // fill this up when we have signature scheme
-pub fn verify_signatures(signedBlock: types.SignedBlockWithAttestations) !void {
+pub fn verify_signatures(signedBlock: types.SignedBlockWithAttestation) !void {
     _ = signedBlock;
 }
 

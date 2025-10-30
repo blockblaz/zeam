@@ -76,7 +76,7 @@ functional and testable as well as add unit, end to end as well as E2E tests run
 1. `pkgs/state-transition`
 
  ```zig
-  pub fn apply_transition(state: types.BeamState, block: types.BlockWithAttestation, .{}) !void
+  pub fn apply_transition(state: types.BeamState, block: types.BeamBlock, .{}) !void
  ```
 
 - Implements/verifies the basic state transistion in zig
@@ -102,7 +102,7 @@ the state transition
 3. `pkgs/state-proving-manager`
 
  ```zig
-   pub fn execute_transition(state: types.BeamState, block: types.BlockWithAttestation, opts: ZKStateTransitionOpts) types.BeamSTFProof
+   pub fn execute_transition(state: types.BeamState, block: types.BeamBlock, opts: ZKStateTransitionOpts) types.BeamSTFProof
 ```
 
 - invoked to prove a block against a pre state

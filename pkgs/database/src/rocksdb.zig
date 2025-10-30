@@ -219,7 +219,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
                 block_root: types.Root,
-                block: types.SignedBlockWithAttestations,
+                block: types.SignedBlockWithAttestation,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                     self.logger.err("Failed to format block key for putBlock: {any}", .{err});
@@ -228,7 +228,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer self.allocator.free(key);
 
                 self.putToBatch(
-                    types.SignedBlockWithAttestations,
+                    types.SignedBlockWithAttestation,
                     key,
                     block,
                     cn,
@@ -397,7 +397,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a block to the database
-        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestations) void {
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
                 return;
@@ -405,7 +405,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             self.saveToDatabase(
-                types.SignedBlockWithAttestations,
+                types.SignedBlockWithAttestation,
                 key,
                 block,
                 cn,
@@ -415,7 +415,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a block from the database
-        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestations {
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
                 return null;
@@ -423,7 +423,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             return self.loadFromDatabase(
-                types.SignedBlockWithAttestations,
+                types.SignedBlockWithAttestation,
                 key,
                 cn,
                 "Loaded block from database: root=0x{s}",
@@ -856,9 +856,9 @@ test "save and load block" {
     try std.testing.expect(loaded.block.body.attestations.len() == 0);
 
     // Verify signatures match
-    try std.testing.expect(loaded_block.?.signatures.len() == 2);
-    const loaded_sig1 = try loaded_block.?.signatures.get(0);
-    const loaded_sig2 = try loaded_block.?.signatures.get(1);
+    try std.testing.expect(loaded_block.?.signature.len() == 2);
+    const loaded_sig1 = try loaded_block.?.signature.get(0);
+    const loaded_sig2 = try loaded_block.?.signature.get(1);
     try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
     try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
 
@@ -978,10 +978,10 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
 
     // Verify signatures match
-    try std.testing.expect(loaded_block.?.signatures.len() == 3);
-    const loaded_sig1 = try loaded_block.?.signatures.get(0);
-    const loaded_sig2 = try loaded_block.?.signatures.get(1);
-    const loaded_sig3 = try loaded_block.?.signatures.get(2);
+    try std.testing.expect(loaded_block.?.signature.len() == 3);
+    const loaded_sig1 = try loaded_block.?.signature.get(0);
+    const loaded_sig2 = try loaded_block.?.signature.get(1);
+    const loaded_sig3 = try loaded_block.?.signature.get(2);
     try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
     try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
     try std.testing.expect(std.mem.eql(u8, &loaded_sig3, &test_sig3));

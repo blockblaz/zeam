@@ -11,7 +11,7 @@ const transition = @import("./transition.zig");
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
-    blocks: []types.SignedBlockWithAttestations,
+    blocks: []types.SignedBlockWithAttestation,
     blockRoots: []types.Root,
     // what should be justified and finalzied post each of these blocks
     latestJustified: []types.Checkpoint,
@@ -45,7 +45,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var genesis_state: types.BeamState = undefined;
     try genesis_state.genGenesisState(allocator, genesis_config);
     errdefer genesis_state.deinit();
-    var blockList = std.ArrayList(types.SignedBlockWithAttestations).init(allocator);
+    var blockList = std.ArrayList(types.SignedBlockWithAttestation).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
 
     var justificationCPList = std.ArrayList(types.Checkpoint).init(allocator);
@@ -76,9 +76,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             },
         },
     };
-    const gen_signed_block = types.SignedBlockWithAttestations{
+
+    const gen_signed_block = types.SignedBlockWithAttestation{
         .message = gen_block_with_attestation,
-        .signatures = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, genesis_block.body.attestations.len()),
     };
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
@@ -115,7 +116,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         const state_root: [32]u8 = types.ZERO_HASH;
         // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
-        var attestations = std.ArrayList(types.SignedAttestation).init(allocator);
+        var attestations = std.ArrayList(types.Attestation).init(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
             // no votes on the first block of this
@@ -123,47 +124,38 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 head_idx = slot;
             },
             2 => {
-                const slotAttestations = [_]types.SignedAttestation{
+                const slotAttestations = [_]types.Attestation{
                     // val 0
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 0,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 0,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                     // skip val1
                     // val2
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 2,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 2,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 3,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 3,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
 
@@ -177,49 +169,40 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             3 => {
-                const slotAttestations = [_]types.SignedAttestation{
+                const slotAttestations = [_]types.Attestation{
                     // skip val0
 
                     // val 1
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 1,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 1,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val2
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 2,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 2,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 3,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 3,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
                 for (slotAttestations) |slotAttestation| {
@@ -233,19 +216,16 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             0 => {
-                const slotAttestations = [_]types.SignedAttestation{
+                const slotAttestations = [_]types.Attestation{
                     // val 0
-                    types.SignedAttestation{
-                        .message = .{
-                            .validator_id = 0,
-                            .data = .{
-                                .slot = slot - 1,
-                                .head = .{ .root = parent_root, .slot = slot - 1 },
-                                .target = .{ .root = parent_root, .slot = slot - 1 },
-                                .source = latest_justified,
-                            },
+                    .{
+                        .validator_id = 0,
+                        .data = .{
+                            .slot = slot - 1,
+                            .head = .{ .root = parent_root, .slot = slot - 1 },
+                            .target = .{ .root = parent_root, .slot = slot - 1 },
+                            .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // skip val1
@@ -287,22 +267,20 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // generate the signed beam block and add to block list
         const block_with_attestation = types.BlockWithAttestation{
             .block = block,
-            .proposer_attestation = if (attestations.items.len > 0)
-                attestations.items[0].message
-            else
-                types.Attestation{
-                    .validator_id = 0,
-                    .data = types.AttestationData{
-                        .slot = slot,
-                        .head = .{ .root = parent_root, .slot = slot },
-                        .target = .{ .root = parent_root, .slot = slot },
-                        .source = latest_justified,
-                    },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = types.AttestationData{
+                    .slot = slot,
+                    .head = .{ .root = parent_root, .slot = slot },
+                    .target = .{ .root = parent_root, .slot = slot },
+                    .source = latest_justified,
                 },
+            },
         };
-        const signed_block = types.SignedBlockWithAttestations{
+
+        const signed_block = types.SignedBlockWithAttestation{
             .message = block_with_attestation,
-            .signatures = try types.BlockSignatures.init(allocator),
+            .signature = try types.createBlockSignatures(allocator, attestations.items.len),
         };
         try blockList.append(signed_block);
         try blockRootList.append(block_root);

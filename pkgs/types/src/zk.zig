@@ -48,7 +48,7 @@ pub const BeamSTFProof = struct {
 };
 
 pub const BeamSTFProverInput = struct {
-    block: block.SignedBlockWithAttestations,
+    block: block.SignedBlockWithAttestation,
     state: state.BeamState,
 
     pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
@@ -107,7 +107,9 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var test_block = block.SignedBlockWithAttestations{
+    var attestations = try block.Attestations.init(std.testing.allocator);
+
+    var test_block = block.SignedBlockWithAttestation{
         .message = .{
             .block = .{
                 .slot = 9,
@@ -115,7 +117,7 @@ test "ssz seralize/deserialize signed stf prover input" {
                 .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
                 .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
                 .body = .{
-                    .attestations = try block.Attestations.init(std.testing.allocator),
+                    .attestations = attestations,
                 },
             },
             .proposer_attestation = .{
@@ -137,10 +139,10 @@ test "ssz seralize/deserialize signed stf prover input" {
                 },
             },
         },
-        .signatures = try block.BlockSignatures.init(std.testing.allocator),
+        .signature = try block.createBlockSignatures(std.testing.allocator, attestations.len()),
     };
     defer test_block.message.block.body.attestations.deinit();
-    defer test_block.signatures.deinit();
+    defer test_block.signature.deinit();
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,
@@ -159,6 +161,6 @@ test "ssz seralize/deserialize signed stf prover input" {
 
     // TODO create a sszEql fn in ssz to recursively compare two ssz structures
     // for now inspect two items
-    try std.testing.expect(prover_input.block.signatures.len() == prover_input_deserialized.block.signatures.len());
+    try std.testing.expect(prover_input.block.signature.len() == prover_input_deserialized.block.signature.len());
     try std.testing.expect(std.mem.eql(u8, &prover_input.state.latest_block_header.state_root, &prover_input_deserialized.state.latest_block_header.state_root));
 }
