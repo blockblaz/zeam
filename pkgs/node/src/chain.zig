@@ -214,7 +214,7 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn constructAttestation(self: *Self, opts: AttestationConstructionParams) !types.Attestation {
+    pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
         const slot = opts.slot;
 
         // const head = try self.forkChoice.getProposalHead(slot);
@@ -225,17 +225,14 @@ pub const BeamChain = struct {
         };
         const target = try self.forkChoice.getAttestationTarget();
 
-        const attestation = types.Attestation{
-            .validator_id = 0, // Placeholder - will be filled in by validator
-            .data = types.AttestationData{
-                .slot = slot,
-                .head = head,
-                .target = target,
-                .source = self.forkChoice.fcStore.latest_justified,
-            },
+        const attestation_data = types.AttestationData{
+            .slot = slot,
+            .head = head,
+            .target = target,
+            .source = self.forkChoice.fcStore.latest_justified,
         };
 
-        return attestation;
+        return attestation_data;
     }
 
     pub fn printSlot(self: *Self, islot: isize, peer_count: usize) void {

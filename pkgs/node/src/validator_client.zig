@@ -91,11 +91,14 @@ pub const ValidatorClient = struct {
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
             // Construct proposer attestation for the produced block
-            const proposer_attestation = try self.chain.constructAttestation(.{ .slot = slot });
+            const proposer_attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
 
             const block_with_attestation = types.BlockWithAttestation{
                 .block = produced_block.block,
-                .proposer_attestation = proposer_attestation,
+                .proposer_attestation = .{
+                    .validator_id = slot_proposer_id,
+                    .data = proposer_attestation_data,
+                },
             };
 
             const signed_block = types.SignedBlockWithAttestation{
@@ -121,13 +124,13 @@ pub const ValidatorClient = struct {
         if (self.ids.len == 0) return null;
 
         self.logger.info("constructing attestation message for slot={d}", .{slot});
-        const attestation_data = try self.chain.constructAttestation(.{ .slot = slot });
+        const attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
 
         var result = ValidatorClientOutput.init(self.allocator);
         for (self.ids) |validator_id| {
             const attestation: types.Attestation = .{
                 .validator_id = validator_id,
-                .data = attestation_data.data,
+                .data = attestation_data,
             };
             const signed_attestation: types.SignedAttestation = .{
                 .message = attestation,
