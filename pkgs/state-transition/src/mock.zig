@@ -89,7 +89,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     var prev_block = genesis_block;
 
-    // track latest justified and finalized for constructing votes
+    // track latest justified and finalized for constructing attestations
     var latest_justified: types.Checkpoint = .{ .root = block_root, .slot = genesis_block.slot };
     var latest_justified_prev = latest_justified;
     var latest_finalized = latest_justified;
@@ -119,7 +119,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         var attestations = std.ArrayList(types.Attestation).init(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
-            // no votes on the first block of this
+            // no attestations on the first block of this
             1 => {
                 head_idx = slot;
             },
@@ -164,7 +164,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 }
 
                 head_idx = slot;
-                // post these votes last_justified would be updated
+                // post these attestations last_justified would be updated
                 latest_justified_prev = latest_justified;
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
@@ -210,7 +210,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 }
 
                 head_idx = slot;
-                // post these votes last justified and finalized would be updated
+                // post these attestations last justified and finalized would be updated
                 latest_finalized = latest_justified;
                 latest_justified_prev = latest_justified;
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };

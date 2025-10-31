@@ -137,7 +137,7 @@ pub const LeanNetworkTopic = struct {
 
 pub const GossipTopic = enum {
     block,
-    vote,
+    attestation,
 
     pub fn encode(self: GossipTopic) []const u8 {
         return std.enums.tagName(GossipTopic, self).?;
@@ -150,7 +150,7 @@ pub const GossipTopic = enum {
 
 pub const GossipMessage = union(GossipTopic) {
     block: types.SignedBlockWithAttestation,
-    vote: types.SignedAttestation,
+    attestation: types.SignedAttestation,
 
     const Self = @This();
 
@@ -185,9 +185,9 @@ pub const GossipMessage = union(GossipTopic) {
                 cloned_data.* = .{ .block = undefined };
                 try types.sszClone(allocator, types.SignedBlockWithAttestation, self.block, &cloned_data.block);
             },
-            .vote => {
-                cloned_data.* = .{ .vote = undefined };
-                try types.sszClone(allocator, types.SignedAttestation, self.vote, &cloned_data.vote);
+            .attestation => {
+                cloned_data.* = .{ .attestation = undefined };
+                try types.sszClone(allocator, types.SignedAttestation, self.attestation, &cloned_data.attestation);
             },
         }
 
@@ -200,8 +200,8 @@ pub const GossipMessage = union(GossipTopic) {
                 std.log.err("Failed to convert block to JSON: {any}", .{e});
                 return e;
             },
-            .vote => |vote| vote.toJson(allocator) catch |e| {
-                std.log.err("Failed to convert vote to JSON: {any}", .{e});
+            .attestation => |attestation| attestation.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert attestation to JSON: {any}", .{e});
                 return e;
             },
         };
@@ -757,9 +757,9 @@ test GossipTopic {
     try std.testing.expect(std.mem.eql(u8, gossip_topic.encode(), "block"));
     try std.testing.expectEqual(gossip_topic, try GossipTopic.decode("block"));
 
-    const gossip_topic2 = GossipTopic.vote;
-    try std.testing.expect(std.mem.eql(u8, gossip_topic2.encode(), "vote"));
-    try std.testing.expectEqual(gossip_topic2, try GossipTopic.decode("vote"));
+    const gossip_topic2 = GossipTopic.attestation;
+    try std.testing.expect(std.mem.eql(u8, gossip_topic2.encode(), "attestation"));
+    try std.testing.expectEqual(gossip_topic2, try GossipTopic.decode("attestation"));
 
     try std.testing.expectError(error.InvalidDecoding, GossipTopic.decode("invalid"));
 }

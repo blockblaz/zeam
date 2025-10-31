@@ -258,7 +258,7 @@ pub const BeamState = struct {
     }
 
     fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, logger: zeam_utils.ModuleLogger) !void {
-        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} votes={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
+        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
         const justified_str = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str);
         const finalized_str = try self.latest_finalized.toJsonString(allocator);
@@ -283,14 +283,14 @@ pub const BeamState = struct {
         const num_validators: usize = @intCast(self.config.num_validators);
         for (attestations.constSlice()) |attestation| {
             const validator_id: usize = @intCast(attestation.validator_id);
-            const vote = attestation.data;
-            // check if vote is sane
-            const source_slot: usize = @intCast(vote.source.slot);
-            const target_slot: usize = @intCast(vote.target.slot);
-            const vote_str = try vote.toJsonString(allocator);
-            defer allocator.free(vote_str);
+            const attestation_data = attestation.data;
+            // check if attestation is sane
+            const source_slot: usize = @intCast(attestation_data.source.slot);
+            const target_slot: usize = @intCast(attestation_data.target.slot);
+            const attestation_str = try attestation_data.toJsonString(allocator);
+            defer allocator.free(attestation_str);
 
-            logger.debug("processing vote={s} validator_id={d}\n....\n", .{ vote_str, validator_id });
+            logger.debug("processing attestation={s} validator_id={d}\n....\n", .{ attestation_str, validator_id });
 
             if (source_slot >= self.justified_slots.len()) {
                 return StateTransitionError.InvalidSlotIndex;
@@ -307,8 +307,8 @@ pub const BeamState = struct {
 
             const is_source_justified = try self.justified_slots.get(source_slot);
             const is_target_already_justified = try self.justified_slots.get(target_slot);
-            const has_correct_source_root = std.mem.eql(u8, &vote.source.root, &(try self.historical_block_hashes.get(source_slot)));
-            const has_correct_target_root = std.mem.eql(u8, &vote.target.root, &(try self.historical_block_hashes.get(target_slot)));
+            const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &(try self.historical_block_hashes.get(source_slot)));
+            const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &(try self.historical_block_hashes.get(target_slot)));
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
 
@@ -321,7 +321,7 @@ pub const BeamState = struct {
                 target_not_ahead or
                 !is_target_justifiable)
             {
-                logger.debug("skipping the vote as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
                     is_source_justified,
                     is_target_already_justified,
                     has_correct_source_root,
@@ -336,24 +336,24 @@ pub const BeamState = struct {
                 return StateTransitionError.InvalidValidatorId;
             }
 
-            var target_justifications = justifications.get(vote.target.root) orelse targetjustifications: {
+            var target_justifications = justifications.get(attestation_data.target.root) orelse targetjustifications: {
                 var targetjustifications = try allocator.alloc(u8, num_validators);
                 for (0..targetjustifications.len) |i| {
                     targetjustifications[i] = 0;
                 }
-                try justifications.put(allocator, vote.target.root, targetjustifications);
+                try justifications.put(allocator, attestation_data.target.root, targetjustifications);
                 break :targetjustifications targetjustifications;
             };
 
             target_justifications[validator_id] = 1;
-            try justifications.put(allocator, vote.target.root, target_justifications);
+            try justifications.put(allocator, attestation_data.target.root, target_justifications);
             var target_justifications_count: usize = 0;
             for (target_justifications) |justified| {
                 if (justified == 1) {
                     target_justifications_count += 1;
                 }
             }
-            logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, vote.target.root, target_justifications });
+            logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, attestation_data.target.root, target_justifications });
 
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
@@ -361,9 +361,9 @@ pub const BeamState = struct {
             // ceilDiv is not available so this seems like a less compute intensive way without
             // requring float division, can be further optimized
             if (3 * target_justifications_count >= 2 * num_validators) {
-                self.latest_justified = vote.target;
+                self.latest_justified = attestation_data.target;
                 try self.justified_slots.set(target_slot, true);
-                _ = justifications.remove(vote.target.root);
+                _ = justifications.remove(attestation_data.target.root);
                 const justified_str_new = try self.latest_justified.toJsonString(allocator);
                 defer allocator.free(justified_str_new);
 
@@ -379,7 +379,7 @@ pub const BeamState = struct {
                 }
                 logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
                 if (can_target_finalize == true) {
-                    self.latest_finalized = vote.source;
+                    self.latest_finalized = attestation_data.source;
                     const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
                     defer allocator.free(finalized_str_new);
 

@@ -150,7 +150,7 @@ pub const BeamChain = struct {
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
-            // interval to vote so we should put out the chain status information to the user along with
+            // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
             self.printSlot(islot, self.connected_peers.count());
@@ -167,7 +167,7 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const votes = try self.forkChoice.getProposalAttestations();
+        const attestations = try self.forkChoice.getProposalAttestations();
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -184,7 +184,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = votes,
+                .attestations = attestations,
             },
         };
 
@@ -223,7 +223,7 @@ pub const BeamChain = struct {
             .root = head_proto.blockRoot,
             .slot = head_proto.slot,
         };
-        const target = try self.forkChoice.getVoteTarget();
+        const target = try self.forkChoice.getAttestationTarget();
 
         const attestation = types.Attestation{
             .validator_id = 0, // Placeholder - will be filled in by validator
@@ -323,14 +323,14 @@ pub const BeamChain = struct {
                     }
                 }
             },
-            .vote => |signed_attestation| {
+            .attestation => |signed_attestation| {
                 const signed_attestation_json = try signed_attestation.toJson(self.allocator);
 
                 // Convert JSON value to string for proper logging
                 const signed_attestation_str = try jsonToString(self.allocator, signed_attestation_json);
                 defer self.allocator.free(signed_attestation_str);
 
-                self.module_logger.debug("chain received vote onGossip cb: {s}", .{signed_attestation_str});
+                self.module_logger.debug("chain received attestation onGossip cb: {s}", .{signed_attestation_str});
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
@@ -390,7 +390,7 @@ pub const BeamChain = struct {
         });
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 4. fc onvotes
+        // 4. fc onattestations
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -493,8 +493,8 @@ pub const BeamChain = struct {
     /// is_from_block: true if attestation came from a block, false if from network gossip
     ///
     /// Per leanSpec:
-    /// - Gossip attestations (is_from_block=false): vote.slot <= current_slot (no future tolerance)
-    /// - Block attestations (is_from_block=true): vote.slot <= current_slot + 1 (lenient)
+    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
+    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
     pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
         const data = attestation.data;
 
@@ -534,7 +534,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceSlotExceedsTarget;
         }
 
-        //    This corresponds to leanSpec's: assert vote.source.slot <= vote.target.slot
+        //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
         if (data.source.slot > data.target.slot) {
             self.module_logger.debug("Attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
                 data.source.slot,
@@ -552,7 +552,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceCheckpointSlotMismatch;
         }
 
-        //    This corresponds to leanSpec's: assert target_block.slot == vote.target.slot
+        //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
         if (target_block.slot != data.target.slot) {
             self.module_logger.debug("Attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
                 target_block.slot,
@@ -563,8 +563,8 @@ pub const BeamChain = struct {
 
         // 4. Validate attestation is not too far in the future
         //
-        //    Gossip attestations must be for current or past slots only. Validators vote
-        //    in interval 1 of the current slot, so they cannot vote for future slots.
+        //    Gossip attestations must be for current or past slots only. Validators attest
+        //    in interval 1 of the current slot, so they cannot attest for future slots.
         //    Block attestations can be more lenient since the block itself was validated.
         const current_slot = self.forkChoice.fcStore.timeSlots;
         const max_allowed_slot = if (is_from_block)
@@ -573,7 +573,7 @@ pub const BeamChain = struct {
             current_slot; // Gossip attestations: no future slots allowed
 
         if (data.slot > max_allowed_slot) {
-            self.module_logger.debug("Attestation validation failed: vote slot {d} > max allowed slot {d} (is_from_block={any})", .{
+            self.module_logger.debug("Attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
                 data.slot,
                 max_allowed_slot,
                 is_from_block,
@@ -692,9 +692,9 @@ test "process and add mock blocks into a node's chain" {
 
     const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
     for (0..num_validators) |validator_id| {
-        // all validators should have voted as per the mock chain
-        const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
-        try std.testing.expect(vote_tracker != null);
+        // all validators should have attested as per the mock chain
+        const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
+        try std.testing.expect(attestations_tracker != null);
     }
 }
 
@@ -1115,11 +1115,11 @@ test "attestation validation - gossip vs block future slot handling" {
     };
 
     // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert vote.slot <= time_slots
+    // Per spec store.py:177: assert attestation.slot <= time_slots
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.message, false));
 
     // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert vote.slot <= Slot(current_slot + Slot(1))
+    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
     try beam_chain.validateAttestation(next_slot_attestation.message, true);
     const too_far_attestation: types.SignedAttestation = .{
         .message = .{
@@ -1213,9 +1213,9 @@ test "attestation processing - valid block attestation" {
     // Process attestation through chain (this validates and then processes)
     try beam_chain.onAttestation(valid_attestation);
 
-    // Verify the vote was recorded in votes
-    const vote_tracker = beam_chain.forkChoice.votes.get(1);
-    try std.testing.expect(vote_tracker != null);
-    try std.testing.expect(vote_tracker.?.latestNew != null);
-    try std.testing.expect(vote_tracker.?.latestNew.?.slot == 2);
+    // Verify the attestation was recorded in attestations
+    const attestations_tracker = beam_chain.forkChoice.attestations.get(1);
+    try std.testing.expect(attestations_tracker != null);
+    try std.testing.expect(attestations_tracker.?.latestNew != null);
+    try std.testing.expect(attestations_tracker.?.latestNew.?.slot == 2);
 }

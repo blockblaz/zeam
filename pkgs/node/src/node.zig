@@ -132,7 +132,7 @@ pub const BeamNode = struct {
                     self.logger.warn("Failed to compute block root for incoming gossip block: {any}", .{err});
                 }
             },
-            .vote => {},
+            .attestation => {},
         }
 
         try self.chain.onGossip(data);
@@ -381,9 +381,9 @@ pub const BeamNode = struct {
                                 return e;
                             };
                         },
-                        .vote => |signed_attestation| {
+                        .attestation => |signed_attestation| {
                             self.publishAttestation(signed_attestation) catch |e| {
-                                self.logger.err("Error publishing vote from validator: err={any}", .{e});
+                                self.logger.err("Error publishing attestation from validator: err={any}", .{e});
                                 return e;
                             };
                         },
@@ -426,12 +426,12 @@ pub const BeamNode = struct {
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
         // 1. publish gossip message
-        const gossip_msg = networks.GossipMessage{ .vote = signed_attestation };
+        const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
         const message = signed_attestation.message;
         const data = message.data;
-        self.logger.info("Published vote to network: slot={d} validator={d}", .{
+        self.logger.info("Published attestation to network: slot={d} validator={d}", .{
             data.slot,
             message.validator_id,
         });
@@ -442,7 +442,7 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{ .block, .vote };
+        var topics = [_]networks.GossipTopic{ .block, .attestation };
         try self.network.backend.gossip.subscribe(&topics, handler);
 
         const peer_handler = self.getPeerEventHandler();

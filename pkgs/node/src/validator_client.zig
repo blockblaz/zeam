@@ -33,7 +33,7 @@ pub const ValidatorClientOutput = struct {
     }
 
     pub fn addAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const gossip_msg = networks.GossipMessage{ .vote = signed_attestation };
+        const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.gossip_messages.append(gossip_msg);
     }
 };
@@ -120,7 +120,7 @@ pub const ValidatorClient = struct {
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
 
-        self.logger.info("constructing vote message for slot={d}", .{slot});
+        self.logger.info("constructing attestation message for slot={d}", .{slot});
         const attestation_data = try self.chain.constructAttestation(.{ .slot = slot });
 
         var result = ValidatorClientOutput.init(self.allocator);
@@ -135,7 +135,7 @@ pub const ValidatorClient = struct {
             };
 
             try result.addAttestation(signed_attestation);
-            self.logger.info("constructed vote slot={d} validator={d}", .{ slot, validator_id });
+            self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
         return result;
     }
