@@ -368,6 +368,14 @@ pub fn build(b: *Builder) !void {
     });
     cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
 
+    // Add error handler module to integration tests
+    const error_handler_module = b.addModule("error_handler", .{
+        .root_source_file = b.path("pkgs/cli/src/error_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("error_handler", error_handler_module);
+
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
         .optimize = optimize,

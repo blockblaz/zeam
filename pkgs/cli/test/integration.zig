@@ -3,8 +3,8 @@ const process = std.process;
 const net = std.net;
 const build_options = @import("build_options");
 const constants = @import("cli_constants");
-const main = @import("../src/main.zig");
-const ErrorHandler = main.ErrorHandler;
+const error_handler = @import("error_handler");
+const ErrorHandler = error_handler.ErrorHandler;
 
 /// Verify that the Zeam executable exists and return its path
 /// Includes detailed debugging output if the executable is not found
