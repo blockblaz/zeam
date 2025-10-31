@@ -2,19 +2,11 @@ name: Docker CI
 
 on:
   push:
-    branches: [ main ]
-  # for test only, remove before merging to main
-  pull_request:
-    branches: [ docker-ci ]
+    branches: [ main, docker-ci ]
   release:
     types: [ published ]
   workflow_dispatch:
-    # workflow_run:
-    # workflows: [ "CI", "RISC0" ] # Wait for these workflows to complete
-    #workflows: [ "CI" ] #for test
-    #types:
-    #- completed
-    #branches: [ main ]
+
 
 env:
   REGISTRY: docker.io
@@ -48,11 +40,25 @@ jobs:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
           type=ref,event=branch
-          type=ref,event=pr
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
           type=sha,prefix={{branch}}-
           type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value=always-test-${{ github.run_number }}
+
+    - name: Debug generated tags
+      run: |
+        echo "🔍 Event: ${{ github.event_name }}"
+        echo "🌿 Branch: ${{ github.ref_name }}"
+        echo "📋 Generated tags:"
+        echo "${{ steps.meta.outputs.tags }}"
+        echo ""
+        echo "🏷️  Individual tags:"
+        echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read tag; do
+          [ -n "$tag" ] && echo "  - $tag"
+        done
+        echo ""
+        echo "📊 Tag count: $(echo '${{ steps.meta.outputs.tags }}' | tr ',' '\n' | grep -v '^$' | wc -l)"
 
     - name: Build and push Docker images
       uses: docker/build-push-action@v5
