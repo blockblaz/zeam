@@ -4,32 +4,32 @@
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
-            .url = "https://github.com/blockblaz/ssz.zig/archive/refs/tags/v0.0.7.tar.gz",
-            .hash = "ssz-0.0.4-Lfwd65-iAgBkwCIZmHkrOvD3oCjooiBD73Nmp4gCNMG6",
+            .url = "https://github.com/blockblaz/ssz.zig/archive/d80f0be3d135590f85e69576b64e3b5687afc040.tar.gz",
+            .hash = "ssz-0.0.8-Lfwd61yrAgCyvf75xFq2assHh4Fu0qt4zgo4F6eeYvuz",
         },
         .zigcli = .{
-            .url = "git+https://github.com/jiacai2050/zigcli?ref=main#dcbc59d70b4787671c8a4e484ffd2b725aa17af5",
-            .hash = "zigcli-0.2.3-ORC7jMGUAgC0S6M5tL0RTW1gn-3wFj9tmckO7g2iZB0k",
+            .url = "git+https://github.com/jiacai2050/zigcli?ref=main#bf1b6348e1844cf0a2db90c25914058e4af3e9b2",
+            .hash = "zigcli-0.3.0-ORC7jPyeAgDTOZWL3mxwG3zAklOApYehg9-7v-Ri3u31",
         },
         .xev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/94ed6af.tar.gz",
-            .hash = "libxev-0.0.0-86vtc-zkEgB7uv1i0Sa6ytJETZQi_lHJrImu9mLb9moi",
+            .url = "https://github.com/mitchellh/libxev/archive/9b6634b6229be5f2c8fb22db1f6f652bac5c5040.tar.gz",
+            .hash = "libxev-0.0.0-86vtc2MaEwCW3jbbEvhCl_Mx1_XgunToEOq2KWiuIH6t",
         },
         .datetime = .{
             .url = "git+https://github.com/frmdstryr/zig-datetime?ref=master#3a39a21e6e34dcb0ade0ff828d0914d40ba535f3",
             .hash = "datetime-0.8.0-cJNXzP_YAQBxQ5hkNNP6ScnG5XsqciJmeP5RVV4xwCBA",
         },
         .metrics = .{
-            .url = "https://github.com/karlseguin/metrics.zig/archive/2b584b6209871b7215706028988169599451dc0d.tar.gz",
-            .hash = "metrics-0.0.0-W7G4eCG0AQCQXidzvV5kx4l0smr_WCw-8JLIwS_OHYoW",
+            .url = "https://github.com/karlseguin/metrics.zig/archive/603954879849c331a26529b88254770089acac8b.tar.gz",
+            .hash = "metrics-0.0.0-W7G4eP2_AQAdJGKMonHeZFaY4oU4ZXPFFTqFCFXItX3O",
         },
         .zig_enr = .{
             .url = "git+https://github.com/blockblaz/enr#02f187591f8a9616623e0bc91d139f0d18c99bcf",
             .hash = "zig_enr-0.0.0-cO2P20iiAQALUQA-fb_70u0hyoBJo7u_tdeZue8FuyuZ",
         },
         .zig_yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml#a37be441b042d8aa119213f82f715c0dd1019655",
-            .hash = "zig_yaml-0.1.0-C1161hmEAgBeNkAzDaTpcf-2HBydmS1KpJ6FVfGIZfr_",
+            .url = "git+https://github.com/kubkon/zig-yaml#a6c2cd8760bf45c49b17a3f6259c4dfe3ded528e",
+            .hash = "zig_yaml-0.2.0-C1161pmrAgDnipDTh_4v4RQD27XN5GNaVlzzvlXf1jfW",
         },
         .rocksdb = .{
             .url = "https://github.com/Syndica/rocksdb-zig/archive/70137101ad89640e0fc2e5ddbe60a26c522c7ae7.tar.gz",
