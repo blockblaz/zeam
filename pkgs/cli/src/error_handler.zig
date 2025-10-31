@@ -92,4 +92,3 @@ pub const ErrorHandler = struct {
         std.log.err("Details: {any}", .{details});
     }
 };
-

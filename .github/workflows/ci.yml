@@ -37,7 +37,7 @@ jobs:
         max_attempts=5
         attempt=1
         while [ $attempt -le $max_attempts ]; do
-          if zig fetch; then
+          if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
@@ -113,7 +113,7 @@ jobs:
         max_attempts=5
         attempt=1
         while [ $attempt -le $max_attempts ]; do
-          if zig fetch; then
+          if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
@@ -168,7 +168,7 @@ jobs:
         max_attempts=5
         attempt=1
         while [ $attempt -le $max_attempts ]; do
-          if zig fetch; then
+          if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
@@ -221,7 +221,7 @@ jobs:
         max_attempts=5
         attempt=1
         while [ $attempt -le $max_attempts ]; do
-          if zig fetch; then
+          if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
