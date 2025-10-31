@@ -9,12 +9,12 @@ on:
   release:
     types: [ published ]
   workflow_dispatch:
-  workflow_run:
+    # workflow_run:
     # workflows: [ "CI", "RISC0" ] # Wait for these workflows to complete
-    workflows: [ "CI" ] #for test
-    types:
-    - completed
-    branches: [ main ]
+    #workflows: [ "CI" ] #for test
+    #types:
+    #- completed
+    #branches: [ main ]
 
 env:
   REGISTRY: docker.io
@@ -48,6 +48,7 @@ jobs:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
           type=ref,event=branch
+          type=ref,event=pr
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
           type=sha,prefix={{branch}}-
