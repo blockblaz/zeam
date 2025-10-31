@@ -160,13 +160,121 @@ const ZeamArgs = struct {
     };
 };
 
-pub fn main() !void {
+// Error handling utilities module
+pub const ErrorHandler = struct {
+    /// Get user-friendly error description
+    pub fn formatError(err: anyerror) []const u8 {
+        return switch (err) {
+            error.FileNotFound => "File not found",
+            error.AccessDenied => "Permission denied",
+            error.OutOfMemory => "Out of memory",
+            error.InvalidArgument => "Invalid argument",
+            error.UnexpectedEndOfFile => "Unexpected end of file",
+            error.FileTooBig => "File too large",
+            error.DiskQuota => "Disk quota exceeded",
+            error.PathAlreadyExists => "Path already exists",
+            error.NoSpaceLeft => "No space left on device",
+            error.IsDir => "Is a directory",
+            error.NotDir => "Not a directory",
+            error.NotSupported => "Operation not supported",
+            error.NetworkUnreachable => "Network unreachable",
+            error.ConnectionRefused => "Connection refused",
+            error.ConnectionReset => "Connection reset",
+            error.ConnectionTimedOut => "Connection timed out",
+            error.AddressInUse => "Address already in use",
+            else => @errorName(err),
+        };
+    }
+
+    /// Get context-specific error message with troubleshooting hints
+    pub fn getErrorContext(err: anyerror) []const u8 {
+        return switch (err) {
+            error.FileNotFound => "Required file or directory not found. Please check that all paths are correct.",
+            error.AccessDenied => "Permission denied. Check file/directory permissions and ensure you have appropriate access.",
+            error.OutOfMemory => "Insufficient memory. Try closing other applications or reducing resource usage.",
+            error.InvalidArgument => "Invalid argument provided. Check command-line arguments and configuration files.",
+            error.UnexpectedEndOfFile => "Unexpected end of file. Configuration file may be incomplete or corrupted.",
+            error.JsonInvalidUTF8, error.JsonInvalidCharacter, error.JsonUnexpectedToken => "JSON parsing error. Check that configuration files are valid JSON.",
+            error.YamlError => "YAML parsing error. Check that configuration files are valid YAML.",
+            error.NetworkUnreachable, error.ConnectionRefused, error.ConnectionReset, error.ConnectionTimedOut => "Network error. Check network connectivity and that required services are running.",
+            error.AddressInUse => "Port or address already in use. Try using a different port or stop the conflicting service.",
+            error.NotFound => "Resource not found. Check that required files, directories, or network resources exist.",
+            error.InvalidData => "Invalid data format. Check that configuration files match the expected format.",
+            error.PowdrIsDeprecated => "Powdr ZKVM is deprecated. Please use risc0 or openvm instead.",
+            else => "An unexpected error occurred. Check logs for more details.",
+        };
+    }
+
+    /// Print formatted error message with context
+    pub fn printError(err: anyerror, context: []const u8) void {
+        // Suppress output during tests to avoid test framework complaints
+        if (@import("builtin").is_test) return;
+
+        const stderr = std.io.getStdErr().writer();
+        stderr.print("Error: {s}\n", .{formatError(err)}) catch {};
+        if (context.len > 0) {
+            stderr.print("Context: {s}\n", .{context}) catch {};
+        }
+        stderr.print("Error code: {s}\n\n", .{@errorName(err)}) catch {};
+    }
+
+    /// Handle application-level errors with user-friendly output
+    pub fn handleApplicationError(err: anyerror) void {
+        // Suppress output during tests to avoid test framework complaints
+        if (@import("builtin").is_test) return;
+
+        const stderr = std.io.getStdErr().writer();
+        stderr.print("\n❌ Zeam exited with error\n\n", .{}) catch {};
+
+        const context = getErrorContext(err);
+        printError(err, context);
+
+        // Print usage hint for common argument errors
+        if (err == error.InvalidArgument) {
+            stderr.print("Hint: Run 'zeam --help' or 'zeam node --help' for usage information.\n\n", .{}) catch {};
+        }
+    }
+
+    /// Log error with operation context (for use within mainInner)
+    pub fn logErrorWithOperation(err: anyerror, comptime operation: []const u8) void {
+        // Suppress output during tests to avoid test framework complaints
+        if (@import("builtin").is_test) return;
+
+        std.log.err("Failed to {s}: {s}", .{ operation, @errorName(err) });
+    }
+
+    /// Log error with operation context and additional details
+    pub fn logErrorWithDetails(err: anyerror, comptime operation: []const u8, details: anytype) void {
+        // Suppress output during tests to avoid test framework complaints
+        if (@import("builtin").is_test) return;
+
+        std.log.err("Failed to {s}: {s}", .{ operation, @errorName(err) });
+        std.log.err("Details: {any}", .{details});
+    }
+};
+
+pub fn main() void {
+    mainInner() catch |err| {
+        ErrorHandler.handleApplicationError(err);
+        std.process.exit(1);
+    };
+}
+
+fn mainInner() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
 
-    const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
+    const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        stderr.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)}) catch {};
+        stderr.print("Run 'zeam --help' for usage information.\n", .{}) catch {};
+        ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
+        return err;
+    };
     const genesis = opts.args.genesis;
     const num_validators = opts.args.num_validators;
     const log_filename = opts.args.log_filename;
@@ -178,11 +286,20 @@ pub fn main() !void {
 
     switch (opts.args.__commands__) {
         .clock => {
-            var loop = try xev.Loop.init(.{});
-            var clock = try Clock.init(gpa.allocator(), genesis, &loop);
+            var loop = xev.Loop.init(.{}) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize event loop");
+                return err;
+            };
+            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize clock");
+                return err;
+            };
             std.debug.print("clock {any}\n", .{clock});
 
-            try clock.run();
+            clock.run() catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "run clock service");
+                return err;
+            };
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
@@ -204,26 +321,45 @@ pub fn main() !void {
                 .genesis_time = genesis,
                 .num_validators = num_validators,
             };
-            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config);
+            const mock_chain = sft_factory.genMockChain(allocator, 5, mock_config) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "generate mock chain");
+                return err;
+            };
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |block| {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
-                const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
+                const proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.message.slot });
+                    return err;
+                };
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });
+                sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger }) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "apply transition", .{ .slot = block.message.slot });
+                    return err;
+                };
 
                 // verify the block
-                try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
+                state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "verify proof", .{ .slot = block.message.slot });
+                    return err;
+                };
             }
+            std.log.info("Successfully proved and verified all transitions", .{});
         },
         .beam => |beamcmd| {
-            try api.init(allocator);
+            api.init(allocator) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize API");
+                return err;
+            };
 
             // Start metrics HTTP server
-            try api_server.startAPIServer(allocator, beamcmd.metricsPort);
+            api_server.startAPIServer(allocator, beamcmd.metricsPort) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
+                return err;
+            };
 
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
@@ -377,15 +513,29 @@ pub fn main() !void {
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
-                const generated_config = try generatePrometheusConfig(allocator, genconfig.metrics_port);
+                const generated_config = generatePrometheusConfig(allocator, genconfig.metrics_port) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
+                    return err;
+                };
                 const cwd = std.fs.cwd();
-                const config_file = try cwd.createFile(genconfig.filename, .{ .truncate = true });
+                const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
+                    return err;
+                };
                 defer config_file.close();
-                try config_file.writeAll(generated_config);
+                config_file.writeAll(generated_config) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
+                    return err;
+                };
+                std.log.info("Successfully generated Prometheus config: {s}", .{genconfig.filename});
             },
         },
         .node => |leancmd| {
-            try std.fs.cwd().makePath(leancmd.@"data-dir");
+            std.fs.cwd().makePath(leancmd.@"data-dir") catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
+                return err;
+            };
+
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
             var start_options: node.NodeOptions = .{
@@ -405,12 +555,26 @@ pub fn main() !void {
 
             defer start_options.deinit(allocator);
 
-            try node.buildStartOptions(allocator, leancmd, &start_options);
+            node.buildStartOptions(allocator, leancmd, &start_options) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "build node start options", .{
+                    .node_id = leancmd.@"node-id",
+                    .validator_config = leancmd.validator_config,
+                    .custom_genesis = leancmd.custom_genesis,
+                });
+                return err;
+            };
 
             var lean_node: node.Node = undefined;
-            try lean_node.init(allocator, &start_options);
+            lean_node.init(allocator, &start_options) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize lean node");
+                return err;
+            };
             defer lean_node.deinit();
-            try lean_node.run();
+
+            lean_node.run() catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "run lean node");
+                return err;
+            };
         },
     }
 }
