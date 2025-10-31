@@ -5,15 +5,6 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 
-const transition = @import("./transition.zig");
-
-pub const apply_transition = transition.apply_transition;
-pub const apply_raw_block = transition.apply_raw_block;
-pub const StateTransitionError = transition.StateTransitionError;
-pub const StateTransitionOpts = transition.StateTransitionOpts;
-pub const is_justifiable_slot = transition.is_justifiable_slot;
-pub const verify_signatures = transition.verify_signatures;
-
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
 
@@ -50,7 +41,7 @@ test "apply transition on mocked chain" {
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+        try beam_state.applyTransition(allocator, block, .{ .logger = module_logger });
     }
 
     // check the post state root to be equal to block2's stateroot
@@ -91,7 +82,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+            try beam_state.applyTransition(allocator, block, .{ .logger = module_logger });
         }
     }
 }

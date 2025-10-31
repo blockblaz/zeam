@@ -213,7 +213,7 @@ pub fn main() !void {
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
                 const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });
+                try beam_state.applyTransition(allocator, block, .{ .logger = stf_logger });
 
                 // verify the block
                 try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);

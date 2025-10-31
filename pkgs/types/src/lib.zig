@@ -10,6 +10,7 @@ pub const SignedBeamBlock = block.SignedBeamBlock;
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;
 pub const BeamState = state.BeamState;
+pub const StateTransitionOpts = state.StateTransitionOpts;
 
 const mini_3sf = @import("./mini_3sf.zig");
 pub const Mini3SFCheckpoint = mini_3sf.Mini3SFCheckpoint;
