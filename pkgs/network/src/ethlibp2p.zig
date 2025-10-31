@@ -318,8 +318,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes });
 
-    // TODO: figure out why scheduling on the loop is not working
-    zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
+    zigHandler.gossipHandler.onGossip(&message) catch |e| {
         zigHandler.logger.err("onGossip handling of message failed with error e={any}", .{e});
     };
 }
@@ -732,14 +731,14 @@ pub const EthLibp2p = struct {
 
     pub fn init(
         allocator: Allocator,
-        loop: *xev.Loop,
+        event_loop: *zeam_utils.EventLoop,
         params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
     ) !Self {
         const owned_network_name = try allocator.dupe(u8, params.network_name);
         errdefer allocator.free(owned_network_name);
 
-        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger);
+        const gossip_handler = try interface.GenericGossipHandler.init(allocator, event_loop, params.networkId, logger);
         errdefer gossip_handler.deinit();
 
         const peer_event_handler = try interface.PeerEventHandler.init(allocator, params.networkId, logger);
@@ -838,7 +837,7 @@ pub const EthLibp2p = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, false);
+        return self.gossipHandler.onGossip(data);
     }
 
     pub fn sendRPCRequest(

@@ -137,6 +137,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
+    zeam_utils.addImport("xev", xev);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
