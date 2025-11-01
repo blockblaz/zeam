@@ -1,3 +1,4 @@
+pub mod logger;
 pub mod req_resp;
 
 use futures::future::Either;
@@ -145,15 +146,21 @@ pub unsafe fn publish_msg_to_rust_bridge(
     message_len: usize,
 ) {
     let message_slice = std::slice::from_raw_parts(message_str, message_len);
-    println!(
-        "rustbridge-{network_id}:: publishing message s={:?}..({:?})",
-        hex::encode(&message_slice[..100]),
-        message_len
+    logger::log_debug(
+        network_id,
+        &format!(
+            "publishing message s={:?}..({})",
+            hex::encode(&message_slice[..message_len.min(100)]),
+            message_len
+        ),
     );
     let message_data = message_slice.to_vec();
 
     if topic.is_null() {
-        eprintln!("Error: null pointer passed for `topic` in publish_msg_to_rust_bridge");
+        logger::log_error(
+            network_id,
+            "null pointer passed for `topic` in publish_msg_to_rust_bridge",
+        );
         return;
     }
 
@@ -172,7 +179,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
         .gossipsub
         .publish(topic.clone(), message_data)
     {
-        println!("Publish error: {e:?}");
+        logger::log_error(network_id, &format!("Publish error: {e:?}"));
     }
 }
 
@@ -192,7 +199,7 @@ pub unsafe fn send_rpc_request(
     let peer_id: PeerId = match peer_id_str.parse() {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("Invalid peer ID: {}", e);
+            logger::log_error(network_id, &format!("Invalid peer ID: {}", e));
             return 0;
         }
     };
@@ -203,9 +210,12 @@ pub unsafe fn send_rpc_request(
     let protocol = match LeanSupportedProtocol::try_from(protocol_tag) {
         Ok(protocol) => protocol,
         Err(_) => {
-            eprintln!(
-                "Invalid protocol tag {} provided for RPC request to {}",
-                protocol_tag, peer_id
+            logger::log_error(
+                network_id,
+                &format!(
+                    "Invalid protocol tag {} provided for RPC request to {}",
+                    protocol_tag, peer_id_str
+                ),
             );
             return 0;
         }
@@ -235,9 +245,13 @@ pub unsafe fn send_rpc_request(
         .unwrap()
         .insert(request_id, protocol_id.clone());
 
-    println!(
-        "reqresp:: Sent {:?} request to {} (id: {:?})",
-        protocol, peer_id, request_id
+    logger::log_info_module(
+        network_id,
+        "reqresp",
+        &format!(
+            "Sent {:?} request to {} (id: {})",
+            protocol, peer_id, request_id
+        ),
     );
 
     request_id
@@ -276,12 +290,19 @@ pub unsafe fn send_rpc_response_chunk(
             channel.stream_id,
             response_message,
         );
-        println!(
-            "Sent response payload on channel {} (peer: {})",
-            channel_id, channel.peer_id
+        logger::log_info_module(
+            network_id,
+            "reqresp",
+            &format!(
+                "Sent response payload on channel {} (peer: {})",
+                channel_id, channel.peer_id
+            ),
         );
     } else {
-        eprintln!("No response channel found for id {}", channel_id);
+        logger::log_error(
+            network_id,
+            &format!("No response channel found for id {}", channel_id),
+        );
     }
 }
 
@@ -307,12 +328,19 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
             channel.connection_id,
             channel.stream_id,
         );
-        println!(
-            "Sent end-of-stream on channel {} (peer: {})",
-            channel_id, channel.peer_id
+        logger::log_info_module(
+            network_id,
+            "reqresp",
+            &format!(
+                "Sent end-of-stream on channel {} (peer: {})",
+                channel_id, channel.peer_id
+            ),
         );
     } else {
-        eprintln!("No response channel found for id {}", channel_id);
+        logger::log_error(
+            network_id,
+            &format!("No response channel found for id {}", channel_id),
+        );
     }
 }
 
@@ -325,9 +353,12 @@ pub unsafe fn send_rpc_error_response(
     message_ptr: *const c_char,
 ) {
     if message_ptr.is_null() {
-        eprintln!(
-            "Attempted to send RPC error response with null message pointer for channel {}",
-            channel_id
+        logger::log_error(
+            network_id,
+            &format!(
+                "Attempted to send RPC error response with null message pointer for channel {}",
+                channel_id
+            ),
         );
         return;
     }
@@ -336,9 +367,12 @@ pub unsafe fn send_rpc_error_response(
     let message_bytes = message.as_bytes();
 
     if message_bytes.len() > crate::req_resp::configurations::max_message_size() {
-        eprintln!(
-            "Attempted to send RPC error payload exceeding maximum size on channel {}",
-            channel_id
+        logger::log_error(
+            network_id,
+            &format!(
+                "Attempted to send RPC error payload exceeding maximum size on channel {}",
+                channel_id
+            ),
         );
         return;
     }
@@ -376,12 +410,19 @@ pub unsafe fn send_rpc_error_response(
             channel.connection_id,
             channel.stream_id,
         );
-        println!(
-            "Sent error response on channel {} (peer: {}): {}",
-            channel_id, peer_id, message
+        logger::log_info_module(
+            network_id,
+            "reqresp",
+            &format!(
+                "Sent error response on channel {} (peer: {}): {}",
+                channel_id, peer_id, message
+            ),
         );
     } else {
-        eprintln!("No response channel found for id {}", channel_id);
+        logger::log_error(
+            network_id,
+            &format!("No response channel found for id {}", channel_id),
+        );
     }
 }
 
@@ -466,15 +507,15 @@ impl Network {
         connect_addresses: Vec<Multiaddr>,
         topics: Vec<String>,
     ) {
-        let mut swarm = new_swarm(key_pair, topics);
-        println!("starting listener");
+        let mut swarm = new_swarm(key_pair, topics, self.network_id);
+        logger::log_info(self.network_id, "starting listener");
 
         for mut addr in listen_addresses {
             strip_peer_id(&mut addr);
             swarm.listen_on(addr).unwrap();
         }
 
-        println!("going for loop match");
+        logger::log_debug(self.network_id, "going for loop match");
 
         if !connect_addresses.is_empty() {
             // helper closure for dialing peers
@@ -482,9 +523,18 @@ impl Network {
                 // strip the p2p protocol if it exists
                 strip_peer_id(&mut multiaddr);
                 match swarm.dial(multiaddr.clone()) {
-                    Ok(()) => println!("dialing libp2p peer address: {multiaddr}"),
+                    Ok(()) => logger::log_debug(
+                        self.network_id,
+                        &format!("dialing libp2p peer address: {}", multiaddr),
+                    ),
                     Err(err) => {
-                        println!("could not connect to peer address: {multiaddr} error: {err}");
+                        logger::log_error(
+                            self.network_id,
+                            &format!(
+                                "could not connect to peer address: {} error: {:?}",
+                                multiaddr, err
+                            ),
+                        );
                     }
                 };
             };
@@ -493,7 +543,7 @@ impl Network {
                 dial(addr);
             }
         } else {
-            println!("no connect addresses");
+            logger::log_debug(self.network_id, "no connect addresses");
         }
 
         if self.network_id < 1 {
@@ -524,9 +574,10 @@ impl Network {
             }) => {
                 match timeout_result {
                     Ok((request_id, ())) => {
-                        println!(
-                            "reqresp:: Request {} timed out after {:?}",
-                            request_id, REQUEST_TIMEOUT
+                        logger::log_warn_module(
+                            self.network_id,
+                            "reqresp",
+                            &format!("Request {} timed out after {:?}", request_id, REQUEST_TIMEOUT),
                         );
                         if let Some(protocol_id) = REQUEST_PROTOCOL_MAP
                             .lock()
@@ -550,7 +601,7 @@ impl Network {
                         }
                     }
                     Err(e) => {
-                        eprintln!("reqresp:: Error in delay map: {}", e);
+                        logger::log_error_module(self.network_id, "reqresp", &format!("Error in delay map: {}", e));
                     }
                 }
             }
@@ -558,22 +609,19 @@ impl Network {
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("\nListening on {address:?}\n");
+                            logger::log_info(self.network_id, &format!("\nListening on {}\n", address));
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             let peer_id = peer_id.to_string();
                             let peer_id = peer_id.as_str();
-                            println!(
-                                "\nrustbridge{}:: Connection established with peer: {}\n",
-                                self.network_id, peer_id
+                            logger::log_info(
+                                self.network_id,
+                                &format!("\nConnection established with peer: {}\n", peer_id),
                             );
                             let peer_id_cstr = match CString::new(peer_id) {
                                 Ok(cstr) => cstr,
                                 Err(_) => {
-                                    eprintln!(
-                                        "rustbridge{}:: invalid_peer_id_string={}",
-                                        self.network_id, peer_id
-                                    );
+                                    logger::log_error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
                                     continue;
                                 }
                             };
@@ -584,17 +632,14 @@ impl Network {
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             let peer_id = peer_id.to_string();
                             let peer_id = peer_id.as_str();
-                            println!(
-                                "\nrustbridge{}:: Connection closed with peer: {}\n",
-                                self.network_id, peer_id
+                            logger::log_info(
+                                self.network_id,
+                                &format!("\nConnection closed with peer: {}\n", peer_id),
                             );
                             let peer_id_cstr = match CString::new(peer_id) {
                                 Ok(cstr) => cstr,
                                 Err(_) => {
-                                    eprintln!(
-                                        "rustbridge{}:: invalid_peer_id_string={}",
-                                        self.network_id, peer_id
-                                    );
+                                    logger::log_error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
                                     continue;
                                 }
                             };
@@ -613,10 +658,7 @@ impl Network {
                             let topic = match CString::new(topic) {
                                 Ok(cstr) => cstr,
                                 Err(_) => {
-                                    eprintln!(
-                                        "rustbridge{}:: invalid_topic_string={}",
-                                        self.network_id, topic
-                                    );
+                                    logger::log_error(self.network_id, &format!("invalid_topic_string={}", topic));
                                     continue;
                                 }
                             };
@@ -628,10 +670,7 @@ impl Network {
                             unsafe {
                                 handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
                             };
-                            println!(
-                                "\nrustbridge{0}:: zig callback completed\n",
-                                self.network_id
-                            );
+                            logger::log_debug(self.network_id, "\nzig callback completed\n");
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
                             peer_id,
@@ -642,11 +681,10 @@ impl Network {
                                 let request_message = *message;
                                 let protocol = request_message.protocol.clone();
                                 let payload = request_message.payload;
-                                println!(
-                                    "reqresp:: Received request from {} for protocol {} ({} bytes)",
-                                    peer_id,
-                                    protocol.as_str(),
-                                    payload.len()
+                                logger::log_info_module(
+                                    self.network_id,
+                                    "reqresp",
+                                    &format!("Received request from {} for protocol {} ({} bytes)", peer_id, protocol.as_str(), payload.len()),
                                 );
 
                                 let channel_id =
@@ -665,9 +703,10 @@ impl Network {
                                 let peer_id_cstring = match CString::new(peer_id_string) {
                                     Ok(cstring) => cstring,
                                     Err(err) => {
-                                        eprintln!(
-                                            "reqresp:: Failed to create C string for peer id {}: {}",
-                                            peer_id, err
+                                        logger::log_error_module(
+                                            self.network_id,
+                                            "reqresp",
+                                            &format!("Failed to create C string for peer id {}: {}", peer_id, err),
                                         );
                                         continue;
                                     }
@@ -676,9 +715,10 @@ impl Network {
                                 let protocol_cstring = match CString::new(protocol.as_str()) {
                                     Ok(cstring) => cstring,
                                     Err(err) => {
-                                        eprintln!(
-                                            "reqresp:: Failed to create C string for protocol {}: {}",
-                                            protocol.as_str(), err
+                                        logger::log_error_module(
+                                            self.network_id,
+                                            "reqresp",
+                                            &format!("Failed to create C string for protocol {}: {}", protocol.as_str(), err),
                                         );
                                         continue;
                                     }
@@ -703,21 +743,20 @@ impl Network {
                                     }
                                 }
                                 let response_message = *message;
-                                println!(
-                                    "reqresp:: Received response from {} for request id {} ({} bytes)",
-                                    peer_id,
-                                    request_id,
-                                    response_message.payload.len()
+                                logger::log_info_module(
+                                    self.network_id,
+                                    "reqresp",
+                                    &format!("Received response from {} for request id {} ({} bytes)", peer_id, request_id, response_message.payload.len()),
                                 );
                                 let protocol_cstring = match CString::new(
                                     response_message.protocol.as_str(),
                                 ) {
                                     Ok(cstring) => cstring,
                                     Err(err) => {
-                                        eprintln!(
-                                            "reqresp:: Failed to create C string for protocol {}: {}",
-                                            response_message.protocol.as_str(),
-                                            err
+                                        logger::log_error_module(
+                                            self.network_id,
+                                            "reqresp",
+                                            &format!("Failed to create C string for protocol {}: {}", response_message.protocol.as_str(), err),
                                         );
                                         continue;
                                     }
@@ -744,10 +783,10 @@ impl Network {
                                     let protocol_cstring = match CString::new(protocol_id.as_str()) {
                                         Ok(cstring) => cstring,
                                         Err(err) => {
-                                            eprintln!(
-                                                "reqresp:: Failed to create C string for protocol {} on end-of-stream: {}",
-                                                protocol_id.as_str(),
-                                                err
+                                            logger::log_error_module(
+                                                self.network_id,
+                                                "reqresp",
+                                                &format!("Failed to create C string for protocol {} on end-of-stream: {}", protocol_id.as_str(), err),
                                             );
                                             continue;
                                         }
@@ -761,16 +800,18 @@ impl Network {
                                         );
                                     }
                                 } else {
-                                    println!(
-                                        "reqresp:: Received end-of-stream for request id {} without protocol mapping",
-                                        request_id
+                                    logger::log_warn_module(
+                                        self.network_id,
+                                        "reqresp",
+                                        &format!("Received end-of-stream for request id {} without protocol mapping", request_id),
                                     );
                                 }
                             }
                             Err(ReqRespMessageError::Inbound { stream_id, err }) => {
-                                println!(
-                                    "reqresp:: Inbound error from {} on stream {}: {:?}",
-                                    peer_id, stream_id, err
+                                logger::log_error_module(
+                                    self.network_id,
+                                    "reqresp",
+                                    &format!("Inbound error from {} on stream {}: {:?}", peer_id, stream_id, err),
                                 );
                                 RESPONSE_CHANNEL_MAP
                                     .lock()
@@ -804,13 +845,14 @@ impl Network {
                                         }
                                     }
                                 }
-                                println!(
-                                    "reqresp:: Outbound error for request {} with {}: {:?}",
-                                    request_id, peer_id, err
+                                logger::log_error_module(
+                                    self.network_id,
+                                    "reqresp",
+                                    &format!("Outbound error for request {} with {}: {:?}", request_id, peer_id, err),
                                 );
                             }
                         },
-                        e => println!("{e:?}"),
+                        e => logger::log_debug(self.network_id, &format!("{:?}", e)),
                     }
                 }
             }
@@ -902,9 +944,13 @@ impl Behaviour {
     }
 }
 
-fn new_swarm(local_keypair: Keypair, topics: Vec<String>) -> libp2p::swarm::Swarm<Behaviour> {
+fn new_swarm(
+    local_keypair: Keypair,
+    topics: Vec<String>,
+    network_id: u32,
+) -> libp2p::swarm::Swarm<Behaviour> {
     let transport = build_transport(local_keypair.clone(), true).unwrap();
-    println!("build the transport");
+    logger::log_debug(network_id, "build the transport");
 
     let builder = SwarmBuilder::with_existing_identity(local_keypair)
         .with_tokio()
