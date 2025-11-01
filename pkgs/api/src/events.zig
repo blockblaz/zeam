@@ -1,7 +1,12 @@
 const std = @import("std");
-const json = std.json;
 const types = @import("@zeam/types");
 const utils = @import("@zeam/utils");
+
+const Allocator = std.mem.Allocator;
+const Checkpoint = types.Checkpoint;
+
+const json = std.json;
+const jsonToString = utils.jsonToString;
 
 /// SSE Event types for chain state changes
 pub const ChainEventType = enum {
@@ -18,7 +23,7 @@ pub const NewHeadEvent = struct {
     state_root: []const u8,
     timely: bool,
 
-    pub fn fromProtoBlock(allocator: std.mem.Allocator, proto_block: types.ProtoBlock) !NewHeadEvent {
+    pub fn fromProtoBlock(allocator: Allocator, proto_block: types.ProtoBlock) !NewHeadEvent {
         const block_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.blockRoot)});
         const parent_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.parentRoot)});
         const state_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.stateRoot)});
@@ -32,7 +37,7 @@ pub const NewHeadEvent = struct {
         };
     }
 
-    pub fn toJson(self: *const NewHeadEvent, allocator: std.mem.Allocator) !json.Value {
+    pub fn toJson(self: *const NewHeadEvent, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         try obj.put("block_root", json.Value{ .string = self.block_root });
@@ -42,12 +47,12 @@ pub const NewHeadEvent = struct {
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const NewHeadEvent, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const NewHeadEvent, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
+        return jsonToString(allocator, json_value);
     }
 
-    pub fn deinit(self: *NewHeadEvent, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NewHeadEvent, allocator: Allocator) void {
         allocator.free(self.block_root);
         allocator.free(self.parent_root);
         allocator.free(self.state_root);
@@ -60,7 +65,7 @@ pub const NewJustificationEvent = struct {
     root: []const u8,
     justified_slot: u64,
 
-    pub fn fromCheckpoint(allocator: std.mem.Allocator, checkpoint: types.Mini3SFCheckpoint, current_slot: u64) !NewJustificationEvent {
+    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewJustificationEvent {
         const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
 
         return NewJustificationEvent{
@@ -70,7 +75,7 @@ pub const NewJustificationEvent = struct {
         };
     }
 
-    pub fn toJson(self: *const NewJustificationEvent, allocator: std.mem.Allocator) !json.Value {
+    pub fn toJson(self: *const NewJustificationEvent, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         try obj.put("root", json.Value{ .string = self.root });
@@ -78,12 +83,12 @@ pub const NewJustificationEvent = struct {
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const NewJustificationEvent, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const NewJustificationEvent, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
+        return jsonToString(allocator, json_value);
     }
 
-    pub fn deinit(self: *NewJustificationEvent, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NewJustificationEvent, allocator: Allocator) void {
         allocator.free(self.root);
     }
 };
@@ -94,7 +99,7 @@ pub const NewFinalizationEvent = struct {
     root: []const u8,
     finalized_slot: u64,
 
-    pub fn fromCheckpoint(allocator: std.mem.Allocator, checkpoint: types.Mini3SFCheckpoint, current_slot: u64) !NewFinalizationEvent {
+    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewFinalizationEvent {
         const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
 
         return NewFinalizationEvent{
@@ -104,7 +109,7 @@ pub const NewFinalizationEvent = struct {
         };
     }
 
-    pub fn toJson(self: *const NewFinalizationEvent, allocator: std.mem.Allocator) !json.Value {
+    pub fn toJson(self: *const NewFinalizationEvent, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         try obj.put("root", json.Value{ .string = self.root });
@@ -112,12 +117,12 @@ pub const NewFinalizationEvent = struct {
         return json.Value{ .object = obj };
     }
 
-    pub fn toJsonString(self: *const NewFinalizationEvent, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn toJsonString(self: *const NewFinalizationEvent, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
-        return utils.jsonToString(allocator, json_value);
+        return jsonToString(allocator, json_value);
     }
 
-    pub fn deinit(self: *NewFinalizationEvent, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NewFinalizationEvent, allocator: Allocator) void {
         allocator.free(self.root);
     }
 };
@@ -128,7 +133,7 @@ pub const ChainEvent = union(ChainEventType) {
     new_justification: NewJustificationEvent,
     new_finalization: NewFinalizationEvent,
 
-    pub fn deinit(self: *ChainEvent, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ChainEvent, allocator: Allocator) void {
         switch (self.*) {
             .new_head => |*event| event.deinit(allocator),
             .new_justification => |*event| event.deinit(allocator),
@@ -138,7 +143,7 @@ pub const ChainEvent = union(ChainEventType) {
 };
 
 /// Serialize a chain event to JSON for SSE
-pub fn serializeEventToJson(allocator: std.mem.Allocator, event: ChainEvent) ![]u8 {
+pub fn serializeEventToJson(allocator: Allocator, event: ChainEvent) ![]u8 {
     const event_name = @tagName(std.meta.activeTag(event));
 
     var json_str = std.ArrayListUnmanaged(u8){};
@@ -199,7 +204,7 @@ test "serialize new head event" {
 test "serialize new justification event" {
     const allocator = std.testing.allocator;
 
-    const checkpoint = types.Mini3SFCheckpoint{
+    const checkpoint = Checkpoint{
         .slot = 120,
         .root = [_]u8{5} ** 32,
     };
@@ -219,7 +224,7 @@ test "serialize new justification event" {
 test "serialize new finalization event" {
     const allocator = std.testing.allocator;
 
-    const checkpoint = types.Mini3SFCheckpoint{
+    const checkpoint = Checkpoint{
         .slot = 100,
         .root = [_]u8{4} ** 32,
     };

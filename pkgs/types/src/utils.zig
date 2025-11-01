@@ -15,6 +15,7 @@ pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
+pub const Bytes52 = [52]u8;
 
 pub const SIGSIZE = 4000;
 pub const Bytes4000 = [SIGSIZE]u8;
@@ -28,12 +29,29 @@ pub const ZERO_HASH_4000 = [_]u8{0} ** SIGSIZE;
 
 pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex };
 
-pub const HistoricalBlockHashes = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
-pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
-pub const JustificationsRoots = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMIT);
-pub const JustificationsValidators = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
-
 const json = std.json;
+
+// prepare the state to be pre state of the slot
+pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
+    if (candidate < finalized) {
+        return StateTransitionError.InvalidJustifiableSlot;
+    }
+
+    const delta: f32 = @floatFromInt(candidate - finalized);
+    if (delta <= 5) {
+        return true;
+    }
+    const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
+    if (delta_x2 == 0) {
+        return true;
+    }
+    const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
+    if (delta_x2_x == 0.5) {
+        return true;
+    }
+
+    return false;
+}
 
 // Helper function to convert bytes to hex string
 pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {

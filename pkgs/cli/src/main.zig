@@ -209,8 +209,9 @@ pub fn main() !void {
             // starting beam state
             var beam_state = mock_chain.genesis_state;
             // block 0 is genesis so we have to apply block 1 onwards
-            for (mock_chain.blocks[1..]) |block| {
-                std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.message.slot, beam_state.slot });
+            for (mock_chain.blocks[1..]) |signed_block| {
+                const block = signed_block.message.block;
+                std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
                 const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
                 // transition beam state for the next block
                 try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });

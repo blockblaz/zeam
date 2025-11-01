@@ -11,12 +11,12 @@ const transition = @import("./transition.zig");
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
-    blocks: []types.SignedBeamBlock,
+    blocks: []types.SignedBlockWithAttestation,
     blockRoots: []types.Root,
     // what should be justified and finalzied post each of these blocks
-    latestJustified: []types.Mini3SFCheckpoint,
-    latestFinalized: []types.Mini3SFCheckpoint,
-    latestHead: []types.Mini3SFCheckpoint,
+    latestJustified: []types.Checkpoint,
+    latestFinalized: []types.Checkpoint,
+    latestHead: []types.Checkpoint,
     // did justification/finalization happen
     justification: []bool,
     finalization: []bool,
@@ -45,16 +45,16 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var genesis_state: types.BeamState = undefined;
     try genesis_state.genGenesisState(allocator, genesis_config);
     errdefer genesis_state.deinit();
-    var blockList = std.ArrayList(types.SignedBeamBlock).init(allocator);
+    var blockList = std.ArrayList(types.SignedBlockWithAttestation).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
 
-    var justificationCPList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
+    var justificationCPList = std.ArrayList(types.Checkpoint).init(allocator);
     var justificationList = std.ArrayList(bool).init(allocator);
 
-    var finalizationCPList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
+    var finalizationCPList = std.ArrayList(types.Checkpoint).init(allocator);
     var finalizationList = std.ArrayList(bool).init(allocator);
 
-    var headList = std.ArrayList(types.Mini3SFCheckpoint).init(allocator);
+    var headList = std.ArrayList(types.Checkpoint).init(allocator);
 
     // figure out a way to clone genesis_state
     var beam_state: types.BeamState = undefined;
@@ -64,9 +64,22 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var genesis_block: types.BeamBlock = undefined;
     try beam_state.genGenesisBlock(allocator, &genesis_block);
 
-    const gen_signed_block = types.SignedBeamBlock{
-        .message = genesis_block,
-        .signature = types.ZERO_HASH_4000,
+    const gen_block_with_attestation = types.BlockWithAttestation{
+        .block = genesis_block,
+        .proposer_attestation = types.Attestation{
+            .validator_id = 0,
+            .data = types.AttestationData{
+                .slot = 0,
+                .head = .{ .root = types.ZERO_HASH, .slot = 0 },
+                .target = .{ .root = types.ZERO_HASH, .slot = 0 },
+                .source = .{ .root = types.ZERO_HASH, .slot = 0 },
+            },
+        },
+    };
+
+    const gen_signed_block = types.SignedBlockWithAttestation{
+        .message = gen_block_with_attestation,
+        .signature = try types.createBlockSignatures(allocator, genesis_block.body.attestations.len()),
     };
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
@@ -76,8 +89,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     var prev_block = genesis_block;
 
-    // track latest justified and finalized for constructing votes
-    var latest_justified: types.Mini3SFCheckpoint = .{ .root = block_root, .slot = genesis_block.slot };
+    // track latest justified and finalized for constructing attestations
+    var latest_justified: types.Checkpoint = .{ .root = block_root, .slot = genesis_block.slot };
     var latest_justified_prev = latest_justified;
     var latest_finalized = latest_justified;
 
@@ -103,129 +116,116 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         const state_root: [32]u8 = types.ZERO_HASH;
         // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
-        var votes = std.ArrayList(types.SignedVote).init(allocator);
+        var attestations = std.ArrayList(types.Attestation).init(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
-            // no votes on the first block of this
+            // no attestations on the first block of this
             1 => {
                 head_idx = slot;
             },
             2 => {
-                const slotVotes = [_]types.SignedVote{
+                const slotAttestations = [_]types.Attestation{
                     // val 0
                     .{
                         .validator_id = 0,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                     // skip val1
-
                     // val2
                     .{
                         .validator_id = 2,
-                        .message = .{ //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
                     .{
                         .validator_id = 3,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
-                for (slotVotes) |slotVote| {
-                    try votes.append(slotVote);
+
+                for (slotAttestations) |slotAttestation| {
+                    try attestations.append(slotAttestation);
                 }
 
                 head_idx = slot;
-                // post these votes last_justified would be updated
+                // post these attestations last_justified would be updated
                 latest_justified_prev = latest_justified;
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             3 => {
-                const slotVotes = [_]types.SignedVote{
+                const slotAttestations = [_]types.Attestation{
                     // skip val0
 
                     // val 1
                     .{
                         .validator_id = 1,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val2
                     .{
                         .validator_id = 2,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // val3
                     .{
                         .validator_id = 3,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
                 };
-                for (slotVotes) |slotVote| {
-                    try votes.append(slotVote);
+                for (slotAttestations) |slotAttestation| {
+                    try attestations.append(slotAttestation);
                 }
 
                 head_idx = slot;
-                // post these votes last justified and finalized would be updated
+                // post these attestations last justified and finalized would be updated
                 latest_finalized = latest_justified;
                 latest_justified_prev = latest_justified;
                 latest_justified = .{ .root = parent_root, .slot = slot - 1 };
             },
             0 => {
-                const slotVotes = [_]types.SignedVote{
+                const slotAttestations = [_]types.Attestation{
                     // val 0
                     .{
                         .validator_id = 0,
-                        .message = .{
-                            //
+                        .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
                             .target = .{ .root = parent_root, .slot = slot - 1 },
                             .source = latest_justified,
                         },
-                        .signature = [_]u8{0} ** types.SIGSIZE,
                     },
 
                     // skip val1
@@ -236,26 +236,27 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
                 };
 
                 head_idx = slot;
-                for (slotVotes) |slotVote| {
-                    try votes.append(slotVote);
+                for (slotAttestations) |slotAttestation| {
+                    try attestations.append(slotAttestation);
                 }
             },
             else => unreachable,
         }
 
+        const proposer_index = slot % genesis_config.num_validators;
         var block = types.BeamBlock{
             .slot = slot,
-            .proposer_index = slot % genesis_config.num_validators,
+            .proposer_index = proposer_index,
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
                 .attestations = blk: {
-                    var attestations = try types.SignedVotes.init(allocator);
-                    for (votes.items) |vote| {
-                        try attestations.append(vote);
+                    var attestations_list = try types.Attestations.init(allocator);
+                    for (attestations.items) |attestation| {
+                        try attestations_list.append(attestation);
                     }
-                    break :blk attestations;
+                    break :blk attestations_list;
                 },
             },
         };
@@ -265,14 +266,34 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list
-        const signed_block = types.SignedBeamBlock{
-            .message = block,
-            .signature = types.ZERO_HASH_4000,
+        const block_with_attestation = types.BlockWithAttestation{
+            .block = block,
+            // set the additional proposer attestation to the old with genesis
+            // this way it won't get impored in the forkchoice since forkchoice doesn't
+            // import old attestations
+            // TODO: update with the correct proposer attestation as per the mock sequence
+            .proposer_attestation = .{
+                .validator_id = proposer_index,
+                .data = types.AttestationData{
+                    // setting slot=0 helps to ignore this attestation because forkchoice wouldn't import
+                    // old attestations
+                    .slot = 0,
+                    // set all the votes to genesis since this attestation is to be ignored
+                    .head = .{ .root = blockRootList.items[0], .slot = 0 },
+                    .target = .{ .root = blockRootList.items[0], .slot = 0 },
+                    .source = .{ .root = blockRootList.items[0], .slot = 0 },
+                },
+            },
+        };
+
+        const signed_block = types.SignedBlockWithAttestation{
+            .message = block_with_attestation,
+            .signature = try types.createBlockSignatures(allocator, attestations.items.len),
         };
         try blockList.append(signed_block);
         try blockRootList.append(block_root);
 
-        const head = types.Mini3SFCheckpoint{ .root = blockRootList.items[head_idx], .slot = head_idx };
+        const head = types.Checkpoint{ .root = blockRootList.items[head_idx], .slot = head_idx };
         try headList.append(head);
 
         try justificationCPList.append(latest_justified);

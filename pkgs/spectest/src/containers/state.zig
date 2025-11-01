@@ -22,14 +22,14 @@ fn sampleBlockHeader() types.BeamBlockHeader {
     };
 }
 
-fn sampleCheckpoint() types.Mini3SFCheckpoint {
+fn sampleCheckpoint() types.Checkpoint {
     return .{
         .root = [_]u8{0} ** 32,
         .slot = 0,
     };
 }
 
-fn baseState(allocator: Allocator) types.BeamState {
+fn baseState(allocator: Allocator) !types.BeamState {
     return .{
         .config = sampleConfig(),
         .slot = 0,
@@ -38,14 +38,15 @@ fn baseState(allocator: Allocator) types.BeamState {
         .latest_finalized = sampleCheckpoint(),
         .historical_block_hashes = try types.HistoricalBlockHashes.init(allocator),
         .justified_slots = try types.JustifiedSlots.init(allocator),
-        .justifications_roots = try types.JustificationsRoots.init(allocator),
-        .justifications_validators = try types.JustificationsValidators.init(allocator),
+        .validators = try types.Validators.init(allocator),
+        .justifications_roots = try types.JustificationRoots.init(allocator),
+        .justifications_validators = try types.JustificationValidators.init(allocator),
     };
 }
 
 test "test_get_justifications_empty" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Sanity: State starts with no justifications data.
@@ -62,7 +63,7 @@ test "test_get_justifications_empty" {
 
 test "test_get_justifications_single_root" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Create a unique root under consideration.
@@ -71,12 +72,11 @@ test "test_get_justifications_single_root" {
     // Add the root to the state
     try base_state.justifications_roots.append(root1);
 
-    // Prepare a vote bitlist with required length; flip two positions to True.
     const count = base_state.config.num_validators;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const vote = (i == 2 or i == 5); // Validator 2 and 5 voted True
-        try base_state.justifications_validators.append(vote);
+        const attest = (i == 2 or i == 5); // Validator 2 and 5 attested True
+        try base_state.justifications_validators.append(attest);
     }
 
     // Rebuild the map from the flattened state.
@@ -94,19 +94,19 @@ test "test_get_justifications_single_root" {
     try std.testing.expectEqual(@as(u32, 1), justifications.count());
 
     // Verify the mapping
-    const votes_slice = justifications.get(root1).?;
-    try std.testing.expectEqual(count, votes_slice.len);
+    const attestations_slice = justifications.get(root1).?;
+    try std.testing.expectEqual(count, attestations_slice.len);
 
-    // Check specific votes: positions 2 and 5 should be True, others False
-    for (votes_slice, 0..) |vote_byte, idx| {
+    // Check specific attestations: positions 2 and 5 should be True, others False
+    for (attestations_slice, 0..) |attest_byte, idx| {
         const expected: u8 = if (idx == 2 or idx == 5) 1 else 0;
-        try std.testing.expectEqual(expected, vote_byte);
+        try std.testing.expectEqual(expected, attest_byte);
     }
 }
 
 test "test_get_justifications_multiple_roots" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Three distinct roots to track.
@@ -119,23 +119,23 @@ test "test_get_justifications_multiple_roots" {
     try base_state.justifications_roots.append(root2);
     try base_state.justifications_roots.append(root3);
 
-    // Validator count for each vote slice.
+    // Validator count for each attestation slice.
     const count = base_state.config.num_validators;
 
-    // Build per-root vote slices and add to state
-    // votes1: Only validator 0 in favor for root1
+    // Build per-root attestation slices and add to state
+    // attestations1: Only validator 0 in favor for root1
     var i: usize = 0;
     while (i < count) : (i += 1) {
         try base_state.justifications_validators.append(i == 0);
     }
 
-    // votes2: Validators 1 and 2 in favor for root2
+    // attestations2: Validators 1 and 2 in favor for root2
     i = 0;
     while (i < count) : (i += 1) {
         try base_state.justifications_validators.append(i == 1 or i == 2);
     }
 
-    // votes3: Unanimous in favor for root3
+    // attestations3: Unanimous in favor for root3
     i = 0;
     while (i < count) : (i += 1) {
         try base_state.justifications_validators.append(true);
@@ -158,32 +158,32 @@ test "test_get_justifications_multiple_roots" {
     // Validate that each root maps to its intended slice.
 
     // Check root1: only validator 0 should be True
-    const votes1 = justifications.get(root1).?;
-    try std.testing.expectEqual(count, votes1.len);
-    for (votes1, 0..) |vote_byte, idx| {
+    const attestations1 = justifications.get(root1).?;
+    try std.testing.expectEqual(count, attestations1.len);
+    for (attestations1, 0..) |attest_byte, idx| {
         const expected: u8 = if (idx == 0) 1 else 0;
-        try std.testing.expectEqual(expected, vote_byte);
+        try std.testing.expectEqual(expected, attest_byte);
     }
 
     // Check root2: validators 1 and 2 should be True
-    const votes2 = justifications.get(root2).?;
-    try std.testing.expectEqual(count, votes2.len);
-    for (votes2, 0..) |vote_byte, idx| {
+    const attestations2 = justifications.get(root2).?;
+    try std.testing.expectEqual(count, attestations2.len);
+    for (attestations2, 0..) |attest_byte, idx| {
         const expected: u8 = if (idx == 1 or idx == 2) 1 else 0;
-        try std.testing.expectEqual(expected, vote_byte);
+        try std.testing.expectEqual(expected, attest_byte);
     }
 
     // Check root3: all validators should be True
-    const votes3 = justifications.get(root3).?;
-    try std.testing.expectEqual(count, votes3.len);
-    for (votes3) |vote_byte| {
-        try std.testing.expectEqual(@as(u8, 1), vote_byte);
+    const attestations3 = justifications.get(root3).?;
+    try std.testing.expectEqual(count, attestations3.len);
+    for (attestations3) |attest_byte| {
+        try std.testing.expectEqual(@as(u8, 1), attest_byte);
     }
 }
 
 test "test_with_justifications_invalid_length" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1 = [_]u8{1} ** 32;
@@ -202,7 +202,7 @@ test "test_with_justifications_invalid_length" {
 test "test_with_justifications_empty" {
     const allocator = std.testing.allocator;
 
-    var initial_state = baseState(allocator);
+    var initial_state = try baseState(allocator);
     defer initial_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -227,28 +227,28 @@ test "test_with_justifications_empty" {
 
 test "test_with_justifications_deterministic_order" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Two roots to test ordering
     const root1: types.Root = [_]u8{1} ** 32;
     const root2: types.Root = [_]u8{2} ** 32;
 
-    // Build two vote slices of proper length
+    // Build two attestation slices of proper length
     const count = base_state.config.num_validators;
-    const votes1_buf = try allocator.alloc(u8, count);
-    defer allocator.free(votes1_buf);
-    @memset(votes1_buf, 0); // All False
+    const attestations1_buf = try allocator.alloc(u8, count);
+    defer allocator.free(attestations1_buf);
+    @memset(attestations1_buf, 0); // All False
 
-    const votes2_buf = try allocator.alloc(u8, count);
-    defer allocator.free(votes2_buf);
-    @memset(votes2_buf, 1); // All True
+    const attestations2_buf = try allocator.alloc(u8, count);
+    defer allocator.free(attestations2_buf);
+    @memset(attestations2_buf, 1); // All True
 
     // Intentionally supply the map in unsorted key order (root2 first, then root1)
     var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications.deinit(allocator);
-    try justifications.put(allocator, root2, votes2_buf);
-    try justifications.put(allocator, root1, votes1_buf);
+    try justifications.put(allocator, root2, attestations2_buf);
+    try justifications.put(allocator, root1, attestations1_buf);
 
     // Flatten into the state; method sorts keys deterministically
     try base_state.withJustifications(allocator, &justifications);
@@ -258,34 +258,34 @@ test "test_with_justifications_deterministic_order" {
     try std.testing.expectEqual(root1, base_state.justifications_roots.constSlice()[0]);
     try std.testing.expectEqual(root2, base_state.justifications_roots.constSlice()[1]);
 
-    // The flattened validators list should follow the same order (votes1 + votes2)
+    // The flattened validators list should follow the same order (attestations1 + attestations2)
     try std.testing.expectEqual(count * 2, base_state.justifications_validators.len());
 
-    // Check first part corresponds to votes1 (all false)
+    // Check first part corresponds to attestations1 (all false)
     for (0..count) |i| {
-        const vote = try base_state.justifications_validators.get(i);
-        try std.testing.expect(!vote);
+        const attest = try base_state.justifications_validators.get(i);
+        try std.testing.expect(!attest);
     }
 
-    // Check second part corresponds to votes2 (all true)
+    // Check second part corresponds to attestations2 (all true)
     for (count..base_state.justifications_validators.len()) |i| {
-        const vote = try base_state.justifications_validators.get(i);
-        try std.testing.expect(vote);
+        const attest = try base_state.justifications_validators.get(i);
+        try std.testing.expect(attest);
     }
 }
 
-// Helper function to create votes array with specific indices set to True
-fn createVotes(allocator: Allocator, true_indices: []const usize, total_count: usize) ![]u8 {
-    const votes = try allocator.alloc(u8, total_count);
-    @memset(votes, 0); // Initialize all to False
+// Helper function to create attestations array with specific indices set to True
+fn createAttestations(allocator: Allocator, true_indices: []const usize, total_count: usize) ![]u8 {
+    const attestations = try allocator.alloc(u8, total_count);
+    @memset(attestations, 0); // Initialize all to False
 
     for (true_indices) |idx| {
         if (idx < total_count) {
-            votes[idx] = 1; // Set to True
+            attestations[idx] = 1; // Set to True
         }
     }
 
-    return votes;
+    return attestations;
 }
 
 // Helper function to verify roundtrip equality
@@ -310,14 +310,14 @@ fn verifyRoundtrip(allocator: Allocator, base_state: *types.BeamState, original_
     // Verify each entry matches (the implementation should handle sorting internally)
     var original_it = original_justifications.iterator();
     while (original_it.next()) |original_entry| {
-        const reconstructed_votes = reconstructed_map.get(original_entry.key_ptr.*);
-        try std.testing.expect(reconstructed_votes != null);
+        const reconstructed_attestations = reconstructed_map.get(original_entry.key_ptr.*);
+        try std.testing.expect(reconstructed_attestations != null);
 
-        const original_votes = original_entry.value_ptr.*;
-        const reconstructed_slice = reconstructed_votes.?;
+        const original_attestations = original_entry.value_ptr.*;
+        const reconstructed_slice = reconstructed_attestations.?;
 
-        try std.testing.expectEqual(original_votes.len, reconstructed_slice.len);
-        for (original_votes, reconstructed_slice) |orig, recon| {
+        try std.testing.expectEqual(original_attestations.len, reconstructed_slice.len);
+        for (original_attestations, reconstructed_slice) |orig, recon| {
             try std.testing.expectEqual(orig, recon);
         }
     }
@@ -325,7 +325,7 @@ fn verifyRoundtrip(allocator: Allocator, base_state: *types.BeamState, original_
 
 test "test_justifications_roundtrip_empty" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     // Empty justifications map
@@ -337,24 +337,24 @@ test "test_justifications_roundtrip_empty" {
 
 test "test_justifications_roundtrip_single_root" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
     const true_indices = [_]usize{0};
-    const votes1 = try createVotes(allocator, &true_indices, base_state.config.num_validators);
-    defer allocator.free(votes1);
+    const attestations1 = try createAttestations(allocator, &true_indices, base_state.config.num_validators);
+    defer allocator.free(attestations1);
 
     var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications_map.deinit(allocator);
-    try justifications_map.put(allocator, root1, votes1);
+    try justifications_map.put(allocator, root1, attestations1);
 
     try verifyRoundtrip(allocator, &base_state, &justifications_map);
 }
 
 test "test_justifications_roundtrip_multiple_roots_sorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -362,23 +362,23 @@ test "test_justifications_roundtrip_multiple_roots_sorted" {
 
     const true_indices_1 = [_]usize{0};
     const true_indices_2 = [_]usize{ 1, 2 };
-    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
-    defer allocator.free(votes1);
-    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
-    defer allocator.free(votes2);
+    const attestations1 = try createAttestations(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(attestations1);
+    const attestations2 = try createAttestations(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(attestations2);
 
     var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications_map.deinit(allocator);
     // Insert in sorted order
-    try justifications_map.put(allocator, root1, votes1);
-    try justifications_map.put(allocator, root2, votes2);
+    try justifications_map.put(allocator, root1, attestations1);
+    try justifications_map.put(allocator, root2, attestations2);
 
     try verifyRoundtrip(allocator, &base_state, &justifications_map);
 }
 
 test "test_justifications_roundtrip_multiple_roots_unsorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -386,23 +386,23 @@ test "test_justifications_roundtrip_multiple_roots_unsorted" {
 
     const true_indices_1 = [_]usize{0};
     const true_indices_2 = [_]usize{ 1, 2 };
-    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
-    defer allocator.free(votes1);
-    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
-    defer allocator.free(votes2);
+    const attestations1 = try createAttestations(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(attestations1);
+    const attestations2 = try createAttestations(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(attestations2);
 
     var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications_map.deinit(allocator);
     // Insert in unsorted order (root2 first, then root1)
-    try justifications_map.put(allocator, root2, votes2);
-    try justifications_map.put(allocator, root1, votes1);
+    try justifications_map.put(allocator, root2, attestations2);
+    try justifications_map.put(allocator, root1, attestations1);
 
     try verifyRoundtrip(allocator, &base_state, &justifications_map);
 }
 
 test "test_justifications_roundtrip_complex_unsorted" {
     const allocator = std.testing.allocator;
-    var base_state = baseState(allocator);
+    var base_state = try baseState(allocator);
     defer base_state.deinit();
 
     const root1: types.Root = [_]u8{1} ** 32;
@@ -411,22 +411,22 @@ test "test_justifications_roundtrip_complex_unsorted" {
 
     const true_indices_1 = [_]usize{0};
     const true_indices_2 = [_]usize{ 1, 2 };
-    const votes1 = try createVotes(allocator, &true_indices_1, base_state.config.num_validators);
-    defer allocator.free(votes1);
-    const votes2 = try createVotes(allocator, &true_indices_2, base_state.config.num_validators);
-    defer allocator.free(votes2);
+    const attestations1 = try createAttestations(allocator, &true_indices_1, base_state.config.num_validators);
+    defer allocator.free(attestations1);
+    const attestations2 = try createAttestations(allocator, &true_indices_2, base_state.config.num_validators);
+    defer allocator.free(attestations2);
 
-    // votes3: all validators vote True (unanimous)
-    const votes3 = try allocator.alloc(u8, base_state.config.num_validators);
-    defer allocator.free(votes3);
-    @memset(votes3, 1);
+    // attestations3: all validators attest True (unanimous)
+    const attestations3 = try allocator.alloc(u8, base_state.config.num_validators);
+    defer allocator.free(attestations3);
+    @memset(attestations3, 1);
 
     var justifications_map: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
     defer justifications_map.deinit(allocator);
     // Insert in unsorted order (root3, root1, root2)
-    try justifications_map.put(allocator, root3, votes3);
-    try justifications_map.put(allocator, root1, votes1);
-    try justifications_map.put(allocator, root2, votes2);
+    try justifications_map.put(allocator, root3, attestations3);
+    try justifications_map.put(allocator, root1, attestations1);
+    try justifications_map.put(allocator, root2, attestations2);
 
     try verifyRoundtrip(allocator, &base_state, &justifications_map);
 }
@@ -460,7 +460,7 @@ test "test_generate_genesis" {
 
     // Body root must commit to an empty body at genesis
     var expected_body = types.BeamBlockBody{
-        .attestations = try types.SignedVotes.init(allocator),
+        .attestations = try types.Attestations.init(allocator),
     };
     defer expected_body.deinit();
 
