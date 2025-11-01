@@ -80,27 +80,35 @@ pub const ValidatorClient = struct {
         }
     }
 
-    pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
+    pub fn getSlotProposer(self: *Self, slot: usize) ?usize {
         const num_validators: usize = @intCast(self.config.genesis.num_validators);
-
-        // check for block production
         const slot_proposer_id = slot % num_validators;
-        if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
-            _ = index;
+        return std.mem.indexOfScalar(usize, self.ids, slot_proposer_id);
+    }
+
+    pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
+        if (self.getSlotProposer(slot)) |slot_proposer_id| {
+            // 1. construct the block
             self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
 
-            // Construct proposer attestation for the produced block
+            // 2. construct proposer attestation for the produced block which should already be in forkchoice
+            // including its attestations
             const proposer_attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
-
-            const block_with_attestation = types.BlockWithAttestation{
-                .block = produced_block.block,
-                .proposer_attestation = .{
-                    .validator_id = slot_proposer_id,
-                    .data = proposer_attestation_data,
-                },
+            const proposer_attestation = types.Attestation{
+                .validator_id = slot_proposer_id,
+                .data = proposer_attestation_data,
             };
 
+            // 3. construct the message to be signed
+            const block_with_attestation = types.BlockWithAttestation{
+                .block = produced_block.block,
+                .proposer_attestation = proposer_attestation,
+            };
+
+            // 4. proposer signature which is currently over just proposer_attestation but will eventually
+            //  be over the full message when the leanVM signature validation is introduced which can validate
+            //  the proposer_attestation with that combined signature
             const signed_block = types.SignedBlockWithAttestation{
                 .message = block_with_attestation,
                 .signature = try types.createBlockSignatures(self.allocator, produced_block.block.body.attestations.len()),
@@ -122,12 +130,20 @@ pub const ValidatorClient = struct {
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
+        const slot_proposer_id = self.getSlotProposer(slot);
 
         self.logger.info("constructing attestation message for slot={d}", .{slot});
         const attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
 
         var result = ValidatorClientOutput.init(self.allocator);
         for (self.ids) |validator_id| {
+            // if this validator had proposal its vote would have already been casted
+            // with the block proposal
+            if (validator_id == slot_proposer_id) {
+                self.logger.info("skipping separate attestation for proposer slot={d} validator={d}", .{ slot, validator_id });
+                continue;
+            }
+
             const attestation: types.Attestation = .{
                 .validator_id = validator_id,
                 .data = attestation_data,

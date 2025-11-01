@@ -412,6 +412,10 @@ pub const BeamNode = struct {
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (!hasBlock) {
+            self.logger.info("Seems like block was not locally produced, adding to the chain: slot={d} proposer={d}", .{
+                block.slot,
+                block.proposer_index,
+            });
             try self.chain.onBlock(signed_block, .{
                 .postState = self.chain.states.get(block_root),
                 .blockRoot = block_root,

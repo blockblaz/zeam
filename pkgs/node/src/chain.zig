@@ -208,6 +208,15 @@ pub const BeamChain = struct {
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
         try self.states.put(block_root, post_state);
 
+        // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
+        //   them in the forkchoice
+        _ = try self.forkChoice.onBlock(block, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+        });
+
         return .{
             .block = block,
             .blockRoot = block_root,
