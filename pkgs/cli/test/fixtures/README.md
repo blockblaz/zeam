@@ -77,6 +77,7 @@ wc -c genesis/node0/key genesis/node1/key
 ### Step 5: Create Configuration Files
 
 Create `genesis/config.yaml`:
+
 ```yaml
 # Genesis Settings
 GENESIS_TIME: 1704085200
@@ -86,12 +87,14 @@ VALIDATOR_COUNT: 3
 ```
 
 Create `genesis/nodes.yaml` (paste ENRs from Step 4):
+
 ```yaml
 - enr:<paste_node0_enr_from_step4>
 - enr:<paste_node1_enr_from_step4>
 ```
 
 Create `genesis/validators.yaml`:
+
 ```yaml
 zeam_0:
   - 0
@@ -101,6 +104,7 @@ zeam_1:
 ```
 
 Create `genesis/validator-config.yaml`:
+
 ```yaml
 shuffle: roundrobin
 validators:
@@ -152,13 +156,15 @@ Use the **SAME** `$GENESIS_TIME` value from Step 0.
 ### Expected Behavior
 
 Both nodes should:
+
 - Start successfully and display the Zeam ASCII logo
 - Discover each other as peers
 - Begin producing blocks
-- Exchange votes between validators
+- Exchange attestations between validators
 - Achieve justification and finalization
 
 You'll see output like:
+
 ```
 Latest Justified:   Slot     12 | Root: 0xc2c1742d996828815b6359a48cb3d404...
 Latest Finalized:   Slot      9 | Root: 0xc51a79ed9a8eb78a695639e5599729...
@@ -171,10 +177,12 @@ Latest Finalized:   Slot      9 | Root: 0xc51a79ed9a8eb78a695639e5599729...
 The fixtures contain a minimal 3-node, 9-validator setup:
 
 **`config.yaml`:**
+
 - `VALIDATOR_COUNT: 9` - Total of 9 validators
 - `GENESIS_TIME: 1704085200` - Placeholder (overridden by `--override_genesis_time`)
 
 **`validators.yaml`:**
+
 - `zeam_0: [1, 4, 7]` - zeam_0 controls validator indices 1, 4, and 7
 - `quadrivium_0: [2, 5, 8]` - quadrivium_0 controls validator indices 2, 5, and 8  
 - `ream_0: [0, 3, 6]` - ream_0 controls validator indices 0, 3, and 6
@@ -182,10 +190,12 @@ The fixtures contain a minimal 3-node, 9-validator setup:
 With 9 validators, we need 2/3 (6 validators) to reach finalization.
 
 **`nodes.yaml`:**
+
 - Contains ENRs (Ethereum Node Records) for network discovery
 - Used for peer discovery and connection
 
 **`validator-config.yaml`:**
+
 - Contains node configurations with private keys
 - **zeam_0:** Private key and ENR fields for network configuration
 - **quadrivium_0:** Private key and ENR fields for network configuration
@@ -245,11 +255,13 @@ mkdir -p data/test_node0 data/test_node1
 For quick reference, here are the commands assuming `GENESIS_TIME=1759210782`:
 
 **Terminal 1 (zeam_0):**
+
 ```bash
 ./zig-out/bin/zeam node --custom_genesis ./genesis --node-id "zeam_0" --validator_config genesis_bootnode --override_genesis_time 1759210782 --data-dir ./data/test_node0
 ```
 
 **Terminal 2 (zeam_1):**
+
 ```bash
 ./zig-out/bin/zeam node --custom_genesis ./genesis --node-id "zeam_1" --validator_config genesis_bootnode --override_genesis_time 1759210782 --data-dir ./data/test_node1
 ```

@@ -219,7 +219,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
                 block_root: types.Root,
-                block: types.SignedBeamBlock,
+                block: types.SignedBlockWithAttestation,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                     self.logger.err("Failed to format block key for putBlock: {any}", .{err});
@@ -228,7 +228,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer self.allocator.free(key);
 
                 self.putToBatch(
-                    types.SignedBeamBlock,
+                    types.SignedBlockWithAttestation,
                     key,
                     block,
                     cn,
@@ -260,20 +260,20 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 );
             }
 
-            /// Put a vote to this write batch
-            pub fn putVote(
+            /// Put a attestation to this write batch
+            pub fn putAttestation(
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
-                vote_key: []const u8,
-                vote: types.SignedVote,
+                attestation_key: []const u8,
+                attestation: types.SignedAttestation,
             ) void {
                 self.putToBatch(
-                    types.SignedVote,
-                    vote_key,
-                    vote,
+                    types.SignedAttestation,
+                    attestation_key,
+                    attestation,
                     cn,
-                    "Added vote to batch: key={s}",
-                    .{vote_key},
+                    "Added attestation to batch: key={s}",
+                    .{attestation_key},
                 );
             }
         };
@@ -397,7 +397,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a block to the database
-        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBeamBlock) void {
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
                 return;
@@ -405,7 +405,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             self.saveToDatabase(
-                types.SignedBeamBlock,
+                types.SignedBlockWithAttestation,
                 key,
                 block,
                 cn,
@@ -415,7 +415,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a block from the database
-        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBeamBlock {
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
                 self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
                 return null;
@@ -423,7 +423,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             return self.loadFromDatabase(
-                types.SignedBeamBlock,
+                types.SignedBlockWithAttestation,
                 key,
                 cn,
                 "Loaded block from database: root=0x{s}",
@@ -466,26 +466,26 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             );
         }
 
-        /// Save a vote to the database
-        pub fn saveVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8, vote: types.SignedVote) void {
+        /// Save a attestation to the database
+        pub fn saveAttestation(self: *Self, comptime cn: ColumnNamespace, attestation_key: []const u8, attestation: types.SignedAttestation) void {
             self.saveToDatabase(
-                types.SignedVote,
-                vote_key,
-                vote,
+                types.SignedAttestation,
+                attestation_key,
+                attestation,
                 cn,
-                "Saved vote to database: key={s}",
-                .{vote_key},
+                "Saved attestation to database: key={s}",
+                .{attestation_key},
             );
         }
 
-        /// Load a vote from the database
-        pub fn loadVote(self: *Self, comptime cn: ColumnNamespace, vote_key: []const u8) ?types.SignedVote {
+        /// Load a attestation from the database
+        pub fn loadAttestation(self: *Self, comptime cn: ColumnNamespace, attestation_key: []const u8) ?types.SignedAttestation {
             return self.loadFromDatabase(
-                types.SignedVote,
-                vote_key,
+                types.SignedAttestation,
+                attestation_key,
                 cn,
-                "Loaded vote from database: key={s}",
-                .{vote_key},
+                "Loaded attestation from database: key={s}",
+                .{attestation_key},
             );
         }
 
@@ -826,7 +826,15 @@ test "save and load block" {
 
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAB);
-    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, 0x12);
+
+    // Create test signatures
+    var test_sig1: types.Bytes4000 = undefined;
+    @memset(&test_sig1, 0x12);
+    var test_sig2: types.Bytes4000 = undefined;
+    @memset(&test_sig2, 0x34);
+    const test_signatures = [_]types.Bytes4000{ test_sig1, test_sig2 };
+
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, &test_signatures);
     defer signed_block.deinit();
 
     // Save the block
@@ -839,14 +847,20 @@ test "save and load block" {
     const loaded = loaded_block.?.message;
 
     // Verify all block fields match
-    try std.testing.expect(loaded.slot == signed_block.message.slot);
-    try std.testing.expect(loaded.proposer_index == signed_block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &signed_block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &signed_block.message.state_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded_block.?.signature, &signed_block.signature));
+    try std.testing.expect(loaded.block.slot == signed_block.message.block.slot);
+    try std.testing.expect(loaded.block.proposer_index == signed_block.message.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded.block.parent_root, &signed_block.message.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded.block.state_root, &signed_block.message.block.state_root));
 
     // Verify attestations list is empty as expected
-    try std.testing.expect(loaded.body.attestations.len() == 0);
+    try std.testing.expect(loaded.block.body.attestations.len() == 0);
+
+    // Verify signatures match
+    try std.testing.expect(loaded_block.?.signature.len() == 2);
+    const loaded_sig1 = try loaded_block.?.signature.get(0);
+    const loaded_sig2 = try loaded_block.?.signature.get(1);
+    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
+    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -917,7 +931,17 @@ test "batch write and commit" {
 
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAA);
-    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, 0xDD);
+
+    // Create test signatures
+    var test_sig1: types.Bytes4000 = undefined;
+    @memset(&test_sig1, 0xDD);
+    var test_sig2: types.Bytes4000 = undefined;
+    @memset(&test_sig2, 0xEE);
+    var test_sig3: types.Bytes4000 = undefined;
+    @memset(&test_sig3, 0xFF);
+    const test_signatures = [_]types.Bytes4000{ test_sig1, test_sig2, test_sig3 };
+
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, &test_signatures);
     defer signed_block.deinit();
 
     const test_state_root = test_helpers.createDummyRoot(0xEE);
@@ -948,11 +972,19 @@ test "batch write and commit" {
     try std.testing.expect(loaded_block != null);
 
     const loaded_block_data = loaded_block.?.message;
-    try std.testing.expect(loaded_block_data.slot == signed_block.message.slot);
-    try std.testing.expect(loaded_block_data.proposer_index == signed_block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.message.state_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded_block.?.signature, &signed_block.signature));
+    try std.testing.expect(loaded_block_data.block.slot == signed_block.message.block.slot);
+    try std.testing.expect(loaded_block_data.block.proposer_index == signed_block.message.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.parent_root, &signed_block.message.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
+
+    // Verify signatures match
+    try std.testing.expect(loaded_block.?.signature.len() == 3);
+    const loaded_sig1 = try loaded_block.?.signature.get(0);
+    const loaded_sig2 = try loaded_block.?.signature.get(1);
+    const loaded_sig3 = try loaded_block.?.signature.get(2);
+    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
+    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
+    try std.testing.expect(std.mem.eql(u8, &loaded_sig3, &test_sig3));
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);

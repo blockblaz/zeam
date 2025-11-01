@@ -11,7 +11,6 @@ pub const apply_transition = transition.apply_transition;
 pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
-pub const is_justifiable_slot = transition.is_justifiable_slot;
 pub const verify_signatures = transition.verify_signatures;
 
 const mockImport = @import("./mock.zig");
@@ -49,15 +48,15 @@ test "apply transition on mocked chain" {
     // block 0 is genesis so we have to apply block 1 onwards
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
-        const block = mock_chain.blocks[i];
-        try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+        const signed_block = mock_chain.blocks[i];
+        try apply_transition(allocator, &beam_state, signed_block.message.block, .{ .logger = module_logger });
     }
 
     // check the post state root to be equal to block2's stateroot
     // this is reduant though because apply_transition already checks this for each block's state root
     var post_state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
-    try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.state_root));
+    try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.block.state_root));
 }
 
 test "genStateBlockHeader" {
@@ -80,7 +79,7 @@ test "genStateBlockHeader" {
         // get applied block
         const applied_block = mock_chain.blocks[i];
         var applied_block_root: types.Root = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, applied_block.message, &applied_block_root, allocator);
+        try ssz.hashTreeRoot(types.BeamBlock, applied_block.message.block, &applied_block_root, allocator);
 
         const state_block_header = try beam_state.genStateBlockHeader(allocator);
         var state_block_header_root: types.Root = undefined;
@@ -90,8 +89,8 @@ test "genStateBlockHeader" {
 
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
-            const block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
+            const signed_block_with_attestation = mock_chain.blocks[i + 1];
+            try apply_transition(allocator, &beam_state, signed_block_with_attestation.message.block, .{ .logger = module_logger });
         }
     }
 }
