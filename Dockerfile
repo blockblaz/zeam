@@ -70,7 +70,18 @@ RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") &&
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
+    COUNT=0 && \
+    MAX_RETRIES=3 && \
+    while true; do \
+      zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"; \
+      EXIT_CODE=$?; \
+      [ $EXIT_CODE -eq 0 ] && break; \
+      COUNT=$(( $COUNT + 1 )); \
+      [ $COUNT -eq $MAX_RETRIES ] && exit $EXIT_CODE; \
+      echo "Retrying ${COUNT}..."; \
+      sleep 10; \
+    done
+
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep
