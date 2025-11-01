@@ -89,7 +89,7 @@ const ZKVMOpts = struct { zkvm: ZKVMConfig };
 
 pub const ZKStateTransitionOpts = utils.MixIn(state_transition.StateTransitionOpts, ZKVMOpts);
 
-pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
+pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
     // TODO:  we should also serialize StateTransitionOpts from ZKStateTransitionOpts and feed it to apply
     // transition in the guest program. it makes sense if opts in future will also carry flags like signatures
     // validated. Even logging opts would change the execution trace and hence the proof

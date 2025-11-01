@@ -15,10 +15,12 @@ pub const DbColumnNamespaces = database.DbColumnNamespaces;
 pub const DbDefaultNamespace = database.DbDefaultNamespace;
 pub const DbBlocksNamespace = database.DbBlocksNamespace;
 pub const DbStatesNamespace = database.DbStatesNamespace;
-pub const DbVotesNamespace = database.DbVotesNamespace;
+pub const DbAttestationsNamespace = database.DbAttestationsNamespace;
 pub const DbCheckpointsNamespace = database.DbCheckpointsNamespace;
 pub const DbFinalizedSlotsNamespace = database.DbFinalizedSlotsNamespace;
 pub const DbUnfinalizedSlotsNamespace = database.DbUnfinalizedSlotsNamespace;
 pub const Db = database.Db;
 
-pub const test_helpers = @import("./test_helpers.zig");
+test "get tests" {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}

@@ -317,8 +317,8 @@ pub const Mock = struct {
         return switch (response.*) {
             .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
             .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBeamBlock = undefined;
-                try types.sszClone(self.allocator, types.SignedBeamBlock, block_resp, &cloned_block);
+                var cloned_block: types.SignedBlockWithAttestation = undefined;
+                try types.sszClone(self.allocator, types.SignedBlockWithAttestation, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
         };
@@ -593,19 +593,41 @@ test "Mock messaging across two subscribers" {
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
+    var attestations = try types.Attestations.init(allocator);
+
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
     block_message.* = .{ .block = .{
         .message = .{
-            .slot = 1,
-            .proposer_index = 0,
-            .parent_root = [_]u8{1} ** 32,
-            .state_root = [_]u8{2} ** 32,
-            .body = .{
-                .attestations = try types.SignedVotes.init(allocator),
+            .block = .{
+                .slot = 1,
+                .proposer_index = 0,
+                .parent_root = [_]u8{1} ** 32,
+                .state_root = [_]u8{2} ** 32,
+                .body = .{
+                    .attestations = attestations,
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 1,
+                    .head = .{
+                        .slot = 1,
+                        .root = [_]u8{1} ** 32,
+                    },
+                    .source = .{
+                        .slot = 0,
+                        .root = [_]u8{0} ** 32,
+                    },
+                    .target = .{
+                        .slot = 1,
+                        .root = [_]u8{1} ** 32,
+                    },
+                },
             },
         },
-        .signature = [_]u8{3} ** types.SIGSIZE,
+        .signature = try types.createBlockSignatures(allocator, attestations.len()),
     } };
 
     // Publish the message using the network interface - both subscribers should receive it
@@ -630,11 +652,10 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(received2 == .block);
 
     // Verify the block content is identical
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
-    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
-    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &received1.block.signature, &received2.block.signature));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.parent_root, &received2.block.message.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.state_root, &received2.block.message.block.state_root));
+    try std.testing.expect(received1.block.message.block.slot == received2.block.message.block.slot);
+    try std.testing.expect(received1.block.message.block.proposer_index == received2.block.message.block.proposer_index);
 }
 
 test "Mock status RPC between peers" {

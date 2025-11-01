@@ -15,7 +15,7 @@ const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
-pub const validators = @import("./validator.zig");
+pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
@@ -36,13 +36,13 @@ pub const BeamNode = struct {
     clock: *clockFactory.Clock,
     chain: *chainFactory.BeamChain,
     network: networkFactory.Network,
-    validator: ?validators.BeamValidator = null,
+    validator: ?validatorClient.ValidatorClient = null,
     nodeId: u32,
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
-        var validator: ?validators.BeamValidator = null;
+        var validator: ?validatorClient.ValidatorClient = null;
 
         var network = try networkFactory.Network.init(allocator, opts.backend);
         var network_init_cleanup = true;
@@ -67,7 +67,7 @@ pub const BeamNode = struct {
             allocator.destroy(chain);
         }
         if (opts.validator_ids) |ids| {
-            validator = validators.BeamValidator.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
+            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
             chain.registerValidatorIds(ids);
         }
 
@@ -95,7 +95,7 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .block => |signed_block| {
-                const parent_root = signed_block.message.parent_root;
+                const parent_root = signed_block.message.block.parent_root;
                 if (!self.chain.forkChoice.hasBlock(parent_root)) {
                     const handler = self.getReqRespResponseHandler();
                     const roots = [_]types.Root{parent_root};
@@ -126,13 +126,13 @@ pub const BeamNode = struct {
                 }
 
                 var block_root: types.Root = undefined;
-                if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator)) |_| {
+                if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                     _ = self.network.removePendingBlockRoot(block_root);
                 } else |err| {
                     self.logger.warn("Failed to compute block root for incoming gossip block: {any}", .{err});
                 }
             },
-            .vote => {},
+            .attestation => {},
         }
 
         try self.chain.onGossip(data);
@@ -145,9 +145,9 @@ pub const BeamNode = struct {
         };
     }
 
-    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, block: *const types.SignedBeamBlock) void {
+    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) void {
         var block_root: types.Root = undefined;
-        if (ssz.hashTreeRoot(types.BeamBlock, block.message, &block_root, self.allocator)) |_| {
+        if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
                 self.logger.warn(
@@ -156,7 +156,7 @@ pub const BeamNode = struct {
                 );
             }
 
-            self.chain.onBlock(block.*, .{}) catch |err| {
+            self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 self.logger.warn(
                     "Failed to import block fetched via RPC 0x{s} from peer {s}: {any}",
                     .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id, err },
@@ -264,7 +264,7 @@ pub const BeamNode = struct {
                         defer signed_block.deinit();
 
                         var response = networks.ReqRespResponse{ .blocks_by_root = undefined };
-                        try types.sszClone(self.allocator, types.SignedBeamBlock, signed_block, &response.blocks_by_root);
+                        try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &response.blocks_by_root);
                         defer response.deinit();
 
                         try responder.sendResponse(&response);
@@ -381,9 +381,9 @@ pub const BeamNode = struct {
                                 return e;
                             };
                         },
-                        .vote => |signed_vote| {
-                            self.publishVote(signed_vote) catch |e| {
-                                self.logger.err("Error publishing vote from validator: err={any}", .{e});
+                        .attestation => |signed_attestation| {
+                            self.publishAttestation(signed_attestation) catch |e| {
+                                self.logger.err("Error publishing attestation from validator: err={any}", .{e});
                                 return e;
                             };
                         },
@@ -393,54 +393,60 @@ pub const BeamNode = struct {
         }
     }
 
-    pub fn publishBlock(self: *Self, signed_block: types.SignedBeamBlock) !void {
+    pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         // 1. publish gossip message
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.network.publish(&gossip_msg);
 
+        const block = signed_block.message.block;
+
         self.logger.info("Published block to network: slot={d} proposer={d}", .{
-            signed_block.message.slot,
-            signed_block.message.proposer_index,
+            block.slot,
+            block.proposer_index,
         });
 
         // 2. Process locally through chain
         var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
+        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (!hasBlock) {
+            self.logger.info("Seems like block was not locally produced, adding to the chain: slot={d} proposer={d}", .{
+                block.slot,
+                block.proposer_index,
+            });
             try self.chain.onBlock(signed_block, .{
                 .postState = self.chain.states.get(block_root),
                 .blockRoot = block_root,
             });
         } else {
             self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
-                signed_block.message.slot,
-                signed_block.message.proposer_index,
+                block.slot,
+                block.proposer_index,
             });
         }
     }
 
-    pub fn publishVote(self: *Self, signed_vote: types.SignedVote) !void {
+    pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
         // 1. publish gossip message
-        const gossip_msg = networks.GossipMessage{ .vote = signed_vote };
+        const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        self.logger.info("Published vote to network: slot={d} validator={d}", .{
-            signed_vote.message.slot,
-            signed_vote.validator_id,
+        const message = signed_attestation.message;
+        const data = message.data;
+        self.logger.info("Published attestation to network: slot={d} validator={d}", .{
+            data.slot,
+            message.validator_id,
         });
 
         // 2. Process locally through chain
-        // no need to see if we produced this vote as everything is trusted in-process lifecycle
-        // validate when validator is separated out
-        return self.chain.onAttestation(signed_vote);
+        return self.chain.onAttestation(signed_attestation);
     }
 
     pub fn run(self: *Self) !void {
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{ .block, .vote };
+        var topics = [_]networks.GossipTopic{ .block, .attestation };
         try self.network.backend.gossip.subscribe(&topics, handler);
 
         const peer_handler = self.getPeerEventHandler();
