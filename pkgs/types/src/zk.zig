@@ -146,7 +146,7 @@ test "ssz seralize/deserialize signed stf prover input" {
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,
-        .block = test_block,
+        .block = test_block.message.block,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -161,6 +161,6 @@ test "ssz seralize/deserialize signed stf prover input" {
 
     // TODO create a sszEql fn in ssz to recursively compare two ssz structures
     // for now inspect two items
-    try std.testing.expect(prover_input.block.signature.len() == prover_input_deserialized.block.signature.len());
+    try std.testing.expect(prover_input.block.body.attestations.len() == prover_input_deserialized.block.body.attestations.len());
     try std.testing.expect(std.mem.eql(u8, &prover_input.state.latest_block_header.state_root, &prover_input_deserialized.state.latest_block_header.state_root));
 }

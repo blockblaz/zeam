@@ -243,9 +243,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
+        const proposer_index = slot % genesis_config.num_validators;
         var block = types.BeamBlock{
             .slot = slot,
-            .proposer_index = slot % genesis_config.num_validators,
+            .proposer_index = proposer_index,
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
@@ -267,13 +268,20 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         // generate the signed beam block and add to block list
         const block_with_attestation = types.BlockWithAttestation{
             .block = block,
+            // set the additional proposer attestation to the old with genesis
+            // this way it won't get impored in the forkchoice since forkchoice doesn't
+            // import old attestations
+            // TODO: update with the correct proposer attestation as per the mock sequence
             .proposer_attestation = .{
-                .validator_id = 0,
+                .validator_id = proposer_index,
                 .data = types.AttestationData{
-                    .slot = slot,
-                    .head = .{ .root = parent_root, .slot = slot },
-                    .target = .{ .root = parent_root, .slot = slot },
-                    .source = latest_justified,
+                    // setting slot=0 helps to ignore this attestation because forkchoice wouldn't import
+                    // old attestations
+                    .slot = 0,
+                    // set all the votes to genesis since this attestation is to be ignored
+                    .head = .{ .root = blockRootList.items[0], .slot = 0 },
+                    .target = .{ .root = blockRootList.items[0], .slot = 0 },
+                    .source = .{ .root = blockRootList.items[0], .slot = 0 },
                 },
             },
         };
