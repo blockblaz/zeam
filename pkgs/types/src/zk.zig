@@ -48,7 +48,7 @@ pub const BeamSTFProof = struct {
 };
 
 pub const BeamSTFProverInput = struct {
-    block: block.SignedBlockWithAttestation,
+    block: block.BeamBlock,
     state: state.BeamState,
 
     pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
