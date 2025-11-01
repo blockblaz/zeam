@@ -492,7 +492,7 @@ pub const BeamChain = struct {
     }
 
     /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, batch: *database.Db.WriteBatch, signedBlock: types.SignedBeamBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
+    fn updateBlockDb(self: *Self, batch: *database.Db.WriteBatch, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
         // Store block and state
         batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
@@ -500,7 +500,7 @@ pub const BeamChain = struct {
         // Update slot indices
         if (slot <= finalizedSlot) {
             // Add to finalized slot index
-            if (self.forkChoice.isFinalizedDescendant(blockRoot)) {
+            if (self.forkChoice.hasBlock(blockRoot)) {
                 batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockRoot);
             }
         } else {
@@ -533,7 +533,7 @@ pub const BeamChain = struct {
 
             // Find the canonical block (on the finalized chain)
             for (unfinalized_blockroots) |blockroot| {
-                if (self.forkChoice.isFinalizedDescendant(blockroot)) {
+                if (self.forkChoice.hasBlock(blockroot)) {
                     batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockroot);
                     break;
                 }
