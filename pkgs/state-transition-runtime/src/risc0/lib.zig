@@ -84,7 +84,11 @@ fn sys_halt(out_state: *const [8]u32, status: u32) noreturn {
 }
 
 pub fn get_input(allocator: std.mem.Allocator) []const u8 {
-    var input: []u8 = allocator.alloc(u8, 1024) catch @panic("could not allocate space for the input slice");
+    // The input slice can be very large, owing to the signatures themselves being quite
+    // large. Right now, it will allocate 256kb of space, which is probably too much. A
+    // better approach is to either use the rlp encoding to figure out the size of the
+    // input, or change the format so that the size is present as a 32byte word header.
+    var input: []u8 = allocator.alloc(u8, 1 << 18) catch @panic("could not allocate space for the input slice");
     const input_size = io.read_slice(0, input[0..]);
     return input[0..input_size];
 }
