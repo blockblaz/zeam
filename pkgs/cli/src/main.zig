@@ -243,18 +243,18 @@ fn mainInner() !void {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
                 const proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
-                    ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.message.slot });
+                    ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
                     return err;
                 };
                 // transition beam state for the next block
                 sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger }) catch |err| {
-                    ErrorHandler.logErrorWithDetails(err, "apply transition", .{ .slot = block.message.slot });
+                    ErrorHandler.logErrorWithDetails(err, "apply transition", .{ .slot = block.slot });
                     return err;
                 };
 
                 // verify the block
                 state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options) catch |err| {
-                    ErrorHandler.logErrorWithDetails(err, "verify proof", .{ .slot = block.message.slot });
+                    ErrorHandler.logErrorWithDetails(err, "verify proof", .{ .slot = block.slot });
                     return err;
                 };
             }
