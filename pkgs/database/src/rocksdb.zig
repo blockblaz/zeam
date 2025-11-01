@@ -276,6 +276,68 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     .{attestation_key},
                 );
             }
+
+            /// Put a finalized slot index entry to this write batch
+            pub fn putFinalizedSlotIndex(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+                blockroot: types.Root,
+            ) void {
+                const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
+                    self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                    return;
+                };
+                defer self.allocator.free(key);
+
+                self.putToBatch(
+                    types.Root,
+                    key,
+                    blockroot,
+                    cn,
+                    "Added finalized slot index to batch: slot={d} root=0x{s}",
+                    .{ slot, std.fmt.fmtSliceHexLower(&blockroot) },
+                );
+            }
+
+            /// Put an unfinalized slot index entry to this write batch
+            pub fn putUnfinalizedSlotIndex(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+                blockroots: []const types.Root,
+            ) void {
+                const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
+                    self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                    return;
+                };
+                defer self.allocator.free(key);
+
+                self.putToBatch(
+                    []const types.Root,
+                    key,
+                    blockroots,
+                    cn,
+                    "Added unfinalized slot index to batch: slot={d} count={d}",
+                    .{ slot, blockroots.len },
+                );
+            }
+
+            /// Delete an unfinalized slot index entry from this write batch
+            pub fn deleteUnfinalizedSlotIndexFromBatch(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+            ) void {
+                const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
+                    self.logger.err("Failed to format unfinalized slot key for deletion: {any}", .{err});
+                    return;
+                };
+                defer self.allocator.free(key);
+
+                self.delete(cn, key);
+                self.logger.debug("Deleted unfinalized slot index from batch: slot={d}", .{slot});
+            }
         };
 
         pub fn iterator(
@@ -486,6 +548,40 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 cn,
                 "Loaded attestation from database: key={s}",
                 .{attestation_key},
+            );
+        }
+
+        /// Load a finalized slot index from the database
+        pub fn loadFinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?types.Root {
+            const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
+                self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                return null;
+            };
+            defer self.allocator.free(key);
+
+            return self.loadFromDatabase(
+                types.Root,
+                key,
+                cn,
+                "Loaded finalized slot index from database: slot={d}",
+                .{slot},
+            );
+        }
+
+        /// Load an unfinalized slot index from the database
+        pub fn loadUnfinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?[]types.Root {
+            const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
+                self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                return null;
+            };
+            defer self.allocator.free(key);
+
+            return self.loadFromDatabase(
+                []types.Root,
+                key,
+                cn,
+                "Loaded unfinalized slot index from database: slot={d}",
+                .{slot},
             );
         }
 

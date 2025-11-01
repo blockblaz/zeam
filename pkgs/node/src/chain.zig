@@ -443,11 +443,17 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        // 8. Emit justification/finalization events based on forkchoice store
         const store = self.forkChoice.fcStore;
         const latest_justified = store.latest_justified;
         const latest_finalized = store.latest_finalized;
 
+        // 7. Save block and state to database
+        var batch = self.db.initWriteBatch();
+        defer batch.deinit();
+        try self.updateBlockDb(&batch, signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized.slot);
+        self.db.commit(&batch);
+
+        // 8. Emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified_slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
@@ -476,15 +482,6 @@ pub const BeamChain = struct {
             }
         }
 
-        // 9. Save block and state to database
-        var batch = self.db.initWriteBatch();
-        defer batch.deinit();
-
-        batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
-        batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state.*);
-
-        self.db.commit(&batch);
-
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -492,6 +489,69 @@ pub const BeamChain = struct {
             blockInfo.blockRoot == null,
             blockInfo.postState == null,
         });
+    }
+
+    /// Update block database with block, state, and slot indices
+    fn updateBlockDb(self: *Self, batch: *database.Db.WriteBatch, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
+        // Store block and state
+        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putState(database.DbStatesNamespace, blockRoot, postState);
+
+        // Update slot indices
+        if (slot <= finalizedSlot) {
+            // Add to finalized slot index
+            if (self.forkChoice.hasBlock(blockRoot)) {
+                batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockRoot);
+            }
+        } else {
+            // Add to unfinalized slot index
+            const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
+            defer if (existing_blockroots.len > 0) self.allocator.free(existing_blockroots);
+
+            // Add new blockroot to the list
+            var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+            defer updated_blockroots.deinit();
+
+            try updated_blockroots.appendSlice(existing_blockroots);
+            try updated_blockroots.append(blockRoot);
+
+            batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
+        }
+
+        // Handle cleanup when new finalization occurs
+        if (finalizedSlot > self.last_emitted_finalized_slot) {
+            try self.cleanupSlotIndicesOnFinalization(batch, self.last_emitted_finalized_slot + 1, finalizedSlot);
+        }
+    }
+
+    /// Clean up slot indices when finalization advances
+    fn cleanupSlotIndicesOnFinalization(self: *Self, batch: *database.Db.WriteBatch, start_slot: types.Slot, end_slot: types.Slot) !void {
+        for (start_slot..end_slot + 1) |slot| {
+            // Move canonical block from unfinalized to finalized index
+            const unfinalized_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse continue;
+            defer self.allocator.free(unfinalized_blockroots);
+
+            // Find the canonical block (on the finalized chain)
+            for (unfinalized_blockroots) |blockroot| {
+                if (self.forkChoice.hasBlock(blockroot)) {
+                    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, blockroot);
+                    break;
+                }
+            }
+
+            // Remove from unfinalized index
+            batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+        }
+    }
+
+    /// get finalized block at slot
+    pub fn getFinalizedBlockAtSlot(self: *Self, slot: types.Slot) ?types.Root {
+        return self.db.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot);
+    }
+
+    /// get unfinalized blocks at slot
+    pub fn getUnfinalizedBlocksAtSlot(self: *Self, slot: types.Slot) ?[]types.Root {
+        return self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot);
     }
 
     /// Validate incoming attestation before processing.

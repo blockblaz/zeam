@@ -14,6 +14,16 @@ pub fn formatStateKey(allocator: Allocator, state_root: types.Root) ![]const u8 
     return std.fmt.allocPrint(allocator, "state:{any}", .{std.fmt.fmtSliceHexLower(&state_root)});
 }
 
+/// Helper function to format finalized slot index keys
+pub fn formatFinalizedSlotKey(allocator: Allocator, slot: types.Slot) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "finalized_slot_{d}", .{slot});
+}
+
+/// Helper function to format unfinalized slot index keys
+pub fn formatUnfinalizedSlotKey(allocator: Allocator, slot: types.Slot) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "unfinalized_slot_{d}", .{slot});
+}
+
 /// Gets the return type of a function or function pointer
 pub fn ReturnType(comptime FnPtr: type) type {
     return switch (@typeInfo(FnPtr)) {
