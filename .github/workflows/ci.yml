@@ -32,6 +32,22 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
@@ -92,6 +108,22 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: build
       run: zig build all
 
@@ -131,6 +163,22 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: Build with all provers
       run: zig build -Dprover=all
 
@@ -167,6 +215,22 @@ jobs:
       with:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
 
     - name: Run all unit tests
       run: zig build test --summary all

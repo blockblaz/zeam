@@ -50,6 +50,11 @@ WORKDIR /app
 COPY build.zig.zon ./
 COPY build.zig ./
 
+# Fetch Zig dependencies using BuildKit cache mount
+# This allows Docker to cache the dependency fetching step
+RUN --mount=type=cache,target=/root/.cache/zig \
+    zig build --fetch
+
 # Copy source code
 COPY pkgs/ ./pkgs/
 COPY build/ ./build/
@@ -63,7 +68,9 @@ COPY .git/HEAD .git/HEAD
 COPY .git/refs .git/refs
 
 # Get git commit hash and build the project with optimizations
-RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
+# Use cache mount for Zig build cache as well
+RUN --mount=type=cache,target=/root/.cache/zig \
+    GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
     if [ -z "$GIT_VERSION" ] || [ "$GIT_VERSION" = "unknown" ]; then \
         REF=$(cat .git/HEAD | sed 's/ref: //'); \
         GIT_VERSION=$(cat ".git/$REF" 2>/dev/null | head -c 7 || echo "unknown"); \
