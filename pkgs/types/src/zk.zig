@@ -1,15 +1,18 @@
 const std = @import("std");
 const ssz = @import("ssz");
+
 const params = @import("@zeam/params");
 
-const Allocator = std.mem.Allocator;
-
 const block = @import("./block.zig");
-const bytesToHex = utils.BytesToHex;
-const json = std.json;
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
+const validator = @import("./validator.zig");
+
+const Allocator = std.mem.Allocator;
+
+const bytesToHex = utils.BytesToHex;
+const json = std.json;
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
 pub const ZkVm = enum {
@@ -45,7 +48,7 @@ pub const BeamSTFProof = struct {
 };
 
 pub const BeamSTFProverInput = struct {
-    block: block.SignedBeamBlock,
+    block: block.BeamBlock,
     state: state.BeamState,
 
     pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
@@ -81,8 +84,9 @@ test "ssz seralize/deserialize signed stf prover input" {
         // mini3sf
         .latest_justified = .{ .root = [_]u8{5} ** 32, .slot = 0 },
         .latest_finalized = .{ .root = [_]u8{4} ** 32, .slot = 0 },
-        .historical_block_hashes = try utils.HistoricalBlockHashes.init(std.testing.allocator),
-        .justified_slots = try utils.JustifiedSlots.init(std.testing.allocator),
+        .historical_block_hashes = try state.HistoricalBlockHashes.init(std.testing.allocator),
+        .justified_slots = try state.JustifiedSlots.init(std.testing.allocator),
+        .validators = try validator.Validators.init(std.testing.allocator),
         .justifications_roots = blk: {
             var roots = try ssz.utils.List(utils.Root, params.HISTORICAL_ROOTS_LIMIT).init(std.testing.allocator);
             try roots.append(genesis_root);
@@ -103,25 +107,46 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var test_block = block.SignedBeamBlock{
+    var attestations = try block.Attestations.init(std.testing.allocator);
+
+    var test_block = block.SignedBlockWithAttestation{
         .message = .{
-            .slot = 9,
-            .proposer_index = 3,
-            .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
-            .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
-            .body = .{
-                //
-                // .execution_payload_header = ExecutionPayloadHeader{ .timestamp = 23 },
-                .attestations = try mini_3sf.SignedVotes.init(std.testing.allocator),
+            .block = .{
+                .slot = 9,
+                .proposer_index = 3,
+                .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
+                .state_root = [_]u8{ 81, 12, 244, 147, 45, 160, 28, 192, 208, 78, 159, 151, 165, 43, 244, 44, 103, 197, 231, 128, 122, 15, 182, 90, 109, 10, 229, 68, 229, 60, 50, 231 },
+                .body = .{
+                    .attestations = attestations,
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 3,
+                .data = .{
+                    .slot = 9,
+                    .head = .{
+                        .slot = 9,
+                        .root = [_]u8{1} ** 32,
+                    },
+                    .source = .{
+                        .slot = 0,
+                        .root = [_]u8{0} ** 32,
+                    },
+                    .target = .{
+                        .slot = 9,
+                        .root = [_]u8{1} ** 32,
+                    },
+                },
             },
         },
-        .signature = [_]u8{2} ** utils.SIGSIZE,
+        .signature = try block.createBlockSignatures(std.testing.allocator, attestations.len()),
     };
-    defer test_block.message.body.attestations.deinit();
+    defer test_block.message.block.body.attestations.deinit();
+    defer test_block.signature.deinit();
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,
-        .block = test_block,
+        .block = test_block.message.block,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -136,6 +161,6 @@ test "ssz seralize/deserialize signed stf prover input" {
 
     // TODO create a sszEql fn in ssz to recursively compare two ssz structures
     // for now inspect two items
-    try std.testing.expect(std.mem.eql(u8, &prover_input.block.signature, &prover_input_deserialized.block.signature));
+    try std.testing.expect(prover_input.block.body.attestations.len() == prover_input_deserialized.block.body.attestations.len());
     try std.testing.expect(std.mem.eql(u8, &prover_input.state.latest_block_header.state_root, &prover_input_deserialized.state.latest_block_header.state_root));
 }

@@ -1,8 +1,12 @@
 const std = @import("std");
-const Thread = std.Thread;
-const Mutex = Thread.Mutex;
-const events = @import("./events.zig");
+
 const types = @import("@zeam/types");
+
+const events = @import("./events.zig");
+
+const Checkpoint = types.Checkpoint;
+const Mutex = Thread.Mutex;
+const Thread = std.Thread;
 
 /// SSE connection wrapper
 pub const SSEConnection = struct {
@@ -227,7 +231,7 @@ test "global broadcaster functionality" {
     try std.testing.expect(getGlobalBroadcaster().?.getConnectionCount() == 0);
 
     // Test global event broadcasting
-    const checkpoint = @import("@zeam/types").Mini3SFCheckpoint{
+    const checkpoint = Checkpoint{
         .slot = 120,
         .root = [_]u8{5} ** 32,
     };
