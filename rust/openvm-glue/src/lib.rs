@@ -102,9 +102,6 @@ extern "C" fn openvm_prove(
     let exe = sdk.transpile(elf, vm_config.transpiler()).unwrap();
 
     let mut stdin = StdIn::default();
-    // Write 4-byte length prefix followed by the actual data
-    let len_bytes = (serialized_block.len() as u32).to_le_bytes();
-    stdin.write(&len_bytes);
     stdin.write(&serialized_block);
 
     let app_log_blowup = 2;
