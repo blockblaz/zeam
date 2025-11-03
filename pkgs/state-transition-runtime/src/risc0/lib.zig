@@ -93,7 +93,7 @@ pub fn get_input(allocator: std.mem.Allocator) []const u8 {
 
     // Sanity check: limit to 10MB to prevent excessive allocation
     if (input_len > 10 * 1024 * 1024) {
-        @panic("input size exceeds maximum allowed (3MB)");
+        @panic("input size exceeds maximum allowed (10MB)");
     }
 
     // The +4 here is because of a putative bug in risc0, which will return the total
