@@ -20,28 +20,9 @@ pub fn get_allocator() std.mem.Allocator {
 }
 
 pub fn get_input(allocator: std.mem.Allocator) []const u8 {
-    // OpenVM doesn't use a length prefix, so we allocate a buffer and read available data
-    // Maximum input size: 1MB
-    const max_input_size = 1024 * 1024;
-
-    // Allocate buffer for maximum possible input
-    var buffer: []u8 = allocator.alloc(u8, max_input_size) catch @panic("could not allocate space for the input buffer");
-
-    // Read all available input data
-    const bytes_read = io.read_input(buffer[0..]);
-
-    // If nothing was read, panic
-    if (bytes_read == 0) {
-        @panic("no input data available");
-    }
-
-    // Resize the buffer to actual data size to free unused memory
-    const input = allocator.realloc(buffer, bytes_read) catch {
-        // If resize fails, just return the portion that was read
-        return buffer[0..bytes_read];
-    };
-
-    return input;
+    var input: []u8 = allocator.alloc(u8, 1024) catch @panic("could not allocate space for the input slice");
+    const input_size = io.read_input(input[0..]);
+    return input[0..input_size];
 }
 
 pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
