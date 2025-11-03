@@ -20,9 +20,31 @@ pub fn get_allocator() std.mem.Allocator {
 }
 
 pub fn get_input(allocator: std.mem.Allocator) []const u8 {
-    var input: []u8 = allocator.alloc(u8, 1024) catch @panic("could not allocate space for the input slice");
-    const input_size = io.read_input(input[0..]);
-    return input[0..input_size];
+    // First read the 4-byte length prefix
+    var len_bytes: [4]u8 = undefined;
+    const len_bytes_read = io.read_input(&len_bytes);
+    if (len_bytes_read != 4) {
+        @panic("failed to read length prefix");
+    }
+
+    // Parse the length as little-endian u32
+    const input_len = std.mem.readInt(u32, &len_bytes, .little);
+
+    // Sanity check: limit to 1MB to prevent excessive allocation
+    if (input_len > 1024 * 1024) {
+        @panic("input size exceeds maximum allowed (1MB)");
+    }
+
+    // Allocate exact size needed
+    var input: []u8 = allocator.alloc(u8, input_len) catch @panic("could not allocate space for the input slice");
+
+    // Read the actual data
+    const bytes_read = io.read_input(input[0..]);
+    if (bytes_read != input_len) {
+        @panic("input size mismatch");
+    }
+
+    return input[0..bytes_read];
 }
 
 pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {

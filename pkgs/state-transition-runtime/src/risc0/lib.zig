@@ -84,13 +84,33 @@ fn sys_halt(out_state: *const [8]u32, status: u32) noreturn {
 }
 
 pub fn get_input(allocator: std.mem.Allocator) []const u8 {
-    // The input slice can be very large, owing to the signatures themselves being quite
-    // large. Right now, it will allocate 256kb of space, which is probably too much. A
-    // better approach is to either use the rlp encoding to figure out the size of the
-    // input, or change the format so that the size is present as a 32byte word header.
-    var input: []u8 = allocator.alloc(u8, 1 << 18) catch @panic("could not allocate space for the input slice");
-    const input_size = io.read_slice(0, input[0..]);
-    return input[0..input_size];
+    // First read the 4-byte length prefix
+    var len_bytes: [4]u8 = undefined;
+    const len_bytes_read = io.read_slice(0, &len_bytes);
+    if (len_bytes_read != 4) {
+        @panic("failed to read length prefix");
+    }
+
+    // Parse the length as little-endian u32
+    const input_len = std.mem.readInt(u32, &len_bytes, .little);
+
+    // Sanity check: limit to 3MB to prevent excessive allocation
+    if (input_len > 3 * 1024 * 1024) {
+        @panic("input size exceeds maximum allowed (3MB)");
+    }
+
+    // Allocate exact size needed
+    // The +4 here is because of a putative bug in risc0, which will return the total
+    // amount of bytes read, and not just the bytes read in one instance.
+    var input: []u8 = allocator.alloc(u8, input_len + 4) catch @panic("could not allocate space for the input slice");
+
+    // Read the actual data
+    const bytes_read = io.read_slice(0, input[0..]);
+    if (bytes_read != input_len) {
+        @panic("input size mismatch");
+    }
+
+    return input[0..bytes_read];
 }
 
 pub fn free_input(allocator: std.mem.Allocator, input: []const u8) void {
