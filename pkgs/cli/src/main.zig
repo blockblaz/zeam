@@ -212,7 +212,8 @@ pub fn main() !void {
             for (mock_chain.blocks[1..]) |signed_block| {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
-                const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
+                var proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
+                defer proof.deinit();
                 // transition beam state for the next block
                 try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });
 
