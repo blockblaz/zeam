@@ -1,5 +1,8 @@
 <p align="center"><a href="https://github.com/blockblaz/zeam"><img width="500" title="Zeam" src='assets/zeam-logo.png' /></a></p>
 
+[![CI](https://github.com/blockblaz/zeam/actions/workflows/ci.yml/badge.svg)](https://github.com/blockblaz/zeam/actions/workflows/ci.yml)
+[![risc0](https://github.com/blockblaz/zeam/actions/workflows/risc0.yml/badge.svg)](https://github.com/blockblaz/zeam/actions/workflows/risc0.yml)
+
 # zeam - Zig Beam Client
 
 Beam Chain is a futuristic ZK based Ethereum Consensus Protocol first [unveiled in Devcon 7 Bangkok Thailand, Nov 2024](https://www.youtube.com/watch?v=Gjuenkv1zrw)
