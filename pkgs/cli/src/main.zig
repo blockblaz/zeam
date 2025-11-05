@@ -242,10 +242,11 @@ fn mainInner() !void {
             for (mock_chain.blocks[1..]) |signed_block| {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
-                const proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
+                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
                     return err;
                 };
+                defer proof.deinit();
                 // transition beam state for the next block
                 sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "apply transition", .{ .slot = block.slot });
