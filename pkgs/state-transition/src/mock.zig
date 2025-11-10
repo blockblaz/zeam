@@ -36,14 +36,28 @@ const MockChainData = struct {
     }
 };
 
-pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
+pub fn genMockChain(
+    allocator: Allocator,
+    numBlocks: usize,
+    from_genesis: ?types.GenesisSpec,
+    num_validators_override: ?usize,
+) !MockChainData {
     const genesis_config = from_genesis orelse types.GenesisSpec{
         .genesis_time = 1234,
-        .num_validators = 4,
     };
 
+    const requested_validator_count: usize = num_validators_override orelse 4;
+    if (requested_validator_count < 4) {
+        return error.InvalidValidatorCount;
+    }
+    var validators = try types.Validators.init(allocator);
+    defer validators.deinit();
+    for (0..requested_validator_count) |_| {
+        try validators.append(.{ .pubkey = [_]u8{0} ** 52 });
+    }
+
     var genesis_state: types.BeamState = undefined;
-    try genesis_state.genGenesisState(allocator, genesis_config);
+    try genesis_state.genGenesisState(allocator, genesis_config, validators);
     errdefer genesis_state.deinit();
     var blockList = std.ArrayList(types.SignedBlockWithAttestation).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
@@ -58,8 +72,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     // figure out a way to clone genesis_state
     var beam_state: types.BeamState = undefined;
-    try beam_state.genGenesisState(allocator, genesis_config);
+    try beam_state.genGenesisState(allocator, genesis_config, validators);
     defer beam_state.deinit();
+
+    const validator_count = beam_state.validatorCount();
 
     var genesis_block: types.BeamBlock = undefined;
     try beam_state.genGenesisBlock(allocator, &genesis_block);
@@ -243,7 +259,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
-        const proposer_index = slot % genesis_config.num_validators;
+        const proposer_index = slot % validator_count;
         var block = types.BeamBlock{
             .slot = slot,
             .proposer_index = proposer_index,

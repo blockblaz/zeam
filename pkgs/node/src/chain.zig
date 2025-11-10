@@ -125,6 +125,14 @@ pub const BeamChain = struct {
         self.registered_validator_ids = validator_ids;
     }
 
+    fn currentHeadState(self: *Self) *const types.BeamState {
+        return self.states.get(self.forkChoice.head.blockRoot) orelse self.anchor_state;
+    }
+
+    pub fn validatorCount(self: *Self) usize {
+        return types.BeamState.validatorCount(self.currentHeadState());
+    }
+
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
         // see if the node has a proposal this slot to properly tick
         // forkchoice head
@@ -133,7 +141,7 @@ pub const BeamChain = struct {
 
         var has_proposal = false;
         if (interval == 0) {
-            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const num_validators = self.validatorCount();
             const slot_proposer_id = slot % num_validators;
             if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
                 _ = index;
@@ -634,7 +642,7 @@ test "process and add mock blocks into a node's chain" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+           \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -643,7 +651,7 @@ test "process and add mock blocks into a node's chain" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -696,7 +704,7 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 
-    const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
+    const num_validators = mock_chain.genesis_state.validatorCount();
     for (0..num_validators) |validator_id| {
         // all validators should have attested as per the mock chain
         const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
@@ -711,7 +719,7 @@ test "printSlot output demonstration" {
 
     // Create a chain configuration
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -721,7 +729,7 @@ test "printSlot output demonstration" {
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
     // Create a mock chain with some blocks
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
@@ -781,7 +789,7 @@ test "attestation validation - comprehensive" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -790,7 +798,7 @@ test "attestation validation - comprehensive" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -1065,7 +1073,7 @@ test "attestation validation - gossip vs block future slot handling" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -1074,7 +1082,7 @@ test "attestation validation - gossip vs block future slot handling" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -1159,7 +1167,7 @@ test "attestation processing - valid block attestation" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -1168,7 +1176,7 @@ test "attestation processing - valid block attestation" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 

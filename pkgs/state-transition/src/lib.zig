@@ -30,14 +30,13 @@ test "apply transition on mocked chain" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
-        .num_validators = 4,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const mock_chain = try genMockChain(allocator, 5, test_config);
+    const mock_chain = try genMockChain(allocator, 5, test_config, 4);
     try std.testing.expect(mock_chain.blocks.len == 5);
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -63,14 +62,13 @@ test "genStateBlockHeader" {
     // 1. setup genesis config
     const test_config = types.GenesisSpec{
         .genesis_time = 1234,
-        .num_validators = 4,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const mock_chain = try genMockChain(allocator, 2, test_config);
+    const mock_chain = try genMockChain(allocator, 2, test_config, 4);
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.state_transition);
 

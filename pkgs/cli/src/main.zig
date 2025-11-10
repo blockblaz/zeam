@@ -202,9 +202,8 @@ pub fn main() !void {
             // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
             const mock_config = types.GenesisSpec{
                 .genesis_time = genesis,
-                .num_validators = num_validators,
             };
-            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config);
+            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config, @intCast(num_validators));
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
@@ -245,11 +244,17 @@ pub fn main() !void {
             const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
 
             chain_options.genesis_time = time_now;
-            chain_options.num_validators = num_validators;
             // transfer ownership of the chain_options to ChainConfig
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
             var anchorState: types.BeamState = undefined;
-            try anchorState.genGenesisState(gpa.allocator(), chain_config.genesis);
+            const validator_count: usize = @intCast(num_validators);
+            var genesis_validators = try types.Validators.init(gpa.allocator());
+            defer genesis_validators.deinit();
+            for (0..validator_count) |_| {
+                try genesis_validators.append(.{ .pubkey = [_]u8{0} ** 52 });
+            }
+
+            try anchorState.genGenesisState(gpa.allocator(), chain_config.genesis, genesis_validators);
             defer anchorState.deinit();
 
             // TODO we seem to be needing one loop because then the events added to loop are not being fired
@@ -395,6 +400,7 @@ pub fn main() !void {
                 .node_key = leancmd.@"node-id",
                 .validator_config = leancmd.validator_config,
                 .node_key_index = undefined,
+                .validator_count = 0,
                 .metrics_enable = leancmd.metrics_enable,
                 .metrics_port = leancmd.metrics_port,
                 .bootnodes = undefined,

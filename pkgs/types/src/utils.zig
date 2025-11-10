@@ -5,7 +5,6 @@ const ssz = @import("ssz");
 const params = @import("@zeam/params");
 const utils = @import("@zeam/utils");
 
-const block = @import("./block.zig");
 const types = @import("./lib.zig");
 pub const jsonToString = utils.jsonToString;
 
@@ -58,7 +57,7 @@ pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
 }
 
-pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
+pub const GenesisSpec = struct { genesis_time: u64 };
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,

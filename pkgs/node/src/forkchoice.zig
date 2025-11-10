@@ -339,8 +339,13 @@ pub const ForkChoice = struct {
         }
     }
 
+    fn validatorCount(self: *Self) usize {
+        return types.BeamState.validatorCount(self.anchorState);
+    }
+
     pub fn acceptNewAttestations(self: *Self) !ProtoBlock {
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        const validator_count = self.validatorCount();
+        for (0..validator_count) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.latestNew) |new_attestation| {
                 // we can directly assign because we always make sure that new attestation is fresher
@@ -374,11 +379,12 @@ pub const ForkChoice = struct {
     pub fn getProposalAttestations(self: *Self) !types.Attestations {
         var included_attestations = try types.Attestations.init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
+        const validator_count = self.validatorCount();
 
         // TODO naive strategy to include all attestations that are consistent with the latest justified
         // replace by the other mini 3sf simple strategy to loop and see if justification happens and
         // till no further attestations can be added
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        for (0..validator_count) |validator_id| {
             const validator_attestation = ((self.attestations.get(validator_id) orelse AttestationTracker{})
                 //
                 .latestKnown orelse ProtoAttestation{}).attestation;
@@ -424,7 +430,8 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        const validator_count = self.validatorCount();
+        for (0..validator_count) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.appliedIndex) |applied_index| {
                 self.deltas.items[applied_index] -= validatorWeight;
@@ -479,7 +486,9 @@ pub const ForkChoice = struct {
     }
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
-        const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.num_validators, 3);
+        const validator_count = self.validatorCount();
+        const total_weight = @as(u64, @intCast(validator_count)) * 2;
+        const cutoff_weight = try std.math.divCeil(u64, total_weight, 3);
         self.safeTarget = try self.computeFCHead(false, cutoff_weight);
         return self.safeTarget;
     }
@@ -609,7 +618,7 @@ test "forkchoice block tree" {
     const allocator = arena_allocator.allocator();
 
     const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
+           \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234}
     ;
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
@@ -618,7 +627,7 @@ test "forkchoice block tree" {
     const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
     const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
 
-    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis, 4);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);

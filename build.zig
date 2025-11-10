@@ -43,8 +43,7 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
         },
     }
     comp.linkLibC();
-    comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
-    // Add macOS framework linking for CLI tests
+    comp.linkSystemLibrary("unwind");
     if (target.result.os.tag == .macos) {
         comp.linkFramework("CoreFoundation");
         comp.linkFramework("SystemConfiguration");
@@ -273,6 +272,10 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/configs", zeam_configs);
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("ssz", ssz);
+    zeam_spectests.addImport("build_options", build_options_module);
+    zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("build_options", build_options_module);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -518,9 +521,74 @@ pub fn build(b: *Builder) !void {
     simtests.dependOn(&run_cli_integration_test.step);
 
     // Create spectest step that runs spec tests
+    const spectest_generate_exe = b.addExecutable(.{
+        .name = "spectest-generate",
+        .root_source_file = b.path("pkgs/spectest/src/generate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
+    const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
+    spectest_generate_step.dependOn(&run_spectest_generate.step);
+
     const spectests_step = b.step("spectest", "Run spec tests");
     const run_spectests = b.addRunArtifact(spectests);
     spectests_step.dependOn(&run_spectests.step);
+
+    const run_spectests_after_generate = b.addRunArtifact(spectests);
+    run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
+
+    if (b.args) |args| {
+        var generator_args_builder = std.ArrayList([]const u8).init(b.allocator);
+        defer generator_args_builder.deinit();
+
+        var runner_args_builder = std.ArrayList([]const u8).init(b.allocator);
+        defer runner_args_builder.deinit();
+
+        var skip_expected_errors = false;
+
+        for (args) |arg| {
+            if (std.mem.startsWith(u8, arg, "--skip-expected-error-fixtures")) {
+                const suffix = arg["--skip-expected-error-fixtures".len..];
+                if (suffix.len == 0) {
+                    skip_expected_errors = true;
+                    continue;
+                }
+
+                if (suffix[0] == '=') {
+                    const value = suffix[1..];
+                    if (std.ascii.eqlIgnoreCase(value, "true")) {
+                        skip_expected_errors = true;
+                    }
+                    continue;
+                }
+
+                // fallthrough to treat as a normal argument if the suffix does not
+                // match the supported forms.
+            }
+
+            try generator_args_builder.append(arg);
+        }
+
+        if (generator_args_builder.items.len != 0) {
+            const generator_args = try generator_args_builder.toOwnedSlice();
+            run_spectest_generate.addArgs(generator_args);
+        }
+
+        if (runner_args_builder.items.len != 0) {
+            const runner_args = try runner_args_builder.toOwnedSlice();
+            run_spectests.addArgs(runner_args);
+            run_spectests_after_generate.addArgs(runner_args);
+        }
+
+        if (skip_expected_errors) {
+            run_spectests.setEnvironmentVariable("ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS", "true");
+            run_spectests_after_generate.setEnvironmentVariable("ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS", "true");
+        }
+    }
+
+    const spectest_run_step = b.step("spectest:run", "Regenerate and run spectests");
+    spectest_run_step.dependOn(&run_spectests_after_generate.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {

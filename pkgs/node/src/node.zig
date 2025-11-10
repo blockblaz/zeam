@@ -478,11 +478,17 @@ test "Node peer tracking on connect/disconnect" {
 
     const genesis_config = types.GenesisSpec{
         .genesis_time = 0,
-        .num_validators = 4,
     };
 
+    const validator_count: usize = 4;
+    var genesis_validators = try types.Validators.init(allocator);
+    defer genesis_validators.deinit();
+    for (0..validator_count) |_| {
+        try genesis_validators.append(.{ .pubkey = [_]u8{0} ** 52 });
+    }
+
     var anchor_state: types.BeamState = undefined;
-    try anchor_state.genGenesisState(allocator, genesis_config);
+    try anchor_state.genGenesisState(allocator, genesis_config, genesis_validators);
     defer anchor_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});

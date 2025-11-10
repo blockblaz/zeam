@@ -81,7 +81,7 @@ pub const ValidatorClient = struct {
     }
 
     pub fn getSlotProposer(self: *Self, slot: usize) ?usize {
-        const num_validators: usize = @intCast(self.config.genesis.num_validators);
+        const num_validators = self.chain.validatorCount();
         const slot_proposer_id = slot % num_validators;
         if (std.mem.indexOfScalar(usize, self.ids, slot_proposer_id)) |index| {
             _ = index;

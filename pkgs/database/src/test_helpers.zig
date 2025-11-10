@@ -58,9 +58,14 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
 
 /// Helper function to create a dummy state for testing
 pub fn createDummyState(allocator: Allocator, slot: u64, num_validators: u64, genesis_time: u64, justified_slot: u64, finalized_slot: u64, justified_root_fill: u8, finalized_root_fill: u8) !types.BeamState {
+    var validators = try types.Validators.init(allocator);
+    errdefer validators.deinit();
+    for (0..num_validators) |_| {
+        try validators.append(.{ .pubkey = [_]u8{0} ** 52 });
+    }
+
     var test_state = types.BeamState{
         .config = types.BeamStateConfig{
-            .num_validators = num_validators,
             .genesis_time = genesis_time,
         },
         .slot = slot,
