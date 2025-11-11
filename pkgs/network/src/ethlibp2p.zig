@@ -662,6 +662,24 @@ export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: 
     };
 }
 
+// Receive plain log lines from the Rust bridge and emit using Zeam logger with proper node scope
+export fn handleLogFromRustBridge(
+    zigHandler: *EthLibp2p,
+    level: u32,
+    message_ptr: [*]const u8,
+    message_len: usize,
+) void {
+    const message_slice: []const u8 = message_ptr[0..message_len];
+    const trimmed: []const u8 = std.mem.trim(u8, message_slice, " \t\r\n");
+    switch (level) {
+        0 => zigHandler.logger.debug("rust-bridge: {s}", .{trimmed}),
+        1 => zigHandler.logger.info("rust-bridge: {s}", .{trimmed}),
+        2 => zigHandler.logger.warn("rust-bridge: {s}", .{trimmed}),
+        3 => zigHandler.logger.err("rust-bridge: {s}", .{trimmed}),
+        else => zigHandler.logger.debug("rust-bridge:{s}", .{trimmed}),
+    }
+}
+
 export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
     const listen_slice = std.mem.span(listen_addresses);
     zig_handler.allocator.free(listen_slice);

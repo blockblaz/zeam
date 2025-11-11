@@ -160,13 +160,31 @@ const ZeamArgs = struct {
     };
 };
 
-pub fn main() !void {
+const error_handler = @import("error_handler.zig");
+const ErrorHandler = error_handler.ErrorHandler;
+
+pub fn main() void {
+    mainInner() catch |err| {
+        ErrorHandler.handleApplicationError(err);
+        std.process.exit(1);
+    };
+}
+
+fn mainInner() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
 
-    const opts = try simargs.parse(allocator, ZeamArgs, app_description, app_version);
+    const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        stderr.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)}) catch {};
+        stderr.print("Run 'zeam --help' for usage information.\n", .{}) catch {};
+        ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
+        return err;
+    };
     const genesis = opts.args.genesis;
     const num_validators = opts.args.num_validators;
     const log_filename = opts.args.log_filename;
@@ -178,11 +196,20 @@ pub fn main() !void {
 
     switch (opts.args.__commands__) {
         .clock => {
-            var loop = try xev.Loop.init(.{});
-            var clock = try Clock.init(gpa.allocator(), genesis, &loop);
+            var loop = xev.Loop.init(.{}) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize event loop");
+                return err;
+            };
+            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize clock");
+                return err;
+            };
             std.debug.print("clock {any}\n", .{clock});
 
-            try clock.run();
+            clock.run() catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "run clock service");
+                return err;
+            };
         },
         .prove => |provecmd| {
             std.debug.print("distribution dir={s}\n", .{provecmd.dist_dir});
@@ -204,7 +231,10 @@ pub fn main() !void {
                 .genesis_time = genesis,
                 .num_validators = num_validators,
             };
-            const mock_chain = try sft_factory.genMockChain(allocator, 5, mock_config);
+            const mock_chain = sft_factory.genMockChain(allocator, 5, mock_config) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "generate mock chain");
+                return err;
+            };
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
@@ -212,19 +242,36 @@ pub fn main() !void {
             for (mock_chain.blocks[1..]) |signed_block| {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
-                const proof = try state_proving_manager.prove_transition(beam_state, block, options, allocator);
+                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
+                    return err;
+                };
+                defer proof.deinit();
                 // transition beam state for the next block
-                try sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger });
+                sft_factory.apply_transition(allocator, &beam_state, block, .{ .logger = stf_logger }) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "apply transition", .{ .slot = block.slot });
+                    return err;
+                };
 
                 // verify the block
-                try state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options);
+                state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "verify proof", .{ .slot = block.slot });
+                    return err;
+                };
             }
+            std.log.info("Successfully proved and verified all transitions", .{});
         },
         .beam => |beamcmd| {
-            try api.init(allocator);
+            api.init(allocator) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize API");
+                return err;
+            };
 
             // Start metrics HTTP server
-            try api_server.startAPIServer(allocator, beamcmd.metricsPort);
+            api_server.startAPIServer(allocator, beamcmd.metricsPort) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
+                return err;
+            };
 
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
@@ -378,15 +425,29 @@ pub fn main() !void {
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
-                const generated_config = try generatePrometheusConfig(allocator, genconfig.metrics_port);
+                const generated_config = generatePrometheusConfig(allocator, genconfig.metrics_port) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
+                    return err;
+                };
                 const cwd = std.fs.cwd();
-                const config_file = try cwd.createFile(genconfig.filename, .{ .truncate = true });
+                const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
+                    return err;
+                };
                 defer config_file.close();
-                try config_file.writeAll(generated_config);
+                config_file.writeAll(generated_config) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
+                    return err;
+                };
+                std.log.info("Successfully generated Prometheus config: {s}", .{genconfig.filename});
             },
         },
         .node => |leancmd| {
-            try std.fs.cwd().makePath(leancmd.@"data-dir");
+            std.fs.cwd().makePath(leancmd.@"data-dir") catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
+                return err;
+            };
+
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
             var start_options: node.NodeOptions = .{
@@ -406,12 +467,26 @@ pub fn main() !void {
 
             defer start_options.deinit(allocator);
 
-            try node.buildStartOptions(allocator, leancmd, &start_options);
+            node.buildStartOptions(allocator, leancmd, &start_options) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "build node start options", .{
+                    .node_id = leancmd.@"node-id",
+                    .validator_config = leancmd.validator_config,
+                    .custom_genesis = leancmd.custom_genesis,
+                });
+                return err;
+            };
 
             var lean_node: node.Node = undefined;
-            try lean_node.init(allocator, &start_options);
+            lean_node.init(allocator, &start_options) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "initialize lean node");
+                return err;
+            };
             defer lean_node.deinit();
-            try lean_node.run();
+
+            lean_node.run() catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "run lean node");
+                return err;
+            };
         },
     }
 }
