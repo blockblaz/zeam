@@ -382,15 +382,14 @@ pub const BeamNode = struct {
         if (self.validator) |*validator| {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
-            const validator_output = validator.onInterval(interval) catch |e| {
+            var validator_output = validator.onInterval(interval) catch |e| {
                 self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
 
-            if (validator_output) |output| {
-                var mutable_output = output;
-                defer mutable_output.deinit();
-                for (mutable_output.gossip_messages.items) |gossip_msg| {
+            if (validator_output) |*output| {
+                defer output.deinit();
+                for (output.gossip_messages.items) |gossip_msg| {
 
                     // Process based on message type
                     switch (gossip_msg) {
