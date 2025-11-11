@@ -1,0 +1,119 @@
+name: Auto Release on Release Branch
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ release ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: blockblaz/zeam
+
+permissions:
+  contents: write
+
+jobs:
+  auto-release:
+    # Only run if PR was merged to release branch (not just closed)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract tags from PR labels
+      id: get_tags_labels
+      run: |
+        # Get PR labels and extract version
+        LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+        echo "PR Labels: $LABELS"
+
+        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.)
+        VERSION=$(echo $LABELS | jq -r '.[] | select(test("^(v|version:)?[0-9]+\\.[0-9]+\\.[0-9]+")) | gsub("^(v|version:)"; "")')
+
+        # Look for zeam network tags (devnet0, devnet1, testnet, mainnet)
+        ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))')
+
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "❌ No version label found! Please add a label like 'v1.0.0' or 'version:1.0.0'"
+          exit 1
+        fi
+
+        # Set outputs
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "git_tag=v$VERSION" >> $GITHUB_OUTPUT
+
+        if [ -n "$ZEAM_TAG" ] && [ "$ZEAM_TAG" != "null" ]; then
+          echo "zeam_tag=$ZEAM_TAG" >> $GITHUB_OUTPUT
+          echo "has_network_tag=true" >> $GITHUB_OUTPUT
+          echo "✅ Found network tag: $ZEAM_TAG"
+        else
+          echo "has_network_tag=false" >> $GITHUB_OUTPUT
+          echo "ℹ️ No network tag found (optional)"
+        fi
+
+        echo "✅ Version found: $VERSION"
+
+    - name: Create and push git tags
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Create version tag
+        if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
+          echo "⚠️ Tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists, skipping"
+        else
+          git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
+          git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
+          echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
+        fi
+
+        # Create zeam network tag if network label exists
+        if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
+          ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
+          if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
+            echo "⚠️ Zeam tag $ZEAM_GIT_TAG already exists, skipping"
+          else
+            git tag -a "$ZEAM_GIT_TAG" -m "Zeam network tag for ${{ steps.get_tags_labels.outputs.zeam_tag }}"
+            git push origin "$ZEAM_GIT_TAG"
+            echo "✅ Created zeam tag $ZEAM_GIT_TAG"
+          fi
+        fi
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest
+          type=raw,value=${{ steps.get_tags_labels.outputs.version }}
+          type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.has_network_tag }}
+
+    - name: Build zeam natively
+      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Build and push Docker image with pre-built binary
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.prebuilt
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
