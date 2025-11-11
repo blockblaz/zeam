@@ -310,6 +310,27 @@ pub const ForkChoice = struct {
         return false;
     }
 
+    /// Get all ancestor block roots from the current finalized block,
+    /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
+    /// Stops traversal when previousFinalizedSlot is reached or at genesis.
+    pub fn getAncestorsofFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: ?types.Slot) ![]types.Root {
+        var ancestors = std.ArrayList(types.Root).init(allocator);
+
+        var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
+
+        while (current_idx_or_null) |current_idx| {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            if (previousFinalizedSlot) |previous_finalized_slot| {
+                if (current_node.slot == previous_finalized_slot) {
+                    break;
+                }
+            }
+            try ancestors.append(current_node.blockRoot);
+            current_idx_or_null = current_node.parent;
+        }
+        return ancestors.toOwnedSlice();
+    }
+
     pub fn tickInterval(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
