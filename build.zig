@@ -18,24 +18,28 @@ const ProverChoice = enum { none, risc0, openvm, all };
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
-    comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
-    comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
-
     // Conditionally include prover libraries based on selection
     // Use profile-specific directories for single-prover builds
     switch (prover) {
         .none => {
-            // Only include libp2p for networking, no prover libraries
+            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
     comp.linkLibC();
@@ -367,6 +371,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
+
+    // Add error handler module to integration tests
+    const error_handler_module = b.addModule("error_handler", .{
+        .root_source_file = b.path("pkgs/cli/src/error_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("error_handler", error_handler_module);
 
     const types_tests = b.addTest(.{
         .root_module = zeam_types,

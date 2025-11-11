@@ -28,3 +28,7 @@ pub const Mock = mockFactory.Mock;
 const ethlibp2pFactory = @import("./ethlibp2p.zig");
 pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
 pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
+
+test "get tests" {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}

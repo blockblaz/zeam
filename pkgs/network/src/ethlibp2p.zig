@@ -282,8 +282,8 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     defer zigHandler.allocator.free(uncompressed_message);
     const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
-            var message_data: types.SignedBeamBlock = undefined;
-            ssz.deserialize(types.SignedBeamBlock, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+            var message_data: types.SignedBlockWithAttestation = undefined;
+            ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
                 if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
                     zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
@@ -295,18 +295,18 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
             break :blockmessage .{ .block = message_data };
         },
-        .vote => votemessage: {
-            var message_data: types.SignedVote = undefined;
-            ssz.deserialize(types.SignedVote, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed vote message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "vote", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Vote deserialization failed - debug file created: {s}", .{filename});
+        .attestation => attestationmessage: {
+            var message_data: types.SignedAttestation = undefined;
+            ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+                zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
+                if (writeFailedBytes(uncompressed_message, "attestation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("Attestation deserialization failed - debug file created: {s}", .{filename});
                 } else {
-                    zigHandler.logger.err("Vote deserialization failed - could not create debug file", .{});
+                    zigHandler.logger.err("Attestation deserialization failed - could not create debug file", .{});
                 }
                 return;
             };
-            break :votemessage .{ .vote = message_data };
+            break :attestationmessage .{ .attestation = message_data };
         },
     };
 
@@ -660,6 +660,24 @@ export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: 
     zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
     };
+}
+
+// Receive plain log lines from the Rust bridge and emit using Zeam logger with proper node scope
+export fn handleLogFromRustBridge(
+    zigHandler: *EthLibp2p,
+    level: u32,
+    message_ptr: [*]const u8,
+    message_len: usize,
+) void {
+    const message_slice: []const u8 = message_ptr[0..message_len];
+    const trimmed: []const u8 = std.mem.trim(u8, message_slice, " \t\r\n");
+    switch (level) {
+        0 => zigHandler.logger.debug("rust-bridge: {s}", .{trimmed}),
+        1 => zigHandler.logger.info("rust-bridge: {s}", .{trimmed}),
+        2 => zigHandler.logger.warn("rust-bridge: {s}", .{trimmed}),
+        3 => zigHandler.logger.err("rust-bridge: {s}", .{trimmed}),
+        else => zigHandler.logger.debug("rust-bridge:{s}", .{trimmed}),
+    }
 }
 
 export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {

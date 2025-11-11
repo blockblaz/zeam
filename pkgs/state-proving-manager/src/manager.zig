@@ -89,7 +89,7 @@ const ZKVMOpts = struct { zkvm: ZKVMConfig };
 
 pub const ZKStateTransitionOpts = utils.MixIn(state_transition.StateTransitionOpts, ZKVMOpts);
 
-pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
+pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZKStateTransitionOpts, allocator: Allocator) !types.BeamSTFProof {
     // TODO:  we should also serialize StateTransitionOpts from ZKStateTransitionOpts and feed it to apply
     // transition in the guest program. it makes sense if opts in future will also carry flags like signatures
     // validated. Even logging opts would change the execution trace and hence the proof
@@ -112,9 +112,8 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
 
     opts.logger.debug("should deserialize to={s}", .{state_str});
 
-    // allocate a megabyte of data so that we have enough space for the proof.
-    // XXX not deallocated yet
-    var output = try allocator.alloc(u8, 1024 * 1024);
+    // allocate 3MB of data so that we have enough space for the proof.
+    var output = try allocator.alloc(u8, 3 * 1024 * 1024);
     const output_len = switch (opts.zkvm) {
         // .powdr => |powdrcfg| powdr_prove(serialized.items.ptr, serialized.items.len, @ptrCast(&output), 256, powdrcfg.program_path.ptr, powdrcfg.program_path.len, powdrcfg.output_dir.ptr, powdrcfg.output_dir.len),
         .powdr => return error.RiscVPowdrIsDeprecated,
@@ -124,6 +123,7 @@ pub fn prove_transition(state: types.BeamState, block: types.SignedBeamBlock, op
     };
     const proof = types.BeamSTFProof{
         .proof = output[0..output_len],
+        .allocator = allocator,
     };
     opts.logger.debug("proof len={}\n", .{output_len});
 

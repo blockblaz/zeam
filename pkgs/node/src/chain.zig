@@ -27,8 +27,8 @@ pub const BlockProductionParams = struct {
     proposer_index: usize,
 };
 
-pub const VoteConstructionParams = struct {
-    slot: usize,
+pub const AttestationConstructionParams = struct {
+    slot: types.Slot,
 };
 
 pub const ChainOpts = struct {
@@ -150,7 +150,7 @@ pub const BeamChain = struct {
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
-            // interval to vote so we should put out the chain status information to the user along with
+            // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
             self.printSlot(islot, self.connected_peers.count());
@@ -167,7 +167,7 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const votes = try self.forkChoice.getProposalVotes();
+        const attestations = try self.forkChoice.getProposalAttestations();
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -184,7 +184,7 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = votes,
+                .attestations = attestations,
             },
         };
 
@@ -208,27 +208,40 @@ pub const BeamChain = struct {
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
         try self.states.put(block_root, post_state);
 
+        // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
+        //   them in the forkchoice
+        _ = try self.forkChoice.onBlock(block, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+        });
+
         return .{
             .block = block,
             .blockRoot = block_root,
         };
     }
 
-    pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
+    pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
         const slot = opts.slot;
 
-        const head = try self.forkChoice.getProposalHead(slot);
-        const target = try self.forkChoice.getVoteTarget();
+        // const head = try self.forkChoice.getProposalHead(slot);
+        const head_proto = self.forkChoice.head;
+        const head: types.Checkpoint = .{
+            .root = head_proto.blockRoot,
+            .slot = head_proto.slot,
+        };
+        const target = try self.forkChoice.getAttestationTarget();
 
-        const vote = types.Mini3SFVote{
-            //
+        const attestation_data = types.AttestationData{
             .slot = slot,
             .head = head,
             .target = target,
             .source = self.forkChoice.fcStore.latest_justified,
         };
 
-        return vote;
+        return attestation_data;
     }
 
     pub fn printSlot(self: *Self, islot: isize, peer_count: usize) void {
@@ -287,7 +300,7 @@ pub const BeamChain = struct {
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |signed_block| {
-                const block = signed_block.message;
+                const block = signed_block.message.block;
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
@@ -316,23 +329,23 @@ pub const BeamChain = struct {
                     }
                 }
             },
-            .vote => |signed_vote| {
-                const signed_vote_json = try signed_vote.toJson(self.allocator);
+            .attestation => |signed_attestation| {
+                const signed_attestation_json = try signed_attestation.toJson(self.allocator);
 
                 // Convert JSON value to string for proper logging
-                const signed_vote_str = try jsonToString(self.allocator, signed_vote_json);
-                defer self.allocator.free(signed_vote_str);
+                const signed_attestation_str = try jsonToString(self.allocator, signed_attestation_json);
+                defer self.allocator.free(signed_attestation_str);
 
-                self.module_logger.debug("chain received vote onGossip cb: {s}", .{signed_vote_str});
+                self.module_logger.debug("chain received attestation onGossip cb: {s}", .{signed_attestation_str});
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_vote, false) catch |err| {
+                self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.debug("Gossip attestation validation failed: {any}", .{err});
                     return; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
-                self.onAttestation(signed_vote) catch |err| {
+                self.onAttestation(signed_attestation) catch |err| {
                     self.module_logger.debug("Attestation processing error: {any}", .{err});
                 };
             },
@@ -342,10 +355,10 @@ pub const BeamChain = struct {
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
-    pub fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, blockInfo: CachedProcessedBlockInfo) !void {
+    pub fn onBlock(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockInfo: CachedProcessedBlockInfo) !void {
         const onblock_timer = api.chain_onblock_duration_seconds.start();
 
-        const block = signedBlock.message;
+        const block = signedBlock.message.block;
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
             try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
@@ -358,7 +371,7 @@ pub const BeamChain = struct {
 
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state
-            const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+            const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
 
@@ -367,7 +380,7 @@ pub const BeamChain = struct {
             stf.verify_signatures(signedBlock) catch {
                 validSignatures = false;
             };
-            try stf.apply_transition(self.allocator, cpost_state, signedBlock, .{
+            try stf.apply_transition(self.allocator, cpost_state, block, .{
                 //
                 .logger = self.stf_logger,
                 .validSignatures = validSignatures,
@@ -383,21 +396,25 @@ pub const BeamChain = struct {
         });
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 4. fc onvotes
+        // 4. fc onattestations
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
         });
-        for (block.body.attestations.constSlice()) |signed_vote| {
+
+        const signatures = signedBlock.signature.constSlice();
+        for (block.body.attestations.constSlice(), 0..) |attestation, index| {
             // Validate attestation before processing (from block = true)
-            self.validateAttestation(signed_vote, true) catch |e| {
-                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ signed_vote.validator_id, e });
+            self.validateAttestation(attestation, true) catch |e| {
+                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ attestation.validator_id, e });
                 // Skip invalid attestations but continue processing the block
                 continue;
             };
 
-            self.forkChoice.onAttestation(signed_vote, true) catch |e| {
-                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+            const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
+
+            self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
             };
         }
 
@@ -405,7 +422,17 @@ pub const BeamChain = struct {
         const new_head = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
 
-        // 6. Emit new head event via SSE (use forkchoice ProtoBlock directly)
+        // 6. proposer attestation
+        const proposer_signature = signatures[block.body.attestations.len()];
+        const signed_proposer_attestation = types.SignedAttestation{
+            .message = signedBlock.message.proposer_attestation,
+            .signature = proposer_signature,
+        };
+        self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
+            self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
+        };
+
+        // 7. Emit new head event via SSE (use forkchoice ProtoBlock directly)
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
@@ -416,7 +443,7 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        // 7. Emit justification/finalization events based on forkchoice store
+        // 8. Emit justification/finalization events based on forkchoice store
         const store = self.forkChoice.fcStore;
         const latest_justified = store.latest_justified;
         const latest_finalized = store.latest_finalized;
@@ -449,7 +476,7 @@ pub const BeamChain = struct {
             }
         }
 
-        // 8. Save block and state to database
+        // 9. Save block and state to database
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
@@ -472,29 +499,29 @@ pub const BeamChain = struct {
     /// is_from_block: true if attestation came from a block, false if from network gossip
     ///
     /// Per leanSpec:
-    /// - Gossip attestations (is_from_block=false): vote.slot <= current_slot (no future tolerance)
-    /// - Block attestations (is_from_block=true): vote.slot <= current_slot + 1 (lenient)
-    pub fn validateAttestation(self: *Self, signed_vote: types.SignedVote, is_from_block: bool) !void {
-        const vote = signed_vote.message;
+    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
+    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
+    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+        const data = attestation.data;
 
         // 1. Validate that source, target, and head blocks exist in proto array
-        const source_idx = self.forkChoice.protoArray.indices.get(vote.source.root) orelse {
+        const source_idx = self.forkChoice.protoArray.indices.get(data.source.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown source block root=0x{s}", .{
-                std.fmt.fmtSliceHexLower(&vote.source.root),
+                std.fmt.fmtSliceHexLower(&data.source.root),
             });
             return AttestationValidationError.UnknownSourceBlock;
         };
 
-        const target_idx = self.forkChoice.protoArray.indices.get(vote.target.root) orelse {
+        const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
-                std.fmt.fmtSliceHexLower(&vote.target.root),
+                std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
-        const head_idx = self.forkChoice.protoArray.indices.get(vote.head.root) orelse {
+        const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
-                std.fmt.fmtSliceHexLower(&vote.head.root),
+                std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
         };
@@ -513,40 +540,37 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceSlotExceedsTarget;
         }
 
-        //    This corresponds to leanSpec's: assert vote.source.slot <= vote.target.slot
-        if (vote.source.slot > vote.target.slot) {
+        //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
+        if (data.source.slot > data.target.slot) {
             self.module_logger.debug("Attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
-                vote.source.slot,
-                vote.target.slot,
+                data.source.slot,
+                data.target.slot,
             });
             return AttestationValidationError.SourceCheckpointExceedsTarget;
         }
 
         // 3. Validate checkpoint slots match block slots
-        if (source_block.slot != vote.source.slot) {
+        if (source_block.slot != data.source.slot) {
             self.module_logger.debug("Attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
                 source_block.slot,
-                vote.source.slot,
+                data.source.slot,
             });
             return AttestationValidationError.SourceCheckpointSlotMismatch;
         }
 
-        //    This corresponds to leanSpec's: assert target_block.slot == vote.target.slot
-        if (target_block.slot != vote.target.slot) {
+        //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
+        if (target_block.slot != data.target.slot) {
             self.module_logger.debug("Attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
                 target_block.slot,
-                vote.target.slot,
+                data.target.slot,
             });
             return AttestationValidationError.TargetCheckpointSlotMismatch;
         }
 
         // 4. Validate attestation is not too far in the future
-        //    Per leanSpec store.py:
-        //    - General validation (line 140): assert vote.slot <= Slot(current_slot + Slot(1))
-        //    - Gossip processing (line 177): assert vote.slot <= time_slots
         //
-        //    Gossip attestations must be for current or past slots only. Validators vote
-        //    in interval 1 of the current slot, so they cannot vote for future slots.
+        //    Gossip attestations must be for current or past slots only. Validators attest
+        //    in interval 1 of the current slot, so they cannot attest for future slots.
         //    Block attestations can be more lenient since the block itself was validated.
         const current_slot = self.forkChoice.fcStore.timeSlots;
         const max_allowed_slot = if (is_from_block)
@@ -554,9 +578,9 @@ pub const BeamChain = struct {
         else
             current_slot; // Gossip attestations: no future slots allowed
 
-        if (vote.slot > max_allowed_slot) {
-            self.module_logger.debug("Attestation validation failed: vote slot {d} > max allowed slot {d} (is_from_block={any})", .{
-                vote.slot,
+        if (data.slot > max_allowed_slot) {
+            self.module_logger.debug("Attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
+                data.slot,
                 max_allowed_slot,
                 is_from_block,
             });
@@ -564,18 +588,18 @@ pub const BeamChain = struct {
         }
 
         self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
-            signed_vote.validator_id,
-            vote.slot,
-            vote.source.slot,
-            vote.target.slot,
+            attestation.validator_id,
+            data.slot,
+            data.source.slot,
+            data.target.slot,
             is_from_block,
         });
     }
 
-    pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
+    pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
-        try self.validateAttestation(signedVote, false);
-        return self.forkChoice.onAttestation(signedVote, false);
+        try self.validateAttestation(signedAttestation.message, false);
+        return self.forkChoice.onAttestation(signedAttestation, false);
     }
 
     pub fn getStatus(self: *Self) types.Status {
@@ -642,17 +666,18 @@ test "process and add mock blocks into a node's chain" {
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
-    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
-        const block = mock_chain.blocks[i];
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
         const block_root = mock_chain.blockRoots[i];
-        const current_slot = block.message.slot;
+        const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        try beam_chain.onBlock(block, .{});
+        try beam_chain.onBlock(signed_block, .{});
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
@@ -663,7 +688,7 @@ test "process and add mock blocks into a node's chain" {
         const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
-        try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
+        try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_justified.root, &mock_chain.latestJustified[i].root));
@@ -673,9 +698,9 @@ test "process and add mock blocks into a node's chain" {
 
     const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
     for (0..num_validators) |validator_id| {
-        // all validators should have voted as per the mock chain
-        const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
-        try std.testing.expect(vote_tracker != null);
+        // all validators should have attested as per the mock chain
+        const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
+        try std.testing.expect(attestations_tracker != null);
     }
 }
 
@@ -715,11 +740,12 @@ test "printSlot output demonstration" {
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
-        const block = mock_chain.blocks[i];
-        const current_slot = block.message.slot;
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        try beam_chain.onBlock(block, .{});
+        try beam_chain.onBlock(signed_block, .{});
     }
 
     // Register some validators to make the output more interesting
@@ -784,231 +810,249 @@ test "attestation validation - comprehensive" {
 
     // Add blocks to chain (slots 1 and 2)
     for (1..mock_chain.blocks.len) |i| {
-        const block = mock_chain.blocks[i];
-        try beam_chain.forkChoice.onInterval(block.message.slot * constants.INTERVALS_PER_SLOT, false);
-        try beam_chain.onBlock(block, .{});
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.onBlock(signed_block, .{});
     }
 
     // Test 1: Valid attestation (baseline - should pass)
     {
         const source_slot: types.Slot = 1;
         const target_slot: types.Slot = 2;
-        const valid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = target_slot,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[target_slot],
+        const valid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = target_slot,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[source_slot],
-                    .slot = source_slot,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[target_slot],
-                    .slot = target_slot,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[target_slot],
+                        .slot = target_slot,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[source_slot],
+                        .slot = source_slot,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[target_slot],
+                        .slot = target_slot,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
         // Should pass validation
-        try beam_chain.validateAttestation(valid_vote, false);
+        try beam_chain.validateAttestation(valid_attestation.message, false);
     }
 
     // Test 2: Unknown source block
     {
         const unknown_root = [_]u8{0xFF} ** 32;
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = unknown_root, // Unknown block
-                    .slot = 1,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 3: Unknown target block
     {
         const unknown_root = [_]u8{0xEE} ** 32;
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = unknown_root, // Unknown block
-                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 2,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 4: Unknown head block
     {
         const unknown_root = [_]u8{0xDD} ** 32;
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = unknown_root, // Unknown block
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
-
     // Test 5: Source slot exceeds target slot (block slots)
     {
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2], // Slot 2 block
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1], // Slot 1 block
-                    .slot = 1,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 6: Source checkpoint slot exceeds target checkpoint slot
     {
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1], // Block at slot 1 (passes block slot check)
-                    .slot = 2, // Checkpoint claims slot 2
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2], // Block at slot 2 (passes block slot check)
-                    .slot = 1, // Checkpoint claims slot 1 (2 > 1 fails checkpoint check)
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceCheckpointExceedsTarget, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 7: Source checkpoint slot mismatch
     {
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1], // Block at slot 1
-                    .slot = 0, // Checkpoint claims slot 0 (mismatch)
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 0,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 8: Target checkpoint slot mismatch
     {
-        const invalid_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 2,
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
                     .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2], // Block at slot 2
-                    .slot = 1, // Checkpoint claims slot 1 (mismatch)
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 1, // Checkpoint claims slot 1 (mismatch)
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_vote, false));
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
 
     // Test 9: Attestation too far in future (for gossip)
     {
-        const future_vote = types.SignedVote{
-            .validator_id = 0,
-            .message = types.Mini3SFVote{
-                .slot = 100, // Way too far in the future
-                .head = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
-                },
-                .source = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .target = types.Mini3SFCheckpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
+        const future_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 3, // Future slot (current is 2)
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_vote, false));
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.message, false));
     }
 }
 
@@ -1050,64 +1094,64 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Add one block (slot 1)
     const block = mock_chain.blocks[1];
-    try beam_chain.forkChoice.onInterval(block.message.slot * constants.INTERVALS_PER_SLOT, false);
+    try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
     try beam_chain.onBlock(block, .{});
 
     // Current time is at slot 1, create attestation for slot 2 (next slot)
-    const next_slot_vote = types.SignedVote{
-        .validator_id = 0,
-        .message = types.Mini3SFVote{
-            .slot = 2, // Next slot
-            .head = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
-            },
-            .source = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[0],
-                .slot = 0,
-            },
-            .target = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
+    const next_slot_attestation: types.SignedAttestation = .{
+        .message = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[0],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
             },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
     };
 
     // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert vote.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_vote, false));
+    // Per spec store.py:177: assert attestation.slot <= time_slots
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.message, false));
 
     // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert vote.slot <= Slot(current_slot + Slot(1))
-    try beam_chain.validateAttestation(next_slot_vote, true);
-
-    // Both should still reject attestations > current_slot + 1
-    const too_far_vote = types.SignedVote{
-        .validator_id = 0,
-        .message = types.Mini3SFVote{
-            .slot = 3, // Too far in future
-            .head = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
-            },
-            .source = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[0],
-                .slot = 0,
-            },
-            .target = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
+    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    try beam_chain.validateAttestation(next_slot_attestation.message, true);
+    const too_far_attestation: types.SignedAttestation = .{
+        .message = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 3, // Too far in future
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[0],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
             },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
     };
-
     // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_vote, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_vote, true));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, true));
 }
-
 test "attestation processing - valid block attestation" {
     // Test that valid attestations from blocks are processed correctly
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1145,37 +1189,39 @@ test "attestation processing - valid block attestation" {
     // Add blocks to chain
     for (1..mock_chain.blocks.len) |i| {
         const block = mock_chain.blocks[i];
-        try beam_chain.forkChoice.onInterval(block.message.slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
         try beam_chain.onBlock(block, .{});
     }
 
     // Create a valid attestation
-    const valid_vote = types.SignedVote{
-        .validator_id = 1,
-        .message = types.Mini3SFVote{
-            .slot = 2,
-            .head = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[2],
+    const valid_attestation: types.SignedAttestation = .{
+        .message = .{
+            .validator_id = 1,
+            .data = .{
                 .slot = 2,
-            },
-            .source = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
-            },
-            .target = types.Mini3SFCheckpoint{
-                .root = mock_chain.blockRoots[2],
-                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
             },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
     };
 
     // Process attestation through chain (this validates and then processes)
-    try beam_chain.onAttestation(valid_vote);
+    try beam_chain.onAttestation(valid_attestation);
 
-    // Verify the vote was recorded in latestKnown
-    const vote_tracker = beam_chain.forkChoice.votes.get(1);
-    try std.testing.expect(vote_tracker != null);
-    try std.testing.expect(vote_tracker.?.latestNew != null);
-    try std.testing.expect(vote_tracker.?.latestNew.?.slot == 2);
+    // Verify the attestation was recorded in attestations
+    const attestations_tracker = beam_chain.forkChoice.attestations.get(1);
+    try std.testing.expect(attestations_tracker != null);
+    try std.testing.expect(attestations_tracker.?.latestNew != null);
+    try std.testing.expect(attestations_tracker.?.latestNew.?.slot == 2);
 }
