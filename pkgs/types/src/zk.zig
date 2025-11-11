@@ -37,7 +37,8 @@ pub const BeamSTFProof = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *BeamSTFProof) void {
-        self.allocator.free(self.proof);
+        // self.allocator.free(self.proof);
+        _ = self;
     }
 
     pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {

@@ -233,7 +233,9 @@ fn mainInner() !void {
             for (mock_chain.blocks[1..]) |signed_block| {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
-                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
+                var output = try allocator.alloc(u8, 3 * 1024 * 1024);
+                defer allocator.free(output);
+                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator, output[0..]) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
                     return err;
                 };
