@@ -37,7 +37,7 @@ pub const BeamSTFProof = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *BeamSTFProof) void {
-        // self.allocator.free(self.proof);
+        // the memory is taken from a larger buffer, and freed at the call site.
         _ = self;
     }
 
