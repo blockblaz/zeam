@@ -63,7 +63,7 @@ pub fn build(b: *Builder) !void {
     const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
 
-    const zkvm_host_cmd = build_rust_project(b, "rust", prover);
+    const build_rust_lib_steps = build_rust_project(b, "rust", prover);
 
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
@@ -324,7 +324,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("yaml", yaml);
     cli_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
 
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
+    cli_exe.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
@@ -442,7 +442,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -502,7 +502,7 @@ pub fn build(b: *Builder) !void {
     });
 
     // xmss_tests.step.dependOn(&networking_build.step);
-    xmss_tests.step.dependOn(&zkvm_host_cmd.step);
+    xmss_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_tests, target, prover);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
@@ -518,10 +518,11 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
 
-    manager_tests.step.dependOn(&zkvm_host_cmd.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
-    network_tests.step.dependOn(&zkvm_host_cmd.step);
-    node_tests.step.dependOn(&zkvm_host_cmd.step);
+    manager_tests.step.dependOn(&build_rust_lib_steps.step);
+    cli_tests.step.dependOn(&build_rust_lib_steps.step);
+    network_tests.step.dependOn(&build_rust_lib_steps.step);
+    node_tests.step.dependOn(&build_rust_lib_steps.step);
+    transition_tests.step.dependOn(&build_rust_lib_steps.step);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
