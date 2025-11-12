@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
+const keymanager = @import("@zeam/key-manager");
 
 const transition = @import("./transition.zig");
 
@@ -22,9 +23,9 @@ const MockChainData = struct {
     finalization: []bool,
 
     pub fn deinit(self: *MockChainData, allocator: Allocator) void {
-        self.genesis_state.deinit(allocator);
+        self.genesis_state.deinit();
         for (self.blocks) |*b| {
-            b.deinit(allocator);
+            b.deinit();
         }
         allocator.free(self.blocks);
         allocator.free(self.blockRoots);
@@ -36,28 +37,35 @@ const MockChainData = struct {
     }
 };
 
-pub fn genMockChain(
-    allocator: Allocator,
-    numBlocks: usize,
-    from_genesis: ?types.GenesisSpec,
-    num_validators_override: ?usize,
-) !MockChainData {
-    const genesis_config = from_genesis orelse types.GenesisSpec{
-        .genesis_time = 1234,
-    };
+pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types.GenesisSpec) !MockChainData {
+    // Determine num_validators early
+    const num_validators: usize = if (from_genesis) |gen| @intCast(gen.numValidators()) else 4;
+    std.debug.assert(num_validators > 0); // A chain must have at least one validator.
 
-    const requested_validator_count: usize = num_validators_override orelse 4;
-    if (requested_validator_count < 4) {
-        return error.InvalidValidatorCount;
+    // Init key_manager ONCE for entire function (used for genesis AND signing later)
+    var key_manager = try keymanager.getTestKeyManager(allocator, num_validators, numBlocks);
+    defer key_manager.deinit();
+
+    var genesis_config: types.GenesisSpec = undefined;
+    var should_free_genesis = false;
+
+    if (from_genesis) |gen| {
+        genesis_config = gen;
+    } else {
+        // Generate pubkeys from key_manager
+        const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+        errdefer allocator.free(pubkeys);
+
+        genesis_config = types.GenesisSpec{
+            .genesis_time = 1234,
+            .validator_pubkeys = pubkeys,
+        };
+        should_free_genesis = true;
     }
-    var validators = try types.Validators.init(allocator);
-    defer validators.deinit();
-    for (0..requested_validator_count) |_| {
-        try validators.append(.{ .pubkey = [_]u8{0} ** 52 });
-    }
+    defer if (should_free_genesis) allocator.free(genesis_config.validator_pubkeys);
 
     var genesis_state: types.BeamState = undefined;
-    try genesis_state.genGenesisState(allocator, genesis_config, validators);
+    try genesis_state.genGenesisState(allocator, genesis_config);
     errdefer genesis_state.deinit();
     var blockList = std.ArrayList(types.SignedBlockWithAttestation).init(allocator);
     var blockRootList = std.ArrayList(types.Root).init(allocator);
@@ -72,10 +80,8 @@ pub fn genMockChain(
 
     // figure out a way to clone genesis_state
     var beam_state: types.BeamState = undefined;
-    try beam_state.genGenesisState(allocator, genesis_config, validators);
+    try beam_state.genGenesisState(allocator, genesis_config);
     defer beam_state.deinit();
-
-    const validator_count = beam_state.validatorCount();
 
     var genesis_block: types.BeamBlock = undefined;
     try beam_state.genGenesisBlock(allocator, &genesis_block);
@@ -95,7 +101,15 @@ pub fn genMockChain(
 
     const gen_signed_block = types.SignedBlockWithAttestation{
         .message = gen_block_with_attestation,
-        .signature = try types.createBlockSignatures(allocator, genesis_block.body.attestations.len()),
+        .signature = blk: {
+            var sigs = try types.BlockSignatures.init(allocator);
+            const proposer_sig = try key_manager.signAttestation(
+                &gen_block_with_attestation.proposer_attestation,
+                allocator,
+            );
+            try sigs.append(proposer_sig);
+            break :blk sigs;
+        },
     };
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
@@ -143,7 +157,7 @@ pub fn genMockChain(
                 const slotAttestations = [_]types.Attestation{
                     // val 0
                     .{
-                        .validator_id = 0,
+                        .validator_id = 0 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -154,7 +168,7 @@ pub fn genMockChain(
                     // skip val1
                     // val2
                     .{
-                        .validator_id = 2,
+                        .validator_id = 2 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -165,7 +179,7 @@ pub fn genMockChain(
 
                     // val3
                     .{
-                        .validator_id = 3,
+                        .validator_id = 3 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -190,7 +204,7 @@ pub fn genMockChain(
 
                     // val 1
                     .{
-                        .validator_id = 1,
+                        .validator_id = 1 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -201,7 +215,7 @@ pub fn genMockChain(
 
                     // val2
                     .{
-                        .validator_id = 2,
+                        .validator_id = 2 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -212,7 +226,7 @@ pub fn genMockChain(
 
                     // val3
                     .{
-                        .validator_id = 3,
+                        .validator_id = 3 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -235,7 +249,7 @@ pub fn genMockChain(
                 const slotAttestations = [_]types.Attestation{
                     // val 0
                     .{
-                        .validator_id = 0,
+                        .validator_id = 0 % num_validators,
                         .data = .{
                             .slot = slot - 1,
                             .head = .{ .root = parent_root, .slot = slot - 1 },
@@ -259,7 +273,7 @@ pub fn genMockChain(
             else => unreachable,
         }
 
-        const proposer_index = slot % validator_count;
+        const proposer_index = slot % genesis_config.numValidators();
         var block = types.BeamBlock{
             .slot = slot,
             .proposer_index = proposer_index,
@@ -304,7 +318,22 @@ pub fn genMockChain(
 
         const signed_block = types.SignedBlockWithAttestation{
             .message = block_with_attestation,
-            .signature = try types.createBlockSignatures(allocator, attestations.items.len),
+            .signature = blk: {
+                var sigs = try types.BlockSignatures.init(allocator);
+
+                for (block.body.attestations.constSlice()) |attestation| {
+                    const sig = try key_manager.signAttestation(&attestation, allocator);
+                    try sigs.append(sig);
+                }
+
+                const proposer_sig = try key_manager.signAttestation(
+                    &block_with_attestation.proposer_attestation,
+                    allocator,
+                );
+                try sigs.append(proposer_sig);
+
+                break :blk sigs;
+            },
         };
         try blockList.append(signed_block);
         try blockRootList.append(block_root);

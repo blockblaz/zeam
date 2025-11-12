@@ -186,4 +186,3 @@ test "devnet fc test_fork_choice_head test_head_with_two_competing_forks" {
     const Case = fork_choice.TestCase(forks.devnet, "consensus/fork_choice/devnet/fc/test_fork_choice_head/test_head_with_two_competing_forks.json");
     try Case.execute(test_allocator, fixtures_dir);
 }
-

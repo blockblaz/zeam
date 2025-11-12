@@ -32,6 +32,22 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
@@ -92,6 +108,22 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: build
       run: zig build all
 
@@ -131,6 +163,22 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: Build with all provers
       run: zig build -Dprover=all
 
@@ -168,6 +216,22 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
     - name: Run all unit tests
       run: zig build test --summary all
 
@@ -179,21 +243,51 @@ jobs:
 
   docker-build:
     name: docker-build
-    runs-on: ubuntu-latest
     needs: [lint, build, test, build-all-provers]
+    strategy:
+      matrix:
+        builder: [ubuntu-latest, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.builder }}
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0  # Fetch full history to get git commit info
 
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build zeam natively
+      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build Docker image
+    - name: Build Docker image with pre-built binary
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: ./Dockerfile
+        file: ./Dockerfile.prebuilt
         push: false  # Don't push, just build to verify
         tags: zeam:ci-${{ github.run_number }}
         cache-from: type=gha

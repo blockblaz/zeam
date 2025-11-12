@@ -21,6 +21,10 @@ pub const Validator = struct {
         return json.Value{ .object = obj };
     }
 
+    pub fn getPubkey(self: *const Validator) []const u8 {
+        return &self.pubkey;
+    }
+
     pub fn toJsonString(self: *const Validator, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
         return utils.jsonToString(allocator, json_value);

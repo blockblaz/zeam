@@ -224,4 +224,3 @@ test "devnet fc test_fork_choice_reorgs test_two_block_reorg_progressive_buildin
     const Case = fork_choice.TestCase(forks.devnet, "consensus/fork_choice/devnet/fc/test_fork_choice_reorgs/test_two_block_reorg_progressive_building.json");
     try Case.execute(test_allocator, fixtures_dir);
 }
-

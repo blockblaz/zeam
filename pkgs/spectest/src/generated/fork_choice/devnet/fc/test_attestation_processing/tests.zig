@@ -186,4 +186,3 @@ test "devnet fc test_attestation_processing test_slot_gaps_with_attestation_supe
     const Case = fork_choice.TestCase(forks.devnet, "consensus/fork_choice/devnet/fc/test_attestation_processing/test_slot_gaps_with_attestation_superseding.json");
     try Case.execute(test_allocator, fixtures_dir);
 }
-

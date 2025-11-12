@@ -167,4 +167,3 @@ test "devnet fc test_attestation_target_selection test_attestation_target_with_s
     const Case = fork_choice.TestCase(forks.devnet, "consensus/fork_choice/devnet/fc/test_attestation_target_selection/test_attestation_target_with_slot_gaps.json");
     try Case.execute(test_allocator, fixtures_dir);
 }
-

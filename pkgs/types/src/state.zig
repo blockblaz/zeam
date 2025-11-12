@@ -24,10 +24,12 @@ const json = std.json;
 
 // PQ devnet0 config
 pub const BeamStateConfig = struct {
+    num_validators: u64,
     genesis_time: u64,
 
     pub fn toJson(self: *const BeamStateConfig, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
+        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
         try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
         return json.Value{ .object = obj };
     }
@@ -63,7 +65,7 @@ pub const BeamState = struct {
 
     const Self = @This();
 
-    pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec, validators: Validators) !void {
+    pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
         var genesis_block: block.BeamBlock = undefined;
         try genesis_block.genGenesisBlock(allocator);
         defer genesis_block.deinit();
@@ -83,8 +85,20 @@ pub const BeamState = struct {
         var justifications_validators = try ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT).init(allocator);
         errdefer justifications_validators.deinit();
 
+        var validators = try Validators.init(allocator);
+        errdefer validators.deinit();
+
+        // Populate validators from genesis pubkeys
+        for (genesis.validator_pubkeys) |pubkey| {
+            const val = validator.Validator{
+                .pubkey = pubkey,
+            };
+            try validators.append(val);
+        }
+
         self.* = .{
             .config = .{
+                .num_validators = genesis.numValidators(),
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
@@ -103,7 +117,7 @@ pub const BeamState = struct {
 
     pub fn getJustification(self: *const Self, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = self.validatorCount();
+        const num_validators: usize = @intCast(self.config.num_validators);
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
             const validator_data = try allocator.alloc(u8, num_validators);
@@ -117,10 +131,6 @@ pub const BeamState = struct {
         }
     }
 
-    pub fn validatorCount(self: *const Self) usize {
-        return self.validators.len();
-    }
-
     pub fn withJustifications(self: *Self, allocator: Allocator, justifications: *const std.AutoHashMapUnmanaged(Root, []u8)) !void {
         var new_justifications_roots = try JustificationRoots.init(allocator);
         errdefer new_justifications_roots.deinit();
@@ -131,8 +141,7 @@ pub const BeamState = struct {
         // First, collect all keys
         var iterator = justifications.iterator();
         while (iterator.next()) |kv| {
-            const expected_len = self.validatorCount();
-            if (kv.value_ptr.*.len != expected_len) {
+            if (kv.value_ptr.*.len != self.config.num_validators) {
                 return error.InvalidJustificationLength;
             }
             try new_justifications_roots.append(kv.key_ptr.*);
@@ -205,12 +214,7 @@ pub const BeamState = struct {
         }
 
         // 3. check proposer is correct
-        const num_validators = self.validatorCount();
-        if (num_validators == 0) {
-            logger.err("process-block-header: validator registry empty", .{});
-            return StateTransitionError.InvalidValidatorId;
-        }
-        const correct_proposer_index = staged_block.slot % num_validators;
+        const correct_proposer_index = staged_block.slot % self.config.num_validators;
         if (staged_block.proposer_index != correct_proposer_index) {
             logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ staged_block.proposer_index, staged_block.slot, correct_proposer_index });
             return StateTransitionError.InvalidProposer;
@@ -284,7 +288,7 @@ pub const BeamState = struct {
         try self.getJustification(allocator, &justifications);
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = self.validatorCount();
+        const num_validators: usize = @intCast(self.config.num_validators);
         for (attestations.constSlice()) |attestation| {
             const validator_id: usize = @intCast(attestation.validator_id);
             const attestation_data = attestation.data;
@@ -503,7 +507,7 @@ pub const BeamState = struct {
 };
 
 test "ssz seralize/deserialize signed beam state" {
-    const config = BeamStateConfig{ .genesis_time = 93 };
+    const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
     const genesis_root = [_]u8{9} ** 32;
 
     var state = BeamState{

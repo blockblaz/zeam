@@ -405,7 +405,7 @@ fn buildState(
     }
 
     return types.BeamState{
-        .config = .{ .genesis_time = genesis_time },
+        .config = .{ .genesis_time = genesis_time, .num_validators = validators.len() },
         .slot = slot,
         .latest_block_header = latest_block_header,
         .latest_justified = latest_justified,
@@ -561,7 +561,7 @@ fn verifyPost(
 
     if (post_obj.get("validatorCount")) |val| {
         const expected = try expect.expectU64Value(FixtureError, val, ctx, "post.validatorCount");
-        const actual: u64 = @intCast(state.validatorCount());
+        const actual: u64 = @intCast(state.validators.len());
         if (actual != expected) {
             std.debug.print(
                 "fixture {s} case {s}: validator count mismatch (got {d}, want {d})\n",

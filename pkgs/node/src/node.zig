@@ -8,6 +8,7 @@ const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const key_manager_lib = @import("@zeam/key-manager");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -26,6 +27,7 @@ const NodeOpts = struct {
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     validator_ids: ?[]usize = null,
+    key_manager: ?*const key_manager_lib.KeyManager = null,
     nodeId: u32 = 0,
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
@@ -67,7 +69,15 @@ pub const BeamNode = struct {
             allocator.destroy(chain);
         }
         if (opts.validator_ids) |ids| {
-            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
+            // key_manager is required when validator_ids is provided
+            const km = opts.key_manager orelse return error.KeyManagerRequired;
+            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{
+                .ids = ids,
+                .chain = chain,
+                .network = network,
+                .logger = opts.logger_config.logger(.validator),
+                .key_manager = km,
+            });
             chain.registerValidatorIds(ids);
         }
 
@@ -342,6 +352,15 @@ pub const BeamNode = struct {
     pub fn onInterval(ptr: *anyopaque, itime_intervals: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
+        if (itime_intervals <= self.chain.forkChoice.fcStore.time) {
+            self.logger.warn("Skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
+                self.chain.forkChoice.fcStore.time,
+                itime_intervals,
+            });
+            return;
+        }
+
         // till its time to attest atleast for first time don't run onInterval,
         // just print chain status i.e avoid zero slot zero interval block production
         if (itime_intervals < 1) {
@@ -363,15 +382,14 @@ pub const BeamNode = struct {
         if (self.validator) |*validator| {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
-            const validator_output = validator.onInterval(interval) catch |e| {
+            var validator_output = validator.onInterval(interval) catch |e| {
                 self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
 
-            if (validator_output) |output| {
-                var mutable_output = output;
-                defer mutable_output.deinit();
-                for (mutable_output.gossip_messages.items) |gossip_msg| {
+            if (validator_output) |*output| {
+                defer output.deinit();
+                for (output.gossip_messages.items) |gossip_msg| {
 
                     // Process based on message type
                     switch (gossip_msg) {
@@ -476,19 +494,22 @@ test "Node peer tracking on connect/disconnect" {
 
     const backend = mock.getNetworkInterface();
 
+    // Generate pubkeys for validators using testing key manager
+    const num_validators = 4;
+    const keymanager = @import("@zeam/key-manager");
+    var key_manager = try keymanager.getTestKeyManager(allocator, num_validators, 10);
+    defer key_manager.deinit();
+
+    const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+    defer allocator.free(pubkeys);
+
     const genesis_config = types.GenesisSpec{
         .genesis_time = 0,
+        .validator_pubkeys = pubkeys,
     };
 
-    const validator_count: usize = 4;
-    var genesis_validators = try types.Validators.init(allocator);
-    defer genesis_validators.deinit();
-    for (0..validator_count) |_| {
-        try genesis_validators.append(.{ .pubkey = [_]u8{0} ** 52 });
-    }
-
     var anchor_state: types.BeamState = undefined;
-    try anchor_state.genGenesisState(allocator, genesis_config, genesis_validators);
+    try anchor_state.genGenesisState(allocator, genesis_config);
     defer anchor_state.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});

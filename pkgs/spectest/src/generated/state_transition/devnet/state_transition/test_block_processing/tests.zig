@@ -262,4 +262,3 @@ test "devnet state_transition test_block_processing test_process_first_block_aft
     const Case = state_transition.TestCase(forks.devnet, "consensus/state_transition/devnet/state_transition/test_block_processing/test_process_first_block_after_genesis.json");
     try Case.execute(test_allocator, fixtures_dir);
 }
-

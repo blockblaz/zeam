@@ -62,6 +62,18 @@ out for this space for annoucements on the same or reach out to us via our [comm
 
 ### Build instructions
 
+#### Docker
+
+Docker images are built in CI using `Dockerfile.prebuilt`, which packages pre-built binaries. This avoids intermittent build failures caused by a [Zig HTTP connection pool bug](https://github.com/ziglang/zig/issues/21316) when building inside Docker.
+
+To build a Docker image locally:
+```bash
+# Build zeam natively first
+zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+# Then create Docker image with pre-built binary
+docker build -f Dockerfile.prebuilt -t zeam:local .
+```
 
 #### Prerequisites
 

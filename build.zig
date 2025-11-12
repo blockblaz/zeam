@@ -62,7 +62,7 @@ pub fn build(b: *Builder) !void {
     const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
 
-    const zkvm_host_cmd = build_rust_project(b, "rust", prover);
+    const build_rust_lib_steps = build_rust_project(b, "rust", prover);
 
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
@@ -180,6 +180,23 @@ pub fn build(b: *Builder) !void {
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
+    });
+
+    // add zeam-key-manager
+    const zeam_key_manager = b.addModule("@zeam/key-manager", .{
+        .root_source_file = b.path("pkgs/key-manager/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
+    zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("ssz", ssz);
+
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
@@ -191,6 +208,8 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
     zeam_state_transition.addImport("@zeam/api", zeam_api);
+    zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
+    zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -223,13 +242,6 @@ pub fn build(b: *Builder) !void {
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
 
-    // add zeam-xmss
-    const zeam_xmss = b.addModule("@zeam/xmss", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
-    });
-
     // add network
     const zeam_network = b.addModule("@zeam/network", .{
         .target = target,
@@ -261,6 +273,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/network", zeam_network);
     zeam_beam_node.addImport("@zeam/database", zeam_database);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
+    zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -271,6 +284,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/types", zeam_types);
     zeam_spectests.addImport("@zeam/configs", zeam_configs);
     zeam_spectests.addImport("@zeam/params", zeam_params);
+    zeam_spectests.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_spectests.addImport("ssz", ssz);
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
@@ -311,8 +325,9 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
+    cli_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
 
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
+    cli_exe.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
@@ -375,6 +390,14 @@ pub fn build(b: *Builder) !void {
     });
     cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
 
+    // Add error handler module to integration tests
+    const error_handler_module = b.addModule("error_handler", .{
+        .root_source_file = b.path("pkgs/cli/src/error_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("error_handler", error_handler_module);
+
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
         .optimize = optimize,
@@ -422,7 +445,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
@@ -482,7 +505,7 @@ pub fn build(b: *Builder) !void {
     });
 
     // xmss_tests.step.dependOn(&networking_build.step);
-    xmss_tests.step.dependOn(&zkvm_host_cmd.step);
+    xmss_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_tests, target, prover);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
@@ -498,10 +521,12 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
 
-    manager_tests.step.dependOn(&zkvm_host_cmd.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
-    network_tests.step.dependOn(&zkvm_host_cmd.step);
-    node_tests.step.dependOn(&zkvm_host_cmd.step);
+    manager_tests.step.dependOn(&build_rust_lib_steps.step);
+
+    network_tests.step.dependOn(&build_rust_lib_steps.step);
+    node_tests.step.dependOn(&build_rust_lib_steps.step);
+    transition_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, transition_tests, target, prover);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{

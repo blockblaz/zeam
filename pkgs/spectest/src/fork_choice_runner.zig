@@ -1193,7 +1193,7 @@ fn buildState(
     }
 
     return types.BeamState{
-        .config = .{ .genesis_time = genesis_time },
+        .config = .{ .genesis_time = genesis_time, .num_validators = validators.len() },
         .slot = slot,
         .latest_block_header = latest_block_header,
         .latest_justified = latest_justified,
@@ -1239,7 +1239,7 @@ fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.Chai
     var writer = buffer.writer(allocator);
     try writer.print(
         "{{\"preset\":\"mainnet\",\"name\":\"forkchoice\",\"genesis_time\":{d}}}",
-        .{ state.config.genesis_time },
+        .{state.config.genesis_time},
     );
     const options = json.ParseOptions{
         .ignore_unknown_fields = true,
