@@ -122,7 +122,6 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
     };
     const proof = types.BeamSTFProof{
         .proof = output[0..output_len],
-        .allocator = allocator,
     };
     opts.logger.debug("proof len={}\n", .{output_len});
 

@@ -34,12 +34,8 @@ pub const ZkVm = enum {
 pub const BeamSTFProof = struct {
     // zk_vm: ZkVm,
     proof: []const u8,
-    allocator: Allocator,
 
-    pub fn deinit(self: *BeamSTFProof) void {
-        // the memory is taken from a larger buffer, and freed at the call site.
-        _ = self;
-    }
+    pub fn deinit(_: *BeamSTFProof) void {}
 
     pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
