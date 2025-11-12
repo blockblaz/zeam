@@ -48,13 +48,12 @@ jobs:
         ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))')
 
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-          echo "❌ No version label found! Please add a label like 'v1.0.0' or 'version:1.0.0'"
-          exit 1
+          echo "ℹ️ No version label found"
+        else
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "git_tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "✅ Version found: $VERSION"
         fi
-
-        # Set outputs
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "git_tag=v$VERSION" >> $GITHUB_OUTPUT
 
         if [ -n "$ZEAM_TAG" ] && [ "$ZEAM_TAG" != "null" ]; then
           echo "zeam_tag=$ZEAM_TAG" >> $GITHUB_OUTPUT
@@ -65,20 +64,26 @@ jobs:
           echo "ℹ️ No network tag found (optional)"
         fi
 
-        echo "✅ Version found: $VERSION"
+        # Require at least one label (version or network)
+        if { [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; } && { [ -z "$ZEAM_TAG" ] || [ "$ZEAM_TAG" = "null" ]; }; then
+          echo "❌ No usable label found! Please add a version (e.g. v1.0.0) or network tag (e.g. devnet0, testnet, mainnet)"
+          exit 1
+        fi
 
     - name: Create and push git tags
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Create version tag
-        if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
-          echo "⚠️ Tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists, skipping"
-        else
-          git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
-          git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
-          echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
+        # Create version tag if version label exists
+        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
+          if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
+            echo "⚠️ Tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists, skipping"
+          else
+            git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
+            git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
+            echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
+          fi
         fi
 
         # Create zeam network tag if network label exists
@@ -103,6 +108,7 @@ jobs:
           type=raw,value=${{ steps.get_tags_labels.outputs.version }}
           type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.has_network_tag }}
 
+    # change for testing
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 
