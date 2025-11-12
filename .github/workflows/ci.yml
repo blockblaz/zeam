@@ -241,6 +241,43 @@ jobs:
     - name: Run all spec tests
       run: zig build spectest --summary all  
 
+  dummy-prove:
+    name: Dummy prove
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run the dummy prover
+      run: zig build run -Dprover=dummy -- prove --zkvm dummy
+
   docker-build:
     name: docker-build
     needs: [lint, build, test, build-all-provers]
