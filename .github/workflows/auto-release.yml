@@ -108,7 +108,30 @@ jobs:
           type=raw,value=${{ steps.get_tags_labels.outputs.version }}
           type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.has_network_tag }}
 
-    # change for testing
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 
