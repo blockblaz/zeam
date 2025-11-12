@@ -14,14 +14,14 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
-const ProverChoice = enum { none, risc0, openvm, all };
+const ProverChoice = enum { dummy, risc0, openvm, all };
 
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
     // Use profile-specific directories for single-prover builds
     switch (prover) {
-        .none => {
+        .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
@@ -59,9 +59,9 @@ pub fn build(b: *Builder) !void {
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
 
-    // Get prover choice (default to none)
-    const prover_option = b.option([]const u8, "prover", "Choose prover: none, risc0, openvm, or all (default: none)") orelse "none";
-    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .none;
+    // Get prover choice (default to dummy)
+    const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, or all (default: dummy)") orelse "dummy";
+    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .dummy;
 
     const build_rust_lib_steps = build_rust_project(b, "rust", prover);
 
@@ -552,7 +552,7 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Build only the selected prover crates
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
-        .none => b.addSystemCommand(&.{
+        .dummy => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
             "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
         }),
