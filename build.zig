@@ -519,10 +519,11 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("ssz", ssz);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
-    cli_tests.step.dependOn(&build_rust_lib_steps.step);
+
     network_tests.step.dependOn(&build_rust_lib_steps.step);
     node_tests.step.dependOn(&build_rust_lib_steps.step);
     transition_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, transition_tests, target, prover);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
