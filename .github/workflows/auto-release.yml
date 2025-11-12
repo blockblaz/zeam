@@ -70,34 +70,6 @@ jobs:
           exit 1
         fi
 
-    - name: Create and push git tags
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-        # Create version tag if version label exists
-        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
-          if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
-            echo "⚠️ Tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists, skipping"
-          else
-            git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
-            git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
-            echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
-          fi
-        fi
-
-        # Create zeam network tag if network label exists
-        if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
-          ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
-          if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
-            echo "⚠️ Zeam tag $ZEAM_GIT_TAG already exists, skipping"
-          else
-            git tag -a "$ZEAM_GIT_TAG" -m "Zeam network tag for ${{ steps.get_tags_labels.outputs.zeam_tag }}"
-            git push origin "$ZEAM_GIT_TAG"
-            echo "✅ Created zeam tag $ZEAM_GIT_TAG"
-          fi
-        fi
-
     - name: Extract metadata
       id: meta
       uses: docker/metadata-action@v5
@@ -134,6 +106,34 @@ jobs:
 
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Create and push git tags
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Create version tag if version label exists
+        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
+          if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
+            echo "⚠️ Tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists, skipping"
+          else
+            git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
+            git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
+            echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
+          fi
+        fi
+
+        # Create zeam network tag if network label exists
+        if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
+          ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
+          if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
+            echo "⚠️ Zeam tag $ZEAM_GIT_TAG already exists, skipping"
+          else
+            git tag -a "$ZEAM_GIT_TAG" -m "Zeam network tag for ${{ steps.get_tags_labels.outputs.zeam_tag }}"
+            git push origin "$ZEAM_GIT_TAG"
+            echo "✅ Created zeam tag $ZEAM_GIT_TAG"
+          fi
+        fi
 
     - name: Build and push Docker image with pre-built binary
       uses: docker/build-push-action@v5
