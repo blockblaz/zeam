@@ -229,11 +229,13 @@ fn mainInner() !void {
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;
+            var output = try allocator.alloc(u8, 3 * 1024 * 1024);
+            defer allocator.free(output);
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |signed_block| {
                 const block = signed_block.message.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
-                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator) catch |err| {
+                var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator, output[0..]) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
                     return err;
                 };
