@@ -250,8 +250,11 @@ jobs:
     - name: Run all sim tests
       run: zig build simtest --summary all
     
+    - name: Generate spec fixtures
+      run: zig build spectest:generate --summary all
+
     - name: Run all spec tests
-      run: zig build spectest --summary all -- --skip-expected-error-fixtures=true
+      run: zig build spectest:run --summary all -- --skip-expected-error-fixtures=true
 
   docker-build:
     name: docker-build
