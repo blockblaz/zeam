@@ -662,6 +662,24 @@ export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: 
     };
 }
 
+// Receive plain log lines from the Rust bridge and emit using Zeam logger with proper node scope
+export fn handleLogFromRustBridge(
+    zigHandler: *EthLibp2p,
+    level: u32,
+    message_ptr: [*]const u8,
+    message_len: usize,
+) void {
+    const message_slice: []const u8 = message_ptr[0..message_len];
+    const trimmed: []const u8 = std.mem.trim(u8, message_slice, " \t\r\n");
+    switch (level) {
+        0 => zigHandler.logger.debug("rust-bridge: {s}", .{trimmed}),
+        1 => zigHandler.logger.info("rust-bridge: {s}", .{trimmed}),
+        2 => zigHandler.logger.warn("rust-bridge: {s}", .{trimmed}),
+        3 => zigHandler.logger.err("rust-bridge: {s}", .{trimmed}),
+        else => zigHandler.logger.debug("rust-bridge:{s}", .{trimmed}),
+    }
+}
+
 export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: [*:0]const u8, listen_addresses: [*:0]const u8, connect_addresses: [*:0]const u8, topics: [*:0]const u8) void {
     const listen_slice = std.mem.span(listen_addresses);
     zig_handler.allocator.free(listen_slice);
@@ -684,6 +702,10 @@ pub extern fn create_and_run_network(
     connect_addresses: [*:0]const u8,
     topics: [*:0]const u8,
 ) void;
+pub extern fn wait_for_network_ready(
+    network_id: u32,
+    timeout_ms: u64,
+) bool;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
@@ -811,6 +833,18 @@ pub const EthLibp2p = struct {
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
         self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
+
+        // Wait for the network to be fully initialized before returning
+        // Use a 10 second timeout to avoid hanging indefinitely
+        const timeout_ms: u64 = 10000;
+        self.logger.debug("network-{d}:: Waiting for network initialization to complete...", .{self.params.networkId});
+
+        if (!wait_for_network_ready(self.params.networkId, timeout_ms)) {
+            self.logger.err("network-{d}:: Network failed to initialize within {d}ms timeout", .{ self.params.networkId, timeout_ms });
+            return error.NetworkInitializationTimeout;
+        }
+
+        self.logger.info("network-{d}:: Network initialization complete, ready to send/receive messages", .{self.params.networkId});
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {

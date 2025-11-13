@@ -6,7 +6,9 @@
 .github/
 
 # Build artifacts
-zig-out/
+# NOTE: zig-out/ is intentionally NOT ignored for Dockerfile.prebuilt
+# Dockerfile.prebuilt requires pre-built binaries from zig-out/ directory
+# The binaries must be built natively on Linux before running docker build
 zig-cache/
 *.o
 *.a

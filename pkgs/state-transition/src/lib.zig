@@ -11,7 +11,8 @@ pub const apply_transition = transition.apply_transition;
 pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
-pub const verify_signatures = transition.verify_signatures;
+pub const verifySignatures = transition.verifySignatures;
+pub const verifySingleAttestation = transition.verifySingleAttestation;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
@@ -27,17 +28,11 @@ test "ssz import" {
 }
 
 test "apply transition on mocked chain" {
-    // 1. setup genesis config
-    const test_config = types.GenesisSpec{
-        .genesis_time = 1234,
-        .num_validators = 4,
-    };
-
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const mock_chain = try genMockChain(allocator, 5, test_config);
+    const mock_chain = try genMockChain(allocator, 5, null);
     try std.testing.expect(mock_chain.blocks.len == 5);
 
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -49,6 +44,10 @@ test "apply transition on mocked chain" {
     for (1..mock_chain.blocks.len) |i| {
         // this is a signed block
         const signed_block = mock_chain.blocks[i];
+
+        // Verify signatures before applying state transition
+        try verifySignatures(allocator, &beam_state, &signed_block);
+
         try apply_transition(allocator, &beam_state, signed_block.message.block, .{ .logger = module_logger });
     }
 
@@ -60,17 +59,11 @@ test "apply transition on mocked chain" {
 }
 
 test "genStateBlockHeader" {
-    // 1. setup genesis config
-    const test_config = types.GenesisSpec{
-        .genesis_time = 1234,
-        .num_validators = 4,
-    };
-
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const mock_chain = try genMockChain(allocator, 2, test_config);
+    const mock_chain = try genMockChain(allocator, 2, null);
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.state_transition);
 

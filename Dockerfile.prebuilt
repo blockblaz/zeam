@@ -1,0 +1,52 @@
+# Dockerfile.prebuilt
+#
+# This Dockerfile is designed for pre-built binaries (built outside Docker).
+# It bypasses the Zig HTTP connection pool bug by copying pre-built artifacts.
+#
+# Usage:
+#   1. Build natively: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+#   2. Build image: docker build -f Dockerfile.prebuilt -t zeam:latest .
+#
+# This approach is used for multi-arch builds on CI/VMs to avoid intermittent
+# Zig HTTP failures during dependency fetching.
+
+# Runtime prep stage - get the necessary libraries
+FROM ubuntu:24.04 AS runtime-prep
+ARG TARGETARCH
+
+# Install SSL certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built binaries and resources
+COPY zig-out/ /app/zig-out/
+COPY resources/ /app/resources/
+
+# Create a script to copy the right libraries based on architecture
+RUN mkdir -p /runtime-libs && \
+    for lib in `ldd /app/zig-out/bin/zeam | grep -oP '(\/lib\/[^\s]+)'`; do \
+        [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
+    done;
+
+# Runtime stage - using scratch for minimal size
+FROM scratch AS runtime
+
+# Copy the architecture-specific libraries and loader
+COPY --from=runtime-prep /runtime-libs/ /
+
+# Copy SSL certificates for HTTPS
+COPY --from=runtime-prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy pre-built binaries
+COPY --from=runtime-prep /app/zig-out/ /app/zig-out/
+
+# Copy runtime resources
+COPY --from=runtime-prep /app/resources/ /app/resources/
+
+# Set the zeam binary as the entrypoint
+ENTRYPOINT ["/app/zig-out/bin/zeam"]
+
+# NOTE: The xev event loop used by zeam may require running with:
+#   --security-opt seccomp=unconfined
+# This is necessary for certain container environments to avoid PermissionDenied errors.

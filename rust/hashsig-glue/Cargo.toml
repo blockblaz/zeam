@@ -9,6 +9,7 @@ hashsig = { git = "https://github.com/b-wagn/hash-sig", rev = "93eabbf76665b3922
 rand = "0.9.2"
 rand_chacha = "0.9.0"
 thiserror = "2.0.17"
+bincode = { version = "2.0", features = ["serde"] }
 
 [lib]
 crate-type = ["staticlib"]
