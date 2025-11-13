@@ -507,14 +507,14 @@ pub const BeamChain = struct {
             const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
             if (existing_blockroots.len > 0) {
                 defer self.allocator.free(existing_blockroots);
-                var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
-                defer updated_blockroots.deinit();
-
-                updated_blockroots.appendSlice(existing_blockroots) catch {};
-                updated_blockroots.append(blockRoot) catch {};
-
-                batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
             }
+            var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+            defer updated_blockroots.deinit();
+
+            updated_blockroots.appendSlice(existing_blockroots) catch {};
+            updated_blockroots.append(blockRoot) catch {};
+
+            batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
         }
 
         // Update finalized slot indices and cleanup if finalization has advanced
@@ -553,14 +553,13 @@ pub const BeamChain = struct {
 
         // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace
         for (newly_finalized_roots) |root| {
-            if (self.forkChoice.protoArray.indices.get(root)) |idx| {
-                const node = self.forkChoice.protoArray.nodes.items[idx];
-                batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
-                self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
-                    std.fmt.fmtSliceHexLower(&root),
-                    node.slot,
-                });
-            }
+            const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
+            const node = self.forkChoice.protoArray.nodes.items[idx];
+            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
+            self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
+                std.fmt.fmtSliceHexLower(&root),
+                node.slot,
+            });
         }
 
         // 3. Remove orphaned blocks from database and cleanup unfinalized indices
