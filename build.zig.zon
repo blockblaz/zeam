@@ -36,8 +36,8 @@
             .hash = "rocksdb-9.7.4-z_CUTmO5AAD0CQ2ZvShSDZHjC2x9MKrTnpvbNAIU7ah0",
         },
         .zig_snappy = .{
-            .url = "git+https://github.com/blockblaz/zig-snappy#dd63108bd8e41c7cd799385dd9aa5085314eeafa",
-            .hash = "zig_snappy-0.0.1-bDFzXpJWAAA3c5bLc8JZK_HCwd0mGLTuFgz4LndjnVao",
+            .url = "git+https://github.com/blockblaz/zig-snappy#6084220140937f5909090eb75199c6a3430cc277",
+            .hash = "zig_snappy-0.0.1-bDFzXpRWAAB7OvKIiOndOdHZPK8Sg1U5pboBywo-pj2y",
         },
         .snappyframesz = .{
             .url = "https://github.com/blockblaz/snappyframesz/archive/78e66c2d42dc44dd1177ad007e28838a82157aa3.tar.gz",

@@ -58,7 +58,18 @@ pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
 }
 
-pub const GenesisSpec = struct { genesis_time: u64, num_validators: u64 };
+pub const GenesisSpec = struct {
+    genesis_time: u64,
+    validator_pubkeys: []const Bytes52,
+
+    pub fn deinit(self: *GenesisSpec, allocator: Allocator) void {
+        allocator.free(self.validator_pubkeys);
+    }
+
+    pub fn numValidators(self: *const GenesisSpec) u64 {
+        return @intCast(self.validator_pubkeys.len);
+    }
+};
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,

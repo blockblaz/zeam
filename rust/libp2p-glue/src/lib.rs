@@ -54,6 +54,8 @@ lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
+    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
+    static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
 }
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -65,6 +67,44 @@ struct PendingResponse {
     connection_id: ConnectionId,
     stream_id: u64,
     protocol: ProtocolId,
+}
+
+/// Wait for a network to be fully initialized and ready to accept messages.
+/// Returns true if the network is ready, false on timeout.
+///
+/// # Safety
+///
+/// This function is thread-safe and can be called from any thread.
+#[no_mangle]
+pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + timeout;
+
+    let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
+    loop {
+        if match network_id {
+            0 => ready.0,
+            1 => ready.1,
+            _ => false,
+        } {
+            return true;
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+
+        let remaining = deadline - now;
+        let (guard, timeout_result) = NETWORK_READY_CONDVAR
+            .wait_timeout(ready, remaining)
+            .unwrap();
+        ready = guard;
+
+        if timeout_result.timed_out() {
+            return false;
+        }
+    }
 }
 
 /// # Safety
@@ -182,11 +222,28 @@ pub unsafe fn publish_msg_to_rust_bridge(
 
     #[allow(static_mut_refs)]
     let swarm = if network_id < 1 {
-        unsafe { SWARM_STATE.as_mut().unwrap() }
+        match unsafe { SWARM_STATE.as_mut() } {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "publish_msg_to_rust_bridge called before network initialized",
+                );
+                return;
+            }
+        }
     } else {
-        unsafe { SWARM_STATE1.as_mut().unwrap() }
+        match unsafe { SWARM_STATE1.as_mut() } {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "publish_msg_to_rust_bridge called before network initialized",
+                );
+                return;
+            }
+        }
     };
-    // let mut swarm = unsafe {SWARM_STATE.as_mut().unwrap()};
     if let Err(e) = swarm
         .behaviour_mut()
         .gossipsub
@@ -238,9 +295,27 @@ pub unsafe fn send_rpc_request(
 
     #[allow(static_mut_refs)]
     let swarm = if network_id < 1 {
-        SWARM_STATE.as_mut().unwrap()
+        match SWARM_STATE.as_mut() {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_request called before network initialized",
+                );
+                return 0;
+            }
+        }
     } else {
-        SWARM_STATE1.as_mut().unwrap()
+        match SWARM_STATE1.as_mut() {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_request called before network initialized",
+                );
+                return 0;
+            }
+        }
     };
 
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -549,9 +624,33 @@ impl Network {
         let mut swarm = new_swarm(key_pair, topics, self.network_id);
         logger::rustLogger.info(self.network_id, "starting listener");
 
+        let mut listen_success = false;
         for mut addr in listen_addresses {
             strip_peer_id(&mut addr);
-            swarm.listen_on(addr).unwrap();
+            match swarm.listen_on(addr.clone()) {
+                Ok(_) => {
+                    logger::rustLogger.info(
+                        self.network_id,
+                        &format!("Successfully started listener on {}", addr),
+                    );
+                    listen_success = true;
+                }
+                Err(e) => {
+                    logger::rustLogger.error(
+                        self.network_id,
+                        &format!("Failed to listen on {}: {:?}", addr, e),
+                    );
+                }
+            }
+        }
+
+        if !listen_success {
+            logger::rustLogger.error(
+                self.network_id,
+                "Failed to start listener on any address - network initialization failed",
+            );
+            // Signal failure by NOT setting the ready flag
+            return;
         }
 
         logger::rustLogger.debug(self.network_id, "going for loop match");
@@ -594,6 +693,19 @@ impl Network {
                 SWARM_STATE1 = Some(swarm);
             }
         }
+
+        // Signal that this network is now ready
+        {
+            let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
+            match self.network_id {
+                0 => ready.0 = true,
+                1 => ready.1 = true,
+                _ => {}
+            }
+            NETWORK_READY_CONDVAR.notify_all();
+        }
+
+        logger::rustLogger.info(self.network_id, "network initialization complete and ready");
     }
 
     pub async fn run_eventloop(&mut self) {
@@ -994,12 +1106,13 @@ fn new_swarm(
 
     // subscribe all the topics
     for topic in topics {
-        let gossipsub_topic = gossipsub::IdentTopic::new(topic);
-        swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&gossipsub_topic)
-            .unwrap();
+        let gossipsub_topic = gossipsub::IdentTopic::new(topic.clone());
+        if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic) {
+            logger::rustLogger.error(
+                network_id,
+                &format!("Failed to subscribe to topic {}: {:?}", topic, e),
+            );
+        }
     }
 
     swarm
@@ -1070,6 +1183,17 @@ mod tests {
     use libp2p::gossipsub::MessageId;
     use snap::raw::Encoder;
 
+    // Mock FFI functions for testing
+    #[no_mangle]
+    extern "C" fn handleLogFromRustBridge(
+        _zig_handler: u64,
+        _level: u32,
+        _message_ptr: *const u8,
+        _message_len: usize,
+    ) {
+        // Mock: do nothing
+    }
+
     #[test]
     fn test_message_id_computation_with_snappy() {
         let compressed_data = {
@@ -1102,5 +1226,36 @@ mod tests {
         let expected_hex = "a7f41aaccd241477955c981714eb92244c2efc98";
         let expected_bytes = hex::decode(expected_hex).unwrap();
         assert_eq!(message_id, MessageId::new(&expected_bytes));
+    }
+
+    #[test]
+    fn test_wait_for_network_ready_timeout() {
+        // Test that wait_for_network_ready times out when network is not initialized
+        // Use network_id 99 which we won't initialize
+        let result = unsafe { wait_for_network_ready(99, 100) }; // 100ms timeout
+        assert!(!result, "Should timeout when network is not initialized");
+    }
+
+    #[test]
+    fn test_send_rpc_request_before_initialization_returns_zero() {
+        // Test that sending RPC request before initialization returns 0
+        let network_id = 99;
+        let peer_id = std::ffi::CString::new("12D3KooWTest").unwrap();
+        let request_data = b"test request";
+
+        let request_id = unsafe {
+            send_rpc_request(
+                network_id,
+                peer_id.as_ptr(),
+                0, // protocol_tag
+                request_data.as_ptr(),
+                request_data.len(),
+            )
+        };
+
+        assert_eq!(
+            request_id, 0,
+            "Should return 0 when network is not initialized"
+        );
     }
 }

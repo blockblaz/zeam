@@ -5,6 +5,7 @@ const types = @import("@zeam/types");
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const xmss = @import("@zeam/xmss");
 
 const Allocator = std.mem.Allocator;
 const debugLog = zeam_utils.zeamLog;
@@ -49,8 +50,59 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
 }
 
 // fill this up when we have signature scheme
-pub fn verify_signatures(signedBlock: types.SignedBlockWithAttestation) !void {
-    _ = signedBlock;
+pub fn verifySignatures(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    signed_block: *const types.SignedBlockWithAttestation,
+) !void {
+    const attestations = signed_block.message.block.body.attestations.constSlice();
+    const signatures = signed_block.signature.constSlice();
+
+    // Must have exactly one signature per attestation plus one for proposer
+    if (attestations.len + 1 != signatures.len) {
+        return StateTransitionError.InvalidBlockSignatures;
+    }
+
+    // Verify all body attestations
+    for (attestations, 0..) |attestation, i| {
+        try verifySingleAttestation(
+            allocator,
+            state,
+            &attestation,
+            &signatures[i],
+        );
+    }
+
+    // Verify proposer attestation (last signature in the list)
+    try verifySingleAttestation(
+        allocator,
+        state,
+        &signed_block.message.proposer_attestation,
+        &signatures[signatures.len - 1],
+    );
+}
+
+pub fn verifySingleAttestation(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    attestation: *const types.Attestation,
+    signatureBytes: *const types.Bytes4000,
+) !void {
+    const validatorIndex: usize = @intCast(attestation.validator_id);
+    const validators = state.validators.constSlice();
+    if (validatorIndex >= validators.len) {
+        return StateTransitionError.InvalidValidatorId;
+    }
+
+    const validator = &validators[validatorIndex];
+    const pubkey = validator.getPubkey();
+
+    var message: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
+
+    const epoch: u32 = @intCast(attestation.data.slot);
+
+    try xmss.verifyBincode(pubkey, &message, epoch, signatureBytes);
 }
 
 // TODO(gballet) check if beam block needs to be a pointer
