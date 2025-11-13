@@ -12,28 +12,28 @@ const transition = @import("./transition.zig");
 const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
-    blocks: std.ArrayList(types.SignedBlockWithAttestation),
-    blockRoots: std.ArrayList(types.Root),
+    blocks: []types.SignedBlockWithAttestation,
+    blockRoots: []types.Root,
     // what should be justified and finalzied post each of these blocks
-    latestJustified: std.ArrayList(types.Checkpoint),
-    latestFinalized: std.ArrayList(types.Checkpoint),
-    latestHead: std.ArrayList(types.Checkpoint),
+    latestJustified: []types.Checkpoint,
+    latestFinalized: []types.Checkpoint,
+    latestHead: []types.Checkpoint,
     // did justification/finalization happen
-    justification: std.ArrayList(bool),
-    finalization: std.ArrayList(bool),
+    justification: []bool,
+    finalization: []bool,
 
-    pub fn deinit(self: *MockChainData) void {
+    pub fn deinit(self: *MockChainData, allocator: Allocator) void {
         self.genesis_state.deinit();
-        for (self.blocks.items) |*b| {
+        for (self.blocks) |*b| {
             b.deinit();
         }
-        self.blocks.deinit();
-        self.blockRoots.deinit();
-        self.latestJustified.deinit();
-        self.latestFinalized.deinit();
-        self.latestHead.deinit();
-        self.justification.deinit();
-        self.finalization.deinit();
+        allocator.free(self.blocks);
+        allocator.free(self.blockRoots);
+        allocator.free(self.latestJustified);
+        allocator.free(self.latestFinalized);
+        allocator.free(self.latestHead);
+        allocator.free(self.justification);
+        allocator.free(self.finalization);
     }
 };
 
@@ -358,12 +358,12 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     return MockChainData{
         .genesis_config = genesis_config,
         .genesis_state = genesis_state,
-        .blocks = blockList,
-        .blockRoots = blockRootList,
-        .latestJustified = justificationCPList,
-        .latestFinalized = finalizationCPList,
-        .latestHead = headList,
-        .justification = justificationList,
-        .finalization = finalizationList,
+        .blocks = try blockList.toOwnedSlice(),
+        .blockRoots = try blockRootList.toOwnedSlice(),
+        .latestJustified = try justificationCPList.toOwnedSlice(),
+        .latestFinalized = try finalizationCPList.toOwnedSlice(),
+        .latestHead = try headList.toOwnedSlice(),
+        .justification = try justificationList.toOwnedSlice(),
+        .finalization = try finalizationList.toOwnedSlice(),
     };
 }
