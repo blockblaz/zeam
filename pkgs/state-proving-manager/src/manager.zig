@@ -127,10 +127,7 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
             // For dummy prover, we actually run the transition function to test it
             // This ensures the transition function works and tests allocations
 
-            var mutable_state = state;
-            // defer mutable_state.deinit();
-
-            try state_transition.apply_transition(allocator, &mutable_state, block, .{
+            try state_transition.apply_transition(allocator, &prover_input_deserialized.state, prover_input_deserialized.block, .{
                 .validSignatures = if (@hasField(@TypeOf(opts), "validSignatures")) opts.validSignatures else true,
                 .validateResult = if (@hasField(@TypeOf(opts), "validateResult")) opts.validateResult else true,
                 .logger = opts.logger,
