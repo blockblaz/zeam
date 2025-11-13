@@ -239,7 +239,7 @@ jobs:
       run: zig build simtest --summary all
     
     - name: Run all spec tests
-      run: zig build spectest:run --summary all -- --skip-expected-error-fixtures=true
+      run: zig build spectest --summary all -- --skip-expected-error-fixtures=true
 
   docker-build:
     name: docker-build

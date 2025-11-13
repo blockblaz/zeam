@@ -24,12 +24,10 @@ const json = std.json;
 
 // PQ devnet0 config
 pub const BeamStateConfig = struct {
-    num_validators: u64,
     genesis_time: u64,
 
     pub fn toJson(self: *const BeamStateConfig, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
         try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
         return json.Value{ .object = obj };
     }
@@ -65,6 +63,10 @@ pub const BeamState = struct {
 
     const Self = @This();
 
+    pub fn validatorCount(self: *const Self) usize {
+        return self.validators.constSlice().len;
+    }
+
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
         var genesis_block: block.BeamBlock = undefined;
         try genesis_block.genGenesisBlock(allocator);
@@ -98,7 +100,6 @@ pub const BeamState = struct {
 
         self.* = .{
             .config = .{
-                .num_validators = genesis.numValidators(),
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
@@ -117,7 +118,7 @@ pub const BeamState = struct {
 
     pub fn getJustification(self: *const Self, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = @intCast(self.config.num_validators);
+        const num_validators = self.validatorCount();
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
             const validator_data = try allocator.alloc(u8, num_validators);
@@ -141,7 +142,7 @@ pub const BeamState = struct {
         // First, collect all keys
         var iterator = justifications.iterator();
         while (iterator.next()) |kv| {
-            if (kv.value_ptr.*.len != self.config.num_validators) {
+            if (kv.value_ptr.*.len != self.validatorCount()) {
                 return error.InvalidJustificationLength;
             }
             try new_justifications_roots.append(kv.key_ptr.*);
@@ -214,7 +215,8 @@ pub const BeamState = struct {
         }
 
         // 3. check proposer is correct
-        const correct_proposer_index = staged_block.slot % self.config.num_validators;
+        const validator_count: u64 = @intCast(self.validatorCount());
+        const correct_proposer_index = staged_block.slot % validator_count;
         if (staged_block.proposer_index != correct_proposer_index) {
             logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ staged_block.proposer_index, staged_block.slot, correct_proposer_index });
             return StateTransitionError.InvalidProposer;
@@ -288,7 +290,7 @@ pub const BeamState = struct {
         try self.getJustification(allocator, &justifications);
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = @intCast(self.config.num_validators);
+        const num_validators: usize = @intCast(self.validatorCount());
         for (attestations.constSlice()) |attestation| {
             const validator_id: usize = @intCast(attestation.validator_id);
             const attestation_data = attestation.data;
@@ -507,7 +509,7 @@ pub const BeamState = struct {
 };
 
 test "ssz seralize/deserialize signed beam state" {
-    const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
+    const config = BeamStateConfig{ .genesis_time = 93 };
     const genesis_root = [_]u8{9} ** 32;
 
     var state = BeamState{

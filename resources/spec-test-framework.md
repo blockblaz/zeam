@@ -8,15 +8,24 @@ to reconstruct Zeam state, execute the scenario, and check the expected
 outcome.
 
 ### Regenerating and running tests
-- `zig build spectest:generate` – rebuilds the generated test files.
-- `zig build spectest:run` – executes the complete spectest suite.
+- `zig build spectest:generate` – rebuilds the generated test files only.
+- `zig build spectest` – regenerates the fixtures and runs the full spectest suite.
+- `zig build spectest:run` – executes the suite using whatever files are already generated.
 
-Both commands run from the repository root and assume fixtures live at
-`leanSpec/fixtures`. Pass `--vectors-root <path>` after `--` when generating
-if you want to point at an alternate directory. While running, append
-`--skip-expected-error-fixtures=true` (or `--no-skip-expected-error-fixtures`)
-after `--` to control whether fixtures that are expected to fail should be
-executed.
+All commands run from the repository root and assume fixtures live at
+`leanSpec/fixtures`. Pass `--vectors-root <path>` after `--` when generating if
+you want to point at an alternate directory.
+
+To skip fixtures that are expected to fail, set the environment variable before
+invocation:
+
+```bash
+ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS=true zig build spectest:run
+```
+
+The same flag works with `spectest` or `spectest:generate`. As a shortcut you
+can pass `--skip-expected-error-fixtures` after `--` when invoking the build
+step; the build script converts that into the environment toggle.
 
 ### Fixture layout and generated tests
 `pkgs/spectest/src/generated/index.zig` (rewritten by the generator) hosts the
@@ -26,8 +35,8 @@ missing, allowing the rest of the Zeam tree to build without external
 dependencies.
 
 ### Runner modules
-The harness ships two runners: `pkgs/spectest/src/state_transition_runner.zig`
-and `pkgs/spectest/src/fork_choice_runner.zig`. Each exports a `TestCase` type
+The harness ships two runners: `pkgs/spectest/src/runner/state_transition_runner.zig`
+and `pkgs/spectest/src/runner/fork_choice_runner.zig`. Each exports a `TestCase` type
 that knows how to parse its portion of the LeanSpec JSON tree, rebuild Zeam
 state, execute the transition, and validate post-conditions. The generator
 instantiates these runners based on fixture metadata (kind, fork, handler).
@@ -55,18 +64,11 @@ wire up an additional runner:
 	pointing `handlerSubdir` at the leanSpec directory that hosts your fixtures.
 	Make sure to extend the `all` constant so the generator discovers the new
 	kind.
-3. **Update the generator header** in
-	`pkgs/spectest/src/generate.zig` → `makeHeaderWithPrefix` to import your
-	runner module and expose it alongside `state_transition` and `fork_choice`.
-	If the runner requires additional skip or CLI handling, hook it in here as
-	well.
-4. **Expose the module** from `pkgs/spectest/src/lib.zig` so downstream code can
-	import it without reaching into private paths.
-5. **Regenerate fixtures** by running `zig build spectest:generate` to ensure the
+3. **Regenerate fixtures** by running `zig build spectest:generate` to ensure the
 	new kind produces tests. Point the generator at a fixture tree that contains
 	the new JSON files (for example, with `--vectors-root` if they live outside
 	`leanSpec/fixtures`).
-6. **Execute the suite** with `zig build spectest:run` (or `zig build test` once
+4. **Execute the suite** with `zig build spectest:run` (or `zig build test` once
 	the new runner is part of the generated index) to verify the fixtures pass
 	and to catch missing skip logic early.
 

@@ -2,9 +2,9 @@ const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
 
-const expect = @import("./json_expect.zig");
-const forks = @import("./fork.zig");
-const fixture_kind = @import("./fixture_kind.zig");
+const expect = @import("../json_expect.zig");
+const forks = @import("../fork.zig");
+const fixture_kind = @import("../fixture_kind.zig");
 const Context = expect.Context;
 
 const ssz = @import("ssz");
@@ -16,7 +16,7 @@ const node_constants = node.constants;
 const state_transition = @import("@zeam/state-transition");
 const zeam_utils = @import("@zeam/utils");
 const params = @import("@zeam/params");
-const state_runner = @import("./state_transition_runner.zig");
+const skip = @import("../skip.zig");
 
 const JsonValue = std.json.Value;
 
@@ -341,7 +341,7 @@ fn runCase(
         .base_context = ctx,
     };
 
-    const skip_on_mismatch = state_runner.skipExpectedErrorFixturesEnabled();
+    const skip_on_mismatch = skip.configured();
 
     for (steps_array.items, 0..) |step_value, step_index| {
         runStep(&step_ctx, step_index, step_value) catch |err| switch (err) {
@@ -1193,7 +1193,7 @@ fn buildState(
     }
 
     return types.BeamState{
-        .config = .{ .genesis_time = genesis_time, .num_validators = validators.len() },
+        .config = .{ .genesis_time = genesis_time },
         .slot = slot,
         .latest_block_header = latest_block_header,
         .latest_justified = latest_justified,
@@ -1234,23 +1234,30 @@ fn parseCheckpoint(
 }
 
 fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.ChainConfig {
-    var buffer = std.ArrayListUnmanaged(u8).empty;
-    defer buffer.deinit(allocator);
-    var writer = buffer.writer(allocator);
-    try writer.print(
-        "{{\"preset\":\"mainnet\",\"name\":\"forkchoice\",\"genesis_time\":{d}}}",
-        .{state.config.genesis_time},
-    );
-    const options = json.ParseOptions{
+    const chain_spec =
+        \\{"preset":"mainnet","name":"devnet0"}
+    ;
+    const parse_options = json.ParseOptions{
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
     };
-    const parsed_result = json.parseFromSlice(configs.ChainOptions, allocator, buffer.items, options) catch |err| {
+    const parse_result = json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, parse_options) catch |err| {
         std.debug.print("spectest: unable to parse chain config: {s}\n", .{@errorName(err)});
         return FixtureError.InvalidFixture;
     };
-    defer parsed_result.deinit();
-    return configs.ChainConfig.init(configs.Chain.custom, parsed_result.value) catch |err| {
+    var chain_options = parse_result.value;
+    chain_options.genesis_time = state.config.genesis_time;
+
+    const validators_slice = state.validators.constSlice();
+    const num_validators = validators_slice.len;
+    const pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+    errdefer allocator.free(pubkeys);
+    for (validators_slice, 0..) |validator_info, idx| {
+        pubkeys[idx] = validator_info.pubkey;
+    }
+    chain_options.validator_pubkeys = pubkeys;
+
+    return configs.ChainConfig.init(configs.Chain.custom, chain_options) catch |err| {
         std.debug.print("spectest: unable to init chain config: {s}\n", .{@errorName(err)});
         return FixtureError.InvalidFixture;
     };

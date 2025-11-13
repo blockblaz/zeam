@@ -1,15 +1,12 @@
 const std = @import("std");
 
-const expect = @import("./json_expect.zig");
-const forks = @import("./fork.zig");
-const fixture_kind = @import("./fixture_kind.zig");
+const expect = @import("../json_expect.zig");
+const forks = @import("../fork.zig");
+const fixture_kind = @import("../fixture_kind.zig");
+const skip = @import("../skip.zig");
 
 const Fork = forks.Fork;
 const FixtureKind = fixture_kind.FixtureKind;
-const skip_env_var_name = "ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS";
-
-var skip_expected_error_fixtures: bool = false;
-var skip_flag_initialized: bool = false;
 
 pub const name = "state_transition";
 
@@ -321,42 +318,15 @@ fn runCase(
 }
 
 pub fn setSkipExpectedErrorFixtures(flag: bool) void {
-    skip_expected_error_fixtures = flag;
-    skip_flag_initialized = true;
+    skip.set(flag);
 }
 
 pub fn configureSkipExpectedErrorFixturesFromEnv() void {
-    if (skip_flag_initialized) return;
-    skip_expected_error_fixtures = detectSkipFlagFromEnv();
-    skip_flag_initialized = true;
+    _ = skip.configured();
 }
 
 pub fn skipExpectedErrorFixturesEnabled() bool {
-    configureSkipExpectedErrorFixturesFromEnv();
-    return skip_expected_error_fixtures;
-}
-
-fn detectSkipFlagFromEnv() bool {
-    const allocator = std.heap.page_allocator;
-    const value = std.process.getEnvVarOwned(allocator, skip_env_var_name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return false,
-        error.OutOfMemory => return false,
-        else => return false,
-    };
-    defer allocator.free(value);
-    return parseEnvBool(value);
-}
-
-fn parseEnvBool(raw: []const u8) bool {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return true;
-    if (std.mem.eql(u8, trimmed, "false")) {
-        return false;
-    }
-    if (std.mem.eql(u8, trimmed, "true")) {
-        return true;
-    }
-    return true;
+    return skip.configured();
 }
 
 fn buildState(
@@ -405,7 +375,7 @@ fn buildState(
     }
 
     return types.BeamState{
-        .config = .{ .genesis_time = genesis_time, .num_validators = validators.len() },
+        .config = .{ .genesis_time = genesis_time },
         .slot = slot,
         .latest_block_header = latest_block_header,
         .latest_justified = latest_justified,
