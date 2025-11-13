@@ -433,9 +433,7 @@ pub const BeamChain = struct {
             // Validate attestation before processing (from block = true)
             self.validateAttestation(attestation, true) catch |e| {
                 if (e == AttestationValidationError.UnknownHeadBlock) {
-                    missing_roots.append(attestation.data.head.root) catch |append_err| {
-                        self.module_logger.warn("Failed to track missing root: {any}", .{append_err});
-                    };
+                    try missing_roots.append(attestation.data.head.root);
                 }
 
                 self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ attestation.validator_id, e });
