@@ -8,6 +8,7 @@ const configs = @import("@zeam/configs");
 const zeam_utils = @import("@zeam/utils");
 const stf = @import("@zeam/state-transition");
 const api = @import("@zeam/api");
+const params = @import("@zeam/params");
 
 const constants = @import("./constants.zig");
 
@@ -340,7 +341,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn acceptNewAttestations(self: *Self) !ProtoBlock {
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.latestNew) |new_attestation| {
                 // we can directly assign because we always make sure that new attestation is fresher
@@ -371,25 +372,25 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn getProposalAttestations(self: *Self) !types.Attestations {
-        var included_attestations = try types.Attestations.init(self.allocator);
+    pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
+        var included_attestations = std.ArrayList(types.SignedAttestation).init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
 
         // TODO naive strategy to include all attestations that are consistent with the latest justified
         // replace by the other mini 3sf simple strategy to loop and see if justification happens and
         // till no further attestations can be added
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        for (0..self.config.genesis.numValidators()) |validator_id| {
             const validator_attestation = ((self.attestations.get(validator_id) orelse AttestationTracker{})
                 //
                 .latestKnown orelse ProtoAttestation{}).attestation;
 
             if (validator_attestation) |signed_attestation| {
                 if (std.mem.eql(u8, &latest_justified.root, &signed_attestation.message.data.source.root)) {
-                    try included_attestations.append(signed_attestation.message);
+                    try included_attestations.append(signed_attestation);
                 }
             }
         }
-        return included_attestations;
+        return included_attestations.toOwnedSlice();
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
@@ -424,7 +425,7 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
-        for (0..self.config.genesis.num_validators) |validator_id| {
+        for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.appliedIndex) |applied_index| {
                 self.deltas.items[applied_index] -= validatorWeight;
@@ -479,7 +480,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
-        const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.num_validators, 3);
+        const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         self.safeTarget = try self.computeFCHead(false, cutoff_weight);
         return self.safeTarget;
     }
@@ -603,22 +604,26 @@ const ForkChoiceError = error{
     InvalidTargetSearch,
 };
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
+    // Use genMockChain with null to generate default genesis with pubkeys
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
 
-    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
+    // Create chain config from mock chain genesis
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
     const module_logger = zeam_logger_config.logger(.forkchoice);

@@ -35,6 +35,8 @@ pub const BeamSTFProof = struct {
     // zk_vm: ZkVm,
     proof: []const u8,
 
+    pub fn deinit(_: *BeamSTFProof) void {}
+
     pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });

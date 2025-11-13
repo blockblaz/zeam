@@ -14,6 +14,7 @@ const database = @import("@zeam/database");
 const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
+const keymanager = @import("@zeam/key-manager");
 const jsonToString = zeam_utils.jsonToString;
 
 pub const fcFactory = @import("./forkchoice.zig");
@@ -47,6 +48,8 @@ pub const CachedProcessedBlockInfo = struct {
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
+    // signatures corresponding to attestations in the blockbody
+    signatures: types.BlockSignatures,
 };
 
 pub const BeamChain = struct {
@@ -133,7 +136,7 @@ pub const BeamChain = struct {
 
         var has_proposal = false;
         if (interval == 0) {
-            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const num_validators: usize = @intCast(self.config.genesis.numValidators());
             const slot_proposer_id = slot % num_validators;
             if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
                 _ = index;
@@ -167,7 +170,9 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const attestations = try self.forkChoice.getProposalAttestations();
+        const signed_attestations = try self.forkChoice.getProposalAttestations();
+        defer self.allocator.free(signed_attestations);
+
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -184,7 +189,13 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = attestations,
+                .attestations = blk: {
+                    var attestations_list = try types.Attestations.init(self.allocator);
+                    for (signed_attestations) |signed_attestation| {
+                        try attestations_list.append(signed_attestation.message);
+                    }
+                    break :blk attestations_list;
+                },
             },
         };
 
@@ -220,6 +231,13 @@ pub const BeamChain = struct {
         return .{
             .block = block,
             .blockRoot = block_root,
+            .signatures = blk: {
+                var signatures_list = try types.BlockSignatures.init(self.allocator);
+                for (signed_attestations) |signed_attestation| {
+                    try signatures_list.append(signed_attestation.signature);
+                }
+                break :blk signatures_list;
+            },
         };
     }
 
@@ -324,7 +342,8 @@ pub const BeamChain = struct {
                     self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
                     if (hasParentBlock) {
                         self.onBlock(signed_block, .{}) catch |err| {
-                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                            self.module_logger.err(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                            return err;
                         };
                     }
                 }
@@ -347,6 +366,7 @@ pub const BeamChain = struct {
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
                     self.module_logger.debug("Attestation processing error: {any}", .{err});
+                    return err;
                 };
             },
         }
@@ -375,15 +395,14 @@ pub const BeamChain = struct {
             const cpost_state = try self.allocator.create(types.BeamState);
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
 
-            // 2. apply STF to get post state
-            var validSignatures = true;
-            stf.verify_signatures(signedBlock) catch {
-                validSignatures = false;
-            };
+            // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
+            try stf.verifySignatures(self.allocator, pre_state, &signedBlock);
+
+            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
                 //
                 .logger = self.stf_logger,
-                .validSignatures = validSignatures,
+                .validSignatures = true,
             });
             break :computedstate cpost_state;
         };
@@ -599,6 +618,12 @@ pub const BeamChain = struct {
     pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
         try self.validateAttestation(signedAttestation.message, false);
+
+        const attestation = signedAttestation.message;
+        const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+
+        try stf.verifySingleAttestation(self.allocator, state, &attestation, &signedAttestation.signature);
+
         return self.forkChoice.onAttestation(signedAttestation, false);
     }
 
@@ -618,6 +643,7 @@ pub const BeamChain = struct {
 const BlockProcessingError = error{MissingPreState};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
+    MissingState,
     UnknownSourceBlock,
     UnknownTargetBlock,
     UnknownHeadBlock,
@@ -628,22 +654,24 @@ const AttestationValidationError = error{
     AttestationTooFarInFuture,
 };
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
+    // Generate a mock chain with validator pubkeys baked into the genesis spec.
+    const mock_chain = try stf.genMockChain(allocator, 5, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
     };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
-    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -696,7 +724,7 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 
-    const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
+    const num_validators: usize = @intCast(mock_chain.genesis_config.numValidators());
     for (0..num_validators) |validator_id| {
         // all validators should have attested as per the mock chain
         const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
@@ -704,24 +732,24 @@ test "process and add mock blocks into a node's chain" {
     }
 }
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "printSlot output demonstration" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    // Create a chain configuration
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
     // Create a mock chain with some blocks
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
     var beam_state = mock_chain.genesis_state;
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
@@ -773,6 +801,8 @@ test "printSlot output demonstration" {
 // Attestation Validation Tests
 // These tests align with leanSpec's test_attestation_processing.py
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "attestation validation - comprehensive" {
     // Comprehensive test covering all attestation validation rules
     // This consolidates multiple validation checks into one test to avoid redundant setup
@@ -780,17 +810,16 @@ test "attestation validation - comprehensive" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
     };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -1056,6 +1085,8 @@ test "attestation validation - comprehensive" {
     }
 }
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "attestation validation - gossip vs block future slot handling" {
     // Test that gossip and block attestations have different future slot tolerances
     // Gossip: must be <= current_slot
@@ -1064,17 +1095,16 @@ test "attestation validation - gossip vs block future slot handling" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
     };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
-    const mock_chain = try stf.genMockChain(allocator, 2, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -1152,23 +1182,24 @@ test "attestation validation - gossip vs block future slot handling" {
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, true));
 }
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "attestation processing - valid block attestation" {
     // Test that valid attestations from blocks are processed correctly
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
     };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -1194,26 +1225,33 @@ test "attestation processing - valid block attestation" {
     }
 
     // Create a valid attestation
-    const valid_attestation: types.SignedAttestation = .{
-        .message = .{
-            .validator_id = 1,
-            .data = .{
+    const message = types.Attestation{
+        .validator_id = 1,
+        .data = .{
+            .slot = 2,
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[2],
                 .slot = 2,
-                .head = types.Checkpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
-                },
-                .source = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .target = types.Checkpoint{
-                    .root = mock_chain.blockRoots[2],
-                    .slot = 2,
-                },
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[2],
+                .slot = 2,
             },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+    };
+
+    var key_manager = try keymanager.getTestKeyManager(allocator, 4, 3);
+    defer key_manager.deinit();
+
+    const signature = try key_manager.signAttestation(&message, allocator);
+
+    const valid_attestation: types.SignedAttestation = .{
+        .message = message,
+        .signature = signature,
     };
 
     // Process attestation through chain (this validates and then processes)
