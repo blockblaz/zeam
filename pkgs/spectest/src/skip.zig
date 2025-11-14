@@ -2,12 +2,13 @@ const std = @import("std");
 
 const skip_env_var_name = "ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS";
 
-var flag: bool = false;
-var initialized: bool = false;
+const AtomicBool = std.atomic.Value(bool);
+
+var flag = AtomicBool.init(false);
+var manual_override = AtomicBool.init(false);
+var env_once = std.once(initializeFromEnv);
 
 fn detectSkipFlagFromEnv() bool {
-    std.debug.assert(!initialized);
-
     const env_val = std.process.getEnvVarOwned(std.heap.page_allocator, skip_env_var_name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return false,
         error.InvalidWtf8 => return false,
@@ -19,17 +20,21 @@ fn detectSkipFlagFromEnv() bool {
     return std.mem.eql(u8, trimmed, "true") or std.mem.eql(u8, trimmed, "1");
 }
 
+fn initializeFromEnv() void {
+    if (manual_override.load(.seq_cst)) return;
+    flag.store(detectSkipFlagFromEnv(), .seq_cst);
+}
+
 pub fn configured() bool {
-    if (!initialized) {
-        const detected_flag = detectSkipFlagFromEnv();
-        set(detected_flag);
+    if (!manual_override.load(.seq_cst)) {
+        env_once.call();
     }
-    return flag;
+    return flag.load(.seq_cst);
 }
 
 pub fn set(value: bool) void {
-    flag = value;
-    initialized = true;
+    manual_override.store(true, .seq_cst);
+    flag.store(value, .seq_cst);
 }
 
 pub fn name() []const u8 {
