@@ -535,6 +535,7 @@ pub const BeamChain = struct {
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
+        _ = slot;
         // primarily this is served by the forkchoice
         // update unfinalized slot index
         // if (slot > finalizedSlot) {
