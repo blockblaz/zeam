@@ -19,6 +19,6 @@ pub const DbStatesNamespace = DbColumnNamespaces[2];
 pub const DbAttestationsNamespace = DbColumnNamespaces[3];
 pub const DbCheckpointsNamespace = DbColumnNamespaces[4];
 pub const DbFinalizedSlotsNamespace = DbColumnNamespaces[5];
-pub const DbUnfinalizedSlotsNamespace = DbColumnNamespaces[6];
-
+// TODO: uncomment this code if there is a need of slot to unfinalized index
+// pub const DbUnfinalizedSlotsNamespace = DbColumnNamespaces[6];
 pub const Db = rocksdb.RocksDB(&DbColumnNamespaces);

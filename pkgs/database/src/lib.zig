@@ -18,7 +18,8 @@ pub const DbStatesNamespace = database.DbStatesNamespace;
 pub const DbAttestationsNamespace = database.DbAttestationsNamespace;
 pub const DbCheckpointsNamespace = database.DbCheckpointsNamespace;
 pub const DbFinalizedSlotsNamespace = database.DbFinalizedSlotsNamespace;
-pub const DbUnfinalizedSlotsNamespace = database.DbUnfinalizedSlotsNamespace;
+// TODO: uncomment this code if there is a need of slot to unfinalized index
+// pub const DbUnfinalizedSlotsNamespace = database.DbUnfinalizedSlotsNamespace;
 pub const Db = database.Db;
 
 test "get tests" {

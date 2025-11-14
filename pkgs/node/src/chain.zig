@@ -534,20 +534,22 @@ pub const BeamChain = struct {
         batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
+        // primarily this is served by the forkchoice
         // update unfinalized slot index
-        if (slot > finalizedSlot) {
-            const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
-            if (existing_blockroots.len > 0) {
-                defer self.allocator.free(existing_blockroots);
-            }
-            var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
-            defer updated_blockroots.deinit();
+        // if (slot > finalizedSlot) {
+        //     const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
+        //     if (existing_blockroots.len > 0) {
+        //         defer self.allocator.free(existing_blockroots);
+        //     }
+        //     var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+        //     defer updated_blockroots.deinit();
 
-            updated_blockroots.appendSlice(existing_blockroots) catch {};
-            updated_blockroots.append(blockRoot) catch {};
+        //     updated_blockroots.appendSlice(existing_blockroots) catch {};
+        //     updated_blockroots.append(blockRoot) catch {};
 
-            batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
-        }
+        //     batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
+        // }
 
         // Update finalized slot indices and cleanup if finalization has advanced
         if (finalizedSlot > self.last_emitted_finalized_slot) {
@@ -594,33 +596,34 @@ pub const BeamChain = struct {
             });
         }
 
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
         // 3. Remove orphaned blocks from database and cleanup unfinalized indices
-        for (previousFinalizedSlot + 1..finalizedSlot + 1) |slot| {
-            var slot_orphaned_count: usize = 0;
-            // Get all unfinalized blocks at this slot before deleting the index
-            if (self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot)) |unfinalized_blockroots| {
-                defer self.allocator.free(unfinalized_blockroots);
-                // Remove blocks not in the canonical finalized chain
-                for (unfinalized_blockroots) |blockroot| {
-                    if (!canonical_blocks.contains(blockroot)) {
-                        // This block is orphaned - remove it from database
-                        batch.delete(database.DbBlocksNamespace, &blockroot);
-                        batch.delete(database.DbStatesNamespace, &blockroot);
-                        slot_orphaned_count += 1;
-                    }
-                }
-                if (slot_orphaned_count > 0) {
-                    self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
-                        slot_orphaned_count,
-                        slot,
-                    });
-                }
+        // for (previousFinalizedSlot + 1..finalizedSlot + 1) |slot| {
+        //     var slot_orphaned_count: usize = 0;
+        //     // Get all unfinalized blocks at this slot before deleting the index
+        //     if (self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot)) |unfinalized_blockroots| {
+        //         defer self.allocator.free(unfinalized_blockroots);
+        //         // Remove blocks not in the canonical finalized chain
+        //         for (unfinalized_blockroots) |blockroot| {
+        //             if (!canonical_blocks.contains(blockroot)) {
+        //                 // This block is orphaned - remove it from database
+        //                 batch.delete(database.DbBlocksNamespace, &blockroot);
+        //                 batch.delete(database.DbStatesNamespace, &blockroot);
+        //                 slot_orphaned_count += 1;
+        //             }
+        //         }
+        //         if (slot_orphaned_count > 0) {
+        //             self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
+        //                 slot_orphaned_count,
+        //                 slot,
+        //             });
+        //         }
 
-                // Remove the unfinalized slot index
-                batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
-                self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
-            }
-        }
+        //         // Remove the unfinalized slot index
+        //         batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+        //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
+        //     }
+        // }
 
         self.module_logger.info("Finalization cleanup completed for slots {d} to {d}", .{
             previousFinalizedSlot,
