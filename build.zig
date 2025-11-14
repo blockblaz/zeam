@@ -148,6 +148,14 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
 
+    // add zeam-metrics (core metrics definitions)
+    const zeam_metrics = b.addModule("@zeam/metrics", .{
+        .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_metrics.addImport("metrics", metrics);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -157,6 +165,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("ssz", ssz);
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
+    zeam_types.addImport("@zeam/metrics", zeam_metrics);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -169,14 +178,13 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/params", zeam_params);
     zeam_configs.addImport("yaml", yaml);
 
-    // add zeam-metrics
-    // Rename metrics module to api (keeps same source path for now)
+    // add zeam-api (HTTP serving and events)
     const zeam_api = b.addModule("@zeam/api", .{
         .root_source_file = b.path("pkgs/api/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zeam_api.addImport("metrics", metrics);
+    zeam_api.addImport("@zeam/metrics", zeam_metrics);
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
 
@@ -210,6 +218,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/api", zeam_api);
     zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
     zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -272,6 +281,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
     zeam_beam_node.addImport("@zeam/database", zeam_database);
+    zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
 
@@ -315,6 +325,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);
     cli_exe.root_module.addImport("@zeam/configs", zeam_configs);
+    cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
     cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
@@ -415,6 +426,7 @@ pub fn build(b: *Builder) !void {
     // this will no longer be necessary in later versions of zig.
     transition_tests.root_module.addImport("@zeam/types", zeam_types);
     transition_tests.root_module.addImport("@zeam/params", zeam_params);
+    transition_tests.root_module.addImport("@zeam/metrics", zeam_metrics);
     transition_tests.root_module.addImport("ssz", ssz);
     const run_transition_test = b.addRunArtifact(transition_tests);
     test_step.dependOn(&run_transition_test.step);
@@ -517,6 +529,7 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/utils", zeam_utils);
     spectests.root_module.addImport("@zeam/types", zeam_types);
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
+    spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
 
@@ -655,6 +668,12 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
         }).module("ssz.zig");
 
+        // add metrics
+        const metrics = b.dependency("metrics", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("metrics");
+
         // add zeam-params
         const zeam_params = b.addModule("@zeam/params", .{
             .target = target,
@@ -669,6 +688,14 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
 
+        // add zeam-metrics (core metrics definitions for ZKVM)
+        const zeam_metrics = b.addModule("@zeam/metrics", .{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        });
+        zeam_metrics.addImport("metrics", metrics);
+
         // add zeam-types
         const zeam_types = b.addModule("@zeam/types", .{
             .target = target,
@@ -678,6 +705,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         zeam_types.addImport("ssz", ssz);
         zeam_types.addImport("@zeam/params", zeam_params);
         zeam_types.addImport("@zeam/utils", zeam_utils);
+        zeam_types.addImport("@zeam/metrics", zeam_metrics);
 
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
@@ -697,6 +725,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);
+        zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
         zeam_state_transition.addImport("zkvm", zkvm_module);
 
         // target has to be riscv5 runtime provable/verifiable on zkVMs
@@ -712,6 +741,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         exe.root_module.addImport("@zeam/utils", zeam_utils);
         exe.root_module.addImport("@zeam/params", zeam_params);
         exe.root_module.addImport("@zeam/types", zeam_types);
+        exe.root_module.addImport("@zeam/metrics", zeam_metrics);
         exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
         exe.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));

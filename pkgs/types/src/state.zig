@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const block = @import("./block.zig");
 const utils = @import("./utils.zig");
@@ -199,9 +200,18 @@ pub const BeamState = struct {
             return StateTransitionError.InvalidPreState;
         }
 
+        const start_slot = self.slot;
+        const slots_timer = zeam_metrics.lean_state_transition_slots_processing_time_seconds.start();
+        defer _ = slots_timer.observe();
+
         while (self.slot < slot) {
             try self.process_slot(allocator);
             self.slot += 1;
+        }
+
+        if (comptime !zeam_metrics.isZKVM()) {
+            const slots_processed: u64 = @intCast(slot - start_slot);
+            zeam_metrics.metrics.lean_state_transition_slots_processed_total.incrBy(slots_processed);
         }
     }
 
@@ -274,6 +284,14 @@ pub const BeamState = struct {
     }
 
     fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, logger: zeam_utils.ModuleLogger) !void {
+        const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
+        defer _ = attestations_timer.observe();
+
+        if (comptime !zeam_metrics.isZKVM()) {
+            const attestation_count: u64 = @intCast(attestations.constSlice().len);
+            zeam_metrics.metrics.lean_state_transition_attestations_processed_total.incrBy(attestation_count);
+        }
+
         logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
         const justified_str = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str);
@@ -291,6 +309,7 @@ pub const BeamState = struct {
             while (iterator.next()) |entry| {
                 allocator.free(entry.value_ptr.*);
             }
+            justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
         try self.getJustification(allocator, &justifications);
@@ -379,7 +398,10 @@ pub const BeamState = struct {
             if (3 * target_justifications_count >= 2 * num_validators) {
                 self.latest_justified = attestation_data.target;
                 try self.justified_slots.set(target_slot, true);
-                _ = justifications.remove(attestation_data.target.root);
+                // Free the removed justifications array before removing from map
+                if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
+                    allocator.free(kv.value);
+                }
                 const justified_str_new = try self.latest_justified.toJsonString(allocator);
                 defer allocator.free(justified_str_new);
 
@@ -532,16 +554,25 @@ pub const BeamState = struct {
             for (hashes.array.items) |*hash| {
                 allocator.free(hash.string);
             }
+            hashes.array.deinit();
+        }
+        if (json_value.object.get("justified_slots")) |*slots| {
+            slots.array.deinit();
         }
         if (json_value.object.get("justifications_roots")) |*roots| {
             for (roots.array.items) |*root| {
                 allocator.free(root.string);
             }
+            roots.array.deinit();
+        }
+        if (json_value.object.get("justifications_validators")) |*validators_bits| {
+            validators_bits.array.deinit();
         }
         if (json_value.object.get("validators")) |*validators| {
             for (validators.array.items) |*val| {
                 validator.Validator.freeJson(@constCast(val), allocator);
             }
+            validators.array.deinit();
         }
         json_value.object.deinit();
     }

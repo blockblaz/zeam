@@ -9,6 +9,7 @@ const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 const api = @import("@zeam/api");
+const zeam_metrics = @import("@zeam/metrics");
 const database = @import("@zeam/database");
 
 const event_broadcaster = api.event_broadcaster;
@@ -379,7 +380,7 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
-        const onblock_timer = api.chain_onblock_duration_seconds.start();
+        const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
 
         const block = signedBlock.message.block;
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
@@ -409,7 +410,6 @@ pub const BeamChain = struct {
             });
             break :computedstate cpost_state;
         };
-
         // 3. fc onblock
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{
             .currentSlot = block.slot,
@@ -473,11 +473,19 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        // 8. Emit justification/finalization events based on forkchoice store
         const store = self.forkChoice.fcStore;
         const latest_justified = store.latest_justified;
         const latest_finalized = store.latest_finalized;
 
+        // 7. Save block and state to database
+        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized.slot) catch |err| {
+            self.module_logger.err("Failed to update block database for block root=0x{s}: {any}", .{
+                std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
+                err,
+            });
+        };
+
+        // 8. Emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified_slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
@@ -506,15 +514,6 @@ pub const BeamChain = struct {
             }
         }
 
-        // 9. Save block and state to database
-        var batch = self.db.initWriteBatch();
-        defer batch.deinit();
-
-        batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
-        batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state.*);
-
-        self.db.commit(&batch);
-
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -523,7 +522,117 @@ pub const BeamChain = struct {
             blockInfo.postState == null,
         });
 
+        zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
+        zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+
         return missing_roots.toOwnedSlice();
+    }
+
+    /// Update block database with block, state, and slot indices
+    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
+        var batch = self.db.initWriteBatch();
+        defer batch.deinit();
+
+        // Store block and state
+        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putState(database.DbStatesNamespace, blockRoot, postState);
+
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
+        _ = slot;
+        // primarily this is served by the forkchoice
+        // update unfinalized slot index
+        // if (slot > finalizedSlot) {
+        //     const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
+        //     if (existing_blockroots.len > 0) {
+        //         defer self.allocator.free(existing_blockroots);
+        //     }
+        //     var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+        //     defer updated_blockroots.deinit();
+
+        //     updated_blockroots.appendSlice(existing_blockroots) catch {};
+        //     updated_blockroots.append(blockRoot) catch {};
+
+        //     batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
+        // }
+
+        // Update finalized slot indices and cleanup if finalization has advanced
+        if (finalizedSlot > self.last_emitted_finalized_slot) {
+            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized_slot, finalizedSlot) catch |err| {
+                self.module_logger.err("Failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                    self.last_emitted_finalized_slot,
+                    finalizedSlot,
+                    err,
+                });
+            };
+        }
+
+        self.db.commit(&batch);
+    }
+
+    /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
+    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalizedSlot: types.Slot, finalizedSlot: types.Slot) !void {
+        // 1. Fetch all newly finalized roots
+        const current_finalized = self.forkChoice.fcStore.latest_finalized.root;
+
+        const newly_finalized_roots = try self.forkChoice.getAncestorsOfFinalized(self.allocator, current_finalized, previousFinalizedSlot);
+        defer self.allocator.free(newly_finalized_roots);
+
+        self.module_logger.info("Finalization advanced to slot {d}, found {d} newly finalized blocks", .{
+            finalizedSlot,
+            newly_finalized_roots.len,
+        });
+
+        var canonical_blocks = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer canonical_blocks.deinit();
+
+        for (newly_finalized_roots) |root| {
+            canonical_blocks.put(root, {}) catch {};
+        }
+
+        // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace
+        for (newly_finalized_roots) |root| {
+            const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
+            const node = self.forkChoice.protoArray.nodes.items[idx];
+            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
+            self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
+                std.fmt.fmtSliceHexLower(&root),
+                node.slot,
+            });
+        }
+
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
+        // 3. Remove orphaned blocks from database and cleanup unfinalized indices
+        // for (previousFinalizedSlot + 1..finalizedSlot + 1) |slot| {
+        //     var slot_orphaned_count: usize = 0;
+        //     // Get all unfinalized blocks at this slot before deleting the index
+        //     if (self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot)) |unfinalized_blockroots| {
+        //         defer self.allocator.free(unfinalized_blockroots);
+        //         // Remove blocks not in the canonical finalized chain
+        //         for (unfinalized_blockroots) |blockroot| {
+        //             if (!canonical_blocks.contains(blockroot)) {
+        //                 // This block is orphaned - remove it from database
+        //                 batch.delete(database.DbBlocksNamespace, &blockroot);
+        //                 batch.delete(database.DbStatesNamespace, &blockroot);
+        //                 slot_orphaned_count += 1;
+        //             }
+        //         }
+        //         if (slot_orphaned_count > 0) {
+        //             self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
+        //                 slot_orphaned_count,
+        //                 slot,
+        //             });
+        //         }
+
+        //         // Remove the unfinalized slot index
+        //         batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+        //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
+        //     }
+        // }
+
+        self.module_logger.info("Finalization cleanup completed for slots {d} to {d}", .{
+            previousFinalizedSlot,
+            finalizedSlot,
+        });
     }
 
     /// Validate incoming attestation before processing.
