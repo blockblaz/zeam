@@ -200,14 +200,8 @@ fn runCase(
         },
     };
 
-    const skip_expected = skipExpectedErrorFixturesEnabled();
-
     if (blocks_array.items.len == 0 and expect_exception != null) {
-        if (skip_expected) {
-            std.debug.print(
-                "spectest: skipping expectException case {s} in {s} due to configured skip\n",
-                .{ ctx.case_name, ctx.fixture_label },
-            );
+        if (skipExpectExceptionIfEnabled(ctx)) {
             return FixtureError.SkippedFixture;
         }
 
@@ -297,6 +291,10 @@ fn runCase(
     }
 
     if (expect_exception) |_| {
+        if (skipExpectExceptionIfEnabled(ctx)) {
+            return FixtureError.SkippedFixture;
+        }
+
         if (!encountered_error) {
             std.debug.print(
                 "fixture {s} case {s}: expected exception but transition succeeded\n",
@@ -327,6 +325,18 @@ pub fn configureSkipExpectedErrorFixturesFromEnv() void {
 
 pub fn skipExpectedErrorFixturesEnabled() bool {
     return skip.configured();
+}
+
+fn skipExpectExceptionIfEnabled(ctx: Context) bool {
+    if (!skipExpectedErrorFixturesEnabled()) {
+        return false;
+    }
+
+    std.debug.print(
+        "spectest: skipping expectException case {s} in {s} due to configured skip\n",
+        .{ ctx.case_name, ctx.fixture_label },
+    );
+    return true;
 }
 
 fn buildState(
