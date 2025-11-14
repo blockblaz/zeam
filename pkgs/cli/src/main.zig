@@ -188,7 +188,7 @@ fn mainInner() !void {
         return err;
     };
     defer opts.deinit();
-    
+
     const genesis = opts.args.genesis;
     const log_filename = opts.args.log_filename;
     const log_file_active_level = opts.args.log_file_active_level;
