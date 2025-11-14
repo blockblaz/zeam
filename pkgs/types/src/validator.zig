@@ -26,7 +26,13 @@ pub const Validator = struct {
     }
 
     pub fn toJsonString(self: *const Validator, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        allocator.free(val.object.get("pubkey").?.string);
+        val.object.deinit();
     }
 };

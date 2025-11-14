@@ -35,8 +35,14 @@ pub const BeamStateConfig = struct {
     }
 
     pub fn toJsonString(self: *const BeamStateConfig, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        _ = allocator;
+        val.object.deinit();
     }
 };
 
@@ -501,8 +507,41 @@ pub const BeamState = struct {
     }
 
     pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer self.freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(self: *const BeamState, json_value: *json.Value, allocator: Allocator) void {
+        _ = self;
+        if (json_value.object.get("config")) |*config| {
+            BeamStateConfig.freeJson(@constCast(config), allocator);
+        }
+        if (json_value.object.get("latest_block_header")) |*header| {
+            BeamBlockHeader.freeJson(@constCast(header), allocator);
+        }
+        if (json_value.object.get("latest_justified")) |*justified| {
+            Checkpoint.freeJson(@constCast(justified), allocator);
+        }
+        if (json_value.object.get("latest_finalized")) |*finalized| {
+            Checkpoint.freeJson(@constCast(finalized), allocator);
+        }
+        if (json_value.object.get("historical_block_hashes")) |*hashes| {
+            for (hashes.array.items) |*hash| {
+                allocator.free(hash.string);
+            }
+        }
+        if (json_value.object.get("justifications_roots")) |*roots| {
+            for (roots.array.items) |*root| {
+                allocator.free(root.string);
+            }
+        }
+        if (json_value.object.get("validators")) |*validators| {
+            for (validators.array.items) |*val| {
+                validator.Validator.freeJson(@constCast(val), allocator);
+            }
+        }
+        json_value.object.deinit();
     }
 };
 
