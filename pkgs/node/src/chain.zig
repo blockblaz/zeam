@@ -568,7 +568,7 @@ pub const BeamChain = struct {
         // 1. Fetch all newly finalized roots
         const current_finalized = self.forkChoice.fcStore.latest_finalized.root;
 
-        const newly_finalized_roots = try self.forkChoice.getAncestorsofFinalized(self.allocator, current_finalized, previousFinalizedSlot);
+        const newly_finalized_roots = try self.forkChoice.getAncestorsOfFinalized(self.allocator, current_finalized, previousFinalizedSlot);
         defer self.allocator.free(newly_finalized_roots);
 
         self.module_logger.info("Finalization advanced to slot {d}, found {d} newly finalized blocks", .{
@@ -596,31 +596,33 @@ pub const BeamChain = struct {
 
         // 3. Remove orphaned blocks from database and cleanup unfinalized indices
         for (previousFinalizedSlot + 1..finalizedSlot + 1) |slot| {
+            var slot_orphaned_count: usize = 0;
             // Get all unfinalized blocks at this slot before deleting the index
             if (self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot)) |unfinalized_blockroots| {
                 defer self.allocator.free(unfinalized_blockroots);
-
                 // Remove blocks not in the canonical finalized chain
                 for (unfinalized_blockroots) |blockroot| {
                     if (!canonical_blocks.contains(blockroot)) {
                         // This block is orphaned - remove it from database
                         batch.delete(database.DbBlocksNamespace, &blockroot);
                         batch.delete(database.DbStatesNamespace, &blockroot);
-
-                        self.module_logger.debug("Removed orphaned block 0x{s} at slot {d} from database", .{
-                            std.fmt.fmtSliceHexLower(&blockroot),
-                            slot,
-                        });
+                        slot_orphaned_count += 1;
                     }
                 }
-            }
+                if (slot_orphaned_count > 0) {
+                    self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
+                        slot_orphaned_count,
+                        slot,
+                    });
+                }
 
-            // Remove the unfinalized slot index
-            batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
-            self.module_logger.debug("Removed unfinalized index for slot {d}", .{slot});
+                // Remove the unfinalized slot index
+                batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+                self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
+            }
         }
 
-        self.module_logger.info("Finalization cleanup completed: removed orphaned blocks from slots {d} to {d}", .{
+        self.module_logger.info("Finalization cleanup completed for slots {d} to {d}", .{
             previousFinalizedSlot,
             finalizedSlot,
         });
