@@ -358,12 +358,12 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     return MockChainData{
         .genesis_config = genesis_config,
         .genesis_state = genesis_state,
-        .blocks = blockList.items,
-        .blockRoots = blockRootList.items,
-        .latestJustified = justificationCPList.items,
-        .latestFinalized = finalizationCPList.items,
-        .latestHead = headList.items,
-        .justification = justificationList.items,
-        .finalization = finalizationList.items,
+        .blocks = try blockList.toOwnedSlice(),
+        .blockRoots = try blockRootList.toOwnedSlice(),
+        .latestJustified = try justificationCPList.toOwnedSlice(),
+        .latestFinalized = try finalizationCPList.toOwnedSlice(),
+        .latestHead = try headList.toOwnedSlice(),
+        .justification = try justificationList.toOwnedSlice(),
+        .finalization = try finalizationList.toOwnedSlice(),
     };
 }

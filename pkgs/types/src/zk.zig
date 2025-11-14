@@ -14,6 +14,26 @@ const Allocator = std.mem.Allocator;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
+fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
+
 // non ssz types, difference is the variable list doesn't need upper boundaries
 pub const ZkVm = enum {
     ceno,
@@ -26,7 +46,8 @@ pub const ZkVm = enum {
     }
 
     pub fn toJsonString(self: *const ZkVm, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.deinit();
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -44,8 +65,14 @@ pub const BeamSTFProof = struct {
     }
 
     pub fn toJsonString(self: *const BeamSTFProof, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        allocator.free(val.object.get("proof").?.string);
+        val.object.deinit();
     }
 };
 
@@ -61,7 +88,8 @@ pub const BeamSTFProverInput = struct {
     }
 
     pub fn toJsonString(self: *const BeamSTFProverInput, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };

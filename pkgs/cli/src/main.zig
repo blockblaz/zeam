@@ -223,10 +223,11 @@ fn mainInner() !void {
             };
 
             // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
-            const mock_chain = sft_factory.genMockChain(allocator, 5, null) catch |err| {
+            var mock_chain = sft_factory.genMockChain(allocator, 5, null) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "generate mock chain");
                 return err;
             };
+            defer mock_chain.deinit(allocator);
 
             // starting beam state
             var beam_state = mock_chain.genesis_state;

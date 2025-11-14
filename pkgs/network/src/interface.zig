@@ -12,6 +12,26 @@ const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
+fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
+
 pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
@@ -208,7 +228,8 @@ pub const GossipMessage = union(GossipTopic) {
     }
 
     pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
-        const message_json = try self.toJson(allocator);
+        var message_json = try self.toJson(allocator);
+        defer freeJsonValue(&message_json, allocator);
         return zeam_utils.jsonToString(allocator, message_json);
     }
 };
@@ -263,7 +284,8 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 
     pub fn toJsonString(self: *const ReqRespRequest, allocator: Allocator) ![]const u8 {
-        const message_json = try self.toJson(allocator);
+        var message_json = try self.toJson(allocator);
+        defer freeJsonValue(&message_json, allocator);
         return zeam_utils.jsonToString(allocator, message_json);
     }
 
@@ -332,7 +354,8 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     }
 
     pub fn toJsonString(self: *const ReqRespResponse, allocator: Allocator) ![]const u8 {
-        const message_json = try self.toJson(allocator);
+        var message_json = try self.toJson(allocator);
+        defer freeJsonValue(&message_json, allocator);
         return zeam_utils.jsonToString(allocator, message_json);
     }
 

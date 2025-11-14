@@ -48,7 +48,8 @@ pub const NewHeadEvent = struct {
     }
 
     pub fn toJsonString(self: *const NewHeadEvent, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return jsonToString(allocator, json_value);
     }
 
@@ -84,7 +85,8 @@ pub const NewJustificationEvent = struct {
     }
 
     pub fn toJsonString(self: *const NewJustificationEvent, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return jsonToString(allocator, json_value);
     }
 
@@ -118,7 +120,8 @@ pub const NewFinalizationEvent = struct {
     }
 
     pub fn toJsonString(self: *const NewFinalizationEvent, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return jsonToString(allocator, json_value);
     }
 
