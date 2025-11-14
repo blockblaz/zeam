@@ -169,7 +169,13 @@ pub fn main() void {
 fn mainInner() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.err("Memory leak detected!", .{});
+            std.process.exit(1);
+        }
+    }
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
@@ -181,6 +187,8 @@ fn mainInner() !void {
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
+    defer opts.deinit();
+    
     const genesis = opts.args.genesis;
     const log_filename = opts.args.log_filename;
     const log_file_active_level = opts.args.log_file_active_level;
@@ -229,8 +237,10 @@ fn mainInner() !void {
             };
             defer mock_chain.deinit(allocator);
 
-            // starting beam state
+            // starting beam state - take ownership and clean it up ourselves
             var beam_state = mock_chain.genesis_state;
+            defer beam_state.deinit();
+
             var output = try allocator.alloc(u8, 3 * 1024 * 1024);
             defer allocator.free(output);
             // block 0 is genesis so we have to apply block 1 onwards
