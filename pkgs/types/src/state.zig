@@ -35,8 +35,14 @@ pub const BeamStateConfig = struct {
     }
 
     pub fn toJsonString(self: *const BeamStateConfig, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        _ = allocator;
+        val.object.deinit();
     }
 };
 
@@ -283,6 +289,7 @@ pub const BeamState = struct {
             while (iterator.next()) |entry| {
                 allocator.free(entry.value_ptr.*);
             }
+            justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
         try self.getJustification(allocator, &justifications);
@@ -371,7 +378,10 @@ pub const BeamState = struct {
             if (3 * target_justifications_count >= 2 * num_validators) {
                 self.latest_justified = attestation_data.target;
                 try self.justified_slots.set(target_slot, true);
-                _ = justifications.remove(attestation_data.target.root);
+                // Free the removed justifications array before removing from map
+                if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
+                    allocator.free(kv.value);
+                }
                 const justified_str_new = try self.latest_justified.toJsonString(allocator);
                 defer allocator.free(justified_str_new);
 
@@ -501,8 +511,50 @@ pub const BeamState = struct {
     }
 
     pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer self.freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(self: *const BeamState, json_value: *json.Value, allocator: Allocator) void {
+        _ = self;
+        if (json_value.object.get("config")) |*config| {
+            BeamStateConfig.freeJson(@constCast(config), allocator);
+        }
+        if (json_value.object.get("latest_block_header")) |*header| {
+            BeamBlockHeader.freeJson(@constCast(header), allocator);
+        }
+        if (json_value.object.get("latest_justified")) |*justified| {
+            Checkpoint.freeJson(@constCast(justified), allocator);
+        }
+        if (json_value.object.get("latest_finalized")) |*finalized| {
+            Checkpoint.freeJson(@constCast(finalized), allocator);
+        }
+        if (json_value.object.get("historical_block_hashes")) |*hashes| {
+            for (hashes.array.items) |*hash| {
+                allocator.free(hash.string);
+            }
+            hashes.array.deinit();
+        }
+        if (json_value.object.get("justified_slots")) |*slots| {
+            slots.array.deinit();
+        }
+        if (json_value.object.get("justifications_roots")) |*roots| {
+            for (roots.array.items) |*root| {
+                allocator.free(root.string);
+            }
+            roots.array.deinit();
+        }
+        if (json_value.object.get("justifications_validators")) |*validators_bits| {
+            validators_bits.array.deinit();
+        }
+        if (json_value.object.get("validators")) |*validators| {
+            for (validators.array.items) |*val| {
+                validator.Validator.freeJson(@constCast(val), allocator);
+            }
+            validators.array.deinit();
+        }
+        json_value.object.deinit();
     }
 };
 

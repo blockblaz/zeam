@@ -26,8 +26,14 @@ pub const Checkpoint = struct {
     }
 
     pub fn toJsonString(self: *const Checkpoint, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        allocator.free(val.object.get("root").?.string);
+        val.object.deinit();
     }
 };
 
@@ -47,7 +53,14 @@ pub const Status = struct {
     }
 
     pub fn toJsonString(self: *const Status, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        allocator.free(val.object.get("finalized_root").?.string);
+        allocator.free(val.object.get("head_root").?.string);
+        val.object.deinit();
     }
 };

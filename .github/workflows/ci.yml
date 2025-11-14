@@ -129,7 +129,7 @@ jobs:
 
   build-all-provers:
     name: build-all-provers
-    runs-on: ${{ matrix.os }}
+    runs-on: 
     needs: build  # Only run if the build job succeeds
     strategy:
       matrix:
@@ -184,7 +184,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
