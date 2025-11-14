@@ -78,10 +78,15 @@ const OpenVMConfig = struct {
     result_path: []const u8,
 };
 
+const DummyConfig = struct {
+    // Empty struct - dummy prover doesn't need configuration
+};
+
 const ZKVMConfig = union(enum) {
     powdr: PowdrConfig,
     risc0: Risc0Config,
     openvm: OpenVMConfig,
+    dummy: DummyConfig,
 };
 pub const ZKVMs = std.meta.Tag(ZKVMConfig);
 
@@ -118,8 +123,25 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
         .powdr => return error.RiscVPowdrIsDeprecated,
         .risc0 => |risc0cfg| risc0_prove_fn(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
         .openvm => |openvmcfg| openvm_prove_fn(serialized.items.ptr, serialized.items.len, output.ptr, output.len, openvmcfg.program_path.ptr, openvmcfg.program_path.len, openvmcfg.result_path.ptr, openvmcfg.result_path.len),
-        // else => @panic("prover isn't enabled"),
+        .dummy => blk: {
+            // For dummy prover, we actually run the transition function to test it
+            // This ensures the transition function works and tests allocations
+
+            try state_transition.apply_transition(allocator, &prover_input_deserialized.state, prover_input_deserialized.block, .{
+                .validSignatures = if (@hasField(@TypeOf(opts), "validSignatures")) opts.validSignatures else true,
+                .validateResult = if (@hasField(@TypeOf(opts), "validateResult")) opts.validateResult else true,
+                .logger = opts.logger,
+            });
+
+            const dummy_proof_data = "DUMMY_PROOF_V1";
+            @memcpy(output[0..dummy_proof_data.len], dummy_proof_data);
+
+            opts.logger.debug("Dummy prover: transition executed successfully", .{});
+
+            break :blk dummy_proof_data.len;
+        },
     };
+
     const proof = types.BeamSTFProof{
         .proof = output[0..output_len],
     };
@@ -135,6 +157,18 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
     const valid = switch (opts.zkvm) {
         .risc0 => |risc0cfg| risc0_verify_fn(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         .openvm => |openvmcfg| openvm_verify_fn(openvmcfg.program_path.ptr, openvmcfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        .dummy => blk: {
+            const expected_proof = "DUMMY_PROOF_V1";
+            if (stf_proof.proof.len >= expected_proof.len) {
+                const is_valid_dummy = std.mem.eql(u8, stf_proof.proof[0..expected_proof.len], expected_proof);
+                if (is_valid_dummy) {
+                    opts.logger.debug("Dummy verifier: proof verified successfully", .{});
+                }
+                break :blk is_valid_dummy;
+            } else {
+                break :blk false;
+            }
+        },
         else => return error.UnsupportedVerifier,
     };
 

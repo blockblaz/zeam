@@ -20,6 +20,26 @@ const ZERO_HASH = utils.ZERO_HASH;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
+fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
+
 // Types
 pub const Attestations = ssz.utils.List(attestation.Attestation, params.VALIDATOR_REGISTRY_LIMIT);
 pub const BlockSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
@@ -45,7 +65,8 @@ pub const BeamBlockBody = struct {
     }
 
     pub fn toJsonString(self: *const BeamBlockBody, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -68,8 +89,22 @@ pub const BeamBlockHeader = struct {
     }
 
     pub fn toJsonString(self: *const BeamBlockHeader, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer self.freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        if (val.object.get("parent_root")) |*parent_root| {
+            allocator.free(parent_root.string);
+        }
+        if (val.object.get("state_root")) |*state_root| {
+            allocator.free(state_root.string);
+        }
+        if (val.object.get("body_root")) |*body_root| {
+            allocator.free(body_root.string);
+        }
+        val.object.deinit();
     }
 };
 
@@ -151,6 +186,7 @@ pub const BeamBlock = struct {
 
     pub fn toJsonString(self: *const BeamBlock, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -172,7 +208,8 @@ pub const BlockWithAttestation = struct {
     }
 
     pub fn toJsonString(self: *const BlockWithAttestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -201,7 +238,8 @@ pub const SignedBlockWithAttestation = struct {
     }
 
     pub fn toJsonString(self: *const SignedBlockWithAttestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -231,7 +269,8 @@ pub const BlockByRootRequest = struct {
     }
 
     pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -256,6 +295,7 @@ pub const ProtoBlock = struct {
 
     pub fn toJsonString(self: *const ProtoBlock, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -272,6 +312,7 @@ pub const ExecutionPayloadHeader = struct {
 
     pub fn toJsonString(self: *const ExecutionPayloadHeader, allocator: Allocator) ![]const u8 {
         const json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return utils.jsonToString(allocator, json_value);
     }
 };
