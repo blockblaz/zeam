@@ -46,6 +46,11 @@ pub const CachedProcessedBlockInfo = struct {
     blockRoot: ?types.Root = null,
 };
 
+pub const GossipProcessingResult = struct {
+    processed_block_root: ?types.Root = null,
+    missing_attestation_roots: []types.Root = &[_]types.Root{},
+};
+
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
@@ -316,7 +321,7 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
+    pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.message.block;
@@ -344,11 +349,18 @@ pub const BeamChain = struct {
                     if (hasParentBlock) {
                         const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
                             self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
-                            return;
+                            return GossipProcessingResult{};
                         };
-                        defer self.allocator.free(missing_roots);
+                        // Return both the block root and missing attestation roots so the node can:
+                        // 1. Call processCachedDescendants(block_root) to retry any cached children
+                        // 2. Fetch missing attestation head blocks via RPC
+                        return GossipProcessingResult{
+                            .processed_block_root = block_root,
+                            .missing_attestation_roots = missing_roots,
+                        };
                     }
                 }
+                return GossipProcessingResult{};
             },
             .attestation => |signed_attestation| {
                 const signed_attestation_json = try signed_attestation.toJson(self.allocator);
@@ -362,7 +374,7 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.debug("Gossip attestation validation failed: {any}", .{err});
-                    return; // Drop invalid gossip attestations
+                    return GossipProcessingResult{}; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
@@ -370,6 +382,7 @@ pub const BeamChain = struct {
                     self.module_logger.debug("Attestation processing error: {any}", .{err});
                     return err;
                 };
+                return GossipProcessingResult{};
             },
         }
     }
@@ -653,7 +666,7 @@ pub const BeamChain = struct {
     }
 };
 
-const BlockProcessingError = error{MissingPreState};
+pub const BlockProcessingError = error{MissingPreState};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
     MissingState,
