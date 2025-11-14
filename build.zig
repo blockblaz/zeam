@@ -562,6 +562,18 @@ pub fn build(b: *Builder) !void {
     const spectests_step = b.step("spectest", "Regenerate and run spec tests");
     spectests_step.dependOn(&run_spectests_after_generate.step);
 
+    try setSpectestArgsAndEnv(b, run_spectest_generate, run_spectests, run_spectests_after_generate);
+
+    const spectest_run_step = b.step("spectest:run", "Run previously generated spectests");
+    spectest_run_step.dependOn(&run_spectests.step);
+}
+
+fn setSpectestArgsAndEnv(
+    b: *Builder,
+    run_spectest_generate: *std.Build.Step.Run,
+    run_spectests: *std.Build.Step.Run,
+    run_spectests_after_generate: *std.Build.Step.Run,
+) !void {
     if (b.args) |args| {
         var generator_args_builder = std.ArrayList([]const u8).init(b.allocator);
         defer generator_args_builder.deinit();
@@ -601,9 +613,6 @@ pub fn build(b: *Builder) !void {
             run_spectests_after_generate.setEnvironmentVariable("ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS", "true");
         }
     }
-
-    const spectest_run_step = b.step("spectest:run", "Run previously generated spectests");
-    spectest_run_step.dependOn(&run_spectests.step);
 }
 
 fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
