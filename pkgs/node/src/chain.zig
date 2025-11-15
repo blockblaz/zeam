@@ -128,6 +128,7 @@ pub const BeamChain = struct {
         // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
         self.registered_validator_ids = validator_ids;
+        zeam_metrics.metrics.lean_validators_count.set(self.registered_validator_ids.len);
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
