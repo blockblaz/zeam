@@ -488,16 +488,8 @@ fn mainInner() !void {
                 .database_path = leancmd.@"data-dir",
             };
 
+            try node.buildStartOptions(allocator, leancmd, &start_options);
             defer start_options.deinit(allocator);
-
-            node.buildStartOptions(allocator, leancmd, &start_options) catch |err| {
-                ErrorHandler.logErrorWithDetails(err, "build node start options", .{
-                    .node_id = leancmd.@"node-id",
-                    .validator_config = leancmd.validator_config,
-                    .custom_genesis = leancmd.custom_genesis,
-                });
-                return err;
-            };
 
             var lean_node: node.Node = undefined;
             lean_node.init(allocator, &start_options) catch |err| {

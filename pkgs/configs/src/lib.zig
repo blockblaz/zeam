@@ -50,42 +50,55 @@ const ChainConfigError = error{
     InvalidChainSpec,
 };
 
-pub fn genesisConfigFromYAML(config: Yaml, override_genesis_time: ?u64) !types.GenesisSpec {
-    _ = config;
-    _ = override_genesis_time;
-    // TODO: Implement YAML parsing for validator pubkeys
-    // This function needs to:
-    // 1. Parse VALIDATOR_COUNT or VALIDATOR_PUBKEYS from config.yaml
-    // 2. If VALIDATOR_COUNT: create keymanager and extract pubkeys
-    // 3. If VALIDATOR_PUBKEYS: read them directly from YAML
-    // 4. Return GenesisSpec with genesis_time and validator_pubkeys populated
-    // Until this is implemented, use beam command for testing or provide genesis_spec programmatically
-    return error.NotImplemented;
+/// Intermediate structure for genesis config before keys are generated
+pub const GenesisConfig = struct {
+    genesis_time: u64,
+    validator_count: usize,
+};
+
+/// Parse genesis configuration from YAML (without generating keys)
+/// Returns genesis time and validator count. The caller is responsible for
+/// generating validator keys and creating the full GenesisSpec.
+pub fn genesisConfigFromYAML(config: Yaml, override_genesis_time: ?u64) !GenesisConfig {
+    // Parse GENESIS_TIME from YAML
+    const genesis_time_value = config.docs.items[0].map.get("GENESIS_TIME") orelse return error.MissingGenesisTime;
+    if (genesis_time_value != .int) return error.InvalidGenesisTime;
+    const genesis_time = if (override_genesis_time) |override| override else @as(u64, @intCast(genesis_time_value.int));
+
+    // Parse VALIDATOR_COUNT from YAML
+    const validator_count_value = config.docs.items[0].map.get("VALIDATOR_COUNT") orelse return error.MissingValidatorCount;
+    if (validator_count_value != .int) return error.InvalidValidatorCount;
+    const validator_count: usize = @intCast(validator_count_value.int);
+
+    if (validator_count == 0) return error.InvalidValidatorCount;
+
+    return GenesisConfig{
+        .genesis_time = genesis_time,
+        .validator_count = validator_count,
+    };
 }
 
-// TODO: Enable and update the this test once the YAML parsing for public keys PR is added
-// test "load genesis config from yaml" {
-//     const yaml_content =
-//         \\# Genesis Settings
-//         \\GENESIS_TIME: 1704085200
-//         \\
-//         \\# Validator Settings
-//         \\VALIDATOR_COUNT: 9
-//     ;
-//
-//     var yaml: Yaml = .{ .source = yaml_content };
-//     defer yaml.deinit(std.testing.allocator);
-//     try yaml.load(std.testing.allocator);
-//
-//     const genesis_config = try genesisConfigFromYAML(yaml, null);
-//
-//     try std.testing.expect(genesis_config.genesis_time == 1704085200);
-//     try std.testing.expect(genesis_config.num_validators() == 9);
-//
-//     const genesis_config_override = try genesisConfigFromYAML(yaml, 1234);
-//     try std.testing.expect(genesis_config_override.genesis_time == 1234);
-//     try std.testing.expect(genesis_config_override.num_validators() == 9);
-// }
+test "load genesis config from yaml" {
+    const yaml_content =
+        \\# Genesis Settings
+        \\GENESIS_TIME: 1704085200
+        \\
+        \\# Validator Settings
+        \\VALIDATOR_COUNT: 9
+    ;
+
+    var yaml: Yaml = .{ .source = yaml_content };
+    defer yaml.deinit(std.testing.allocator);
+    try yaml.load(std.testing.allocator);
+
+    const genesis_config = try genesisConfigFromYAML(yaml, null);
+    try std.testing.expectEqual(@as(u64, 1704085200), genesis_config.genesis_time);
+    try std.testing.expectEqual(@as(usize, 9), genesis_config.validator_count);
+
+    const genesis_config_override = try genesisConfigFromYAML(yaml, 1234);
+    try std.testing.expectEqual(@as(u64, 1234), genesis_config_override.genesis_time);
+    try std.testing.expectEqual(@as(usize, 9), genesis_config_override.validator_count);
+}
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added (followup PR)
 // JSON parsing for genesis config needs to support validator_pubkeys instead of num_validators
