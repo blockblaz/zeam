@@ -39,6 +39,8 @@ pub const ProtoArray = struct {
     }
 
     pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot) !void {
+        const onblock_timer = zeam_metrics.lean_fork_choice_block_processing_time_seconds.start();
+
         // currentSlot might be needed in future for finding the viable head
         _ = currentSlot;
         const node_or_null = self.indices.get(block.blockRoot);
@@ -69,6 +71,7 @@ pub const ProtoArray = struct {
         const node_index = self.nodes.items.len;
         try self.nodes.append(node);
         try self.indices.put(node.blockRoot, node_index);
+        _ = onblock_timer.observe();
     }
 
     fn getNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
@@ -508,6 +511,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
+        const fc_attestation_validation_time = zeam_metrics.lean_attestation_validation_time_seconds.start();
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
@@ -517,7 +521,15 @@ pub const ForkChoice = struct {
         const attestation_slot = attestation.data.slot;
 
         // This get should never fail after validation, but we keep the check for safety
-        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse return ForkChoiceError.InvalidAttestation;
+        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse {
+            // Track whether this is from gossip or block processing
+            if (is_from_block) {
+                zeam_metrics.incrementLeanAttestationsInvalid(.unknown_head_block);
+            } else {
+                zeam_metrics.incrementLeanAttestationsInvalid(.unknown_head_gossip);
+            }
+            return ForkChoiceError.InvalidAttestation;
+        };
 
         var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
         // update latest known attested head of the validator if already included on chain
@@ -537,7 +549,10 @@ pub const ForkChoice = struct {
                 attestation_tracker.latestNew = null;
             }
         } else {
-            if (attestation_slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
+            if (attestation_slot > self.fcStore.timeSlots) {
+                zeam_metrics.incrementLeanAttestationsInvalid(.from_future_gossip);
+                return ForkChoiceError.InvalidFutureAttestation;
+            }
             // just update latest new attested head of the validator
             const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
             if (attestation_slot > attestation_tracker_latest_new_slot) {
@@ -550,6 +565,8 @@ pub const ForkChoice = struct {
         }
 
         try self.attestations.put(validator_id, attestation_tracker);
+        _ = fc_attestation_validation_time.observe();
+        zeam_metrics.metrics.lean_attestations_valid_total.incr();
     }
 
     // we process state outside forkchoice onblock to parallize verifications and just use the post state here

@@ -102,6 +102,36 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 - **Labels**: None
 - **Sample Collection Event**: Updated on state transition completion
 
+#### `lean_fork_choice_block_processing_time_seconds` (Histogram)
+- **Description**: Time taken to process block in fork choice.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On fork choice block processing
+
+#### `lean_attestations_valid_total` (Counter)
+- **Description**: Total number of valid attestations processed by fork choice.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On successful attestation validation and processing
+
+#### `lean_attestations_invalid_total` (Counter)
+- **Description**: Total number of invalid attestations rejected by fork choice.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On attestation validation failure
+
+#### `lean_attestation_validation_time_seconds` (Histogram)
+- **Description**: Time taken to validate and process attestations in fork choice.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On attestation validation and processing
+
 ### State Transition Metrics
 
 #### `lean_state_transition_time_seconds` (Histogram)
