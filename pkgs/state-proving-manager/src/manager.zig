@@ -111,6 +111,10 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
 
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
+    defer {
+        prover_input_deserialized.state.deinit();
+        prover_input_deserialized.block.deinit();
+    }
 
     const state_str = try prover_input_deserialized.state.toJsonString(allocator);
     defer allocator.free(state_str);

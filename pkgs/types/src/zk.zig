@@ -96,7 +96,6 @@ pub const BeamSTFProverInput = struct {
 
 test "ssz seralize/deserialize signed stf prover input" {
     const config = state.BeamStateConfig{
-        .num_validators = 4,
         .genesis_time = 93,
     };
     const genesis_root = [_]u8{9} ** 32;
