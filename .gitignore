@@ -5,6 +5,9 @@ target
 *.asm
 out
 
+# Generated spec tests
+pkgs/spectest/src/generated/
+
 # Claude and AI assistant files
 CLAUDE.md
 .claude/

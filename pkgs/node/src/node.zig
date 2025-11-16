@@ -8,6 +8,7 @@ const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const key_manager_lib = @import("@zeam/key-manager");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -26,6 +27,7 @@ const NodeOpts = struct {
     backend: networks.NetworkInterface,
     clock: *clockFactory.Clock,
     validator_ids: ?[]usize = null,
+    key_manager: ?*const key_manager_lib.KeyManager = null,
     nodeId: u32 = 0,
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
@@ -67,7 +69,15 @@ pub const BeamNode = struct {
             allocator.destroy(chain);
         }
         if (opts.validator_ids) |ids| {
-            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{ .ids = ids, .chain = chain, .network = network, .logger = opts.logger_config.logger(.validator) });
+            // key_manager is required when validator_ids is provided
+            const km = opts.key_manager orelse return error.KeyManagerRequired;
+            validator = validatorClient.ValidatorClient.init(allocator, opts.config, .{
+                .ids = ids,
+                .chain = chain,
+                .network = network,
+                .logger = opts.logger_config.logger(.validator),
+                .key_manager = km,
+            });
             chain.registerValidatorIds(ids);
         }
 
@@ -97,32 +107,10 @@ pub const BeamNode = struct {
             .block => |signed_block| {
                 const parent_root = signed_block.message.block.parent_root;
                 if (!self.chain.forkChoice.hasBlock(parent_root)) {
-                    const handler = self.getReqRespResponseHandler();
                     const roots = [_]types.Root{parent_root};
-                    const maybe_request = self.network.ensureBlocksByRootRequest(&roots, handler) catch |err| blk: {
-                        switch (err) {
-                            error.NoPeersAvailable => {
-                                self.logger.warn(
-                                    "No peers available to request {d} block(s) by root",
-                                    .{roots.len},
-                                );
-                            },
-                            else => {
-                                self.logger.warn(
-                                    "Failed to send blocks-by-root request to peer: {any}",
-                                    .{err},
-                                );
-                            },
-                        }
-                        break :blk null;
+                    self.fetchBlockByRoots(&roots) catch |err| {
+                        self.logger.warn("Failed to fetch block by root: {any}", .{err});
                     };
-
-                    if (maybe_request) |request_info| {
-                        self.logger.debug(
-                            "Requested {d} block(s) by root from peer {s}, request_id={d}",
-                            .{ roots.len, request_info.peer_id, request_info.request_id },
-                        );
-                    }
                 }
 
                 var block_root: types.Root = undefined;
@@ -156,11 +144,17 @@ pub const BeamNode = struct {
                 );
             }
 
-            self.chain.onBlock(signed_block.*, .{}) catch |err| {
+            const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 self.logger.warn(
                     "Failed to import block fetched via RPC 0x{s} from peer {s}: {any}",
                     .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id, err },
                 );
+                return;
+            };
+            defer self.allocator.free(missing_roots);
+
+            self.fetchBlockByRoots(missing_roots) catch |err| {
+                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
             self.logger.warn("Failed to compute block root from RPC response: {any}", .{err});
@@ -292,6 +286,51 @@ pub const BeamNode = struct {
         };
     }
 
+    fn fetchBlockByRoots(
+        self: *Self,
+        roots: []const types.Root,
+    ) !void {
+        if (roots.len == 0) return;
+
+        // Check if any of the requested blocks are missing
+        var missing_roots = std.ArrayList(types.Root).init(self.allocator);
+        defer missing_roots.deinit();
+
+        for (roots) |root| {
+            if (!self.chain.forkChoice.hasBlock(root)) {
+                try missing_roots.append(root);
+            }
+        }
+
+        if (missing_roots.items.len == 0) return;
+
+        const handler = self.getReqRespResponseHandler();
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, handler) catch |err| blk: {
+            switch (err) {
+                error.NoPeersAvailable => {
+                    self.logger.warn(
+                        "No peers available to request {d} block(s) by root",
+                        .{missing_roots.items.len},
+                    );
+                },
+                else => {
+                    self.logger.warn(
+                        "Failed to send blocks-by-root request to peer: {any}",
+                        .{err},
+                    );
+                },
+            }
+            break :blk null;
+        };
+
+        if (maybe_request) |request_info| {
+            self.logger.debug(
+                "Requested {d} block(s) by root from peer {s}, request_id={d}",
+                .{ missing_roots.items.len, request_info.peer_id, request_info.request_id },
+            );
+        }
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -342,6 +381,15 @@ pub const BeamNode = struct {
     pub fn onInterval(ptr: *anyopaque, itime_intervals: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
+        if (itime_intervals <= self.chain.forkChoice.fcStore.time) {
+            self.logger.warn("Skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
+                self.chain.forkChoice.fcStore.time,
+                itime_intervals,
+            });
+            return;
+        }
+
         // till its time to attest atleast for first time don't run onInterval,
         // just print chain status i.e avoid zero slot zero interval block production
         if (itime_intervals < 1) {
@@ -363,15 +411,14 @@ pub const BeamNode = struct {
         if (self.validator) |*validator| {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
-            const validator_output = validator.onInterval(interval) catch |e| {
+            var validator_output = validator.onInterval(interval) catch |e| {
                 self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
 
-            if (validator_output) |output| {
-                var mutable_output = output;
-                defer mutable_output.deinit();
-                for (mutable_output.gossip_messages.items) |gossip_msg| {
+            if (validator_output) |*output| {
+                defer output.deinit();
+                for (output.gossip_messages.items) |gossip_msg| {
 
                     // Process based on message type
                     switch (gossip_msg) {
@@ -416,10 +463,16 @@ pub const BeamNode = struct {
                 block.slot,
                 block.proposer_index,
             });
-            try self.chain.onBlock(signed_block, .{
+
+            const missing_roots = try self.chain.onBlock(signed_block, .{
                 .postState = self.chain.states.get(block_root),
                 .blockRoot = block_root,
             });
+            defer self.allocator.free(missing_roots);
+
+            self.fetchBlockByRoots(missing_roots) catch |err| {
+                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+            };
         } else {
             self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
                 block.slot,
@@ -476,9 +529,18 @@ test "Node peer tracking on connect/disconnect" {
 
     const backend = mock.getNetworkInterface();
 
+    // Generate pubkeys for validators using testing key manager
+    const num_validators = 4;
+    const keymanager = @import("@zeam/key-manager");
+    var key_manager = try keymanager.getTestKeyManager(allocator, num_validators, 10);
+    defer key_manager.deinit();
+
+    const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+    defer allocator.free(pubkeys);
+
     const genesis_config = types.GenesisSpec{
         .genesis_time = 0,
-        .num_validators = 4,
+        .validator_pubkeys = pubkeys,
     };
 
     var anchor_state: types.BeamState = undefined;
