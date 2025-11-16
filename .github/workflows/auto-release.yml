@@ -76,6 +76,7 @@ jobs:
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
+          # Latest tag will need to be removed on every release. For now it satisfies our requirement.
           type=raw,value=latest
           type=raw,value=${{ steps.get_tags_labels.outputs.version }}
           type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.has_network_tag }}
@@ -153,13 +154,30 @@ jobs:
         echo "create_version_tag=$CREATE_VERSION_TAG" >> $GITHUB_OUTPUT
         echo "create_network_tag=$CREATE_NETWORK_TAG" >> $GITHUB_OUTPUT
 
+    - name: Determine primary tag for release
+      id: primary_tag
+      run: |
+        # Determine which tag to use for the release (version takes precedence)
+        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
+          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.git_tag }}"
+          RELEASE_NAME="Release ${{ steps.get_tags_labels.outputs.version }}"
+        else
+          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
+          RELEASE_NAME="Network Release ${{ steps.get_tags_labels.outputs.zeam_tag }}"
+        fi
+
+        echo "primary_tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
+        echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+        echo "✅ Primary tag for release: $PRIMARY_TAG"
+
     - name: Create GitHub Release
       if: ${{ steps.create_tags.outputs.create_version_tag == 'true' || steps.create_tags.outputs.create_network_tag == 'true' }}
       uses: actions/create-release@v1
       with:
-        tag_name: ${{ steps.get_tags_labels.outputs.git_tag != '' && steps.get_tags_labels.outputs.git_tag != 'null' && steps.get_tags_labels.outputs.git_tag || steps.get_tags_labels.outputs.zeam_tag }}
-        release_name: Release ${{ steps.get_tags_labels.outputs.git_tag != '' && steps.get_tags_labels.outputs.git_tag != 'null' && steps.get_tags_labels.outputs.git_tag || steps.get_tags_labels.outputs.zeam_tag }}
-        body: Release ${{ steps.get_tags_labels.outputs.git_tag != '' && steps.get_tags_labels.outputs.git_tag != 'null' && steps.get_tags_labels.outputs.git_tag || steps.get_tags_labels.outputs.zeam_tag }}
+        tag_name: ${{ steps.primary_tag.outputs.primary_tag }}
+        release_name: ${{ steps.primary_tag.outputs.release_name }}
+        body: |
+          ${{ steps.primary_tag.outputs.release_name }}
         draft: false
         prerelease: false
       env:
