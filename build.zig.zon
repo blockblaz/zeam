@@ -43,6 +43,10 @@
             .url = "https://github.com/blockblaz/snappyframesz/archive/78e66c2d42dc44dd1177ad007e28838a82157aa3.tar.gz",
             .hash = "snappyframesz-0.0.1-COCLy9EQBADDWj8BS-OdrIFOwHfiY9KUUiClsyBHgETn",
         },
+        .zevem = .{
+            .url = "https://github.com/tsujp/zevem/archive/a097b75e1a13514c6629e796c67723d5b28db278.tar.gz",
+            .hash = "zevem-0.0.0-ur64buxSAgAGJiDxLHVbXhU3S7nHyogjvmgUUxOEXFln",
+        },
     },
     .paths = .{""},
 }

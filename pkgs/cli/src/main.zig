@@ -33,6 +33,8 @@ const yaml = @import("yaml");
 const node = @import("node.zig");
 const enr_lib = @import("enr");
 
+const zevem = @import("zevem");
+
 pub const NodeCommand = struct {
     help: bool = false,
     custom_genesis: []const u8,
@@ -132,6 +134,9 @@ const ZeamArgs = struct {
             },
         },
         node: NodeCommand,
+        testevm: struct {
+            help: bool = false,
+        },
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
@@ -139,6 +144,7 @@ const ZeamArgs = struct {
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
             .node = "Run a lean node",
+            .testevm = "Test evm integration",
         };
     },
 
@@ -510,6 +516,11 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "run lean node");
                 return err;
             };
+        },
+        .testevm => {
+            var dummyEnv = zevem.DummyEnv{};
+            var evm2 = try zevem.EVM.init(allocator, &dummyEnv);
+            try evm2.execute(.{ .gas = 100_000, .data = &.{ 0x5F, 0x60, 0x11, 0x61, 0x22, 0x33, 0x00 }, .sender = 0 });
         },
     }
 }

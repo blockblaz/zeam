@@ -72,6 +72,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
+    const zevem = b.dependency("zevem", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zevem");
     const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
@@ -307,6 +311,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    cli_exe.root_module.addImport("zevem", zevem);
 
     // Enable LTO if requested and on Linux (disabled by default for faster builds)
     // Always disabled on macOS due to linker issues with Rust static libraries
