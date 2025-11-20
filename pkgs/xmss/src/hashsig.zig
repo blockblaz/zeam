@@ -14,6 +14,14 @@ extern fn hashsig_keypair_generate(
     num_active_epochs: usize,
 ) ?*HashSigKeyPair;
 
+/// Reconstruct a key pair from serialized JSON
+extern fn hashsig_keypair_from_json(
+    secret_key_json: [*]const u8,
+    secret_key_len: usize,
+    public_key_json: [*]const u8,
+    public_key_len: usize,
+) ?*HashSigKeyPair;
+
 /// Free a key pair
 extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
 
@@ -64,7 +72,7 @@ extern fn hashsig_verify_bincode(
     signature_len: usize,
 ) i32;
 
-pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, OutOfMemory };
+pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 
 /// Verify signature using bincode-serialized bytes
 pub fn verifyBincode(
@@ -118,6 +126,31 @@ pub const KeyPair = struct {
             num_active_epochs,
         ) orelse {
             return HashSigError.KeyGenerationFailed;
+        };
+
+        return Self{
+            .handle = handle,
+            .allocator = allocator,
+        };
+    }
+
+    /// Reconstruct a key pair from serialized JSON blobs
+    pub fn fromJson(
+        allocator: Allocator,
+        secret_key_json: []const u8,
+        public_key_json: []const u8,
+    ) HashSigError!Self {
+        if (secret_key_json.len == 0 or public_key_json.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_keypair_from_json(
+            secret_key_json.ptr,
+            secret_key_json.len,
+            public_key_json.ptr,
+            public_key_json.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
         };
 
         return Self{
