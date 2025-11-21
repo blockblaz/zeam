@@ -120,7 +120,7 @@ jobs:
         # Check if version tag should be created
         if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
           if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
-            echo "❌ Version tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists. Please create a new tag."
+            echo "❌ Version tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists. Please use a different version label."
             exit 1
           else
             CREATE_VERSION_TAG=true
@@ -131,7 +131,7 @@ jobs:
         if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
           ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
           if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
-            echo "❌ Network tag $ZEAM_GIT_TAG already exists. Please create a new tag."
+            echo "❌ Network tag $ZEAM_GIT_TAG already exists. Please use a different network label."
             exit 1
           else
             CREATE_NETWORK_TAG=true
