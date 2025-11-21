@@ -331,6 +331,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/api", zeam_api);
+    cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("enr", enr);
@@ -490,6 +491,8 @@ pub fn build(b: *Builder) !void {
     configs_tests.root_module.addImport("@zeam/types", zeam_types);
     configs_tests.root_module.addImport("@zeam/params", zeam_params);
     configs_tests.root_module.addImport("yaml", yaml);
+    configs_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, configs_tests, target, prover);
     const run_configs_tests = b.addRunArtifact(configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
