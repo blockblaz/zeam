@@ -185,18 +185,7 @@ jobs:
         echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
         echo "✅ Primary tag for release: $PRIMARY_TAG"
 
-    - name: Create GitHub Release
-      # Skip if docker only label is present
-      if: ${{ steps.get_tags_labels.outputs.docker_only != 'true' && (steps.create_tags.outputs.create_version_tag == 'true' || steps.create_tags.outputs.create_network_tag == 'true') }}
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.primary_tag.outputs.primary_tag }}
-        name: ${{ steps.primary_tag.outputs.release_name }}
-        body_path: release-notes.md
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # Only createa a Github tag, not a release at this point
 
     - name: Build and push Docker image with pre-built binary
       uses: docker/build-push-action@v5
