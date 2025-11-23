@@ -103,10 +103,10 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -114,7 +114,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-docker-${{ github.sha }}
 
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"

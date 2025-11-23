@@ -25,10 +25,10 @@ jobs:
         version: 0.14.1
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -62,7 +62,7 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ github.sha }}
 
     - name: Check Rust formatting
       run: |
@@ -81,7 +81,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -95,10 +95,10 @@ jobs:
 
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -106,7 +106,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ github.sha }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -135,7 +135,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -150,10 +150,10 @@ jobs:
 
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -161,7 +161,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-all-provers-${{ github.sha }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -215,10 +215,10 @@ jobs:
 
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -226,7 +226,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-test-${{ github.sha }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -263,7 +263,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -277,10 +277,10 @@ jobs:
 
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -288,7 +288,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-test-${{ github.sha }}
 
     - name: Run the dummy prover
       run: zig build run -Dprover=dummy -- prove --zkvm dummy
@@ -316,10 +316,10 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -327,7 +327,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-docker-${{ github.sha }}
 
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"

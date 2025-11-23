@@ -42,7 +42,7 @@ pub const KeyManager = struct {
         self: *const Self,
         attestation: *const types.Attestation,
         allocator: Allocator,
-    ) !types.Bytes4000 {
+    ) !types.SIGBYTES {
         const validator_index: usize = @intCast(attestation.validator_id);
 
         const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
@@ -54,7 +54,7 @@ pub const KeyManager = struct {
         var signature = try keypair.sign(&message, epoch);
         defer signature.deinit();
 
-        var sig_buffer: types.Bytes4000 = undefined;
+        var sig_buffer: types.SIGBYTES = undefined;
         const bytes_written = try signature.toBytes(&sig_buffer);
 
         if (bytes_written < types.SIGSIZE) {

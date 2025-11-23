@@ -13,7 +13,7 @@ const Attestation = attestation.Attestation;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
-const Bytes4000 = utils.Bytes4000;
+const SIGBYTES = utils.SIGBYTES;
 const Root = utils.Root;
 const ZERO_HASH = utils.ZERO_HASH;
 
@@ -42,7 +42,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 
 // Types
 pub const Attestations = ssz.utils.List(attestation.Attestation, params.VALIDATOR_REGISTRY_LIMIT);
-pub const BlockSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
+pub const BlockSignatures = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const BeamBlockBody = struct {
     attestations: Attestations,
@@ -249,7 +249,7 @@ pub fn createBlockSignatures(allocator: Allocator, num_attestations: usize) !Blo
     var signatures = try BlockSignatures.init(allocator);
     // +1 for proposer attestation
     for (0..(num_attestations + 1)) |_| {
-        try signatures.append(utils.ZERO_HASH_4000);
+        try signatures.append(utils.ZERO_SIGBYTES);
     }
     return signatures;
 }
