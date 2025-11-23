@@ -24,11 +24,21 @@ jobs:
       with:
         version: 0.14.1
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
+
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -93,12 +103,21 @@ jobs:
       with:
         toolchain: nightly
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -148,12 +167,21 @@ jobs:
         toolchain: nightly
         components: clippy, rustfmt
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -213,12 +241,21 @@ jobs:
       with:
         toolchain: nightly
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -275,12 +312,21 @@ jobs:
       with:
         toolchain: nightly
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
 
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -315,11 +361,21 @@ jobs:
       with:
         toolchain: nightly
 
+    - name: Get build.zig.zon hash
+      id: zig-zon-hash
+      run: |
+        if [ -f build.zig.zon ]; then
+          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+        else
+          echo "hash=default" >> $GITHUB_OUTPUT
+        fi
+
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('**/build.zig.zon') }}
+        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
