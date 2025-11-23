@@ -25,7 +25,7 @@ COPY resources/ /app/resources/
 
 # Create a script to copy the right libraries based on architecture
 RUN mkdir -p /runtime-libs && \
-    for lib in `ldd /app/zig-out/bin/zeam | grep -oP '(\/lib\/[^\s]+)'`; do \
+    for lib in `ldd /app/zig-out/bin/zeam | grep -oP '(\/lib[^\s]+)'`; do \
         [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
     done;
 

@@ -51,6 +51,7 @@ pub const NodeCommand = struct {
     metrics_enable: bool = false,
     metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
+    @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
 
@@ -68,6 +69,7 @@ pub const NodeCommand = struct {
         .metrics_enable = "Enable metrics endpoint",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
+        .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .help = "Show help information for the node command",
     };
@@ -169,7 +171,13 @@ pub fn main() void {
 fn mainInner() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.err("Memory leak detected!", .{});
+            std.process.exit(1);
+        }
+    }
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
@@ -181,6 +189,8 @@ fn mainInner() !void {
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
+    defer opts.deinit();
+
     const genesis = opts.args.genesis;
     const log_filename = opts.args.log_filename;
     const log_file_active_level = opts.args.log_file_active_level;
@@ -223,13 +233,16 @@ fn mainInner() !void {
             };
 
             // generate a mock chain with 5 blocks including genesis i.e. 4 blocks on top of genesis
-            const mock_chain = sft_factory.genMockChain(allocator, 5, null) catch |err| {
+            var mock_chain = sft_factory.genMockChain(allocator, 5, null) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "generate mock chain");
                 return err;
             };
+            defer mock_chain.deinit(allocator);
 
-            // starting beam state
+            // starting beam state - take ownership and clean it up ourselves
             var beam_state = mock_chain.genesis_state;
+            defer beam_state.deinit();
+
             var output = try allocator.alloc(u8, 3 * 1024 * 1024);
             defer allocator.free(output);
             // block 0 is genesis so we have to apply block 1 onwards
@@ -281,16 +294,11 @@ fn mainInner() !void {
             };
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
 
-            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
-            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
-
-            chain_options.genesis_time = time_now;
-
             // Create key manager FIRST to get validator pubkeys for genesis
             const key_manager_lib = @import("@zeam/key-manager");
             // Using 3 validators: so by default beam cmd command runs two nodes to interop
             const num_validators: usize = 3;
-            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 10000);
+            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager
@@ -301,6 +309,10 @@ fn mainInner() !void {
             // Set validator_pubkeys in chain_options
             chain_options.validator_pubkeys = pubkeys;
             owns_pubkeys = false; // ownership moved into genesis spec
+
+            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
+            chain_options.genesis_time = time_now;
 
             // transfer ownership of the chain_options to ChainConfig
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
@@ -475,6 +487,7 @@ fn mainInner() !void {
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
+                .hash_sig_key_dir = undefined,
             };
 
             defer start_options.deinit(allocator);

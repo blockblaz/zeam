@@ -7,7 +7,7 @@ const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const zeam_utils = @import("@zeam/utils");
 const stf = @import("@zeam/state-transition");
-const api = @import("@zeam/api");
+const zeam_metrics = @import("@zeam/metrics");
 const params = @import("@zeam/params");
 
 const constants = @import("./constants.zig");
@@ -311,6 +311,28 @@ pub const ForkChoice = struct {
         return false;
     }
 
+    /// Get all ancestor block roots from the current finalized block,
+    /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
+    /// Stops traversal when previousFinalizedSlot is reached or at genesis.
+    pub fn getAncestorsOfFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
+        var ancestors = std.ArrayList(types.Root).init(allocator);
+
+        var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
+
+        while (current_idx_or_null) |current_idx| {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            if (current_node.slot < previousFinalizedSlot) {
+                return error.InvalidFinalizationTraversal;
+            } else if (current_node.slot == previousFinalizedSlot) {
+                break;
+            } else {
+                try ancestors.append(current_node.blockRoot);
+                current_idx_or_null = current_node.parent;
+            }
+        }
+        return ancestors.toOwnedSlice();
+    }
+
     pub fn tickInterval(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
@@ -475,7 +497,7 @@ pub const ForkChoice = struct {
     pub fn updateHead(self: *Self) !ProtoBlock {
         self.head = try self.computeFCHead(true, 0);
         // Update the lean_head_slot metric
-        api.setLeanHeadSlot(self.head.slot);
+        zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
         return self.head;
     }
 

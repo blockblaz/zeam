@@ -16,6 +16,26 @@ const ValidatorIndex = utils.ValidatorIndex;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
+fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
+
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
 pub const AggregatedSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
@@ -36,7 +56,8 @@ pub const AttestationData = struct {
     }
 
     pub fn toJsonString(self: *const AttestationData, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -53,7 +74,8 @@ pub const Attestation = struct {
     }
 
     pub fn toJsonString(self: *const Attestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -70,7 +92,8 @@ pub const SignedAttestation = struct {
     }
 
     pub fn toJsonString(self: *const SignedAttestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -93,7 +116,8 @@ pub const AggregatedAttestation = struct {
     }
 
     pub fn toJsonString(self: *const AggregatedAttestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
@@ -118,7 +142,8 @@ pub const SignedAggregatedAttestation = struct {
     }
 
     pub fn toJsonString(self: *const SignedAggregatedAttestation, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };
