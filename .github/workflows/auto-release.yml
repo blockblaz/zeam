@@ -1,0 +1,200 @@
+name: Auto Release on Release Branch
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ release ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: blockblaz/zeam
+
+permissions:
+  contents: write
+
+jobs:
+  auto-release:
+    # Only run if PR was merged to release branch (not just closed)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract tags from PR labels
+      id: get_tags_labels
+      run: |
+        # Get PR labels and extract version
+        LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+        echo "PR Labels: $LABELS"
+
+        # Check for "docker only" label
+        DOCKER_ONLY=$(echo $LABELS | jq -r '.[] | select(test("^docker only$"; "i"))' | head -n 1)
+
+        if [ -n "$DOCKER_ONLY" ] && [ "$DOCKER_ONLY" != "null" ]; then
+          echo "docker_only=true" >> $GITHUB_OUTPUT
+          echo "✅ Docker only deployment - skipping GitHub tags and releases"
+        else
+          echo "docker_only=false" >> $GITHUB_OUTPUT
+        fi
+
+        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.)
+        VERSION=$(echo $LABELS | jq -r '.[] | select(test("^(v|version:)?[0-9]+\\.[0-9]+\\.[0-9]+")) | gsub("^(v|version:)"; "")' | head -n 1)
+
+        # Look for zeam network tags (devnet0, devnet1, testnet, mainnet)
+        ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))'| head -n 1)
+
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "ℹ️ No version label found"
+        else
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "git_tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "✅ Version found: $VERSION"
+        fi
+
+        if [ -n "$ZEAM_TAG" ] && [ "$ZEAM_TAG" != "null" ]; then
+          echo "zeam_tag=$ZEAM_TAG" >> $GITHUB_OUTPUT
+          echo "has_network_tag=true" >> $GITHUB_OUTPUT
+          echo "✅ Found network tag: $ZEAM_TAG"
+        else
+          echo "has_network_tag=false" >> $GITHUB_OUTPUT
+          echo "ℹ️ No network tag found (optional)"
+        fi
+
+        # Require at least one label (version, network, or docker only)
+        if [ "$DOCKER_ONLY" = "docker only" ]; then
+          echo "ℹ️ Docker only deployment - no tags required"
+        elif { [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; } && { [ -z "$ZEAM_TAG" ] || [ "$ZEAM_TAG" = "null" ]; }; then
+          echo "❌ No usable label found! Please add a version (e.g. v1.0.0), network tag (e.g. devnet0, testnet, mainnet), or 'docker only' label"
+          exit 1
+        fi
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest
+          type=raw,value=${{ steps.get_tags_labels.outputs.version }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true'  && steps.get_tags_labels.outputs.version != 'null' }}
+          type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true' && steps.get_tags_labels.outputs.has_network_tag }}
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build zeam natively
+      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Create and push git tags
+      id: create_tags
+      # Skip if docker only label is present
+      if: ${{ steps.get_tags_labels.outputs.docker_only != 'true' }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        CREATE_VERSION_TAG=false
+        CREATE_NETWORK_TAG=false
+
+        # Check if version tag should be created
+        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
+          if git rev-parse "${{ steps.get_tags_labels.outputs.git_tag }}" >/dev/null 2>&1; then
+            echo "❌ Version tag ${{ steps.get_tags_labels.outputs.git_tag }} already exists. Please use a different version label."
+            exit 1
+          else
+            CREATE_VERSION_TAG=true
+          fi
+        fi
+
+        # Check if network tag should be created
+        if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
+          ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
+          if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
+            echo "❌ Network tag $ZEAM_GIT_TAG already exists. Please use a different network label."
+            exit 1
+          else
+            CREATE_NETWORK_TAG=true
+          fi
+        fi
+
+        # Create version tag if needed
+        if [ "$CREATE_VERSION_TAG" = "true" ]; then
+          git tag -a "${{ steps.get_tags_labels.outputs.git_tag }}" -m "Release version ${{ steps.get_tags_labels.outputs.version }}"
+          git push origin "${{ steps.get_tags_labels.outputs.git_tag }}"
+          echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
+        fi
+
+        # Create network tag if needed
+        if [ "$CREATE_NETWORK_TAG" = "true" ]; then
+          git tag -a "$ZEAM_GIT_TAG" -m "Zeam network tag for $ZEAM_GIT_TAG"
+          git push origin "$ZEAM_GIT_TAG"
+          echo "✅ Created zeam tag $ZEAM_GIT_TAG"
+        fi
+        echo "create_version_tag=$CREATE_VERSION_TAG" >> $GITHUB_OUTPUT
+        echo "create_network_tag=$CREATE_NETWORK_TAG" >> $GITHUB_OUTPUT
+
+    - name: Determine primary tag for release
+      id: primary_tag
+      # Skip if docker only label is present
+      if: ${{ steps.get_tags_labels.outputs.docker_only != 'true' }}
+      run: |
+        # Determine which tag to use for the release (version takes precedence)
+        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
+          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.git_tag }}"
+          RELEASE_NAME="Release ${{ steps.get_tags_labels.outputs.version }}"
+        else
+          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
+          RELEASE_NAME="Network Release ${{ steps.get_tags_labels.outputs.zeam_tag }}"
+        fi
+
+        echo "primary_tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
+        echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+        echo "✅ Primary tag for release: $PRIMARY_TAG"
+
+    # Only createa a Github tag, not a release at this point
+
+    - name: Build and push Docker image with pre-built binary
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.prebuilt
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max

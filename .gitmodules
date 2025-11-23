@@ -1,3 +1,6 @@
 [submodule "lean-quickstart"]
 	path = lean-quickstart
 	url = git@github.com:blockblaz/lean-quickstart.git
+[submodule "leanSpec"]
+	path = leanSpec
+	url = https://github.com/leanEthereum/leanSpec

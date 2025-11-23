@@ -2,164 +2,223 @@
 
 ## Overview
 
-This package provides the application API facilities for the `zeam` node:
+This package provides the HTTP API server for the Zeam node with three main endpoints:
 
 - Server-Sent Events (SSE) stream for real-time chain events at `/events`
-- Prometheus metrics at `/metrics`
+- Prometheus metrics endpoint at `/metrics`
 - Health check at `/health`
 
-The primary components are:
-- Core API surface implemented in `src/lib.zig` (`@zeam/api`)
-- Event system: `src/events.zig` and `src/event_broadcaster.zig`
-- The underlying Prometheus client library: [karlseguin/metrics.zig](https://github.com/karlseguin/metrics.zig)
-- A dedicated HTTP API server in `pkgs/cli/src/api_server.zig` (serves SSE, metrics, health)
+## Package Components
+
+- `src/lib.zig` - Core API module with initialization and metrics serialization
+- `src/events.zig` - Event type definitions (NewHeadEvent, NewJustificationEvent, NewFinalizationEvent)
+- `src/event_broadcaster.zig` - SSE broadcaster for real-time events
+- `src/routes.zig` - HTTP route handlers
+- `pkgs/cli/src/api_server.zig` - HTTP server implementation (runs in background thread)
 
 ## Metrics Exposed
 
-The following metrics are currently available:
+This package **serves** metrics via the `/metrics` HTTP endpoint in Prometheus format. Metrics are **defined** in `@zeam/metrics`.
 
-- **`chain_onblock_duration_seconds`** (Histogram)
-  - **Description**: Measures the time taken to process a block within the `chain.onBlock` function (end-to-end block processing).
-  - **Labels**: None.
+**For all metrics documentation (definitions, usage, adding new metrics), see:** [`pkgs/metrics/README.md`](../metrics/README.md)
 
-- **`block_processing_duration_seconds`** (Histogram)
-  - **Description**: Measures the time taken to process a block in the state transition function.
-  - **Labels**: None.
+### 1. Broadcasts Events via SSE
 
-- **`lean_head_slot`** (Gauge)
-  - **Description**: Latest slot of the lean chain (canonical chain head as determined by fork choice).
-  - **Labels**: None.
-  - **Sample Collection Event**: Updated on every fork choice head update.
+Provides real-time chain event streaming via Server-Sent Events:
+- `new_head` - Fork choice selects new head
+- `new_justification` - New justified checkpoint
+- `new_finalization` - New finalized checkpoint
 
-## How It Works
+### 2. Health Checks
 
-The API system is initialized at application startup in `pkgs/cli/src/main.zig`. 
+Simple health check endpoint at `/health`.
 
-1.  `api.init()` is called once to set up histograms used by the node.
-2.  A dedicated HTTP API server is started via `startAPIServer()` to serve SSE, metrics, and health.
-3.  This server runs in a background thread and exposes:
-    - SSE at `/events`
-    - Metrics at `/metrics`
-    - Health at `/health`
+## Event System
 
-**Note**: For freestanding targets (zkvm runs), the API metrics operate in no-op mode and the HTTP server is disabled.
+Events are defined in `src/events.zig`:
 
-## Architecture
-
-The API uses a dedicated HTTP server implementation (`pkgs/cli/src/api_server.zig`) that:
-
-- Runs independently of the main application
-- Serves SSE at `/events`
-- Serves Prometheus-formatted metrics at `/metrics`
-- Provides health checks at `/health`
-- Automatically handles ZKVM targets (no HTTP server for freestanding environments)
-- Uses background threading to avoid blocking the main application
-
-## Freestanding Target Support
-
-The API library automatically detects freestanding targets (like zkvm runs) and operates in no-op mode:
-
-- **Host targets**: Full metrics functionality with HTTP server
-- **Freestanding targets**: No-op metrics that don't use system calls like `std.net` or `std.Thread`
-
-This ensures compatibility with zero-knowledge proof environments where traditional networking and threading are not available.
-
-## Running for Visualization
-
-The dashboards and monitoring infrastructure have been moved to a separate repository: [zeam-dashboards](https://github.com/blockblaz/zeam-dashboards).
-
-### Quick Setup
-
-1. **Clone the dashboard repository**:
-```sh
-git clone https://github.com/blockblaz/zeam-dashboards.git
-cd zeam-dashboards
+```zig
+pub const ChainEvent = union(enum) {
+    new_head: NewHeadEvent,
+    new_justification: NewJustificationEvent,
+    new_finalization: NewFinalizationEvent,
+};
 ```
 
-2. **Generate Prometheus configuration**:
-```sh
-# From your Zeam repository
-./zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
+### Broadcasting Events in Code
+
+```zig
+const api = @import("@zeam/api");
+
+// Create and broadcast an event
+if (api.events.NewHeadEvent.fromProtoBlock(allocator, new_head)) |head_event| {
+    var chain_event = api.events.ChainEvent{ .new_head = head_event };
+    api.event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
+        // Handle error
+    };
+}
 ```
 
-3. **Start the monitoring stack**:
+### Consuming Events
+
+Connect to the SSE endpoint:
+
 ```sh
-docker-compose up -d
+curl -N http://localhost:9667/events
 ```
 
-4. **Access dashboards**:
-- Grafana: http://localhost:3001 (admin/admin)
-- Prometheus: http://localhost:9090
+Events are streamed in SSE format:
 
-For detailed setup instructions and troubleshooting, see the [zeam-dashboards repository](https://github.com/blockblaz/zeam-dashboards).
+```
+event: head
+data: {"slot":12345,"block_root":"0x...","state_root":"0x..."}
 
-**Important**: Make sure the metrics port in your `prometheus.yml` file matches the port used when starting the beam command.
+event: justification
+data: {"epoch":123,"root":"0x...","current_slot":12345}
+```
 
-### Verify and Visualize
+## HTTP Endpoints
 
-1.  **Check Prometheus Targets**: Open the Prometheus UI at [http://localhost:9090/targets](http://localhost:9090/targets). The `zeam_app` job should be **UP**.
-2.  **Build a Grafana Dashboard**: Create a new dashboard and panel. Use a query like the following to visualize the 95th percentile of block processing time:
-```promql
-histogram_quantile(0.95, sum(rate(chain_onblock_duration_seconds_bucket[5m])) by (le))
+### `/metrics`
+
+Returns Prometheus-formatted metrics. Metrics are collected from `@zeam/metrics` and serialized by this package.
+
+```sh
+curl http://localhost:9667/metrics
+```
+
+**For what metrics are available, see:** [`pkgs/metrics/README.md`](../metrics/README.md)
+
+### `/events`
+
+Streams real-time chain events (head, justification, finalization).
+
+```sh
+curl -N http://localhost:9667/events
+```
+
+### `/health`
+
+Returns node health status.
+
+```sh
+curl http://localhost:9667/health
+```
+
+## Usage
+
+### Initialization
+
+The API system is initialized at startup in `pkgs/cli/src/main.zig`:
+
+```zig
+// Initialize metrics
+try api.init(allocator);
+
+// Start HTTP server in background thread
+try api_server.startAPIServer(allocator, metricsPort);
+```
+
+The server exposes:
+- SSE at `/events`
+- Metrics at `/metrics`
+- Health at `/health`
+
+**Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
+
+### Dependency Flow
+
+```
+pkgs/metrics/              ← Defines and collects metrics
+    ↓
+pkgs/api/                  ← Serializes metrics, broadcasts events
+    ↓
+pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 ```
 
 ## CLI Commands
 
-The `zeam` executable provides several commands for working with metrics:
-
-### Beam Command
-Run a full Beam node with configurable metrics:
+### Running the Node
 
 ```sh
-# Use default metrics port (9667)
+# Default metrics port (9667)
 ./zig-out/bin/zeam beam
 
-# Use custom metrics port
+# Custom port
 ./zig-out/bin/zeam beam --metricsPort 8080
 
-# Use mock network for testing
+# Mock network for testing
 ./zig-out/bin/zeam beam --mockNetwork --metricsPort 8080
 ```
 
 ### Generate Prometheus Config
-Generate a Prometheus configuration file that matches your metrics settings:
 
 ```sh
-# Generate config with default port (9667)
+# Default port (9667)
 ./zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
 
-# Generate config with custom port
+# Custom port
 ./zig-out/bin/zeam prometheus genconfig --metricsPort 8080 -f prometheus.yml
 ```
 
-## Testing the API Server
+## Testing
 
-You can test that the API server is working by:
+Start a node:
 
-1. **Starting the beam node**:
 ```sh
 ./zig-out/bin/zeam beam --mockNetwork --metricsPort 9668
 ```
 
-2. **Checking the SSE endpoint**:
+Test endpoints:
+
 ```sh
+# SSE events
 curl -N http://localhost:9668/events
-```
 
-3. **Checking the metrics endpoint**:
-```sh
+# Metrics
 curl http://localhost:9668/metrics
-```
 
-4. **Checking the health endpoint**:
-```sh
+# Health
 curl http://localhost:9668/health
 ```
 
-## Adding New Metrics
+## Visualization with Prometheus & Grafana
 
-To add a new metric, follow the existing pattern:
+Monitoring infrastructure: [zeam-dashboards](https://github.com/blockblaz/zeam-dashboards)
 
-1.  **Declare it**: Add a new global variable for your metric in `pkgs/api/src/lib.zig`.
-2.  **Initialize it**: In the `init()` function in `lib.zig`, initialize the metric with its name, help text, and any labels or buckets.
-3.  **Use it**: Import the metrics package in your application code and record observations (e.g., `metrics.my_new_metric.observe(value)`).
+**Quick setup:**
+
+```sh
+# 1. Clone dashboards repo
+git clone https://github.com/blockblaz/zeam-dashboards.git
+cd zeam-dashboards
+
+# 2. Generate Prometheus config
+../zeam/zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
+
+# 3. Start stack
+docker-compose up -d
+```
+
+**Access:**
+- Grafana: http://localhost:3001 (admin/admin)
+- Prometheus: http://localhost:9090
+
+**Verify:** Check http://localhost:9090/targets - `zeam_app` should be **UP**.
+
+**Example query** (95th percentile block processing):
+
+```promql
+histogram_quantile(0.95, sum(rate(chain_onblock_duration_seconds_bucket[5m])) by (le))
+```
+
+## Package Dependencies
+
+**Depends on:**
+- `@zeam/metrics` - Metrics definitions and serialization
+- `@zeam/types` - Event type definitions
+- `@zeam/utils` - Utility functions
+
+**Used by:**
+- `@zeam/node` - Event broadcasting
+- `pkgs/cli` - HTTP API server

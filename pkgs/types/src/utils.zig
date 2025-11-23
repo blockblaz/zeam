@@ -86,7 +86,8 @@ pub const ChainSpec = struct {
     }
 
     pub fn toJsonString(self: *const ChainSpec, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return jsonToString(allocator, json_value);
     }
 };

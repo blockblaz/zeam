@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const block = @import("./block.zig");
 const utils = @import("./utils.zig");
@@ -24,19 +25,23 @@ const json = std.json;
 
 // PQ devnet0 config
 pub const BeamStateConfig = struct {
-    num_validators: u64,
     genesis_time: u64,
 
     pub fn toJson(self: *const BeamStateConfig, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("num_validators", json.Value{ .integer = @as(i64, @intCast(self.num_validators)) });
         try obj.put("genesis_time", json.Value{ .integer = @as(i64, @intCast(self.genesis_time)) });
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const BeamStateConfig, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer json_value.object.deinit();
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(val: *json.Value, allocator: Allocator) void {
+        _ = allocator;
+        val.object.deinit();
     }
 };
 
@@ -64,6 +69,10 @@ pub const BeamState = struct {
     justifications_validators: JustificationValidators,
 
     const Self = @This();
+
+    pub fn validatorCount(self: *const Self) usize {
+        return self.validators.constSlice().len;
+    }
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
         var genesis_block: block.BeamBlock = undefined;
@@ -98,7 +107,6 @@ pub const BeamState = struct {
 
         self.* = .{
             .config = .{
-                .num_validators = genesis.numValidators(),
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
@@ -117,7 +125,7 @@ pub const BeamState = struct {
 
     pub fn getJustification(self: *const Self, allocator: Allocator, justifications: *std.AutoHashMapUnmanaged(Root, []u8)) !void {
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = @intCast(self.config.num_validators);
+        const num_validators = self.validatorCount();
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
             const validator_data = try allocator.alloc(u8, num_validators);
@@ -141,7 +149,7 @@ pub const BeamState = struct {
         // First, collect all keys
         var iterator = justifications.iterator();
         while (iterator.next()) |kv| {
-            if (kv.value_ptr.*.len != self.config.num_validators) {
+            if (kv.value_ptr.*.len != self.validatorCount()) {
                 return error.InvalidJustificationLength;
             }
             try new_justifications_roots.append(kv.key_ptr.*);
@@ -192,9 +200,18 @@ pub const BeamState = struct {
             return StateTransitionError.InvalidPreState;
         }
 
+        const start_slot = self.slot;
+        const slots_timer = zeam_metrics.lean_state_transition_slots_processing_time_seconds.start();
+        defer _ = slots_timer.observe();
+
         while (self.slot < slot) {
             try self.process_slot(allocator);
             self.slot += 1;
+        }
+
+        if (comptime !zeam_metrics.isZKVM()) {
+            const slots_processed: u64 = @intCast(slot - start_slot);
+            zeam_metrics.metrics.lean_state_transition_slots_processed_total.incrBy(slots_processed);
         }
     }
 
@@ -214,7 +231,8 @@ pub const BeamState = struct {
         }
 
         // 3. check proposer is correct
-        const correct_proposer_index = staged_block.slot % self.config.num_validators;
+        const validator_count: u64 = @intCast(self.validatorCount());
+        const correct_proposer_index = staged_block.slot % validator_count;
         if (staged_block.proposer_index != correct_proposer_index) {
             logger.err("process-block-header: invalid proposer={d} slot={d} correct-proposer={d}", .{ staged_block.proposer_index, staged_block.slot, correct_proposer_index });
             return StateTransitionError.InvalidProposer;
@@ -266,6 +284,14 @@ pub const BeamState = struct {
     }
 
     fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, logger: zeam_utils.ModuleLogger) !void {
+        const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
+        defer _ = attestations_timer.observe();
+
+        if (comptime !zeam_metrics.isZKVM()) {
+            const attestation_count: u64 = @intCast(attestations.constSlice().len);
+            zeam_metrics.metrics.lean_state_transition_attestations_processed_total.incrBy(attestation_count);
+        }
+
         logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
         const justified_str = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str);
@@ -283,12 +309,13 @@ pub const BeamState = struct {
             while (iterator.next()) |entry| {
                 allocator.free(entry.value_ptr.*);
             }
+            justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
         try self.getJustification(allocator, &justifications);
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
-        const num_validators: usize = @intCast(self.config.num_validators);
+        const num_validators: usize = @intCast(self.validatorCount());
         for (attestations.constSlice()) |attestation| {
             const validator_id: usize = @intCast(attestation.validator_id);
             const attestation_data = attestation.data;
@@ -371,7 +398,10 @@ pub const BeamState = struct {
             if (3 * target_justifications_count >= 2 * num_validators) {
                 self.latest_justified = attestation_data.target;
                 try self.justified_slots.set(target_slot, true);
-                _ = justifications.remove(attestation_data.target.root);
+                // Free the removed justifications array before removing from map
+                if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
+                    allocator.free(kv.value);
+                }
                 const justified_str_new = try self.latest_justified.toJsonString(allocator);
                 defer allocator.free(justified_str_new);
 
@@ -501,13 +531,55 @@ pub const BeamState = struct {
     }
 
     pub fn toJsonString(self: *const BeamState, allocator: Allocator) ![]const u8 {
-        const json_value = try self.toJson(allocator);
+        var json_value = try self.toJson(allocator);
+        defer self.freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    pub fn freeJson(self: *const BeamState, json_value: *json.Value, allocator: Allocator) void {
+        _ = self;
+        if (json_value.object.get("config")) |*config| {
+            BeamStateConfig.freeJson(@constCast(config), allocator);
+        }
+        if (json_value.object.get("latest_block_header")) |*header| {
+            BeamBlockHeader.freeJson(@constCast(header), allocator);
+        }
+        if (json_value.object.get("latest_justified")) |*justified| {
+            Checkpoint.freeJson(@constCast(justified), allocator);
+        }
+        if (json_value.object.get("latest_finalized")) |*finalized| {
+            Checkpoint.freeJson(@constCast(finalized), allocator);
+        }
+        if (json_value.object.get("historical_block_hashes")) |*hashes| {
+            for (hashes.array.items) |*hash| {
+                allocator.free(hash.string);
+            }
+            hashes.array.deinit();
+        }
+        if (json_value.object.get("justified_slots")) |*slots| {
+            slots.array.deinit();
+        }
+        if (json_value.object.get("justifications_roots")) |*roots| {
+            for (roots.array.items) |*root| {
+                allocator.free(root.string);
+            }
+            roots.array.deinit();
+        }
+        if (json_value.object.get("justifications_validators")) |*validators_bits| {
+            validators_bits.array.deinit();
+        }
+        if (json_value.object.get("validators")) |*validators| {
+            for (validators.array.items) |*val| {
+                validator.Validator.freeJson(@constCast(val), allocator);
+            }
+            validators.array.deinit();
+        }
+        json_value.object.deinit();
     }
 };
 
 test "ssz seralize/deserialize signed beam state" {
-    const config = BeamStateConfig{ .num_validators = 4, .genesis_time = 93 };
+    const config = BeamStateConfig{ .genesis_time = 93 };
     const genesis_root = [_]u8{9} ** 32;
 
     var state = BeamState{
