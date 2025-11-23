@@ -7,7 +7,7 @@ const mini_3sf = @import("./mini_3sf.zig");
 const utils = @import("./utils.zig");
 
 const Allocator = std.mem.Allocator;
-const Bytes4000 = utils.Bytes4000;
+const SIGBYTES = utils.SIGBYTES;
 const Checkpoint = mini_3sf.Checkpoint;
 const Root = utils.Root;
 const Slot = utils.Slot;
@@ -38,7 +38,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
-pub const AggregatedSignatures = ssz.utils.List(Bytes4000, params.VALIDATOR_REGISTRY_LIMIT);
+pub const AggregatedSignatures = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const AttestationData = struct {
     slot: Slot,
@@ -82,7 +82,7 @@ pub const Attestation = struct {
 
 pub const SignedAttestation = struct {
     message: Attestation,
-    signature: Bytes4000,
+    signature: SIGBYTES,
 
     pub fn toJson(self: *const SignedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);

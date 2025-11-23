@@ -20,7 +20,7 @@ test "XMSS full cycle: generate, sign, verify" {
     defer signature.deinit();
 
     // Serialize signature
-    var sig_buffer: types.Bytes4000 = undefined;
+    var sig_buffer: types.SIGBYTES = undefined;
     const sig_size = try signature.toBytes(&sig_buffer);
     std.debug.print("\nSignature size: {d} bytes\n", .{sig_size});
 
