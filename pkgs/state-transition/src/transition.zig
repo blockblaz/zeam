@@ -92,7 +92,7 @@ pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,
     attestation: *const types.Attestation,
-    signatureBytes: *const types.Bytes4000,
+    signatureBytes: *const types.SIGBYTES,
 ) !void {
     const validatorIndex: usize = @intCast(attestation.validator_id);
     const validators = state.validators.constSlice();

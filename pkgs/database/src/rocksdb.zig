@@ -924,11 +924,11 @@ test "save and load block" {
     const test_block_root = test_helpers.createDummyRoot(0xAB);
 
     // Create test signatures
-    var test_sig1: types.Bytes4000 = undefined;
+    var test_sig1: types.SIGBYTES = undefined;
     @memset(&test_sig1, 0x12);
-    var test_sig2: types.Bytes4000 = undefined;
+    var test_sig2: types.SIGBYTES = undefined;
     @memset(&test_sig2, 0x34);
-    const test_signatures = [_]types.Bytes4000{ test_sig1, test_sig2 };
+    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2 };
 
     var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, &test_signatures);
     defer signed_block.deinit();
@@ -1029,13 +1029,13 @@ test "batch write and commit" {
     const test_block_root = test_helpers.createDummyRoot(0xAA);
 
     // Create test signatures
-    var test_sig1: types.Bytes4000 = undefined;
+    var test_sig1: types.SIGBYTES = undefined;
     @memset(&test_sig1, 0xDD);
-    var test_sig2: types.Bytes4000 = undefined;
+    var test_sig2: types.SIGBYTES = undefined;
     @memset(&test_sig2, 0xEE);
-    var test_sig3: types.Bytes4000 = undefined;
+    var test_sig3: types.SIGBYTES = undefined;
     @memset(&test_sig3, 0xFF);
-    const test_signatures = [_]types.Bytes4000{ test_sig1, test_sig2, test_sig3 };
+    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2, test_sig3 };
 
     var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, &test_signatures);
     defer signed_block.deinit();
