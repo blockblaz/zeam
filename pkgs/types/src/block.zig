@@ -410,10 +410,10 @@ test "blockToLatestBlockHeader and blockToHeader" {
 
 test "encode decode signed block with attestation roundtrip" {
     var attestations = try Attestations.init(std.testing.allocator);
-    defer attestations.deinit();
+    errdefer attestations.deinit();
 
     var signatures = try BlockSignatures.init(std.testing.allocator);
-    defer signatures.deinit();
+    errdefer signatures.deinit();
 
     var signed_block_with_attestation = SignedBlockWithAttestation{
         .message = .{
