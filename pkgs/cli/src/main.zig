@@ -483,7 +483,7 @@ fn mainInner() !void {
                 .metrics_port = leancmd.metrics_port,
                 .bootnodes = undefined,
                 .genesis_spec = undefined,
-                .validator_indices = undefined,
+                .validator_assignments = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",

@@ -8,8 +8,9 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-pub type HashSigScheme =
-    hashsig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
+use hashsig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
+
+pub type HashSigScheme = SIGTopLevelTargetSumLifetime32Dim64Base8;
 pub type HashSigPrivateKey = <HashSigScheme as SignatureScheme>::SecretKey;
 pub type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
 pub type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
@@ -158,6 +159,49 @@ pub unsafe extern "C" fn hashsig_keypair_from_json(
                 return ptr::null_mut();
             }
         };
+
+        let keypair = Box::new(KeyPair {
+            public_key: PublicKey::new(public_key),
+            private_key: PrivateKey::new(private_key),
+        });
+
+        Box::into_raw(keypair)
+    }
+}
+
+/// Reconstruct a key pair from JSON-serialized secret key and bincode-serialized public key bytes
+/// Returns a pointer to the KeyPair or null on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_keypair_from_json_sk_bincode_pk(
+    secret_key_ptr: *const u8,
+    secret_key_len: usize,
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+) -> *mut KeyPair {
+    if secret_key_ptr.is_null() || public_key_ptr.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let sk_slice = slice::from_raw_parts(secret_key_ptr, secret_key_len);
+        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
+
+        let private_key: HashSigPrivateKey = match serde_json::from_slice(sk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let public_key: HashSigPublicKey =
+            match bincode::serde::decode_from_slice(pk_slice, BINCODE_CONFIG) {
+                Ok((pk, _)) => pk,
+                Err(_) => {
+                    return ptr::null_mut();
+                }
+            };
 
         let keypair = Box::new(KeyPair {
             public_key: PublicKey::new(public_key),

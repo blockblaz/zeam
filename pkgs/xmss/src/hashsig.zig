@@ -22,6 +22,14 @@ extern fn hashsig_keypair_from_json(
     public_key_len: usize,
 ) ?*HashSigKeyPair;
 
+/// Reconstruct a key pair from JSON secret key and bincode public key bytes
+extern fn hashsig_keypair_from_json_sk_bincode_pk(
+    secret_key_json: [*]const u8,
+    secret_key_len: usize,
+    public_key_bytes: [*]const u8,
+    public_key_len: usize,
+) ?*HashSigKeyPair;
+
 /// Free a key pair
 extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
 
@@ -149,6 +157,31 @@ pub const KeyPair = struct {
             secret_key_json.len,
             public_key_json.ptr,
             public_key_json.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
+        };
+
+        return Self{
+            .handle = handle,
+            .allocator = allocator,
+        };
+    }
+
+    /// Reconstruct a key pair from JSON secret key and bincode public key bytes
+    pub fn fromJsonSkBincodePk(
+        allocator: Allocator,
+        secret_key_json: []const u8,
+        public_key_bytes: []const u8,
+    ) HashSigError!Self {
+        if (secret_key_json.len == 0 or public_key_bytes.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_keypair_from_json_sk_bincode_pk(
+            secret_key_json.ptr,
+            secret_key_json.len,
+            public_key_bytes.ptr,
+            public_key_bytes.len,
         ) orelse {
             return HashSigError.DeserializationFailed;
         };
