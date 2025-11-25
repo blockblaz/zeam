@@ -407,3 +407,77 @@ test "blockToLatestBlockHeader and blockToHeader" {
     try std.testing.expect(std.mem.eql(u8, &block.parent_root, &block_header.parent_root));
     try std.testing.expect(std.mem.eql(u8, &block.state_root, &block_header.state_root));
 }
+
+test "encode decode signed block with attestation roundtrip" {
+    var attestations = try Attestations.init(std.testing.allocator);
+    defer attestations.deinit();
+
+    var signatures = try BlockSignatures.init(std.testing.allocator);
+    defer signatures.deinit();
+
+    var signed_block_with_attestation = SignedBlockWithAttestation{
+        .message = .{
+            .block = .{
+                .slot = 0,
+                .proposer_index = 0,
+                .parent_root = ZERO_HASH,
+                .state_root = ZERO_HASH,
+                .body = .{
+                    .attestations = attestations,
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 0,
+                    .head = .{
+                        .root = ZERO_HASH,
+                        .slot = 0,
+                    },
+                    .target = .{
+                        .root = ZERO_HASH,
+                        .slot = 0,
+                    },
+                    .source = .{
+                        .root = ZERO_HASH,
+                        .slot = 0,
+                    },
+                },
+            },
+        },
+        .signature = signatures,
+    };
+    defer signed_block_with_attestation.deinit();
+
+    // Encode
+    var encoded = std.ArrayList(u8).init(std.testing.allocator);
+    defer encoded.deinit();
+    try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded);
+
+    // Convert to hex and compare with expected value
+    const expected_value = "08000000ec0000008c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005400000004000000";
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    defer std.testing.allocator.free(encoded_hex);
+    try std.testing.expectEqualStrings(expected_value, encoded_hex);
+
+    // Decode
+    var decoded: SignedBlockWithAttestation = undefined;
+    try ssz.deserialize(SignedBlockWithAttestation, encoded.items[0..], &decoded, std.testing.allocator);
+    defer decoded.deinit();
+
+    // Verify roundtrip
+    try std.testing.expect(decoded.message.block.slot == signed_block_with_attestation.message.block.slot);
+    try std.testing.expect(decoded.message.block.proposer_index == signed_block_with_attestation.message.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.block.parent_root, &signed_block_with_attestation.message.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.block.state_root, &signed_block_with_attestation.message.block.state_root));
+    try std.testing.expect(decoded.message.proposer_attestation.validator_id == signed_block_with_attestation.message.proposer_attestation.validator_id);
+    try std.testing.expect(decoded.message.proposer_attestation.data.slot == signed_block_with_attestation.message.proposer_attestation.data.slot);
+    try std.testing.expect(decoded.message.proposer_attestation.data.head.slot == signed_block_with_attestation.message.proposer_attestation.data.head.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.proposer_attestation.data.head.root, &signed_block_with_attestation.message.proposer_attestation.data.head.root));
+    try std.testing.expect(decoded.message.proposer_attestation.data.target.slot == signed_block_with_attestation.message.proposer_attestation.data.target.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.proposer_attestation.data.target.root, &signed_block_with_attestation.message.proposer_attestation.data.target.root));
+    try std.testing.expect(decoded.message.proposer_attestation.data.source.slot == signed_block_with_attestation.message.proposer_attestation.data.source.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.proposer_attestation.data.source.root, &signed_block_with_attestation.message.proposer_attestation.data.source.root));
+    try std.testing.expect(decoded.signature.len() == signed_block_with_attestation.signature.len());
+    try std.testing.expect(decoded.message.block.body.attestations.len() == signed_block_with_attestation.message.block.body.attestations.len());
+}

@@ -636,3 +636,66 @@ test "ssz seralize/deserialize signed beam state" {
         std.testing.allocator,
     );
 }
+
+test "encode decode state roundtrip" {
+    const block_header = BeamBlockHeader{
+        .slot = 0,
+        .proposer_index = 0,
+        .parent_root = utils.ZERO_HASH,
+        .state_root = utils.ZERO_HASH,
+        .body_root = utils.ZERO_HASH,
+    };
+
+    const temp_finalized = Checkpoint{ .root = utils.ZERO_HASH, .slot = 0 };
+
+    var state = BeamState{
+        .config = BeamStateConfig{ .genesis_time = 1000 },
+        .slot = 0,
+        .latest_block_header = block_header,
+        .latest_justified = temp_finalized,
+        .latest_finalized = temp_finalized,
+        .historical_block_hashes = try HistoricalBlockHashes.init(std.testing.allocator),
+        .justified_slots = try JustifiedSlots.init(std.testing.allocator),
+        .justifications_roots = try JustificationRoots.init(std.testing.allocator),
+        .justifications_validators = try JustificationValidators.init(std.testing.allocator),
+        .validators = try Validators.init(std.testing.allocator),
+    };
+    defer state.deinit();
+
+    // Encode
+    var encoded = std.ArrayList(u8).init(std.testing.allocator);
+    defer encoded.deinit();
+    try ssz.serialize(BeamState, state, &encoded);
+
+    // Convert to hex and compare with expected value
+    const expected_value = "e8030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e4000000e4000000e5000000e5000000e50000000101";
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    defer std.testing.allocator.free(encoded_hex);
+    try std.testing.expectEqualStrings(expected_value, encoded_hex);
+
+    // Decode
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+
+    var decoded: BeamState = undefined;
+    try ssz.deserialize(BeamState, encoded.items[0..], &decoded, arena_allocator.allocator());
+    defer decoded.deinit();
+
+    // Verify roundtrip
+    try std.testing.expect(decoded.config.genesis_time == state.config.genesis_time);
+    try std.testing.expect(decoded.slot == state.slot);
+    try std.testing.expect(decoded.latest_block_header.slot == state.latest_block_header.slot);
+    try std.testing.expect(decoded.latest_block_header.proposer_index == state.latest_block_header.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &decoded.latest_block_header.parent_root, &state.latest_block_header.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &decoded.latest_block_header.state_root, &state.latest_block_header.state_root));
+    try std.testing.expect(std.mem.eql(u8, &decoded.latest_block_header.body_root, &state.latest_block_header.body_root));
+    try std.testing.expect(decoded.latest_justified.slot == state.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.latest_justified.root, &state.latest_justified.root));
+    try std.testing.expect(decoded.latest_finalized.slot == state.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.latest_finalized.root, &state.latest_finalized.root));
+    try std.testing.expect(decoded.historical_block_hashes.len() == state.historical_block_hashes.len());
+    try std.testing.expect(decoded.justified_slots.len() == state.justified_slots.len());
+    try std.testing.expect(decoded.justifications_roots.len() == state.justifications_roots.len());
+    try std.testing.expect(decoded.justifications_validators.len() == state.justifications_validators.len());
+    try std.testing.expect(decoded.validators.len() == state.validators.len());
+}

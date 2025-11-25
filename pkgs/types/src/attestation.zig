@@ -12,6 +12,8 @@ const Checkpoint = mini_3sf.Checkpoint;
 const Root = utils.Root;
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
+const ZERO_HASH = utils.ZERO_HASH;
+const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
@@ -147,3 +149,58 @@ pub const SignedAggregatedAttestation = struct {
         return utils.jsonToString(allocator, json_value);
     }
 };
+
+test "encode decode signed attestation roundtrip" {
+    const signed_attestation = SignedAttestation{
+        .message = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 0,
+                .head = .{
+                    .root = ZERO_HASH,
+                    .slot = 0,
+                },
+                .target = .{
+                    .root = ZERO_HASH,
+                    .slot = 0,
+                },
+                .source = .{
+                    .root = ZERO_HASH,
+                    .slot = 0,
+                },
+            },
+        },
+        .signature = ZERO_SIGBYTES,
+    };
+
+    // Encode
+    var encoded = std.ArrayList(u8).init(std.testing.allocator);
+    defer encoded.deinit();
+    try ssz.serialize(SignedAttestation, signed_attestation, &encoded);
+
+    // Convert to hex and compare with expected value
+    // Expected value is "0" * 6504 (6504 hex characters = 3252 bytes)
+    const expected_hex_len = 6504;
+    const expected_value = try std.testing.allocator.alloc(u8, expected_hex_len);
+    defer std.testing.allocator.free(expected_value);
+    @memset(expected_value, '0');
+
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    defer std.testing.allocator.free(encoded_hex);
+    try std.testing.expectEqualStrings(expected_value, encoded_hex);
+
+    // Decode
+    var decoded: SignedAttestation = undefined;
+    try ssz.deserialize(SignedAttestation, encoded.items[0..], &decoded, std.testing.allocator);
+
+    // Verify roundtrip
+    try std.testing.expect(decoded.message.validator_id == signed_attestation.message.validator_id);
+    try std.testing.expect(decoded.message.data.slot == signed_attestation.message.data.slot);
+    try std.testing.expect(decoded.message.data.head.slot == signed_attestation.message.data.head.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.head.root, &signed_attestation.message.data.head.root));
+    try std.testing.expect(decoded.message.data.target.slot == signed_attestation.message.data.target.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.target.root, &signed_attestation.message.data.target.root));
+    try std.testing.expect(decoded.message.data.source.slot == signed_attestation.message.data.source.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.source.root, &signed_attestation.message.data.source.root));
+    try std.testing.expect(std.mem.eql(u8, &decoded.signature, &signed_attestation.signature));
+}
