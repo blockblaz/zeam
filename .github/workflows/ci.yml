@@ -389,13 +389,18 @@ jobs:
     - name: Run the dummy prover
       run: zig build run -Dprover=dummy -- prove --zkvm dummy
 
-  docker-build:
-    name: docker-build
+  docker-build-binaries:
+    name: docker-build-binaries
     needs: [lint, build, test, build-all-provers]
     strategy:
       matrix:
-        builder: [ubuntu-latest, ubuntu-22.04-arm]
-    runs-on: ${{ matrix.builder }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -445,18 +450,64 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-docker-${{ steps.cargo-lock-hash.outputs.hash }}
 
-    - name: Build zeam natively
+    - name: Build zeam natively for ${{ matrix.arch }}
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Upload binary artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: zeam-binaries-${{ matrix.arch }}
+        path: zig-out/
+        retention-days: 1
+
+  docker-build:
+    name: docker-build
+    needs: docker-build-binaries
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build Docker image with pre-built binary
+    - name: Download binaries for ${{ matrix.arch }}
+      uses: actions/download-artifact@v4
+      with:
+        name: zeam-binaries-${{ matrix.arch }}
+        path: zig-out/
+
+    - name: Build Docker image for ${{ matrix.arch }}
       uses: docker/build-push-action@v5
       with:
         context: .
         file: ./Dockerfile.prebuilt
+        platforms: linux/${{ matrix.arch }}
         push: false  # Don't push, just build to verify
-        tags: zeam:ci-${{ github.run_number }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        tags: |
+          zeam:ci-${{ github.run_number }}-${{ matrix.arch }}
+          zeam:ci-${{ matrix.arch }}
+        build-args: |
+          TARGETARCH=${{ matrix.arch }}
+        cache-from: type=gha,scope=${{ matrix.arch }}
+        cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  docker-create-manifest:
+    name: docker-create-manifest
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Create multi-arch manifest
+      run: |
+        docker buildx imagetools create \
+          --tag zeam:ci-${{ github.run_number }} \
+          --tag zeam:ci \
+          zeam:ci-${{ github.run_number }}-amd64 \
+          zeam:ci-${{ github.run_number }}-arm64
