@@ -1,10 +1,16 @@
 const std = @import("std");
 const ssz = @import("ssz");
+
 const params = @import("@zeam/params");
+
+const attestation = @import("./attestation.zig");
 const utils = @import("./utils.zig");
 
+const Attestation = attestation.Attestation;
+const AttestationData = attestation.AttestationData;
 const Allocator = std.mem.Allocator;
 const Bytes52 = utils.Bytes52;
+const ValidatorIndex = utils.ValidatorIndex;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
@@ -14,18 +20,29 @@ pub const Validators = ssz.utils.List(Validator, params.VALIDATOR_REGISTRY_LIMIT
 
 pub const Validator = struct {
     pubkey: Bytes52,
+    index: ValidatorIndex = 0,
 
-    pub fn toJson(self: *const Validator, allocator: Allocator) !json.Value {
+    const Self = @This();
+
+    pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("pubkey", json.Value{ .string = try bytesToHex(allocator, &self.pubkey) });
+        try obj.put("index", json.Value{ .integer = @as(i64, @intCast(self.index)) });
         return json.Value{ .object = obj };
     }
 
-    pub fn getPubkey(self: *const Validator) []const u8 {
+    pub fn getPubkey(self: *const Self) []const u8 {
         return &self.pubkey;
     }
 
-    pub fn toJsonString(self: *const Validator, allocator: Allocator) ![]const u8 {
+    pub fn produceAttestation(self: *const Self, data: AttestationData) Attestation {
+        return Attestation{
+            .data = data,
+            .validator_id = self.index,
+        };
+    }
+
+    pub fn toJsonString(self: *const Self, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
         defer freeJson(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
@@ -33,6 +50,7 @@ pub const Validator = struct {
 
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("pubkey").?.string);
+        allocator.free(val.object.get("index").?.string);
         val.object.deinit();
     }
 };
