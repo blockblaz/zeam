@@ -581,12 +581,26 @@ fn processBlockStep(
     step_index: usize,
     step_obj: std.json.ObjectMap,
 ) !void {
-    const block_value = step_obj.get("block") orelse {
+    const block_wrapper = step_obj.get("block") orelse {
         std.debug.print(
             "fixture {s} case {s}{}: block step missing block field\n",
             .{ fixture_path, case_name, formatStep(step_index) },
         );
         return FixtureError.InvalidFixture;
+    };
+
+    // Handle new nested format where block data is under block.block
+    const block_value = blk: {
+        const wrapper_obj = switch (block_wrapper) {
+            .object => |map| map,
+            else => break :blk block_wrapper, // Fall back to old format
+        };
+        // Check if there's a nested "block" field (new format)
+        if (wrapper_obj.get("block")) |nested_block| {
+            break :blk nested_block;
+        }
+        // Otherwise use the wrapper itself (old format where block fields are directly in block_wrapper)
+        break :blk block_wrapper;
     };
 
     var block = try buildBlock(ctx.allocator, fixture_path, case_name, block_value, step_index);
