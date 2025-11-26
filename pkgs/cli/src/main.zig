@@ -211,7 +211,7 @@ fn mainInner() !void {
         \\  custom_genesis: {s}
         \\  data-dir: {s}
         \\
-        ,
+    ,
         .{
             genesis,
             log_filename,

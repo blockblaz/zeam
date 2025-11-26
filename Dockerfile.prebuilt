@@ -49,7 +49,7 @@ RUN mkdir -p /runtime-libs && \
         *) \
             # Fallback to ldd for unknown architectures
             for lib in `ldd /app/zig-out/bin/zeam 2>/dev/null | grep -oP '(\/lib[^\s]+)' || true`; do \
-                [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
+        [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
             done && \
             exit 0 \
             ;; \
