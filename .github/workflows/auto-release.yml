@@ -13,10 +13,66 @@ permissions:
   contents: write
 
 jobs:
+  build-binaries:
+    # Only run if PR was merged to release branch (not just closed)
+    if: github.event.pull_request.merged == true
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            zig-target: native
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            zig-target: native
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build zeam for ${{ matrix.arch }}
+      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Upload binary artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: zeam-binaries-${{ matrix.arch }}
+        path: zig-out/
+        retention-days: 1
+
   auto-release:
     # Only run if PR was merged to release branch (not just closed)
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    needs: build-binaries
 
     steps:
     - name: Checkout code
@@ -92,32 +148,23 @@ jobs:
           type=raw,value=${{ steps.get_tags_labels.outputs.version }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true'  && steps.get_tags_labels.outputs.version != 'null' }}
           type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true' && steps.get_tags_labels.outputs.has_network_tag }}
 
-    - name: Set up Zig
-      uses: mlugg/setup-zig@v2.0.5
-      with:
-        version: 0.14.1
+    - name: Save metadata outputs
+      run: |
+        echo "tags=${{ steps.meta.outputs.tags }}" >> $GITHUB_OUTPUT
+        echo "labels=${{ steps.meta.outputs.labels }}" >> $GITHUB_OUTPUT
+      id: save_meta
 
-    - name: Set up Rust/Cargo
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Download amd64 binaries
+      uses: actions/download-artifact@v4
       with:
-        toolchain: nightly
+        name: zeam-binaries-amd64
+        path: zig-out-amd64/
 
-    - name: Cache Zig packages
-      uses: actions/cache@v3
+    - name: Download arm64 binaries
+      uses: actions/download-artifact@v4
       with:
-        path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
-        restore-keys: |
-          ${{ runner.os }}-zig-packages-
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Build zeam natively
-      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+        name: zeam-binaries-arm64
+        path: zig-out-arm64/
 
     - name: Create and push git tags
       id: create_tags
@@ -187,14 +234,80 @@ jobs:
 
     # Only createa a Github tag, not a release at this point
 
-    - name: Build and push Docker image with pre-built binary
+  build-docker-images:
+    # Only run if PR was merged to release branch (not just closed)
+    if: github.event.pull_request.merged == true
+    needs: [auto-release, build-binaries]
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Download binaries for ${{ matrix.arch }}
+      uses: actions/download-artifact@v4
+      with:
+        name: zeam-binaries-${{ matrix.arch }}
+        path: zig-out/
+
+    - name: Extract tags from PR labels
+      id: get_tags_labels
+      run: |
+        # Get PR labels and extract version
+        LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+        echo "PR Labels: $LABELS"
+
+        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.)
+        VERSION=$(echo $LABELS | jq -r '.[] | select(test("^(v|version:)?[0-9]+\\.[0-9]+\\.[0-9]+")) | gsub("^(v|version:)"; "")' | head -n 1)
+
+        # Look for zeam network tags (devnet0, devnet1, testnet, mainnet)
+        ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))'| head -n 1)
+
+        if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        fi
+
+        if [ -n "$ZEAM_TAG" ] && [ "$ZEAM_TAG" != "null" ]; then
+          echo "zeam_tag=$ZEAM_TAG" >> $GITHUB_OUTPUT
+          echo "has_network_tag=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_network_tag=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest
+          type=raw,value=${{ steps.get_tags_labels.outputs.version }},enable=${{ steps.get_tags_labels.outputs.version != '' && steps.get_tags_labels.outputs.version != 'null' }}
+          type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.has_network_tag == 'true' }}
+
+    - name: Build and push Docker image for ${{ matrix.arch }}
       uses: docker/build-push-action@v5
       with:
         context: .
         file: ./Dockerfile.prebuilt
-        platforms: linux/amd64
+        platforms: linux/${{ matrix.arch }}
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          TARGETARCH=${{ matrix.arch }}
         cache-from: type=gha
         cache-to: type=gha,mode=max

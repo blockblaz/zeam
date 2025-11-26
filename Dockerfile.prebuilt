@@ -25,9 +25,45 @@ COPY resources/ /app/resources/
 
 # Create a script to copy the right libraries based on architecture
 RUN mkdir -p /runtime-libs && \
-    for lib in `ldd /app/zig-out/bin/zeam | grep -oP '(\/lib[^\s]+)'`; do \
-        [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
-    done;
+    case "$TARGETARCH" in \
+        amd64) \
+            LIBDIR="x86_64-linux-gnu" && \
+            LDSO="/lib64/ld-linux-x86-64.so.2" \
+            ;; \
+        arm64) \
+            LIBDIR="aarch64-linux-gnu" && \
+            LDSO="/lib/ld-linux-aarch64.so.1" \
+            ;; \
+        arm) \
+            LIBDIR="arm-linux-gnueabihf" && \
+            LDSO="/lib/ld-linux-armhf.so.3" \
+            ;; \
+        386) \
+            LIBDIR="i386-linux-gnu" && \
+            LDSO="/lib/ld-linux.so.2" \
+            ;; \
+        riscv64) \
+            LIBDIR="riscv64-linux-gnu" && \
+            LDSO="/lib/ld-linux-riscv64-lp64d.so.1" \
+            ;; \
+        *) \
+            # Fallback to ldd for unknown architectures
+            for lib in `ldd /app/zig-out/bin/zeam 2>/dev/null | grep -oP '(\/lib[^\s]+)' || true`; do \
+                [ -f $lib ] && cp --parents -L $lib /runtime-libs/ || true; \
+            done && \
+            exit 0 \
+            ;; \
+    esac && \
+    if [ -d "/lib/$LIBDIR" ]; then \
+        mkdir -p "/runtime-libs/lib/$LIBDIR" && \
+        for lib in libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libgcc_s.so.1 libstdc++.so.6; do \
+            [ -f "/lib/$LIBDIR/$lib" ] && cp -L "/lib/$LIBDIR/$lib" "/runtime-libs/lib/$LIBDIR/" || true; \
+        done; \
+    fi && \
+    if [ -f "$LDSO" ]; then \
+        mkdir -p "/runtime-libs$(dirname $LDSO)" && \
+        cp -L "$LDSO" "/runtime-libs$LDSO"; \
+    fi
 
 # Runtime stage - using scratch for minimal size
 FROM scratch AS runtime
