@@ -337,18 +337,23 @@ pub const BeamNode = struct {
         try self.network.connectPeer(peer_id);
         self.logger.info("Peer connected: {s}, total peers: {d}", .{ peer_id, self.network.getPeerCount() });
 
-        const handler = self.getReqRespResponseHandler();
-        const status = self.chain.getStatus();
-
-        const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("Failed to send status request to peer {s}: {any}", .{ peer_id, err });
-            return;
-        };
-
-        self.logger.info(
-            "Sent status request to peer {s}: request_id={d}, head_slot={d}, finalized_slot={d}",
-            .{ peer_id, request_id, status.head_slot, status.finalized_slot },
-        );
+        // TODO(devnet2): Re-enable outbound status req/resp once the status
+        // handshake is stable across clients (ream/zeam compatibility). For
+        // devnet1 we still respond to inbound status requests but do not
+        // initiate them on connect to avoid interoperability issues.
+        //
+        // const handler = self.getReqRespResponseHandler();
+        // const status = self.chain.getStatus();
+        //
+        // const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
+        //     self.logger.warn("Failed to send status request to peer {s}: {any}", .{ peer_id, err });
+        //     return;
+        // };
+        //
+        // self.logger.info(
+        //     "Sent status request to peer {s}: request_id={d}, head_slot={d}, finalized_slot={d}",
+        //     .{ peer_id, request_id, status.head_slot, status.finalized_slot },
+        // );
     }
 
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
