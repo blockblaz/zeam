@@ -197,7 +197,34 @@ fn mainInner() !void {
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+    // Human-readable startup log instead of raw struct/byte dump
+    std.debug.print(
+        \\Zeam starting with:
+        \\  genesis: {d}
+        \\  log_filename: {s}
+        \\  log_file_active_level: {s}
+        \\  monocolor_file_log: {any}
+        \\  console_log_level: {s}
+        \\  command: {s}
+        \\  node-id: {s}
+        \\  validator_config: {s}
+        \\  custom_genesis: {s}
+        \\  data-dir: {s}
+        \\
+        ,
+        .{
+            genesis,
+            log_filename,
+            @tagName(log_file_active_level),
+            monocolor_file_log,
+            @tagName(console_log_level),
+            @tagName(opts.args.__commands__),
+            if (opts.args.__commands__ == .node) opts.args.__commands__.node.@"node-id" else "n/a",
+            if (opts.args.__commands__ == .node) opts.args.__commands__.node.validator_config else "n/a",
+            if (opts.args.__commands__ == .node) opts.args.__commands__.node.custom_genesis else "n/a",
+            if (opts.args.__commands__ == .node) opts.args.__commands__.node.@"data-dir" else "n/a",
+        },
+    );
 
     switch (opts.args.__commands__) {
         .clock => {
