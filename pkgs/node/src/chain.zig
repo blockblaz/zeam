@@ -341,7 +341,12 @@ pub const BeamChain = struct {
                         return; // Drop invalid gossip attestations
                     };
                     const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
-                        self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                        self.module_logger.err(" error processing block for slot={any} root={any}: {any}", .{
+                            //
+                            block.slot,
+                            std.fmt.fmtSliceHexLower(&block_root),
+                            err,
+                        });
                         return;
                     };
                     defer self.allocator.free(missing_roots);
@@ -370,7 +375,7 @@ pub const BeamChain = struct {
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
-                    self.module_logger.debug("attestation processing error: {any}", .{err});
+                    self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
             },
