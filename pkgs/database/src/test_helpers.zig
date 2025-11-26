@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.Bytes4000) !types.SignedBlockWithAttestation {
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.SIGBYTES) !types.SignedBlockWithAttestation {
     var test_block = types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,

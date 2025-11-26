@@ -17,15 +17,15 @@ pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
-pub const SIGSIZE = 4000;
-pub const Bytes4000 = [SIGSIZE]u8;
+pub const SIGSIZE = 3116;
+pub const SIGBYTES = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
 // zig treats string as byte sequence so hex is 64 bytes string
 pub const RootHex = [64]u8;
 
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
-pub const ZERO_HASH_4000 = [_]u8{0} ** SIGSIZE;
+pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 
 pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex };
 

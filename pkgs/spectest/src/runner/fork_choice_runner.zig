@@ -666,7 +666,7 @@ fn processBlockStep(
 
     const signed_attestation = types.SignedAttestation{
         .message = proposer_attestation,
-        .signature = types.ZERO_HASH_4000,
+        .signature = types.ZERO_SIGBYTES,
     };
     try ctx.fork_choice.onAttestation(signed_attestation, false);
 }

@@ -341,6 +341,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
+    cli_exe.linkLibCpp(); // for rocksdb C++ library to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
 
     b.installArtifact(cli_exe);
