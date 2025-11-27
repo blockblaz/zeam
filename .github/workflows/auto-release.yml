@@ -209,9 +209,9 @@ jobs:
     - name: Build zeam natively
       run: |
         if [ "${{ matrix.arch }}" = "amd64" ]; then
-          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
         else
-          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
         fi
 
     - name: Build and push Docker image with pre-built binary (${{ matrix.arch }})
