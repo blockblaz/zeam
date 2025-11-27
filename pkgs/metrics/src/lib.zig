@@ -40,11 +40,8 @@ const Metrics = struct {
     lean_state_transition_attestations_processed_total: AttestationsProcessedCounter,
     lean_state_transition_attestations_processing_time_seconds: AttestationsProcessingHistogram,
     lean_fork_choice_block_processing_time_seconds: ForkChoiceBlockProcessingTimeHistogram,
-    lean_attestations_valid_total: ForkChoiceAttestationsValidCounter,
-    lean_attestations_invalid_total: ForkChoiceAttestationsInvalidCounter,
-    lean_attestations_invalid_from_future_gossip: ForkChoiceAttestationsInvalidCounterFromFutureGossip,
-    lean_attestations_invalid_unknown_head_gossip: ForkChoiceAttestationsInvalidCounterUnknownHeadGossip,
-    lean_attestations_invalid_unknown_head_block: ForkChoiceAttestationsInvalidCounterUnknownHeadBlock,
+    lean_attestations_valid_total: ForkChoiceAttestationsValidLabeledCounter,
+    lean_attestations_invalid_total: ForkChoiceAttestationsInvalidLabeledCounter,
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -59,11 +56,8 @@ const Metrics = struct {
     const SlotsProcessedCounter = metrics_lib.Counter(u64);
     const AttestationsProcessedCounter = metrics_lib.Counter(u64);
     const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
-    const ForkChoiceAttestationsValidCounter = metrics_lib.Counter(u64);
-    const ForkChoiceAttestationsInvalidCounter = metrics_lib.Counter(u64);
-    const ForkChoiceAttestationsInvalidCounterFromFutureGossip = metrics_lib.Counter(u64);
-    const ForkChoiceAttestationsInvalidCounterUnknownHeadGossip = metrics_lib.Counter(u64);
-    const ForkChoiceAttestationsInvalidCounterUnknownHeadBlock = metrics_lib.Counter(u64);
+    const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
+    const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
 };
 
@@ -157,18 +151,25 @@ pub const AttestationInvalidReason = enum {
     /// The block root referenced by the attestation is unknown during block validation
     unknown_head_block,
 };
-/// Increments the lean_attestations_invalid_total counter based on the provided reason.
-/// This function increments both the aggregate counter and the specific counter for the given reason.
-pub fn incrementLeanAttestationsInvalid(reason: AttestationInvalidReason) void {
-    // Increment the aggregate counter
-    metrics.lean_attestations_invalid_total.incr();
 
-    // Increment the specific counter based on the reason
-    switch (reason) {
-        .from_future_gossip => metrics.lean_attestations_invalid_from_future_gossip.incr(),
-        .unknown_head_gossip => metrics.lean_attestations_invalid_unknown_head_gossip.incr(),
-        .unknown_head_block => metrics.lean_attestations_invalid_unknown_head_block.incr(),
-    }
+/// Increments the lean_attestations_valid_total counter with appropriate label
+pub fn incrementLeanAttestationsValid(is_from_block: bool) void {
+    if (!g_initialized or isZKVM()) return;
+
+    const source_label = if (is_from_block) "block" else "gossip";
+    metrics.lean_attestations_valid_total.incr(.{ .source = source_label }) catch |err| {
+        std.log.warn("Failed to increment valid attestations metric: {any}", .{err});
+    };
+}
+
+/// Updated function to handle labeled invalid attestations
+pub fn incrementLeanAttestationsInvalid(is_from_block: bool) void {
+    if (!g_initialized or isZKVM()) return;
+
+    const source_label = if (is_from_block) "block" else "gossip";
+    metrics.lean_attestations_invalid_total.incr(.{ .source = source_label }) catch |err| {
+        std.log.warn("Failed to increment invalid attestations metric: {any}", .{err});
+    };
 }
 
 /// The public variables the application interacts with.
@@ -209,7 +210,6 @@ pub var lean_attestation_validation_time_seconds: Histogram = .{
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
-    _ = allocator; // Not needed for basic histograms
     if (g_initialized) return;
 
     // For ZKVM targets, use no-op metrics
@@ -231,12 +231,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_block_processing_time_seconds = Metrics.BlockProcessingTimeHistogram.init("lean_state_transition_block_processing_time_seconds", .{ .help = "Time taken to process block." }, .{}),
         .lean_state_transition_attestations_processed_total = Metrics.AttestationsProcessedCounter.init("lean_state_transition_attestations_processed_total", .{ .help = "Total number of processed attestations." }, .{}),
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations." }, .{}),
-        .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block." }, .{}),
-        .lean_attestations_valid_total = Metrics.ForkChoiceAttestationsValidCounter.init("lean_attestations_valid_total", .{ .help = "Total number of valid attestations." }, .{}),
-        .lean_attestations_invalid_total = Metrics.ForkChoiceAttestationsInvalidCounter.init("lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations." }, .{}),
-        .lean_attestations_invalid_from_future_gossip = Metrics.ForkChoiceAttestationsInvalidCounterFromFutureGossip.init("lean_attestations_invalid_from_future_gossip", .{ .help = "Number of invalid attestations due to future slot during gossip processing." }, .{}),
-        .lean_attestations_invalid_unknown_head_gossip = Metrics.ForkChoiceAttestationsInvalidCounterUnknownHeadGossip.init("lean_attestations_invalid_unknown_head_gossip", .{ .help = "Number of invalid attestations due to unknown block root during gossip processing." }, .{}),
-        .lean_attestations_invalid_unknown_head_block = Metrics.ForkChoiceAttestationsInvalidCounterUnknownHeadBlock.init("lean_attestations_invalid_unknown_head_block", .{ .help = "Number of invalid attestations due to unknown block root during block processing." }, .{}),
+        .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block in fork choice." }, .{}),
+        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip or block)." }, .{}),
+        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip or block)." }, .{}),
+
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
     };
 
