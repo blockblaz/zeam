@@ -13,26 +13,21 @@ permissions:
   contents: write
 
 jobs:
-  auto-release:
+  create-tags:
     # Only run if PR was merged to release branch (not just closed)
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    outputs:
+      docker_only: ${{ steps.get_tags_labels.outputs.docker_only }}
+      version: ${{ steps.get_tags_labels.outputs.version }}
+      zeam_tag: ${{ steps.get_tags_labels.outputs.zeam_tag }}
+      has_network_tag: ${{ steps.get_tags_labels.outputs.has_network_tag }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Extract tags from PR labels
       id: get_tags_labels
@@ -81,43 +76,6 @@ jobs:
           echo "❌ No usable label found! Please add a version (e.g. v1.0.0), network tag (e.g. devnet0, testnet, mainnet), or 'docker only' label"
           exit 1
         fi
-
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-        tags: |
-          type=raw,value=latest
-          type=raw,value=${{ steps.get_tags_labels.outputs.version }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true'  && steps.get_tags_labels.outputs.version != 'null' }}
-          type=raw,value=${{ steps.get_tags_labels.outputs.zeam_tag }},enable=${{ steps.get_tags_labels.outputs.docker_only != 'true' && steps.get_tags_labels.outputs.has_network_tag }}
-
-    - name: Set up Zig
-      uses: mlugg/setup-zig@v2.0.5
-      with:
-        version: 0.14.1
-
-    - name: Set up Rust/Cargo
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: nightly
-
-    - name: Cache Zig packages
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
-        restore-keys: |
-          ${{ runner.os }}-zig-packages-
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Build zeam natively
-      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 
     - name: Create and push git tags
       id: create_tags
@@ -185,16 +143,115 @@ jobs:
         echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
         echo "✅ Primary tag for release: $PRIMARY_TAG"
 
-    # Only createa a Github tag, not a release at this point
+    # Only create a Github tag, not a release at this point
 
-    - name: Build and push Docker image with pre-built binary
+  build-and-push:
+    needs: create-tags
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest-${{ matrix.arch }}
+          type=raw,value=${{ needs.create-tags.outputs.version }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.version != 'null' }}
+          type=raw,value=${{ needs.create-tags.outputs.zeam_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.has_network_tag == 'true' }}
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build zeam natively
+      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+
+    - name: Build and push Docker image with pre-built binary (${{ matrix.arch }})
       uses: docker/build-push-action@v5
       with:
         context: .
         file: ./Dockerfile.prebuilt
-        platforms: linux/amd64
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+        provenance: false
+
+  create-manifest:
+    needs: [create-tags, build-and-push]
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Create and push multi-arch manifest for latest
+      run: |
+        docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-amd64 \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-arm64
+
+    - name: Create and push multi-arch manifest for version tag
+      if: ${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.version != 'null' }}
+      run: |
+        docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }} \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-amd64 \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-arm64
+
+    - name: Create and push multi-arch manifest for network tag
+      if: ${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.has_network_tag == 'true' }}
+      run: |
+        docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }} \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }}-amd64 \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }}-arm64
