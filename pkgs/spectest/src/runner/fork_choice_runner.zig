@@ -1169,7 +1169,7 @@ fn buildState(
                 const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
                 const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
 
-                validators.append(.{ .pubkey = pubkey }) catch |err| {
+                validators.append(.{ .pubkey = pubkey, .index = idx }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ fixture_path, case_name, idx, @errorName(err) },
