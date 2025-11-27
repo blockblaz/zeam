@@ -75,12 +75,12 @@ pub const BeamState = struct {
     }
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
-        var genesis_block: block.BeamBlock = undefined;
-        try genesis_block.genGenesisBlock(allocator);
-        defer genesis_block.deinit();
+        var empty_block: block.BeamBlock = undefined;
+        try empty_block.genEmptyBlock(allocator);
+        defer empty_block.deinit();
 
         var genesis_block_header: block.BeamBlockHeader = undefined;
-        try genesis_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
+        try empty_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
 
         var historical_block_hashes = try HistoricalBlockHashes.init(allocator);
         errdefer historical_block_hashes.deinit();
