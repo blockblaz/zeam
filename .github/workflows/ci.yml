@@ -24,21 +24,11 @@ jobs:
       with:
         version: 0.14.1
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -69,20 +59,10 @@ jobs:
         rustc --version
         cargo --version
 
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ runner.os }}-cargo-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check Rust formatting
       run: |
@@ -113,31 +93,11 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -145,7 +105,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -187,31 +147,11 @@ jobs:
         toolchain: nightly
         components: clippy, rustfmt
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -219,7 +159,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-all-provers-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -271,31 +211,11 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -303,7 +223,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -352,31 +272,11 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -384,7 +284,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run the dummy prover
       run: zig build run -Dprover=dummy -- prove --zkvm dummy
@@ -411,31 +311,11 @@ jobs:
       with:
         toolchain: nightly
 
-    - name: Get build.zig.zon hash
-      id: zig-zon-hash
-      run: |
-        if [ -f build.zig.zon ]; then
-          HASH=$(sha256sum build.zig.zon 2>/dev/null | cut -d' ' -f1 || shasum -a 256 build.zig.zon | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get Cargo.lock hash
-      id: cargo-lock-hash
-      run: |
-        if [ -f rust/Cargo.lock ]; then
-          HASH=$(sha256sum rust/Cargo.lock 2>/dev/null | cut -d' ' -f1 || shasum -a 256 rust/Cargo.lock | cut -d' ' -f1)
-          echo "hash=${HASH}" >> $GITHUB_OUTPUT
-        else
-          echo "hash=default" >> $GITHUB_OUTPUT
-        fi
-
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
 
@@ -443,7 +323,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ steps.cargo-lock-hash.outputs.hash }}
+        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build zeam natively
       run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
