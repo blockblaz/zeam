@@ -50,7 +50,6 @@ pub const Validator = struct {
 
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("pubkey").?.string);
-        allocator.free(val.object.get("index").?.string);
         val.object.deinit();
     }
 };
