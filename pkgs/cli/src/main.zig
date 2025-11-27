@@ -171,9 +171,9 @@ const ZeamArgs = struct {
             @tagName(self.console_log_level),
             @tagName(self.log_file_active_level),
         });
-        try writer.print(", command=");
+        try writer.writeAll(", command=");
         switch (self.__commands__) {
-            .clock => try writer.print("clock"),
+            .clock => try writer.writeAll("clock"),
             .beam => |cmd| try writer.print("beam(mockNetwork={}, metricsPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.metricsPort, cmd.data_dir }),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
@@ -181,7 +181,7 @@ const ZeamArgs = struct {
             },
             .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", metrics_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.metrics_port }),
         }
-        try writer.print(")");
+        try writer.writeAll(")");
     }
 };
 
