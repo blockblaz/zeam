@@ -107,4 +107,4 @@ or checkout the [lean-quickstart](https://github.com/blockblaz/lean-quickstart) 
 
 ### Reporting Issues
 
-Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH).
+Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH). 

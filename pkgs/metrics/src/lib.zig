@@ -39,6 +39,7 @@ const Metrics = struct {
     lean_state_transition_block_processing_time_seconds: BlockProcessingTimeHistogram,
     lean_state_transition_attestations_processed_total: AttestationsProcessedCounter,
     lean_state_transition_attestations_processing_time_seconds: AttestationsProcessingHistogram,
+    lean_validators_count: LeanValidatorsCountGauge,
     lean_fork_choice_block_processing_time_seconds: ForkChoiceBlockProcessingTimeHistogram,
     lean_attestations_valid_total: ForkChoiceAttestationsValidLabeledCounter,
     lean_attestations_invalid_total: ForkChoiceAttestationsInvalidLabeledCounter,
@@ -55,6 +56,7 @@ const Metrics = struct {
     const LeanLatestFinalizedSlotGauge = metrics_lib.Gauge(u64);
     const SlotsProcessedCounter = metrics_lib.Counter(u64);
     const AttestationsProcessedCounter = metrics_lib.Counter(u64);
+    const LeanValidatorsCountGauge = metrics_lib.Gauge(u64);
     const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
@@ -231,6 +233,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_block_processing_time_seconds = Metrics.BlockProcessingTimeHistogram.init("lean_state_transition_block_processing_time_seconds", .{ .help = "Time taken to process block." }, .{}),
         .lean_state_transition_attestations_processed_total = Metrics.AttestationsProcessedCounter.init("lean_state_transition_attestations_processed_total", .{ .help = "Total number of processed attestations." }, .{}),
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations." }, .{}),
+        .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of connected validators." }, .{}),
         .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block in fork choice." }, .{}),
         .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip or block)." }, .{}),
         .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip or block)." }, .{}),
