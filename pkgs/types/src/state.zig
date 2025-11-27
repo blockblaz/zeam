@@ -98,8 +98,8 @@ pub const BeamState = struct {
         errdefer validators.deinit();
 
         // Populate validators from genesis pubkeys
-        for (genesis.validator_pubkeys) |pubkey| {
-            const val = validator.Validator{ .pubkey = pubkey };
+        for (genesis.validator_pubkeys, 0..) |pubkey, i| {
+            const val = validator.Validator{ .pubkey = pubkey, .index = i };
             try validators.append(val);
         }
 
