@@ -20,7 +20,7 @@ pub const Validators = ssz.utils.List(Validator, params.VALIDATOR_REGISTRY_LIMIT
 
 pub const Validator = struct {
     pubkey: Bytes52,
-    index: ValidatorIndex = 0,
+    index: ValidatorIndex,
 
     const Self = @This();
 
