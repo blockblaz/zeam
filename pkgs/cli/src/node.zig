@@ -26,6 +26,8 @@ const zeam_utils = @import("@zeam/utils");
 const constants = @import("constants.zig");
 const database = @import("@zeam/database");
 const json = std.json;
+const utils = @import("@zeam/utils");
+const ssz = @import("ssz");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -726,35 +728,35 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
-// TODO: Enable and update this test - YAML parsing for public keys is now implemented, but test expectations may need adjustment
-// test "config yaml parsing" {
-//     var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
-//     defer config1.deinit(std.testing.allocator);
-//     const genesis_spec = try configs.genesisConfigFromYAML(config1, null);
-//     try std.testing.expectEqual(9, genesis_spec.num_validators);
-//     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
-//
-//     var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
-//     defer config2.deinit(std.testing.allocator);
-//     const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", config2);
-//     defer std.testing.allocator.free(validator_indices);
-//     try std.testing.expectEqual(3, validator_indices.len);
-//     try std.testing.expectEqual(1, validator_indices[0]);
-//     try std.testing.expectEqual(4, validator_indices[1]);
-//     try std.testing.expectEqual(7, validator_indices[2]);
-//
-//     var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
-//     defer config3.deinit(std.testing.allocator);
-//     const nodes = try nodesFromYAML(std.testing.allocator, config3);
-//     defer {
-//         for (nodes) |node| std.testing.allocator.free(node);
-//         std.testing.allocator.free(nodes);
-//     }
-//     try std.testing.expectEqual(3, nodes.len);
-//     try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
-//     try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
-//     try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
-// }
+test "configs yaml parsing" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+    const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
+    defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
+    try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
+    try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
+
+    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
+    defer validators_file.deinit(std.testing.allocator);
+    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", validators_file);
+    defer std.testing.allocator.free(validator_indices);
+    try std.testing.expectEqual(3, validator_indices.len);
+    try std.testing.expectEqual(1, validator_indices[0]);
+    try std.testing.expectEqual(4, validator_indices[1]);
+    try std.testing.expectEqual(7, validator_indices[2]);
+
+    var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
+    defer nodes_file.deinit(std.testing.allocator);
+    const nodes = try nodesFromYAML(std.testing.allocator, nodes_file);
+    defer {
+        for (nodes) |node| std.testing.allocator.free(node);
+        std.testing.allocator.free(nodes);
+    }
+    try std.testing.expectEqual(3, nodes.len);
+    try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
+    try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
+    try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
+}
 
 test "ENR fields parsing from validator config" {
     var validator_config = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validator-config.yaml");
@@ -814,4 +816,48 @@ test "ENR construction from fields" {
     try std.testing.expect(constructed_enr.kvs.get("quic") != null);
     try std.testing.expect(constructed_enr.kvs.get("tcp") != null);
     try std.testing.expect(constructed_enr.kvs.get("seq") != null);
+}
+
+test "compare roots from genGensisBlock and genGenesisState and genStateBlockHeader" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Load config.yaml from test fixtures
+    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
+    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    // Parse genesis config from YAML
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    // Generate genesis state
+    var genesis_state: types.BeamState = undefined;
+    try genesis_state.genGenesisState(allocator, genesis_spec);
+    defer genesis_state.deinit();
+
+    std.debug.print("\nGenesis state: {s}\n", .{try genesis_state.toJsonString(allocator)});
+
+    // Generate genesis block using genGenesisBlock
+    var genesis_block: types.BeamBlock = undefined;
+    try genesis_state.genGenesisBlock(allocator, &genesis_block);
+    defer genesis_block.deinit();
+
+    // Get state root by hashing the state directly
+    var state_root_from_genesis: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+
+    // Generate block header using genStateBlockHeader
+    const state_block_header = try genesis_state.genStateBlockHeader(allocator);
+    const state_root_from_block_header = state_block_header.state_root;
+
+    // Compare the roots - they should be equal
+    try std.testing.expect(std.mem.eql(u8, &genesis_block.state_root, &state_root_from_block_header));
+    try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
+
+    // Verify the state root matches the expected value
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
+    defer allocator.free(state_root_from_genesis_hex);
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
 }
