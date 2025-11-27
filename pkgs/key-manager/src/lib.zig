@@ -148,7 +148,11 @@ pub fn getTestKeyManager(
     key_manager.owns_keypairs = false;
     errdefer key_manager.deinit();
 
-    const num_active_epochs = max_slot + 1;
+    var num_active_epochs = max_slot + 1;
+    // to reuse cached keypairs, gen for 10 since most tests ask for < 10 max slot including
+    // building mock chain for tests. otherwise getOrCreateCachedKeyPair might cleanup previous
+    //  key generated for smaller life time
+    if (num_active_epochs < 10) num_active_epochs = 10;
 
     for (0..num_validators) |i| {
         const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
