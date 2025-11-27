@@ -76,7 +76,7 @@ pub const BeamState = struct {
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
         var empty_block: block.BeamBlock = undefined;
-        try empty_block.genEmptyBlock(allocator);
+        try empty_block.setToDefault(allocator);
         defer empty_block.deinit();
 
         var genesis_block_header: block.BeamBlockHeader = undefined;
@@ -444,18 +444,8 @@ pub const BeamState = struct {
             allocator,
         );
 
-        const attestations = try Attestations.init(allocator);
-        errdefer attestations.deinit();
-
-        genesis_block.* = .{
-            .slot = 0,
-            .proposer_index = 0,
-            .parent_root = utils.ZERO_HASH,
-            .state_root = state_root,
-            .body = .{
-                .attestations = attestations,
-            },
-        };
+        try genesis_block.setToDefault(allocator);
+        genesis_block.state_root = state_root;
     }
 
     pub fn genStateBlockHeader(self: *const Self, allocator: Allocator) !block.BeamBlockHeader {
