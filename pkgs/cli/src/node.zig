@@ -728,26 +728,26 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
-test "config yaml parsing" {
-    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
-    defer config1.deinit(std.testing.allocator);
-    const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config1, null);
+test "configs yaml parsing" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+    const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
     defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
     try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
     try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
 
-    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
-    defer config2.deinit(std.testing.allocator);
-    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", config2);
+    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
+    defer validators_file.deinit(std.testing.allocator);
+    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", validators_file);
     defer std.testing.allocator.free(validator_indices);
     try std.testing.expectEqual(3, validator_indices.len);
     try std.testing.expectEqual(1, validator_indices[0]);
     try std.testing.expectEqual(4, validator_indices[1]);
     try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
-    defer config3.deinit(std.testing.allocator);
-    const nodes = try nodesFromYAML(std.testing.allocator, config3);
+    var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
+    defer nodes_file.deinit(std.testing.allocator);
+    const nodes = try nodesFromYAML(std.testing.allocator, nodes_file);
     defer {
         for (nodes) |node| std.testing.allocator.free(node);
         std.testing.allocator.free(nodes);
@@ -818,7 +818,7 @@ test "ENR construction from fields" {
     try std.testing.expect(constructed_enr.kvs.get("seq") != null);
 }
 
-test "compare roots from genGensisBlock andgenGenesisState and genStateBlockHeader" {
+test "compare roots from genGensisBlock and genGenesisState and genStateBlockHeader" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -837,6 +837,8 @@ test "compare roots from genGensisBlock andgenGenesisState and genStateBlockHead
     try genesis_state.genGenesisState(allocator, genesis_spec);
     defer genesis_state.deinit();
 
+    std.debug.print("\nGenesis state: {s}\n", .{try genesis_state.toJsonString(allocator)});
+
     // Generate genesis block using genGenesisBlock
     var genesis_block: types.BeamBlock = undefined;
     try genesis_state.genGenesisBlock(allocator, &genesis_block);
@@ -850,7 +852,12 @@ test "compare roots from genGensisBlock andgenGenesisState and genStateBlockHead
     const state_block_header = try genesis_state.genStateBlockHeader(allocator);
     const state_root_from_block_header = state_block_header.state_root;
 
-    // Compare the two roots - they should be equal
+    // Compare the roots - they should be equal
     try std.testing.expect(std.mem.eql(u8, &genesis_block.state_root, &state_root_from_block_header));
     try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
+
+    // Verify the state root matches the expected value
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
+    defer allocator.free(state_root_from_genesis_hex);
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0x0633e83653b971a7b69b889e6530c6d0df1a9dbdc034347f455306046d13e0e4");
 }
