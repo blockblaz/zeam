@@ -327,29 +327,35 @@ pub const BeamChain = struct {
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                const signed_block_json = try signed_block.toJson(self.allocator);
 
-                // Convert JSON value to string for proper logging
-                const signed_block_str = try jsonToString(self.allocator, signed_block_json);
-                defer self.allocator.free(signed_block_str);
-
-                self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
+                self.module_logger.info("chain received gossip block for slot={any} blockroot={any} hasBlock={any}", .{
                     //
-                    signed_block_str,
-                    block_root,
+                    block.slot,
+                    std.fmt.fmtSliceHexLower(&block_root),
                     hasBlock,
                 });
 
                 if (!hasBlock) {
-                    const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
-                    self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
-                    if (hasParentBlock) {
-                        const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
-                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
-                            return;
-                        };
-                        defer self.allocator.free(missing_roots);
-                    }
+                    self.validateBlock(block, true) catch |err| {
+                        self.module_logger.warn("gossip block validation failed: {any}", .{err});
+                        return; // Drop invalid gossip attestations
+                    };
+                    const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
+                        self.module_logger.err(" error processing block for slot={any} root={any}: {any}", .{
+                            //
+                            block.slot,
+                            std.fmt.fmtSliceHexLower(&block_root),
+                            err,
+                        });
+                        return;
+                    };
+                    defer self.allocator.free(missing_roots);
+                } else {
+                    self.module_logger.debug("skipping processing the already present block slot={any} blockroot={any}", .{
+                        //
+                        block.slot,
+                        std.fmt.fmtSliceHexLower(&block_root),
+                    });
                 }
             },
             .attestation => |signed_attestation| {
@@ -363,13 +369,13 @@ pub const BeamChain = struct {
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
-                    self.module_logger.debug("Gossip attestation validation failed: {any}", .{err});
+                    self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
                     return; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
-                    self.module_logger.debug("Attestation processing error: {any}", .{err});
+                    self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
             },
@@ -636,6 +642,20 @@ pub const BeamChain = struct {
         });
     }
 
+    pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
+        _ = is_from_gossip;
+        const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
+
+        if (!hasParentBlock) {
+            self.module_logger.warn("gossip block validation failed slot={any} with unknown parent={any}", .{
+                //
+                block.slot,
+                std.fmt.fmtSliceHexLower(&block.parent_root),
+            });
+            return BlockValidationError.UnknownParentBlock;
+        }
+    }
+
     /// Validate incoming attestation before processing.
     ///
     /// is_from_block: true if attestation came from a block, false if from network gossip
@@ -775,6 +795,9 @@ const AttestationValidationError = error{
     SourceCheckpointSlotMismatch,
     TargetCheckpointSlotMismatch,
     AttestationTooFarInFuture,
+};
+const BlockValidationError = error{
+    UnknownParentBlock,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
