@@ -117,7 +117,7 @@ pub const BeamBlock = struct {
 
     const Self = @This();
 
-    pub fn genGenesisBlock(self: *Self, allocator: Allocator) !void {
+    pub fn setToDefault(self: *Self, allocator: Allocator) !void {
         const attestations = try Attestations.init(allocator);
         errdefer attestations.deinit();
 

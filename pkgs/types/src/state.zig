@@ -75,12 +75,12 @@ pub const BeamState = struct {
     }
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
-        var genesis_block: block.BeamBlock = undefined;
-        try genesis_block.genGenesisBlock(allocator);
-        defer genesis_block.deinit();
+        var empty_block: block.BeamBlock = undefined;
+        try empty_block.setToDefault(allocator);
+        defer empty_block.deinit();
 
-        var genesis_block_header: block.BeamBlockHeader = undefined;
-        try genesis_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
+        var genesis_latest_block_header: block.BeamBlockHeader = undefined;
+        try empty_block.blockToLatestBlockHeader(allocator, &genesis_latest_block_header);
 
         var historical_block_hashes = try HistoricalBlockHashes.init(allocator);
         errdefer historical_block_hashes.deinit();
@@ -108,7 +108,7 @@ pub const BeamState = struct {
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
-            .latest_block_header = genesis_block_header,
+            .latest_block_header = genesis_latest_block_header,
             // mini3sf
             .latest_justified = .{ .root = utils.ZERO_HASH, .slot = 0 },
             .latest_finalized = .{ .root = utils.ZERO_HASH, .slot = 0 },
@@ -444,18 +444,8 @@ pub const BeamState = struct {
             allocator,
         );
 
-        const attestations = try Attestations.init(allocator);
-        errdefer attestations.deinit();
-
-        genesis_block.* = .{
-            .slot = 0,
-            .proposer_index = 0,
-            .parent_root = utils.ZERO_HASH,
-            .state_root = state_root,
-            .body = .{
-                .attestations = attestations,
-            },
-        };
+        try genesis_block.setToDefault(allocator);
+        genesis_block.state_root = state_root;
     }
 
     pub fn genStateBlockHeader(self: *const Self, allocator: Allocator) !block.BeamBlockHeader {
