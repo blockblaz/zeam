@@ -8,9 +8,53 @@ const KeyManagerError = error{
     ValidatorKeyNotFound,
 };
 
+const CachedKeyPair = struct {
+    keypair: xmss.KeyPair,
+    num_active_epochs: usize,
+};
+var global_test_key_pair_cache: ?std.AutoHashMap(usize, CachedKeyPair) = null;
+const cache_allocator = std.heap.page_allocator;
+
+fn getOrCreateCachedKeyPair(
+    validator_id: usize,
+    num_active_epochs: usize,
+) !xmss.KeyPair {
+    if (global_test_key_pair_cache == null) {
+        global_test_key_pair_cache = std.AutoHashMap(usize, CachedKeyPair).init(cache_allocator);
+    }
+    var cache = &global_test_key_pair_cache.?;
+
+    if (cache.get(validator_id)) |cached| {
+        if (cached.num_active_epochs >= num_active_epochs) {
+            std.debug.print("CACHE HIT: validator {d}\n", .{validator_id});
+            return cached.keypair;
+        }
+        // Not enough epochs, remove old key pair and regenerate
+        var old = cache.fetchRemove(validator_id).?.value;
+        old.keypair.deinit();
+    }
+    std.debug.print("CACHE MISS: generating validator {d}\n", .{validator_id});
+    const seed = try std.fmt.allocPrint(cache_allocator, "test_validator_{d}", .{validator_id});
+    defer cache_allocator.free(seed);
+
+    const keypair = try xmss.KeyPair.generate(
+        cache_allocator,
+        seed,
+        0,
+        num_active_epochs,
+    );
+
+    try cache.put(validator_id, CachedKeyPair{
+        .keypair = keypair,
+        .num_active_epochs = num_active_epochs,
+    });
+    return keypair;
+}
+
 pub const KeyManager = struct {
     keys: std.AutoHashMap(usize, xmss.KeyPair),
     allocator: Allocator,
+    owns_keypairs: bool,
 
     const Self = @This();
 
@@ -18,13 +62,16 @@ pub const KeyManager = struct {
         return Self{
             .keys = std.AutoHashMap(usize, xmss.KeyPair).init(allocator),
             .allocator = allocator,
+            .owns_keypairs = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        var it = self.keys.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
+        if (self.owns_keypairs) {
+            var it = self.keys.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit();
+            }
         }
         self.keys.deinit();
     }
@@ -98,20 +145,17 @@ pub fn getTestKeyManager(
     max_slot: usize,
 ) !KeyManager {
     var key_manager = KeyManager.init(allocator);
+    key_manager.owns_keypairs = false;
     errdefer key_manager.deinit();
 
-    const num_active_epochs = max_slot + 1;
+    var num_active_epochs = max_slot + 1;
+    // to reuse cached keypairs, gen for 10 since most tests ask for < 10 max slot including
+    // building mock chain for tests. otherwise getOrCreateCachedKeyPair might cleanup previous
+    //  key generated for smaller life time
+    if (num_active_epochs < 10) num_active_epochs = 10;
 
     for (0..num_validators) |i| {
-        const seed = try std.fmt.allocPrint(allocator, "test_validator_{d}", .{i});
-        defer allocator.free(seed);
-
-        const keypair = try xmss.KeyPair.generate(
-            allocator,
-            seed,
-            0,
-            num_active_epochs,
-        );
+        const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
         try key_manager.addKeypair(i, keypair);
     }
 

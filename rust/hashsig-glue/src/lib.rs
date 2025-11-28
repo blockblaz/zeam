@@ -1,4 +1,4 @@
-use hashsig::{signature::SignatureScheme, MESSAGE_LENGTH};
+use leansig::{signature::SignatureScheme, MESSAGE_LENGTH};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -9,7 +9,7 @@ use std::ptr;
 use std::slice;
 
 pub type HashSigScheme =
-    hashsig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
+    leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
 pub type HashSigPrivateKey = <HashSigScheme as SignatureScheme>::SecretKey;
 pub type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
 pub type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
@@ -35,7 +35,7 @@ pub struct KeyPair {
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("Signing failed: {0:?}")]
-    SigningFailed(hashsig::signature::SigningError),
+    SigningFailed(leansig::signature::SigningError),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -156,6 +156,33 @@ const ZeamArgs = struct {
         .help = .h,
         .version = .v,
     };
+
+    pub fn format(
+        self: ZeamArgs,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("ZeamArgs(genesis={d}, log_filename=\"{s}\", console_log_level={s}, file_log_level={s}", .{
+            self.genesis,
+            self.log_filename,
+            @tagName(self.console_log_level),
+            @tagName(self.log_file_active_level),
+        });
+        try writer.writeAll(", command=");
+        switch (self.__commands__) {
+            .clock => try writer.writeAll("clock"),
+            .beam => |cmd| try writer.print("beam(mockNetwork={}, metricsPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.metricsPort, cmd.data_dir }),
+            .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
+            .prometheus => |cmd| switch (cmd.__commands__) {
+                .genconfig => |genconfig| try writer.print("prometheus.genconfig(metrics_port={d}, filename=\"{s}\")", .{ genconfig.metrics_port, genconfig.filename }),
+            },
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", metrics_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.metrics_port }),
+        }
+        try writer.writeAll(")");
+    }
 };
 
 const error_handler = @import("error_handler.zig");
@@ -197,7 +224,7 @@ fn mainInner() !void {
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+    std.debug.print("opts ={any} genesis={d}\n", .{ opts.args, genesis });
 
     switch (opts.args.__commands__) {
         .clock => {

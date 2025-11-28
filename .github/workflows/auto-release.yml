@@ -207,7 +207,12 @@ jobs:
         key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build zeam natively
-      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+      run: |
+        if [ "${{ matrix.arch }}" = "amd64" ]; then
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+        else
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+        fi
 
     - name: Build and push Docker image with pre-built binary (${{ matrix.arch }})
       uses: docker/build-push-action@v5
