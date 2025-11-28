@@ -48,22 +48,22 @@ extern fn hashsig_verify(
 /// Get the message length constant
 extern fn hashsig_message_length() usize;
 
-/// Serialize a signature to bytes using bincode
+/// Serialize a signature to bytes using SSZ encoding
 extern fn hashsig_signature_to_bytes(
     signature: *const HashSigSignature,
     buffer: [*]u8,
     buffer_len: usize,
 ) usize;
 
-/// Serialize a public key to bytes using bincode
+/// Serialize a public key to bytes using SSZ encoding
 extern fn hashsig_pubkey_to_bytes(
     keypair: *const HashSigKeyPair,
     buffer: [*]u8,
     buffer_len: usize,
 ) usize;
 
-/// Verify XMSS signature from bincode-serialized bytes
-extern fn hashsig_verify_bincode(
+/// Verify XMSS signature from SSZ-encoded bytes
+extern fn hashsig_verify_ssz(
     pubkey_bytes: [*]const u8,
     pubkey_len: usize,
     message: [*]const u8,
@@ -74,8 +74,8 @@ extern fn hashsig_verify_bincode(
 
 pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 
-/// Verify signature using bincode-serialized bytes
-pub fn verifyBincode(
+/// Verify signature using SSZ-encoded bytes
+pub fn verifySsz(
     pubkey_bytes: []const u8,
     message: []const u8,
     epoch: u32,
@@ -85,7 +85,7 @@ pub fn verifyBincode(
         return HashSigError.InvalidMessageLength;
     }
 
-    const result = hashsig_verify_bincode(
+    const result = hashsig_verify_ssz(
         pubkey_bytes.ptr,
         pubkey_bytes.len,
         message.ptr,
@@ -211,7 +211,7 @@ pub const KeyPair = struct {
         return hashsig_message_length();
     }
 
-    /// Serialize public key to bytes (bincode format)
+    /// Serialize public key to bytes (SSZ format)
     pub fn pubkeyToBytes(self: *const Self, buffer: []u8) HashSigError!usize {
         const bytes_written = hashsig_pubkey_to_bytes(
             self.handle,
@@ -238,7 +238,7 @@ pub const Signature = struct {
 
     const Self = @This();
 
-    /// Serialize signature to bytes (bincode format)
+    /// Serialize signature to bytes (SSZ format)
     /// Returns the number of bytes written to the buffer
     pub fn toBytes(self: *const Self, buffer: []u8) HashSigError!usize {
         const bytes_written = hashsig_signature_to_bytes(
@@ -322,7 +322,7 @@ test "HashSig: invalid message length" {
     try std.testing.expectError(HashSigError.InvalidMessageLength, result);
 }
 
-test "HashSig: bincode serialize and verify" {
+test "HashSig: SSZ serialize and verify" {
     const allocator = std.testing.allocator;
 
     var keypair = try KeyPair.generate(allocator, "test_seed", 0, 10);
@@ -345,12 +345,12 @@ test "HashSig: bincode serialize and verify" {
     const pubkey_size = try keypair.pubkeyToBytes(&pubkey_buffer);
     std.debug.print("Public key size: {d} bytes\n", .{pubkey_size});
 
-    // Verify using bincode
-    try verifyBincode(
+    // Verify using SSZ
+    try verifySsz(
         pubkey_buffer[0..pubkey_size],
         &message,
         epoch,
-        &sig_buffer,
+        sig_buffer[0..sig_size],
     );
 
     std.debug.print("Verification succeeded!\n", .{});
@@ -369,16 +369,34 @@ test "HashSig: verify fails with zero signature" {
     var pubkey_buffer: [256]u8 = undefined;
     const pubkey_size = try keypair.pubkeyToBytes(&pubkey_buffer);
 
+    var signature_buffer: [4000]u8 = undefined;
+
+    var signature = try keypair.sign(&message, epoch);
+    defer signature.deinit();
+
+    const signature_size = try signature.toBytes(&signature_buffer);
+
     // Create invalid signature with all zeros
     var zero_sig_buffer = [_]u8{0} ** 4000;
 
-    // Verification should fail
-    const result = verifyBincode(
+    // Invalid signature length - should fail with InvalidSignature
+    const invalid_signature_result = verifySsz(
         pubkey_buffer[0..pubkey_size],
         &message,
         epoch,
         &zero_sig_buffer,
     );
 
-    try std.testing.expectError(HashSigError.VerificationFailed, result);
+    try std.testing.expectError(HashSigError.InvalidSignature, invalid_signature_result);
+
+    const invalid_message = [_]u8{2} ** 32;
+    // Verification should fail - should fail with VerificationFailed
+    const verification_failed_result = verifySsz(
+        pubkey_buffer[0..pubkey_size],
+        &invalid_message,
+        epoch,
+        signature_buffer[0..signature_size],
+    );
+
+    try std.testing.expectError(HashSigError.VerificationFailed, verification_failed_result);
 }

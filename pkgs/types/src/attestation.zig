@@ -179,8 +179,8 @@ test "encode decode signed attestation roundtrip" {
     try ssz.serialize(SignedAttestation, signed_attestation, &encoded);
 
     // Convert to hex and compare with expected value
-    // Expected value is "0" * 6504 (6504 hex characters = 3252 bytes)
-    const expected_hex_len = 6504;
+    // Expected value is "0" * 6496 (6496 hex characters = 3248 bytes)
+    const expected_hex_len = 6496;
     const expected_value = try std.testing.allocator.alloc(u8, expected_hex_len);
     defer std.testing.allocator.free(expected_value);
     @memset(expected_value, '0');
