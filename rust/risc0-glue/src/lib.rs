@@ -34,7 +34,10 @@ extern "C" fn risc0_prove(
 
     let guest_elf = fs::read(std::str::from_utf8(binary_path).unwrap()).unwrap();
 
+    // Write 4-byte length prefix followed by the actual data
+    let len_bytes = (serialized_block.len() as u32).to_le_bytes();
     let env = ExecutorEnv::builder()
+        .write_slice(&len_bytes)
         .write_slice(serialized_block)
         .build()
         .unwrap();

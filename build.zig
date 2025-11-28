@@ -14,12 +14,36 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
+const ProverChoice = enum { dummy, risc0, openvm, all };
+
 // Add the glue libs to a compile target
-fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget) void {
-    comp.addObjectFile(b.path("rust/target/release/librustglue.a"));
+fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
+    // Conditionally include prover libraries based on selection
+    // Use profile-specific directories for single-prover builds
+    switch (prover) {
+        .dummy => {
+            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
+        .risc0 => {
+            comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
+        },
+        .openvm => {
+            comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
+        },
+        .all => {
+            comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
+        },
+    }
     comp.linkLibC();
-    comp.linkSystemLibrary("unwind"); // to be able to display rust backtraces
-    // Add macOS framework linking for CLI tests
+    comp.linkSystemLibrary("unwind");
     if (target.result.os.tag == .macos) {
         comp.linkFramework("CoreFoundation");
         comp.linkFramework("SystemConfiguration");
@@ -33,6 +57,15 @@ pub fn build(b: *Builder) !void {
 
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
+
+    // Get prover choice (default to dummy)
+    const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, or all (default: dummy)") orelse "dummy";
+    const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .dummy;
+
+    const build_rust_lib_steps = build_rust_project(b, "rust", prover);
+
+    // LTO option (disabled by default for faster builds)
+    const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
 
     // add ssz
     const ssz = b.dependency("ssz", .{
@@ -85,6 +118,20 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("snappyz");
 
+    const snappyframesz_dep = b.dependency("snappyframesz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
+
+    // Create build options early so modules can use them
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", git_version);
+    build_options.addOption([]const u8, "prover", @tagName(prover));
+    build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
+    build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    const build_options_module = build_options.createModule();
+
     // add zeam-utils
     const zeam_utils = b.addModule("@zeam/utils", .{
         .target = target,
@@ -101,6 +148,14 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/params/src/lib.zig"),
     });
 
+    // add zeam-metrics (core metrics definitions)
+    const zeam_metrics = b.addModule("@zeam/metrics", .{
+        .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_metrics.addImport("metrics", metrics);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -110,6 +165,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("ssz", ssz);
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
+    zeam_types.addImport("@zeam/metrics", zeam_metrics);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -122,16 +178,32 @@ pub fn build(b: *Builder) !void {
     zeam_configs.addImport("@zeam/params", zeam_params);
     zeam_configs.addImport("yaml", yaml);
 
-    // add zeam-metrics
-    // Rename metrics module to api (keeps same source path for now)
+    // add zeam-api (HTTP serving and events)
     const zeam_api = b.addModule("@zeam/api", .{
         .root_source_file = b.path("pkgs/api/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zeam_api.addImport("metrics", metrics);
+    zeam_api.addImport("@zeam/metrics", zeam_metrics);
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
+
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
+    });
+
+    // add zeam-key-manager
+    const zeam_key_manager = b.addModule("@zeam/key-manager", .{
+        .root_source_file = b.path("pkgs/key-manager/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
+    zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("ssz", ssz);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -144,6 +216,9 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
     zeam_state_transition.addImport("@zeam/api", zeam_api);
+    zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
+    zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -155,6 +230,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_proving_manager.addImport("@zeam/utils", zeam_utils);
     zeam_state_proving_manager.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_state_proving_manager.addImport("ssz", ssz);
+    zeam_state_proving_manager.addImport("build_options", build_options_module);
 
     const st_lib = b.addStaticLibrary(.{
         .name = "zeam-state-transition",
@@ -183,9 +259,11 @@ pub fn build(b: *Builder) !void {
     });
     zeam_network.addImport("@zeam/types", zeam_types);
     zeam_network.addImport("@zeam/utils", zeam_utils);
+    zeam_network.addImport("@zeam/params", zeam_params);
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
+    zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
 
     // add beam node
@@ -203,7 +281,9 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_beam_node.addImport("@zeam/network", zeam_network);
     zeam_beam_node.addImport("@zeam/database", zeam_database);
+    zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
+    zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -214,12 +294,11 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/types", zeam_types);
     zeam_spectests.addImport("@zeam/configs", zeam_configs);
     zeam_spectests.addImport("@zeam/params", zeam_params);
+    zeam_spectests.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_spectests.addImport("ssz", ssz);
-
-    // Create build options
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", git_version);
-    const build_options_module = build_options.createModule();
+    zeam_spectests.addImport("build_options", build_options_module);
+    zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
+    zeam_spectests.addImport("@zeam/node", zeam_beam_node);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -228,6 +307,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+
+    // Enable LTO if requested and on Linux (disabled by default for faster builds)
+    // Always disabled on macOS due to linker issues with Rust static libraries
+    // (LTO requires LLD but macOS uses its own linker by default)
+    if (enable_lto and target.result.os.tag == .linux) {
+        cli_exe.want_lto = true;
+    }
+
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
     cli_exe.root_module.addImport("build_options", build_options_module);
@@ -238,26 +325,28 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/params", zeam_params);
     cli_exe.root_module.addImport("@zeam/types", zeam_types);
     cli_exe.root_module.addImport("@zeam/configs", zeam_configs);
+    cli_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
     cli_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     cli_exe.root_module.addImport("@zeam/state-proving-manager", zeam_state_proving_manager);
     cli_exe.root_module.addImport("@zeam/network", zeam_network);
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/api", zeam_api);
+    cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
+    cli_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
 
-    addRustGlueLib(b, cli_exe, target);
+    cli_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, cli_exe, target, prover);
     cli_exe.linkLibC(); // for rust static libs to link
+    cli_exe.linkLibCpp(); // for rocksdb C++ library to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
 
     b.installArtifact(cli_exe);
 
     try build_zkvm_targets(b, &cli_exe.step, target);
-
-    var zkvm_host_cmd = build_rust_project(b, "rust");
-    cli_exe.step.dependOn(&zkvm_host_cmd.step);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -313,6 +402,14 @@ pub fn build(b: *Builder) !void {
     });
     cli_integration_tests.root_module.addImport("cli_constants", cli_constants);
 
+    // Add error handler module to integration tests
+    const error_handler_module = b.addModule("error_handler", .{
+        .root_source_file = b.path("pkgs/cli/src/error_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_integration_tests.root_module.addImport("error_handler", error_handler_module);
+
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
         .optimize = optimize,
@@ -331,6 +428,7 @@ pub fn build(b: *Builder) !void {
     // this will no longer be necessary in later versions of zig.
     transition_tests.root_module.addImport("@zeam/types", zeam_types);
     transition_tests.root_module.addImport("@zeam/params", zeam_params);
+    transition_tests.root_module.addImport("@zeam/metrics", zeam_metrics);
     transition_tests.root_module.addImport("ssz", ssz);
     const run_transition_test = b.addRunArtifact(transition_tests);
     test_step.dependOn(&run_transition_test.step);
@@ -341,7 +439,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
-    addRustGlueLib(b, manager_tests, target);
+    addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
@@ -350,6 +448,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
+    addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_test.step);
 
@@ -359,7 +458,8 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
-    addRustGlueLib(b, cli_tests, target);
+    cli_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
@@ -379,6 +479,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
+    addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
     test_step.dependOn(&run_network_tests.step);
 
@@ -391,6 +492,8 @@ pub fn build(b: *Builder) !void {
     configs_tests.root_module.addImport("@zeam/types", zeam_types);
     configs_tests.root_module.addImport("@zeam/params", zeam_params);
     configs_tests.root_module.addImport("yaml", yaml);
+    configs_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, configs_tests, target, prover);
     const run_configs_tests = b.addRunArtifact(configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
@@ -410,6 +513,18 @@ pub fn build(b: *Builder) !void {
     const run_database_tests = b.addRunArtifact(database_tests);
     test_step.dependOn(&run_database_tests.step);
 
+    const xmss_tests = b.addTest(.{
+        .root_module = zeam_xmss,
+        .optimize = optimize,
+        .target = target,
+    });
+
+    // xmss_tests.step.dependOn(&networking_build.step);
+    xmss_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, xmss_tests, target, prover);
+    const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    test_step.dependOn(&run_xmss_tests.step);
+
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
         .optimize = optimize,
@@ -418,11 +533,16 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/utils", zeam_utils);
     spectests.root_module.addImport("@zeam/types", zeam_types);
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
+    spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
 
-    manager_tests.step.dependOn(&zkvm_host_cmd.step);
-    cli_tests.step.dependOn(&zkvm_host_cmd.step);
+    manager_tests.step.dependOn(&build_rust_lib_steps.step);
+
+    network_tests.step.dependOn(&build_rust_lib_steps.step);
+    node_tests.step.dependOn(&build_rust_lib_steps.step);
+    transition_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, transition_tests, target, prover);
 
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
@@ -442,22 +562,101 @@ pub fn build(b: *Builder) !void {
     simtests.dependOn(&run_cli_integration_test.step);
 
     // Create spectest step that runs spec tests
-    const spectests_step = b.step("spectest", "Run spec tests");
+    const spectest_generate_exe = b.addExecutable(.{
+        .name = "spectest-generate",
+        .root_source_file = b.path("pkgs/spectest/src/generator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
+    const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
+    spectest_generate_step.dependOn(&run_spectest_generate.step);
+
+    const run_spectests_after_generate = b.addRunArtifact(spectests);
+    run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
     const run_spectests = b.addRunArtifact(spectests);
-    spectests_step.dependOn(&run_spectests.step);
+
+    const spectests_step = b.step("spectest", "Regenerate and run spec tests");
+    spectests_step.dependOn(&run_spectests_after_generate.step);
+
+    try setSpectestArgsAndEnv(b, run_spectest_generate, run_spectests, run_spectests_after_generate);
+
+    const spectest_run_step = b.step("spectest:run", "Run previously generated spectests");
+    spectest_run_step.dependOn(&run_spectests.step);
 }
 
-fn build_rust_project(b: *Builder, path: []const u8) *Builder.Step.Run {
-    return b.addSystemCommand(&.{
-        "cargo",
-        "+nightly",
-        "-C",
-        path,
-        "-Z",
-        "unstable-options",
-        "build",
-        "--release",
-    });
+fn setSpectestArgsAndEnv(
+    b: *Builder,
+    run_spectest_generate: *std.Build.Step.Run,
+    run_spectests: *std.Build.Step.Run,
+    run_spectests_after_generate: *std.Build.Step.Run,
+) !void {
+    if (b.args) |args| {
+        var generator_args_builder = std.ArrayList([]const u8).init(b.allocator);
+        defer generator_args_builder.deinit();
+
+        var skip_expected_errors = false;
+
+        for (args) |arg| {
+            if (std.mem.startsWith(u8, arg, "--skip-expected-error-fixtures")) {
+                const suffix = arg["--skip-expected-error-fixtures".len..];
+                if (suffix.len == 0) {
+                    skip_expected_errors = true;
+                    continue;
+                }
+
+                if (suffix[0] == '=') {
+                    const value = suffix[1..];
+                    if (std.ascii.eqlIgnoreCase(value, "true")) {
+                        skip_expected_errors = true;
+                    }
+                    continue;
+                }
+
+                // fallthrough to treat as a normal argument if the suffix does not
+                // match the supported forms.
+            }
+
+            try generator_args_builder.append(arg);
+        }
+
+        if (generator_args_builder.items.len != 0) {
+            const generator_args = try generator_args_builder.toOwnedSlice();
+            run_spectest_generate.addArgs(generator_args);
+        }
+
+        if (skip_expected_errors) {
+            run_spectests.setEnvironmentVariable("ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS", "true");
+            run_spectests_after_generate.setEnvironmentVariable("ZEAM_SPECTEST_SKIP_EXPECTED_ERRORS", "true");
+        }
+    }
+}
+
+fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
+    // Build only the selected prover crates
+    // Use optimized profiles for single-prover builds to reduce binary size
+    const cargo_build = switch (prover) {
+        .dummy => b.addSystemCommand(&.{
+            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
+            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
+        }),
+        .risc0 => b.addSystemCommand(&.{
+            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
+            "risc0-glue", "-p",        "hashsig-glue",
+        }),
+        .openvm => b.addSystemCommand(&.{
+            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
+            "openvm-glue", "-p",        "hashsig-glue",
+        }),
+        .all => b.addSystemCommand(&.{
+            "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
+            "build", "--release", "--all",
+        }),
+    };
+
+    return cargo_build;
 }
 
 fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
@@ -473,6 +672,12 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
         }).module("ssz.zig");
 
+        // add metrics
+        const metrics = b.dependency("metrics", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("metrics");
+
         // add zeam-params
         const zeam_params = b.addModule("@zeam/params", .{
             .target = target,
@@ -487,6 +692,14 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
 
+        // add zeam-metrics (core metrics definitions for ZKVM)
+        const zeam_metrics = b.addModule("@zeam/metrics", .{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("pkgs/metrics/src/lib.zig"),
+        });
+        zeam_metrics.addImport("metrics", metrics);
+
         // add zeam-types
         const zeam_types = b.addModule("@zeam/types", .{
             .target = target,
@@ -496,6 +709,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         zeam_types.addImport("ssz", ssz);
         zeam_types.addImport("@zeam/params", zeam_params);
         zeam_types.addImport("@zeam/utils", zeam_utils);
+        zeam_types.addImport("@zeam/metrics", zeam_metrics);
 
         const zkvm_module = b.addModule("zkvm", .{
             .optimize = optimize,
@@ -515,6 +729,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);
+        zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
         zeam_state_transition.addImport("zkvm", zkvm_module);
 
         // target has to be riscv5 runtime provable/verifiable on zkVMs
@@ -530,6 +745,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         exe.root_module.addImport("@zeam/utils", zeam_utils);
         exe.root_module.addImport("@zeam/params", zeam_params);
         exe.root_module.addImport("@zeam/types", zeam_types);
+        exe.root_module.addImport("@zeam/metrics", zeam_metrics);
         exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
         exe.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));

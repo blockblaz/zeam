@@ -9,27 +9,30 @@ const ssz = @import("ssz");
 const networks = @import("@zeam/network");
 const params = @import("@zeam/params");
 const api = @import("@zeam/api");
+const zeam_metrics = @import("@zeam/metrics");
 const database = @import("@zeam/database");
 
 const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
+const keymanager = @import("@zeam/key-manager");
 const jsonToString = zeam_utils.jsonToString;
 
+const utils = @import("./utils.zig");
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
 const tree_visualizer = @import("./tree_visualizer.zig");
 
-const node = @import("./node.zig");
-const PeerInfo = node.PeerInfo;
+const networkFactory = @import("./network.zig");
+const PeerInfo = networkFactory.PeerInfo;
 
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
 };
 
-pub const VoteConstructionParams = struct {
-    slot: usize,
+pub const AttestationConstructionParams = struct {
+    slot: types.Slot,
 };
 
 pub const ChainOpts = struct {
@@ -48,6 +51,8 @@ pub const CachedProcessedBlockInfo = struct {
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
+    // signatures corresponding to attestations in the blockbody
+    signatures: types.BlockSignatures,
 };
 
 pub const BeamChain = struct {
@@ -124,6 +129,7 @@ pub const BeamChain = struct {
         // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
         self.registered_validator_ids = validator_ids;
+        zeam_metrics.metrics.lean_validators_count.set(self.registered_validator_ids.len);
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
@@ -134,7 +140,7 @@ pub const BeamChain = struct {
 
         var has_proposal = false;
         if (interval == 0) {
-            const num_validators: usize = @intCast(self.config.genesis.num_validators);
+            const num_validators: usize = @intCast(self.config.genesis.numValidators());
             const slot_proposer_id = slot % num_validators;
             if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
                 _ = index;
@@ -151,7 +157,7 @@ pub const BeamChain = struct {
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
-            // interval to vote so we should put out the chain status information to the user along with
+            // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
             self.printSlot(islot, null, self.connected_peers.count());
@@ -168,7 +174,9 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const votes = try self.forkChoice.getProposalVotes();
+        const signed_attestations = try self.forkChoice.getProposalAttestations();
+        defer self.allocator.free(signed_attestations);
+
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -185,7 +193,13 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = votes,
+                .attestations = blk: {
+                    var attestations_list = try types.Attestations.init(self.allocator);
+                    for (signed_attestations) |signed_attestation| {
+                        try attestations_list.append(signed_attestation.message);
+                    }
+                    break :blk attestations_list;
+                },
             },
         };
 
@@ -209,27 +223,47 @@ pub const BeamChain = struct {
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
         try self.states.put(block_root, post_state);
 
+        // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
+        //   them in the forkchoice
+        _ = try self.forkChoice.onBlock(block, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+        });
+
         return .{
             .block = block,
             .blockRoot = block_root,
+            .signatures = blk: {
+                var signatures_list = try types.BlockSignatures.init(self.allocator);
+                for (signed_attestations) |signed_attestation| {
+                    try signatures_list.append(signed_attestation.signature);
+                }
+                break :blk signatures_list;
+            },
         };
     }
 
-    pub fn constructVote(self: *Self, opts: VoteConstructionParams) !types.Mini3SFVote {
+    pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
         const slot = opts.slot;
 
-        const head = try self.forkChoice.getProposalHead(slot);
-        const target = try self.forkChoice.getVoteTarget();
+        // const head = try self.forkChoice.getProposalHead(slot);
+        const head_proto = self.forkChoice.head;
+        const head: types.Checkpoint = .{
+            .root = head_proto.blockRoot,
+            .slot = head_proto.slot,
+        };
+        const target = try self.forkChoice.getAttestationTarget();
 
-        const vote = types.Mini3SFVote{
-            //
+        const attestation_data = types.AttestationData{
             .slot = slot,
             .head = head,
             .target = target,
             .source = self.forkChoice.fcStore.latest_justified,
         };
 
-        return vote;
+        return attestation_data;
     }
 
     pub fn printSlot(self: *Self, islot: isize, tree_depth: ?usize, peer_count: usize) void {
@@ -297,55 +331,63 @@ pub const BeamChain = struct {
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
         switch (data.*) {
             .block => |signed_block| {
-                const block = signed_block.message;
+                const block = signed_block.message.block;
                 var block_root: [32]u8 = undefined;
                 try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
-                const signed_block_json = try signed_block.toJson(self.allocator);
 
-                // Convert JSON value to string for proper logging
-                const signed_block_str = try jsonToString(self.allocator, signed_block_json);
-                defer self.allocator.free(signed_block_str);
-
-                self.module_logger.debug("chain received block onGossip cb at slot={any} blockroot={any} hasBlock={any}", .{
+                self.module_logger.info("chain received gossip block for slot={any} blockroot={any} hasBlock={any}", .{
                     //
-                    signed_block_str,
-                    block_root,
+                    block.slot,
+                    std.fmt.fmtSliceHexLower(&block_root),
                     hasBlock,
                 });
 
                 if (!hasBlock) {
-                    const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
-                    self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
-                    if (hasParentBlock) {
-                        self.onBlock(signed_block, .{}) catch |err| {
-                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
-                        };
-                    }
+                    self.validateBlock(block, true) catch |err| {
+                        self.module_logger.warn("gossip block validation failed: {any}", .{err});
+                        return; // Drop invalid gossip attestations
+                    };
+                    const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
+                        self.module_logger.err(" error processing block for slot={any} root={any}: {any}", .{
+                            //
+                            block.slot,
+                            std.fmt.fmtSliceHexLower(&block_root),
+                            err,
+                        });
+                        return;
+                    };
+                    defer self.allocator.free(missing_roots);
+                } else {
+                    self.module_logger.debug("skipping processing the already present block slot={any} blockroot={any}", .{
+                        //
+                        block.slot,
+                        std.fmt.fmtSliceHexLower(&block_root),
+                    });
                 }
             },
-            .vote => |signed_vote| {
-                const vote = signed_vote.message;
-                const hasHead = self.forkChoice.hasBlock(vote.head.root);
-                const signed_vote_json = try signed_vote.toJson(self.allocator);
+            .attestation => |signed_attestation| {
+                const signed_attestation_json = try signed_attestation.toJson(self.allocator);
 
                 // Convert JSON value to string for proper logging
-                const signed_vote_str = try jsonToString(self.allocator, signed_vote_json);
-                defer self.allocator.free(signed_vote_str);
+                const signed_attestation_str = try jsonToString(self.allocator, signed_attestation_json);
+                defer self.allocator.free(signed_attestation_str);
 
-                self.module_logger.debug("chain received vote onGossip cb at slot={any} hasHead={any}", .{
-                    //
-                    signed_vote_str,
-                    hasHead,
-                });
+                self.module_logger.debug("chain received attestation onGossip cb: {s}", .{signed_attestation_str});
 
-                if (hasHead) {
-                    self.onAttestation(signed_vote) catch |err| {
-                        self.module_logger.debug(" ^^^^^^^^ Attestation processing error ^^^^^^ {any}", .{err});
-                    };
-                }
+                // Validate attestation before processing (gossip = not from block)
+                self.validateAttestation(signed_attestation.message, false) catch |err| {
+                    self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
+                    return; // Drop invalid gossip attestations
+                };
+
+                // Process validated attestation
+                self.onAttestation(signed_attestation) catch |err| {
+                    self.module_logger.err("attestation processing error: {any}", .{err});
+                    return err;
+                };
             },
         }
     }
@@ -353,10 +395,11 @@ pub const BeamChain = struct {
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
-    pub fn onBlock(self: *Self, signedBlock: types.SignedBeamBlock, blockInfo: CachedProcessedBlockInfo) !void {
-        const onblock_timer = api.chain_onblock_duration_seconds.start();
+    // Returns a list of missing block roots that need to be fetched from the network
+    pub fn onBlock(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
+        const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
 
-        const block = signedBlock.message;
+        const block = signedBlock.message.block;
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
             try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
@@ -369,23 +412,21 @@ pub const BeamChain = struct {
 
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state
-            const pre_state = self.states.get(signedBlock.message.parent_root) orelse return BlockProcessingError.MissingPreState;
+            const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
 
-            // 2. apply STF to get post state
-            var validSignatures = true;
-            stf.verify_signatures(signedBlock) catch {
-                validSignatures = false;
-            };
-            try stf.apply_transition(self.allocator, cpost_state, signedBlock, .{
+            // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
+            try stf.verifySignatures(self.allocator, pre_state, &signedBlock);
+
+            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
+            try stf.apply_transition(self.allocator, cpost_state, block, .{
                 //
                 .logger = self.stf_logger,
-                .validSignatures = validSignatures,
+                .validSignatures = true,
             });
             break :computedstate cpost_state;
         };
-
         // 3. fc onblock
         const fcBlock = try self.forkChoice.onBlock(block, post_state, .{
             .currentSlot = block.slot,
@@ -394,14 +435,33 @@ pub const BeamChain = struct {
         });
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 4. fc onvotes
+        // 4. fc onattestations
         self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
         });
-        for (block.body.attestations.constSlice()) |signed_vote| {
-            self.forkChoice.onAttestation(signed_vote, true) catch |e| {
-                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_vote, e });
+
+        var missing_roots = std.ArrayList(types.Root).init(self.allocator);
+        errdefer missing_roots.deinit();
+
+        const signatures = signedBlock.signature.constSlice();
+
+        for (block.body.attestations.constSlice(), 0..) |attestation, index| {
+            // Validate attestation before processing (from block = true)
+            self.validateAttestation(attestation, true) catch |e| {
+                if (e == AttestationValidationError.UnknownHeadBlock) {
+                    try missing_roots.append(attestation.data.head.root);
+                }
+
+                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ attestation.validator_id, e });
+                // Skip invalid attestations but continue processing the block
+                continue;
+            };
+
+            const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
+
+            self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
             };
         }
 
@@ -409,7 +469,17 @@ pub const BeamChain = struct {
         const new_head = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
 
-        // 6. Emit new head event via SSE (use forkchoice ProtoBlock directly)
+        // 6. proposer attestation
+        const proposer_signature = signatures[block.body.attestations.len()];
+        const signed_proposer_attestation = types.SignedAttestation{
+            .message = signedBlock.message.proposer_attestation,
+            .signature = proposer_signature,
+        };
+        self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
+            self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
+        };
+
+        // 7. Emit new head event via SSE (use forkchoice ProtoBlock directly)
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
@@ -420,11 +490,19 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        // 7. Emit justification/finalization events based on forkchoice store
         const store = self.forkChoice.fcStore;
         const latest_justified = store.latest_justified;
         const latest_finalized = store.latest_finalized;
 
+        // 7. Save block and state to database
+        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized.slot) catch |err| {
+            self.module_logger.err("Failed to update block database for block root=0x{s}: {any}", .{
+                std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
+                err,
+            });
+        };
+
+        // 8. Emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified_slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
@@ -453,15 +531,6 @@ pub const BeamChain = struct {
             }
         }
 
-        // 8. Save block and state to database
-        var batch = self.db.initWriteBatch();
-        defer batch.deinit();
-
-        batch.putBlock(database.DbBlocksNamespace, fcBlock.blockRoot, signedBlock);
-        batch.putState(database.DbStatesNamespace, fcBlock.blockRoot, post_state.*);
-
-        self.db.commit(&batch);
-
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
@@ -469,32 +538,296 @@ pub const BeamChain = struct {
             blockInfo.blockRoot == null,
             blockInfo.postState == null,
         });
+
+        zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
+        zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+
+        return missing_roots.toOwnedSlice();
     }
 
-    pub fn onAttestation(self: *Self, signedVote: types.SignedVote) !void {
-        return self.forkChoice.onAttestation(signedVote, false);
+    /// Update block database with block, state, and slot indices
+    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
+        var batch = self.db.initWriteBatch();
+        defer batch.deinit();
+
+        // Store block and state
+        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putState(database.DbStatesNamespace, blockRoot, postState);
+
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
+        _ = slot;
+        // primarily this is served by the forkchoice
+        // update unfinalized slot index
+        // if (slot > finalizedSlot) {
+        //     const existing_blockroots = self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot) orelse &[_]types.Root{};
+        //     if (existing_blockroots.len > 0) {
+        //         defer self.allocator.free(existing_blockroots);
+        //     }
+        //     var updated_blockroots = std.ArrayList(types.Root).init(self.allocator);
+        //     defer updated_blockroots.deinit();
+
+        //     updated_blockroots.appendSlice(existing_blockroots) catch {};
+        //     updated_blockroots.append(blockRoot) catch {};
+
+        //     batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
+        // }
+
+        // Update finalized slot indices and cleanup if finalization has advanced
+        if (finalizedSlot > self.last_emitted_finalized_slot) {
+            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized_slot, finalizedSlot) catch |err| {
+                self.module_logger.err("Failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                    self.last_emitted_finalized_slot,
+                    finalizedSlot,
+                    err,
+                });
+            };
+        }
+
+        self.db.commit(&batch);
+    }
+
+    /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
+    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalizedSlot: types.Slot, finalizedSlot: types.Slot) !void {
+        // 1. Fetch all newly finalized roots
+        const current_finalized = self.forkChoice.fcStore.latest_finalized.root;
+
+        const newly_finalized_roots = try self.forkChoice.getAncestorsOfFinalized(self.allocator, current_finalized, previousFinalizedSlot);
+        defer self.allocator.free(newly_finalized_roots);
+
+        self.module_logger.info("Finalization advanced to slot {d}, found {d} newly finalized blocks", .{
+            finalizedSlot,
+            newly_finalized_roots.len,
+        });
+
+        var canonical_blocks = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer canonical_blocks.deinit();
+
+        for (newly_finalized_roots) |root| {
+            canonical_blocks.put(root, {}) catch {};
+        }
+
+        // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace
+        for (newly_finalized_roots) |root| {
+            const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
+            const node = self.forkChoice.protoArray.nodes.items[idx];
+            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
+            self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
+                std.fmt.fmtSliceHexLower(&root),
+                node.slot,
+            });
+        }
+
+        // TODO: uncomment this code if there is a need of slot to unfinalized index
+        // 3. Remove orphaned blocks from database and cleanup unfinalized indices
+        // for (previousFinalizedSlot + 1..finalizedSlot + 1) |slot| {
+        //     var slot_orphaned_count: usize = 0;
+        //     // Get all unfinalized blocks at this slot before deleting the index
+        //     if (self.db.loadUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot)) |unfinalized_blockroots| {
+        //         defer self.allocator.free(unfinalized_blockroots);
+        //         // Remove blocks not in the canonical finalized chain
+        //         for (unfinalized_blockroots) |blockroot| {
+        //             if (!canonical_blocks.contains(blockroot)) {
+        //                 // This block is orphaned - remove it from database
+        //                 batch.delete(database.DbBlocksNamespace, &blockroot);
+        //                 batch.delete(database.DbStatesNamespace, &blockroot);
+        //                 slot_orphaned_count += 1;
+        //             }
+        //         }
+        //         if (slot_orphaned_count > 0) {
+        //             self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
+        //                 slot_orphaned_count,
+        //                 slot,
+        //             });
+        //         }
+
+        //         // Remove the unfinalized slot index
+        //         batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
+        //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
+        //     }
+        // }
+
+        self.module_logger.info("Finalization cleanup completed for slots {d} to {d}", .{
+            previousFinalizedSlot,
+            finalizedSlot,
+        });
+    }
+
+    pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
+        _ = is_from_gossip;
+        const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
+
+        if (!hasParentBlock) {
+            self.module_logger.warn("gossip block validation failed slot={any} with unknown parent={any}", .{
+                //
+                block.slot,
+                std.fmt.fmtSliceHexLower(&block.parent_root),
+            });
+            return BlockValidationError.UnknownParentBlock;
+        }
+    }
+
+    /// Validate incoming attestation before processing.
+    ///
+    /// is_from_block: true if attestation came from a block, false if from network gossip
+    ///
+    /// Per leanSpec:
+    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
+    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
+    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+        const data = attestation.data;
+
+        // 1. Validate that source, target, and head blocks exist in proto array
+        const source_idx = self.forkChoice.protoArray.indices.get(data.source.root) orelse {
+            self.module_logger.debug("Attestation validation failed: unknown source block root=0x{s}", .{
+                std.fmt.fmtSliceHexLower(&data.source.root),
+            });
+            return AttestationValidationError.UnknownSourceBlock;
+        };
+
+        const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
+            self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
+                std.fmt.fmtSliceHexLower(&data.target.root),
+            });
+            return AttestationValidationError.UnknownTargetBlock;
+        };
+
+        const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
+            self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
+                std.fmt.fmtSliceHexLower(&data.head.root),
+            });
+            return AttestationValidationError.UnknownHeadBlock;
+        };
+
+        const source_block = self.forkChoice.protoArray.nodes.items[source_idx];
+        const target_block = self.forkChoice.protoArray.nodes.items[target_idx];
+        const head_block = self.forkChoice.protoArray.nodes.items[head_idx];
+        _ = head_block; // Will be used in future validations
+
+        // 2. Validate slot relationships
+        if (source_block.slot > target_block.slot) {
+            self.module_logger.debug("Attestation validation failed: source slot {d} > target slot {d}", .{
+                source_block.slot,
+                target_block.slot,
+            });
+            return AttestationValidationError.SourceSlotExceedsTarget;
+        }
+
+        //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
+        if (data.source.slot > data.target.slot) {
+            self.module_logger.debug("Attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
+                data.source.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.SourceCheckpointExceedsTarget;
+        }
+
+        // 3. Validate checkpoint slots match block slots
+        if (source_block.slot != data.source.slot) {
+            self.module_logger.debug("Attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
+                source_block.slot,
+                data.source.slot,
+            });
+            return AttestationValidationError.SourceCheckpointSlotMismatch;
+        }
+
+        //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
+        if (target_block.slot != data.target.slot) {
+            self.module_logger.debug("Attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
+                target_block.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.TargetCheckpointSlotMismatch;
+        }
+
+        // 4. Validate attestation is not too far in the future
+        //
+        //    Gossip attestations must be for current or past slots only. Validators attest
+        //    in interval 1 of the current slot, so they cannot attest for future slots.
+        //    Block attestations can be more lenient since the block itself was validated.
+        const current_slot = self.forkChoice.fcStore.timeSlots;
+        const max_allowed_slot = if (is_from_block)
+            current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
+        else
+            current_slot; // Gossip attestations: no future slots allowed
+
+        if (data.slot > max_allowed_slot) {
+            self.module_logger.debug("Attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
+                data.slot,
+                max_allowed_slot,
+                is_from_block,
+            });
+            return AttestationValidationError.AttestationTooFarInFuture;
+        }
+
+        self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
+            attestation.validator_id,
+            data.slot,
+            data.source.slot,
+            data.target.slot,
+            is_from_block,
+        });
+    }
+
+    pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
+        // Validate attestation before processing (gossip = not from block)
+        try self.validateAttestation(signedAttestation.message, false);
+
+        const attestation = signedAttestation.message;
+        const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+
+        try stf.verifySingleAttestation(self.allocator, state, &attestation, &signedAttestation.signature);
+
+        return self.forkChoice.onAttestation(signedAttestation, false);
+    }
+
+    pub fn getStatus(self: *Self) types.Status {
+        const finalized = self.forkChoice.fcStore.latest_finalized;
+        const head = self.forkChoice.head;
+
+        return .{
+            .finalized_root = finalized.root,
+            .finalized_slot = finalized.slot,
+            .head_root = head.blockRoot,
+            .head_slot = head.slot,
+        };
     }
 };
 
 const BlockProcessingError = error{MissingPreState};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
+const AttestationValidationError = error{
+    MissingState,
+    UnknownSourceBlock,
+    UnknownTargetBlock,
+    UnknownHeadBlock,
+    SourceSlotExceedsTarget,
+    SourceCheckpointExceedsTarget,
+    SourceCheckpointSlotMismatch,
+    TargetCheckpointSlotMismatch,
+    AttestationTooFarInFuture,
+};
+const BlockValidationError = error{
+    UnknownParentBlock,
+};
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
+    // Generate a mock chain with validator pubkeys baked into the genesis spec.
+    const mock_chain = try stf.genMockChain(allocator, 5, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
     };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
-    const mock_chain = try stf.genMockChain(allocator, 5, chain_config.genesis);
     var beam_state = mock_chain.genesis_state;
     const nodeId = 10; // random value
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
@@ -517,17 +850,19 @@ test "process and add mock blocks into a node's chain" {
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
-    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
-        const block = mock_chain.blocks[i];
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
         const block_root = mock_chain.blockRoots[i];
-        const current_slot = block.message.slot;
+        const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        try beam_chain.onBlock(block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &beam_chain.forkChoice.protoArray.nodes.items[i].blockRoot));
@@ -538,7 +873,7 @@ test "process and add mock blocks into a node's chain" {
         const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
-        try std.testing.expect(std.mem.eql(u8, &state_root, &block.message.state_root));
+        try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_justified.root, &mock_chain.latestJustified[i].root));
@@ -546,32 +881,32 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
     }
 
-    const num_validators: usize = @intCast(mock_chain.genesis_config.num_validators);
+    const num_validators: usize = @intCast(mock_chain.genesis_config.numValidators());
     for (0..num_validators) |validator_id| {
-        // all validators should have voted as per the mock chain
-        const vote_tracker = beam_chain.forkChoice.votes.get(validator_id);
-        try std.testing.expect(vote_tracker != null);
+        // all validators should have attested as per the mock chain
+        const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
+        try std.testing.expect(attestations_tracker != null);
     }
 }
 
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
 test "printSlot output demonstration" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    // Create a chain configuration
-    const chain_spec =
-        \\{"preset": "mainnet", "name": "beamdev", "genesis_time": 1234, "num_validators": 4}
-    ;
-    const options = json.ParseOptions{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-    };
-    const parsed_chain_spec = (try json.parseFromSlice(configs.ChainOptions, allocator, chain_spec, options)).value;
-    const chain_config = try configs.ChainConfig.init(configs.Chain.custom, parsed_chain_spec);
-
     // Create a mock chain with some blocks
-    const mock_chain = try stf.genMockChain(allocator, 3, chain_config.genesis);
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
     var beam_state = mock_chain.genesis_state;
     const nodeId = 42; // Test node ID
     var zeam_logger_config = zeam_utils.getLoggerConfig(.info, null);
@@ -590,11 +925,13 @@ test "printSlot output demonstration" {
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
-        const block = mock_chain.blocks[i];
-        const current_slot = block.message.slot;
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        try beam_chain.onBlock(block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
     }
 
     // Register some validators to make the output more interesting
@@ -617,4 +954,473 @@ test "printSlot output demonstration" {
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);
     try std.testing.expect(beam_chain.registered_validator_ids.len == 3);
+}
+
+// Attestation Validation Tests
+// These tests align with leanSpec's test_attestation_processing.py
+
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+test "attestation validation - comprehensive" {
+    // Comprehensive test covering all attestation validation rules
+    // This consolidates multiple validation checks into one test to avoid redundant setup
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Add blocks to chain (slots 1 and 2)
+    for (1..mock_chain.blocks.len) |i| {
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
+    }
+
+    // Test 1: Valid attestation (baseline - should pass)
+    {
+        const source_slot: types.Slot = 1;
+        const target_slot: types.Slot = 2;
+        const valid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = target_slot,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[target_slot],
+                        .slot = target_slot,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[source_slot],
+                        .slot = source_slot,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[target_slot],
+                        .slot = target_slot,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        // Should pass validation
+        try beam_chain.validateAttestation(valid_attestation.message, false);
+    }
+
+    // Test 2: Unknown source block
+    {
+        const unknown_root = [_]u8{0xFF} ** 32;
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 3: Unknown target block
+    {
+        const unknown_root = [_]u8{0xEE} ** 32;
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 2,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 4: Unknown head block
+    {
+        const unknown_root = [_]u8{0xDD} ** 32;
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = unknown_root, // Unknown block
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+    // Test 5: Source slot exceeds target slot (block slots)
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 6: Source checkpoint slot exceeds target checkpoint slot
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 7: Source checkpoint slot mismatch
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 0,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 8: Target checkpoint slot mismatch
+    {
+        const invalid_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 1, // Checkpoint claims slot 1 (mismatch)
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+    }
+
+    // Test 9: Attestation too far in future (for gossip)
+    {
+        const future_attestation: types.SignedAttestation = .{
+            .message = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 3, // Future slot (current is 2)
+                    .head = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                    .source = types.Checkpoint{
+                        .root = mock_chain.blockRoots[1],
+                        .slot = 1,
+                    },
+                    .target = types.Checkpoint{
+                        .root = mock_chain.blockRoots[2],
+                        .slot = 2,
+                    },
+                },
+            },
+            .signature = [_]u8{0} ** types.SIGSIZE,
+        };
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.message, false));
+    }
+}
+
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+test "attestation validation - gossip vs block future slot handling" {
+    // Test that gossip and block attestations have different future slot tolerances
+    // Gossip: must be <= current_slot
+    // Block: can be <= current_slot + 1
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Add one block (slot 1)
+    const block = mock_chain.blocks[1];
+    try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
+    const missing_roots = try beam_chain.onBlock(block, .{});
+    allocator.free(missing_roots);
+
+    // Current time is at slot 1, create attestation for slot 2 (next slot)
+    const next_slot_attestation: types.SignedAttestation = .{
+        .message = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[0],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+            },
+        },
+        .signature = [_]u8{0} ** types.SIGSIZE,
+    };
+
+    // Gossip attestations: should FAIL for next slot (current + 1)
+    // Per spec store.py:177: assert attestation.slot <= time_slots
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.message, false));
+
+    // Block attestations: should PASS for next slot (current + 1)
+    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    try beam_chain.validateAttestation(next_slot_attestation.message, true);
+    const too_far_attestation: types.SignedAttestation = .{
+        .message = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 3, // Too far in future
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[0],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+            },
+        },
+        .signature = [_]u8{0} ** types.SIGSIZE,
+    };
+    // Both should fail for slot 3 when current is slot 1
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, true));
+}
+// TODO: Enable and update this test once the keymanager file-reading PR is added
+// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+test "attestation processing - valid block attestation" {
+    // Test that valid attestations from blocks are processed correctly
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Add blocks to chain
+    for (1..mock_chain.blocks.len) |i| {
+        const block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(block, .{});
+        allocator.free(missing_roots);
+    }
+
+    // Create a valid attestation
+    const message = types.Attestation{
+        .validator_id = 1,
+        .data = .{
+            .slot = 2,
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[2],
+                .slot = 2,
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[2],
+                .slot = 2,
+            },
+        },
+    };
+
+    var key_manager = try keymanager.getTestKeyManager(allocator, 4, 3);
+    defer key_manager.deinit();
+
+    const signature = try key_manager.signAttestation(&message, allocator);
+
+    const valid_attestation: types.SignedAttestation = .{
+        .message = message,
+        .signature = signature,
+    };
+
+    // Process attestation through chain (this validates and then processes)
+    try beam_chain.onAttestation(valid_attestation);
+
+    // Verify the attestation was recorded in attestations
+    const attestations_tracker = beam_chain.forkChoice.attestations.get(1);
+    try std.testing.expect(attestations_tracker != null);
+    try std.testing.expect(attestations_tracker.?.latestNew != null);
+    try std.testing.expect(attestations_tracker.?.latestNew.?.slot == 2);
 }

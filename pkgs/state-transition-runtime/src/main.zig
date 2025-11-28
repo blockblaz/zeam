@@ -36,8 +36,9 @@ export fn main() noreturn {
 
     logger.debug("deserialized input={s}\n", .{state_str});
 
+    const block = prover_input.block;
     // apply the state transition to modify the state
-    state_transition.apply_transition(allocator, &prover_input.state, prover_input.block, .{ .logger = stf_runtime_logger }) catch |e| {
+    state_transition.apply_transition(allocator, &prover_input.state, block, .{ .logger = stf_runtime_logger }) catch |e| {
         logger.err("error running transition function: {any}", .{e});
     };
 

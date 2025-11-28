@@ -8,12 +8,19 @@ pub const GossipEncoding = interfaceFactory.GossipEncoding;
 pub const LeanNetworkTopic = interfaceFactory.LeanNetworkTopic;
 pub const GossipTopic = interfaceFactory.GossipTopic;
 pub const GossipMessage = interfaceFactory.GossipMessage;
-pub const ReqRespMethod = interfaceFactory.ReqRespMethod;
+pub const LeanSupportedProtocol = interfaceFactory.LeanSupportedProtocol;
 pub const ReqRespRequest = interfaceFactory.ReqRespRequest;
+pub const ReqRespResponse = interfaceFactory.ReqRespResponse;
+pub const ReqRespResponseEvent = interfaceFactory.ReqRespResponseEvent;
+pub const ReqRespResponseError = interfaceFactory.ReqRespResponseError;
+pub const ReqRespRequestCallback = interfaceFactory.ReqRespRequestCallback;
 pub const OnPeerEventCbType = interfaceFactory.OnPeerEventCbType;
 pub const OnPeerEventCbHandler = interfaceFactory.OnPeerEventCbHandler;
 pub const PeerEventHandler = interfaceFactory.PeerEventHandler;
 pub const GenericGossipHandler = interfaceFactory.GenericGossipHandler;
+pub const ReqRespServerStream = interfaceFactory.ReqRespServerStream;
+pub const OnReqRespResponseCbHandler = interfaceFactory.OnReqRespResponseCbHandler;
+pub const OnReqRespRequestCbHandler = interfaceFactory.OnReqRespRequestCbHandler;
 
 const mockFactory = @import("./mock.zig");
 pub const Mock = mockFactory.Mock;
@@ -21,3 +28,7 @@ pub const Mock = mockFactory.Mock;
 const ethlibp2pFactory = @import("./ethlibp2p.zig");
 pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
 pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
+
+test "get tests" {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}

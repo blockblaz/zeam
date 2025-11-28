@@ -6,7 +6,7 @@ const Yaml = @import("yaml").Yaml;
 const configs = @import("@zeam/configs");
 const api = @import("@zeam/api");
 const api_server = @import("api_server.zig");
-const json = std.json;
+const event_broadcaster = api.event_broadcaster;
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
@@ -15,6 +15,8 @@ const xev = @import("xev");
 const networks = @import("@zeam/network");
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const node_lib = @import("@zeam/node");
+const key_manager_lib = @import("@zeam/key-manager");
+const xmss = @import("@zeam/xmss");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
@@ -23,8 +25,9 @@ const NodeCommand = @import("main.zig").NodeCommand;
 const zeam_utils = @import("@zeam/utils");
 const constants = @import("constants.zig");
 const database = @import("@zeam/database");
-
-const prefix = "zeam_";
+const json = std.json;
+const utils = @import("@zeam/utils");
+const ssz = @import("ssz");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -66,12 +69,14 @@ pub const NodeOptions = struct {
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
     database_path: []const u8,
+    hash_sig_key_dir: []const u8,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
         allocator.free(self.bootnodes);
         allocator.free(self.validator_indices);
         allocator.free(self.local_priv_key);
+        allocator.free(self.hash_sig_key_dir);
     }
 };
 
@@ -87,12 +92,20 @@ pub const Node = struct {
     allocator: std.mem.Allocator,
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
+    key_manager: key_manager_lib.KeyManager,
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: std.mem.Allocator, options: *const NodeOptions) !void {
+    pub fn init(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        options: *const NodeOptions,
+    ) !void {
         self.allocator = allocator;
         self.options = options;
+
+        // Initialize event broadcaster
+        try event_broadcaster.initGlobalBroadcaster(allocator);
 
         if (options.metrics_enable) {
             try api.init(allocator);
@@ -109,7 +122,10 @@ pub const Node = struct {
         };
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
         chain_options.genesis_time = options.genesis_spec.genesis_time;
-        chain_options.num_validators = options.genesis_spec.num_validators;
+
+        // Set validator_pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
+        chain_options.validator_pubkeys = options.genesis_spec.validator_pubkeys;
+
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
         var anchorState: types.BeamState = undefined;
@@ -137,6 +153,12 @@ pub const Node = struct {
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
 
+        const num_validators: usize = @intCast(chain_config.genesis.numValidators());
+        self.key_manager = key_manager_lib.KeyManager.init(allocator);
+        errdefer self.key_manager.deinit();
+
+        try self.loadValidatorKeypairs(num_validators);
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -144,6 +166,7 @@ pub const Node = struct {
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = options.validator_indices,
+            .key_manager = &self.key_manager,
             .db = db,
             .logger_config = options.logger_config,
         });
@@ -154,10 +177,12 @@ pub const Node = struct {
     pub fn deinit(self: *Self) void {
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
+        self.key_manager.deinit();
         self.network.deinit();
         self.enr.deinit();
         self.db.deinit();
         self.loop.deinit();
+        event_broadcaster.deinitGlobalBroadcaster();
     }
 
     pub fn run(self: *Node) !void {
@@ -276,13 +301,65 @@ pub const Node = struct {
 
         return .{ .listen_addresses = listen_addresses, .connect_peers = connect_peers };
     }
+
+    fn loadValidatorKeypairs(
+        self: *Self,
+        num_validators: usize,
+    ) !void {
+        if (self.options.validator_indices.len == 0) {
+            return error.NoValidatorAssignments;
+        }
+
+        const hash_sig_key_dir = self.options.hash_sig_key_dir;
+
+        for (self.options.validator_indices) |validator_index| {
+            if (validator_index >= num_validators) {
+                return error.HashSigValidatorIndexOutOfRange;
+            }
+
+            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_pk.json", .{ hash_sig_key_dir, validator_index });
+            defer self.allocator.free(pk_path);
+
+            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            defer pk_file.close();
+            const public_json = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+            defer self.allocator.free(public_json);
+
+            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.json", .{ hash_sig_key_dir, validator_index });
+            defer self.allocator.free(sk_path);
+
+            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.HashSigSecretKeyMissing,
+                else => return err,
+            };
+            defer sk_file.close();
+            const secret_json = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+            defer self.allocator.free(secret_json);
+
+            var keypair = try xmss.KeyPair.fromJson(
+                self.allocator,
+                secret_json,
+                public_json,
+            );
+            errdefer keypair.deinit();
+
+            try self.key_manager.addKeypair(validator_index, keypair);
+        }
+    }
 };
 
 /// Builds the start options for a node based on the provided command and options.
 /// It loads the necessary configuration files, parses them, and populates the
 /// `StartNodeOptions` structure.
 /// The caller is responsible for freeing the allocated resources in `StartNodeOptions`.
-pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, opts: *NodeOptions) !void {
+pub fn buildStartOptions(
+    allocator: std.mem.Allocator,
+    node_cmd: NodeCommand,
+    opts: *NodeOptions,
+) !void {
     try utils_lib.checkDIRExists(node_cmd.custom_genesis);
 
     const config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{ node_cmd.custom_genesis, "/config.yaml" });
@@ -331,7 +408,7 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
     if (bootnodes.len == 0) {
         return error.InvalidNodesConfig;
     }
-    const genesis_spec = try configs.genesisConfigFromYAML(parsed_config, node_cmd.override_genesis_time);
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.override_genesis_time);
 
     const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_key, parsed_validators);
     errdefer allocator.free(validator_indices);
@@ -340,11 +417,20 @@ pub fn buildStartOptions(allocator: std.mem.Allocator, node_cmd: NodeCommand, op
     }
     const local_priv_key = try getPrivateKeyFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
 
+    const node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+
+    const hash_sig_key_dir = try std.mem.concat(allocator, u8, &[_][]const u8{
+        node_cmd.custom_genesis,
+        "/",
+        node_cmd.@"sig-keys-dir",
+    });
+
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
     opts.local_priv_key = local_priv_key;
     opts.genesis_spec = genesis_spec;
-    opts.node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+    opts.node_key_index = node_key_index;
+    opts.hash_sig_key_dir = hash_sig_key_dir;
 }
 
 /// Parses the nodes from a YAML configuration.
@@ -642,25 +728,26 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
-test "config yaml parsing" {
-    var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
-    defer config1.deinit(std.testing.allocator);
-    const genesis_spec = try configs.genesisConfigFromYAML(config1, null);
-    try std.testing.expectEqual(9, genesis_spec.num_validators);
-    try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
+test "configs yaml parsing" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+    const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
+    defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
+    try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
+    try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
 
-    var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
-    defer config2.deinit(std.testing.allocator);
-    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", config2);
+    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
+    defer validators_file.deinit(std.testing.allocator);
+    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", validators_file);
     defer std.testing.allocator.free(validator_indices);
     try std.testing.expectEqual(3, validator_indices.len);
     try std.testing.expectEqual(1, validator_indices[0]);
     try std.testing.expectEqual(4, validator_indices[1]);
     try std.testing.expectEqual(7, validator_indices[2]);
 
-    var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
-    defer config3.deinit(std.testing.allocator);
-    const nodes = try nodesFromYAML(std.testing.allocator, config3);
+    var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
+    defer nodes_file.deinit(std.testing.allocator);
+    const nodes = try nodesFromYAML(std.testing.allocator, nodes_file);
     defer {
         for (nodes) |node| std.testing.allocator.free(node);
         std.testing.allocator.free(nodes);
@@ -729,4 +816,48 @@ test "ENR construction from fields" {
     try std.testing.expect(constructed_enr.kvs.get("quic") != null);
     try std.testing.expect(constructed_enr.kvs.get("tcp") != null);
     try std.testing.expect(constructed_enr.kvs.get("seq") != null);
+}
+
+test "compare roots from genGensisBlock and genGenesisState and genStateBlockHeader" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Load config.yaml from test fixtures
+    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
+    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    // Parse genesis config from YAML
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    // Generate genesis state
+    var genesis_state: types.BeamState = undefined;
+    try genesis_state.genGenesisState(allocator, genesis_spec);
+    defer genesis_state.deinit();
+
+    std.debug.print("\nGenesis state: {s}\n", .{try genesis_state.toJsonString(allocator)});
+
+    // Generate genesis block using genGenesisBlock
+    var genesis_block: types.BeamBlock = undefined;
+    try genesis_state.genGenesisBlock(allocator, &genesis_block);
+    defer genesis_block.deinit();
+
+    // Get state root by hashing the state directly
+    var state_root_from_genesis: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+
+    // Generate block header using genStateBlockHeader
+    const state_block_header = try genesis_state.genStateBlockHeader(allocator);
+    const state_root_from_block_header = state_block_header.state_root;
+
+    // Compare the roots - they should be equal
+    try std.testing.expect(std.mem.eql(u8, &genesis_block.state_root, &state_root_from_block_header));
+    try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
+
+    // Verify the state root matches the expected value
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
+    defer allocator.free(state_root_from_genesis_hex);
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
 }

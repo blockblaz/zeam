@@ -30,8 +30,8 @@ RUN ZIG_VERSION="0.14.1" && \
     mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig && \
     ln -s /opt/zig/zig /usr/local/bin/zig
 
-# Install Rust 1.85+
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0
+# Install Rust nightly (required by build.zig which uses +nightly)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install RISC0 toolchain using rzup (only for linux/amd64)
@@ -43,12 +43,28 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     fi
 ENV PATH="/root/.risc0/bin:${PATH}"
 
+# Configure Rust for ARM64 QEMU compatibility
+# Use generic CPU target to avoid illegal instructions when running under QEMU emulation
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        rustup target add aarch64-unknown-linux-gnu; \
+    fi
+
+# Set RUSTFLAGS for ARM64 to use generic CPU (QEMU-compatible)
+# This prevents illegal instruction errors when running ARM64 binaries under QEMU emulation
+# We'll set this conditionally in the build step below
+
 # Set working directory
 WORKDIR /app
 
 # Copy dependency files first for better caching
 COPY build.zig.zon ./
 COPY build.zig ./
+
+# Fetch Zig dependencies using BuildKit cache mount
+# This allows Docker to cache the dependency fetching step
+RUN --mount=type=cache,target=/root/.cache/zig \
+    zig build --fetch
 
 # Copy source code
 COPY pkgs/ ./pkgs/
@@ -63,7 +79,14 @@ COPY .git/HEAD .git/HEAD
 COPY .git/refs .git/refs
 
 # Get git commit hash and build the project with optimizations
-RUN GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
+# Use cache mount for Zig build cache as well
+# Set RUSTFLAGS for ARM64 to use generic CPU (QEMU-compatible)
+ARG TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/zig \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        export RUSTFLAGS="-C target-cpu=generic"; \
+    fi && \
+    GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
     if [ -z "$GIT_VERSION" ] || [ "$GIT_VERSION" = "unknown" ]; then \
         REF=$(cat .git/HEAD | sed 's/ref: //'); \
         GIT_VERSION=$(cat ".git/$REF" 2>/dev/null | head -c 7 || echo "unknown"); \
