@@ -594,14 +594,12 @@ fn processBlockStep(
         else => null,
     };
 
-    // Handle new nested format where block data is under block.block
     const block_value = blk: {
         if (block_wrapper_obj) |wrapper_obj| {
             if (wrapper_obj.get("block")) |nested_block| {
                 break :blk nested_block;
             }
         }
-        // Otherwise use the wrapper itself (old format where block fields are directly in block_wrapper)
         break :blk block_wrapper;
     };
 
@@ -697,7 +695,6 @@ fn processBlockStep(
     };
     try ctx.fork_choice.onAttestation(signed_attestation, false);
 
-    // Record blockRootLabel if present (used for lexicographicHeadAmong checks)
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {
             const label = switch (label_value) {
@@ -1140,12 +1137,12 @@ fn parseCheckpointField(
 ) FixtureError!types.Checkpoint {
     var context_buf: [160]u8 = undefined;
     const checkpoint_context = std.fmt.bufPrint(&context_buf, "{s}.{s}", .{ label_prefix, field }) catch field;
-    const checkpoint_obj = try expectObjectField(parent, &.{ field }, fixture_path, case_name, step_index, checkpoint_context);
+    const checkpoint_obj = try expectObjectField(parent, &.{field}, fixture_path, case_name, step_index, checkpoint_context);
 
     var root_label_buf: [192]u8 = undefined;
-    const root_label = std.fmt.bufPrint(&root_label_buf, "{s}.root", .{ checkpoint_context }) catch "checkpoint.root";
+    const root_label = std.fmt.bufPrint(&root_label_buf, "{s}.root", .{checkpoint_context}) catch "checkpoint.root";
     var slot_label_buf: [192]u8 = undefined;
-    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{ checkpoint_context }) catch "checkpoint.slot";
+    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{checkpoint_context}) catch "checkpoint.slot";
 
     const root = try expectRootField(checkpoint_obj, &.{"root"}, fixture_path, case_name, step_index, root_label);
     const slot = try expectU64Field(checkpoint_obj, &.{"slot"}, fixture_path, case_name, step_index, slot_label);
