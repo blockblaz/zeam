@@ -125,7 +125,7 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 - **Sample Collection Event**: On attestation validation failure
 
 #### `lean_attestation_validation_time_seconds` (Histogram)
-- **Description**: Time taken to validate and process attestations in fork choice.
+- **Description**: Time taken to validate attestations in fork choice.
 - **Type**: Histogram
 - **Unit**: Seconds
 - **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
