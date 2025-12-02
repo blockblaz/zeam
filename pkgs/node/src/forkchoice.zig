@@ -560,7 +560,6 @@ pub const ForkChoice = struct {
         }
 
         try self.attestations.put(validator_id, attestation_tracker);
-        zeam_metrics.incrementLeanAttestationsValid(is_from_block);
     }
 
     // we process state outside forkchoice onblock to parallize verifications and just use the post state here
