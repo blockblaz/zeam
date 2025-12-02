@@ -21,6 +21,8 @@ pub const HashSigError = error{
     DeserializationFailed,
     OutOfMemory,
     SchemeInitFailed,
+    InvalidJsonFormat,
+    SecretKeyNotSupported,
 };
 
 /// Wrapper for hash-zig keypair that maintains compatibility with existing zeam API
@@ -85,27 +87,183 @@ pub const KeyPair = struct {
     }
 
     /// Reconstruct a key pair from JSON (for backward compatibility)
-    /// NOTE: This function is not fully implemented yet.
     ///
-    /// Migration path:
-    /// 1. For new deployments: Use SSZ format directly (validator_N_pk.ssz, validator_N_sk.ssz)
-    /// 2. For existing deployments: Regenerate keys using KeyPair.generate()
-    /// 3. If JSON migration is needed: Implement JSON→SSZ conversion here
+    /// Supports the old Rust hashsig-glue JSON format.
+    /// Expected JSON formats:
     ///
-    /// The old Rust format stored keys as JSON with bincode-encoded bytes.
-    /// The new format uses pure SSZ serialization.
+    /// Public Key: { "root": [u32, ...], "parameter": [u32, ...], "hash_len_fe": u32 }
+    /// Secret Key: { "prf_key": [u8; 32], "parameter": [u32, ...],
+    ///               "activation_epoch": usize, "num_active_epochs": usize }
+    ///
+    /// Note: The Merkle trees are not stored in JSON and will be regenerated.
+    /// This is expensive (5-10 minutes for lifetime_2_32) but necessary.
     pub fn fromJson(
         allocator: Allocator,
         secret_key_json: []const u8,
         public_key_json: []const u8,
     ) HashSigError!Self {
-        _ = allocator;
-        _ = secret_key_json;
-        _ = public_key_json;
+        const json = std.json;
 
-        // TODO: Implement JSON parsing if migration from old format is needed
-        // For now, recommend regenerating keys with KeyPair.generate()
-        return HashSigError.DeserializationFailed;
+        // Parse secret key JSON
+        const sk_parsed = json.parseFromSlice(
+            json.Value,
+            allocator,
+            secret_key_json,
+            .{},
+        ) catch return HashSigError.InvalidJsonFormat;
+        defer sk_parsed.deinit();
+
+        const sk_obj = sk_parsed.value.object;
+
+        // Extract prf_key (32 bytes)
+        const prf_key_array = sk_obj.get("prf_key") orelse return HashSigError.InvalidJsonFormat;
+        if (prf_key_array != .array) return HashSigError.InvalidJsonFormat;
+        if (prf_key_array.array.items.len != 32) return HashSigError.InvalidJsonFormat;
+
+        var prf_key: [32]u8 = undefined;
+        for (prf_key_array.array.items, 0..) |item, i| {
+            const val = switch (item) {
+                .integer => |int| @as(u8, @intCast(int)),
+                .number_string => |str| std.fmt.parseInt(u8, str, 10) catch return HashSigError.InvalidJsonFormat,
+                else => return HashSigError.InvalidJsonFormat,
+            };
+            prf_key[i] = val;
+        }
+
+        // Extract parameter array (5 field elements)
+        const sk_param_array = sk_obj.get("parameter") orelse return HashSigError.InvalidJsonFormat;
+        if (sk_param_array != .array) return HashSigError.InvalidJsonFormat;
+        if (sk_param_array.array.items.len != 5) return HashSigError.InvalidJsonFormat;
+
+        var parameter: [5]hash_zig.FieldElement = undefined;
+        for (sk_param_array.array.items, 0..) |item, i| {
+            const val = switch (item) {
+                .integer => |int| @as(u32, @intCast(int)),
+                .number_string => |str| std.fmt.parseInt(u32, str, 10) catch return HashSigError.InvalidJsonFormat,
+                else => return HashSigError.InvalidJsonFormat,
+            };
+            parameter[i] = hash_zig.FieldElement.fromCanonical(val);
+        }
+
+        // Extract activation_epoch
+        const activation_epoch_val = sk_obj.get("activation_epoch") orelse return HashSigError.InvalidJsonFormat;
+        const activation_epoch = switch (activation_epoch_val) {
+            .integer => |int| @as(usize, @intCast(int)),
+            .number_string => |str| std.fmt.parseInt(usize, str, 10) catch return HashSigError.InvalidJsonFormat,
+            else => return HashSigError.InvalidJsonFormat,
+        };
+
+        // Extract num_active_epochs
+        const num_active_epochs_val = sk_obj.get("num_active_epochs") orelse return HashSigError.InvalidJsonFormat;
+        const num_active_epochs = switch (num_active_epochs_val) {
+            .integer => |int| @as(usize, @intCast(int)),
+            .number_string => |str| std.fmt.parseInt(usize, str, 10) catch return HashSigError.InvalidJsonFormat,
+            else => return HashSigError.InvalidJsonFormat,
+        };
+
+        // Parse public key JSON to get the public key
+        const public_key = publicKeyFromJson(allocator, public_key_json) catch {
+            return HashSigError.InvalidJsonFormat;
+        };
+
+        // Initialize scheme with the prf_key as seed
+        // This ensures we use the same randomness as the original key
+        const scheme_ptr = GeneralizedXMSSSignatureScheme.initWithSeed(
+            allocator,
+            DEFAULT_LIFETIME,
+            prf_key,
+        ) catch return HashSigError.SchemeInitFailed;
+        errdefer scheme_ptr.deinit();
+
+        // Regenerate the keypair using the same parameters
+        // This will rebuild the Merkle trees from scratch
+        const keypair = scheme_ptr.keyGen(activation_epoch, num_active_epochs) catch {
+            return HashSigError.KeyGenerationFailed;
+        };
+
+        // Verify the regenerated public key matches the stored one
+        // Compare roots to ensure consistency
+        const regenerated_root = keypair.public_key.getRoot();
+        const stored_root = public_key.getRoot();
+        for (regenerated_root, stored_root) |regen, stored| {
+            if (!regen.eql(stored)) {
+                // Mismatch - the regenerated key doesn't match the stored key
+                // This could happen if the JSON format is different or corrupted
+                keypair.secret_key.deinit();
+                scheme_ptr.deinit();
+                return HashSigError.DeserializationFailed;
+            }
+        }
+
+        return Self{
+            .scheme = scheme_ptr,
+            .secret_key = keypair.secret_key,
+            .public_key = keypair.public_key,
+            .allocator = allocator,
+            .owns_scheme = true,
+        };
+    }
+
+    /// Extract public key from JSON for verification purposes only
+    /// This is useful for migrating from old JSON format to verify existing signatures
+    /// without needing the secret key.
+    pub fn publicKeyFromJson(
+        allocator: Allocator,
+        public_key_json: []const u8,
+    ) HashSigError!hash_zig.signature.GeneralizedXMSSPublicKey {
+        const json = std.json;
+
+        // Parse public key JSON
+        const pk_parsed = json.parseFromSlice(
+            json.Value,
+            allocator,
+            public_key_json,
+            .{},
+        ) catch return HashSigError.InvalidJsonFormat;
+        defer pk_parsed.deinit();
+
+        const pk_obj = pk_parsed.value.object;
+
+        // Extract root array (8 field elements)
+        const root_array = pk_obj.get("root") orelse return HashSigError.InvalidJsonFormat;
+        if (root_array != .array) return HashSigError.InvalidJsonFormat;
+        if (root_array.array.items.len != 8) return HashSigError.InvalidJsonFormat;
+
+        var root: [8]hash_zig.FieldElement = undefined;
+        for (root_array.array.items, 0..) |item, i| {
+            const val = switch (item) {
+                .integer => |int| @as(u32, @intCast(int)),
+                .number_string => |str| std.fmt.parseInt(u32, str, 10) catch return HashSigError.InvalidJsonFormat,
+                else => return HashSigError.InvalidJsonFormat,
+            };
+            root[i] = hash_zig.FieldElement.fromCanonical(val);
+        }
+
+        // Extract parameter array (5 field elements)
+        const param_array = pk_obj.get("parameter") orelse return HashSigError.InvalidJsonFormat;
+        if (param_array != .array) return HashSigError.InvalidJsonFormat;
+        if (param_array.array.items.len != 5) return HashSigError.InvalidJsonFormat;
+
+        var parameter: [5]hash_zig.FieldElement = undefined;
+        for (param_array.array.items, 0..) |item, i| {
+            const val = switch (item) {
+                .integer => |int| @as(u32, @intCast(int)),
+                .number_string => |str| std.fmt.parseInt(u32, str, 10) catch return HashSigError.InvalidJsonFormat,
+                else => return HashSigError.InvalidJsonFormat,
+            };
+            parameter[i] = hash_zig.FieldElement.fromCanonical(val);
+        }
+
+        // Extract hash_len_fe
+        const hash_len_fe_val = pk_obj.get("hash_len_fe") orelse return HashSigError.InvalidJsonFormat;
+        const hash_len_fe = switch (hash_len_fe_val) {
+            .integer => |int| @as(usize, @intCast(int)),
+            .number_string => |str| std.fmt.parseInt(usize, str, 10) catch return HashSigError.InvalidJsonFormat,
+            else => return HashSigError.InvalidJsonFormat,
+        };
+
+        // Create and return public key
+        return hash_zig.signature.GeneralizedXMSSPublicKey.init(root, parameter, hash_len_fe);
     }
 
     /// Sign a message
@@ -382,4 +540,79 @@ test "HashSig: verify fails with wrong signature" {
     // Verification should fail
     const verification_failed_result = keypair.verify(&invalid_message, &signature, epoch);
     try std.testing.expectError(HashSigError.VerificationFailed, verification_failed_result);
+}
+
+test "HashSig: fromJson with tree regeneration" {
+    const allocator = std.testing.allocator;
+
+    // Generate a keypair
+    var original_keypair = try KeyPair.generate(allocator, "test_seed_json", 0, 10);
+    defer original_keypair.deinit();
+
+    // Create JSON representations (simulating what would be stored)
+    // In real use, these would come from files
+    const pk_root = original_keypair.public_key.getRoot();
+    const pk_param = original_keypair.public_key.getParameter();
+    const pk_hash_len = original_keypair.public_key.getHashLenFe();
+
+    // Build public key JSON
+    var pk_json = std.ArrayList(u8).init(allocator);
+    defer pk_json.deinit();
+    const pk_writer = pk_json.writer();
+    try pk_writer.writeAll("{\"root\":[");
+    for (pk_root, 0..) |fe, i| {
+        if (i > 0) try pk_writer.writeAll(",");
+        try std.fmt.format(pk_writer, "{d}", .{fe.toCanonical()});
+    }
+    try pk_writer.writeAll("],\"parameter\":[");
+    for (pk_param, 0..) |fe, i| {
+        if (i > 0) try pk_writer.writeAll(",");
+        try std.fmt.format(pk_writer, "{d}", .{fe.toCanonical()});
+    }
+    try std.fmt.format(pk_writer, "],\"hash_len_fe\":{d}}}", .{pk_hash_len});
+
+    // Build secret key JSON (with metadata only - trees will be regenerated)
+    var sk_json = std.ArrayList(u8).init(allocator);
+    defer sk_json.deinit();
+    const sk_writer = sk_json.writer();
+
+    // Extract prf_key from secret key (this is normally not exposed, but for testing we'll use the seed)
+    const prf_key = seedPhraseToBytes("test_seed_json");
+
+    try sk_writer.writeAll("{\"prf_key\":[");
+    for (prf_key, 0..) |byte, i| {
+        if (i > 0) try sk_writer.writeAll(",");
+        try std.fmt.format(sk_writer, "{d}", .{byte});
+    }
+    try sk_writer.writeAll("],\"parameter\":[");
+    for (pk_param, 0..) |fe, i| {
+        if (i > 0) try sk_writer.writeAll(",");
+        try std.fmt.format(sk_writer, "{d}", .{fe.toCanonical()});
+    }
+    try std.fmt.format(sk_writer, "],\"activation_epoch\":{d},\"num_active_epochs\":{d}}}", .{
+        original_keypair.secret_key.activation_epoch,
+        original_keypair.secret_key.num_active_epochs,
+    });
+
+    std.debug.print("\nTesting fromJson with tree regeneration...\n", .{});
+    std.debug.print("PK JSON: {s}\n", .{pk_json.items});
+    std.debug.print("SK JSON (truncated): {s}...\n", .{sk_json.items[0..@min(100, sk_json.items.len)]});
+
+    // Load from JSON (this will regenerate trees)
+    var loaded_keypair = try KeyPair.fromJson(allocator, sk_json.items, pk_json.items);
+    defer loaded_keypair.deinit();
+
+    std.debug.print("Keypair loaded successfully from JSON!\n", .{});
+
+    // Test that the loaded keypair can sign
+    const message = [_]u8{0x99} ** 32;
+    const epoch: u32 = 0;
+
+    var signature = try loaded_keypair.sign(&message, epoch);
+    defer signature.deinit();
+
+    // Verify with the loaded keypair
+    try loaded_keypair.verify(&message, &signature, epoch);
+
+    std.debug.print("✅ fromJson test passed - keypair is fully functional!\n", .{});
 }

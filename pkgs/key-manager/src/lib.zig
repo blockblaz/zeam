@@ -149,9 +149,9 @@ pub fn getTestKeyManager(
     errdefer key_manager.deinit();
 
     var num_active_epochs = max_slot + 1;
-    // For lifetime_2_32, use minimum of 1024 epochs to amortize expensive key generation
+    // For lifetime_2_32, use minimum of 10 epochs to amortize expensive key generation
     // This allows reusing cached keypairs across tests
-    if (num_active_epochs < 1024) num_active_epochs = 1024;
+    if (num_active_epochs < 10) num_active_epochs = 10;
 
     for (0..num_validators) |i| {
         const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
