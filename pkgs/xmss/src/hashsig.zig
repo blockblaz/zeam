@@ -23,6 +23,7 @@ pub const HashSigError = error{
     SchemeInitFailed,
     InvalidJsonFormat,
     SecretKeyNotSupported,
+    PublicKeyMismatch,
 };
 
 /// Wrapper for hash-zig keypair that maintains compatibility with existing zeam API
@@ -71,19 +72,83 @@ pub const KeyPair = struct {
 
     /// Reconstruct a key pair from SSZ-serialized bytes
     /// Note: For secret keys, this requires re-running keyGen since trees aren't serialized
-    /// This function is not fully implemented - use generate() instead
     pub fn fromSSZ(
         allocator: Allocator,
         secret_key_ssz: []const u8,
         public_key_ssz: []const u8,
     ) HashSigError!Self {
-        _ = allocator;
-        _ = secret_key_ssz;
-        _ = public_key_ssz;
+        // Deserialize public key from SSZ
+        const public_key = hash_zig.signature.GeneralizedXMSSPublicKey.fromBytes(public_key_ssz, null) catch {
+            return HashSigError.DeserializationFailed;
+        };
 
-        // Secret key SSZ deserialization requires keyGen to rebuild trees
-        // For now, return error - caller should use generate() or implement full reconstruction
-        return HashSigError.DeserializationFailed;
+        // For secret key, we need to extract metadata and regenerate trees
+        // SSZ format: prf_key (32) + parameter (20) + activation_epoch (8) + num_active_epochs (8)
+        if (secret_key_ssz.len < 68) return HashSigError.DeserializationFailed;
+
+        var offset: usize = 0;
+
+        // Extract prf_key (32 bytes)
+        var prf_key: [32]u8 = undefined;
+        @memcpy(&prf_key, secret_key_ssz[offset .. offset + 32]);
+        offset += 32;
+
+        // Extract parameter (5 x u32 = 20 bytes)
+        var parameter: [5]hash_zig.FieldElement = undefined;
+        for (0..5) |i| {
+            const bytes = secret_key_ssz[offset .. offset + 4];
+            const val = std.mem.readInt(u32, bytes[0..4], .little);
+            parameter[i] = hash_zig.FieldElement.fromCanonical(val);
+            offset += 4;
+        }
+
+        // Extract activation_epoch (8 bytes)
+        const activation_epoch_bytes = secret_key_ssz[offset .. offset + 8];
+        const activation_epoch = std.mem.readInt(u64, activation_epoch_bytes[0..8], .little);
+        offset += 8;
+
+        // Extract num_active_epochs (8 bytes)
+        const num_active_epochs_bytes = secret_key_ssz[offset .. offset + 8];
+        const num_active_epochs = std.mem.readInt(u64, num_active_epochs_bytes[0..8], .little);
+
+        // Initialize scheme (we don't need to seed it since we're providing the exact parameters)
+        const scheme_ptr = GeneralizedXMSSSignatureScheme.init(
+            allocator,
+            DEFAULT_LIFETIME,
+        ) catch return HashSigError.SchemeInitFailed;
+
+        // Regenerate the keypair using the extracted parameters
+        // Use keyGenWithParameter to provide the exact prf_key and parameter from SSZ
+        const keypair = scheme_ptr.keyGenWithParameter(
+            @intCast(activation_epoch),
+            @intCast(num_active_epochs),
+            parameter,
+            prf_key,
+            false, // rng_already_consumed = false since we're reconstructing
+        ) catch |err| {
+            std.debug.print("keyGenWithParameter failed during fromSSZ: {any}\n", .{err});
+            scheme_ptr.deinit();
+            return HashSigError.KeyGenerationFailed;
+        };
+
+        // Verify the regenerated public key matches the stored one
+        const regenerated_root = keypair.public_key.getRoot();
+        const stored_root = public_key.getRoot();
+        for (regenerated_root, stored_root) |regen, stored| {
+            if (regen.value != stored.value) {
+                keypair.secret_key.deinit();
+                scheme_ptr.deinit();
+                return HashSigError.PublicKeyMismatch;
+            }
+        }
+
+        return Self{
+            .scheme = scheme_ptr,
+            .secret_key = keypair.secret_key,
+            .public_key = keypair.public_key,
+            .allocator = allocator,
+            .owns_scheme = true,
+        };
     }
 
     /// Reconstruct a key pair from JSON (for backward compatibility)
@@ -166,18 +231,22 @@ pub const KeyPair = struct {
             return HashSigError.InvalidJsonFormat;
         };
 
-        // Initialize scheme with the prf_key as seed
-        // This ensures we use the same randomness as the original key
-        const scheme_ptr = GeneralizedXMSSSignatureScheme.initWithSeed(
+        // Initialize scheme (we don't need to seed it since we're providing the exact parameters)
+        const scheme_ptr = GeneralizedXMSSSignatureScheme.init(
             allocator,
             DEFAULT_LIFETIME,
-            prf_key,
         ) catch return HashSigError.SchemeInitFailed;
 
-        // Regenerate the keypair using the same parameters
-        // This will rebuild the Merkle trees from scratch
-        const keypair = scheme_ptr.keyGen(activation_epoch, num_active_epochs) catch |err| {
-            std.debug.print("keyGen failed during fromJson: {any}\n", .{err});
+        // Regenerate the keypair using the extracted parameters
+        // Use keyGenWithParameter to provide the exact prf_key and parameter from JSON
+        const keypair = scheme_ptr.keyGenWithParameter(
+            activation_epoch,
+            num_active_epochs,
+            parameter,
+            prf_key,
+            false, // rng_already_consumed = false since we're reconstructing
+        ) catch |err| {
+            std.debug.print("keyGenWithParameter failed during fromJson: {any}\n", .{err});
             // Clean up scheme before returning error
             scheme_ptr.deinit();
             return HashSigError.KeyGenerationFailed;
@@ -188,12 +257,12 @@ pub const KeyPair = struct {
         const regenerated_root = keypair.public_key.getRoot();
         const stored_root = public_key.getRoot();
         for (regenerated_root, stored_root) |regen, stored| {
-            if (!regen.eql(stored)) {
+            if (regen.value != stored.value) {
                 // Mismatch - the regenerated key doesn't match the stored key
                 // This could happen if the JSON format is different or corrupted
                 keypair.secret_key.deinit();
                 scheme_ptr.deinit();
-                return HashSigError.DeserializationFailed;
+                return HashSigError.PublicKeyMismatch;
             }
         }
 
@@ -256,13 +325,14 @@ pub const KeyPair = struct {
             parameter[i] = hash_zig.FieldElement.fromCanonical(val);
         }
 
-        // Extract hash_len_fe
-        const hash_len_fe_val = pk_obj.get("hash_len_fe") orelse return HashSigError.InvalidJsonFormat;
-        const hash_len_fe = switch (hash_len_fe_val) {
-            .integer => |int| @as(usize, @intCast(int)),
-            .number_string => |str| std.fmt.parseInt(usize, str, 10) catch return HashSigError.InvalidJsonFormat,
-            else => return HashSigError.InvalidJsonFormat,
-        };
+        // Extract hash_len_fe (default to 8 for lifetime 2^32 if not present)
+        const hash_len_fe = if (pk_obj.get("hash_len_fe")) |hash_len_fe_val| blk: {
+            break :blk switch (hash_len_fe_val) {
+                .integer => |int| @as(usize, @intCast(int)),
+                .number_string => |str| std.fmt.parseInt(usize, str, 10) catch return HashSigError.InvalidJsonFormat,
+                else => return HashSigError.InvalidJsonFormat,
+            };
+        } else 8; // Default to 8 for lifetime 2^32
 
         // Create and return public key
         return hash_zig.signature.GeneralizedXMSSPublicKey.init(root, parameter, hash_len_fe);
