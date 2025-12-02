@@ -114,36 +114,15 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 - **Description**: Total number of valid attestations processed by fork choice.
 - **Type**: Counter
 - **Unit**: Count (u64)
-- **Labels**: None
+- **Labels**: source ("gossip attestation", "gossip block attestation")
 - **Sample Collection Event**: On successful attestation validation and processing
 
 #### `lean_attestations_invalid_total` (Counter)
 - **Description**: Total number of invalid attestations rejected by fork choice.
 - **Type**: Counter
 - **Unit**: Count (u64)
-- **Labels**: None
+- **Labels**: source ("gossip attestation", "gossip block attestation")
 - **Sample Collection Event**: On attestation validation failure
-
-#### `lean_attestations_invalid_from_future_gossip` (Counter)
-- **Description**: Number of invalid attestations rejected by fork choice due to being from the future (received via gossip).
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: None
-- **Sample Collection Event**: On attestation validation failure due to future slot (gossip)
-
-#### `lean_attestations_invalid_unknown_head_gossip` (Counter)
-- **Description**: Number of invalid attestations rejected by fork choice due to unknown head block (received via gossip).
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: None
-- **Sample Collection Event**: On attestation validation failure due to unknown head block (gossip)
-
-#### `lean_attestations_invalid_unknown_head_block` (Counter)
-- **Description**: Number of invalid attestations rejected by fork choice due to unknown head block (received via block).
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: None
-- **Sample Collection Event**: On attestation validation failure due to unknown head block (block)
 
 #### `lean_attestation_validation_time_seconds` (Histogram)
 - **Description**: Time taken to validate and process attestations in fork choice.

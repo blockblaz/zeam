@@ -145,15 +145,6 @@ fn observeFCAttestationValidationTimeHistogram(ctx: ?*anyopaque, value: f32) voi
     histogram.observe(value);
 }
 
-pub const AttestationInvalidReason = enum {
-    /// The attestation references a future slot (gossip validation only)
-    from_future_gossip,
-    /// The block root referenced by the attestation is unknown during gossip validation
-    unknown_head_gossip,
-    /// The block root referenced by the attestation is unknown during block validation
-    unknown_head_block,
-};
-
 /// Increments the lean_attestations_valid_total counter with appropriate label
 pub fn incrementLeanAttestationsValid(is_from_block: bool) void {
     if (!g_initialized or isZKVM()) return;
