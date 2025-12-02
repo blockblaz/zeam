@@ -581,12 +581,26 @@ fn processBlockStep(
     step_index: usize,
     step_obj: std.json.ObjectMap,
 ) !void {
-    const block_value = step_obj.get("block") orelse {
+    const block_wrapper = step_obj.get("block") orelse {
         std.debug.print(
             "fixture {s} case {s}{}: block step missing block field\n",
             .{ fixture_path, case_name, formatStep(step_index) },
         );
         return FixtureError.InvalidFixture;
+    };
+
+    const block_wrapper_obj: ?std.json.ObjectMap = switch (block_wrapper) {
+        .object => |map| map,
+        else => null,
+    };
+
+    const block_value = blk: {
+        if (block_wrapper_obj) |wrapper_obj| {
+            if (wrapper_obj.get("block")) |nested_block| {
+                break :blk nested_block;
+            }
+        }
+        break :blk block_wrapper;
     };
 
     var block = try buildBlock(ctx.allocator, fixture_path, case_name, block_value, step_index);
@@ -656,7 +670,7 @@ fn processBlockStep(
         return FixtureError.InvalidFixture;
     };
 
-    const proposer_attestation = buildProposerAttestation(block, block_root, parent_state_ptr) catch |err| {
+    var proposer_attestation = buildProposerAttestation(block, block_root, parent_state_ptr) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{}: unable to build proposer attestation ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -664,11 +678,44 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
+    if (block_wrapper_obj) |wrapper_obj| {
+        if (wrapper_obj.get("proposerAttestation")) |att_value| {
+            proposer_attestation = try parseFixtureProposerAttestation(
+                fixture_path,
+                case_name,
+                step_index,
+                att_value,
+            );
+        }
+    }
+
     const signed_attestation = types.SignedAttestation{
         .message = proposer_attestation,
         .signature = types.ZERO_SIGBYTES,
     };
     try ctx.fork_choice.onAttestation(signed_attestation, false);
+
+    if (block_wrapper_obj) |wrapper_obj| {
+        if (wrapper_obj.get("blockRootLabel")) |label_value| {
+            const label = switch (label_value) {
+                .string => |s| s,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{}: blockRootLabel must be string\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            ctx.label_map.put(ctx.allocator, label, block_root) catch |err| {
+                std.debug.print(
+                    "fixture {s} case {s}{}: failed to record blockRootLabel {s} ({s})\n",
+                    .{ fixture_path, case_name, formatStep(step_index), label, @errorName(err) },
+                );
+                return FixtureError.InvalidFixture;
+            };
+        }
+    }
 }
 
 fn processTickStep(
@@ -823,6 +870,11 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "lexicographicHeadAmong")) {
+            try verifyLexicographicHead(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
         std.debug.print(
             "fixture {s} case {s}{}: unsupported check {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), key },
@@ -941,6 +993,77 @@ fn verifyAttestationChecks(
     }
 }
 
+fn verifyLexicographicHead(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    const arr = switch (value) {
+        .array => |entries| entries,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{}: lexicographicHeadAmong must be array\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+
+    if (arr.items.len == 0) {
+        std.debug.print(
+            "fixture {s} case {s}{}: lexicographicHeadAmong cannot be empty\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.InvalidFixture;
+    }
+
+    var best_label: []const u8 = undefined;
+    var best_root: ?types.Root = null;
+
+    for (arr.items) |entry| {
+        const label = switch (entry) {
+            .string => |s| s,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{}: lexicographicHeadAmong entries must be strings\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+
+        const root = ctx.label_map.get(label) orelse {
+            std.debug.print(
+                "fixture {s} case {s}{}: lexicographicHeadAmong label {s} not found (missing prior headRootLabel?)\n",
+                .{ fixture_path, case_name, formatStep(step_index), label },
+            );
+            return FixtureError.InvalidFixture;
+        };
+
+        if (best_root) |best| {
+            if (std.mem.order(u8, &root, &best) == .gt) {
+                best_root = root;
+                best_label = label;
+            }
+        } else {
+            best_root = root;
+            best_label = label;
+        }
+    }
+
+    const expected_root = best_root orelse unreachable;
+    const head_root = ctx.fork_choice.head.blockRoot;
+    if (!std.mem.eql(u8, &head_root, &expected_root)) {
+        std.debug.print(
+            "fixture {s} case {s}{}: head root mismatch for lexicographicHeadAmong (expected label {s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), best_label },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+}
+
 fn buildProposerAttestation(
     block: types.BeamBlock,
     block_root: types.Root,
@@ -958,6 +1081,73 @@ fn buildProposerAttestation(
             },
         },
     };
+}
+
+fn parseFixtureProposerAttestation(
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!types.Attestation {
+    const att_obj = switch (value) {
+        .object => |map| map,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{}: proposerAttestation must be object\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+
+    var validator_label_buf: [96]u8 = undefined;
+    const validator_label = std.fmt.bufPrint(&validator_label_buf, "block.step[{d}].proposerAttestation.validatorId", .{step_index}) catch "proposerAttestation.validatorId";
+    const validator_id = try expectU64Field(att_obj, &.{ "validatorId", "validator_id" }, fixture_path, case_name, step_index, validator_label);
+
+    var data_label_buf: [96]u8 = undefined;
+    const data_label = std.fmt.bufPrint(&data_label_buf, "block.step[{d}].proposerAttestation.data", .{step_index}) catch "proposerAttestation.data";
+    const data_obj = try expectObjectField(att_obj, &.{"data"}, fixture_path, case_name, step_index, data_label);
+
+    var slot_label_buf: [96]u8 = undefined;
+    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{data_label}) catch "proposerAttestation.data.slot";
+    const data_slot = try expectU64Field(data_obj, &.{"slot"}, fixture_path, case_name, step_index, slot_label);
+
+    const head = try parseCheckpointField(data_obj, "head", fixture_path, case_name, step_index, data_label);
+    const target = try parseCheckpointField(data_obj, "target", fixture_path, case_name, step_index, data_label);
+    const source = try parseCheckpointField(data_obj, "source", fixture_path, case_name, step_index, data_label);
+
+    return types.Attestation{
+        .validator_id = validator_id,
+        .data = .{
+            .slot = data_slot,
+            .head = head,
+            .target = target,
+            .source = source,
+        },
+    };
+}
+
+fn parseCheckpointField(
+    parent: std.json.ObjectMap,
+    field: []const u8,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    label_prefix: []const u8,
+) FixtureError!types.Checkpoint {
+    var context_buf: [160]u8 = undefined;
+    const checkpoint_context = std.fmt.bufPrint(&context_buf, "{s}.{s}", .{ label_prefix, field }) catch field;
+    const checkpoint_obj = try expectObjectField(parent, &.{field}, fixture_path, case_name, step_index, checkpoint_context);
+
+    var root_label_buf: [192]u8 = undefined;
+    const root_label = std.fmt.bufPrint(&root_label_buf, "{s}.root", .{checkpoint_context}) catch "checkpoint.root";
+    var slot_label_buf: [192]u8 = undefined;
+    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{checkpoint_context}) catch "checkpoint.slot";
+
+    const root = try expectRootField(checkpoint_obj, &.{"root"}, fixture_path, case_name, step_index, root_label);
+    const slot = try expectU64Field(checkpoint_obj, &.{"slot"}, fixture_path, case_name, step_index, slot_label);
+
+    return .{ .root = root, .slot = slot };
 }
 
 fn buildBlock(
@@ -1169,7 +1359,16 @@ fn buildState(
                 const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
                 const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
 
-                validators.append(.{ .pubkey = pubkey, .index = idx }) catch |err| {
+                const validator_index: u64 = blk: {
+                    if (validator_obj.get("index")) |index_value| {
+                        var index_label_buf: [96]u8 = undefined;
+                        const index_label = std.fmt.bufPrint(&index_label_buf, "{s}.index", .{base_label}) catch "validator.index";
+                        break :blk try expect.expectU64Value(FixtureError, index_value, ctx, index_label);
+                    }
+                    break :blk @as(u64, @intCast(idx));
+                };
+
+                validators.append(.{ .pubkey = pubkey, .index = validator_index }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ fixture_path, case_name, idx, @errorName(err) },
