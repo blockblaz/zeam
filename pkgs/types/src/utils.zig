@@ -17,7 +17,7 @@ pub const ValidatorIndex = u64;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
-pub const SIGSIZE = 3116;
+pub const SIGSIZE = 3112;
 pub const SIGBYTES = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
