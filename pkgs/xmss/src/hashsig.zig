@@ -173,11 +173,13 @@ pub const KeyPair = struct {
             DEFAULT_LIFETIME,
             prf_key,
         ) catch return HashSigError.SchemeInitFailed;
-        errdefer scheme_ptr.deinit();
 
         // Regenerate the keypair using the same parameters
         // This will rebuild the Merkle trees from scratch
-        const keypair = scheme_ptr.keyGen(activation_epoch, num_active_epochs) catch {
+        const keypair = scheme_ptr.keyGen(activation_epoch, num_active_epochs) catch |err| {
+            std.debug.print("keyGen failed during fromJson: {any}\n", .{err});
+            // Clean up scheme before returning error
+            scheme_ptr.deinit();
             return HashSigError.KeyGenerationFailed;
         };
 
