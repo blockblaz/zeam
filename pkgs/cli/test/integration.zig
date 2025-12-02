@@ -540,7 +540,7 @@ test "SSE events integration test - wait for justification and finalization" {
 
     // Require justification (finalization is optional as it requires more chain progression)
     try std.testing.expect(got_justification);
-    
+
     // Finalization is expected but not required (can be flaky in CI due to timing)
     if (!got_finalization) {
         std.debug.print("WARNING: No finalization event received (this can happen in CI with slow key generation)\n", .{});
