@@ -157,6 +157,9 @@ pub const Node = struct {
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
         errdefer self.key_manager.deinit();
 
+        // Initialize logger BEFORE loadValidatorKeypairs so it can log
+        self.logger = options.logger_config.logger(.node);
+
         try self.loadValidatorKeypairs(num_validators);
 
         try self.beam_node.init(allocator, .{
@@ -170,8 +173,6 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
         });
-
-        self.logger = options.logger_config.logger(.node);
     }
 
     pub fn deinit(self: *Self) void {
@@ -322,6 +323,8 @@ pub const Node = struct {
             defer self.allocator.free(pk_ssz_path);
             const sk_ssz_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.ssz", .{ hash_sig_key_dir, validator_index });
             defer self.allocator.free(sk_ssz_path);
+
+            self.logger.info("Loading hash-sig keys for validator {d}: pk={s}, sk={s}", .{ validator_index, pk_ssz_path, sk_ssz_path });
 
             // Check if SSZ files exist
             const ssz_exists = blk: {

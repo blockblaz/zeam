@@ -77,30 +77,47 @@ pub const KeyPair = struct {
         secret_key_ssz: []const u8,
         public_key_ssz: []const u8,
     ) HashSigError!Self {
-        // Deserialize public key from SSZ
-        const public_key = hash_zig.signature.GeneralizedXMSSPublicKey.fromBytes(public_key_ssz, null) catch {
-            return HashSigError.DeserializationFailed;
-        };
+        _ = public_key_ssz; // Public key file not used - we derive it from secret key
+        std.debug.print("[HASH-ZIG-LOAD] fromSSZ: Starting key load, sk_len={d}\n", .{secret_key_ssz.len});
 
-        // Deserialize secret key from SSZ (includes full trees from leansig)
-        var secret_key_data: hash_zig.signature.GeneralizedXMSSSecretKey = undefined;
-        hash_zig.signature.GeneralizedXMSSSecretKey.sszDecode(secret_key_ssz, &secret_key_data, allocator) catch |err| {
-            std.debug.print("SSZ deserialization failed: {any}, data len={d}\n", .{ err, secret_key_ssz.len });
-            return HashSigError.DeserializationFailed;
-        };
+        // Deserialize secret key from SSZ (includes full trees)
+        std.debug.print("[HASH-ZIG-LOAD] fromSSZ: Deserializing secret key with trees\n", .{});
 
-        // Create a heap-allocated secret key
+        // Allocate secret key on heap first
         const secret_key = try allocator.create(hash_zig.signature.GeneralizedXMSSSecretKey);
-        secret_key.* = secret_key_data;
+        errdefer allocator.destroy(secret_key);
 
-        // Initialize scheme (not needed for signing since we have the full trees)
+        // Deserialize the full secret key (including trees) from SSZ
+        hash_zig.signature.GeneralizedXMSSSecretKey.sszDecode(secret_key_ssz, secret_key, allocator) catch |err| {
+            std.debug.print("[HASH-ZIG-LOAD] fromSSZ: Secret key SSZ deserialization FAILED: {any}, data len={d}\n", .{ err, secret_key_ssz.len });
+            allocator.destroy(secret_key);
+            return HashSigError.DeserializationFailed;
+        };
+        std.debug.print("[HASH-ZIG-LOAD] fromSSZ: Secret key deserialized, trees loaded\n", .{});
+
+        // Derive public key from secret key's top tree root (not from file!)
+        // The public key is: root = top_tree.root(), parameter = secret_key.parameter
+        const top_tree_root = secret_key.top_tree.root();
+        const hash_len_fe: usize = switch (DEFAULT_LIFETIME) {
+            .lifetime_2_8 => 8,
+            .lifetime_2_18 => 7,
+            .lifetime_2_32 => 8,
+        };
+        const public_key = hash_zig.signature.GeneralizedXMSSPublicKey.init(top_tree_root, secret_key.parameter, hash_len_fe);
+        std.debug.print("[HASH-ZIG-LOAD] fromSSZ: Derived public key from secret key's top tree root\n", .{});
+
+        // Initialize scheme with just the lifetime - we don't need to pass PRF key as seed!
+        // The secret key already contains the PRF key, parameter, and all trees.
         const scheme_ptr = GeneralizedXMSSSignatureScheme.init(
             allocator,
             DEFAULT_LIFETIME,
         ) catch {
             secret_key.deinit();
+            allocator.destroy(secret_key);
             return HashSigError.SchemeInitFailed;
         };
+
+        std.debug.print("[HASH-ZIG-LOAD] fromSSZ: ✅ Using deserialized trees directly (no regeneration)\n", .{});
 
         return Self{
             .scheme = scheme_ptr,
@@ -313,8 +330,19 @@ pub const KeyPair = struct {
         }
 
         std.debug.print("[HASH-ZIG-SIGN] Signing message for epoch {d}\n", .{epoch});
-        const message_array: *const [32]u8 = message[0..32];
-        const signature_ptr = self.scheme.sign(self.secret_key, epoch, message_array.*) catch |err| {
+        std.debug.print("[HASH-ZIG-SIGN] Message hash: {s}\n", .{std.fmt.fmtSliceHexLower(message)});
+        std.debug.print("[HASH-ZIG-SIGN] Public key root[0]: 0x{x:0>8}, param[0]: 0x{x:0>8}\n", .{
+            self.public_key.getRoot()[0].value,
+            self.public_key.getParameter()[0].value,
+        });
+        std.debug.print("[HASH-ZIG-SIGN] Secret key activation_epoch: {}, num_active_epochs: {}\n", .{
+            self.secret_key.activation_epoch,
+            self.secret_key.num_active_epochs,
+        });
+        // Convert message slice to array value (same pattern as cross_lang_zig_tool.zig)
+        var msg_bytes: [32]u8 = undefined;
+        @memcpy(&msg_bytes, message[0..32]);
+        const signature_ptr = self.scheme.sign(self.secret_key, epoch, msg_bytes) catch |err| {
             std.debug.print("[HASH-ZIG-SIGN] ERROR: Signing failed for epoch {d}: {any}\n", .{ epoch, err });
             return HashSigError.SigningFailed;
         };
@@ -339,8 +367,14 @@ pub const KeyPair = struct {
         }
 
         std.debug.print("[HASH-ZIG-VERIFY] Verifying signature for epoch {d}\n", .{epoch});
-        const message_array: *const [32]u8 = message[0..32];
-        const is_valid = self.scheme.verify(&self.public_key, epoch, message_array.*, signature.inner) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] Public key root[0]: 0x{x:0>8}, param[0]: 0x{x:0>8}\n", .{
+            self.public_key.getRoot()[0].value,
+            self.public_key.getParameter()[0].value,
+        });
+        // Convert message slice to array value (same pattern as cross_lang_zig_tool.zig)
+        var msg_bytes: [32]u8 = undefined;
+        @memcpy(&msg_bytes, message[0..32]);
+        const is_valid = self.scheme.verify(&self.public_key, epoch, msg_bytes, signature.inner) catch |err| {
             std.debug.print("[HASH-ZIG-VERIFY] ERROR: Verification failed for epoch {d}: {any}\n", .{ epoch, err });
             return HashSigError.VerificationFailed;
         };
@@ -431,7 +465,8 @@ pub fn verifySsz(
 
     std.debug.print("[HASH-ZIG-VERIFY] Starting SSZ verification for epoch {d}, pubkey_len={d}, sig_len={d}\n", .{ epoch, pubkey_bytes.len, signature_bytes.len });
     std.debug.print("[HASH-ZIG-VERIFY] Message hash: {s}\n", .{std.fmt.fmtSliceHexLower(message)});
-    std.debug.print("[HASH-ZIG-VERIFY] Pubkey (first 20 bytes): {s}\n", .{std.fmt.fmtSliceHexLower(pubkey_bytes[0..20])});
+    const pubkey_preview_len = @min(20, pubkey_bytes.len);
+    std.debug.print("[HASH-ZIG-VERIFY] Pubkey (first {d} bytes): {s}\n", .{ pubkey_preview_len, std.fmt.fmtSliceHexLower(pubkey_bytes[0..pubkey_preview_len]) });
     std.debug.print("[HASH-ZIG-VERIFY] Signature (first 20 bytes): {s}\n", .{std.fmt.fmtSliceHexLower(signature_bytes[0..20])});
 
     // Use page allocator for temporary scheme instance
@@ -444,37 +479,46 @@ pub fn verifySsz(
     };
     defer scheme.deinit();
 
-    // Deserialize public key.
-    // In genesis / validator registry we store the 52-byte raw public key, while
-    // internal tests often use full SSZ-encoded public keys. Support both:
+    // Deserialize public key from SSZ (52 bytes = root + parameter)
+    // Both fromBytes() and sszDecode() should work identically for this
+    std.debug.print("[HASH-ZIG-VERIFY] Attempting SSZ decode of {d}-byte pubkey\n", .{pubkey_bytes.len});
     var public_key: hash_zig.signature.GeneralizedXMSSPublicKey = undefined;
-    if (pubkey_bytes.len == 52) {
-        // Raw encoding (root + parameter) coming from validators.yaml (leansig format).
-        public_key = hash_zig.signature.GeneralizedXMSSPublicKey.fromBytes(pubkey_bytes, null) catch |err| {
-            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key fromBytes failed: {any}\n", .{err});
-            return HashSigError.DeserializationFailed;
-        };
-    } else {
-        // Full SSZ encoding (used by xmss tests and some internal callers).
-        hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch |err| {
-            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key SSZ deserialization failed: {any}\n", .{err});
-            return HashSigError.DeserializationFailed;
-        };
-    }
+
+    // Try SSZ decode with detailed error tracking
+    hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key SSZ deserialization failed: {any}\n", .{err});
+        std.debug.print("[HASH-ZIG-VERIFY]        Pubkey bytes: {s}\n", .{std.fmt.fmtSliceHexLower(pubkey_bytes)});
+        return HashSigError.DeserializationFailed;
+    };
+
+    std.debug.print("[HASH-ZIG-VERIFY] Pubkey SSZ decode SUCCESS\n", .{});
+    std.debug.print("[HASH-ZIG-VERIFY] Pubkey deserialized: root[0]=0x{x:0>8}, param[0]=0x{x:0>8}\n", .{
+        public_key.getRoot()[0].value,
+        public_key.getParameter()[0].value,
+    });
 
     // Deserialize signature from SSZ
+    std.debug.print("[HASH-ZIG-VERIFY] Attempting signature SSZ decode\n", .{});
     var signature = hash_zig.signature.GeneralizedXMSSSignature.fromBytes(signature_bytes, allocator) catch |err| {
         std.debug.print("[HASH-ZIG-VERIFY] ERROR: Signature deserialization failed: {any}\n", .{err});
         return HashSigError.DeserializationFailed;
     };
     defer signature.deinit();
+    std.debug.print("[HASH-ZIG-VERIFY] Signature SSZ decode SUCCESS\n", .{});
+    std.debug.print("[HASH-ZIG-VERIFY] Signature deserialized: path_nodes={d}, hashes_len={d}, rho[0]=0x{x:0>8}\n", .{
+        signature.getPath().getNodes().len,
+        signature.getHashes().len,
+        signature.getRho()[0].value,
+    });
 
     // Verify
+    std.debug.print("[HASH-ZIG-VERIFY] Starting verification call\n", .{});
     const message_array: *const [32]u8 = message[0..32];
     const is_valid = scheme.verify(&public_key, epoch, message_array.*, signature) catch |err| {
         std.debug.print("[HASH-ZIG-VERIFY] ERROR: Verification check failed for epoch {d}: {any}\n", .{ epoch, err });
         return HashSigError.VerificationFailed;
     };
+    std.debug.print("[HASH-ZIG-VERIFY] Verification call completed, is_valid={}\n", .{is_valid});
 
     if (!is_valid) {
         std.debug.print("[HASH-ZIG-VERIFY] FAILED: Invalid signature for epoch {d}\n", .{epoch});

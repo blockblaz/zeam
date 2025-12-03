@@ -103,6 +103,14 @@ pub fn verifySingleAttestation(
     const validator = &validators[validatorIndex];
     const pubkey = validator.getPubkey();
 
+    // Log the pubkey being used for verification (first 20 bytes as hex)
+    const xmss_lib = @import("@zeam/xmss");
+    _ = xmss_lib;
+    std.debug.print("[VERIFY-DEBUG] Validator {d} pubkey from registry (first 20 bytes): {s}\n", .{
+        validatorIndex,
+        std.fmt.fmtSliceHexLower(pubkey[0..@min(20, pubkey.len)]),
+    });
+
     var message: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
 
