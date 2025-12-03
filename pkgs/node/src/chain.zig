@@ -25,6 +25,9 @@ const constants = @import("./constants.zig");
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
 
+const node_registry = @import("./node_registry.zig");
+pub const NodeNameRegistry = node_registry.NodeNameRegistry;
+
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
@@ -40,6 +43,7 @@ pub const ChainOpts = struct {
     nodeId: u32,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
+    node_registry: *const NodeNameRegistry,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -75,8 +79,15 @@ pub const BeamChain = struct {
     last_emitted_justified_slot: u64 = 0,
     last_emitted_finalized_slot: u64 = 0,
     connected_peers: *const std.StringHashMap(PeerInfo),
+    node_registry: *const NodeNameRegistry,
 
     const Self = @This();
+
+    /// Helper to get node name for logging from validator index if available
+    fn getNodeNameForLog(self: *const Self, validator_index: usize) ?[]const u8 {
+        return self.node_registry.getNodeNameFromValidatorIndex(validator_index);
+    }
+
     pub fn init(
         allocator: Allocator,
         opts: ChainOpts,
@@ -109,6 +120,7 @@ pub const BeamChain = struct {
             .last_emitted_justified_slot = 0,
             .last_emitted_finalized_slot = 0,
             .connected_peers = connected_peers,
+            .node_registry = opts.node_registry,
         };
     }
 
@@ -328,10 +340,11 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.info("chain received gossip block for slot={any} blockroot={any} hasBlock={any}", .{
-                    //
+                self.module_logger.info("{}chain received gossip block for slot={any} blockroot={any} proposer={d} hasBlock={any}", .{
+                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(block.proposer_index)),
                     block.slot,
                     std.fmt.fmtSliceHexLower(&block_root),
+                    block.proposer_index,
                     hasBlock,
                 });
 
@@ -443,7 +456,11 @@ pub const BeamChain = struct {
                     try missing_roots.append(attestation.data.head.root);
                 }
 
-                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{ attestation.validator_id, e });
+                self.module_logger.err("{}invalid attestation in block: validator={d} error={any}", .{
+                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(attestation.validator_id)),
+                    attestation.validator_id,
+                    e,
+                });
                 // Skip invalid attestations but continue processing the block
                 continue;
             };
@@ -749,7 +766,8 @@ pub const BeamChain = struct {
             return AttestationValidationError.AttestationTooFarInFuture;
         }
 
-        self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
+        self.module_logger.debug("{}Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
+            zeam_utils.OptionalNode.init(self.getNodeNameForLog(attestation.validator_id)),
             attestation.validator_id,
             data.slot,
             data.source.slot,
@@ -834,7 +852,13 @@ test "process and add mock blocks into a node's chain" {
     const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
     connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
@@ -910,8 +934,14 @@ test "printSlot output demonstration" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db }, &std.StringHashMap(PeerInfo).init(allocator));
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, &std.StringHashMap(PeerInfo).init(allocator));
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
@@ -982,7 +1012,13 @@ test "attestation validation - comprehensive" {
     const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
     connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain (slots 1 and 2)
@@ -1268,7 +1304,13 @@ test "attestation validation - gossip vs block future slot handling" {
     const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
     connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
     // Add one block (slot 1)
@@ -1364,7 +1406,13 @@ test "attestation processing - valid block attestation" {
     const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
     connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
 
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db }, connected_peers);
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
     // Add blocks to chain

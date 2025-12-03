@@ -70,6 +70,7 @@ pub const NodeOptions = struct {
     logger_config: *LoggerConfig,
     database_path: []const u8,
     hash_sig_key_dir: []const u8,
+    node_registry: *node_lib.NodeNameRegistry,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -77,6 +78,8 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_indices);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
+        self.node_registry.deinit();
+        allocator.destroy(self.node_registry);
     }
 };
 
@@ -169,6 +172,7 @@ pub const Node = struct {
             .key_manager = &self.key_manager,
             .db = db,
             .logger_config = options.logger_config,
+            .node_registry = options.node_registry,
         });
 
         self.logger = options.logger_config.logger(.node);
@@ -424,6 +428,18 @@ pub fn buildStartOptions(
         "/",
         node_cmd.@"sig-keys-dir",
     });
+
+    // Build node name registry (replace empty registry with populated one)
+    opts.node_registry.deinit(); // Clean up the empty registry
+    if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode")) {
+        // Keep empty registry for genesis bootnode
+        opts.node_registry.* = node_lib.NodeNameRegistry.init(allocator);
+    } else {
+        opts.node_registry.* = buildNodeNameRegistry(allocator, validator_config_filepath, validators_filepath) catch |err| blk: {
+            std.log.warn("Failed to build node name registry: {any}", .{err});
+            break :blk node_lib.NodeNameRegistry.init(allocator);
+        };
+    }
 
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
@@ -728,6 +744,93 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
+/// Build a NodeNameRegistry from validator-config.yaml and validators.yaml
+/// This creates mappings from peer IDs and validator indices to node names
+pub fn buildNodeNameRegistry(
+    allocator: std.mem.Allocator,
+    validator_config_path: []const u8,
+    validators_path: []const u8,
+) !node_lib.NodeNameRegistry {
+    var registry = node_lib.NodeNameRegistry.init(allocator);
+    errdefer registry.deinit();
+
+    // Parse validator-config.yaml to get node names and their ENRs/privkeys
+    var parsed_validator_config = try utils_lib.loadFromYAMLFile(allocator, validator_config_path);
+    defer parsed_validator_config.deinit(allocator);
+
+    // Parse validators.yaml to get validator indices for each node
+    var parsed_validators = try utils_lib.loadFromYAMLFile(allocator, validators_path);
+    defer parsed_validators.deinit(allocator);
+
+    const validators_list = parsed_validator_config.docs.items[0].map.get("validators");
+    if (validators_list == null) return registry;
+
+    for (validators_list.?.list) |entry| {
+        const name_value = entry.map.get("name");
+        if (name_value == null or name_value.? != .string) continue;
+        const node_name = name_value.?.string;
+
+        // Get peer ID from ENR or private key
+        const peer_id_str = blk: {
+            var peer_id_buf: [256]u8 = undefined;
+            // Try to get ENR first
+            if (entry.map.get("enr")) |enr_value| {
+                if (enr_value == .string) {
+                    var enr: ENR = undefined;
+                    ENR.decodeTxtInto(&enr, enr_value.string) catch break :blk null;
+                    const pid = enr.peerId(allocator) catch break :blk null;
+                    const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                    const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                    break :blk pid_str;
+                }
+            }
+
+            // Try to construct ENR from privkey and enrFields
+            if (entry.map.get("privkey")) |privkey_value| {
+                if (privkey_value == .string) {
+                    const enr_fields_value = entry.map.get("enrFields");
+                    if (enr_fields_value != null) {
+                        var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
+                        defer enr_fields.deinit(allocator);
+                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields) catch break :blk null;
+                        defer enr.deinit();
+                        const pid = enr.peerId(allocator) catch break :blk null;
+                        const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                        const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                        break :blk pid_str;
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        // Add peer ID mapping if we got a valid peer ID string
+        if (peer_id_str) |pid_str| {
+            defer allocator.free(pid_str);
+            registry.addPeerMapping(pid_str, node_name) catch |err| {
+                std.log.warn("Failed to add peer mapping for node {s}: {any}", .{ node_name, err });
+            };
+        }
+
+        // Add validator index mappings
+        const node_validators = parsed_validators.docs.items[0].map.get(node_name);
+        if (node_validators) |validators| {
+            if (validators == .list) {
+                for (validators.list) |item| {
+                    if (item == .int) {
+                        const validator_index: usize = @intCast(item.int);
+                        registry.addValidatorMapping(validator_index, node_name) catch |err| {
+                            std.log.warn("Failed to add validator mapping for node {s} index {d}: {any}", .{ node_name, validator_index, err });
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    return registry;
+}
+
 test "configs yaml parsing" {
     var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
     defer config_file.deinit(std.testing.allocator);
@@ -860,4 +963,34 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
     defer allocator.free(state_root_from_genesis_hex);
     try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
+}
+
+test "buildNodeNameRegistry" {
+    const allocator = std.testing.allocator;
+
+    const validator_config_path = "pkgs/cli/test/fixtures/validator-config.yaml";
+    const validators_path = "pkgs/cli/test/fixtures/validators.yaml";
+
+    // Build the registry from test fixtures
+    var registry = try buildNodeNameRegistry(allocator, validator_config_path, validators_path);
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 9), registry.validator_index_to_name.count());
+    try std.testing.expectEqual(@as(usize, 3), registry.peer_id_to_name.count());
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(1).?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(4).?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(7).?);
+
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(0).?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(3).?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(6).?);
+
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(2).?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(5).?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(8).?);
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").?);
 }

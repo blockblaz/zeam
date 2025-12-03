@@ -320,6 +320,30 @@ pub const ModuleLogger = struct {
     }
 };
 
+/// Formatter for optional node names in logs
+/// Usage: logger.info("{}message", .{OptionalNode.init(maybe_node_name)})
+/// Outputs: "message" or "(node: node1) message"
+pub const OptionalNode = struct {
+    name: ?[]const u8,
+
+    pub fn init(name: ?[]const u8) OptionalNode {
+        return .{ .name = name };
+    }
+
+    pub fn format(
+        self: OptionalNode,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        if (self.name) |n| {
+            try writer.print("(node: {s}) ", .{n});
+        }
+    }
+};
+
 pub fn getScopedLoggerConfig(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
     return ZeamLoggerConfig.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
@@ -442,4 +466,65 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
         .utils => "utils",
         .validator => "validator",
     };
+}
+
+test "OptionalNode formatter" {
+    const testing = std.testing;
+    var buffer: [256]u8 = undefined;
+
+    // Test with node name present
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
+            OptionalNode.init("alice"),
+            "peer123",
+            5,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(node: alice) Peer connected: peer123, total peers: 5", result);
+    }
+
+    // Test with node name null
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
+            OptionalNode.init(null),
+            "peer456",
+            3,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", result);
+    }
+
+    // Test in different positions
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{}Published block: slot={d} proposer={d}", .{
+            OptionalNode.init("validator-7"),
+            100,
+            7,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(node: validator-7) Published block: slot=100 proposer=7", result);
+    }
+
+    // Test with empty string (should still format)
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{}Message", .{OptionalNode.init("")});
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(node: ) Message", result);
+    }
 }
