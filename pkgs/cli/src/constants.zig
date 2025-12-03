@@ -23,3 +23,6 @@ pub const DEFAULT_NODE_KEY: []const u8 = "./key";
 
 /// Maximum size (in bytes) for hash-sig key JSON blobs ingested by the CLI
 pub const MAX_HASH_SIG_KEY_JSON_SIZE: usize = 128 * 1024 * 1024;
+
+/// Maximum size (in bytes) for hash-sig key SSZ blobs ingested by the CLI
+pub const MAX_HASH_SIG_KEY_SSZ_SIZE: usize = 128 * 1024 * 1024;

@@ -168,6 +168,48 @@ pub unsafe extern "C" fn hashsig_keypair_from_json(
     }
 }
 
+/// Reconstruct a key pair from SSZ-encoded secret and public keys
+/// Returns a pointer to the KeyPair or null on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_keypair_from_ssz(
+    secret_key_ptr: *const u8,
+    secret_key_len: usize,
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+) -> *mut KeyPair {
+    if secret_key_ptr.is_null() || public_key_ptr.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let sk_slice = slice::from_raw_parts(secret_key_ptr, secret_key_len);
+        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
+
+        let private_key: HashSigPrivateKey = match HashSigPrivateKey::from_ssz_bytes(sk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let public_key: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let keypair = Box::new(KeyPair {
+            public_key: PublicKey::new(public_key),
+            private_key: PrivateKey::new(private_key),
+        });
+
+        Box::into_raw(keypair)
+    }
+}
+
 /// Free a key pair
 /// # Safety
 /// This is meant to be called from zig, so the pointers will always dereference correctly
@@ -323,6 +365,36 @@ pub unsafe extern "C" fn hashsig_pubkey_to_bytes(
 
         // Directly SSZ encode the public key (leansig has SSZ support built-in)
         let ssz_bytes = keypair_ref.public_key.inner.as_ssz_bytes();
+
+        if ssz_bytes.len() > buffer_len {
+            return 0;
+        }
+
+        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
+        output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
+        ssz_bytes.len()
+    }
+}
+
+/// Serialize a private key to bytes using SSZ encoding
+/// Returns number of bytes written, or 0 on error
+/// # Safety
+/// buffer must point to a valid buffer of sufficient size
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_privkey_to_bytes(
+    keypair: *const KeyPair,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> usize {
+    if keypair.is_null() || buffer.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        let keypair_ref = &*keypair;
+
+        // Directly SSZ encode the private key (leansig has SSZ support built-in)
+        let ssz_bytes = keypair_ref.private_key.inner.as_ssz_bytes();
 
         if ssz_bytes.len() > buffer_len {
             return 0;

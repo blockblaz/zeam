@@ -22,6 +22,14 @@ extern fn hashsig_keypair_from_json(
     public_key_len: usize,
 ) ?*HashSigKeyPair;
 
+/// Reconstruct a key pair from SSZ-encoded bytes
+extern fn hashsig_keypair_from_ssz(
+    secret_key_ssz: [*]const u8,
+    secret_key_len: usize,
+    public_key_ssz: [*]const u8,
+    public_key_len: usize,
+) ?*HashSigKeyPair;
+
 /// Free a key pair
 extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
 
@@ -57,6 +65,13 @@ extern fn hashsig_signature_to_bytes(
 
 /// Serialize a public key to bytes using SSZ encoding
 extern fn hashsig_pubkey_to_bytes(
+    keypair: *const HashSigKeyPair,
+    buffer: [*]u8,
+    buffer_len: usize,
+) usize;
+
+/// Serialize a private key to bytes using SSZ encoding
+extern fn hashsig_privkey_to_bytes(
     keypair: *const HashSigKeyPair,
     buffer: [*]u8,
     buffer_len: usize,
@@ -149,6 +164,31 @@ pub const KeyPair = struct {
             secret_key_json.len,
             public_key_json.ptr,
             public_key_json.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
+        };
+
+        return Self{
+            .handle = handle,
+            .allocator = allocator,
+        };
+    }
+
+    /// Reconstruct a key pair from SSZ-encoded bytes
+    pub fn fromSsz(
+        allocator: Allocator,
+        secret_key_ssz: []const u8,
+        public_key_ssz: []const u8,
+    ) HashSigError!Self {
+        if (secret_key_ssz.len == 0 or public_key_ssz.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_keypair_from_ssz(
+            secret_key_ssz.ptr,
+            secret_key_ssz.len,
+            public_key_ssz.ptr,
+            public_key_ssz.len,
         ) orelse {
             return HashSigError.DeserializationFailed;
         };
