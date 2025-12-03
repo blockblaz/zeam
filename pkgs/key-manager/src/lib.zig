@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 
 const KeyManagerError = error{
     ValidatorKeyNotFound,
+    SignatureMismatch,
 };
 
 const CachedKeyPair = struct {
@@ -108,8 +109,14 @@ pub const KeyManager = struct {
         var sig_buffer: types.SIGBYTES = undefined;
         const bytes_written = try signature.toBytes(&sig_buffer);
 
+        std.debug.print("[SIGN-DEBUG] Signature serialized: bytes_written={d}, SIGSIZE={d}\n", .{ bytes_written, types.SIGSIZE });
+
         if (bytes_written < types.SIGSIZE) {
+            std.debug.print("[SIGN-DEBUG] Zero-padding {d} bytes\n", .{types.SIGSIZE - bytes_written});
             @memset(sig_buffer[bytes_written..], 0);
+        } else if (bytes_written > types.SIGSIZE) {
+            std.debug.print("[SIGN-DEBUG] ERROR: Signature too large! bytes_written={d} > SIGSIZE={d}\n", .{ bytes_written, types.SIGSIZE });
+            return KeyManagerError.SignatureMismatch;
         }
 
         return sig_buffer;

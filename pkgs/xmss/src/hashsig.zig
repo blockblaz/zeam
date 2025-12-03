@@ -430,6 +430,9 @@ pub fn verifySsz(
     }
 
     std.debug.print("[HASH-ZIG-VERIFY] Starting SSZ verification for epoch {d}, pubkey_len={d}, sig_len={d}\n", .{ epoch, pubkey_bytes.len, signature_bytes.len });
+    std.debug.print("[HASH-ZIG-VERIFY] Message hash: {s}\n", .{std.fmt.fmtSliceHexLower(message)});
+    std.debug.print("[HASH-ZIG-VERIFY] Pubkey (first 20 bytes): {s}\n", .{std.fmt.fmtSliceHexLower(pubkey_bytes[0..20])});
+    std.debug.print("[HASH-ZIG-VERIFY] Signature (first 20 bytes): {s}\n", .{std.fmt.fmtSliceHexLower(signature_bytes[0..20])});
 
     // Use page allocator for temporary scheme instance
     const allocator = std.heap.page_allocator;
@@ -441,12 +444,23 @@ pub fn verifySsz(
     };
     defer scheme.deinit();
 
-    // Deserialize public key from SSZ
+    // Deserialize public key.
+    // In genesis / validator registry we store the 52-byte raw public key, while
+    // internal tests often use full SSZ-encoded public keys. Support both:
     var public_key: hash_zig.signature.GeneralizedXMSSPublicKey = undefined;
-    hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch |err| {
-        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key deserialization failed: {any}\n", .{err});
-        return HashSigError.DeserializationFailed;
-    };
+    if (pubkey_bytes.len == 52) {
+        // Raw encoding (root + parameter) coming from validators.yaml (leansig format).
+        public_key = hash_zig.signature.GeneralizedXMSSPublicKey.fromBytes(pubkey_bytes, null) catch |err| {
+            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key fromBytes failed: {any}\n", .{err});
+            return HashSigError.DeserializationFailed;
+        };
+    } else {
+        // Full SSZ encoding (used by xmss tests and some internal callers).
+        hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch |err| {
+            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key SSZ deserialization failed: {any}\n", .{err});
+            return HashSigError.DeserializationFailed;
+        };
+    }
 
     // Deserialize signature from SSZ
     var signature = hash_zig.signature.GeneralizedXMSSSignature.fromBytes(signature_bytes, allocator) catch |err| {
