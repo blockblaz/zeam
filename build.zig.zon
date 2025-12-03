@@ -45,7 +45,7 @@
         },
         .@"hash-zig" = .{
             .url = "https://github.com/blockblaz/hash-zig/archive/refs/heads/master.tar.gz",
-            .hash = "1220f4044726ed5c8a93ff1ab3eb4b5dcb3138880e75d440e2e3ae54fded14255f9f",
+            .hash = "1220c5c9b251dc8727f2f693a9714f1753100f9fdf5688fe1b35427cb0ce242bbafe",
         },
     },
     .paths = .{""},

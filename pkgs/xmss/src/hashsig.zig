@@ -70,8 +70,8 @@ pub const KeyPair = struct {
         };
     }
 
-    /// Reconstruct a key pair from SSZ-serialized bytes
-    /// Note: For secret keys, this requires re-running keyGen since trees aren't serialized
+    /// Reconstruct a key pair from SSZ-serialized bytes (leansig format)
+    /// Loads the full Merkle trees from the SSZ file
     pub fn fromSSZ(
         allocator: Allocator,
         secret_key_ssz: []const u8,
@@ -82,70 +82,30 @@ pub const KeyPair = struct {
             return HashSigError.DeserializationFailed;
         };
 
-        // For secret key, we need to extract metadata and regenerate trees
-        // SSZ format: prf_key (32) + parameter (20) + activation_epoch (8) + num_active_epochs (8)
-        if (secret_key_ssz.len < 68) return HashSigError.DeserializationFailed;
+        // Deserialize secret key from SSZ (includes full trees from leansig)
+        var secret_key_data: hash_zig.signature.GeneralizedXMSSSecretKey = undefined;
+        hash_zig.signature.GeneralizedXMSSSecretKey.sszDecode(secret_key_ssz, &secret_key_data, allocator) catch |err| {
+            std.debug.print("SSZ deserialization failed: {any}, data len={d}\n", .{ err, secret_key_ssz.len });
+            return HashSigError.DeserializationFailed;
+        };
+        
+        // Create a heap-allocated secret key
+        const secret_key = try allocator.create(hash_zig.signature.GeneralizedXMSSSecretKey);
+        secret_key.* = secret_key_data;
 
-        var offset: usize = 0;
-
-        // Extract prf_key (32 bytes)
-        var prf_key: [32]u8 = undefined;
-        @memcpy(&prf_key, secret_key_ssz[offset .. offset + 32]);
-        offset += 32;
-
-        // Extract parameter (5 x u32 = 20 bytes)
-        var parameter: [5]hash_zig.FieldElement = undefined;
-        for (0..5) |i| {
-            const bytes = secret_key_ssz[offset .. offset + 4];
-            const val = std.mem.readInt(u32, bytes[0..4], .little);
-            parameter[i] = hash_zig.FieldElement.fromCanonical(val);
-            offset += 4;
-        }
-
-        // Extract activation_epoch (8 bytes)
-        const activation_epoch_bytes = secret_key_ssz[offset .. offset + 8];
-        const activation_epoch = std.mem.readInt(u64, activation_epoch_bytes[0..8], .little);
-        offset += 8;
-
-        // Extract num_active_epochs (8 bytes)
-        const num_active_epochs_bytes = secret_key_ssz[offset .. offset + 8];
-        const num_active_epochs = std.mem.readInt(u64, num_active_epochs_bytes[0..8], .little);
-
-        // Initialize scheme (we don't need to seed it since we're providing the exact parameters)
+        // Initialize scheme (not needed for signing since we have the full trees)
         const scheme_ptr = GeneralizedXMSSSignatureScheme.init(
             allocator,
             DEFAULT_LIFETIME,
-        ) catch return HashSigError.SchemeInitFailed;
-
-        // Regenerate the keypair using the extracted parameters
-        // Use keyGenWithParameter to provide the exact prf_key and parameter from SSZ
-        const keypair = scheme_ptr.keyGenWithParameter(
-            @intCast(activation_epoch),
-            @intCast(num_active_epochs),
-            parameter,
-            prf_key,
-            false, // rng_already_consumed = false since we're reconstructing
-        ) catch |err| {
-            std.debug.print("keyGenWithParameter failed during fromSSZ: {any}\n", .{err});
-            scheme_ptr.deinit();
-            return HashSigError.KeyGenerationFailed;
+        ) catch {
+            secret_key.deinit();
+            return HashSigError.SchemeInitFailed;
         };
-
-        // Verify the regenerated public key matches the stored one
-        const regenerated_root = keypair.public_key.getRoot();
-        const stored_root = public_key.getRoot();
-        for (regenerated_root, stored_root) |regen, stored| {
-            if (regen.value != stored.value) {
-                keypair.secret_key.deinit();
-                scheme_ptr.deinit();
-                return HashSigError.PublicKeyMismatch;
-            }
-        }
 
         return Self{
             .scheme = scheme_ptr,
-            .secret_key = keypair.secret_key,
-            .public_key = keypair.public_key,
+            .secret_key = secret_key,
+            .public_key = public_key,
             .allocator = allocator,
             .owns_scheme = true,
         };
@@ -231,20 +191,22 @@ pub const KeyPair = struct {
             return HashSigError.InvalidJsonFormat;
         };
 
-        // Initialize scheme (we don't need to seed it since we're providing the exact parameters)
-        const scheme_ptr = GeneralizedXMSSSignatureScheme.init(
+        // Initialize scheme with the prf_key as seed to ensure deterministic tree generation
+        const scheme_ptr = GeneralizedXMSSSignatureScheme.initWithSeed(
             allocator,
             DEFAULT_LIFETIME,
+            prf_key,
         ) catch return HashSigError.SchemeInitFailed;
 
         // Regenerate the keypair using the extracted parameters
         // Use keyGenWithParameter to provide the exact prf_key and parameter from JSON
+        // The scheme's RNG is already seeded with prf_key, ensuring deterministic trees
         const keypair = scheme_ptr.keyGenWithParameter(
             activation_epoch,
             num_active_epochs,
             parameter,
             prf_key,
-            false, // rng_already_consumed = false since we're reconstructing
+            true, // rng_already_consumed = true since initWithSeed already consumed the seed
         ) catch |err| {
             std.debug.print("keyGenWithParameter failed during fromJson: {any}\n", .{err});
             // Clean up scheme before returning error
