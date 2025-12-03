@@ -102,14 +102,6 @@ pub const KeyManager = struct {
         var message: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
 
-        // Log the public key being used for signing
-        const signing_pubkey_root = keypair.public_key.getRoot();
-        std.debug.print("[SIGN-DEBUG] Signing pubkey root[0]=0x{x:0>8} (canonical=0x{x:0>8}), param[0]=0x{x:0>8}\n", .{
-            signing_pubkey_root[0].value,
-            signing_pubkey_root[0].toCanonical(),
-            keypair.public_key.getParameter()[0].value,
-        });
-
         const epoch: u32 = @intCast(attestation.data.slot);
         var signature = try keypair.sign(&message, epoch);
         defer signature.deinit();
@@ -117,24 +109,9 @@ pub const KeyManager = struct {
         var sig_buffer: types.SIGBYTES = undefined;
         const bytes_written = try signature.toBytes(&sig_buffer);
 
-        // Save signature to file for debugging
-        if (attestation.data.slot == 3) {
-            const sig_file = std.fs.cwd().createFile("/tmp/zeam_sig_epoch3.ssz", .{}) catch |err| {
-                std.debug.print("[SIGN-DEBUG] Failed to save signature: {any}\n", .{err});
-                return sig_buffer;
-            };
-            defer sig_file.close();
-            sig_file.writeAll(&sig_buffer) catch {};
-            std.debug.print("[SIGN-DEBUG] Saved epoch 3 signature to /tmp/zeam_sig_epoch3.ssz\n", .{});
-        }
-
-        std.debug.print("[SIGN-DEBUG] Signature serialized: bytes_written={d}, SIGSIZE={d}\n", .{ bytes_written, types.SIGSIZE });
-
         if (bytes_written < types.SIGSIZE) {
-            std.debug.print("[SIGN-DEBUG] Zero-padding {d} bytes\n", .{types.SIGSIZE - bytes_written});
             @memset(sig_buffer[bytes_written..], 0);
         } else if (bytes_written > types.SIGSIZE) {
-            std.debug.print("[SIGN-DEBUG] ERROR: Signature too large! bytes_written={d} > SIGSIZE={d}\n", .{ bytes_written, types.SIGSIZE });
             return KeyManagerError.SignatureMismatch;
         }
 
@@ -179,9 +156,8 @@ pub fn getTestKeyManager(
     errdefer key_manager.deinit();
 
     var num_active_epochs = max_slot + 1;
-    // For tests, use minimum of 256 epochs (sufficient for test scenarios)
-    // This balances key generation time with test coverage
-    if (num_active_epochs < 256) num_active_epochs = 256;
+    // For tests, use minimum of 10 epochs
+    if (num_active_epochs < 10) num_active_epochs = 10;
 
     // Parallelize key generation for multiple validators
     if (num_validators > 1) {
