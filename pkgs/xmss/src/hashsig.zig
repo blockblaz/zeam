@@ -88,7 +88,7 @@ pub const KeyPair = struct {
             std.debug.print("SSZ deserialization failed: {any}, data len={d}\n", .{ err, secret_key_ssz.len });
             return HashSigError.DeserializationFailed;
         };
-        
+
         // Create a heap-allocated secret key
         const secret_key = try allocator.create(hash_zig.signature.GeneralizedXMSSSecretKey);
         secret_key.* = secret_key_data;
@@ -308,14 +308,18 @@ pub const KeyPair = struct {
         epoch: u32,
     ) HashSigError!Signature {
         if (message.len != 32) {
+            std.debug.print("[HASH-ZIG-SIGN] ERROR: Invalid message length {d}, expected 32\n", .{message.len});
             return HashSigError.InvalidMessageLength;
         }
 
+        std.debug.print("[HASH-ZIG-SIGN] Signing message for epoch {d}\n", .{epoch});
         const message_array: *const [32]u8 = message[0..32];
-        const signature_ptr = self.scheme.sign(self.secret_key, epoch, message_array.*) catch {
+        const signature_ptr = self.scheme.sign(self.secret_key, epoch, message_array.*) catch |err| {
+            std.debug.print("[HASH-ZIG-SIGN] ERROR: Signing failed for epoch {d}: {any}\n", .{ epoch, err });
             return HashSigError.SigningFailed;
         };
 
+        std.debug.print("[HASH-ZIG-SIGN] SUCCESS: Signed message for epoch {d}\n", .{epoch});
         return Signature{
             .inner = signature_ptr,
             .allocator = self.allocator,
@@ -330,17 +334,23 @@ pub const KeyPair = struct {
         epoch: u32,
     ) HashSigError!void {
         if (message.len != 32) {
+            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Invalid message length {d}, expected 32\n", .{message.len});
             return HashSigError.InvalidMessageLength;
         }
 
+        std.debug.print("[HASH-ZIG-VERIFY] Verifying signature for epoch {d}\n", .{epoch});
         const message_array: *const [32]u8 = message[0..32];
-        const is_valid = self.scheme.verify(&self.public_key, epoch, message_array.*, signature.inner) catch {
+        const is_valid = self.scheme.verify(&self.public_key, epoch, message_array.*, signature.inner) catch |err| {
+            std.debug.print("[HASH-ZIG-VERIFY] ERROR: Verification failed for epoch {d}: {any}\n", .{ epoch, err });
             return HashSigError.VerificationFailed;
         };
 
         if (!is_valid) {
+            std.debug.print("[HASH-ZIG-VERIFY] FAILED: Invalid signature for epoch {d}\n", .{epoch});
             return HashSigError.VerificationFailed;
         }
+
+        std.debug.print("[HASH-ZIG-VERIFY] SUCCESS: Valid signature for epoch {d}\n", .{epoch});
     }
 
     /// Get the required message length (always 32 bytes)
@@ -415,39 +425,49 @@ pub fn verifySsz(
     signature_bytes: []const u8,
 ) HashSigError!void {
     if (message.len != 32) {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Invalid message length {d}, expected 32\n", .{message.len});
         return HashSigError.InvalidMessageLength;
     }
+
+    std.debug.print("[HASH-ZIG-VERIFY] Starting SSZ verification for epoch {d}, pubkey_len={d}, sig_len={d}\n", .{ epoch, pubkey_bytes.len, signature_bytes.len });
 
     // Use page allocator for temporary scheme instance
     const allocator = std.heap.page_allocator;
 
     // Initialize scheme with default lifetime
-    var scheme = GeneralizedXMSSSignatureScheme.init(allocator, DEFAULT_LIFETIME) catch {
+    var scheme = GeneralizedXMSSSignatureScheme.init(allocator, DEFAULT_LIFETIME) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Scheme init failed: {any}\n", .{err});
         return HashSigError.SchemeInitFailed;
     };
     defer scheme.deinit();
 
     // Deserialize public key from SSZ
     var public_key: hash_zig.signature.GeneralizedXMSSPublicKey = undefined;
-    hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch {
+    hash_zig.signature.GeneralizedXMSSPublicKey.sszDecode(pubkey_bytes, &public_key, null) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Public key deserialization failed: {any}\n", .{err});
         return HashSigError.DeserializationFailed;
     };
 
     // Deserialize signature from SSZ
-    var signature = hash_zig.signature.GeneralizedXMSSSignature.fromBytes(signature_bytes, allocator) catch {
+    var signature = hash_zig.signature.GeneralizedXMSSSignature.fromBytes(signature_bytes, allocator) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Signature deserialization failed: {any}\n", .{err});
         return HashSigError.DeserializationFailed;
     };
     defer signature.deinit();
 
     // Verify
     const message_array: *const [32]u8 = message[0..32];
-    const is_valid = scheme.verify(&public_key, epoch, message_array.*, signature) catch {
+    const is_valid = scheme.verify(&public_key, epoch, message_array.*, signature) catch |err| {
+        std.debug.print("[HASH-ZIG-VERIFY] ERROR: Verification check failed for epoch {d}: {any}\n", .{ epoch, err });
         return HashSigError.VerificationFailed;
     };
 
     if (!is_valid) {
+        std.debug.print("[HASH-ZIG-VERIFY] FAILED: Invalid signature for epoch {d}\n", .{epoch});
         return HashSigError.VerificationFailed;
     }
+
+    std.debug.print("[HASH-ZIG-VERIFY] SUCCESS: Valid SSZ signature for epoch {d}\n", .{epoch});
 }
 
 /// Verify signature using SSZ-encoded bytes (bincode compatibility wrapper)
