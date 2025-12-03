@@ -226,8 +226,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations." }, .{}),
         .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of connected validators." }, .{}),
         .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block in fork choice." }, .{}),
-        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip attestation or gossip block attestaion)." }, .{}),
-        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip attestation or gossip block attestaion)." }, .{}),
+        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip attestation or gossip block attestation)." }, .{}),
+        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip attestation or gossip block attestation)." }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
     };
 
