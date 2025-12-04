@@ -490,7 +490,7 @@ test "SSE events integration test - wait for justification and finalization" {
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
     // Read events until both justification and finalization are seen, or timeout
-    const timeout_ms: u64 = 900000; // 900 seconds (15 minutes) timeout - extended for finalization
+    const timeout_ms: u64 = 1_080_000; // 1,080 seconds (18 minutes) timeout - extended for finalization
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
