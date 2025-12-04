@@ -341,7 +341,7 @@ test "HashSig: SSZ keypair roundtrip" {
     defer allocator.free(sk_buffer);
     const sk_len = try keypair.privkeyToBytes(sk_buffer);
 
-    std.debug.print("\nPK size: {d}, SK size: {d}\n", .{pk_len, sk_len});
+    std.debug.print("\nPK size: {d}, SK size: {d}\n", .{ pk_len, sk_len });
 
     // Reconstruct from SSZ
     var restored_keypair = try KeyPair.fromSsz(
@@ -362,7 +362,6 @@ test "HashSig: SSZ keypair roundtrip" {
     // Verify with original keypair (should work as they are same keys)
     try keypair.verify(&message, &signature, epoch);
 }
-
 
 test "HashSig: sign and verify" {
     const allocator = std.testing.allocator;
