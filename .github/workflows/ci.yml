@@ -235,7 +235,7 @@ jobs:
       run: zig build test --summary all
 
     - name: Run all sim tests
-      run: zig build simtest --summary all
+      run: timeout 360 zig build simtest -Doptimize=ReleaseFast --summary all
 
     - name: Install uv
       shell: bash

@@ -490,11 +490,8 @@ test "SSE events integration test - wait for justification and finalization" {
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
     // Read events until both justification and finalization are seen, or timeout
-    // CI environments (GitHub Actions) are significantly slower than local machines due to:
-    // - CPU throttling and shared resources
-    // - Slower signature verification (Poseidon2 hashing is CPU-intensive)
-    // Local: ~60 seconds, CI: 18+ minutes observed
-    const timeout_ms: u64 = 1_800_000; // 1,800 seconds (30 minutes) timeout - extended for CI performance
+    // With ReleaseFast optimization, finalization typically happens within 40-60 seconds
+    const timeout_ms: u64 = 180_000; // 180 seconds (3 minutes) timeout
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
