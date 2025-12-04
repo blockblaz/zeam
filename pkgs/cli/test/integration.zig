@@ -490,9 +490,9 @@ test "SSE events integration test - wait for justification and finalization" {
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
     // Read events until both justification and finalization are seen, or timeout
-    // With ReleaseFast optimization, finalization typically happens within 40-60 seconds
-    // CI may need extra time for build + execution
-    const timeout_ms: u64 = 300_000; // 300 seconds (5 minutes) timeout
+    // With ReleaseFast optimization, finalization typically happens within 40-60 seconds locally
+    // CI needs more time due to slower hardware and cold builds (even with caching)
+    const timeout_ms: u64 = 480_000; // 480 seconds (8 minutes) - allows 2 minutes for build overhead
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;

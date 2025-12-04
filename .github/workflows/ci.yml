@@ -234,7 +234,10 @@ jobs:
     - name: Run all unit tests
       run: zig build test -Doptimize=ReleaseFast --summary all
 
-    - name: Run all sim tests
+    - name: Build zeam CLI for integration tests
+      run: zig build -Doptimize=ReleaseFast
+
+    - name: Run integration tests
       run: timeout 600 zig build simtest -Doptimize=ReleaseFast --summary all
 
     - name: Install uv
