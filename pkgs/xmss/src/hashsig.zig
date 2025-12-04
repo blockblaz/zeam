@@ -266,6 +266,21 @@ pub const KeyPair = struct {
         return bytes_written;
     }
 
+    /// Serialize private key to bytes (SSZ format)
+    pub fn privkeyToBytes(self: *const Self, buffer: []u8) HashSigError!usize {
+        const bytes_written = hashsig_privkey_to_bytes(
+            self.handle,
+            buffer.ptr,
+            buffer.len,
+        );
+
+        if (bytes_written == 0) {
+            return HashSigError.SerializationFailed;
+        }
+
+        return bytes_written;
+    }
+
     /// Free the key pair
     pub fn deinit(self: *Self) void {
         hashsig_keypair_free(self.handle);
@@ -308,6 +323,46 @@ test "HashSig: generate keypair" {
 
     try std.testing.expect(@intFromPtr(keypair.handle) != 0);
 }
+
+test "HashSig: SSZ keypair roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Generate original keypair
+    var keypair = try KeyPair.generate(allocator, "test_ssz_roundtrip", 0, 5);
+    defer keypair.deinit();
+
+    // Serialize to SSZ
+    var pk_buffer: [256]u8 = undefined;
+    const pk_len = try keypair.pubkeyToBytes(&pk_buffer);
+
+    // We need a large buffer for private key (it contains many one-time keys)
+    // Allocating on heap to be safe with stack size
+    const sk_buffer = try allocator.alloc(u8, 1024 * 1024 * 10); // 10MB should be enough
+    defer allocator.free(sk_buffer);
+    const sk_len = try keypair.privkeyToBytes(sk_buffer);
+
+    std.debug.print("\nPK size: {d}, SK size: {d}\n", .{pk_len, sk_len});
+
+    // Reconstruct from SSZ
+    var restored_keypair = try KeyPair.fromSsz(
+        allocator,
+        sk_buffer[0..sk_len],
+        pk_buffer[0..pk_len],
+    );
+    defer restored_keypair.deinit();
+
+    // Verify functionality with restored keypair
+    const message = [_]u8{42} ** 32;
+    const epoch: u32 = 0;
+
+    // Sign with restored keypair
+    var signature = try restored_keypair.sign(&message, epoch);
+    defer signature.deinit();
+
+    // Verify with original keypair (should work as they are same keys)
+    try keypair.verify(&message, &signature, epoch);
+}
+
 
 test "HashSig: sign and verify" {
     const allocator = std.testing.allocator;
