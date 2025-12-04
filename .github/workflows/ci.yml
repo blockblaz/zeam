@@ -182,10 +182,10 @@ jobs:
 
   test:
     name: test
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [ubuntu-latest-4-cores, macos-latest-xlarge]
+        os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
       with:
