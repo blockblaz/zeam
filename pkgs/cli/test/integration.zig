@@ -490,7 +490,7 @@ test "SSE events integration test - wait for justification and finalization" {
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
     // Read events until both justification and finalization are seen, or timeout
-    const timeout_ms: u64 = 180000; // 180 seconds timeout
+    const timeout_ms: u64 = 360000; // 360 seconds (6 minutes) timeout - extended for finalization
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
@@ -538,13 +538,9 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Received events - Head: {}, Justification: {}, Finalization: {}\n", .{ head_events, justification_events, finalization_events });
 
-    // Require justification (finalization is optional as it requires more chain progression)
+    // Require both justification and finalization (timeout extended to 6 minutes)
     try std.testing.expect(got_justification);
-    
-    // Finalization is optional in CI due to timing constraints
-    if (!got_finalization) {
-        std.debug.print("WARNING: No finalization event received (this can happen in CI)\n", .{});
-    }
+    try std.testing.expect(got_finalization);
 
     // Print some sample events for debugging
     for (sse_client.received_events.items, 0..) |event_data, i| {
