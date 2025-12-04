@@ -419,7 +419,16 @@ fn parseValidators(
                 const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
                 const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
 
-                validators.append(.{ .pubkey = pubkey, .index = idx }) catch |err| {
+                const validator_index: u64 = blk: {
+                    if (validator_obj.get("index")) |index_value| {
+                        var index_label_buf: [96]u8 = undefined;
+                        const index_label = std.fmt.bufPrint(&index_label_buf, "{s}.index", .{base_label}) catch "validator.index";
+                        break :blk try expect.expectU64Value(FixtureError, index_value, ctx, index_label);
+                    }
+                    break :blk @as(u64, @intCast(idx));
+                };
+
+                validators.append(.{ .pubkey = pubkey, .index = validator_index }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ ctx.fixture_label, ctx.case_name, idx, @errorName(err) },
