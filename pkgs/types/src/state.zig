@@ -406,11 +406,16 @@ pub const BeamState = struct {
                 logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
 
                 // source is finalized if target is the next valid justifiable hash
+                // Special case: allow genesis (slot 0) to finalize when any slot is justified,
+                // since slots 1-5 are always justifiable from genesis, which would prevent
+                // any finalization from ever happening.
                 var can_target_finalize = true;
-                for (source_slot + 1..target_slot) |check_slot| {
-                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, check_slot)) {
-                        can_target_finalize = false;
-                        break;
+                if (self.latest_finalized.slot > 0) {
+                    for (source_slot + 1..target_slot) |check_slot| {
+                        if (try utils.IsJustifiableSlot(self.latest_finalized.slot, check_slot)) {
+                            can_target_finalize = false;
+                            break;
+                        }
                     }
                 }
                 logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });

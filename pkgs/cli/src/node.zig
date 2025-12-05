@@ -157,6 +157,9 @@ pub const Node = struct {
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
         errdefer self.key_manager.deinit();
 
+        // Initialize logger BEFORE loadValidatorKeypairs so it can log
+        self.logger = options.logger_config.logger(.node);
+
         try self.loadValidatorKeypairs(num_validators);
 
         try self.beam_node.init(allocator, .{
@@ -170,8 +173,6 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
         });
-
-        self.logger = options.logger_config.logger(.node);
     }
 
     pub fn deinit(self: *Self) void {
@@ -317,33 +318,67 @@ pub const Node = struct {
                 return error.HashSigValidatorIndexOutOfRange;
             }
 
-            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_pk.json", .{ hash_sig_key_dir, validator_index });
-            defer self.allocator.free(pk_path);
+            // Try SSZ format first (preferred), then fall back to JSON
+            const pk_ssz_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_pk.ssz", .{ hash_sig_key_dir, validator_index });
+            defer self.allocator.free(pk_ssz_path);
+            const sk_ssz_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.ssz", .{ hash_sig_key_dir, validator_index });
+            defer self.allocator.free(sk_ssz_path);
 
-            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigPublicKeyMissing,
-                else => return err,
+            self.logger.info("Loading hash-sig keys for validator {d}: pk={s}, sk={s}", .{ validator_index, pk_ssz_path, sk_ssz_path });
+
+            // Check if SSZ files exist
+            const ssz_exists = blk: {
+                std.fs.cwd().access(pk_ssz_path, .{}) catch break :blk false;
+                std.fs.cwd().access(sk_ssz_path, .{}) catch break :blk false;
+                break :blk true;
             };
-            defer pk_file.close();
-            const public_json = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
-            defer self.allocator.free(public_json);
 
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.json", .{ hash_sig_key_dir, validator_index });
-            defer self.allocator.free(sk_path);
+            var keypair = if (ssz_exists) blk: {
+                // Load SSZ format
+                var pk_file = try std.fs.cwd().openFile(pk_ssz_path, .{});
+                defer pk_file.close();
+                const public_ssz = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+                defer self.allocator.free(public_ssz);
 
-            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigSecretKeyMissing,
-                else => return err,
+                var sk_file = try std.fs.cwd().openFile(sk_ssz_path, .{});
+                defer sk_file.close();
+                const secret_ssz = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+                defer self.allocator.free(secret_ssz);
+
+                break :blk try xmss.KeyPair.fromSSZ(
+                    self.allocator,
+                    secret_ssz,
+                    public_ssz,
+                );
+            } else blk: {
+                // Fall back to JSON format
+                const pk_json_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_pk.json", .{ hash_sig_key_dir, validator_index });
+                defer self.allocator.free(pk_json_path);
+                const sk_json_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.json", .{ hash_sig_key_dir, validator_index });
+                defer self.allocator.free(sk_json_path);
+
+                var pk_file = std.fs.cwd().openFile(pk_json_path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => return error.HashSigPublicKeyMissing,
+                    else => return err,
+                };
+                defer pk_file.close();
+                const public_json = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+                defer self.allocator.free(public_json);
+
+                var sk_file = std.fs.cwd().openFile(sk_json_path, .{}) catch |err| switch (err) {
+                    error.FileNotFound => return error.HashSigSecretKeyMissing,
+                    else => return err,
+                };
+                defer sk_file.close();
+                const secret_json = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
+                defer self.allocator.free(secret_json);
+
+                break :blk try xmss.KeyPair.fromJson(
+                    self.allocator,
+                    secret_json,
+                    public_json,
+                );
             };
-            defer sk_file.close();
-            const secret_json = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
-            defer self.allocator.free(secret_json);
-
-            var keypair = try xmss.KeyPair.fromJson(
-                self.allocator,
-                secret_json,
-                public_json,
-            );
             errdefer keypair.deinit();
 
             try self.key_manager.addKeypair(validator_index, keypair);

@@ -43,6 +43,10 @@
             .url = "https://github.com/blockblaz/snappyframesz/archive/78e66c2d42dc44dd1177ad007e28838a82157aa3.tar.gz",
             .hash = "snappyframesz-0.0.1-COCLy9EQBADDWj8BS-OdrIFOwHfiY9KUUiClsyBHgETn",
         },
+        .@"hash-zig" = .{
+            .url = "https://github.com/blockblaz/hash-zig/archive/refs/tags/v1.1.3.tar.gz",
+            .hash = "1220b0dc5fe3420bc478ddc2892885b71a070a9e1e9ba9ae815b66bd0963c5145b83",
+        },
     },
     .paths = .{""},
 }

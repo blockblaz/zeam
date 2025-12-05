@@ -232,10 +232,13 @@ jobs:
         exit 1
 
     - name: Run all unit tests
-      run: zig build test --summary all
+      run: zig build test -Doptimize=ReleaseFast --summary all
 
-    - name: Run all sim tests
-      run: zig build simtest --summary all
+    - name: Build zeam CLI for integration tests
+      run: zig build -Doptimize=ReleaseSafe
+
+    - name: Run integration tests (with instrumentation)
+      run: timeout 600 zig build simtest -Doptimize=ReleaseSafe --summary all
 
     - name: Install uv
       shell: bash

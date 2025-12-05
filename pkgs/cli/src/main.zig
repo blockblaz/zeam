@@ -325,7 +325,9 @@ fn mainInner() !void {
             const key_manager_lib = @import("@zeam/key-manager");
             // Using 3 validators: so by default beam cmd command runs two nodes to interop
             const num_validators: usize = 3;
-            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
+            // Use 100 max_slot for beam command (will be rounded up to 1024 minimum)
+            // This is sufficient for integration tests while keeping key generation reasonable
+            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 100);
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager

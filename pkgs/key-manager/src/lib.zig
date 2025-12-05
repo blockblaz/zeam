@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 
 const KeyManagerError = error{
     ValidatorKeyNotFound,
+    SignatureMismatch,
 };
 
 const CachedKeyPair = struct {
@@ -13,12 +14,16 @@ const CachedKeyPair = struct {
     num_active_epochs: usize,
 };
 var global_test_key_pair_cache: ?std.AutoHashMap(usize, CachedKeyPair) = null;
+var cache_mutex: std.Thread.Mutex = .{};
 const cache_allocator = std.heap.page_allocator;
 
 fn getOrCreateCachedKeyPair(
     validator_id: usize,
     num_active_epochs: usize,
 ) !xmss.KeyPair {
+    cache_mutex.lock();
+    defer cache_mutex.unlock();
+
     if (global_test_key_pair_cache == null) {
         global_test_key_pair_cache = std.AutoHashMap(usize, CachedKeyPair).init(cache_allocator);
     }
@@ -106,6 +111,8 @@ pub const KeyManager = struct {
 
         if (bytes_written < types.SIGSIZE) {
             @memset(sig_buffer[bytes_written..], 0);
+        } else if (bytes_written > types.SIGSIZE) {
+            return KeyManagerError.SignatureMismatch;
         }
 
         return sig_buffer;
@@ -149,14 +156,66 @@ pub fn getTestKeyManager(
     errdefer key_manager.deinit();
 
     var num_active_epochs = max_slot + 1;
-    // to reuse cached keypairs, gen for 10 since most tests ask for < 10 max slot including
-    // building mock chain for tests. otherwise getOrCreateCachedKeyPair might cleanup previous
-    //  key generated for smaller life time
+    // For tests, use minimum of 10 epochs
     if (num_active_epochs < 10) num_active_epochs = 10;
 
-    for (0..num_validators) |i| {
-        const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
-        try key_manager.addKeypair(i, keypair);
+    // Parallelize key generation for multiple validators
+    if (num_validators > 1) {
+        // Create threads for parallel key generation
+        const KeyGenContext = struct {
+            validator_id: usize,
+            num_active_epochs: usize,
+            result: ?xmss.KeyPair = null,
+            err: ?anyerror = null,
+        };
+
+        var contexts = try allocator.alloc(KeyGenContext, num_validators);
+        defer allocator.free(contexts);
+
+        for (contexts, 0..) |*ctx, i| {
+            ctx.* = KeyGenContext{
+                .validator_id = i,
+                .num_active_epochs = num_active_epochs,
+            };
+        }
+
+        const threads = try allocator.alloc(std.Thread, num_validators);
+        defer allocator.free(threads);
+
+        // Spawn threads for parallel key generation
+        for (threads, 0..) |*thread, i| {
+            thread.* = try std.Thread.spawn(.{}, struct {
+                fn run(ctx: *KeyGenContext) void {
+                    ctx.result = getOrCreateCachedKeyPair(ctx.validator_id, ctx.num_active_epochs) catch |err| {
+                        ctx.err = err;
+                        return;
+                    };
+                }
+            }.run, .{&contexts[i]});
+        }
+
+        // Wait for all threads to complete
+        for (threads) |thread| {
+            thread.join();
+        }
+
+        // Collect results and check for errors
+        for (contexts) |ctx| {
+            if (ctx.err) |err| {
+                return err;
+            }
+            if (ctx.result) |keypair| {
+                try key_manager.addKeypair(ctx.validator_id, keypair);
+            } else {
+                return error.KeyGenerationFailed;
+            }
+        }
+    } else {
+        // Single validator - no need for parallelization
+        for (0..num_validators) |i| {
+            const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
+            try key_manager.addKeypair(i, keypair);
+        }
     }
 
     return key_manager;
