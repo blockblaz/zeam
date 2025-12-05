@@ -488,20 +488,35 @@ test "SSE events integration test - wait for justification and finalization" {
     try sse_client.connect();
 
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
+    const test_start_time = std.time.milliTimestamp();
+    std.debug.print("INFO: Test started at timestamp {}\n", .{test_start_time});
 
     // Read events until both justification and finalization are seen, or timeout
-    // With ReleaseFast optimization, finalization typically happens within 40-60 seconds locally
-    // CI needs more time due to slower hardware and cold builds (even with caching)
-    const timeout_ms: u64 = 480_000; // 480 seconds (8 minutes) - allows 2 minutes for build overhead
+    const timeout_ms: u64 = 480_000; // 480 seconds (8 minutes)
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
     var got_finalization = false;
+    var event_count: usize = 0;
+    var last_progress_log = std.time.milliTimestamp();
 
     // FIXED: This loop now works correctly with the improved readEvent() function
     while (std.time.nanoTimestamp() < deadline_ns and !(got_justification and got_finalization)) {
+        // Log progress every 30 seconds
+        const now = std.time.milliTimestamp();
+        if (now - last_progress_log > 30000) {
+            const elapsed_sec = @divTrunc(now - test_start_time, 1000);
+            std.debug.print("INFO: Still waiting... {}s elapsed, {} events received, justification={}, finalization={}\n", .{
+                elapsed_sec,
+                event_count,
+                got_justification,
+                got_finalization,
+            });
+            last_progress_log = now;
+        }
         const event = try sse_client.readEvent();
         if (event) |e| {
+            event_count += 1;
             // Check for justification with slot > 0
             if (!got_justification and std.mem.eql(u8, e.event_type, "new_justification")) {
                 if (e.justified_slot) |slot| {
