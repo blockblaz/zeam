@@ -235,10 +235,10 @@ jobs:
       run: zig build test -Doptimize=ReleaseFast --summary all
 
     - name: Build zeam CLI for integration tests
-      run: zig build -Doptimize=ReleaseFast
+      run: zig build -Doptimize=ReleaseSafe
 
-    - name: Run integration tests
-      run: timeout 600 zig build simtest -Doptimize=ReleaseFast --summary all
+    - name: Run integration tests (with instrumentation)
+      run: timeout 600 zig build simtest -Doptimize=ReleaseSafe --summary all
 
     - name: Install uv
       shell: bash
