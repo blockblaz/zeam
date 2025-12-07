@@ -56,7 +56,7 @@ lazy_static::lazy_static! {
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
     static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
-    static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> = 
+    static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
         Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
     static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
 }
@@ -731,7 +731,9 @@ impl Network {
 
             for addr in connect_addresses {
                 if let Some(peer_id) = Self::extract_peer_id(&addr) {
-                    self.peer_addr_map.entry(peer_id).or_insert_with(|| addr.clone());
+                    self.peer_addr_map
+                        .entry(peer_id)
+                        .or_insert_with(|| addr.clone());
                 } else {
                     logger::rustLogger.warn(
                         self.network_id,
@@ -827,15 +829,15 @@ impl Network {
                                 self.network_id,
                                 &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
                             );
-                            
+
                             RECONNECT_ATTEMPTS
                                 .lock()
                                 .unwrap()
                                 .insert((self.network_id, peer_id), (addr.clone(), attempt));
-                            
+
                             let mut dial_addr = addr.clone();
                             strip_peer_id(&mut dial_addr);
-                            
+
                             match swarm.dial(
                                 DialOpts::peer_id(peer_id)
                                     .addresses(vec![dial_addr.clone()])
