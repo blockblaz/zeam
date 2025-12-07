@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # serde = { version = "1.0", features = ["derive"] }
-libp2p-mplex = "0.42"
+libp2p-mplex = "0.43"
 futures = "0.3.31"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
@@ -23,7 +23,7 @@ thiserror = "2.0.11"
 tracing = "0.1"
 
 [dependencies.libp2p]
-version = "0.54"
+version = "0.55"
 default-features = false
 features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]
 
