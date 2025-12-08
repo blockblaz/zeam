@@ -339,7 +339,7 @@ pub const OptionalNode = struct {
         _ = fmt;
         _ = options;
         if (self.name) |n| {
-            try writer.print("(node: {s}) ", .{n});
+            try writer.print("(node: {s})", .{n});
         }
     }
 };
@@ -477,7 +477,7 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
+        try writer.print("{} Peer connected: {s}, total peers: {d}", .{
             OptionalNode.init("alice"),
             "peer123",
             5,
@@ -507,7 +507,7 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{}Published block: slot={d} proposer={d}", .{
+        try writer.print("{} Published block: slot={d} proposer={d}", .{
             OptionalNode.init("validator-7"),
             100,
             7,
@@ -522,7 +522,7 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{}Message", .{OptionalNode.init("")});
+        try writer.print("{} Message", .{OptionalNode.init("")});
 
         const result = fbs.getWritten();
         try testing.expectEqualStrings("(node: ) Message", result);

@@ -429,17 +429,10 @@ pub fn buildStartOptions(
         node_cmd.@"sig-keys-dir",
     });
 
-    // Build node name registry (replace empty registry with populated one)
-    opts.node_registry.deinit(); // Clean up the empty registry
-    if (std.mem.eql(u8, node_cmd.validator_config, "genesis_bootnode")) {
-        // Keep empty registry for genesis bootnode
-        opts.node_registry.* = node_lib.NodeNameRegistry.init(allocator);
-    } else {
-        opts.node_registry.* = buildNodeNameRegistry(allocator, validator_config_filepath, validators_filepath) catch |err| blk: {
-            std.log.warn("Failed to build node name registry: {any}", .{err});
-            break :blk node_lib.NodeNameRegistry.init(allocator);
-        };
-    }
+    // Populate node name registry with peer information
+    populateNodeNameRegistry(allocator, opts.node_registry, validator_config_filepath, validators_filepath) catch |err| {
+        std.log.warn("Failed to populate node name registry: {any}", .{err});
+    };
 
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
@@ -744,15 +737,14 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
-/// Build a NodeNameRegistry from validator-config.yaml and validators.yaml
+/// Populate a NodeNameRegistry from validator-config.yaml and validators.yaml
 /// This creates mappings from peer IDs and validator indices to node names
-pub fn buildNodeNameRegistry(
+pub fn populateNodeNameRegistry(
     allocator: std.mem.Allocator,
+    registry: *node_lib.NodeNameRegistry,
     validator_config_path: []const u8,
     validators_path: []const u8,
-) !node_lib.NodeNameRegistry {
-    var registry = node_lib.NodeNameRegistry.init(allocator);
-    errdefer registry.deinit();
+) !void {
 
     // Parse validator-config.yaml to get node names and their ENRs/privkeys
     var parsed_validator_config = try utils_lib.loadFromYAMLFile(allocator, validator_config_path);
@@ -763,7 +755,7 @@ pub fn buildNodeNameRegistry(
     defer parsed_validators.deinit(allocator);
 
     const validators_list = parsed_validator_config.docs.items[0].map.get("validators");
-    if (validators_list == null) return registry;
+    if (validators_list == null) return;
 
     for (validators_list.?.list) |entry| {
         const name_value = entry.map.get("name");
@@ -827,8 +819,6 @@ pub fn buildNodeNameRegistry(
             }
         }
     }
-
-    return registry;
 }
 
 test "configs yaml parsing" {
@@ -965,15 +955,16 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
 }
 
-test "buildNodeNameRegistry" {
+test "populateNodeNameRegistry" {
     const allocator = std.testing.allocator;
 
     const validator_config_path = "pkgs/cli/test/fixtures/validator-config.yaml";
     const validators_path = "pkgs/cli/test/fixtures/validators.yaml";
 
-    // Build the registry from test fixtures
-    var registry = try buildNodeNameRegistry(allocator, validator_config_path, validators_path);
+    // Create an empty registry and populate it from test fixtures
+    var registry = node_lib.NodeNameRegistry.init(allocator);
     defer registry.deinit();
+    try populateNodeNameRegistry(allocator, &registry, validator_config_path, validators_path);
 
     try std.testing.expectEqual(@as(usize, 9), registry.validator_index_to_name.count());
     try std.testing.expectEqual(@as(usize, 3), registry.peer_id_to_name.count());

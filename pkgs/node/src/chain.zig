@@ -83,11 +83,6 @@ pub const BeamChain = struct {
 
     const Self = @This();
 
-    /// Helper to get node name for logging from validator index if available
-    fn getNodeNameForLog(self: *const Self, validator_index: usize) ?[]const u8 {
-        return self.node_registry.getNodeNameFromValidatorIndex(validator_index);
-    }
-
     pub fn init(
         allocator: Allocator,
         opts: ChainOpts,
@@ -330,7 +325,7 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage) !void {
+    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !void {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.message.block;
@@ -340,8 +335,8 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.info("{}chain received gossip block for slot={any} blockroot={any} proposer={d} hasBlock={any}", .{
-                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(block.proposer_index)),
+                self.module_logger.info("chain received gossip block {} for slot={any} blockroot={any} proposer={d} hasBlock={any}", .{
+                    zeam_utils.OptionalNode.init(self.node_registry.getNodeNameFromPeerId(sender_peer_id)),
                     block.slot,
                     std.fmt.fmtSliceHexLower(&block_root),
                     block.proposer_index,
@@ -456,8 +451,7 @@ pub const BeamChain = struct {
                     try missing_roots.append(attestation.data.head.root);
                 }
 
-                self.module_logger.err("{}invalid attestation in block: validator={d} error={any}", .{
-                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(attestation.validator_id)),
+                self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
                     attestation.validator_id,
                     e,
                 });
@@ -766,8 +760,7 @@ pub const BeamChain = struct {
             return AttestationValidationError.AttestationTooFarInFuture;
         }
 
-        self.module_logger.debug("{}Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
-            zeam_utils.OptionalNode.init(self.getNodeNameForLog(attestation.validator_id)),
+        self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
             attestation.validator_id,
             data.slot,
             data.source.slot,
