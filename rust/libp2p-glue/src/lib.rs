@@ -9,6 +9,7 @@ use libp2p::core::{
 };
 
 use libp2p::identity::{secp256k1, Keypair};
+use libp2p::swarm::dial_opts::PeerCondition;
 use libp2p::swarm::{dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     core, gossipsub, identify, identity, noise, ping, yamux, PeerId, SwarmBuilder, Transport,
@@ -840,6 +841,7 @@ impl Network {
 
                             match swarm.dial(
                                 DialOpts::peer_id(peer_id)
+                                    .condition(PeerCondition::NotDialing)
                                     .addresses(vec![dial_addr.clone()])
                                     .build(),
                             ) {
