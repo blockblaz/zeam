@@ -972,12 +972,12 @@ impl Network {
                             let message_len = message.data.len();
 
                             let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
-                            let sender_peer_id_cstring = match CString::new(sender_peer_id_string) {
+                            let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
                                 Ok(cstring) => cstring,
                                 Err(_) => {
                                     logger::rustLogger.error(
                                         self.network_id,
-                                        &format!("Failed to create C string for peer id"),
+                                        &format!("Failed to create C string for peer id {}", sender_peer_id_string),
                                     );
                                     continue;
                                 }
