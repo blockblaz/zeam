@@ -930,11 +930,10 @@ impl Network {
                                 )
                             };
 
-                            if !swarm.is_connected(&peer_id) {
-                                if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
-                                    self.schedule_reconnection(peer_id, peer_addr, 1);
-                                }
+                            if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
+                                self.schedule_reconnection(peer_id, peer_addr, 1);
                             }
+
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
