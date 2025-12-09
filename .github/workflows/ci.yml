@@ -251,7 +251,7 @@ jobs:
       run: zig build spectest:generate --summary all
 
     - name: Run all spec tests
-      run: zig build spectest:run --summary all -- --skip-expected-error-fixtures=true
+      run: zig build spectest:run --summary all
 
   dummy-prove:
     name: Dummy prove
