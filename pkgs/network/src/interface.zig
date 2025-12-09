@@ -37,7 +37,7 @@ pub const GossipSub = struct {
     ptr: *anyopaque,
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
-    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage) anyerror!void,
+    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);

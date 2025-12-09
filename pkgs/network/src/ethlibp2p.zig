@@ -871,9 +871,9 @@ pub const EthLibp2p = struct {
         return self.gossipHandler.subscribe(topics, handler);
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, "unknown_peer", false);
+        return self.gossipHandler.onGossip(data, sender_peer_id, false);
     }
 
     pub fn sendRPCRequest(
