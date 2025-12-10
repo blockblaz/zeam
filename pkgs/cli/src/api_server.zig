@@ -2,6 +2,25 @@ const std = @import("std");
 const api = @import("@zeam/api");
 const constants = @import("constants.zig");
 const event_broadcaster = api.event_broadcaster;
+const node = @import("@zeam/node");
+
+// Global chain reference for API access
+var global_chain: ?*node.BeamChain = null;
+var chain_mutex = std.Thread.Mutex{};
+
+/// Register the chain for API access
+pub fn registerChain(chain: *node.BeamChain) void {
+    chain_mutex.lock();
+    defer chain_mutex.unlock();
+    global_chain = chain;
+}
+
+/// Get the global chain reference
+fn getChain() ?*node.BeamChain {
+    chain_mutex.lock();
+    defer chain_mutex.unlock();
+    return global_chain;
+}
 
 /// Simple metrics server that runs in a background thread
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16) !void {
@@ -63,9 +82,180 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
         }) catch {};
+    } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
+        // Handle fork choice graph request
+        handleForkChoiceGraph(&request, allocator) catch |err| {
+            std.log.warn("Fork choice graph request failed: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{}) catch {};
+        };
     } else {
         _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
     }
+}
+
+/// Handle fork choice graph API request
+fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
+    // Get chain reference
+    const chain = getChain() orelse {
+        const error_response = "{\"error\":\"Chain not initialized\"}";
+        _ = request.respond(error_response, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
+        return;
+    };
+
+    // Parse query parameters for max_slots (default: 50)
+    var max_slots: usize = 50;
+    if (std.mem.indexOf(u8, request.head.target, "?slots=")) |query_start| {
+        const slots_param = request.head.target[query_start + 7 ..];
+        if (std.mem.indexOf(u8, slots_param, "&")) |end| {
+            max_slots = std.fmt.parseInt(usize, slots_param[0..end], 10) catch 50;
+        } else {
+            max_slots = std.fmt.parseInt(usize, slots_param, 10) catch 50;
+        }
+    }
+
+    // Build the graph data
+    var graph_json = std.ArrayList(u8).init(allocator);
+    defer graph_json.deinit();
+
+    try buildGraphJSON(chain, graph_json.writer(), max_slots, allocator);
+
+    // Send response
+    _ = request.respond(graph_json.items, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            .{ .name = "access-control-allow-origin", .value = "*" },
+        },
+    }) catch {};
+}
+
+/// Build fork choice graph in Grafana node-graph JSON format
+fn buildGraphJSON(
+    chain: *node.BeamChain,
+    writer: anytype,
+    max_slots: usize,
+    allocator: std.mem.Allocator,
+) !void {
+    const fork_choice = &chain.forkChoice;
+    const proto_nodes = fork_choice.protoArray.nodes.items;
+
+    // Determine the slot threshold (show only recent slots)
+    const current_slot = fork_choice.head.slot;
+    const min_slot = if (current_slot > max_slots) current_slot - max_slots else 0;
+
+    // Build nodes and edges
+    var nodes_list = std.ArrayList(u8).init(allocator);
+    defer nodes_list.deinit();
+    var edges_list = std.ArrayList(u8).init(allocator);
+    defer edges_list.deinit();
+
+    var node_count: usize = 0;
+    var edge_count: usize = 0;
+
+    // Find max weight for normalization
+    var max_weight: isize = 1;
+    for (proto_nodes) |pnode| {
+        if (pnode.slot >= min_slot and pnode.weight > max_weight) {
+            max_weight = pnode.weight;
+        }
+    }
+
+    // Build nodes
+    for (proto_nodes, 0..) |pnode, idx| {
+        if (pnode.slot < min_slot) continue;
+
+        // Determine node role and color
+        const is_head = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.head.blockRoot);
+        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.fcStore.latest_justified.root);
+        const is_finalized = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.fcStore.latest_finalized.root);
+
+        const role = if (is_finalized)
+            "finalized"
+        else if (is_justified)
+            "justified"
+        else if (is_head)
+            "head"
+        else
+            "normal";
+
+        // Direct HTML color strings - no threshold mapping needed!
+        const color_str = if (is_finalized)
+            "#9B59B6" // Finalized - purple
+        else if (is_justified)
+            "#3498DB" // Justified - blue
+        else if (is_head)
+            "#F39C12" // Head - gold/orange
+        else if (pnode.timeliness)
+            "#2ECC71" // Timely - green
+        else
+            "#FFA500"; // Non-timely - orange
+
+        // Normalized weight for arc
+        const arc_weight: f64 = if (max_weight > 0)
+            @as(f64, @floatFromInt(pnode.weight)) / @as(f64, @floatFromInt(max_weight))
+        else
+            0.0;
+
+        // Block root as hex
+        const hex_prefix = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(pnode.blockRoot[0..4])});
+        defer allocator.free(hex_prefix);
+        const full_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&pnode.blockRoot)});
+        defer allocator.free(full_root);
+
+        if (node_count > 0) {
+            try nodes_list.appendSlice(",");
+        }
+
+        try std.fmt.format(nodes_list.writer(),
+            \\{{"id":"{s}","title":"Slot {d}","mainStat":"{d}","secondaryStat":"{d}","arc__weight":{d:.2},"color":"{s}","detail__role":"{s}","detail__timely":{},"detail__hex_prefix":"{s}"}}
+        , .{
+            full_root,
+            pnode.slot,
+            pnode.weight,
+            pnode.slot,
+            arc_weight,
+            color_str,
+            role,
+            pnode.timeliness,
+            hex_prefix,
+        });
+
+        node_count += 1;
+
+        // Build edges (parent -> child relationships)
+        if (pnode.parent) |parent_idx| {
+            const parent_node = proto_nodes[parent_idx];
+            if (parent_node.slot >= min_slot) {
+                const parent_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&parent_node.blockRoot)});
+                defer allocator.free(parent_root);
+
+                const is_best_child = if (parent_node.bestChild) |bc| bc == idx else false;
+
+                if (edge_count > 0) {
+                    try edges_list.appendSlice(",");
+                }
+
+                try std.fmt.format(edges_list.writer(),
+                    \\{{"id":"edge_{d}","source":"{s}","target":"{s}","mainStat":"","detail__is_best_child":{}}}
+                , .{
+                    edge_count,
+                    parent_root,
+                    full_root,
+                    is_best_child,
+                });
+
+                edge_count += 1;
+            }
+        }
+    }
+
+    // Write final JSON
+    try std.fmt.format(writer,
+        \\{{"nodes":[{s}],"edges":[{s}]}}
+    , .{ nodes_list.items, edges_list.items });
 }
 
 /// Simple metrics server context

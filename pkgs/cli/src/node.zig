@@ -171,6 +171,11 @@ pub const Node = struct {
             .logger_config = options.logger_config,
         });
 
+        // Register the chain with the API server for fork choice graph endpoint
+        if (options.metrics_enable) {
+            api_server.registerChain(self.beam_node.chain);
+        }
+
         self.logger = options.logger_config.logger(.node);
     }
 

@@ -450,6 +450,9 @@ fn mainInner() !void {
                 .logger_config = &logger1_config,
             });
 
+            // Register beam_node_1's chain for fork choice graph API
+            api_server.registerChain(beam_node_1.chain);
+
             var beam_node_2: BeamNode = undefined;
             try beam_node_2.init(allocator, .{
                 // options
