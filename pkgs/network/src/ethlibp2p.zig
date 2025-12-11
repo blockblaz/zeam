@@ -262,7 +262,7 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     return filename;
 }
 
-export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize) void {
+export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize, sender_peer_id: [*:0]const u8) void {
     const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
         zigHandler.logger.err("Ignoring Invalid topic_id={d} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
         return;
@@ -316,11 +316,12 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
     defer zigHandler.allocator.free(message_str);
 
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} \n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes });
+    const sender_peer_id_slice = std.mem.span(sender_peer_id);
+    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} sender_peer_id={s}\n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes, sender_peer_id_slice });
 
     // TODO: figure out why scheduling on the loop is not working
-    zigHandler.gossipHandler.onGossip(&message, false) catch |e| {
-        zigHandler.logger.err("onGossip handling of message failed with error e={any}", .{e});
+    zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
+        zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}", .{ e, sender_peer_id_slice });
     };
 }
 
@@ -870,9 +871,9 @@ pub const EthLibp2p = struct {
         return self.gossipHandler.subscribe(topics, handler);
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, false);
+        return self.gossipHandler.onGossip(data, sender_peer_id, false);
     }
 
     pub fn sendRPCRequest(

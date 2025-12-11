@@ -522,6 +522,7 @@ extern "C" {
         topic: *const c_char,
         message_ptr: *const u8,
         message_len: usize,
+        sender_peer_id: *const c_char,
     );
 }
 
@@ -970,8 +971,20 @@ impl Network {
                             let message_ptr = message.data.as_ptr();
                             let message_len = message.data.len();
 
+                            let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
+                            let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                Ok(cstring) => cstring,
+                                Err(_) => {
+                                    logger::rustLogger.error(
+                                        self.network_id,
+                                        &format!("Failed to create C string for peer id {}", sender_peer_id_string),
+                                    );
+                                    continue;
+                                }
+                            };
+
                             unsafe {
-                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
+                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
                             };
                             logger::rustLogger.debug(self.network_id, "zig callback completed");
                         }
