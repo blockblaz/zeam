@@ -48,16 +48,6 @@ pub const BeamNode = struct {
 
     const Self = @This();
 
-    /// Helper to get node name for logging if available
-    fn getNodeNameForLog(self: *const Self, peer_id: []const u8) ?[]const u8 {
-        return self.node_registry.getNodeNameFromPeerId(peer_id);
-    }
-
-    /// Helper to get node name for logging from validator index if available
-    fn getNodeNameForLogFromValidator(self: *const Self, validator_index: usize) ?[]const u8 {
-        return self.node_registry.getNodeNameFromValidatorIndex(validator_index);
-    }
-
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
         var validator: ?validatorClient.ValidatorClient = null;
 
@@ -155,18 +145,18 @@ pub const BeamNode = struct {
         if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
-                self.logger.warn("Received unexpected block root 0x{s} from peer {s} {}", .{
+                self.logger.warn("Received unexpected block root 0x{s} from peer {s}{}", .{
                     std.fmt.fmtSliceHexLower(block_root[0..]),
                     block_ctx.peer_id,
-                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(block_ctx.peer_id)),
+                    self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
             }
 
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
-                self.logger.warn("Failed to import block fetched via RPC 0x{s} from peer {s} {}: {any}", .{
+                self.logger.warn("Failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
                     std.fmt.fmtSliceHexLower(block_root[0..]),
                     block_ctx.peer_id,
-                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(block_ctx.peer_id)),
+                    self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                     err,
                 });
                 return;
@@ -195,14 +185,14 @@ pub const BeamNode = struct {
                         .status => |*status_ctx| {
                             self.logger.info("Received status response from peer {s}{} head_slot={d}, finalized_slot={d}", .{
                                 status_ctx.peer_id,
-                                zeam_utils.OptionalNode.init(self.getNodeNameForLog(status_ctx.peer_id)),
+                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 status_resp.head_slot,
                                 status_resp.finalized_slot,
                             });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
                                 self.logger.warn("Status response received for unknown peer {s}{}", .{
                                     status_ctx.peer_id,
-                                    zeam_utils.OptionalNode.init(self.getNodeNameForLog(status_ctx.peer_id)),
+                                    self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 });
                             }
                         },
@@ -214,9 +204,9 @@ pub const BeamNode = struct {
                 .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
                         .blocks_by_root => |*block_ctx| {
-                            self.logger.info("Received blocks-by-root chunk from peer {s} {}", .{
+                            self.logger.info("Received blocks-by-root chunk from peer {s}{}", .{
                                 block_ctx.peer_id,
-                                zeam_utils.OptionalNode.init(self.getNodeNameForLog(block_ctx.peer_id)),
+                                self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             });
 
                             self.processBlockByRootChunk(block_ctx, &block_resp);
@@ -230,17 +220,17 @@ pub const BeamNode = struct {
             .failure => |err_payload| {
                 switch (ctx_ptr.*) {
                     .status => |status_ctx| {
-                        self.logger.warn("Status request to peer {s} {} failed ({d}): {s}", .{
+                        self.logger.warn("Status request to peer {s}{} failed ({d}): {s}", .{
                             status_ctx.peer_id,
-                            zeam_utils.OptionalNode.init(self.getNodeNameForLog(status_ctx.peer_id)),
+                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                             err_payload.code,
                             err_payload.message,
                         });
                     },
                     .blocks_by_root => |block_ctx| {
-                        self.logger.warn("Blocks-by-root request to peer {s} {} failed ({d}): {s}", .{
+                        self.logger.warn("Blocks-by-root request to peer {s}{} failed ({d}): {s}", .{
                             block_ctx.peer_id,
-                            zeam_utils.OptionalNode.init(self.getNodeNameForLog(block_ctx.peer_id)),
+                            self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             err_payload.code,
                             err_payload.message,
                         });
@@ -350,10 +340,10 @@ pub const BeamNode = struct {
         };
 
         if (maybe_request) |request_info| {
-            self.logger.debug("Requested {d} block(s) by root from peer {s} {}, request_id={d}", .{
+            self.logger.debug("Requested {d} block(s) by root from peer {s}{}, request_id={d}", .{
                 missing_roots.items.len,
                 request_info.peer_id,
-                zeam_utils.OptionalNode.init(self.getNodeNameForLog(request_info.peer_id)),
+                self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
                 request_info.request_id,
             });
         }
@@ -372,17 +362,17 @@ pub const BeamNode = struct {
         const status = self.chain.getStatus();
 
         const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("Failed to send status request to peer {s} {}: {any}", .{
+            self.logger.warn("Failed to send status request to peer {s}{} {any}", .{
                 peer_id,
-                zeam_utils.OptionalNode.init(self.getNodeNameForLog(peer_id)),
+                self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
             });
             return;
         };
 
-        self.logger.info("Sent status request to peer {s} {}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+        self.logger.info("Sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
             peer_id,
-            zeam_utils.OptionalNode.init(self.getNodeNameForLog(peer_id)),
+            self.node_registry.getNodeNameFromPeerId(peer_id),
             request_id,
             status.head_slot,
             status.finalized_slot,
@@ -393,9 +383,9 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("{}Peer disconnected: {s}, total peers: {d}", .{
-                zeam_utils.OptionalNode.init(self.getNodeNameForLog(peer_id)),
+            self.logger.info("Peer disconnected: {s}{}, total peers: {d}", .{
                 peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
                 self.network.getPeerCount(),
             });
         }
@@ -488,10 +478,10 @@ pub const BeamNode = struct {
         try self.network.publish(&gossip_msg);
 
         const block = signed_block.message.block;
-        self.logger.info("{}Published block to network: slot={d} proposer={d}", .{
-            zeam_utils.OptionalNode.init(self.getNodeNameForLogFromValidator(block.proposer_index)),
+        self.logger.info("Published block to network: slot={d} proposer={d}{}", .{
             block.slot,
             block.proposer_index,
+            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
         });
 
         // 2. Process locally through chain

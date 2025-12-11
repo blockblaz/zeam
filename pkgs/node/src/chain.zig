@@ -339,10 +339,10 @@ pub const BeamChain = struct {
                     block.slot,
                     std.fmt.fmtSliceHexLower(&block_root),
                     block.proposer_index,
-                    zeam_utils.OptionalNode.init(self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index)),
+                    self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
                     hasBlock,
                     sender_peer_id,
-                    zeam_utils.OptionalNode.init(self.node_registry.getNodeNameFromPeerId(sender_peer_id)),
+                    self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
                 if (!hasBlock) {

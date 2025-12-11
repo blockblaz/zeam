@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const zeam_utils = @import("@zeam/utils");
 
 /// A registry that maps peer IDs and validator indices to node names
 /// for better log readability and debugging
@@ -61,13 +62,13 @@ pub const NodeNameRegistry = struct {
     }
 
     /// Get node name from peer ID, returns null if not found
-    pub fn getNodeNameFromPeerId(self: *const NodeNameRegistry, peer_id: []const u8) ?[]const u8 {
-        return self.peer_id_to_name.get(peer_id);
+    pub fn getNodeNameFromPeerId(self: *const NodeNameRegistry, peer_id: []const u8) zeam_utils.OptionalNode {
+        return zeam_utils.OptionalNode.init(self.peer_id_to_name.get(peer_id));
     }
 
     /// Get node name from validator index, returns null if not found
-    pub fn getNodeNameFromValidatorIndex(self: *const NodeNameRegistry, validator_index: usize) ?[]const u8 {
-        return self.validator_index_to_name.get(validator_index);
+    pub fn getNodeNameFromValidatorIndex(self: *const NodeNameRegistry, validator_index: usize) zeam_utils.OptionalNode {
+        return zeam_utils.OptionalNode.init(self.validator_index_to_name.get(validator_index));
     }
 };
 
