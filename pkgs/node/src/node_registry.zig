@@ -86,26 +86,26 @@ test "NodeNameRegistry tests" {
 
     // Test peer mappings
     const peer1 = registry.getNodeNameFromPeerId("peer_abc");
-    try std.testing.expect(peer1 != null);
-    try std.testing.expectEqualStrings("node_1", peer1.?);
+    try std.testing.expect(peer1.name != null);
+    try std.testing.expectEqualStrings("node_1", peer1.name.?);
 
     const peer2 = registry.getNodeNameFromPeerId("peer_def");
-    try std.testing.expect(peer2 != null);
-    try std.testing.expectEqualStrings("node_2", peer2.?);
+    try std.testing.expect(peer2.name != null);
+    try std.testing.expectEqualStrings("node_2", peer2.name.?);
 
     // Test validator mappings
     const val1 = registry.getNodeNameFromValidatorIndex(10);
-    try std.testing.expect(val1 != null);
-    try std.testing.expectEqualStrings("node_1", val1.?);
+    try std.testing.expect(val1.name != null);
+    try std.testing.expectEqualStrings("node_1", val1.name.?);
 
     const val2 = registry.getNodeNameFromValidatorIndex(20);
-    try std.testing.expect(val2 != null);
-    try std.testing.expectEqualStrings("node_2", val2.?);
+    try std.testing.expect(val2.name != null);
+    try std.testing.expectEqualStrings("node_2", val2.name.?);
 
     // Empty registry should return null for any query
     const peer_result = registry.getNodeNameFromPeerId("any_peer");
-    try std.testing.expect(peer_result == null);
+    try std.testing.expect(peer_result.name == null);
 
     const val_result = registry.getNodeNameFromValidatorIndex(0);
-    try std.testing.expect(val_result == null);
+    try std.testing.expect(val_result.name == null);
 }

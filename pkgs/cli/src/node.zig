@@ -969,19 +969,19 @@ test "populateNodeNameRegistry" {
     try std.testing.expectEqual(@as(usize, 9), registry.validator_index_to_name.count());
     try std.testing.expectEqual(@as(usize, 3), registry.peer_id_to_name.count());
 
-    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(1).?);
-    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(4).?);
-    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(7).?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(1).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(4).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(7).name.?);
 
-    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(0).?);
-    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(3).?);
-    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(6).?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(0).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(3).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(6).name.?);
 
-    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(2).?);
-    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(5).?);
-    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(8).?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(2).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(5).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(8).name.?);
 
-    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").?);
-    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").?);
-    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
 }
