@@ -488,7 +488,7 @@ test "OptionalNode formatter" {
         });
 
         const result = fbs.getWritten();
-        try testing.expectEqualStrings("(\x1b[38;5;201malice\x1b[0m) Peer connected: peer123, total peers: 5", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", result);
     }
 
     // Test with node name null
@@ -518,7 +518,7 @@ test "OptionalNode formatter" {
         });
 
         const result = fbs.getWritten();
-        try testing.expectEqualStrings("(\x1b[38;5;201mvalidator-7\x1b[0m) Published block: slot=100 proposer=7", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", result);
     }
 
     // Test with empty string (should still format)
@@ -529,6 +529,6 @@ test "OptionalNode formatter" {
         try writer.print("{} Message", .{OptionalNode.init("")});
 
         const result = fbs.getWritten();
-        try testing.expectEqualStrings("(\x1b[38;5;201m\x1b[0m) Message", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", result);
     }
 }
