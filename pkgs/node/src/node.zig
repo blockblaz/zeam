@@ -193,14 +193,14 @@ pub const BeamNode = struct {
                 .status => |status_resp| {
                     switch (ctx_ptr.*) {
                         .status => |*status_ctx| {
-                            self.logger.info("Received status response from peer {s} {}: head_slot={d}, finalized_slot={d}", .{
+                            self.logger.info("Received status response from peer {s}{} head_slot={d}, finalized_slot={d}", .{
                                 status_ctx.peer_id,
                                 zeam_utils.OptionalNode.init(self.getNodeNameForLog(status_ctx.peer_id)),
                                 status_resp.head_slot,
                                 status_resp.finalized_slot,
                             });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn("Status response received for unknown peer {s} {}", .{
+                                self.logger.warn("Status response received for unknown peer {s}{}", .{
                                     status_ctx.peer_id,
                                     zeam_utils.OptionalNode.init(self.getNodeNameForLog(status_ctx.peer_id)),
                                 });

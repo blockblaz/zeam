@@ -13,6 +13,7 @@ const Colors = struct {
     const timestamp = "\x1b[90m"; // Bright black
     const scope = "\x1b[35m"; // Magenta
     const module = "\x1b[94m"; // Bright blue
+    const peer = "\x1b[38;5;201m"; // Pink;
 };
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
@@ -322,7 +323,7 @@ pub const ModuleLogger = struct {
 
 /// Formatter for optional node names in logs
 /// Usage: logger.info("{}message", .{OptionalNode.init(maybe_node_name)})
-/// Outputs: "message" or "(node: node1) message"
+/// Outputs: "message" or "(node1) message"
 pub const OptionalNode = struct {
     name: ?[]const u8,
 
@@ -336,10 +337,13 @@ pub const OptionalNode = struct {
         options: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
+        const peer_color = Colors.peer;
+        const reset_color = Colors.reset;
+
         _ = fmt;
         _ = options;
         if (self.name) |n| {
-            try writer.print("(node: {s})", .{n});
+            try writer.print("({s}{s}{s})", .{ peer_color, n, reset_color });
         }
     }
 };
