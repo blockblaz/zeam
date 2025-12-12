@@ -22,6 +22,14 @@ extern fn hashsig_keypair_from_json(
     public_key_len: usize,
 ) ?*HashSigKeyPair;
 
+/// Reconstruct a key pair from SSZ-encoded bytes
+extern fn hashsig_keypair_from_ssz(
+    secret_key_ssz: [*]const u8,
+    secret_key_len: usize,
+    public_key_ssz: [*]const u8,
+    public_key_len: usize,
+) ?*HashSigKeyPair;
+
 /// Free a key pair
 extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
 
@@ -57,6 +65,13 @@ extern fn hashsig_signature_to_bytes(
 
 /// Serialize a public key to bytes using SSZ encoding
 extern fn hashsig_pubkey_to_bytes(
+    keypair: *const HashSigKeyPair,
+    buffer: [*]u8,
+    buffer_len: usize,
+) usize;
+
+/// Serialize a private key to bytes using SSZ encoding
+extern fn hashsig_privkey_to_bytes(
     keypair: *const HashSigKeyPair,
     buffer: [*]u8,
     buffer_len: usize,
@@ -159,6 +174,31 @@ pub const KeyPair = struct {
         };
     }
 
+    /// Reconstruct a key pair from SSZ-encoded bytes
+    pub fn fromSsz(
+        allocator: Allocator,
+        secret_key_ssz: []const u8,
+        public_key_ssz: []const u8,
+    ) HashSigError!Self {
+        if (secret_key_ssz.len == 0 or public_key_ssz.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_keypair_from_ssz(
+            secret_key_ssz.ptr,
+            secret_key_ssz.len,
+            public_key_ssz.ptr,
+            public_key_ssz.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
+        };
+
+        return Self{
+            .handle = handle,
+            .allocator = allocator,
+        };
+    }
+
     /// Sign a message
     /// Caller owns the returned signature and must free it with deinit()
     pub fn sign(
@@ -226,6 +266,21 @@ pub const KeyPair = struct {
         return bytes_written;
     }
 
+    /// Serialize private key to bytes (SSZ format)
+    pub fn privkeyToBytes(self: *const Self, buffer: []u8) HashSigError!usize {
+        const bytes_written = hashsig_privkey_to_bytes(
+            self.handle,
+            buffer.ptr,
+            buffer.len,
+        );
+
+        if (bytes_written == 0) {
+            return HashSigError.SerializationFailed;
+        }
+
+        return bytes_written;
+    }
+
     /// Free the key pair
     pub fn deinit(self: *Self) void {
         hashsig_keypair_free(self.handle);
@@ -267,6 +322,45 @@ test "HashSig: generate keypair" {
     defer keypair.deinit();
 
     try std.testing.expect(@intFromPtr(keypair.handle) != 0);
+}
+
+test "HashSig: SSZ keypair roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Generate original keypair
+    var keypair = try KeyPair.generate(allocator, "test_ssz_roundtrip", 0, 5);
+    defer keypair.deinit();
+
+    // Serialize to SSZ
+    var pk_buffer: [256]u8 = undefined;
+    const pk_len = try keypair.pubkeyToBytes(&pk_buffer);
+
+    // We need a large buffer for private key (it contains many one-time keys)
+    // Allocating on heap to be safe with stack size
+    const sk_buffer = try allocator.alloc(u8, 1024 * 1024 * 10); // 10MB should be enough
+    defer allocator.free(sk_buffer);
+    const sk_len = try keypair.privkeyToBytes(sk_buffer);
+
+    std.debug.print("\nPK size: {d}, SK size: {d}\n", .{ pk_len, sk_len });
+
+    // Reconstruct from SSZ
+    var restored_keypair = try KeyPair.fromSsz(
+        allocator,
+        sk_buffer[0..sk_len],
+        pk_buffer[0..pk_len],
+    );
+    defer restored_keypair.deinit();
+
+    // Verify functionality with restored keypair
+    const message = [_]u8{42} ** 32;
+    const epoch: u32 = 0;
+
+    // Sign with restored keypair
+    var signature = try restored_keypair.sign(&message, epoch);
+    defer signature.deinit();
+
+    // Verify with original keypair (should work as they are same keys)
+    try keypair.verify(&message, &signature, epoch);
 }
 
 test "HashSig: sign and verify" {

@@ -37,7 +37,7 @@ pub const GossipSub = struct {
     ptr: *anyopaque,
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
-    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage) anyerror!void,
+    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
@@ -80,14 +80,14 @@ pub const NetworkInterface = struct {
     peers: PeerEvents,
 };
 
-const OnGossipCbType = *const fn (*anyopaque, *const GossipMessage) anyerror!void;
+const OnGossipCbType = *const fn (*anyopaque, *const GossipMessage, sender_peer_id: []const u8) anyerror!void;
 pub const OnGossipCbHandler = struct {
     ptr: *anyopaque,
     onGossipCb: OnGossipCbType,
     // c: xev.Completion = undefined,
 
-    pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage) anyerror!void {
-        return self.onGossipCb(self.ptr, data);
+    pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8) anyerror!void {
+        return self.onGossipCb(self.ptr, data, sender_peer_id);
     }
 };
 
@@ -574,19 +574,22 @@ const MessagePublishWrapper = struct {
     allocator: Allocator,
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
+    sender_peer_id: []const u8,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
 
-    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
+    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
         const cloned_data = try data.clone(allocator);
+        const sender_peer_id_copy = try allocator.dupe(u8, sender_peer_id);
 
         const self = try allocator.create(Self);
         self.* = MessagePublishWrapper{
             .allocator = allocator,
             .handler = handler,
             .data = cloned_data,
+            .sender_peer_id = sender_peer_id_copy,
             .networkId = networkId,
             .logger = logger,
         };
@@ -594,6 +597,7 @@ const MessagePublishWrapper = struct {
     }
 
     fn deinit(self: *Self) void {
+        self.allocator.free(self.sender_peer_id);
         self.allocator.destroy(self.data);
         self.allocator.destroy(self);
     }
@@ -706,7 +710,7 @@ pub const GenericGossipHandler = struct {
         self.onGossipHandlers.deinit(self.allocator);
     }
 
-    pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
+    pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8, scheduleOnLoop: bool) anyerror!void {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
         self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, gossip_topic });
@@ -715,7 +719,7 @@ pub const GenericGossipHandler = struct {
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
             // remove this option once resolved
             if (scheduleOnLoop) {
-                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, self.networkId, self.logger);
+                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
                 self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
 
@@ -739,7 +743,7 @@ pub const GenericGossipHandler = struct {
                             _ = r catch unreachable;
                             if (ud) |pwrap| {
                                 pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
-                                _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                                _ = pwrap.handler.onGossip(pwrap.data, pwrap.sender_peer_id) catch void;
                                 defer pwrap.deinit();
                                 // Clean up the completion object
                                 pwrap.allocator.destroy(c);
@@ -749,7 +753,7 @@ pub const GenericGossipHandler = struct {
                     }).callback,
                 );
             } else {
-                handler.onGossip(data) catch |e| {
+                handler.onGossip(data, sender_peer_id) catch |e| {
                     self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
                 };
             }
