@@ -181,23 +181,21 @@ fn buildGraphJSON(
         else
             "normal";
 
-        // Direct HTML color strings - no threshold mapping needed!
-        const color_str = if (is_finalized)
-            "#9B59B6" // Finalized - purple
-        else if (is_justified)
-            "#3498DB" // Justified - blue
-        else if (is_head)
-            "#F39C12" // Head - gold/orange
-        else if (pnode.timeliness)
-            "#2ECC71" // Timely - green
-        else
-            "#FFA500"; // Non-timely - orange
-
-        // Normalized weight for arc
+        // Normalized weight for arc (0.0 to 1.0, draws partial circle border)
+        // Represents fraction of circle filled (0.5 = half circle, 1.0 = full circle)
         const arc_weight: f64 = if (max_weight > 0)
             @as(f64, @floatFromInt(pnode.weight)) / @as(f64, @floatFromInt(max_weight))
         else
             0.0;
+
+        // Use separate arc fields for each color (only one is set per node, others are 0)
+        // This allows manual arc section configuration with explicit colors
+        // TODO: Use chain.forkChoice.isBlockTimely(blockDelayMs) once implemented
+        // For now, treat all non-finalized/non-justified/non-head blocks as timely
+        const arc_timely: f64 = if (!is_finalized and !is_justified and !is_head) arc_weight else 0.0;
+        const arc_head: f64 = if (is_head) arc_weight else 0.0;
+        const arc_justified: f64 = if (is_justified) arc_weight else 0.0;
+        const arc_finalized: f64 = if (is_finalized) arc_weight else 0.0;
 
         // Block root as hex
         const hex_prefix = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(pnode.blockRoot[0..4])});
@@ -210,16 +208,17 @@ fn buildGraphJSON(
         }
 
         try std.fmt.format(nodes_list.writer(),
-            \\{{"id":"{s}","title":"Slot {d}","mainStat":"{d}","secondaryStat":"{d}","arc__weight":{d:.2},"color":"{s}","detail__role":"{s}","detail__timely":{},"detail__hex_prefix":"{s}"}}
+            \\{{"id":"{s}","title":"Slot {d}","mainStat":"{d}","secondaryStat":"{d}","arc__timely":{d:.4},"arc__head":{d:.4},"arc__justified":{d:.4},"arc__finalized":{d:.4},"detail__role":"{s}","detail__hex_prefix":"{s}"}}
         , .{
             full_root,
             pnode.slot,
             pnode.weight,
             pnode.slot,
-            arc_weight,
-            color_str,
+            arc_timely,
+            arc_head,
+            arc_justified,
+            arc_finalized,
             role,
-            pnode.timeliness,
             hex_prefix,
         });
 
