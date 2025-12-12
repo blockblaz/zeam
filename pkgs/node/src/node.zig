@@ -429,7 +429,7 @@ pub const BeamNode = struct {
             const interval = @mod(itime_intervals, constants.INTERVALS_PER_SLOT);
 
             if (interval == 1) {
-                self.chain.printSlot(islot, self.network.getPeerCount());
+                self.chain.printSlot(islot, null, self.network.getPeerCount());
             }
             return;
         }
