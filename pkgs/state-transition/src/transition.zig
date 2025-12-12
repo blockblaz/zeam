@@ -103,12 +103,14 @@ pub fn verifySingleAttestation(
     const validator = &validators[validatorIndex];
     const pubkey = validator.getPubkey();
 
+    const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
     var message: [32]u8 = undefined;
     try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
 
     const epoch: u32 = @intCast(attestation.data.slot);
 
     try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
+    _ = verification_timer.observe();
 }
 
 // TODO(gballet) check if beam block needs to be a pointer

@@ -203,6 +203,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
     zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("@zeam/metrics", zeam_metrics);
     zeam_key_manager.addImport("ssz", ssz);
 
     // add zeam-state-transition
