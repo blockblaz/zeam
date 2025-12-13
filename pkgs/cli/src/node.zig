@@ -347,24 +347,16 @@ pub const Node = struct {
                 return error.HashSigValidatorIndexOutOfRange;
             }
 
-            // Get the base filename from privkey_file (e.g., "validator_0_sk.ssz" -> "validator_0")
-            // The privkey_file in annotated_validators.yaml should now be like "validator_0_sk.ssz"
             const privkey_file = assignment.privkey_file;
 
-            // Construct the secret key path
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ hash_sig_key_dir, privkey_file });
-            defer self.allocator.free(sk_path);
+            if (!std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
+                return error.InvalidPrivkeyFileFormat;
+            }
 
-            // Construct the public key path by replacing _sk.ssz with _pk.ssz
-            const pk_path = blk: {
-                if (std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
-                    const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
-                    break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
-                } else {
-                    // Fallback: assume it's the old format and try to construct pk path
-                    return error.InvalidPrivkeyFileFormat;
-                }
-            };
+            const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
+            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, base });
+            defer self.allocator.free(sk_path);
+            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
             defer self.allocator.free(pk_path);
 
             // Read secret key
