@@ -50,7 +50,7 @@ const EnrFields = struct {
     }
 };
 
-/// Represents a validator assignment from validators.yaml
+/// Represents a validator assignment from annotated_validators.yaml
 pub const ValidatorAssignment = struct {
     index: usize,
     pubkey_hex: []const u8,
@@ -68,7 +68,7 @@ pub const NodeOptions = struct {
     node_key_index: usize,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
-    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
+    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
     //   and one must use all the nodes in genesis nodes.yaml as peers
     validator_config: []const u8,
     bootnodes: []const []const u8,
@@ -399,7 +399,7 @@ pub fn buildStartOptions(
             node_cmd.custom_genesis
         else
             node_cmd.validator_config,
-        "/validators.yaml",
+        "/annotated_validators.yaml",
     });
     defer allocator.free(validators_filepath);
     const validator_config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{

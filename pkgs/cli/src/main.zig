@@ -45,7 +45,7 @@ pub const NodeCommand = struct {
     @"node-key": []const u8 = constants.DEFAULT_NODE_KEY,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
-    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
+    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
     //   and one must use all the nodes in genesis nodes.yaml as peers
     validator_config: []const u8,
     metrics_enable: bool = false,
