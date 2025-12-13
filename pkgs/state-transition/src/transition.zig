@@ -2,10 +2,12 @@ const ssz = @import("ssz");
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
+const utils = types.utils;
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
 const xmss = @import("@zeam/xmss");
+const zeam_metrics = @import("@zeam/metrics");
 
 const Allocator = std.mem.Allocator;
 const debugLog = zeam_utils.zeamLog;
@@ -15,7 +17,7 @@ const StateTransitionError = types.StateTransitionError;
 pub const StateTransitionOpts = struct {
     // signatures are validated outside for keeping life simple for the STF prover
     // we will trust client will validate them however the flag here
-    // represents such dependancy and assumption for STF
+    // represents such dependency and assumption for STF
     validSignatures: bool = true,
     validateResult: bool = true,
     logger: zeam_utils.ModuleLogger,
@@ -36,6 +38,10 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
 }
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    // prepare pre state to process block for that slot, may be rename prepare_pre_stateCollapse comment
+    const transition_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+    defer _ = transition_timer.observe();
+
     // prepare pre state to process block for that slot, may be rename prepare_pre_state
     try state.process_slots(allocator, block.slot, logger);
 
@@ -86,7 +92,7 @@ pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,
     attestation: *const types.Attestation,
-    signatureBytes: *const types.Bytes4000,
+    signatureBytes: *const types.SIGBYTES,
 ) !void {
     const validatorIndex: usize = @intCast(attestation.validator_id);
     const validators = state.validators.constSlice();
@@ -102,12 +108,15 @@ pub fn verifySingleAttestation(
 
     const epoch: u32 = @intCast(attestation.data.slot);
 
-    try xmss.verifyBincode(pubkey, &message, epoch, signatureBytes);
+    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
 }
 
 // TODO(gballet) check if beam block needs to be a pointer
 pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: types.BeamBlock, opts: StateTransitionOpts) !void {
     opts.logger.debug("applying  state transition state-slot={d} block-slot={d}\n", .{ state.slot, block.slot });
+
+    const transition_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+    defer _ = transition_timer.observe();
 
     // client is supposed to call verify_signatures outside STF to make STF prover friendly
     const validSignatures = opts.validSignatures;
@@ -117,6 +126,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
 
     // prepare the pre state for this block slot
     try state.process_slots(allocator, block.slot, opts.logger);
+
     // process the block
     try state.process_block(allocator, block, opts.logger);
 

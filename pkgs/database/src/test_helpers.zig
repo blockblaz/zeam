@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.Bytes4000) !types.SignedBlockWithAttestation {
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.SIGBYTES) !types.SignedBlockWithAttestation {
     var test_block = types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,
@@ -58,9 +58,14 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
 
 /// Helper function to create a dummy state for testing
 pub fn createDummyState(allocator: Allocator, slot: u64, num_validators: u64, genesis_time: u64, justified_slot: u64, finalized_slot: u64, justified_root_fill: u8, finalized_root_fill: u8) !types.BeamState {
+    var validators = try types.Validators.init(allocator);
+    errdefer validators.deinit();
+    for (0..num_validators) |index| {
+        try validators.append(.{ .pubkey = [_]u8{0} ** 52, .index = @as(types.ValidatorIndex, @intCast(index)) });
+    }
+
     var test_state = types.BeamState{
         .config = types.BeamStateConfig{
-            .num_validators = num_validators,
             .genesis_time = genesis_time,
         },
         .slot = slot,

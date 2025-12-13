@@ -51,6 +51,7 @@ pub const NodeCommand = struct {
     metrics_enable: bool = false,
     metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
+    @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
 
@@ -68,6 +69,7 @@ pub const NodeCommand = struct {
         .metrics_enable = "Enable metrics endpoint",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
+        .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .help = "Show help information for the node command",
     };
@@ -154,6 +156,33 @@ const ZeamArgs = struct {
         .help = .h,
         .version = .v,
     };
+
+    pub fn format(
+        self: ZeamArgs,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("ZeamArgs(genesis={d}, log_filename=\"{s}\", console_log_level={s}, file_log_level={s}", .{
+            self.genesis,
+            self.log_filename,
+            @tagName(self.console_log_level),
+            @tagName(self.log_file_active_level),
+        });
+        try writer.writeAll(", command=");
+        switch (self.__commands__) {
+            .clock => try writer.writeAll("clock"),
+            .beam => |cmd| try writer.print("beam(mockNetwork={}, metricsPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.metricsPort, cmd.data_dir }),
+            .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
+            .prometheus => |cmd| switch (cmd.__commands__) {
+                .genconfig => |genconfig| try writer.print("prometheus.genconfig(metrics_port={d}, filename=\"{s}\")", .{ genconfig.metrics_port, genconfig.filename }),
+            },
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", metrics_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.metrics_port }),
+        }
+        try writer.writeAll(")");
+    }
 };
 
 const error_handler = @import("error_handler.zig");
@@ -169,7 +198,13 @@ pub fn main() void {
 fn mainInner() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.err("Memory leak detected!", .{});
+            std.process.exit(1);
+        }
+    }
 
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
@@ -181,13 +216,15 @@ fn mainInner() !void {
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
+    defer opts.deinit();
+
     const genesis = opts.args.genesis;
     const log_filename = opts.args.log_filename;
     const log_file_active_level = opts.args.log_file_active_level;
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+    std.debug.print("opts ={any} genesis={d}\n", .{ opts.args, genesis });
 
     switch (opts.args.__commands__) {
         .clock => {
@@ -229,8 +266,10 @@ fn mainInner() !void {
             };
             defer mock_chain.deinit(allocator);
 
-            // starting beam state
+            // starting beam state - take ownership and clean it up ourselves
             var beam_state = mock_chain.genesis_state;
+            defer beam_state.deinit();
+
             var output = try allocator.alloc(u8, 3 * 1024 * 1024);
             defer allocator.free(output);
             // block 0 is genesis so we have to apply block 1 onwards
@@ -282,16 +321,11 @@ fn mainInner() !void {
             };
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
 
-            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
-            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
-
-            chain_options.genesis_time = time_now;
-
             // Create key manager FIRST to get validator pubkeys for genesis
             const key_manager_lib = @import("@zeam/key-manager");
             // Using 3 validators: so by default beam cmd command runs two nodes to interop
             const num_validators: usize = 3;
-            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 10000);
+            var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager
@@ -302,6 +336,10 @@ fn mainInner() !void {
             // Set validator_pubkeys in chain_options
             chain_options.validator_pubkeys = pubkeys;
             owns_pubkeys = false; // ownership moved into genesis spec
+
+            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
+            chain_options.genesis_time = time_now;
 
             // transfer ownership of the chain_options to ChainConfig
             const chain_config = try ChainConfig.init(Chain.custom, chain_options);
@@ -398,6 +436,17 @@ fn mainInner() !void {
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
+            // Create empty node registries for beam simulation
+            const registry_1 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_1);
+            registry_1.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_1.deinit();
+
+            const registry_2 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_2);
+            registry_2.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_2.deinit();
+
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
                 // options
@@ -410,6 +459,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_1,
                 .logger_config = &logger1_config,
+                .node_registry = registry_1,
             });
 
             var beam_node_2: BeamNode = undefined;
@@ -424,6 +474,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_2,
                 .logger_config = &logger2_config,
+                .node_registry = registry_2,
             });
 
             try beam_node_1.run();
@@ -463,6 +514,10 @@ fn mainInner() !void {
 
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
+            // Create empty node registry upfront to avoid undefined pointer in error paths
+            const node_registry = try allocator.create(node_lib.NodeNameRegistry);
+            node_registry.* = node_lib.NodeNameRegistry.init(allocator);
+
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,
                 .node_key = leancmd.@"node-id",
@@ -476,6 +531,8 @@ fn mainInner() !void {
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
+                .hash_sig_key_dir = undefined,
+                .node_registry = node_registry,
             };
 
             defer start_options.deinit(allocator);

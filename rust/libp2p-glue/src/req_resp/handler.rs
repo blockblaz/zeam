@@ -224,6 +224,7 @@ impl ReqRespConnectionHandler {
     }
 }
 
+#[allow(deprecated)]
 impl ConnectionHandler for ReqRespConnectionHandler {
     type FromBehaviour = ConnectionRequest;
     type ToBehaviour = HandlerEvent;

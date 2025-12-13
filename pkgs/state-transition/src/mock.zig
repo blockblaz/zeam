@@ -23,7 +23,9 @@ const MockChainData = struct {
     finalization: []bool,
 
     pub fn deinit(self: *MockChainData, allocator: Allocator) void {
-        self.genesis_state.deinit();
+        // NOTE: genesis_state cleanup is handled by the caller who uses it
+        // This is necessary because the state may be modified externally,
+        // creating new allocations that this struct doesn't know about
         for (self.blocks) |*b| {
             b.deinit();
         }
@@ -147,6 +149,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         const state_root: [32]u8 = types.ZERO_HASH;
         // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
         var attestations = std.ArrayList(types.Attestation).init(allocator);
+        defer attestations.deinit();
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {
             // no attestations on the first block of this

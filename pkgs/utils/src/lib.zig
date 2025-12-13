@@ -17,6 +17,7 @@ pub const FileBehaviourParams = logFactory.FileBehaviourParams;
 pub const FileParams = logFactory.FileParams;
 pub const ZeamLoggerConfig = logFactory.ZeamLoggerConfig;
 pub const ModuleLogger = logFactory.ModuleLogger;
+pub const OptionalNode = logFactory.OptionalNode;
 pub const getScopedLoggerConfig = logFactory.getScopedLoggerConfig;
 pub const getLoggerConfig = logFactory.getLoggerConfig;
 pub const getTestLoggerConfig = logFactory.getTestLoggerConfig;

@@ -1,4 +1,4 @@
-use hashsig::{signature::SignatureScheme, MESSAGE_LENGTH};
+use leansig::{signature::SignatureScheme, MESSAGE_LENGTH};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -8,9 +8,8 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-use hashsig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
-
-pub type HashSigScheme = SIGTopLevelTargetSumLifetime32Dim64Base8;
+pub type HashSigScheme =
+    leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
 pub type HashSigPrivateKey = <HashSigScheme as SignatureScheme>::SecretKey;
 pub type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
 pub type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
@@ -36,7 +35,7 @@ pub struct KeyPair {
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("Signing failed: {0:?}")]
-    SigningFailed(hashsig::signature::SigningError),
+    SigningFailed(leansig::signature::SigningError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,14 +60,13 @@ impl PrivateKey {
         (PublicKey::new(public_key), Self::new(private_key))
     }
 
-    pub fn sign<R: Rng>(
+    pub fn sign(
         &self,
-        rng: &mut R,
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
     ) -> Result<Signature, SigningError> {
         Ok(Signature::new(
-            <HashSigScheme as SignatureScheme>::sign(rng, &self.inner, epoch, message)
+            <HashSigScheme as SignatureScheme>::sign(&self.inner, epoch, message)
                 .map_err(SigningError::SigningFailed)?,
         ))
     }
@@ -128,6 +126,90 @@ pub unsafe extern "C" fn hashsig_keypair_generate(
     Box::into_raw(keypair)
 }
 
+/// Reconstruct a key pair from JSON-serialized secret and public keys
+/// Returns a pointer to the KeyPair or null on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_keypair_from_json(
+    secret_key_ptr: *const u8,
+    secret_key_len: usize,
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+) -> *mut KeyPair {
+    if secret_key_ptr.is_null() || public_key_ptr.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let sk_slice = slice::from_raw_parts(secret_key_ptr, secret_key_len);
+        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
+
+        let private_key: HashSigPrivateKey = match serde_json::from_slice(sk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let public_key: HashSigPublicKey = match serde_json::from_slice(pk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let keypair = Box::new(KeyPair {
+            public_key: PublicKey::new(public_key),
+            private_key: PrivateKey::new(private_key),
+        });
+
+        Box::into_raw(keypair)
+    }
+}
+
+/// Reconstruct a key pair from SSZ-encoded secret and public keys
+/// Returns a pointer to the KeyPair or null on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_keypair_from_ssz(
+    secret_key_ptr: *const u8,
+    secret_key_len: usize,
+    public_key_ptr: *const u8,
+    public_key_len: usize,
+) -> *mut KeyPair {
+    if secret_key_ptr.is_null() || public_key_ptr.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let sk_slice = slice::from_raw_parts(secret_key_ptr, secret_key_len);
+        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
+
+        let private_key: HashSigPrivateKey = match HashSigPrivateKey::from_ssz_bytes(sk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let public_key: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_slice) {
+            Ok(key) => key,
+            Err(_) => {
+                return ptr::null_mut();
+            }
+        };
+
+        let keypair = Box::new(KeyPair {
+            public_key: PublicKey::new(public_key),
+            private_key: PrivateKey::new(private_key),
+        });
+
+        Box::into_raw(keypair)
+    }
+}
+
 /// Free a key pair
 /// # Safety
 /// This is meant to be called from zig, so the pointers will always dereference correctly
@@ -166,8 +248,7 @@ pub unsafe extern "C" fn hashsig_sign(
             }
         };
 
-        let mut rng = rand::rng();
-        let signature = match keypair_ref.private_key.sign(&mut rng, message_array, epoch) {
+        let signature = match keypair_ref.private_key.sign(message_array, epoch) {
             Ok(sig) => sig,
             Err(_) => {
                 return ptr::null_mut();
@@ -233,12 +314,9 @@ pub extern "C" fn hashsig_message_length() -> usize {
     MESSAGE_LENGTH
 }
 
-use bincode::config::{Configuration, Fixint, LittleEndian, NoLimit};
+use ssz::{Decode, Encode};
 
-const BINCODE_CONFIG: Configuration<LittleEndian, Fixint, NoLimit> =
-    bincode::config::standard().with_fixed_int_encoding();
-
-/// Serialize a signature to bytes using bincode
+/// Serialize a signature to bytes using SSZ encoding
 /// Returns number of bytes written, or 0 on error
 /// # Safety
 /// buffer must point to a valid buffer of sufficient size (recommend 4000+ bytes)
@@ -254,14 +332,21 @@ pub unsafe extern "C" fn hashsig_signature_to_bytes(
 
     unsafe {
         let sig_ref = &*signature;
-        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
 
-        bincode::serde::encode_into_slice(&sig_ref.inner, output_slice, BINCODE_CONFIG)
-            .unwrap_or_default()
+        // Directly SSZ encode the signature (leansig has SSZ support built-in)
+        let ssz_bytes = sig_ref.inner.as_ssz_bytes();
+
+        if ssz_bytes.len() > buffer_len {
+            return 0;
+        }
+
+        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
+        output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
+        ssz_bytes.len()
     }
 }
 
-/// Serialize a public key to bytes using bincode
+/// Serialize a public key to bytes using SSZ encoding
 /// Returns number of bytes written, or 0 on error
 /// # Safety
 /// buffer must point to a valid buffer of sufficient size
@@ -277,23 +362,56 @@ pub unsafe extern "C" fn hashsig_pubkey_to_bytes(
 
     unsafe {
         let keypair_ref = &*keypair;
-        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
 
-        bincode::serde::encode_into_slice(
-            &keypair_ref.public_key.inner,
-            output_slice,
-            BINCODE_CONFIG,
-        )
-        .unwrap_or_default()
+        // Directly SSZ encode the public key (leansig has SSZ support built-in)
+        let ssz_bytes = keypair_ref.public_key.inner.as_ssz_bytes();
+
+        if ssz_bytes.len() > buffer_len {
+            return 0;
+        }
+
+        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
+        output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
+        ssz_bytes.len()
     }
 }
 
-/// Verify XMSS signature from bincode-serialized bytes
+/// Serialize a private key to bytes using SSZ encoding
+/// Returns number of bytes written, or 0 on error
+/// # Safety
+/// buffer must point to a valid buffer of sufficient size
+#[no_mangle]
+pub unsafe extern "C" fn hashsig_privkey_to_bytes(
+    keypair: *const KeyPair,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> usize {
+    if keypair.is_null() || buffer.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        let keypair_ref = &*keypair;
+
+        // Directly SSZ encode the private key (leansig has SSZ support built-in)
+        let ssz_bytes = keypair_ref.private_key.inner.as_ssz_bytes();
+
+        if ssz_bytes.len() > buffer_len {
+            return 0;
+        }
+
+        let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
+        output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
+        ssz_bytes.len()
+    }
+}
+
+/// Verify XMSS signature from SSZ-encoded bytes
 /// Returns 1 if valid, 0 if invalid, -1 on error
 /// # Safety
 /// All pointers must be valid and point to correctly sized data
 #[no_mangle]
-pub unsafe extern "C" fn hashsig_verify_bincode(
+pub unsafe extern "C" fn hashsig_verify_ssz(
     pubkey_bytes: *const u8,
     pubkey_len: usize,
     message: *const u8,
@@ -315,17 +433,16 @@ pub unsafe extern "C" fn hashsig_verify_bincode(
             Err(_) => return -1,
         };
 
-        let pk: HashSigPublicKey = match bincode::serde::decode_from_slice(pk_data, BINCODE_CONFIG)
-        {
-            Ok((pk, _)) => pk,
+        // Directly SSZ decode (leansig has SSZ support built-in)
+        let pk: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_data) {
+            Ok(pk) => pk,
             Err(_) => return -1,
         };
 
-        let sig: HashSigSignature =
-            match bincode::serde::decode_from_slice(sig_data, BINCODE_CONFIG) {
-                Ok((sig, _)) => sig,
-                Err(_) => return -1,
-            };
+        let sig: HashSigSignature = match HashSigSignature::from_ssz_bytes(sig_data) {
+            Ok(sig) => sig,
+            Err(_) => return -1,
+        };
 
         let is_valid = <HashSigScheme as SignatureScheme>::verify(&pk, epoch, message_array, &sig);
 

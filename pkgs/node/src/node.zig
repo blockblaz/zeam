@@ -18,10 +18,12 @@ const testing = @import("./testing.zig");
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
+pub const node_registry = @import("./node_registry.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
+pub const NodeNameRegistry = node_registry.NodeNameRegistry;
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -33,6 +35,7 @@ const NodeOpts = struct {
     nodeId: u32 = 0,
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
+    node_registry: *const NodeNameRegistry,
 };
 
 pub const BeamNode = struct {
@@ -43,8 +46,10 @@ pub const BeamNode = struct {
     validator: ?validatorClient.ValidatorClient = null,
     nodeId: u32,
     logger: zeam_utils.ModuleLogger,
+    node_registry: *const NodeNameRegistry,
 
     const Self = @This();
+
     pub fn init(self: *Self, allocator: Allocator, opts: NodeOpts) !void {
         var validator: ?validatorClient.ValidatorClient = null;
 
@@ -63,6 +68,7 @@ pub const BeamNode = struct {
                 .nodeId = opts.nodeId,
                 .db = opts.db,
                 .logger_config = opts.logger_config,
+                .node_registry = opts.node_registry,
             },
             network.connected_peers,
         );
@@ -91,6 +97,7 @@ pub const BeamNode = struct {
             .validator = validator,
             .nodeId = opts.nodeId,
             .logger = opts.logger_config.logger(.node),
+            .node_registry = opts.node_registry,
         };
 
         network_init_cleanup = false;
@@ -102,7 +109,7 @@ pub const BeamNode = struct {
         self.allocator.destroy(self.chain);
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         switch (data.*) {
@@ -125,7 +132,7 @@ pub const BeamNode = struct {
             .attestation => {},
         }
 
-        const result = try self.chain.onGossip(data);
+        const result = try self.chain.onGossip(data, sender_peer_id);
         self.handleGossipProcessingResult(result);
     }
 
@@ -239,10 +246,11 @@ pub const BeamNode = struct {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
-                self.logger.warn(
-                    "Received unexpected block root 0x{s} from peer {s}",
-                    .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id },
-                );
+                self.logger.warn("Received unexpected block root 0x{s} from peer {s}{}", .{
+                    std.fmt.fmtSliceHexLower(block_root[0..]),
+                    block_ctx.peer_id,
+                    self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                });
             }
 
             // Try to add the block to the chain
@@ -292,10 +300,12 @@ pub const BeamNode = struct {
                     return;
                 }
 
-                self.logger.warn(
-                    "Failed to import block fetched via RPC 0x{s} from peer {s}: {any}",
-                    .{ std.fmt.fmtSliceHexLower(block_root[0..]), block_ctx.peer_id, err },
-                );
+                self.logger.warn("Failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
+                    std.fmt.fmtSliceHexLower(block_root[0..]),
+                    block_ctx.peer_id,
+                    self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                    err,
+                });
                 return;
             };
             defer self.allocator.free(missing_roots);
@@ -329,15 +339,17 @@ pub const BeamNode = struct {
                 .status => |status_resp| {
                     switch (ctx_ptr.*) {
                         .status => |*status_ctx| {
-                            self.logger.info(
-                                "Received status response from peer {s}: head_slot={d}, finalized_slot={d}",
-                                .{ status_ctx.peer_id, status_resp.head_slot, status_resp.finalized_slot },
-                            );
+                            self.logger.info("Received status response from peer {s}{} head_slot={d}, finalized_slot={d}", .{
+                                status_ctx.peer_id,
+                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                status_resp.head_slot,
+                                status_resp.finalized_slot,
+                            });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn(
-                                    "Status response received for unknown peer {s}",
-                                    .{status_ctx.peer_id},
-                                );
+                                self.logger.warn("Status response received for unknown peer {s}{}", .{
+                                    status_ctx.peer_id,
+                                    self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                });
                             }
                         },
                         else => {
@@ -348,10 +360,10 @@ pub const BeamNode = struct {
                 .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
                         .blocks_by_root => |*block_ctx| {
-                            self.logger.info(
-                                "Received blocks-by-root chunk from peer {s}",
-                                .{block_ctx.peer_id},
-                            );
+                            self.logger.info("Received blocks-by-root chunk from peer {s}{}", .{
+                                block_ctx.peer_id,
+                                self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                            });
 
                             try self.processBlockByRootChunk(block_ctx, &block_resp);
                         },
@@ -364,16 +376,20 @@ pub const BeamNode = struct {
             .failure => |err_payload| {
                 switch (ctx_ptr.*) {
                     .status => |status_ctx| {
-                        self.logger.warn(
-                            "Status request to peer {s} failed ({d}): {s}",
-                            .{ status_ctx.peer_id, err_payload.code, err_payload.message },
-                        );
+                        self.logger.warn("Status request to peer {s}{} failed ({d}): {s}", .{
+                            status_ctx.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                            err_payload.code,
+                            err_payload.message,
+                        });
                     },
                     .blocks_by_root => |block_ctx| {
-                        self.logger.warn(
-                            "Blocks-by-root request to peer {s} failed ({d}): {s}",
-                            .{ block_ctx.peer_id, err_payload.code, err_payload.message },
-                        );
+                        self.logger.warn("Blocks-by-root request to peer {s}{} failed ({d}): {s}", .{
+                            block_ctx.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                            err_payload.code,
+                            err_payload.message,
+                        });
                     },
                 }
                 self.network.finalizePendingRequest(request_id);
@@ -481,10 +497,12 @@ pub const BeamNode = struct {
         };
 
         if (maybe_request) |request_info| {
-            self.logger.debug(
-                "Requested {d} block(s) by root from peer {s}, request_id={d}",
-                .{ missing_roots.items.len, request_info.peer_id, request_info.request_id },
-            );
+            self.logger.debug("Requested {d} block(s) by root from peer {s}{}, request_id={d}", .{
+                missing_roots.items.len,
+                request_info.peer_id,
+                self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
+                request_info.request_id,
+            });
         }
     }
 
@@ -492,27 +510,41 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         try self.network.connectPeer(peer_id);
-        self.logger.info("Peer connected: {s}, total peers: {d}", .{ peer_id, self.network.getPeerCount() });
+        self.logger.info("Peer connected: {s}, total peers: {d}", .{
+            peer_id,
+            self.network.getPeerCount(),
+        });
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
 
         const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("Failed to send status request to peer {s}: {any}", .{ peer_id, err });
+            self.logger.warn("Failed to send status request to peer {s}{} {any}", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
             return;
         };
 
-        self.logger.info(
-            "Sent status request to peer {s}: request_id={d}, head_slot={d}, finalized_slot={d}",
-            .{ peer_id, request_id, status.head_slot, status.finalized_slot },
-        );
+        self.logger.info("Sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+            peer_id,
+            self.node_registry.getNodeNameFromPeerId(peer_id),
+            request_id,
+            status.head_slot,
+            status.finalized_slot,
+        });
     }
 
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("Peer disconnected: {s}, total peers: {d}", .{ peer_id, self.network.getPeerCount() });
+            self.logger.info("Peer disconnected: {s}{}, total peers: {d}", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                self.network.getPeerCount(),
+            });
         }
     }
 
@@ -539,7 +571,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
-        if (itime_intervals <= self.chain.forkChoice.fcStore.time) {
+        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.time) {
             self.logger.warn("Skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
                 self.chain.forkChoice.fcStore.time,
                 itime_intervals,
@@ -603,10 +635,10 @@ pub const BeamNode = struct {
         try self.network.publish(&gossip_msg);
 
         const block = signed_block.message.block;
-
-        self.logger.info("Published block to network: slot={d} proposer={d}", .{
+        self.logger.info("Published block to network: slot={d} proposer={d}{}", .{
             block.slot,
             block.proposer_index,
+            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
         });
 
         // 2. Process locally through chain
@@ -684,18 +716,64 @@ test "Node peer tracking on connect/disconnect" {
 
     const backend = mock.getNetworkInterface();
 
-    const chain_config = ctx.takeChainConfig();
-    const anchor_state = ctx.takeAnchorState();
+    // Generate pubkeys for validators using testing key manager
+    const num_validators = 4;
+    const keymanager = @import("@zeam/key-manager");
+    var key_manager = try keymanager.getTestKeyManager(allocator, num_validators, 10);
+    defer key_manager.deinit();
+
+    const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+    defer allocator.free(pubkeys);
+
+    const genesis_config = types.GenesisSpec{
+        .genesis_time = 0,
+        .validator_pubkeys = pubkeys,
+    };
+
+    var anchor_state: types.BeamState = undefined;
+    try anchor_state.genGenesisState(allocator, genesis_config);
+    defer anchor_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, ctx.loggerConfig().logger(.database), data_dir);
+    defer db.deinit();
+
+    const spec_name = try allocator.dupe(u8, "zeamdev");
+    defer allocator.free(spec_name);
+
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = genesis_config,
+        .spec = .{
+            .preset = params.Preset.minimal,
+            .name = spec_name,
+        },
+    };
+
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
+    defer clock.deinit(allocator);
+
+    // Create empty node registry for test
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
     var node: BeamNode = undefined;
     try node.init(allocator, .{
         .config = chain_config,
-        .anchorState = anchor_state,
+        .anchorState = &anchor_state,
         .backend = backend,
         .clock = ctx.clockPtr(),
         .validator_ids = null,
         .nodeId = 0,
-        .db = ctx.dbInstance(),
-        .logger_config = ctx.loggerConfig(),
+        .db = db,
+        .logger_config = &ctx.logger_config,
+        .node_registry = test_registry,
     });
     defer node.deinit();
 
@@ -757,6 +835,12 @@ test "Node: fetched blocks cache and deduplication" {
 
     const chain_config = ctx.takeChainConfig();
     const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
     var node: BeamNode = undefined;
     try node.init(allocator, .{
         .config = chain_config,
@@ -767,6 +851,7 @@ test "Node: fetched blocks cache and deduplication" {
         .nodeId = 0,
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
     });
     defer node.deinit();
 
@@ -866,6 +951,12 @@ test "Node: processCachedDescendants basic flow" {
     defer mock_chain.deinit(allocator);
     try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[1]);
     try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[2]);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
     var node: BeamNode = undefined;
     try node.init(allocator, .{
         .config = chain_config,
@@ -876,6 +967,7 @@ test "Node: processCachedDescendants basic flow" {
         .nodeId = 0,
         .db = ctx.dbInstance(),
         .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
     });
     defer node.deinit();
 
