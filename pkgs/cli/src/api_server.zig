@@ -139,11 +139,14 @@ fn buildGraphJSON(
     max_slots: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    const fork_choice = &chain.forkChoice;
-    const proto_nodes = fork_choice.protoArray.nodes.items;
+    // Thread-safe snapshot - lock held only during copy
+    const snapshot = try chain.forkChoice.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const proto_nodes = snapshot.nodes;
 
     // Determine the slot threshold (show only recent slots)
-    const current_slot = fork_choice.head.slot;
+    const current_slot = snapshot.head.slot;
     const min_slot = if (current_slot > max_slots) current_slot - max_slots else 0;
 
     // Build nodes and edges
@@ -164,13 +167,41 @@ fn buildGraphJSON(
     }
 
     // Build nodes
+    // Find the finalized node index to check ancestry
+    const finalized_idx = blk: {
+        for (proto_nodes, 0..) |n, i| {
+            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized_root)) {
+                break :blk i;
+            }
+        }
+        break :blk null;
+    };
+
     for (proto_nodes, 0..) |pnode, idx| {
         if (pnode.slot < min_slot) continue;
 
         // Determine node role and color
-        const is_head = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.head.blockRoot);
-        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.fcStore.latest_justified.root);
-        const is_finalized = std.mem.eql(u8, &pnode.blockRoot, &fork_choice.fcStore.latest_finalized.root);
+        const is_head = std.mem.eql(u8, &pnode.blockRoot, &snapshot.head.blockRoot);
+        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified_root);
+
+        // A block is finalized if:
+        // 1. It equals the finalized checkpoint, OR
+        // 2. The finalized block is a descendant of it (block is ancestor of finalized)
+        const is_finalized = blk: {
+            // Check if this block IS the finalized block
+            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized_root)) {
+                break :blk true;
+            }
+            // Check if this block is an ancestor of the finalized block
+            if (finalized_idx) |fin_idx| {
+                var current_idx: ?usize = fin_idx;
+                while (current_idx) |curr| {
+                    if (curr == idx) break :blk true;
+                    current_idx = proto_nodes[curr].parent;
+                }
+            }
+            break :blk false;
+        };
 
         const role = if (is_finalized)
             "finalized"

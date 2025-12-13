@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
 
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
@@ -99,7 +100,8 @@ pub const ProtoArray = struct {
         }
     }
 
-    pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn applyDeltasUnlocked(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
         if (deltas.len != self.nodes.items.len) {
             return ForkChoiceError.InvalidDeltas;
         }
@@ -233,8 +235,22 @@ pub const ForkChoice = struct {
     // get added
     deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
+    // Thread-safe access protection
+    mutex: Thread.RwLock,
 
     const Self = @This();
+
+    /// Thread-safe snapshot for observability
+    pub const Snapshot = struct {
+        head: ProtoNode,
+        latest_justified_root: [32]u8,
+        latest_finalized_root: [32]u8,
+        nodes: []ProtoNode,
+
+        pub fn deinit(self: Snapshot, allocator: Allocator) void {
+            allocator.free(self.nodes);
+        }
+    };
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
         const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
@@ -274,9 +290,51 @@ pub const ForkChoice = struct {
             .safeTarget = anchor_block,
             .deltas = deltas,
             .logger = opts.logger,
+            .mutex = Thread.RwLock{},
         };
-        _ = try fc.updateHead();
+        // No lock needed during init - struct not yet accessible to other threads
+        _ = try fc.updateHeadUnlocked();
         return fc;
+    }
+
+    /// Thread-safe snapshot for observability
+    /// Holds shared lock only during copy, caller formats JSON lock-free
+    pub fn snapshot(self: *Self, allocator: Allocator) !Snapshot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+
+        // Quick copy - ProtoNode has no pointer members, shallow copy is safe
+        const nodes_copy = try allocator.alloc(ProtoNode, self.protoArray.nodes.items.len);
+        @memcpy(nodes_copy, self.protoArray.nodes.items);
+
+        // Get the full ProtoNode for head from protoArray
+        const head_idx = self.protoArray.indices.get(self.head.blockRoot) orelse {
+            // Fallback: create a ProtoNode from ProtoBlock if not found
+            const head_node = ProtoNode{
+                .slot = self.head.slot,
+                .blockRoot = self.head.blockRoot,
+                .parentRoot = self.head.parentRoot,
+                .stateRoot = self.head.stateRoot,
+                .timeliness = self.head.timeliness,
+                .parent = null,
+                .weight = 0,
+                .bestChild = null,
+                .bestDescendant = null,
+            };
+            return Snapshot{
+                .head = head_node,
+                .latest_justified_root = self.fcStore.latest_justified.root,
+                .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .nodes = nodes_copy,
+            };
+        };
+
+        return Snapshot{
+            .head = self.protoArray.nodes.items[head_idx],
+            .latest_justified_root = self.fcStore.latest_justified.root,
+            .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .nodes = nodes_copy,
+        };
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -314,7 +372,8 @@ pub const ForkChoice = struct {
     /// Get all ancestor block roots from the current finalized block,
     /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
     /// Stops traversal when previousFinalizedSlot is reached or at genesis.
-    pub fn getAncestorsOfFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
+    // Internal unlocked version - assumes caller holds lock
+    fn getAncestorsOfFinalizedUnlocked(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
         var ancestors = std.ArrayList(types.Root).init(allocator);
 
         var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
@@ -333,7 +392,8 @@ pub const ForkChoice = struct {
         return ancestors.toOwnedSlice();
     }
 
-    pub fn tickInterval(self: *Self, hasProposal: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
 
@@ -341,28 +401,30 @@ pub const ForkChoice = struct {
             0 => {
                 self.fcStore.timeSlots += 1;
                 if (hasProposal) {
-                    _ = try self.acceptNewAttestations();
+                    _ = try self.acceptNewAttestationsUnlocked();
                 }
             },
             1 => {},
             2 => {
-                _ = try self.updateSafeTarget();
+                _ = try self.updateSafeTargetUnlocked();
             },
             3 => {
-                _ = try self.acceptNewAttestations();
+                _ = try self.acceptNewAttestationsUnlocked();
             },
             else => @panic("invalid interval"),
         }
         self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool) !void {
         while (self.fcStore.time < time_intervals) {
-            try self.tickInterval(has_proposal and (self.fcStore.time + 1) == time_intervals);
+            try self.tickIntervalUnlocked(has_proposal and (self.fcStore.time + 1) == time_intervals);
         }
     }
 
-    pub fn acceptNewAttestations(self: *Self) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.latestNew) |new_attestation| {
@@ -374,19 +436,20 @@ pub const ForkChoice = struct {
             try self.attestations.put(validator_id, attestation_tracker);
         }
 
-        return self.updateHead();
+        return self.updateHeadUnlocked();
     }
 
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
+    // Internal unlocked version - assumes caller holds lock
+    fn getProposalHeadUnlocked(self: *Self, slot: types.Slot) !types.Checkpoint {
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
         // this is deterministally called after the fc has been ticked ahead
         // so the following call should be a no-op
-        try self.onInterval(time_intervals, true);
+        try self.onIntervalUnlocked(time_intervals, true);
         // accept any new attestations in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new attestations
-        const head = try self.acceptNewAttestations();
+        const head = try self.acceptNewAttestationsUnlocked();
 
         return types.Checkpoint{
             .root = head.blockRoot,
@@ -394,7 +457,8 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
+    // Internal unlocked version - assumes caller holds lock
+    fn getProposalAttestationsUnlocked(self: *Self) ![]types.SignedAttestation {
         var included_attestations = std.ArrayList(types.SignedAttestation).init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
 
@@ -415,7 +479,8 @@ pub const ForkChoice = struct {
         return included_attestations.toOwnedSlice();
     }
 
-    pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
+    // Internal unlocked version - assumes caller holds lock
+    fn getAttestationTargetUnlocked(self: *Self) !types.Checkpoint {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;
 
@@ -436,7 +501,8 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+    // Internal unlocked version - assumes caller holds lock
+    fn computeDeltasUnlocked(self: *Self, from_known: bool) ![]isize {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
             try self.deltas.append(0);
@@ -469,9 +535,10 @@ pub const ForkChoice = struct {
         return self.deltas.items;
     }
 
-    pub fn computeFCHead(self: *Self, from_known: bool, cutoff_weight: u64) !ProtoBlock {
-        const deltas = try self.computeDeltas(from_known);
-        try self.protoArray.applyDeltas(deltas, cutoff_weight);
+    // Internal unlocked version - assumes caller holds lock
+    fn computeFCHeadUnlocked(self: *Self, from_known: bool, cutoff_weight: u64) !ProtoBlock {
+        const deltas = try self.computeDeltasUnlocked(from_known);
+        try self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
 
         // head is the best descendant of latest justified
         const justified_idx = self.protoArray.indices.get(self.fcStore.latest_justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
@@ -494,20 +561,23 @@ pub const ForkChoice = struct {
         return fcHead;
     }
 
-    pub fn updateHead(self: *Self) !ProtoBlock {
-        self.head = try self.computeFCHead(true, 0);
+    // Internal unlocked version - assumes caller holds lock
+    fn updateHeadUnlocked(self: *Self) !ProtoBlock {
+        self.head = try self.computeFCHeadUnlocked(true, 0);
         // Update the lean_head_slot metric
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
         return self.head;
     }
 
-    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHead(false, cutoff_weight);
+        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
         return self.safeTarget;
     }
 
-    pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn onAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
@@ -553,7 +623,8 @@ pub const ForkChoice = struct {
     }
 
     // we process state outside forkchoice onblock to parallize verifications and just use the post state here
-    pub fn onBlock(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn onBlockUnlocked(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
@@ -600,13 +671,126 @@ pub const ForkChoice = struct {
         }
     }
 
-    pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
+    // Internal unlocked version - assumes caller holds lock
+    fn hasBlockUnlocked(self: *Self, blockRoot: types.Root) bool {
         const block_or_null = self.protoArray.getBlock(blockRoot);
         if (block_or_null) |_| {
             return true;
         }
 
         return false;
+    }
+
+    //  PUBLIC API - LOCK AT BOUNDARY
+    // These methods acquire locks and delegate to unlocked helpers
+
+    pub fn updateHead(self: *Self) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.updateHeadUnlocked();
+    }
+
+    pub fn onBlock(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onBlockUnlocked(block, state, opts);
+    }
+
+    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onIntervalUnlocked(time_intervals, has_proposal);
+    }
+
+    pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onAttestationUnlocked(signed_attestation, is_from_block);
+    }
+
+    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.updateSafeTargetUnlocked();
+    }
+
+    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
+        self.mutex.lock();  // Write lock - mutates via onInterval
+        defer self.mutex.unlock();
+        return self.getProposalHeadUnlocked(slot);
+    }
+
+    //  READ-ONLY API - SHARED LOCK
+
+    pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getProposalAttestationsUnlocked();
+    }
+
+    pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getAttestationTargetUnlocked();
+    }
+
+    pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.hasBlockUnlocked(blockRoot);
+    }
+
+    pub fn getAncestorsOfFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getAncestorsOfFinalizedUnlocked(allocator, currentFinalized, previousFinalizedSlot);
+    }
+
+    //  SAFE GETTERS FOR SHARED STATE
+    // These provide thread-safe access to internal state
+
+    /// Get a copy of the current head block
+    pub fn getHead(self: *Self) ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.head;
+    }
+
+    /// Get the latest justified checkpoint
+    pub fn getLatestJustified(self: *Self) types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.latest_justified;
+    }
+
+    /// Get the latest finalized checkpoint
+    pub fn getLatestFinalized(self: *Self) types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.latest_finalized;
+    }
+
+    /// Get the current time in slots
+    pub fn getCurrentSlot(self: *Self) types.Slot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.timeSlots;
+    }
+
+    /// Check if a block exists and get its slot (thread-safe)
+    pub fn getBlockSlot(self: *Self, blockRoot: types.Root) ?types.Slot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        const idx = self.protoArray.indices.get(blockRoot) orelse return null;
+        return self.protoArray.nodes.items[idx].slot;
+    }
+
+    /// Get a ProtoNode by root (returns a copy)
+    pub fn getProtoNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        const idx = self.protoArray.indices.get(blockRoot) orelse return null;
+        return self.protoArray.nodes.items[idx];
     }
 };
 
