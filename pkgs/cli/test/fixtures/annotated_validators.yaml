@@ -1,0 +1,32 @@
+quadrivium_0:
+  - index: 2
+    pubkey_hex: 739ee058f743bb22625f611512025d6c6b10291340b43a334e2f9324dcd6651b4be38a2fd20f15362fbd8b3d16ed513388eab459
+    privkey_file: validator_2_sk.ssz
+  - index: 5
+    pubkey_hex: 53f8243e52f90c009e898b6f42a71a71f7170b664a36ff3f2125713d581aa03a88cb7901257750113e229c7161291969daa42639
+    privkey_file: validator_5_sk.ssz
+  - index: 8
+    pubkey_hex: ecf33e3dbd049a41b625d11ad249466f08b98a5d9004bf64bb56e84ae56f502dbb9fa92e1eb8130eb9225555291af5041ac4ca41
+    privkey_file: validator_8_sk.ssz
+
+ream_0:
+  - index: 0
+    pubkey_hex: cf62b50b61804f50265f05077a888d16cd6e8843dfb868419e295873bfb37d3879a80f6827e1a5140f844a185625611fabdab54b
+    privkey_file: validator_0_sk.ssz
+  - index: 3
+    pubkey_hex: edde7b69f0a9c820c24425754e33f95874adc172e0a54d2c6d732a2757eb8c2a235cf91dcf838704233a8126cb5feb1a4b0e444e
+    privkey_file: validator_3_sk.ssz
+  - index: 6
+    pubkey_hex: 30c418308dfd3f15e6e6c811ea6df03c98c8772bba1f72473b2675382d6c715676a67147b438e46a251d2c427d8df53d38464332
+    privkey_file: validator_6_sk.ssz
+
+zeam_0:
+  - index: 1
+    pubkey_hex: 812f8540481ce70515d43b451cedcf6b4e3177312821fa541df6375c20ced55196ad245a00335d425e86817bdbde75536c986c25
+    privkey_file: validator_1_sk.ssz
+  - index: 4
+    pubkey_hex: a47e01144cd43e3efddef56da069f418d9aac406c29589314f74b00158437375e51b1213ecbbf23d47fd9e05933cfb24ac84e72d
+    privkey_file: validator_4_sk.ssz
+  - index: 7
+    pubkey_hex: 809e65341804a10961d9fe37d1cf5c6d3c008f3d3a11532cd4bc37019a0fb44feba1490c6d890c31d216745d3d601e7e4c92f430
+    privkey_file: validator_7_sk.ssz

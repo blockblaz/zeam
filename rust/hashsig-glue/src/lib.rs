@@ -126,48 +126,6 @@ pub unsafe extern "C" fn hashsig_keypair_generate(
     Box::into_raw(keypair)
 }
 
-/// Reconstruct a key pair from JSON-serialized secret and public keys
-/// Returns a pointer to the KeyPair or null on error
-/// # Safety
-/// This is meant to be called from zig, so the pointers will always dereference correctly
-#[no_mangle]
-pub unsafe extern "C" fn hashsig_keypair_from_json(
-    secret_key_ptr: *const u8,
-    secret_key_len: usize,
-    public_key_ptr: *const u8,
-    public_key_len: usize,
-) -> *mut KeyPair {
-    if secret_key_ptr.is_null() || public_key_ptr.is_null() {
-        return ptr::null_mut();
-    }
-
-    unsafe {
-        let sk_slice = slice::from_raw_parts(secret_key_ptr, secret_key_len);
-        let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
-
-        let private_key: HashSigPrivateKey = match serde_json::from_slice(sk_slice) {
-            Ok(key) => key,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        let public_key: HashSigPublicKey = match serde_json::from_slice(pk_slice) {
-            Ok(key) => key,
-            Err(_) => {
-                return ptr::null_mut();
-            }
-        };
-
-        let keypair = Box::new(KeyPair {
-            public_key: PublicKey::new(public_key),
-            private_key: PrivateKey::new(private_key),
-        });
-
-        Box::into_raw(keypair)
-    }
-}
-
 /// Reconstruct a key pair from SSZ-encoded secret and public keys
 /// Returns a pointer to the KeyPair or null on error
 /// # Safety
