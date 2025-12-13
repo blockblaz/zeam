@@ -918,9 +918,9 @@ test "configs yaml parsing" {
         std.testing.allocator.free(validator_assignments);
     }
     try std.testing.expectEqual(3, validator_assignments.len);
-    try std.testing.expectEqual(0, validator_assignments[0].index);
-    try std.testing.expectEqual(3, validator_assignments[1].index);
-    try std.testing.expectEqual(6, validator_assignments[2].index);
+    try std.testing.expectEqual(1, validator_assignments[0].index);
+    try std.testing.expectEqual(4, validator_assignments[1].index);
+    try std.testing.expectEqual(7, validator_assignments[2].index);
 
     var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
     defer nodes_file.deinit(std.testing.allocator);
