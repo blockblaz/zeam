@@ -51,6 +51,11 @@ pub const CachedProcessedBlockInfo = struct {
     blockRoot: ?types.Root = null,
 };
 
+pub const GossipProcessingResult = struct {
+    processed_block_root: ?types.Root = null,
+    missing_attestation_roots: []types.Root = &[_]types.Root{},
+};
+
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
@@ -325,7 +330,7 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !void {
+    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.message.block;
@@ -346,9 +351,24 @@ pub const BeamChain = struct {
                 });
 
                 if (!hasBlock) {
+                    const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
+                    self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
+                    if (hasParentBlock) {
+                        const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
+                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
+                            return .{};
+                        };
+                        // Return both the block root and missing attestation roots so the node can:
+                        // 1. Call processCachedDescendants(block_root) to retry any cached children
+                        // 2. Fetch missing attestation head blocks via RPC
+                        return .{
+                            .processed_block_root = block_root,
+                            .missing_attestation_roots = missing_roots,
+                        };
+                    }
                     self.validateBlock(block, true) catch |err| {
                         self.module_logger.warn("gossip block validation failed: {any}", .{err});
-                        return; // Drop invalid gossip attestations
+                        return .{}; // Drop invalid gossip attestations
                     };
                     const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
                         self.module_logger.err(" error processing block for slot={any} root={any}: {any}", .{
@@ -357,9 +377,12 @@ pub const BeamChain = struct {
                             std.fmt.fmtSliceHexLower(&block_root),
                             err,
                         });
-                        return;
+                        return .{};
                     };
-                    defer self.allocator.free(missing_roots);
+                    return .{
+                        .processed_block_root = block_root,
+                        .missing_attestation_roots = missing_roots,
+                    };
                 } else {
                     self.module_logger.debug("skipping processing the already present block slot={any} blockroot={any}", .{
                         //
@@ -367,6 +390,7 @@ pub const BeamChain = struct {
                         std.fmt.fmtSliceHexLower(&block_root),
                     });
                 }
+                return .{};
             },
             .attestation => |signed_attestation| {
                 const signed_attestation_json = try signed_attestation.toJson(self.allocator);
@@ -379,8 +403,8 @@ pub const BeamChain = struct {
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
-                    self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
-                    return; // Drop invalid gossip attestations
+                    self.module_logger.debug("Gossip attestation validation failed: {any}", .{err});
+                    return .{}; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
@@ -388,6 +412,7 @@ pub const BeamChain = struct {
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
+                return .{};
             },
         }
     }
@@ -796,7 +821,7 @@ pub const BeamChain = struct {
     }
 };
 
-const BlockProcessingError = error{MissingPreState};
+pub const BlockProcessingError = error{MissingPreState};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
     MissingState,
