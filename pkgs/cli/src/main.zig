@@ -156,6 +156,33 @@ const ZeamArgs = struct {
         .help = .h,
         .version = .v,
     };
+
+    pub fn format(
+        self: ZeamArgs,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("ZeamArgs(genesis={d}, log_filename=\"{s}\", console_log_level={s}, file_log_level={s}", .{
+            self.genesis,
+            self.log_filename,
+            @tagName(self.console_log_level),
+            @tagName(self.log_file_active_level),
+        });
+        try writer.writeAll(", command=");
+        switch (self.__commands__) {
+            .clock => try writer.writeAll("clock"),
+            .beam => |cmd| try writer.print("beam(mockNetwork={}, metricsPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.metricsPort, cmd.data_dir }),
+            .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
+            .prometheus => |cmd| switch (cmd.__commands__) {
+                .genconfig => |genconfig| try writer.print("prometheus.genconfig(metrics_port={d}, filename=\"{s}\")", .{ genconfig.metrics_port, genconfig.filename }),
+            },
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", metrics_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.metrics_port }),
+        }
+        try writer.writeAll(")");
+    }
 };
 
 const error_handler = @import("error_handler.zig");
@@ -197,7 +224,7 @@ fn mainInner() !void {
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts, genesis });
+    std.debug.print("opts ={any} genesis={d}\n", .{ opts.args, genesis });
 
     switch (opts.args.__commands__) {
         .clock => {
@@ -409,6 +436,17 @@ fn mainInner() !void {
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
+            // Create empty node registries for beam simulation
+            const registry_1 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_1);
+            registry_1.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_1.deinit();
+
+            const registry_2 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_2);
+            registry_2.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_2.deinit();
+
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
                 // options
@@ -421,6 +459,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_1,
                 .logger_config = &logger1_config,
+                .node_registry = registry_1,
             });
 
             var beam_node_2: BeamNode = undefined;
@@ -435,6 +474,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_2,
                 .logger_config = &logger2_config,
+                .node_registry = registry_2,
             });
 
             try beam_node_1.run();
@@ -474,6 +514,10 @@ fn mainInner() !void {
 
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
+            // Create empty node registry upfront to avoid undefined pointer in error paths
+            const node_registry = try allocator.create(node_lib.NodeNameRegistry);
+            node_registry.* = node_lib.NodeNameRegistry.init(allocator);
+
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,
                 .node_key = leancmd.@"node-id",
@@ -488,6 +532,7 @@ fn mainInner() !void {
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = undefined,
+                .node_registry = node_registry,
             };
 
             defer start_options.deinit(allocator);

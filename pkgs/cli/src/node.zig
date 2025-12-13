@@ -26,6 +26,8 @@ const zeam_utils = @import("@zeam/utils");
 const constants = @import("constants.zig");
 const database = @import("@zeam/database");
 const json = std.json;
+const utils = @import("@zeam/utils");
+const ssz = @import("ssz");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -80,6 +82,7 @@ pub const NodeOptions = struct {
     logger_config: *LoggerConfig,
     database_path: []const u8,
     hash_sig_key_dir: []const u8,
+    node_registry: *node_lib.NodeNameRegistry,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -90,6 +93,8 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_assignments);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
+        self.node_registry.deinit();
+        allocator.destroy(self.node_registry);
     }
 
     pub fn getValidatorIndices(self: *const NodeOptions, allocator: std.mem.Allocator) ![]usize {
@@ -193,6 +198,7 @@ pub const Node = struct {
             .key_manager = &self.key_manager,
             .db = db,
             .logger_config = options.logger_config,
+            .node_registry = options.node_registry,
         });
 
         self.logger = options.logger_config.logger(.node);
@@ -341,35 +347,48 @@ pub const Node = struct {
                 return error.HashSigValidatorIndexOutOfRange;
             }
 
-            const pubkey_hex = assignment.pubkey_hex;
-            const hex_str = if (std.mem.startsWith(u8, pubkey_hex, "0x"))
-                pubkey_hex[2..]
-            else
-                pubkey_hex;
+            // Get the base filename from privkey_file (e.g., "validator_0_sk.ssz" -> "validator_0")
+            // The privkey_file in annotated_validators.yaml should now be like "validator_0_sk.ssz"
+            const privkey_file = assignment.privkey_file;
 
-            if (hex_str.len != 104) { // 52 bytes = 104 hex chars
-                return error.InvalidPublicKeyLength;
-            }
-            var pubkey_bytes: [52]u8 = undefined;
-            _ = std.fmt.hexToBytes(&pubkey_bytes, hex_str) catch {
-                return error.InvalidPublicKeyHex;
-            };
-
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ hash_sig_key_dir, assignment.privkey_file });
+            // Construct the secret key path
+            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ hash_sig_key_dir, privkey_file });
             defer self.allocator.free(sk_path);
 
+            // Construct the public key path by replacing _sk.ssz with _pk.ssz
+            const pk_path = blk: {
+                if (std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
+                    const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
+                    break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
+                } else {
+                    // Fallback: assume it's the old format and try to construct pk path
+                    return error.InvalidPrivkeyFileFormat;
+                }
+            };
+            defer self.allocator.free(pk_path);
+
+            // Read secret key
             var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
                 error.FileNotFound => return error.HashSigSecretKeyMissing,
                 else => return err,
             };
             defer sk_file.close();
-            const secret_json = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
-            defer self.allocator.free(secret_json);
+            const secret_ssz = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
+            defer self.allocator.free(secret_ssz);
 
-            var keypair = try xmss.KeyPair.fromJsonSkBincodePk(
+            // Read public key
+            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            defer pk_file.close();
+            const public_ssz = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
+            defer self.allocator.free(public_ssz);
+
+            var keypair = try xmss.KeyPair.fromSsz(
                 self.allocator,
-                secret_json,
-                &pubkey_bytes,
+                secret_ssz,
+                public_ssz,
             );
             errdefer keypair.deinit();
 
@@ -456,6 +475,11 @@ pub fn buildStartOptions(
         "/",
         node_cmd.@"sig-keys-dir",
     });
+
+    // Populate node name registry with peer information
+    populateNodeNameRegistry(allocator, opts.node_registry, validator_config_filepath, validators_filepath) catch |err| {
+        std.log.warn("Failed to populate node name registry: {any}", .{err});
+    };
 
     opts.bootnodes = bootnodes;
     opts.validator_assignments = validator_assignments;
@@ -792,35 +816,124 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
-// TODO: Enable and update this test - YAML parsing for public keys is now implemented, but test expectations may need adjustment
-// test "config yaml parsing" {
-//     var config1 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
-//     defer config1.deinit(std.testing.allocator);
-//     const genesis_spec = try configs.genesisConfigFromYAML(config1, null);
-//     try std.testing.expectEqual(9, genesis_spec.num_validators);
-//     try std.testing.expectEqual(1704085200, genesis_spec.genesis_time);
-//
-//     var config2 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
-//     defer config2.deinit(std.testing.allocator);
-//     const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", config2);
-//     defer std.testing.allocator.free(validator_indices);
-//     try std.testing.expectEqual(3, validator_indices.len);
-//     try std.testing.expectEqual(1, validator_indices[0]);
-//     try std.testing.expectEqual(4, validator_indices[1]);
-//     try std.testing.expectEqual(7, validator_indices[2]);
-//
-//     var config3 = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
-//     defer config3.deinit(std.testing.allocator);
-//     const nodes = try nodesFromYAML(std.testing.allocator, config3);
-//     defer {
-//         for (nodes) |node| std.testing.allocator.free(node);
-//         std.testing.allocator.free(nodes);
-//     }
-//     try std.testing.expectEqual(3, nodes.len);
-//     try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
-//     try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
-//     try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
-// }
+/// Populate a NodeNameRegistry from validator-config.yaml and validators.yaml
+/// This creates mappings from peer IDs and validator indices to node names
+pub fn populateNodeNameRegistry(
+    allocator: std.mem.Allocator,
+    registry: *node_lib.NodeNameRegistry,
+    validator_config_path: []const u8,
+    validators_path: []const u8,
+) !void {
+
+    // Parse validator-config.yaml to get node names and their ENRs/privkeys
+    var parsed_validator_config = try utils_lib.loadFromYAMLFile(allocator, validator_config_path);
+    defer parsed_validator_config.deinit(allocator);
+
+    // Parse validators.yaml to get validator indices for each node
+    var parsed_validators = try utils_lib.loadFromYAMLFile(allocator, validators_path);
+    defer parsed_validators.deinit(allocator);
+
+    const validators_list = parsed_validator_config.docs.items[0].map.get("validators");
+    if (validators_list == null) return;
+
+    for (validators_list.?.list) |entry| {
+        const name_value = entry.map.get("name");
+        if (name_value == null or name_value.? != .string) continue;
+        const node_name = name_value.?.string;
+
+        // Get peer ID from ENR or private key
+        const peer_id_str = blk: {
+            var peer_id_buf: [256]u8 = undefined;
+            // Try to get ENR first
+            if (entry.map.get("enr")) |enr_value| {
+                if (enr_value == .string) {
+                    var enr: ENR = undefined;
+                    ENR.decodeTxtInto(&enr, enr_value.string) catch break :blk null;
+                    const pid = enr.peerId(allocator) catch break :blk null;
+                    const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                    const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                    break :blk pid_str;
+                }
+            }
+
+            // Try to construct ENR from privkey and enrFields
+            if (entry.map.get("privkey")) |privkey_value| {
+                if (privkey_value == .string) {
+                    const enr_fields_value = entry.map.get("enrFields");
+                    if (enr_fields_value != null) {
+                        var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
+                        defer enr_fields.deinit(allocator);
+                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields) catch break :blk null;
+                        defer enr.deinit();
+                        const pid = enr.peerId(allocator) catch break :blk null;
+                        const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                        const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                        break :blk pid_str;
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        // Add peer ID mapping if we got a valid peer ID string
+        if (peer_id_str) |pid_str| {
+            defer allocator.free(pid_str);
+            registry.addPeerMapping(pid_str, node_name) catch |err| {
+                std.log.warn("Failed to add peer mapping for node {s}: {any}", .{ node_name, err });
+            };
+        }
+
+        // Add validator index mappings
+        const node_validators = parsed_validators.docs.items[0].map.get(node_name);
+        if (node_validators) |validators| {
+            if (validators == .list) {
+                for (validators.list) |item| {
+                    if (item == .int) {
+                        const validator_index: usize = @intCast(item.int);
+                        registry.addValidatorMapping(validator_index, node_name) catch |err| {
+                            std.log.warn("Failed to add validator mapping for node {s} index {d}: {any}", .{ node_name, validator_index, err });
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "configs yaml parsing" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+    const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
+    defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
+    try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
+    try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
+
+    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/annotated_validators.yaml");
+    defer validators_file.deinit(std.testing.allocator);
+    const validator_assignments = try validatorAssignmentsFromYAML(std.testing.allocator, "zeam_0", validators_file);
+    defer {
+        for (validator_assignments) |*a| {
+            @constCast(a).deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(validator_assignments);
+    }
+    try std.testing.expectEqual(3, validator_assignments.len);
+    try std.testing.expectEqual(0, validator_assignments[0].index);
+    try std.testing.expectEqual(3, validator_assignments[1].index);
+    try std.testing.expectEqual(6, validator_assignments[2].index);
+
+    var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
+    defer nodes_file.deinit(std.testing.allocator);
+    const nodes = try nodesFromYAML(std.testing.allocator, nodes_file);
+    defer {
+        for (nodes) |node| std.testing.allocator.free(node);
+        std.testing.allocator.free(nodes);
+    }
+    try std.testing.expectEqual(3, nodes.len);
+    try std.testing.expectEqualStrings("enr:-IW4QA0pljjdLfxS_EyUxNAxJSoGCwmOVNJauYWsTiYHyWG5Bky-7yCEktSvu_w-PWUrmzbc8vYL_Mx5pgsAix2OfOMBgmlkgnY0gmlwhKwUAAGEcXVpY4IfkIlzZWNwMjU2azGhA6mw8mfwe-3TpjMMSk7GHe3cURhOn9-ufyAqy40wEyui", nodes[0]);
+    try std.testing.expectEqualStrings("enr:-IW4QNx7F6OKXCmx9igmSwOAOdUEiQ9Et73HNygWV1BbuFgkXZLMslJVgpLYmKAzBF-AO0qJYq40TtqvtFkfeh2jzqYBgmlkgnY0gmlwhKwUAAKEcXVpY4IfkIlzZWNwMjU2azGhA2hqUIfSG58w4lGPMiPp9llh1pjFuoSRUuoHmwNdHELw", nodes[1]);
+    try std.testing.expectEqualStrings("enr:-IW4QOh370UNQipE8qYlVRK3MpT7I0hcOmrTgLO9agIxuPS2B485Se8LTQZ4Rhgo6eUuEXgMAa66Wt7lRYNHQo9zk8QBgmlkgnY0gmlwhKwUAAOEcXVpY4IfkIlzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN", nodes[2]);
+}
 
 test "ENR fields parsing from validator config" {
     var validator_config = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validator-config.yaml");
@@ -880,4 +993,79 @@ test "ENR construction from fields" {
     try std.testing.expect(constructed_enr.kvs.get("quic") != null);
     try std.testing.expect(constructed_enr.kvs.get("tcp") != null);
     try std.testing.expect(constructed_enr.kvs.get("seq") != null);
+}
+
+test "compare roots from genGensisBlock and genGenesisState and genStateBlockHeader" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Load config.yaml from test fixtures
+    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
+    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    // Parse genesis config from YAML
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    // Generate genesis state
+    var genesis_state: types.BeamState = undefined;
+    try genesis_state.genGenesisState(allocator, genesis_spec);
+    defer genesis_state.deinit();
+
+    std.debug.print("\nGenesis state: {s}\n", .{try genesis_state.toJsonString(allocator)});
+
+    // Generate genesis block using genGenesisBlock
+    var genesis_block: types.BeamBlock = undefined;
+    try genesis_state.genGenesisBlock(allocator, &genesis_block);
+    defer genesis_block.deinit();
+
+    // Get state root by hashing the state directly
+    var state_root_from_genesis: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+
+    // Generate block header using genStateBlockHeader
+    const state_block_header = try genesis_state.genStateBlockHeader(allocator);
+    const state_root_from_block_header = state_block_header.state_root;
+
+    // Compare the roots - they should be equal
+    try std.testing.expect(std.mem.eql(u8, &genesis_block.state_root, &state_root_from_block_header));
+    try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
+
+    // Verify the state root matches the expected value
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
+    defer allocator.free(state_root_from_genesis_hex);
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
+}
+
+test "populateNodeNameRegistry" {
+    const allocator = std.testing.allocator;
+
+    const validator_config_path = "pkgs/cli/test/fixtures/validator-config.yaml";
+    const validators_path = "pkgs/cli/test/fixtures/validators.yaml";
+
+    // Create an empty registry and populate it from test fixtures
+    var registry = node_lib.NodeNameRegistry.init(allocator);
+    defer registry.deinit();
+    try populateNodeNameRegistry(allocator, &registry, validator_config_path, validators_path);
+
+    try std.testing.expectEqual(@as(usize, 9), registry.validator_index_to_name.count());
+    try std.testing.expectEqual(@as(usize, 3), registry.peer_id_to_name.count());
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(1).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(4).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(7).name.?);
+
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(0).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(3).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(6).name.?);
+
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(2).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(5).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(8).name.?);
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
 }

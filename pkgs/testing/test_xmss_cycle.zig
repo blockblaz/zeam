@@ -29,8 +29,8 @@ test "XMSS full cycle: generate, sign, verify" {
     const pubkey_size = try keypair.pubkeyToBytes(&pubkey_buffer);
     std.debug.print("Public key size: {d} bytes\n", .{pubkey_size});
 
-    // Verify using bincode
-    try xmss.verifyBincode(
+    // Verify using SSZ
+    try xmss.verifySsz(
         pubkey_buffer[0..pubkey_size],
         &message,
         0,
@@ -71,7 +71,7 @@ test "TestKeyManager: sign and verify attestation" {
     try ssz.hashTreeRoot(types.Attestation, attestation, &message, allocator);
 
     // Verify
-    try xmss.verifyBincode(
+    try xmss.verifySsz(
         pubkey_buffer[0..pubkey_size],
         &message,
         1, // epoch = slot

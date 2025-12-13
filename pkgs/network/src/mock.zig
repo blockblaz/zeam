@@ -428,7 +428,7 @@ pub const Mock = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data, "unknown_peer_id", true);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -436,9 +436,9 @@ pub const Mock = struct {
         return self.gossipHandler.subscribe(topics, handler);
     }
 
-    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, true);
+        return self.gossipHandler.onGossip(data, sender_peer_id, true);
     }
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
@@ -558,7 +558,8 @@ test "Mock messaging across two subscribers" {
         calls: u32 = 0,
         received_message: ?interface.GossipMessage = null,
 
-        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage) anyerror!void {
+        fn onGossip(ptr: *anyopaque, message: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
+            _ = sender_peer_id;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             self.received_message = message.*;

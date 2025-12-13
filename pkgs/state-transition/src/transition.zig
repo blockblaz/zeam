@@ -108,7 +108,7 @@ pub fn verifySingleAttestation(
 
     const epoch: u32 = @intCast(attestation.data.slot);
 
-    try xmss.verifyBincode(pubkey, &message, epoch, signatureBytes);
+    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
 }
 
 // TODO(gballet) check if beam block needs to be a pointer

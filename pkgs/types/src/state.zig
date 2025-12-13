@@ -75,12 +75,12 @@ pub const BeamState = struct {
     }
 
     pub fn genGenesisState(self: *Self, allocator: Allocator, genesis: utils.GenesisSpec) !void {
-        var genesis_block: block.BeamBlock = undefined;
-        try genesis_block.genGenesisBlock(allocator);
-        defer genesis_block.deinit();
+        var empty_block: block.BeamBlock = undefined;
+        try empty_block.setToDefault(allocator);
+        defer empty_block.deinit();
 
-        var genesis_block_header: block.BeamBlockHeader = undefined;
-        try genesis_block.blockToLatestBlockHeader(allocator, &genesis_block_header);
+        var genesis_latest_block_header: block.BeamBlockHeader = undefined;
+        try empty_block.blockToLatestBlockHeader(allocator, &genesis_latest_block_header);
 
         var historical_block_hashes = try HistoricalBlockHashes.init(allocator);
         errdefer historical_block_hashes.deinit();
@@ -98,10 +98,8 @@ pub const BeamState = struct {
         errdefer validators.deinit();
 
         // Populate validators from genesis pubkeys
-        for (genesis.validator_pubkeys) |pubkey| {
-            const val = validator.Validator{
-                .pubkey = pubkey,
-            };
+        for (genesis.validator_pubkeys, 0..) |pubkey, i| {
+            const val = validator.Validator{ .pubkey = pubkey, .index = i };
             try validators.append(val);
         }
 
@@ -110,10 +108,10 @@ pub const BeamState = struct {
                 .genesis_time = genesis.genesis_time,
             },
             .slot = 0,
-            .latest_block_header = genesis_block_header,
+            .latest_block_header = genesis_latest_block_header,
             // mini3sf
-            .latest_justified = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-            .latest_finalized = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .latest_justified = .{ .root = utils.ZERO_HASH, .slot = 0 },
+            .latest_finalized = .{ .root = utils.ZERO_HASH, .slot = 0 },
             .historical_block_hashes = historical_block_hashes,
             .justified_slots = justified_slots,
             .validators = validators,
@@ -446,18 +444,8 @@ pub const BeamState = struct {
             allocator,
         );
 
-        const attestations = try Attestations.init(allocator);
-        errdefer attestations.deinit();
-
-        genesis_block.* = .{
-            .slot = 0,
-            .proposer_index = 0,
-            .parent_root = utils.ZERO_HASH,
-            .state_root = state_root,
-            .body = .{
-                .attestations = attestations,
-            },
-        };
+        try genesis_block.setToDefault(allocator);
+        genesis_block.state_root = state_root;
     }
 
     pub fn genStateBlockHeader(self: *const Self, allocator: Allocator) !block.BeamBlockHeader {
@@ -616,7 +604,7 @@ test "ssz seralize/deserialize signed beam state" {
     var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
     defer serialized_state.deinit();
     try ssz.serialize(BeamState, state, &serialized_state);
-    std.debug.print("\n\n\nserialized_state ({d})", .{serialized_state.items.len});
+    std.debug.print("serialized_state ({d})\n", .{serialized_state.items.len});
 
     // we need to use arena allocator because deserialization allocs without providing for
     // a way to deinit, this needs to be probably addressed in ssz
@@ -698,4 +686,127 @@ test "encode decode state roundtrip" {
     try std.testing.expect(decoded.justifications_roots.len() == state.justifications_roots.len());
     try std.testing.expect(decoded.justifications_validators.len() == state.justifications_validators.len());
     try std.testing.expect(decoded.validators.len() == state.validators.len());
+}
+
+test "genesis block hash comparison" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Create first genesis state with 3 validators
+    var pubkeys1 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(pubkeys1);
+    {
+        var i: usize = 0;
+        while (i < pubkeys1.len) : (i += 1) {
+            @memset(&pubkeys1[i], @intCast(i + 1)); // Fill with different values (1, 2, 3)
+        }
+    }
+
+    const genesis_spec1 = utils.GenesisSpec{
+        .genesis_time = 1000,
+        .validator_pubkeys = pubkeys1,
+    };
+
+    var genesis_state1: BeamState = undefined;
+    try genesis_state1.genGenesisState(allocator, genesis_spec1);
+    defer genesis_state1.deinit();
+
+    // Generate genesis block from first state
+    var genesis_block1: block.BeamBlock = undefined;
+    try genesis_state1.genGenesisBlock(allocator, &genesis_block1);
+    defer genesis_block1.deinit();
+
+    // Compute hash of first genesis block
+    var genesis_block_hash1: Root = undefined;
+    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
+    std.debug.print("genesis_block_hash1 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
+
+    // Create a second genesis state with same config but regenerated (should produce same hash)
+    var genesis_state1_copy: BeamState = undefined;
+    try genesis_state1_copy.genGenesisState(allocator, genesis_spec1);
+    defer genesis_state1_copy.deinit();
+
+    var genesis_block1_copy: block.BeamBlock = undefined;
+    try genesis_state1_copy.genGenesisBlock(allocator, &genesis_block1_copy);
+    defer genesis_block1_copy.deinit();
+
+    var genesis_block_hash1_copy: Root = undefined;
+    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1_copy, &genesis_block_hash1_copy, allocator);
+
+    // Same genesis spec should produce same hash
+    try std.testing.expect(std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash1_copy));
+
+    // Create second genesis state with different validators
+    var pubkeys2 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(pubkeys2);
+    {
+        var i: usize = 0;
+        while (i < pubkeys2.len) : (i += 1) {
+            @memset(&pubkeys2[i], @intCast(i + 10)); // Fill with different values (10, 11, 12)
+        }
+    }
+
+    const genesis_spec2 = utils.GenesisSpec{
+        .genesis_time = 1000, // Same genesis_time but different validators
+        .validator_pubkeys = pubkeys2,
+    };
+
+    var genesis_state2: BeamState = undefined;
+    try genesis_state2.genGenesisState(allocator, genesis_spec2);
+    defer genesis_state2.deinit();
+
+    var genesis_block2: block.BeamBlock = undefined;
+    try genesis_state2.genGenesisBlock(allocator, &genesis_block2);
+    defer genesis_block2.deinit();
+
+    var genesis_block_hash2: Root = undefined;
+    try ssz.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
+    std.debug.print("genesis_block_hash2 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
+
+    // Different validators should produce different genesis block hash
+    try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash2));
+
+    // Create third genesis state with same validators but different genesis_time
+    var pubkeys3 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(pubkeys3);
+    {
+        var i: usize = 0;
+        while (i < pubkeys3.len) : (i += 1) {
+            @memset(&pubkeys3[i], @intCast(i + 1)); // Same as pubkeys1
+        }
+    }
+
+    const genesis_spec3 = utils.GenesisSpec{
+        .genesis_time = 2000, // Different genesis_time but same validators
+        .validator_pubkeys = pubkeys3,
+    };
+
+    var genesis_state3: BeamState = undefined;
+    try genesis_state3.genGenesisState(allocator, genesis_spec3);
+    defer genesis_state3.deinit();
+
+    var genesis_block3: block.BeamBlock = undefined;
+    try genesis_state3.genGenesisBlock(allocator, &genesis_block3);
+    defer genesis_block3.deinit();
+
+    var genesis_block_hash3: Root = undefined;
+    try ssz.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
+    std.debug.print("genesis_block_hash3 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
+
+    // Different genesis_time should produce different genesis block hash
+    try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash3));
+
+    // // Compare genesis block hashes with expected hex values
+    const hash1_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
+    defer allocator.free(hash1_hex);
+    try std.testing.expectEqualStrings(hash1_hex, "0xcc03f11dd80dd79a4add86265fad0a141d0a553812d43b8f2c03aa43e4b002e3");
+
+    const hash2_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
+    defer allocator.free(hash2_hex);
+    try std.testing.expectEqualStrings(hash2_hex, "0x6bd5347aa1397c63ed8558079fdd3042112a5f4258066e3a659a659ff75ba14f");
+
+    const hash3_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
+    defer allocator.free(hash3_hex);
+    try std.testing.expectEqualStrings(hash3_hex, "0xce48a709189aa2b23b6858800996176dc13eb49c0c95d717c39e60042de1ac91");
 }
