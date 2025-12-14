@@ -391,12 +391,18 @@ fn mainInner() !void {
                 listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
+                // Create empty registry for test network
+                const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
+                test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer allocator.destroy(test_registry1);
+
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
                     .network_name = network_name1,
                     .local_private_key = &priv_key1,
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
+                    .node_registry = test_registry1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -408,12 +414,18 @@ fn mainInner() !void {
                 connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
+                // Create empty registry for test network
+                const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
+                test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer allocator.destroy(test_registry2);
+
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
                     .network_name = network_name2,
                     .local_private_key = &priv_key2,
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
+                    .node_registry = test_registry2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
