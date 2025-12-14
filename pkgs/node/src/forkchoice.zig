@@ -715,7 +715,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
-        self.mutex.lock();  // Write lock - mutates via onInterval
+        self.mutex.lock(); // Write lock - mutates via onInterval
         defer self.mutex.unlock();
         return self.getProposalHeadUnlocked(slot);
     }
