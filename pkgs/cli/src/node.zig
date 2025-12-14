@@ -148,6 +148,7 @@ pub const Node = struct {
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
+            .node_registry = options.node_registry,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
