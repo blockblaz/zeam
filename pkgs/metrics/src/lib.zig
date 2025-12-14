@@ -149,7 +149,7 @@ fn observeFCAttestationValidationTimeHistogram(ctx: ?*anyopaque, value: f32) voi
 pub fn incrementLeanAttestationsValid(is_from_block: bool) void {
     if (!g_initialized or isZKVM()) return;
 
-    const source_label = if (is_from_block) "gossip block attestation" else "gossip attestation";
+    const source_label = if (is_from_block) "block" else "gossip";
     metrics.lean_attestations_valid_total.incr(.{ .source = source_label }) catch |err| {
         std.log.warn("Failed to increment valid attestations metric: {any}", .{err});
     };
@@ -159,7 +159,7 @@ pub fn incrementLeanAttestationsValid(is_from_block: bool) void {
 pub fn incrementLeanAttestationsInvalid(is_from_block: bool) void {
     if (!g_initialized or isZKVM()) return;
 
-    const source_label = if (is_from_block) "gossip block attestation" else "gossip attestation";
+    const source_label = if (is_from_block) "block" else "gossip";
     metrics.lean_attestations_invalid_total.incr(.{ .source = source_label }) catch |err| {
         std.log.warn("Failed to increment invalid attestations metric: {any}", .{err});
     };
@@ -226,8 +226,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations." }, .{}),
         .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of connected validators." }, .{}),
         .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block in fork choice." }, .{}),
-        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip attestation or gossip block attestation)." }, .{}),
-        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip attestation or gossip block attestation)." }, .{}),
+        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip or block)." }, .{}),
+        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip or block)." }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
     };
 
