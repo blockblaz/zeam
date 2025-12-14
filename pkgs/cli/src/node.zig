@@ -70,6 +70,7 @@ pub const NodeOptions = struct {
     logger_config: *LoggerConfig,
     database_path: []const u8,
     hash_sig_key_dir: []const u8,
+    node_registry: *node_lib.NodeNameRegistry,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -77,6 +78,8 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_indices);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
+        self.node_registry.deinit();
+        allocator.destroy(self.node_registry);
     }
 };
 
@@ -145,6 +148,7 @@ pub const Node = struct {
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
+            .node_registry = options.node_registry,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
@@ -169,6 +173,7 @@ pub const Node = struct {
             .key_manager = &self.key_manager,
             .db = db,
             .logger_config = options.logger_config,
+            .node_registry = options.node_registry,
         });
 
         // Register the chain with the API server for fork choice graph endpoint
@@ -322,36 +327,90 @@ pub const Node = struct {
                 return error.HashSigValidatorIndexOutOfRange;
             }
 
-            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_pk.json", .{ hash_sig_key_dir, validator_index });
-            defer self.allocator.free(pk_path);
-
-            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigPublicKeyMissing,
-                else => return err,
+            // Helper to read a key file
+            const ReadKeyArgs = struct {
+                dir: []const u8,
+                index: usize,
+                suffix: []const u8,
+                allocator: std.mem.Allocator,
             };
-            defer pk_file.close();
-            const public_json = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
-            defer self.allocator.free(public_json);
+            const readKeyFile = struct {
+                fn read(args: ReadKeyArgs) ![]u8 {
+                    const path = try std.fmt.allocPrint(args.allocator, "{s}/validator_{d}_{s}", .{ args.dir, args.index, args.suffix });
+                    defer args.allocator.free(path);
 
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/validator_{d}_sk.json", .{ hash_sig_key_dir, validator_index });
-            defer self.allocator.free(sk_path);
+                    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+                        error.FileNotFound => return error.FileNotFound,
+                        else => return err,
+                    };
+                    defer file.close();
 
-            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigSecretKeyMissing,
+                    return try file.readToEndAlloc(args.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
+                }
+            }.read;
+
+            // Try loading SSZ keys first
+            if (readKeyFile(.{
+                .dir = hash_sig_key_dir,
+                .index = validator_index,
+                .suffix = "sk.ssz",
+                .allocator = self.allocator,
+            })) |secret_ssz| {
+                defer self.allocator.free(secret_ssz);
+
+                const public_ssz = readKeyFile(.{
+                    .dir = hash_sig_key_dir,
+                    .index = validator_index,
+                    .suffix = "pk.ssz",
+                    .allocator = self.allocator,
+                }) catch |err| switch (err) {
+                    error.FileNotFound => return error.HashSigPublicKeyMissing,
+                    else => return err,
+                };
+                defer self.allocator.free(public_ssz);
+
+                var keypair = try xmss.KeyPair.fromSsz(
+                    self.allocator,
+                    secret_ssz,
+                    public_ssz,
+                );
+                errdefer keypair.deinit();
+                try self.key_manager.addKeypair(validator_index, keypair);
+            } else |err| switch (err) {
+                error.FileNotFound => {
+                    // Fallback to JSON if SSZ secret key is missing
+                    const secret_json = readKeyFile(.{
+                        .dir = hash_sig_key_dir,
+                        .index = validator_index,
+                        .suffix = "sk.json",
+                        .allocator = self.allocator,
+                    }) catch |e| switch (e) {
+                        error.FileNotFound => return error.HashSigSecretKeyMissing,
+                        else => return e,
+                    };
+                    defer self.allocator.free(secret_json);
+
+                    const public_json = readKeyFile(.{
+                        .dir = hash_sig_key_dir,
+                        .index = validator_index,
+                        .suffix = "pk.json",
+                        .allocator = self.allocator,
+                    }) catch |e| switch (e) {
+                        error.FileNotFound => return error.HashSigPublicKeyMissing,
+                        else => return e,
+                    };
+                    defer self.allocator.free(public_json);
+
+                    var keypair = try xmss.KeyPair.fromJson(
+                        self.allocator,
+                        secret_json,
+                        public_json,
+                    );
+                    errdefer keypair.deinit();
+                    try self.key_manager.addKeypair(validator_index, keypair);
+                },
                 else => return err,
-            };
-            defer sk_file.close();
-            const secret_json = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_KEY_JSON_SIZE);
-            defer self.allocator.free(secret_json);
-
-            var keypair = try xmss.KeyPair.fromJson(
-                self.allocator,
-                secret_json,
-                public_json,
-            );
-            errdefer keypair.deinit();
-
-            try self.key_manager.addKeypair(validator_index, keypair);
+            }
         }
     }
 };
@@ -429,6 +488,11 @@ pub fn buildStartOptions(
         "/",
         node_cmd.@"sig-keys-dir",
     });
+
+    // Populate node name registry with peer information
+    populateNodeNameRegistry(allocator, opts.node_registry, validator_config_filepath, validators_filepath) catch |err| {
+        std.log.warn("Failed to populate node name registry: {any}", .{err});
+    };
 
     opts.bootnodes = bootnodes;
     opts.validator_indices = validator_indices;
@@ -733,6 +797,90 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     return enr;
 }
 
+/// Populate a NodeNameRegistry from validator-config.yaml and validators.yaml
+/// This creates mappings from peer IDs and validator indices to node names
+pub fn populateNodeNameRegistry(
+    allocator: std.mem.Allocator,
+    registry: *node_lib.NodeNameRegistry,
+    validator_config_path: []const u8,
+    validators_path: []const u8,
+) !void {
+
+    // Parse validator-config.yaml to get node names and their ENRs/privkeys
+    var parsed_validator_config = try utils_lib.loadFromYAMLFile(allocator, validator_config_path);
+    defer parsed_validator_config.deinit(allocator);
+
+    // Parse validators.yaml to get validator indices for each node
+    var parsed_validators = try utils_lib.loadFromYAMLFile(allocator, validators_path);
+    defer parsed_validators.deinit(allocator);
+
+    const validators_list = parsed_validator_config.docs.items[0].map.get("validators");
+    if (validators_list == null) return;
+
+    for (validators_list.?.list) |entry| {
+        const name_value = entry.map.get("name");
+        if (name_value == null or name_value.? != .string) continue;
+        const node_name = name_value.?.string;
+
+        // Get peer ID from ENR or private key
+        const peer_id_str = blk: {
+            var peer_id_buf: [256]u8 = undefined;
+            // Try to get ENR first
+            if (entry.map.get("enr")) |enr_value| {
+                if (enr_value == .string) {
+                    var enr: ENR = undefined;
+                    ENR.decodeTxtInto(&enr, enr_value.string) catch break :blk null;
+                    const pid = enr.peerId(allocator) catch break :blk null;
+                    const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                    const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                    break :blk pid_str;
+                }
+            }
+
+            // Try to construct ENR from privkey and enrFields
+            if (entry.map.get("privkey")) |privkey_value| {
+                if (privkey_value == .string) {
+                    const enr_fields_value = entry.map.get("enrFields");
+                    if (enr_fields_value != null) {
+                        var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
+                        defer enr_fields.deinit(allocator);
+                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields) catch break :blk null;
+                        defer enr.deinit();
+                        const pid = enr.peerId(allocator) catch break :blk null;
+                        const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
+                        const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
+                        break :blk pid_str;
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        // Add peer ID mapping if we got a valid peer ID string
+        if (peer_id_str) |pid_str| {
+            defer allocator.free(pid_str);
+            registry.addPeerMapping(pid_str, node_name) catch |err| {
+                std.log.warn("Failed to add peer mapping for node {s}: {any}", .{ node_name, err });
+            };
+        }
+
+        // Add validator index mappings
+        const node_validators = parsed_validators.docs.items[0].map.get(node_name);
+        if (node_validators) |validators| {
+            if (validators == .list) {
+                for (validators.list) |item| {
+                    if (item == .int) {
+                        const validator_index: usize = @intCast(item.int);
+                        registry.addValidatorMapping(validator_index, node_name) catch |err| {
+                            std.log.warn("Failed to add validator mapping for node {s} index {d}: {any}", .{ node_name, validator_index, err });
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "configs yaml parsing" {
     var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
     defer config_file.deinit(std.testing.allocator);
@@ -865,4 +1013,35 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
     defer allocator.free(state_root_from_genesis_hex);
     try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
+}
+
+test "populateNodeNameRegistry" {
+    const allocator = std.testing.allocator;
+
+    const validator_config_path = "pkgs/cli/test/fixtures/validator-config.yaml";
+    const validators_path = "pkgs/cli/test/fixtures/validators.yaml";
+
+    // Create an empty registry and populate it from test fixtures
+    var registry = node_lib.NodeNameRegistry.init(allocator);
+    defer registry.deinit();
+    try populateNodeNameRegistry(allocator, &registry, validator_config_path, validators_path);
+
+    try std.testing.expectEqual(@as(usize, 9), registry.validator_index_to_name.count());
+    try std.testing.expectEqual(@as(usize, 3), registry.peer_id_to_name.count());
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(1).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(4).name.?);
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromValidatorIndex(7).name.?);
+
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(0).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(3).name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromValidatorIndex(6).name.?);
+
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(2).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(5).name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromValidatorIndex(8).name.?);
+
+    try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
+    try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
+    try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
 }

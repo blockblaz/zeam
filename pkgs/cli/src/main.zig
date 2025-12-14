@@ -391,12 +391,18 @@ fn mainInner() !void {
                 listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
+                // Create empty registry for test network
+                const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
+                test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer allocator.destroy(test_registry1);
+
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
                     .network_name = network_name1,
                     .local_private_key = &priv_key1,
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
+                    .node_registry = test_registry1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -408,12 +414,18 @@ fn mainInner() !void {
                 connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
+                // Create empty registry for test network
+                const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
+                test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer allocator.destroy(test_registry2);
+
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
                     .network_name = network_name2,
                     .local_private_key = &priv_key2,
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
+                    .node_registry = test_registry2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
@@ -436,6 +448,17 @@ fn mainInner() !void {
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
+            // Create empty node registries for beam simulation
+            const registry_1 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_1);
+            registry_1.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_1.deinit();
+
+            const registry_2 = try allocator.create(node_lib.NodeNameRegistry);
+            defer allocator.destroy(registry_2);
+            registry_2.* = node_lib.NodeNameRegistry.init(allocator);
+            defer registry_2.deinit();
+
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
                 // options
@@ -448,6 +471,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_1,
                 .logger_config = &logger1_config,
+                .node_registry = registry_1,
             });
 
             // Register beam_node_1's chain for fork choice graph API
@@ -465,6 +489,7 @@ fn mainInner() !void {
                 .key_manager = &key_manager,
                 .db = db_2,
                 .logger_config = &logger2_config,
+                .node_registry = registry_2,
             });
 
             try beam_node_1.run();
@@ -504,6 +529,10 @@ fn mainInner() !void {
 
             var zeam_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = leancmd.@"data-dir", .fileName = log_filename });
 
+            // Create empty node registry upfront to avoid undefined pointer in error paths
+            const node_registry = try allocator.create(node_lib.NodeNameRegistry);
+            node_registry.* = node_lib.NodeNameRegistry.init(allocator);
+
             var start_options: node.NodeOptions = .{
                 .network_id = leancmd.network_id,
                 .node_key = leancmd.@"node-id",
@@ -518,6 +547,7 @@ fn mainInner() !void {
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = undefined,
+                .node_registry = node_registry,
             };
 
             defer start_options.deinit(allocator);

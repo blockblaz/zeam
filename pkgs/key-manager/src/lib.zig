@@ -1,6 +1,7 @@
 const std = @import("std");
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
+const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
 const Allocator = std.mem.Allocator;
 
@@ -94,12 +95,15 @@ pub const KeyManager = struct {
 
         const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
 
+        const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
 
         const epoch: u32 = @intCast(attestation.data.slot);
+
         var signature = try keypair.sign(&message, epoch);
         defer signature.deinit();
+        _ = signing_timer.observe();
 
         var sig_buffer: types.SIGBYTES = undefined;
         const bytes_written = try signature.toBytes(&sig_buffer);
