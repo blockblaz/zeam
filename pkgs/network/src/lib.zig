@@ -29,6 +29,9 @@ const ethlibp2pFactory = @import("./ethlibp2p.zig");
 pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
 pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
 
+const node_registryFactory = @import("./node_registry.zig");
+pub const NodeNameRegistry = node_registryFactory.NodeNameRegistry;
+
 test "get tests" {
     @import("std").testing.refAllDeclsRecursive(@This());
 }
