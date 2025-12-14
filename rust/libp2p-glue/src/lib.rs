@@ -539,6 +539,7 @@ extern "C" {
     fn handleRPCResponseFromRustBridge(
         zig_handler: u64,
         request_id: u64,
+        peer_id: *const c_char,
         protocol_id: *const c_char,
         response_ptr: *const u8,
         response_len: usize,
@@ -547,6 +548,7 @@ extern "C" {
     fn handleRPCEndOfStreamFromRustBridge(
         zig_handler: u64,
         request_id: u64,
+        peer_id: *const c_char,
         protocol_id: *const c_char,
     );
 
@@ -1060,6 +1062,17 @@ impl Network {
                                     self.network_id,
                                     &format!("[reqresp] Received response from {} for request id {} ({} bytes)", peer_id, request_id, response_message.payload.len()),
                                 );
+                                let peer_id_string = peer_id.to_string();
+                                let peer_id_cstring = match CString::new(peer_id_string) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            &format!("[reqresp] Failed to create C string for peer id {}: {}", peer_id, err),
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let protocol_cstring = match CString::new(
                                     response_message.protocol.as_str(),
                                 ) {
@@ -1077,6 +1090,7 @@ impl Network {
                                     handleRPCResponseFromRustBridge(
                                         self.zig_handler,
                                         request_id,
+                                        peer_id_cstring.as_ptr(),
                                         protocol_cstring.as_ptr(),
                                         response_message.payload.as_ptr(),
                                         response_message.payload.len(),
@@ -1091,6 +1105,17 @@ impl Network {
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
+                                    let peer_id_string = peer_id.to_string();
+                                    let peer_id_cstring = match CString::new(peer_id_string) {
+                                        Ok(cstring) => cstring,
+                                        Err(err) => {
+                                            logger::rustLogger.error(
+                                                self.network_id,
+                                                &format!("[reqresp] Failed to create C string for peer id {} on end-of-stream: {}", peer_id, err),
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let protocol_cstring = match CString::new(protocol_id.as_str()) {
                                         Ok(cstring) => cstring,
                                     Err(err) => {
@@ -1106,6 +1131,7 @@ impl Network {
                                         handleRPCEndOfStreamFromRustBridge(
                                             self.zig_handler,
                                             request_id,
+                                            peer_id_cstring.as_ptr(),
                                             protocol_cstring.as_ptr(),
                                         );
                                     }
@@ -1221,7 +1247,7 @@ impl Behaviour {
             .mesh_n_high(12)
             .gossip_lazy(6)
             .heartbeat_interval(Duration::from_millis(700))
-            .validation_mode(gossipsub::ValidationMode::Anonymous)
+            .validation_mode(gossipsub::ValidationMode::Permissive)
             .history_length(6)
             .duplicate_cache_time(Duration::from_secs(3 * 4 * 2))
             .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
@@ -1229,10 +1255,13 @@ impl Behaviour {
             .unwrap();
         // .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
 
-        // build a gossipsub network behaviour
-        let gossipsub =
-            gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
-                .unwrap();
+        // build a gossipsub network behaviour with Signed mode to enable source tracking
+        // Signed mode allows us to identify the sender peer ID in messages
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub_config,
+        )
+        .unwrap();
 
         let reqresp = ReqResp::new(vec![
             LeanSupportedProtocol::StatusV1.into(),

@@ -7,8 +7,8 @@ pub const BeamNode = nodeFactory.BeamNode;
 pub const fcFactory = @import("./forkchoice.zig");
 pub const constants = @import("./constants.zig");
 
-pub const node_registry = @import("./node_registry.zig");
-pub const NodeNameRegistry = node_registry.NodeNameRegistry;
+const networks = @import("@zeam/network");
+pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 test "get tests" {
     _ = @import("./forkchoice.zig");

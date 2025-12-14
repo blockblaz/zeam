@@ -25,8 +25,7 @@ const constants = @import("./constants.zig");
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
 
-const node_registry = @import("./node_registry.zig");
-pub const NodeNameRegistry = node_registry.NodeNameRegistry;
+const NodeNameRegistry = networks.NodeNameRegistry;
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -375,7 +374,10 @@ pub const BeamChain = struct {
                 const signed_attestation_str = try jsonToString(self.allocator, signed_attestation_json);
                 defer self.allocator.free(signed_attestation_str);
 
-                self.module_logger.debug("chain received attestation onGossip cb: {s}", .{signed_attestation_str});
+                const validator_id = signed_attestation.message.validator_id;
+                const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
+                const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+                self.module_logger.debug("chain received attestation onGossip cb: {s} validator={d}{} from peer={s}{}", .{ signed_attestation_str, validator_id, validator_node_name, sender_peer_id, sender_node_name });
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
