@@ -184,7 +184,12 @@ pub const BeamChain = struct {
 
         const parent_root = chainHead.blockRoot;
 
-        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        const pre_state = self.states.get(parent_root) orelse {
+            // Record metrics before returning error to maintain continuity
+            const error_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+            _ = error_timer.observe();
+            return BlockProductionError.MissingPreState;
+        };
         const post_state = try self.allocator.create(types.BeamState);
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
@@ -347,6 +352,9 @@ pub const BeamChain = struct {
                 if (!hasBlock) {
                     self.validateBlock(block, true) catch |err| {
                         self.module_logger.warn("gossip block validation failed: {any}", .{err});
+                        // Record metrics even for validation failures to maintain continuity
+                        const validation_error_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+                        _ = validation_error_timer.observe();
                         return; // Drop invalid gossip attestations
                     };
                     const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
@@ -365,6 +373,10 @@ pub const BeamChain = struct {
                         block.slot,
                         std.fmt.fmtSliceHexLower(&block_root),
                     });
+                    // Record metrics for skipped blocks to maintain continuity
+                    // The state transition was already applied when the block was first processed
+                    const skipped_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+                    _ = skipped_timer.observe();
                 }
             },
             .attestation => |signed_attestation| {
@@ -412,16 +424,30 @@ pub const BeamChain = struct {
             block.slot,
         });
 
-        const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
+        const post_state = if (blockInfo.postState) |post_state_ptr| blk: {
+            // Using cached state - state transition was already applied during block production
+            // Record a minimal time to ensure metrics are recorded for this block processing
+            // This ensures continuous metrics reporting even when using cached states
+            const cached_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+            _ = cached_timer.observe();
+            break :blk post_state_ptr;
+        } else computedstate: {
             // 1. get parent state
-            const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
+            const pre_state = self.states.get(block.parent_root) orelse {
+                // Record metrics before returning error to maintain continuity
+                const error_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+                _ = error_timer.observe();
+                return BlockProcessingError.MissingPreState;
+            };
             const cpost_state = try self.allocator.create(types.BeamState);
+            errdefer self.allocator.destroy(cpost_state);
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
 
             // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
             try stf.verifySignatures(self.allocator, pre_state, &signedBlock);
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
+            // apply_transition will record metrics internally
             try stf.apply_transition(self.allocator, cpost_state, block, .{
                 //
                 .logger = self.stf_logger,

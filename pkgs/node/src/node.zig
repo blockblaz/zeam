@@ -7,6 +7,7 @@ const types = @import("@zeam/types");
 const configs = @import("@zeam/configs");
 const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 
@@ -158,6 +159,7 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                     err,
                 });
+                // Metrics are already recorded in onBlock before the error is returned
                 return;
             };
             defer self.allocator.free(missing_roots);
@@ -167,6 +169,9 @@ pub const BeamNode = struct {
             };
         } else |err| {
             self.logger.warn("Failed to compute block root from RPC response from peer={s}{}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
+            // Record metrics even when block root computation fails to maintain continuity
+            const error_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+            _ = error_timer.observe();
         }
     }
 
@@ -516,6 +521,10 @@ pub const BeamNode = struct {
                 block.slot,
                 block.proposer_index,
             });
+            // Record metrics for skipped blocks to maintain continuity
+            // The state transition was already applied during block production
+            const skipped_timer = zeam_metrics.lean_state_transition_time_seconds.start();
+            _ = skipped_timer.observe();
         }
     }
 
