@@ -16,12 +16,11 @@ const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
-pub const node_registry = @import("./node_registry.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
-pub const NodeNameRegistry = node_registry.NodeNameRegistry;
+pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -167,7 +166,7 @@ pub const BeamNode = struct {
                 self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
-            self.logger.warn("Failed to compute block root from RPC response: {any}", .{err});
+            self.logger.warn("Failed to compute block root from RPC response from peer={s}{}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
     }
 
@@ -177,6 +176,11 @@ pub const BeamNode = struct {
             self.logger.warn("Received RPC response for unknown request_id={d}", .{request_id});
             return;
         };
+        const peer_id = switch (ctx_ptr.*) {
+            .status => |*ctx| ctx.peer_id,
+            .blocks_by_root => |*ctx| ctx.peer_id,
+        };
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
 
         switch (event.payload) {
             .success => |resp| switch (resp) {
@@ -197,7 +201,7 @@ pub const BeamNode = struct {
                             }
                         },
                         else => {
-                            self.logger.warn("Status response did not match tracked request_id={d}", .{request_id});
+                            self.logger.warn("Status response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
@@ -212,7 +216,7 @@ pub const BeamNode = struct {
                             self.processBlockByRootChunk(block_ctx, &block_resp);
                         },
                         else => {
-                            self.logger.warn("Blocks-by-root response did not match tracked request_id={d}", .{request_id});
+                            self.logger.warn("Blocks-by-root response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
@@ -353,8 +357,10 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         try self.network.connectPeer(peer_id);
-        self.logger.info("Peer connected: {s}, total peers: {d}", .{
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+        self.logger.info("Peer connected: {s}{}, total peers: {d}", .{
             peer_id,
+            node_name,
             self.network.getPeerCount(),
         });
 
@@ -520,9 +526,10 @@ pub const BeamNode = struct {
 
         const message = signed_attestation.message;
         const data = message.data;
-        self.logger.info("Published attestation to network: slot={d} validator={d}", .{
+        self.logger.info("Published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
             message.validator_id,
+            self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
         });
 
         // 2. Process locally through chain
