@@ -521,10 +521,8 @@ pub const BeamNode = struct {
                 block.slot,
                 block.proposer_index,
             });
-            // Record metrics for skipped blocks to maintain continuity
-            // The state transition was already applied during block production
-            const skipped_timer = zeam_metrics.lean_state_transition_time_seconds.start();
-            _ = skipped_timer.observe();
+            // Block was already added - metrics were recorded during first processing (apply_raw_block).
+            // No metrics recorded here as no actual state transition work is being done.
         }
     }
 

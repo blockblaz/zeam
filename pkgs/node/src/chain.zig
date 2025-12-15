@@ -373,10 +373,7 @@ pub const BeamChain = struct {
                         block.slot,
                         std.fmt.fmtSliceHexLower(&block_root),
                     });
-                    // Record metrics for skipped blocks to maintain continuity
-                    // The state transition was already applied when the block was first processed
-                    const skipped_timer = zeam_metrics.lean_state_transition_time_seconds.start();
-                    _ = skipped_timer.observe();
+                    // Block was already processed - no metrics recorded as no actual state transition work
                 }
             },
             .attestation => |signed_attestation| {
@@ -425,11 +422,9 @@ pub const BeamChain = struct {
         });
 
         const post_state = if (blockInfo.postState) |post_state_ptr| blk: {
-            // Using cached state - state transition was already applied during block production
-            // Record a minimal time to ensure metrics are recorded for this block processing
-            // This ensures continuous metrics reporting even when using cached states
-            const cached_timer = zeam_metrics.lean_state_transition_time_seconds.start();
-            _ = cached_timer.observe();
+            // Using cached state - state transition was already applied (either during block production
+            // or during a previous processing). No metrics recorded here as no actual state transition
+            // work is being done. Metrics are only recorded for actual state transitions.
             break :blk post_state_ptr;
         } else computedstate: {
             // 1. get parent state
@@ -464,7 +459,9 @@ pub const BeamChain = struct {
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 4. fc onattestations
-        self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
+        const attestations = block.body.attestations.constSlice();
+        self.module_logger.info("processing {d} attestations for block with root=0x{s} slot={d}", .{
+            attestations.len,
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
             block.slot,
         });
@@ -474,7 +471,7 @@ pub const BeamChain = struct {
 
         const signatures = signedBlock.signature.constSlice();
 
-        for (block.body.attestations.constSlice(), 0..) |attestation, index| {
+        for (attestations, 0..) |attestation, index| {
             // Validate attestation before processing (from block = true)
             self.validateAttestation(attestation, true) catch |e| {
                 if (e == AttestationValidationError.UnknownHeadBlock) {
@@ -496,6 +493,10 @@ pub const BeamChain = struct {
             };
         }
 
+        if (attestations.len > 0) {
+            self.module_logger.info("processed {d} attestations for block slot={d}", .{ attestations.len, block.slot });
+        }
+
         // 5. fc update head
         const new_head = try self.forkChoice.updateHead();
         const processing_time = onblock_timer.observe();
@@ -506,6 +507,10 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation,
             .signature = proposer_signature,
         };
+        self.module_logger.info("processing proposer attestation for block slot={d} validator={d}", .{
+            block.slot,
+            signedBlock.message.proposer_attestation.validator_id,
+        });
         self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
         };
