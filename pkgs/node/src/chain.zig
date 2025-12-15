@@ -388,6 +388,7 @@ pub const BeamChain = struct {
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
+                    zeam_metrics.incrementLeanAttestationsInvalid(false);
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
@@ -469,7 +470,9 @@ pub const BeamChain = struct {
             const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
 
             self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                zeam_metrics.incrementLeanAttestationsInvalid(true);
                 self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                continue;
             };
             zeam_metrics.incrementLeanAttestationsValid(true);
         }
