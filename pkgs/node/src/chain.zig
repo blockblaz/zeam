@@ -382,6 +382,7 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
+                    zeam_metrics.incrementLeanAttestationsInvalid(false);
                     return; // Drop invalid gossip attestations
                 };
 
@@ -390,6 +391,7 @@ pub const BeamChain = struct {
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
+                zeam_metrics.incrementLeanAttestationsValid(false);
             },
         }
     }
@@ -451,6 +453,7 @@ pub const BeamChain = struct {
         for (block.body.attestations.constSlice(), 0..) |attestation, index| {
             // Validate attestation before processing (from block = true)
             self.validateAttestation(attestation, true) catch |e| {
+                zeam_metrics.incrementLeanAttestationsInvalid(true);
                 if (e == AttestationValidationError.UnknownHeadBlock) {
                     try missing_roots.append(attestation.data.head.root);
                 }
@@ -468,6 +471,7 @@ pub const BeamChain = struct {
             self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
                 self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
             };
+            zeam_metrics.incrementLeanAttestationsValid(true);
         }
 
         // 5. fc update head
@@ -688,7 +692,6 @@ pub const BeamChain = struct {
             self.module_logger.debug("Attestation validation failed: unknown source block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.source.root),
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.UnknownSourceBlock;
         };
 
@@ -696,7 +699,6 @@ pub const BeamChain = struct {
             self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.UnknownTargetBlock;
         };
 
@@ -704,7 +706,6 @@ pub const BeamChain = struct {
             self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.UnknownHeadBlock;
         };
 
@@ -719,7 +720,6 @@ pub const BeamChain = struct {
                 source_block.slot,
                 target_block.slot,
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.SourceSlotExceedsTarget;
         }
 
@@ -729,7 +729,6 @@ pub const BeamChain = struct {
                 data.source.slot,
                 data.target.slot,
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.SourceCheckpointExceedsTarget;
         }
 
@@ -739,7 +738,6 @@ pub const BeamChain = struct {
                 source_block.slot,
                 data.source.slot,
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.SourceCheckpointSlotMismatch;
         }
 
@@ -749,7 +747,6 @@ pub const BeamChain = struct {
                 target_block.slot,
                 data.target.slot,
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.TargetCheckpointSlotMismatch;
         }
 
@@ -770,7 +767,6 @@ pub const BeamChain = struct {
                 max_allowed_slot,
                 is_from_block,
             });
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.AttestationTooFarInFuture;
         }
         self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{

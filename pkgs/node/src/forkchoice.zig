@@ -522,7 +522,6 @@ pub const ForkChoice = struct {
         // This get should never fail after validation, but we keep the check for safety
         const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse {
             // Track whether this is from gossip or block processing
-            zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return ForkChoiceError.InvalidAttestation;
         };
 
@@ -545,7 +544,6 @@ pub const ForkChoice = struct {
             }
         } else {
             if (attestation_slot > self.fcStore.timeSlots) {
-                zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
                 return ForkChoiceError.InvalidFutureAttestation;
             }
             // just update latest new attested head of the validator
@@ -558,9 +556,6 @@ pub const ForkChoice = struct {
                 };
             }
         }
-        // increment valid attestation metric only on successfull attestaion processing
-        zeam_metrics.incrementLeanAttestationsValid(is_from_block);
-
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
