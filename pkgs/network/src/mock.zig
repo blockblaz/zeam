@@ -15,7 +15,8 @@ pub const Mock = struct {
     logger: zeam_utils.ModuleLogger,
     gossipHandler: interface.GenericGossipHandler,
     peerEventHandler: interface.PeerEventHandler,
-    empty_registry: *NodeNameRegistry,
+    registry: *NodeNameRegistry,
+    owns_registry: bool,
 
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     peerLookup: std.StringHashMapUnmanaged(usize),
@@ -136,16 +137,30 @@ pub const Mock = struct {
         return .disarm;
     }
 
-    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger) !Self {
-        // Create empty registry for Mock network (test scenarios don't need real node names)
-        const empty_registry = try allocator.create(NodeNameRegistry);
-        empty_registry.* = NodeNameRegistry.init(allocator);
-        errdefer allocator.destroy(empty_registry);
+    pub fn init(allocator: Allocator, loop: *xev.Loop, logger: zeam_utils.ModuleLogger, registry: ?*NodeNameRegistry) !Self {
+        // Use provided registry or create empty one for backward compatibility
+        const RegistryInfo = struct {
+            registry: *NodeNameRegistry,
+            owns_registry: bool,
+        };
 
-        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger, empty_registry);
+        const registry_info: RegistryInfo = if (registry) |reg| RegistryInfo{
+            .registry = reg,
+            .owns_registry = false,
+        } else blk: {
+            const empty_registry = try allocator.create(NodeNameRegistry);
+            empty_registry.* = NodeNameRegistry.init(allocator);
+            errdefer allocator.destroy(empty_registry);
+            break :blk RegistryInfo{
+                .registry = empty_registry,
+                .owns_registry = true,
+            };
+        };
+
+        const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, 0, logger, registry_info.registry);
         errdefer gossip_handler.deinit();
 
-        const peer_event_handler = try interface.PeerEventHandler.init(allocator, 0, logger, empty_registry);
+        const peer_event_handler = try interface.PeerEventHandler.init(allocator, 0, logger, registry_info.registry);
         errdefer peer_event_handler.deinit();
 
         const timer = try xev.Timer.init();
@@ -156,7 +171,8 @@ pub const Mock = struct {
             .logger = logger,
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
-            .empty_registry = empty_registry,
+            .registry = registry_info.registry,
+            .owns_registry = registry_info.owns_registry,
             .rpcCallbacks = .empty,
             .peerLookup = .empty,
             .ownerToPeer = .empty,
@@ -197,8 +213,11 @@ pub const Mock = struct {
 
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
-        self.empty_registry.deinit();
-        self.allocator.destroy(self.empty_registry);
+        // Only destroy registry if we own it (created it ourselves)
+        if (self.owns_registry) {
+            self.registry.deinit();
+            self.allocator.destroy(self.registry);
+        }
     }
 
     fn allocateRequestId(self: *Self) u64 {
@@ -227,7 +246,17 @@ pub const Mock = struct {
         var peer = &self.peers.items[idx];
         if (peer.peer_id != null) return;
 
-        const peer_id = try std.fmt.allocPrint(self.allocator, "mock-peer-{d}", .{self.nextPeerIndex});
+        // Try to use meaningful peer IDs from registry if available
+        // Map: node 0 -> "zeam_n1", node 1 -> "zeam_n2", etc.
+        const peer_id = blk: {
+            const node_names = [_][]const u8{ "zeam_n1", "zeam_n2", "zeam_n3", "zeam_n4" };
+            if (self.nextPeerIndex < node_names.len) {
+                const name = node_names[self.nextPeerIndex];
+                break :blk try self.allocator.dupe(u8, name);
+            }
+            // Fallback to generic names for additional peers
+            break :blk try std.fmt.allocPrint(self.allocator, "mock-peer-{d}", .{self.nextPeerIndex});
+        };
         self.nextPeerIndex += 1;
         peer.peer_id = peer_id;
         try self.peerLookup.put(self.allocator, peer_id, idx);
@@ -613,7 +642,7 @@ test "Mock messaging across two subscribers" {
 
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(.mock);
-    var mock = try Mock.init(allocator, &loop, logger);
+    var mock = try Mock.init(allocator, &loop, logger, null);
 
     // Create test subscribers with embedded data
     var subscriber1 = TestSubscriber{};
@@ -795,7 +824,7 @@ test "Mock status RPC between peers" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(.mock);
 
-    var mock = try Mock.init(allocator, &loop, logger);
+    var mock = try Mock.init(allocator, &loop, logger, null);
     defer mock.deinit();
 
     const backend_a = mock.getNetworkInterface();

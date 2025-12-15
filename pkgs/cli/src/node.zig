@@ -52,17 +52,29 @@ const EnrFields = struct {
     }
 };
 
+/// Represents a validator assignment from annotated_validators.yaml
+pub const ValidatorAssignment = struct {
+    index: usize,
+    pubkey_hex: []const u8,
+    privkey_file: []const u8,
+
+    pub fn deinit(self: *ValidatorAssignment, allocator: std.mem.Allocator) void {
+        allocator.free(self.pubkey_hex);
+        allocator.free(self.privkey_file);
+    }
+};
+
 pub const NodeOptions = struct {
     network_id: u32,
     node_key: []const u8,
     node_key_index: usize,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
-    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
+    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
     //   and one must use all the nodes in genesis nodes.yaml as peers
     validator_config: []const u8,
     bootnodes: []const []const u8,
-    validator_indices: []usize,
+    validator_assignments: []ValidatorAssignment,
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
     metrics_port: u16,
@@ -75,11 +87,22 @@ pub const NodeOptions = struct {
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
         allocator.free(self.bootnodes);
-        allocator.free(self.validator_indices);
+        for (self.validator_assignments) |*assignment| {
+            @constCast(assignment).deinit(allocator);
+        }
+        allocator.free(self.validator_assignments);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
         self.node_registry.deinit();
         allocator.destroy(self.node_registry);
+    }
+
+    pub fn getValidatorIndices(self: *const NodeOptions, allocator: std.mem.Allocator) ![]usize {
+        var indices = try allocator.alloc(usize, self.validator_assignments.len);
+        for (self.validator_assignments, 0..) |assignment, i| {
+            indices[i] = assignment.index;
+        }
+        return indices;
     }
 };
 
@@ -163,13 +186,16 @@ pub const Node = struct {
 
         try self.loadValidatorKeypairs(num_validators);
 
+        const validator_ids = try options.getValidatorIndices(allocator);
+        errdefer allocator.free(validator_ids);
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
             .anchorState = &anchorState,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
-            .validator_ids = options.validator_indices,
+            .validator_ids = validator_ids,
             .key_manager = &self.key_manager,
             .db = db,
             .logger_config = options.logger_config,
@@ -311,101 +337,55 @@ pub const Node = struct {
         self: *Self,
         num_validators: usize,
     ) !void {
-        if (self.options.validator_indices.len == 0) {
+        if (self.options.validator_assignments.len == 0) {
             return error.NoValidatorAssignments;
         }
 
         const hash_sig_key_dir = self.options.hash_sig_key_dir;
 
-        for (self.options.validator_indices) |validator_index| {
-            if (validator_index >= num_validators) {
+        for (self.options.validator_assignments) |assignment| {
+            if (assignment.index >= num_validators) {
                 return error.HashSigValidatorIndexOutOfRange;
             }
 
-            // Helper to read a key file
-            const ReadKeyArgs = struct {
-                dir: []const u8,
-                index: usize,
-                suffix: []const u8,
-                allocator: std.mem.Allocator,
-            };
-            const readKeyFile = struct {
-                fn read(args: ReadKeyArgs) ![]u8 {
-                    const path = try std.fmt.allocPrint(args.allocator, "{s}/validator_{d}_{s}", .{ args.dir, args.index, args.suffix });
-                    defer args.allocator.free(path);
+            const privkey_file = assignment.privkey_file;
 
-                    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-                        error.FileNotFound => return error.FileNotFound,
-                        else => return err,
-                    };
-                    defer file.close();
-
-                    return try file.readToEndAlloc(args.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
-                }
-            }.read;
-
-            // Try loading SSZ keys first
-            if (readKeyFile(.{
-                .dir = hash_sig_key_dir,
-                .index = validator_index,
-                .suffix = "sk.ssz",
-                .allocator = self.allocator,
-            })) |secret_ssz| {
-                defer self.allocator.free(secret_ssz);
-
-                const public_ssz = readKeyFile(.{
-                    .dir = hash_sig_key_dir,
-                    .index = validator_index,
-                    .suffix = "pk.ssz",
-                    .allocator = self.allocator,
-                }) catch |err| switch (err) {
-                    error.FileNotFound => return error.HashSigPublicKeyMissing,
-                    else => return err,
-                };
-                defer self.allocator.free(public_ssz);
-
-                var keypair = try xmss.KeyPair.fromSsz(
-                    self.allocator,
-                    secret_ssz,
-                    public_ssz,
-                );
-                errdefer keypair.deinit();
-                try self.key_manager.addKeypair(validator_index, keypair);
-            } else |err| switch (err) {
-                error.FileNotFound => {
-                    // Fallback to JSON if SSZ secret key is missing
-                    const secret_json = readKeyFile(.{
-                        .dir = hash_sig_key_dir,
-                        .index = validator_index,
-                        .suffix = "sk.json",
-                        .allocator = self.allocator,
-                    }) catch |e| switch (e) {
-                        error.FileNotFound => return error.HashSigSecretKeyMissing,
-                        else => return e,
-                    };
-                    defer self.allocator.free(secret_json);
-
-                    const public_json = readKeyFile(.{
-                        .dir = hash_sig_key_dir,
-                        .index = validator_index,
-                        .suffix = "pk.json",
-                        .allocator = self.allocator,
-                    }) catch |e| switch (e) {
-                        error.FileNotFound => return error.HashSigPublicKeyMissing,
-                        else => return e,
-                    };
-                    defer self.allocator.free(public_json);
-
-                    var keypair = try xmss.KeyPair.fromJson(
-                        self.allocator,
-                        secret_json,
-                        public_json,
-                    );
-                    errdefer keypair.deinit();
-                    try self.key_manager.addKeypair(validator_index, keypair);
-                },
-                else => return err,
+            if (!std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
+                return error.InvalidPrivkeyFileFormat;
             }
+
+            const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
+            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, base });
+            defer self.allocator.free(sk_path);
+            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
+            defer self.allocator.free(pk_path);
+
+            // Read secret key
+            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.HashSigSecretKeyMissing,
+                else => return err,
+            };
+            defer sk_file.close();
+            const secret_ssz = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
+            defer self.allocator.free(secret_ssz);
+
+            // Read public key
+            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            defer pk_file.close();
+            const public_ssz = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
+            defer self.allocator.free(public_ssz);
+
+            var keypair = try xmss.KeyPair.fromSsz(
+                self.allocator,
+                secret_ssz,
+                public_ssz,
+            );
+            errdefer keypair.deinit();
+
+            try self.key_manager.addKeypair(assignment.index, keypair);
         }
     }
 };
@@ -431,7 +411,7 @@ pub fn buildStartOptions(
             node_cmd.custom_genesis
         else
             node_cmd.validator_config,
-        "/validators.yaml",
+        "/annotated_validators.yaml",
     });
     defer allocator.free(validators_filepath);
     const validator_config_filepath = try std.mem.concat(allocator, u8, &[_][]const u8{
@@ -469,9 +449,14 @@ pub fn buildStartOptions(
     }
     const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, node_cmd.override_genesis_time);
 
-    const validator_indices = try validatorIndicesFromYAML(allocator, opts.node_key, parsed_validators);
-    errdefer allocator.free(validator_indices);
-    if (validator_indices.len == 0) {
+    const validator_assignments = try validatorAssignmentsFromYAML(allocator, opts.node_key, parsed_validators);
+    errdefer {
+        for (validator_assignments) |*a| {
+            @constCast(a).deinit(allocator);
+        }
+        allocator.free(validator_assignments);
+    }
+    if (validator_assignments.len == 0) {
         return error.InvalidValidatorConfig;
     }
     const local_priv_key = try getPrivateKeyFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
@@ -490,7 +475,7 @@ pub fn buildStartOptions(
     };
 
     opts.bootnodes = bootnodes;
-    opts.validator_indices = validator_indices;
+    opts.validator_assignments = validator_assignments;
     opts.local_priv_key = local_priv_key;
     opts.genesis_spec = genesis_spec;
     opts.node_key_index = node_key_index;
@@ -528,19 +513,51 @@ fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []co
 ///   - 0
 ///   - 1
 /// node_1:
-///   - 2
-///   - 3
+/// Parses the validator assignments for a given node from a YAML configuration.
+/// Expects a YAML structure like:
+/// ```yaml
+/// zeam_0:
+///   - index: 0
+///     pubkey_hex: 812f8540481ce70515d43b451cedcf6b4e3177312821fa541df6375c20ced55196ad245a00335d425e86817bdbde75536c986c25
+///     privkey_file: validator_0_sk.json
+///   - index: 3
+///     pubkey_hex: a47e01144cd43e3efddef56da069f418d9aac406c29589314f74b00158437375e51b1213ecbbf23d47fd9e05933cfb24ac84e72d
+///     privkey_file: validator_3_sk.json
 /// ```
-/// where `node_{node_id}` is the key for the node's validator indices.
-/// Returns a set of validator indices. The caller is responsible for freeing the returned slice.
-fn validatorIndicesFromYAML(allocator: std.mem.Allocator, node_key: []const u8, validators: Yaml) ![]usize {
-    var validator_indices: std.ArrayListUnmanaged(usize) = .empty;
-    defer validator_indices.deinit(allocator);
-
-    for (validators.docs.items[0].map.get(node_key).?.list) |item| {
-        try validator_indices.append(allocator, @intCast(item.int));
+/// where `node_key` (e.g., "zeam_0") is the key for the node's validator assignments.
+/// Returns a slice of ValidatorAssignment. The caller is responsible for freeing the returned slice.
+fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const u8, validators: Yaml) ![]ValidatorAssignment {
+    var assignments: std.ArrayListUnmanaged(ValidatorAssignment) = .empty;
+    defer assignments.deinit(allocator);
+    errdefer {
+        for (assignments.items) |*a| {
+            @constCast(a).deinit(allocator);
+        }
     }
-    return try validator_indices.toOwnedSlice(allocator);
+
+    const node_validators = validators.docs.items[0].map.get(node_key) orelse return error.InvalidNodeKey;
+    if (node_validators != .list) return error.InvalidValidatorConfig;
+
+    for (node_validators.list) |item| {
+        if (item != .map) return error.InvalidValidatorConfig;
+
+        const index_value = item.map.get("index") orelse return error.InvalidValidatorConfig;
+        if (index_value != .int) return error.InvalidValidatorConfig;
+
+        const pubkey_value = item.map.get("pubkey_hex") orelse return error.InvalidValidatorConfig;
+        if (pubkey_value != .string) return error.InvalidValidatorConfig;
+
+        const privkey_value = item.map.get("privkey_file") orelse return error.InvalidValidatorConfig;
+        if (privkey_value != .string) return error.InvalidValidatorConfig;
+
+        const assignment = ValidatorAssignment{
+            .index = @intCast(index_value.int),
+            .pubkey_hex = try allocator.dupe(u8, pubkey_value.string),
+            .privkey_file = try allocator.dupe(u8, privkey_value.string),
+        };
+        try assignments.append(allocator, assignment);
+    }
+    return try assignments.toOwnedSlice(allocator);
 }
 
 // Parses the index for a given node key from a YAML configuration.
@@ -884,14 +901,19 @@ test "configs yaml parsing" {
     try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
     try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
 
-    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validators.yaml");
+    var validators_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/annotated_validators.yaml");
     defer validators_file.deinit(std.testing.allocator);
-    const validator_indices = try validatorIndicesFromYAML(std.testing.allocator, "zeam_0", validators_file);
-    defer std.testing.allocator.free(validator_indices);
-    try std.testing.expectEqual(3, validator_indices.len);
-    try std.testing.expectEqual(1, validator_indices[0]);
-    try std.testing.expectEqual(4, validator_indices[1]);
-    try std.testing.expectEqual(7, validator_indices[2]);
+    const validator_assignments = try validatorAssignmentsFromYAML(std.testing.allocator, "zeam_0", validators_file);
+    defer {
+        for (validator_assignments) |*a| {
+            @constCast(a).deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(validator_assignments);
+    }
+    try std.testing.expectEqual(3, validator_assignments.len);
+    try std.testing.expectEqual(1, validator_assignments[0].index);
+    try std.testing.expectEqual(4, validator_assignments[1].index);
+    try std.testing.expectEqual(7, validator_assignments[2].index);
 
     var nodes_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/nodes.yaml");
     defer nodes_file.deinit(std.testing.allocator);
