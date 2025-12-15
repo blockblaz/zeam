@@ -773,7 +773,6 @@ pub const BeamChain = struct {
             zeam_metrics.incrementLeanAttestationsInvalid(is_from_block);
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-        zeam_metrics.incrementLeanAttestationsValid(is_from_block);
         self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
             attestation.validator_id,
             data.slot,

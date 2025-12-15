@@ -558,6 +558,8 @@ pub const ForkChoice = struct {
                 };
             }
         }
+        // increment valid attestation metric only on successfull attestaion processing
+        zeam_metrics.incrementLeanAttestationsValid(is_from_block);
 
         try self.attestations.put(validator_id, attestation_tracker);
     }
