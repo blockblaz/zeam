@@ -39,6 +39,9 @@ pub const ProtoArray = struct {
     }
 
     pub fn onBlock(self: *Self, block: ProtoBlock, currentSlot: types.Slot) !void {
+        const onblock_timer = zeam_metrics.lean_fork_choice_block_processing_time_seconds.start();
+        defer _ = onblock_timer.observe();
+
         // currentSlot might be needed in future for finding the viable head
         _ = currentSlot;
         const node_or_null = self.indices.get(block.blockRoot);
@@ -517,7 +520,10 @@ pub const ForkChoice = struct {
         const attestation_slot = attestation.data.slot;
 
         // This get should never fail after validation, but we keep the check for safety
-        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse return ForkChoiceError.InvalidAttestation;
+        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse {
+            // Track whether this is from gossip or block processing
+            return ForkChoiceError.InvalidAttestation;
+        };
 
         var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
         // update latest known attested head of the validator if already included on chain
@@ -537,7 +543,9 @@ pub const ForkChoice = struct {
                 attestation_tracker.latestNew = null;
             }
         } else {
-            if (attestation_slot > self.fcStore.timeSlots) return ForkChoiceError.InvalidFutureAttestation;
+            if (attestation_slot > self.fcStore.timeSlots) {
+                return ForkChoiceError.InvalidFutureAttestation;
+            }
             // just update latest new attested head of the validator
             const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
             if (attestation_slot > attestation_tracker_latest_new_slot) {
@@ -548,7 +556,6 @@ pub const ForkChoice = struct {
                 };
             }
         }
-
         try self.attestations.put(validator_id, attestation_tracker);
     }
 

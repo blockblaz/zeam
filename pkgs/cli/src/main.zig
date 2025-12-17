@@ -45,7 +45,7 @@ pub const NodeCommand = struct {
     @"node-key": []const u8 = constants.DEFAULT_NODE_KEY,
     // 1. a special value of "genesis_bootnode" for validator config means its a genesis bootnode and so
     //   the configuration is to be picked from genesis
-    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and validatrs.yaml
+    // 2. otherwise validator_config is dir path to this nodes's validator_config.yaml and annotated_validators.yaml
     //   and one must use all the nodes in genesis nodes.yaml as peers
     validator_config: []const u8,
     metrics_enable: bool = false,
@@ -378,9 +378,22 @@ fn mainInner() !void {
                 allocator.free(connect_peers);
             }
 
+            // Create shared registry for beam simulation with validator ID mappings
+            // This registry will be used by both the mock network (if enabled) and the beam nodes
+            const shared_registry = try allocator.create(node_lib.NodeNameRegistry);
+            errdefer allocator.destroy(shared_registry);
+            shared_registry.* = node_lib.NodeNameRegistry.init(allocator);
+            errdefer shared_registry.deinit();
+
+            try shared_registry.addValidatorMapping(1, "zeam_n1");
+            try shared_registry.addValidatorMapping(2, "zeam_n2");
+
+            try shared_registry.addPeerMapping("zeam_n1", "zeam_n1");
+            try shared_registry.addPeerMapping("zeam_n2", "zeam_n2");
+
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
-                network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network));
+                network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network), shared_registry);
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
@@ -448,16 +461,9 @@ fn mainInner() !void {
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
 
-            // Create empty node registries for beam simulation
-            const registry_1 = try allocator.create(node_lib.NodeNameRegistry);
-            defer allocator.destroy(registry_1);
-            registry_1.* = node_lib.NodeNameRegistry.init(allocator);
-            defer registry_1.deinit();
-
-            const registry_2 = try allocator.create(node_lib.NodeNameRegistry);
-            defer allocator.destroy(registry_2);
-            registry_2.* = node_lib.NodeNameRegistry.init(allocator);
-            defer registry_2.deinit();
+            // Use the same shared registry for both beam nodes
+            const registry_1 = shared_registry;
+            const registry_2 = shared_registry;
 
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
@@ -539,7 +545,7 @@ fn mainInner() !void {
                 .metrics_port = leancmd.metrics_port,
                 .bootnodes = undefined,
                 .genesis_spec = undefined,
-                .validator_indices = undefined,
+                .validator_assignments = undefined,
                 .local_priv_key = undefined,
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
