@@ -350,21 +350,6 @@ pub const BeamChain = struct {
                 });
 
                 if (!hasBlock) {
-                    const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
-                    self.module_logger.debug("block processing is required hasParentBlock={any}", .{hasParentBlock});
-                    if (hasParentBlock) {
-                        const missing_roots = self.onBlock(signed_block, .{}) catch |err| {
-                            self.module_logger.debug(" ^^^^^^^^ Block processing error ^^^^^^ {any}", .{err});
-                            return .{};
-                        };
-                        // Return both the block root and missing attestation roots so the node can:
-                        // 1. Call processCachedDescendants(block_root) to retry any cached children
-                        // 2. Fetch missing attestation head blocks via RPC
-                        return .{
-                            .processed_block_root = block_root,
-                            .missing_attestation_roots = missing_roots,
-                        };
-                    }
                     self.validateBlock(block, true) catch |err| {
                         self.module_logger.warn("gossip block validation failed: {any}", .{err});
                         return .{}; // Drop invalid gossip attestations
@@ -378,6 +363,9 @@ pub const BeamChain = struct {
                         });
                         return .{};
                     };
+                    // Return both the block root and missing attestation roots so the node can:
+                    // 1. Call processCachedDescendants(block_root) to retry any cached children
+                    // 2. Fetch missing attestation head blocks via RPC
                     return .{
                         .processed_block_root = block_root,
                         .missing_attestation_roots = missing_roots,
