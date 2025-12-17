@@ -830,7 +830,7 @@ test "Node peer tracking on connect/disconnect" {
     var iterations: u32 = 0;
     while (iterations < 5) : (iterations += 1) {
         std.time.sleep(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
-        try loop.run(.until_done);
+        try ctx.loopPtr().run(.until_done);
     }
 }
 
@@ -842,7 +842,7 @@ test "Node: fetched blocks cache and deduplication" {
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
 
-    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock));
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
 
     const backend = mock.getNetworkInterface();
@@ -954,7 +954,7 @@ test "Node: processCachedDescendants basic flow" {
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
 
-    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock));
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
 
     const backend = mock.getNetworkInterface();
