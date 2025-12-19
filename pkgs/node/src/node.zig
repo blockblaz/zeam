@@ -512,10 +512,19 @@ pub const BeamNode = struct {
                 self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else {
-            self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
+            self.logger.debug("Block already in forkChoice, persisting to database: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
+
+            if (self.chain.states.get(block_root)) |post_state| {
+                const store = self.chain.forkChoice.fcStore;
+                self.chain.updateBlockDb(signed_block, block_root, post_state.*, block.slot, store.latest_finalized.slot) catch |err| {
+                    self.logger.err("Failed to persist produced block to database: slot={d} err={any}", .{ block.slot, err });
+                };
+            } else {
+                self.logger.err("Cannot persist block to database: post state not found in cache for slot={d}", .{block.slot});
+            }
         }
     }
 
