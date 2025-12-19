@@ -21,6 +21,7 @@ const jsonToString = zeam_utils.jsonToString;
 const utils = @import("./utils.zig");
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
+const tree_visualizer = @import("./tree_visualizer.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -165,7 +166,7 @@ pub const BeamChain = struct {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
-            self.printSlot(islot, self.connected_peers.count());
+            self.printSlot(islot, null, self.connected_peers.count());
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
@@ -254,7 +255,7 @@ pub const BeamChain = struct {
         const slot = opts.slot;
 
         // const head = try self.forkChoice.getProposalHead(slot);
-        const head_proto = self.forkChoice.head;
+        const head_proto = self.forkChoice.getHead();
         const head: types.Checkpoint = .{
             .root = head_proto.blockRoot,
             .slot = head_proto.slot,
@@ -265,13 +266,13 @@ pub const BeamChain = struct {
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.fcStore.latest_justified,
+            .source = self.forkChoice.getLatestJustified(),
         };
 
         return attestation_data;
     }
 
-    pub fn printSlot(self: *Self, islot: isize, peer_count: usize) void {
+    pub fn printSlot(self: *Self, islot: isize, tree_depth: ?usize, peer_count: usize) void {
         // head should be auto updated if receieved a block or block proposal done
         // however it doesn't get updated unless called updatehead even though process block
         // logs show it has been updated. debug and fix the call below
@@ -281,16 +282,27 @@ pub const BeamChain = struct {
                 return;
             }
         else
-            self.forkChoice.head;
+            self.forkChoice.getHead();
 
         // Get additional chain information
-        const justified = self.forkChoice.fcStore.latest_justified;
-        const finalized = self.forkChoice.fcStore.latest_finalized;
+        const justified = self.forkChoice.getLatestJustified();
+        const finalized = self.forkChoice.getLatestFinalized();
 
         // Calculate chain progress
         const slot: usize = if (islot < 0) 0 else @intCast(islot);
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
+
+        // Build tree visualization (thread-safe snapshot)
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const tree_visual = blk: {
+            const snapshot = self.forkChoice.snapshot(arena.allocator()) catch {
+                break :blk "Failed to get fork choice snapshot";
+            };
+            defer snapshot.deinit(arena.allocator());
+            break :blk tree_visualizer.buildTreeVisualization(arena.allocator(), snapshot.nodes, tree_depth) catch "Tree visualization failed";
+        };
 
         self.module_logger.info(
             \\
@@ -306,6 +318,9 @@ pub const BeamChain = struct {
             \\+---------------------------------------------------------------+
             \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
             \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\+---------------------------------------------------------------+
+            \\  ForkChoice Tree:
+            \\{s}
             \\+===============================================================+
             \\
         , .{
@@ -321,6 +336,7 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&justified.root),
             finalized.slot,
             std.fmt.fmtSliceHexLower(&finalized.root),
+            tree_visual,
         });
     }
 
@@ -502,9 +518,8 @@ pub const BeamChain = struct {
             self.module_logger.warn("Failed to create head event: {any}", .{err});
         }
 
-        const store = self.forkChoice.fcStore;
-        const latest_justified = store.latest_justified;
-        const latest_finalized = store.latest_finalized;
+        const latest_justified = self.forkChoice.getLatestJustified();
+        const latest_finalized = self.forkChoice.getLatestFinalized();
 
         // 7. Save block and state to database
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized.slot) catch |err| {
@@ -600,8 +615,8 @@ pub const BeamChain = struct {
 
     /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
     fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalizedSlot: types.Slot, finalizedSlot: types.Slot) !void {
-        // 1. Fetch all newly finalized roots
-        const current_finalized = self.forkChoice.fcStore.latest_finalized.root;
+        // 1. Fetch all newly finalized roots (thread-safe)
+        const current_finalized = self.forkChoice.getLatestFinalized().root;
 
         const newly_finalized_roots = try self.forkChoice.getAncestorsOfFinalized(self.allocator, current_finalized, previousFinalizedSlot);
         defer self.allocator.free(newly_finalized_roots);
@@ -618,14 +633,13 @@ pub const BeamChain = struct {
             canonical_blocks.put(root, {}) catch {};
         }
 
-        // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace
+        // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace (thread-safe)
         for (newly_finalized_roots) |root| {
-            const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
-            const node = self.forkChoice.protoArray.nodes.items[idx];
-            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
+            const slot = self.forkChoice.getBlockSlot(root) orelse return error.FinalizedBlockNotInForkChoice;
+            batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, root);
             self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
                 std.fmt.fmtSliceHexLower(&root),
-                node.slot,
+                slot,
             });
         }
 
@@ -690,31 +704,27 @@ pub const BeamChain = struct {
         defer _ = timer.observe();
         const data = attestation.data;
 
-        // 1. Validate that source, target, and head blocks exist in proto array
-        const source_idx = self.forkChoice.protoArray.indices.get(data.source.root) orelse {
+        // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
+        const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown source block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.source.root),
             });
             return AttestationValidationError.UnknownSourceBlock;
         };
 
-        const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
+        const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
-        const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
+        const head_block = self.forkChoice.getProtoNode(data.head.root) orelse {
             self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
         };
-
-        const source_block = self.forkChoice.protoArray.nodes.items[source_idx];
-        const target_block = self.forkChoice.protoArray.nodes.items[target_idx];
-        const head_block = self.forkChoice.protoArray.nodes.items[head_idx];
         _ = head_block; // Will be used in future validations
 
         // 2. Validate slot relationships
@@ -758,7 +768,7 @@ pub const BeamChain = struct {
         //    Gossip attestations must be for current or past slots only. Validators attest
         //    in interval 1 of the current slot, so they cannot attest for future slots.
         //    Block attestations can be more lenient since the block itself was validated.
-        const current_slot = self.forkChoice.fcStore.timeSlots;
+        const current_slot = self.forkChoice.getCurrentSlot();
         const max_allowed_slot = if (is_from_block)
             current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
         else
@@ -794,8 +804,8 @@ pub const BeamChain = struct {
     }
 
     pub fn getStatus(self: *Self) types.Status {
-        const finalized = self.forkChoice.fcStore.latest_finalized;
-        const head = self.forkChoice.head;
+        const finalized = self.forkChoice.getLatestFinalized();
+        const head = self.forkChoice.getHead();
 
         return .{
             .finalized_root = finalized.root,
@@ -866,9 +876,9 @@ test "process and add mock blocks into a node's chain" {
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
@@ -895,9 +905,9 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_justified.root, &mock_chain.latestJustified[i].root));
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.fcStore.latest_finalized.root, &mock_chain.latestFinalized[i].root));
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.head.blockRoot, &mock_chain.latestHead[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestJustified().root, &mock_chain.latestJustified[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.latestFinalized[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getHead().blockRoot, &mock_chain.latestHead[i].root));
     }
 
     const num_validators: usize = @intCast(mock_chain.genesis_config.numValidators());
@@ -965,16 +975,16 @@ test "printSlot output demonstration" {
 
     // Test printSlot at different slots to see the output
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 0 ===\n", .{});
-    beam_chain.printSlot(0, beam_chain.connected_peers.count());
+    beam_chain.printSlot(0, null, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 1 ===\n", .{});
-    beam_chain.printSlot(1, beam_chain.connected_peers.count());
+    beam_chain.printSlot(1, null, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 2 ===\n", .{});
-    beam_chain.printSlot(2, beam_chain.connected_peers.count());
+    beam_chain.printSlot(2, null, beam_chain.connected_peers.count());
 
     std.debug.print("\n=== PRINTING CHAIN STATUS AT SLOT 5 (BEHIND) ===\n", .{});
-    beam_chain.printSlot(5, beam_chain.connected_peers.count());
+    beam_chain.printSlot(5, null, beam_chain.connected_peers.count());
 
     // Verify that the chain state is as expected
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == mock_chain.blocks.len);

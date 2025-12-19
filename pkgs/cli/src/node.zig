@@ -130,12 +130,8 @@ pub const Node = struct {
         self.allocator = allocator;
         self.options = options;
 
-        // Initialize event broadcaster
-        try event_broadcaster.initGlobalBroadcaster(allocator);
-
         if (options.metrics_enable) {
             try api.init(allocator);
-            try api_server.startAPIServer(allocator, options.metrics_port);
         }
 
         // some base mainnet spec would be loaded to build this up
@@ -201,6 +197,10 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
+
+        if (options.metrics_enable) {
+            try api_server.startAPIServer(allocator, options.metrics_port, &self.beam_node.chain.forkChoice);
+        }
 
         self.logger = options.logger_config.logger(.node);
     }

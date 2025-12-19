@@ -301,12 +301,6 @@ fn mainInner() !void {
                 return err;
             };
 
-            // Start metrics HTTP server
-            api_server.startAPIServer(allocator, beamcmd.metricsPort) catch |err| {
-                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
-                return err;
-            };
-
             std.debug.print("beam opts ={any}\n", .{beamcmd});
 
             const mock_network = beamcmd.mockNetwork;
@@ -479,6 +473,11 @@ fn mainInner() !void {
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
             });
+
+            api_server.startAPIServer(allocator, beamcmd.metricsPort, &beam_node_1.chain.forkChoice) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
+                return err;
+            };
 
             var beam_node_2: BeamNode = undefined;
             try beam_node_2.init(allocator, .{
