@@ -197,9 +197,30 @@ pub const Network = struct {
     }
 
     pub fn disconnectPeer(self: *Self, peer_id: []const u8) bool {
-        if (self.connected_peers.fetchRemove(peer_id)) |entry| {
-            self.allocator.free(entry.key);
-            self.allocator.free(entry.value.peer_id);
+        if (self.connected_peers.fetchRemove(peer_id)) |peer_entry| {
+            self.allocator.free(peer_entry.key);
+            self.allocator.free(peer_entry.value.peer_id);
+
+            // Finalize all pending RPC requests for this peer
+            var rpc_it = self.pending_rpc_requests.iterator();
+            var request_ids_to_remove = std.ArrayList(u64).init(self.allocator);
+            defer request_ids_to_remove.deinit();
+
+            while (rpc_it.next()) |rpc_entry| {
+                const pending_peer_id = switch (rpc_entry.value_ptr.*) {
+                    .status => |*ctx| ctx.peer_id,
+                    .blocks_by_root => |*ctx| ctx.peer_id,
+                };
+                if (std.mem.eql(u8, pending_peer_id, peer_id)) {
+                    // If we can't allocate, skip this request (should be rare)
+                    request_ids_to_remove.append(rpc_entry.key_ptr.*) catch continue;
+                }
+            }
+
+            for (request_ids_to_remove.items) |request_id| {
+                self.finalizePendingRequest(request_id);
+            }
+
             return true;
         }
         return false;

@@ -398,14 +398,17 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
+                    zeam_metrics.incrementLeanAttestationsInvalid(false);
                     return; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
+                    zeam_metrics.incrementLeanAttestationsInvalid(false);
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
+                zeam_metrics.incrementLeanAttestationsValid(false);
             },
         }
     }
@@ -467,6 +470,7 @@ pub const BeamChain = struct {
         for (block.body.attestations.constSlice(), 0..) |attestation, index| {
             // Validate attestation before processing (from block = true)
             self.validateAttestation(attestation, true) catch |e| {
+                zeam_metrics.incrementLeanAttestationsInvalid(true);
                 if (e == AttestationValidationError.UnknownHeadBlock) {
                     try missing_roots.append(attestation.data.head.root);
                 }
@@ -482,8 +486,11 @@ pub const BeamChain = struct {
             const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
 
             self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                zeam_metrics.incrementLeanAttestationsInvalid(true);
                 self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                continue;
             };
+            zeam_metrics.incrementLeanAttestationsValid(true);
         }
 
         // 5. fc update head
@@ -693,6 +700,8 @@ pub const BeamChain = struct {
     /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
     /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
     pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+        const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
+        defer _ = timer.observe();
         const data = attestation.data;
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
@@ -773,7 +782,6 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-
         self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
             attestation.validator_id,
             data.slot,
