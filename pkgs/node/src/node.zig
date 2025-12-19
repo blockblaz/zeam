@@ -364,25 +364,26 @@ pub const BeamNode = struct {
             self.network.getPeerCount(),
         });
 
-        const handler = self.getReqRespResponseHandler();
-        const status = self.chain.getStatus();
-
-        const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("Failed to send status request to peer {s}{} {any}", .{
-                peer_id,
-                self.node_registry.getNodeNameFromPeerId(peer_id),
-                err,
-            });
-            return;
-        };
-
-        self.logger.info("Sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
-            peer_id,
-            self.node_registry.getNodeNameFromPeerId(peer_id),
-            request_id,
-            status.head_slot,
-            status.finalized_slot,
-        });
+        // TODO: commented out for devnet1, re-enable once req/resp is stable
+        // const handler = self.getReqRespResponseHandler();
+        // const status = self.chain.getStatus();
+        //
+        // const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
+        //     self.logger.warn("Failed to send status request to peer {s}{} {any}", .{
+        //         peer_id,
+        //         self.node_registry.getNodeNameFromPeerId(peer_id),
+        //         err,
+        //     });
+        //     return;
+        // };
+        //
+        // self.logger.info("Sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+        //     peer_id,
+        //     self.node_registry.getNodeNameFromPeerId(peer_id),
+        //     request_id,
+        //     status.head_slot,
+        //     status.finalized_slot,
+        // });
     }
 
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
