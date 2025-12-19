@@ -1,10 +1,9 @@
 use lean_multisig::{
-    F, XmssPublicKey, XmssSignature,
-    xmss_aggregate_signatures, xmss_aggregation_setup_prover,
-    xmss_aggregation_setup_verifier, xmss_verify_aggregated_signatures,
+    xmss_aggregate_signatures, xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
+    xmss_verify_aggregated_signatures, XmssPublicKey, XmssSignature, F,
 };
-use xmss::WotsSignature;
 use std::slice;
+use xmss::WotsSignature;
 
 #[repr(C)]
 pub struct CXmssPublicKey {
@@ -49,14 +48,11 @@ unsafe fn convert_signature(c_sig: &CXmssSignature) -> XmssSignature {
         std::array::from_fn(|j| u32_to_field(c_sig.wots_signature.chain_tips[i][j]))
     });
 
-    let randomness: [F; 8] = std::array::from_fn(|i| {
-        u32_to_field(c_sig.wots_signature.randomness[i])
-    });
+    let randomness: [F; 8] =
+        std::array::from_fn(|i| u32_to_field(c_sig.wots_signature.randomness[i]));
 
-    let merkle_proof_u32 = slice::from_raw_parts(
-        c_sig.merkle_proof_ptr,
-        c_sig.merkle_proof_len * 8
-    );
+    let merkle_proof_u32 =
+        slice::from_raw_parts(c_sig.merkle_proof_ptr, c_sig.merkle_proof_len * 8);
 
     let merkle_proof: Vec<[F; 8]> = merkle_proof_u32
         .chunks_exact(8)
@@ -113,10 +109,7 @@ pub unsafe extern "C" fn xmss_aggregate(
         let c_signatures = slice::from_raw_parts(signatures_ptr, signatures_len);
         let message_hash_u32 = slice::from_raw_parts(message_hash_ptr, 8);
 
-        let pub_keys: Vec<XmssPublicKey> = c_pub_keys
-            .iter()
-            .map(|pk| convert_pubkey(pk))
-            .collect();
+        let pub_keys: Vec<XmssPublicKey> = c_pub_keys.iter().map(|pk| convert_pubkey(pk)).collect();
 
         let signatures: Vec<XmssSignature> = c_signatures
             .iter()
@@ -164,10 +157,7 @@ pub unsafe extern "C" fn xmss_verify_aggregated(
         let message_hash_u32 = slice::from_raw_parts(message_hash_ptr, 8);
         let proof_bytes = slice::from_raw_parts(proof_ptr, proof_len);
 
-        let pub_keys: Vec<XmssPublicKey> = c_pub_keys
-            .iter()
-            .map(|pk| convert_pubkey(pk))
-            .collect();
+        let pub_keys: Vec<XmssPublicKey> = c_pub_keys.iter().map(|pk| convert_pubkey(pk)).collect();
 
         let message_hash: [F; 8] = std::array::from_fn(|i| u32_to_field(message_hash_u32[i]));
 
