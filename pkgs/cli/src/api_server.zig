@@ -4,38 +4,21 @@ const constants = @import("constants.zig");
 const event_broadcaster = api.event_broadcaster;
 const node = @import("@zeam/node");
 
-// Global chain reference for API access
-var global_chain: ?*node.BeamChain = null;
-var chain_mutex = std.Thread.Mutex{};
+const QUERY_SLOTS_PREFIX = "?slots=";
+const DEFAULT_MAX_SLOTS: usize = 50;
+const MAX_ALLOWED_SLOTS: usize = 200;
 
-/// Register the chain for API access
-pub fn registerChain(chain: *node.BeamChain) void {
-    chain_mutex.lock();
-    defer chain_mutex.unlock();
-    global_chain = chain;
-}
-
-/// Get the global chain reference
-fn getChain() ?*node.BeamChain {
-    chain_mutex.lock();
-    defer chain_mutex.unlock();
-    return global_chain;
-}
-
-/// Simple metrics server that runs in a background thread
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16) !void {
-    // Initialize the global event broadcaster
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node.fcFactory.ForkChoice) !void {
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
-    // Create a simple HTTP server context
     const ctx = try allocator.create(SimpleMetricsServer);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .port = port,
+        .forkchoice = forkchoice,
     };
 
-    // Start server in background thread
     const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
     thread.detach();
 
@@ -43,7 +26,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16) !void {
 }
 
 /// Handle individual HTTP connections in a separate thread
-fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator) void {
+fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
     defer connection.stream.close();
 
     var buffer: [4096]u8 = undefined;
@@ -84,7 +67,7 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
         }) catch {};
     } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
         // Handle fork choice graph request
-        handleForkChoiceGraph(&request, allocator) catch |err| {
+        handleForkChoiceGraph(&request, allocator, forkchoice) catch |err| {
             std.log.warn("Fork choice graph request failed: {}", .{err});
             _ = request.respond("Internal Server Error\n", .{}) catch {};
         };
@@ -93,40 +76,24 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
     }
 }
 
-/// Handle fork choice graph API request
-fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
-    // Get chain reference
-    const chain = getChain() orelse {
-        const error_response = "{\"error\":\"Chain not initialized\"}";
-        _ = request.respond(error_response, .{
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
-            },
-        }) catch {};
-        return;
-    };
-
-    // Parse query parameters for max_slots (default: 50)
-    var max_slots: usize = 50;
-    if (std.mem.indexOf(u8, request.head.target, "?slots=")) |query_start| {
-        const slots_param = request.head.target[query_start + 7 ..];
+fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) !void {
+    var max_slots: usize = DEFAULT_MAX_SLOTS;
+    if (std.mem.indexOf(u8, request.head.target, QUERY_SLOTS_PREFIX)) |query_start| {
+        const slots_param = request.head.target[query_start + QUERY_SLOTS_PREFIX.len ..];
         if (std.mem.indexOf(u8, slots_param, "&")) |end| {
-            max_slots = std.fmt.parseInt(usize, slots_param[0..end], 10) catch 50;
+            max_slots = std.fmt.parseInt(usize, slots_param[0..end], 10) catch DEFAULT_MAX_SLOTS;
         } else {
-            max_slots = std.fmt.parseInt(usize, slots_param, 10) catch 50;
+            max_slots = std.fmt.parseInt(usize, slots_param, 10) catch DEFAULT_MAX_SLOTS;
         }
     }
 
-    // Cap max_slots to prevent resource exhaustion
-    if (max_slots > 200) max_slots = 200;
+    if (max_slots > MAX_ALLOWED_SLOTS) max_slots = MAX_ALLOWED_SLOTS;
 
-    // Build the graph data
     var graph_json = std.ArrayList(u8).init(allocator);
     defer graph_json.deinit();
 
-    try buildGraphJSON(chain, graph_json.writer(), max_slots, allocator);
+    try buildGraphJSON(forkchoice, graph_json.writer(), max_slots, allocator);
 
-    // Send response
     _ = request.respond(graph_json.items, .{
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json; charset=utf-8" },
@@ -137,13 +104,12 @@ fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.A
 
 /// Build fork choice graph in Grafana node-graph JSON format
 fn buildGraphJSON(
-    chain: *node.BeamChain,
+    forkchoice: *node.fcFactory.ForkChoice,
     writer: anytype,
     max_slots: usize,
     allocator: std.mem.Allocator,
 ) !void {
-    // Thread-safe snapshot - lock held only during copy
-    const snapshot = try chain.forkChoice.snapshot(allocator);
+    const snapshot = try forkchoice.snapshot(allocator);
     defer snapshot.deinit(allocator);
 
     const proto_nodes = snapshot.nodes;
@@ -315,9 +281,9 @@ fn buildGraphJSON(
 const SimpleMetricsServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
+    forkchoice: *node.fcFactory.ForkChoice,
 
     fn run(self: *SimpleMetricsServer) !void {
-        // `startMetricsServer` creates this, so we need to free it here
         defer self.allocator.destroy(self);
         const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
         var server = try address.listen(.{ .reuse_address = true });
@@ -330,7 +296,7 @@ const SimpleMetricsServer = struct {
 
             // For SSE connections, we need to handle them differently
             // We'll spawn a new thread for each connection to handle persistence
-            _ = std.Thread.spawn(.{}, handleConnection, .{ connection, self.allocator }) catch |err| {
+            _ = std.Thread.spawn(.{}, handleConnection, .{ connection, self.allocator, self.forkchoice }) catch |err| {
                 std.log.warn("Failed to spawn connection handler: {}", .{err});
                 connection.stream.close();
                 continue;
