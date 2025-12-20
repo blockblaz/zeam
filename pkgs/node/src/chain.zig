@@ -687,10 +687,10 @@ pub const BeamChain = struct {
             const node_idx = self.forkChoice.protoArray.indices.get(root);
             if (node_idx) |idx| {
                 const node = self.forkChoice.protoArray.nodes.items[idx];
-                
+
                 // Check if this root is in the canonical chain
                 const is_canonical = canonical_blocks.contains(root);
-                
+
                 if (is_canonical) {
                     // For canonical states: only prune if slot is old enough (safety window)
                     if (node.slot <= prune_before_slot) {
