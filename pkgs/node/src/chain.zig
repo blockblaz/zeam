@@ -171,18 +171,15 @@ pub const BeamChain = struct {
             // This ensures we prune even when finalization doesn't advance
             if (slot > 0 and slot % constants.STATE_PRUNING_INTERVAL_SLOTS == 0) {
                 const finalized = self.forkChoice.fcStore.latest_finalized;
-                // Prune canonical states at or before finalized slot (we keep the chain from finalized to head)
-                const prune_before_slot = finalized.slot;
 
                 var canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
                 defer canonical_blocks.deinit();
 
-                self.module_logger.info("Periodic pruning triggered at slot {d} (finalized={d}, prune_before_slot={d})", .{
+                self.module_logger.info("Periodic pruning triggered at slot {d} (finalized={d})", .{
                     slot,
                     finalized.slot,
-                    prune_before_slot,
                 });
-                _ = self.pruneNonCanonicalStates(&canonical_blocks, prune_before_slot);
+                _ = self.pruneNonCanonicalStates(&canonical_blocks);
             }
         }
         // check if log rotation is needed
@@ -662,14 +659,12 @@ pub const BeamChain = struct {
     }
 
     /// Prune old non-canonical states from memory
-    /// canonical_blocks: set of block roots that should be kept (e.g., canonical chain)
-    /// prune_before_slot: prune canonical states with slot <= this value (safety window)
-    ///                    Non-canonical states are pruned regardless of slot
-    fn pruneNonCanonicalStates(self: *Self, canonical_blocks: *std.AutoHashMap(types.Root, void), prune_before_slot: types.Slot) usize {
+    /// canonical_blocks: set of block roots that should be kept (e.g., canonical chain from finalized to head)
+    ///                    All states in canonical_blocks are kept, all others are pruned
+    fn pruneNonCanonicalStates(self: *Self, canonical_blocks: *std.AutoHashMap(types.Root, void)) usize {
         const states_count_before = self.states.count();
-        self.module_logger.info("Starting state pruning (states_count={d}, prune_before_slot={d}, canonical_blocks={d})", .{
+        self.module_logger.info("Starting state pruning (states_count={d}, canonical_blocks={d})", .{
             states_count_before,
-            prune_before_slot,
             canonical_blocks.count(),
         });
 
@@ -691,15 +686,9 @@ pub const BeamChain = struct {
                 const is_canonical = canonical_blocks.contains(root);
 
                 if (is_canonical) {
-                    // For canonical states: only prune if slot is old enough (safety window)
-                    if (node.slot <= prune_before_slot) {
-                        states_to_remove.append(root) catch continue;
-                        self.module_logger.debug("Pruning old canonical state for root 0x{s} slot={d} (prune_before_slot={d})", .{
-                            std.fmt.fmtSliceHexLower(&root),
-                            node.slot,
-                            prune_before_slot,
-                        });
-                    }
+                    // Never prune states that are in the canonical chain (from finalized to head)
+                    // These are actively needed for block production and attestation validation
+                    continue;
                 } else {
                     // For non-canonical states: prune ALL of them regardless of slot
                     // These are fork blocks that are not on the canonical chain
@@ -778,16 +767,13 @@ pub const BeamChain = struct {
         var all_canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
         defer all_canonical_blocks.deinit();
 
-        // Prune canonical states at or before the previous finalized slot
-        // We keep the canonical chain from finalized to head, so we can safely prune older canonical states
-        const prune_before_slot = previousFinalizedSlot;
-
-        self.module_logger.info("Finalization pruning triggered: finalized slot advanced from {d} to {d} (prune_before_slot={d})", .{
+        // Prune non-canonical states
+        // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
+        self.module_logger.info("Finalization pruning triggered: finalized slot advanced from {d} to {d}", .{
             previousFinalizedSlot,
             finalizedSlot,
-            prune_before_slot,
         });
-        _ = self.pruneNonCanonicalStates(&all_canonical_blocks, prune_before_slot);
+        _ = self.pruneNonCanonicalStates(&all_canonical_blocks);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
         // 4. Remove orphaned blocks from database and cleanup unfinalized indices
