@@ -169,11 +169,10 @@ pub const BeamChain = struct {
 
             // Periodic pruning: prune old non-canonical states every N slots
             // This ensures we prune even when finalization doesn't advance
-            const prune_interval: types.Slot = 8; // Prune every 8 slots
-            if (slot > 0 and slot % prune_interval == 0) {
+            if (slot > 0 and slot % constants.STATE_PRUNING_INTERVAL_SLOTS == 0) {
                 const finalized = self.forkChoice.fcStore.latest_finalized;
-                const safety_slots: types.Slot = 4;
-                const prune_before_slot = if (finalized.slot > safety_slots) finalized.slot - safety_slots else 0;
+                // Prune canonical states at or before finalized slot (we keep the chain from finalized to head)
+                const prune_before_slot = finalized.slot;
 
                 var canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
                 defer canonical_blocks.deinit();
@@ -779,13 +778,14 @@ pub const BeamChain = struct {
         var all_canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
         defer all_canonical_blocks.deinit();
 
-        // Use a safety window to avoid pruning states that might still be needed
-        const safety_slots: types.Slot = 4;
-        const prune_before_slot = @max(previousFinalizedSlot, if (finalizedSlot > safety_slots) finalizedSlot - safety_slots else 0);
+        // Prune canonical states at or before the previous finalized slot
+        // We keep the canonical chain from finalized to head, so we can safely prune older canonical states
+        const prune_before_slot = previousFinalizedSlot;
 
-        self.module_logger.info("Finalization pruning triggered: finalized slot advanced from {d} to {d}", .{
+        self.module_logger.info("Finalization pruning triggered: finalized slot advanced from {d} to {d} (prune_before_slot={d})", .{
             previousFinalizedSlot,
             finalizedSlot,
+            prune_before_slot,
         });
         _ = self.pruneNonCanonicalStates(&all_canonical_blocks, prune_before_slot);
 
