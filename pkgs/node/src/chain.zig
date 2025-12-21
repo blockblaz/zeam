@@ -309,13 +309,14 @@ pub const BeamChain = struct {
 
         const states_count = self.states.count();
 
+        self.module_logger.debug("Cached States: {d}", .{states_count});
+
         self.module_logger.info(
             \\
             \\+===============================================================+
             \\  CHAIN STATUS: Current Slot: {d} | Head Slot: {d} | Behind: {d}
             \\+---------------------------------------------------------------+
             \\  Connected Peers:    {d}
-            \\  Cached States:      {d}
             \\+---------------------------------------------------------------+
             \\  Head Block Root:    0x{any}
             \\  Parent Block Root:  0x{any}
@@ -331,7 +332,6 @@ pub const BeamChain = struct {
             fc_head.slot,
             blocks_behind,
             peer_count,
-            states_count,
             std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
             std.fmt.fmtSliceHexLower(&fc_head.parentRoot),
             std.fmt.fmtSliceHexLower(&fc_head.stateRoot),
