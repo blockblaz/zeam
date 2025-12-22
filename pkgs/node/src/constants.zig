@@ -11,4 +11,4 @@ pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
 
 // Periodic state pruning interval: prune non-canonical states every N slots
 // Set to 7200 slots (approximately 24 hours in Ethereum, assuming 12 seconds per slot)
-pub const STATE_PRUNING_INTERVAL_SLOTS: u64 = 7200;
+pub const FORKCHOICE_PRUNING_INTERVAL_SLOTS: u64 = 20;

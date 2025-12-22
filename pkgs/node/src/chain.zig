@@ -75,8 +75,8 @@ pub const BeamChain = struct {
     registered_validator_ids: []usize = &[_]usize{},
     db: database.Db,
     // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam)
-    last_emitted_justified_slot: u64 = 0,
-    last_emitted_finalized_slot: u64 = 0,
+    last_emitted_justified: types.Checkpoint,
+    last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
 
@@ -111,8 +111,8 @@ pub const BeamChain = struct {
             .stf_logger = logger_config.logger(.state_transition),
             .block_building_logger = logger_config.logger(.state_transition_block_building),
             .db = opts.db,
-            .last_emitted_justified_slot = 0,
-            .last_emitted_finalized_slot = 0,
+            .last_emitted_justified = fork_choice.fcStore.latest_justified,
+            .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
         };
@@ -169,17 +169,51 @@ pub const BeamChain = struct {
 
             // Periodic pruning: prune old non-canonical states every N slots
             // This ensures we prune even when finalization doesn't advance
-            if (slot > 0 and slot % constants.STATE_PRUNING_INTERVAL_SLOTS == 0) {
+            if (slot > 0 and slot % constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS == 0) {
                 const finalized = self.forkChoice.fcStore.latest_finalized;
+                // no need to work extra if finalization is not far behind
+                if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
+                    const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
 
-                var canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
-                defer canonical_blocks.deinit();
+                    // prune if finalization hasn't happened since a long time
+                    if (pruningAnchor.slot > finalized.slot) {
+                        self.module_logger.info("periodic pruning triggered at slot {d} (finalized={d} pruning anchor={d})", .{
+                            slot,
+                            finalized.slot,
+                            pruningAnchor.slot,
+                        });
+                        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(self.allocator, pruningAnchor.blockRoot, finalized.root);
+                        const depth_confirmed_roots = analysis_result[0];
+                        const non_finalized_descendants = analysis_result[1];
+                        const non_canonical_roots = analysis_result[2];
+                        defer self.allocator.free(depth_confirmed_roots);
+                        defer self.allocator.free(non_finalized_descendants);
+                        defer self.allocator.free(non_canonical_roots);
 
-                self.module_logger.info("Periodic pruning triggered at slot {d} (finalized={d})", .{
-                    slot,
-                    finalized.slot,
-                });
-                _ = self.pruneNonCanonicalStates(&canonical_blocks);
+                        const states_count_before = self.states.count();
+                        _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
+                        _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
+                        const pruned_count = self.states.count() - states_count_before;
+                        self.module_logger.info("pruned states={d} at slot={d} (finalized={d} pruning anchor={d})", .{
+                            //
+                            pruned_count,
+                            slot,
+                            finalized.slot,
+                            pruningAnchor.slot,
+                        });
+                    } else {
+                        self.module_logger.info("skipping periodic pruning at slot {d} since finalization not behind pruning anchor (finalized={d} pruning anchor={d})", .{
+                            slot,
+                            finalized.slot,
+                            pruningAnchor.slot,
+                        });
+                    }
+                } else {
+                    self.module_logger.info("skipping periodic pruning at current slot {d} since finalization={d} not behind", .{
+                        slot,
+                        finalized.slot,
+                    });
+                }
             }
         }
         // check if log rotation is needed
@@ -526,7 +560,7 @@ pub const BeamChain = struct {
         const latest_finalized = store.latest_finalized;
 
         // 7. Save block and state to database
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized.slot) catch |err| {
+        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized) catch |err| {
             self.module_logger.err("Failed to update block database for block root=0x{s}: {any}", .{
                 std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
                 err,
@@ -535,28 +569,28 @@ pub const BeamChain = struct {
 
         // 8. Emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
-        if (latest_justified.slot > self.last_emitted_justified_slot) {
+        if (latest_justified.slot > self.last_emitted_justified.slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.module_logger.warn("Failed to broadcast justification event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
-                self.last_emitted_justified_slot = latest_justified.slot;
+                self.last_emitted_justified = latest_justified;
             } else |err| {
                 self.module_logger.warn("Failed to create justification event: {any}", .{err});
             }
         }
 
         // Emit finalization event only when slot increases beyond last emitted
-        if (latest_finalized.slot > self.last_emitted_finalized_slot) {
+        if (latest_finalized.slot > self.last_emitted_finalized.slot) {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.module_logger.warn("Failed to broadcast finalization event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
-                self.last_emitted_finalized_slot = latest_finalized.slot;
+                self.last_emitted_finalized = latest_finalized;
             } else |err| {
                 self.module_logger.warn("Failed to create finalization event: {any}", .{err});
             }
@@ -579,7 +613,7 @@ pub const BeamChain = struct {
     }
 
     /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, finalizedSlot: types.Slot) !void {
+    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, latestFinalized: types.Checkpoint) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
@@ -606,11 +640,11 @@ pub const BeamChain = struct {
         // }
 
         // Update finalized slot indices and cleanup if finalization has advanced
-        if (finalizedSlot > self.last_emitted_finalized_slot) {
-            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized_slot, finalizedSlot) catch |err| {
+        if (latestFinalized.slot > self.last_emitted_finalized.slot) {
+            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized, latestFinalized) catch |err| {
                 self.module_logger.err("Failed to process finalization advancement from slot {d} to {d}: {any}", .{
-                    self.last_emitted_finalized_slot,
-                    finalizedSlot,
+                    self.last_emitted_finalized.slot,
+                    latestFinalized.slot,
                     err,
                 });
             };
@@ -619,161 +653,89 @@ pub const BeamChain = struct {
         self.db.commit(&batch);
     }
 
-    /// Get all canonical block roots from finalized to head (inclusive)
-    fn getCanonicalChainFromFinalizedToHead(self: *Self, allocator: Allocator) !std.AutoHashMap(types.Root, void) {
-        var canonical_blocks = std.AutoHashMap(types.Root, void).init(allocator);
-        const finalized = self.forkChoice.fcStore.latest_finalized;
-        const head = self.forkChoice.head;
-
-        // Start from head and traverse back to finalized
-        var current_root = head.blockRoot;
-        const finalized_root = finalized.root;
-
-        while (true) {
-            // Add current block to canonical set
-            try canonical_blocks.put(current_root, {});
-
-            // Stop if we've reached the finalized block
-            if (std.mem.eql(u8, &current_root, &finalized_root)) {
-                break;
-            }
-
-            // Get parent
-            const node_idx = self.forkChoice.protoArray.indices.get(current_root) orelse break;
-            const node = self.forkChoice.protoArray.nodes.items[node_idx];
-            if (node.parent) |parent_idx| {
-                const parent_node = self.forkChoice.protoArray.nodes.items[parent_idx];
-                current_root = parent_node.blockRoot;
-
-                // Safety check: if we've gone past finalized slot, something is wrong
-                if (parent_node.slot < finalized.slot) {
-                    self.module_logger.warn("Traversal went past finalized slot, stopping", .{});
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        return canonical_blocks;
-    }
-
     /// Prune old non-canonical states from memory
     /// canonical_blocks: set of block roots that should be kept (e.g., canonical chain from finalized to head)
     ///                    All states in canonical_blocks are kept, all others are pruned
-    fn pruneNonCanonicalStates(self: *Self, canonical_blocks: *std.AutoHashMap(types.Root, void)) usize {
+    fn pruneStates(self: *Self, roots: []types.Root, pruneType: []const u8) usize {
         const states_count_before = self.states.count();
-        self.module_logger.info("Starting state pruning (states_count={d}, canonical_blocks={d})", .{
+        self.module_logger.debug("pruning for {s} (states_count={d}, roots={d})", .{
+            pruneType,
             states_count_before,
-            canonical_blocks.count(),
+            roots.len,
         });
 
-        var pruned_count: usize = 0;
-        var states_to_remove = std.ArrayList(types.Root).init(self.allocator);
-        defer states_to_remove.deinit();
-
-        // Iterate through all states and identify ones to prune
-        var states_it = self.states.iterator();
-        while (states_it.next()) |entry| {
-            const root = entry.key_ptr.*;
-
-            // Find the corresponding ProtoNode to check its slot
-            const node_idx = self.forkChoice.protoArray.indices.get(root);
-            if (node_idx) |idx| {
-                const node = self.forkChoice.protoArray.nodes.items[idx];
-
-                // Check if this root is in the canonical chain
-                const is_canonical = canonical_blocks.contains(root);
-
-                if (is_canonical) {
-                    // Never prune states that are in the canonical chain (from finalized to head)
-                    // These are actively needed for block production and attestation validation
-                    continue;
-                } else {
-                    // For non-canonical states: prune ALL of them regardless of slot
-                    // These are fork blocks that are not on the canonical chain
-                    states_to_remove.append(root) catch continue;
-                    self.module_logger.debug("Pruning non-canonical state for root 0x{s} slot={d}", .{
-                        std.fmt.fmtSliceHexLower(&root),
-                        node.slot,
-                    });
-                }
-            } else {
-                // If we can't find the node in forkchoice, it's likely orphaned
-                // Prune these as they're definitely not needed
-                states_to_remove.append(root) catch continue;
-                self.module_logger.debug("Pruning orphaned state root 0x{s} (not found in forkchoice)", .{
-                    std.fmt.fmtSliceHexLower(&root),
-                });
-            }
-        }
-
+        // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
         // Actually remove and deallocate the pruned states
-        for (states_to_remove.items) |root| {
+        for (roots) |root| {
             if (self.states.fetchRemove(root)) |entry| {
                 const state_ptr = entry.value;
                 state_ptr.deinit();
                 self.allocator.destroy(state_ptr);
-                pruned_count += 1;
-                self.module_logger.debug("Pruned state for root 0x{s}", .{
+                self.module_logger.debug("pruned state for root 0x{s}", .{
                     std.fmt.fmtSliceHexLower(&root),
                 });
             }
         }
 
         const states_count_after = self.states.count();
-        self.module_logger.info("State pruning completed: removed {d} states (states: {d} -> {d})", .{
+        const pruned_count = states_count_before - states_count_after;
+        self.module_logger.debug("pruning completed for {s} removed {d} states (states: {d} -> {d})", .{
+            pruneType,
             pruned_count,
             states_count_before,
             states_count_after,
         });
-
         return pruned_count;
     }
 
     /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
-    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalizedSlot: types.Slot, finalizedSlot: types.Slot) !void {
+    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint) !void {
+        self.module_logger.info("finalization advanced from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
+
         // 1. Fetch all newly finalized roots
-        const current_finalized = self.forkChoice.fcStore.latest_finalized.root;
+        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(self.allocator, latestFinalized.root, previousFinalized.root);
+        const finalized_roots = analysis_result[0];
+        const non_finalized_descendants = analysis_result[1];
+        const non_canonical_roots = analysis_result[2];
+        defer self.allocator.free(finalized_roots);
+        defer self.allocator.free(non_finalized_descendants);
+        defer self.allocator.free(non_canonical_roots);
 
-        const newly_finalized_roots = try self.forkChoice.getAncestorsOfFinalized(self.allocator, current_finalized, previousFinalizedSlot);
-        defer self.allocator.free(newly_finalized_roots);
-
-        self.module_logger.info("Finalization advanced to slot {d}, found {d} newly finalized blocks", .{
-            finalizedSlot,
-            newly_finalized_roots.len,
+        // finalized_ancestor_roots has the previous finalized included
+        const newly_finalized_count = finalized_roots.len - 1;
+        self.module_logger.info("canonicality analysis from slot={d} to slot={d}: newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
+            previousFinalized.slot,
+            //
+            latestFinalized.slot,
+            newly_finalized_count,
+            latestFinalized.slot - previousFinalized.slot - newly_finalized_count,
+            non_finalized_descendants.len,
+            non_canonical_roots.len,
         });
 
-        var canonical_blocks = std.AutoHashMap(types.Root, void).init(self.allocator);
-        defer canonical_blocks.deinit();
-
-        for (newly_finalized_roots) |root| {
-            canonical_blocks.put(root, {}) catch {};
-        }
-
         // 2. Put all newly finalized roots in DbFinalizedSlotsNamespace
-        for (newly_finalized_roots) |root| {
+        for (finalized_roots) |root| {
             const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
             const node = self.forkChoice.protoArray.nodes.items[idx];
             batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
-            self.module_logger.debug("Added block 0x{s} at slot {d} to finalized index", .{
+            self.module_logger.debug("added block 0x{s} at slot {d} to finalized index", .{
                 std.fmt.fmtSliceHexLower(&root),
                 node.slot,
             });
         }
 
-        // 3. Prune non-canonical states from memory
+        // 3. Prunestates from memory
         // Get all canonical blocks from finalized to head (not just newly finalized)
-        var all_canonical_blocks = try self.getCanonicalChainFromFinalizedToHead(self.allocator);
-        defer all_canonical_blocks.deinit();
-
-        // Prune non-canonical states
-        // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
-        self.module_logger.info("Finalization pruning triggered: finalized slot advanced from {d} to {d}", .{
-            previousFinalizedSlot,
-            finalizedSlot,
+        const states_count_before = self.states.count();
+        // first root is the new finalized, we need to retain it and will be pruned in the next round
+        _ = self.pruneStates(finalized_roots[1..finalized_roots.len], "finalized ancestors");
+        _ = self.pruneStates(non_canonical_roots, "fimalized non canonical");
+        const pruned_count = states_count_before - self.states.count();
+        self.module_logger.info("state pruning completed (slots {d} to {d}) removed {d} states", .{
+            previousFinalized.slot,
+            latestFinalized.slot,
+            pruned_count,
         });
-        _ = self.pruneNonCanonicalStates(&all_canonical_blocks);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
         // 4. Remove orphaned blocks from database and cleanup unfinalized indices
@@ -804,10 +766,6 @@ pub const BeamChain = struct {
         //     }
         // }
 
-        self.module_logger.info("Finalization cleanup completed for slots {d} to {d}", .{
-            previousFinalizedSlot,
-            finalizedSlot,
-        });
     }
 
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
