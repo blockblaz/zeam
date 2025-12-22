@@ -256,6 +256,9 @@ pub const BeamChain = struct {
         const post_state = try self.allocator.create(types.BeamState);
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
+        var aggregation = try types.aggregateSignedAttestations(self.allocator, signed_attestations);
+        errdefer aggregation.deinit();
+
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
@@ -266,14 +269,14 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = blk: {
-                    var attestations_list = try types.Attestations.init(self.allocator);
-                    for (signed_attestations) |signed_attestation| {
-                        try attestations_list.append(signed_attestation.message);
-                    }
-                    break :blk attestations_list;
-                },
+                .attestations = aggregation.attestations,
             },
+        };
+        errdefer block.deinit();
+
+        const block_signatures = types.BlockSignatures{
+            .attestation_signatures = aggregation.attestation_signatures,
+            .proposer_signature = types.ZERO_SIGBYTES,
         };
 
         var block_json = try block.toJson(self.allocator);
@@ -311,13 +314,7 @@ pub const BeamChain = struct {
         return .{
             .block = block,
             .blockRoot = block_root,
-            .signatures = blk: {
-                var signatures_list = try types.BlockSignatures.init(self.allocator);
-                for (signed_attestations) |signed_attestation| {
-                    try signatures_list.append(signed_attestation.signature);
-                }
-                break :blk signatures_list;
-            },
+            .signatures = block_signatures,
         };
     }
 
@@ -523,7 +520,6 @@ pub const BeamChain = struct {
         const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
 
         const block = signedBlock.message.block;
-        const signatures = signedBlock.signature.constSlice();
 
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
@@ -568,30 +564,67 @@ pub const BeamChain = struct {
                 block.slot,
             });
 
-            for (block.body.attestations.constSlice(), 0..) |attestation, index| {
-                // Validate attestation before processing (from block = true)
-                self.validateAttestation(attestation, true) catch |e| {
+            const aggregated_attestations = block.body.attestations.constSlice();
+            const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
+
+            if (aggregated_attestations.len != signature_groups.len) {
+                self.module_logger.err(
+                    "signature group count mismatch for block root=0x{s}: attestations={d} signature_groups={d}",
+                    .{ std.fmt.fmtSliceHexLower(&freshFcBlock.blockRoot), aggregated_attestations.len, signature_groups.len },
+                );
+            }
+
+            for (aggregated_attestations, 0..) |aggregated_attestation, index| {
+                var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
+                defer validator_indices.deinit();
+
+                const group_signatures = if (index < signature_groups.len)
+                    signature_groups[index].constSlice()
+                else
+                    &[_]types.SIGBYTES{};
+
+                if (validator_indices.items.len != group_signatures.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    if (e == AttestationValidationError.UnknownHeadBlock) {
-                        try missing_roots.append(attestation.data.head.root);
-                    }
-
-                    self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
-                        attestation.validator_id,
-                        e,
-                    });
-                    // Skip invalid attestations but continue processing the block
+                    self.module_logger.err(
+                        "attestation signature mismatch index={d} validators={d} signatures={d}",
+                        .{ index, validator_indices.items.len, group_signatures.len },
+                    );
                     continue;
-                };
+                }
 
-                const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
+                for (validator_indices.items, group_signatures) |validator_index, signature| {
+                    const validator_id: types.ValidatorIndex = @intCast(validator_index);
+                    const attestation = types.Attestation{
+                        .validator_id = validator_id,
+                        .data = aggregated_attestation.data,
+                    };
 
-                self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
-                    continue;
-                };
-                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
+                    self.validateAttestation(attestation, true) catch |e| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        if (e == AttestationValidationError.UnknownHeadBlock) {
+                            try missing_roots.append(attestation.data.head.root);
+                        }
+
+                        self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
+                            validator_index,
+                            e,
+                        });
+                        continue;
+                    };
+
+                    const signed_attestation = types.SignedAttestation{
+                        .validator_id = validator_id,
+                        .message = attestation.data,
+                        .signature = signature,
+                    };
+
+                    self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                        continue;
+                    };
+                    zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
+                }
             }
 
             // 5. fc update head
@@ -601,10 +634,11 @@ pub const BeamChain = struct {
         };
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 6. import proposer attestation as if it was transmitted on network after block
-        const proposer_signature = signatures[block.body.attestations.len()];
+        // 6. proposer attestation
+        const proposer_signature = signedBlock.signature.proposer_signature;
         const signed_proposer_attestation = types.SignedAttestation{
-            .message = signedBlock.message.proposer_attestation,
+            .validator_id = signedBlock.message.proposer_attestation.validator_id,
+            .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
         self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
@@ -986,7 +1020,13 @@ pub const BeamChain = struct {
         const attestation = signedAttestation.message;
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
 
-        try stf.verifySingleAttestation(self.allocator, state, &attestation, &signedAttestation.signature);
+        try stf.verifySingleAttestation(
+            self.allocator,
+            state,
+            @intCast(attestation.validator_id),
+            &attestation.data,
+            &signedAttestation.signature,
+        );
 
         return self.forkChoice.onAttestation(signedAttestation, false);
     }

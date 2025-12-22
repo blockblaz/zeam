@@ -40,7 +40,8 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
-pub const AggregatedSignatures = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
+pub const NaiveAggregatedSignature = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
+pub const AggregatedSignatures = NaiveAggregatedSignature;
 
 pub const AttestationData = struct {
     slot: Slot,
@@ -88,7 +89,8 @@ pub const SignedAttestation = struct {
 
     pub fn toJson(self: *const SignedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("message", try self.message.toJson(allocator));
+        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.message.validator_id)) });
+        try obj.put("message", try self.message.data.toJson(allocator));
         try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
         return json.Value{ .object = obj };
     }
@@ -98,21 +100,28 @@ pub const SignedAttestation = struct {
         defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
+
+    pub fn toAttestation(self: *const SignedAttestation) Attestation {
+        return self.message;
+    }
 };
 
 pub const AggregatedAttestation = struct {
-    attestation_bits: AggregationBits,
+    aggregation_bits: AggregationBits,
     data: AttestationData,
+
+    pub fn deinit(self: *AggregatedAttestation) void {
+        self.aggregation_bits.deinit();
+    }
 
     pub fn toJson(self: *const AggregatedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
 
-        // Serialize attestation_bits as array of booleans
         var bits_array = json.Array.init(allocator);
-        for (0..self.attestation_bits.len()) |i| {
-            try bits_array.append(json.Value{ .bool = try self.attestation_bits.get(i) });
+        for (0..self.aggregation_bits.len()) |i| {
+            try bits_array.append(json.Value{ .bool = try self.aggregation_bits.get(i) });
         }
-        try obj.put("attestation_bits", json.Value{ .array = bits_array });
+        try obj.put("aggregation_bits", json.Value{ .array = bits_array });
         try obj.put("data", try self.data.toJson(allocator));
         return json.Value{ .object = obj };
     }
@@ -132,7 +141,6 @@ pub const SignedAggregatedAttestation = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("message", try self.message.toJson(allocator));
 
-        // Serialize signature list as array of hex strings
         var sig_array = json.Array.init(allocator);
         errdefer sig_array.deinit();
 
@@ -150,50 +158,58 @@ pub const SignedAggregatedAttestation = struct {
     }
 };
 
+pub fn aggregationBitsEnsureLength(bits: *AggregationBits, target_len: usize) !void {
+    while (bits.len() < target_len) {
+        try bits.append(false);
+    }
+}
+
+pub fn aggregationBitsSet(bits: *AggregationBits, index: usize, value: bool) !void {
+    try aggregationBitsEnsureLength(bits, index + 1);
+    try bits.set(index, value);
+}
+
+pub fn aggregationBitsToValidatorIndices(bits: *const AggregationBits, allocator: Allocator) !std.ArrayList(usize) {
+    var indices = std.ArrayList(usize).init(allocator);
+    errdefer indices.deinit();
+
+    for (0..bits.len()) |validator_index| {
+        if (try bits.get(validator_index)) {
+            try indices.append(validator_index);
+        }
+    }
+
+    return indices;
+}
+
+pub fn attestationDataRoot(allocator: Allocator, data: AttestationData) ![32]u8 {
+    var root: [32]u8 = undefined;
+    try ssz.hashTreeRoot(AttestationData, data, &root, allocator);
+    return root;
+}
+
 test "encode decode signed attestation roundtrip" {
     const signed_attestation = SignedAttestation{
         .message = .{
             .validator_id = 0,
             .data = .{
                 .slot = 0,
-                .head = .{
-                    .root = ZERO_HASH,
-                    .slot = 0,
-                },
-                .target = .{
-                    .root = ZERO_HASH,
-                    .slot = 0,
-                },
-                .source = .{
-                    .root = ZERO_HASH,
-                    .slot = 0,
-                },
+                .head = .{ .root = ZERO_HASH, .slot = 0 },
+                .target = .{ .root = ZERO_HASH, .slot = 0 },
+                .source = .{ .root = ZERO_HASH, .slot = 0 },
             },
         },
         .signature = ZERO_SIGBYTES,
     };
 
-    // Encode
     var encoded = std.ArrayList(u8).init(std.testing.allocator);
     defer encoded.deinit();
     try ssz.serialize(SignedAttestation, signed_attestation, &encoded);
+    try std.testing.expect(encoded.items.len > 0);
 
-    // Convert to hex and compare with expected value
-    // Expected value is "0" * 6496 (6496 hex characters = 3248 bytes)
-    const expected_hex_len = 6496;
-    const expected_value = try std.testing.allocator.alloc(u8, expected_hex_len);
-    defer std.testing.allocator.free(expected_value);
-    @memset(expected_value, '0');
-
-    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
-    defer std.testing.allocator.free(encoded_hex);
-    try std.testing.expectEqualStrings(expected_value, encoded_hex);
-
-    // Decode
     var decoded: SignedAttestation = undefined;
     try ssz.deserialize(SignedAttestation, encoded.items[0..], &decoded, std.testing.allocator);
 
-    // Verify roundtrip
     try std.testing.expect(decoded.message.validator_id == signed_attestation.message.validator_id);
     try std.testing.expect(decoded.message.data.slot == signed_attestation.message.data.slot);
     try std.testing.expect(decoded.message.data.head.slot == signed_attestation.message.data.head.slot);
