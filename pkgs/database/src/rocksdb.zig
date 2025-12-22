@@ -25,7 +25,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
-            logger.info("Initializing RocksDB", .{});
+            logger.info("initializing RocksDB", .{});
 
             const owned_path = try std.fmt.allocPrintZ(allocator, "{s}/rocksdb", .{path});
             errdefer allocator.free(owned_path);
@@ -41,7 +41,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime {
                 // assert that the first cn is the default column family
                 if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {
-                    @compileError("Default column namespace not found: first column namespace must be 'default'");
+                    @compileError("default column namespace not found: first column namespace must be 'default'");
                 }
             }
 
@@ -133,7 +133,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         pub fn commit(self: *Self, batch: *WriteBatch) void {
             callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner }) catch |err| {
-                self.logger.err("Failed to commit write batch: {any}", .{err});
+                self.logger.err("failed to commit write batch: {any}", .{err});
                 return;
             };
         }
@@ -206,7 +206,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer serialized_value.deinit();
 
                 ssz.serialize(T, value, &serialized_value) catch |err| {
-                    self.logger.err("Failed to serialize value for putToBatch: {any}", .{err});
+                    self.logger.err("failed to serialize value for putToBatch: {any}", .{err});
                     return;
                 };
 
@@ -222,7 +222,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 block: types.SignedBlockWithAttestation,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                    self.logger.err("Failed to format block key for putBlock: {any}", .{err});
+                    self.logger.err("failed to format block key for putBlock: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -232,7 +232,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     block,
                     cn,
-                    "Added block to batch: root=0x{s}",
+                    "added block to batch: root=0x{s}",
                     .{std.fmt.fmtSliceHexLower(&block_root)},
                 );
             }
@@ -245,7 +245,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 state: types.BeamState,
             ) void {
                 const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                    self.logger.err("Failed to format state key for putState: {any}", .{err});
+                    self.logger.err("failed to format state key for putState: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -255,7 +255,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     state,
                     cn,
-                    "Added state to batch: root=0x{s}",
+                    "added state to batch: root=0x{s}",
                     .{std.fmt.fmtSliceHexLower(&state_root)},
                 );
             }
@@ -272,7 +272,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     attestation_key,
                     attestation,
                     cn,
-                    "Added attestation to batch: key={s}",
+                    "added attestation to batch: key={s}",
                     .{attestation_key},
                 );
             }
@@ -285,7 +285,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 blockroot: types.Root,
             ) void {
                 const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                    self.logger.err("failed to format finalized slot key: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -295,7 +295,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     blockroot,
                     cn,
-                    "Added finalized slot index to batch: slot={d} root=0x{s}",
+                    "added finalized slot index to batch: slot={d} root=0x{s}",
                     .{ slot, std.fmt.fmtSliceHexLower(&blockroot) },
                 );
             }
@@ -308,7 +308,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 blockroots: []const types.Root,
             ) void {
                 const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                    self.logger.err("failed to format unfinalized slot key: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -318,7 +318,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     blockroots,
                     cn,
-                    "Added unfinalized slot index to batch: slot={d} count={d}",
+                    "added unfinalized slot index to batch: slot={d} count={d}",
                     .{ slot, blockroots.len },
                 );
             }
@@ -330,13 +330,13 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 slot: types.Slot,
             ) void {
                 const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format unfinalized slot key for deletion: {any}", .{err});
+                    self.logger.err("failed to format unfinalized slot key for deletion: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
 
                 self.delete(cn, key);
-                self.logger.debug("Deleted unfinalized slot index from batch: slot={d}", .{slot});
+                self.logger.debug("deleted unfinalized slot index from batch: slot={d}", .{slot});
             }
         };
 
@@ -419,12 +419,12 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer serialized_value.deinit();
 
             ssz.serialize(T, value, &serialized_value) catch |err| {
-                self.logger.err("Failed to serialize value for saveToDatabase: {any}", .{err});
+                self.logger.err("failed to serialize value for saveToDatabase: {any}", .{err});
                 return;
             };
 
             self.put(cn, key, serialized_value.items) catch |err| {
-                self.logger.err("Failed to put value to database in saveToDatabase: {any}", .{err});
+                self.logger.err("failed to put value to database in saveToDatabase: {any}", .{err});
                 return;
             };
             self.logger.debug(log_message, log_args);
@@ -440,7 +440,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             log_args: anytype,
         ) ?T {
             const value = self.get(cn, key) catch |err| {
-                self.logger.err("Failed to get value from database in loadFromDatabase: {any}", .{err});
+                self.logger.err("failed to get value from database in loadFromDatabase: {any}", .{err});
                 return null;
             };
             if (value) |encoded_value| {
@@ -448,7 +448,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
                 var decoded_value: T = undefined;
                 ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator) catch |err| {
-                    self.logger.err("Failed to deserialize value in loadFromDatabase: {any}", .{err});
+                    self.logger.err("failed to deserialize value in loadFromDatabase: {any}", .{err});
                     return null;
                 };
 
@@ -461,7 +461,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Save a block to the database
         pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
+                self.logger.err("failed to format block key for saveBlock: {any}", .{err});
                 return;
             };
             defer self.allocator.free(key);
@@ -471,7 +471,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 block,
                 cn,
-                "Saved block to database: root=0x{s}",
+                "saved block to database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&block_root)},
             );
         }
@@ -479,7 +479,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a block from the database
         pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
+                self.logger.err("failed to format block key for loadBlock: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -488,7 +488,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.SignedBlockWithAttestation,
                 key,
                 cn,
-                "Loaded block from database: root=0x{s}",
+                "loaded block from database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&block_root)},
             );
         }
@@ -496,7 +496,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Save a state to the database
         pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
             const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                self.logger.err("Failed to format state key for saveState: {any}", .{err});
+                self.logger.err("failed to format state key for saveState: {any}", .{err});
                 return;
             };
             defer self.allocator.free(key);
@@ -506,7 +506,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 state,
                 cn,
-                "Saved state to database: root=0x{s}",
+                "saved state to database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&state_root)},
             );
         }
@@ -514,7 +514,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a state from the database
         pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) ?types.BeamState {
             const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                self.logger.err("Failed to format state key for loadState: {any}", .{err});
+                self.logger.err("failed to format state key for loadState: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -523,7 +523,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.BeamState,
                 key,
                 cn,
-                "Loaded state from database: root=0x{s}",
+                "loaded state from database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&state_root)},
             );
         }
@@ -535,7 +535,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 attestation_key,
                 attestation,
                 cn,
-                "Saved attestation to database: key={s}",
+                "saved attestation to database: key={s}",
                 .{attestation_key},
             );
         }
@@ -546,7 +546,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.SignedAttestation,
                 attestation_key,
                 cn,
-                "Loaded attestation from database: key={s}",
+                "loaded attestation from database: key={s}",
                 .{attestation_key},
             );
         }
@@ -554,7 +554,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a finalized slot index from the database
         pub fn loadFinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?types.Root {
             const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
-                self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                self.logger.err("failed to format finalized slot key: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -563,7 +563,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.Root,
                 key,
                 cn,
-                "Loaded finalized slot index from database: slot={d}",
+                "loaded finalized slot index from database: slot={d}",
                 .{slot},
             );
         }
@@ -571,7 +571,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load an unfinalized slot index from the database
         pub fn loadUnfinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?[]types.Root {
             const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                self.logger.err("failed to format unfinalized slot key: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -580,7 +580,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 []types.Root,
                 key,
                 cn,
-                "Loaded unfinalized slot index from database: slot={d}",
+                "loaded unfinalized slot index from database: slot={d}",
                 .{slot},
             );
         }
@@ -603,7 +603,7 @@ fn callRocksDB(logger: zeam_utils.ModuleLogger, func: anytype, args: anytype) in
     var err_str: ?rocksdb.Data = null;
     return @call(.auto, func, args ++ .{&err_str}) catch |e| {
         const func_name = @typeName(@TypeOf(func));
-        logger.err("Failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
+        logger.err("failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
         return e;
     };
 }

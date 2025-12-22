@@ -153,7 +153,7 @@ pub const BeamChain = struct {
             }
         }
 
-        self.module_logger.debug("Ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
+        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} ", .{
             time_intervals,
             slot,
             interval,
@@ -548,11 +548,11 @@ pub const BeamChain = struct {
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                self.module_logger.warn("Failed to broadcast head event: {any}", .{err});
+                self.module_logger.warn("failed to broadcast head event: {any}", .{err});
                 chain_event.deinit(self.allocator);
             };
         } else |err| {
-            self.module_logger.warn("Failed to create head event: {any}", .{err});
+            self.module_logger.warn("failed to create head event: {any}", .{err});
         }
 
         const store = self.forkChoice.fcStore;
@@ -561,7 +561,7 @@ pub const BeamChain = struct {
 
         // 7. Save block and state to database
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized) catch |err| {
-            self.module_logger.err("Failed to update block database for block root=0x{s}: {any}", .{
+            self.module_logger.err("failed to update block database for block root=0x{s}: {any}", .{
                 std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
                 err,
             });
@@ -573,12 +573,12 @@ pub const BeamChain = struct {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("Failed to broadcast justification event: {any}", .{err});
+                    self.module_logger.warn("failed to broadcast justification event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_justified = latest_justified;
             } else |err| {
-                self.module_logger.warn("Failed to create justification event: {any}", .{err});
+                self.module_logger.warn("failed to create justification event: {any}", .{err});
             }
         }
 
@@ -587,12 +587,12 @@ pub const BeamChain = struct {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("Failed to broadcast finalization event: {any}", .{err});
+                    self.module_logger.warn("failed to broadcast finalization event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_finalized = latest_finalized;
             } else |err| {
-                self.module_logger.warn("Failed to create finalization event: {any}", .{err});
+                self.module_logger.warn("failed to create finalization event: {any}", .{err});
             }
         }
 
@@ -690,7 +690,7 @@ pub const BeamChain = struct {
 
     /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
     fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint) !void {
-        self.module_logger.info("finalization advanced from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
+        self.module_logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
 
         // 1. Fetch all newly finalized roots
         const analysis_result = try self.forkChoice.getCanonicalityAnalysis(self.allocator, latestFinalized.root, previousFinalized.root);
@@ -703,7 +703,7 @@ pub const BeamChain = struct {
 
         // finalized_ancestor_roots has the previous finalized included
         const newly_finalized_count = finalized_roots.len - 1;
-        self.module_logger.info("canonicality analysis from slot={d} to slot={d}: newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
+        self.module_logger.info("finalization canonicality analysis from slot={d} to slot={d}: newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
             previousFinalized.slot,
             //
             latestFinalized.slot,
@@ -729,7 +729,7 @@ pub const BeamChain = struct {
         const states_count_before = self.states.count();
         // first root is the new finalized, we need to retain it and will be pruned in the next round
         _ = self.pruneStates(finalized_roots[1..finalized_roots.len], "finalized ancestors");
-        _ = self.pruneStates(non_canonical_roots, "fimalized non canonical");
+        _ = self.pruneStates(non_canonical_roots, "finalized non canonical");
         const pruned_count = states_count_before - self.states.count();
         self.module_logger.info("state pruning completed (slots {d} to {d}) removed {d} states", .{
             previousFinalized.slot,
@@ -766,6 +766,7 @@ pub const BeamChain = struct {
         //     }
         // }
 
+        self.module_logger.debug("finalization advanced from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
@@ -796,21 +797,21 @@ pub const BeamChain = struct {
 
         // 1. Validate that source, target, and head blocks exist in proto array
         const source_idx = self.forkChoice.protoArray.indices.get(data.source.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown source block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown source block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.source.root),
             });
             return AttestationValidationError.UnknownSourceBlock;
         };
 
         const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown target block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
         const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown head block root=0x{s}", .{
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
@@ -823,7 +824,7 @@ pub const BeamChain = struct {
 
         // 2. Validate slot relationships
         if (source_block.slot > target_block.slot) {
-            self.module_logger.debug("Attestation validation failed: source slot {d} > target slot {d}", .{
+            self.module_logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
                 source_block.slot,
                 target_block.slot,
             });
@@ -832,7 +833,7 @@ pub const BeamChain = struct {
 
         //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
         if (data.source.slot > data.target.slot) {
-            self.module_logger.debug("Attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
+            self.module_logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
                 data.source.slot,
                 data.target.slot,
             });
@@ -841,7 +842,7 @@ pub const BeamChain = struct {
 
         // 3. Validate checkpoint slots match block slots
         if (source_block.slot != data.source.slot) {
-            self.module_logger.debug("Attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
+            self.module_logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
                 source_block.slot,
                 data.source.slot,
             });
@@ -850,7 +851,7 @@ pub const BeamChain = struct {
 
         //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
         if (target_block.slot != data.target.slot) {
-            self.module_logger.debug("Attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
+            self.module_logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
                 target_block.slot,
                 data.target.slot,
             });
@@ -869,14 +870,14 @@ pub const BeamChain = struct {
             current_slot; // Gossip attestations: no future slots allowed
 
         if (data.slot > max_allowed_slot) {
-            self.module_logger.debug("Attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
+            self.module_logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
                 data.slot,
                 max_allowed_slot,
                 is_from_block,
             });
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-        self.module_logger.debug("Attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
+        self.module_logger.debug("attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
             attestation.validator_id,
             data.slot,
             data.source.slot,
