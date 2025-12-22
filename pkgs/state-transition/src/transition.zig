@@ -62,39 +62,50 @@ pub fn verifySignatures(
     signed_block: *const types.SignedBlockWithAttestation,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
-    const signatures = signed_block.signature.constSlice();
+    const signature_groups = signed_block.signature.attestation_signatures.constSlice();
 
-    // Must have exactly one signature per attestation plus one for proposer
-    if (attestations.len + 1 != signatures.len) {
+    if (attestations.len != signature_groups.len) {
         return StateTransitionError.InvalidBlockSignatures;
     }
 
-    // Verify all body attestations
-    for (attestations, 0..) |attestation, i| {
-        try verifySingleAttestation(
-            allocator,
-            state,
-            &attestation,
-            &signatures[i],
-        );
+    for (attestations, 0..) |aggregated_attestation, i| {
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+        defer validator_indices.deinit();
+
+        const signatures = signature_groups[i].constSlice();
+        if (validator_indices.items.len != signatures.len) {
+            return StateTransitionError.InvalidBlockSignatures;
+        }
+
+        for (validator_indices.items, signatures) |validator_index, signature| {
+            try verifySingleAttestation(
+                allocator,
+                state,
+                validator_index,
+                &aggregated_attestation.data,
+                &signature,
+            );
+        }
     }
 
-    // Verify proposer attestation (last signature in the list)
+    const proposer_attestation = signed_block.message.proposer_attestation;
     try verifySingleAttestation(
         allocator,
         state,
-        &signed_block.message.proposer_attestation,
-        &signatures[signatures.len - 1],
+        @intCast(proposer_attestation.validator_id),
+        &proposer_attestation.data,
+        &signed_block.signature.proposer_signature,
     );
 }
 
 pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,
-    attestation: *const types.Attestation,
+    validator_index: usize,
+    attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
 ) !void {
-    const validatorIndex: usize = @intCast(attestation.validator_id);
+    const validatorIndex = validator_index;
     const validators = state.validators.constSlice();
     if (validatorIndex >= validators.len) {
         return StateTransitionError.InvalidValidatorId;
@@ -105,9 +116,9 @@ pub fn verifySingleAttestation(
 
     const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
     var message: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
+    try ssz.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
 
-    const epoch: u32 = @intCast(attestation.data.slot);
+    const epoch: u32 = @intCast(attestation_data.slot);
 
     try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
     _ = verification_timer.observe();
