@@ -173,11 +173,12 @@ pub const BeamChain = struct {
                 const finalized = self.forkChoice.fcStore.latest_finalized;
                 // no need to work extra if finalization is not far behind
                 if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
+                    self.module_logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
                     const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
 
                     // prune if finalization hasn't happened since a long time
                     if (pruningAnchor.slot > finalized.slot) {
-                        self.module_logger.info("periodic pruning triggered at slot {d} (finalized={d} pruning anchor={d})", .{
+                        self.module_logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
                             slot,
                             finalized.slot,
                             pruningAnchor.slot,
@@ -190,11 +191,11 @@ pub const BeamChain = struct {
                         defer self.allocator.free(non_finalized_descendants);
                         defer self.allocator.free(non_canonical_roots);
 
-                        const states_count_before = self.states.count();
+                        const states_count_before: isize = self.states.count();
                         _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
                         _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
-                        const pruned_count = self.states.count() - states_count_before;
-                        self.module_logger.info("pruned states={d} at slot={d} (finalized={d} pruning anchor={d})", .{
+                        const pruned_count = states_count_before - self.states.count();
+                        self.module_logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
                             //
                             pruned_count,
                             slot,
@@ -202,14 +203,14 @@ pub const BeamChain = struct {
                             pruningAnchor.slot,
                         });
                     } else {
-                        self.module_logger.info("skipping periodic pruning at slot {d} since finalization not behind pruning anchor (finalized={d} pruning anchor={d})", .{
+                        self.module_logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
                             slot,
                             finalized.slot,
                             pruningAnchor.slot,
                         });
                     }
                 } else {
-                    self.module_logger.info("skipping periodic pruning at current slot {d} since finalization={d} not behind", .{
+                    self.module_logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
                         slot,
                         finalized.slot,
                     });
@@ -703,7 +704,7 @@ pub const BeamChain = struct {
 
         // finalized_ancestor_roots has the previous finalized included
         const newly_finalized_count = finalized_roots.len - 1;
-        self.module_logger.info("finalization canonicality analysis from slot={d} to slot={d}: newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
+        self.module_logger.info("finalization canonicality analysis (previousFinalized slot={d} to latestFinalized slot={d}): newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
             previousFinalized.slot,
             //
             latestFinalized.slot,
@@ -726,12 +727,12 @@ pub const BeamChain = struct {
 
         // 3. Prunestates from memory
         // Get all canonical blocks from finalized to head (not just newly finalized)
-        const states_count_before = self.states.count();
+        const states_count_before: isize = self.states.count();
         // first root is the new finalized, we need to retain it and will be pruned in the next round
         _ = self.pruneStates(finalized_roots[1..finalized_roots.len], "finalized ancestors");
         _ = self.pruneStates(non_canonical_roots, "finalized non canonical");
         const pruned_count = states_count_before - self.states.count();
-        self.module_logger.info("state pruning completed (slots {d} to {d}) removed {d} states", .{
+        self.module_logger.info("state pruning completed (slots latestFinalized={d} to latestFinalized={d}) removed {d} states", .{
             previousFinalized.slot,
             latestFinalized.slot,
             pruned_count,
@@ -766,7 +767,7 @@ pub const BeamChain = struct {
         //     }
         // }
 
-        self.module_logger.debug("finalization advanced from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
+        self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
