@@ -48,6 +48,7 @@ pub const ChainOpts = struct {
 pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
     blockRoot: ?types.Root = null,
+    pruneForkchoice: bool = true,
 };
 
 pub const ProducedBlock = struct {
@@ -561,7 +562,7 @@ pub const BeamChain = struct {
         const latest_finalized = store.latest_finalized;
 
         // 7. Save block and state to database
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized) catch |err| {
+        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot, latest_finalized, blockInfo.pruneForkchoice) catch |err| {
             self.module_logger.err("failed to update block database for block root=0x{s}: {any}", .{
                 std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
                 err,
@@ -614,7 +615,7 @@ pub const BeamChain = struct {
     }
 
     /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, latestFinalized: types.Checkpoint) !void {
+    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot, latestFinalized: types.Checkpoint, pruneForkchoice: bool) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
@@ -642,7 +643,7 @@ pub const BeamChain = struct {
 
         // Update finalized slot indices and cleanup if finalization has advanced
         if (latestFinalized.slot > self.last_emitted_finalized.slot) {
-            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized, latestFinalized) catch |err| {
+            self.processFinalizationAdvancement(&batch, self.last_emitted_finalized, latestFinalized, pruneForkchoice) catch |err| {
                 self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
                     self.last_emitted_finalized.slot,
                     latestFinalized.slot,
@@ -690,7 +691,7 @@ pub const BeamChain = struct {
     }
 
     /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
-    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint) !void {
+    fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint, pruneForkchoice: bool) !void {
         self.module_logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
 
         // 1. Do canonoical analysis to segment forkchoice
@@ -772,7 +773,8 @@ pub const BeamChain = struct {
         // }
 
         // 5 Rebase forkchouce
-        try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+        if (pruneForkchoice)
+            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
 
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
@@ -993,7 +995,7 @@ test "process and add mock blocks into a node's chain" {
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
         allocator.free(missing_roots);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
