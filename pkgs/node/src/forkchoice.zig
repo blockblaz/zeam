@@ -314,27 +314,15 @@ pub const ForkChoice = struct {
         return false;
     }
 
-    /// Get all ancestor block roots from the current finalized block,
-    /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
-    /// Stops traversal when previousFinalizedSlot is reached or at genesis.
-    pub fn getCanonicalityAnalysis(self: *Self, allocator: Allocator, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) ![3][]types.Root {
-        var canonical_roots = std.ArrayList(types.Root).init(allocator);
-        var potential_canonical_roots = std.ArrayList(types.Root).init(allocator);
-        var non_canonical_roots = std.ArrayList(types.Root).init(allocator);
-
-        // get some info about previous and target anchors
+    pub fn getCanonicalView(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
         const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
         const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
-        const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
 
         // first get all canonical blocks till previous anchors
-        var canonical_blocks = std.AutoHashMap(types.Root, void).init(allocator);
-        defer canonical_blocks.deinit();
-
         var current_idx = target_anchor_idx;
         while (current_idx >= prev_anchor_idx) {
             const current_node = self.protoArray.nodes.items[current_idx];
-            try canonical_blocks.put(current_node.blockRoot, {});
+            try canonical_view.put(current_node.blockRoot, {});
 
             if (current_idx != prev_anchor_idx) {
                 current_idx = current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal;
@@ -353,15 +341,36 @@ pub const ForkChoice = struct {
             // if the parent of this node is already in the canonical_blocks, this is a potential canonical block
             const current_node = self.protoArray.nodes.items[current_idx];
             const parent_node = self.protoArray.nodes.items[current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal];
-            if (canonical_blocks.contains(parent_node.blockRoot)) {
-                try canonical_blocks.put(current_node.blockRoot, {});
+            if (canonical_view.contains(parent_node.blockRoot)) {
+                try canonical_view.put(current_node.blockRoot, {});
             }
             current_idx += 1;
         }
+    }
+
+    /// Get all ancestor block roots from the current finalized block,
+    /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
+    /// Stops traversal when previousFinalizedSlot is reached or at genesis.
+    pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
+        var canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+        var potential_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+        var non_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+
+        // get some info about previous and target anchors
+        const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
+        const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
+        const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
+
+        // get all canonical view of the chain finalized and unfinalized anchored at the targetAnchorRoot
+        var canonical_blocks = canonicalViewOrNull orelse blk: {
+            var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
+            try self.getCanonicalView(&local_view, targetAnchorRoot, prevAnchorRootOrNull);
+            break :blk &local_view;
+        };
 
         // now we can split forkchoice into 3 parts (excluding target anchor)
         // traversing all the way from the bottom to the prev_anchor_idx
-        current_idx = self.protoArray.nodes.items.len - 1;
+        var current_idx = self.protoArray.nodes.items.len - 1;
         while (current_idx >= prev_anchor_idx) {
             const current_node = self.protoArray.nodes.items[current_idx];
             if (canonical_blocks.contains(current_node.blockRoot)) {
@@ -397,7 +406,130 @@ pub const ForkChoice = struct {
             try potential_canonical_roots.toOwnedSlice(),
             try non_canonical_roots.toOwnedSlice(),
         };
+
+        // only way to conditionally deinit locally allocated map created in a orelse block scope
+        if (canonicalViewOrNull == null) {
+            canonical_blocks.deinit();
+        }
         return result;
+    }
+
+    pub fn rebase(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
+        const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
+        const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
+
+        var canonical_view = canonicalViewOrNull orelse blk: {
+            var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
+            try self.getCanonicalView(&local_view, targetAnchorRoot, null);
+            break :blk &local_view;
+        };
+
+        // prune, intetesting thing to note is the entire subtree of targetAnchorRoot is not affected and is to be
+        // preserved as it is, because nothing from there is getting pruned
+        var shifted_left: usize = 0;
+        var old_indices_to_new = std.AutoHashMap(usize, usize).init(self.allocator);
+        defer old_indices_to_new.deinit();
+
+        var current_idx: usize = 0;
+        while (current_idx < self.protoArray.nodes.items.len) {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            // we preserve the tree all the way down from the target anchor and its unfinalized potential canonical descendants
+            if (canonical_view.contains(current_node.blockRoot) and current_node.slot >= target_anchor_slot) {
+                try self.protoArray.indices.put(current_node.blockRoot, current_idx);
+                try old_indices_to_new.put((current_idx + shifted_left), current_idx);
+
+                // go to the next node
+                current_idx += 1;
+            } else {
+                // remove the node and continue back to the loop with updating current idx
+                // because after removal next node would be refered at the same current idx
+                _ = self.protoArray.nodes.orderedRemove(current_idx);
+                // don't need order preserving on deltas as they are always set to zero before their use
+                _ = self.deltas.swapRemove(current_idx);
+                _ = self.protoArray.indices.remove(current_node.blockRoot);
+                shifted_left += 1;
+            }
+        }
+
+        // correct parent, bestchild and best decendant indices using the created old to new map
+        current_idx = 0;
+        while (current_idx < self.protoArray.nodes.items.len) {
+            // fix parent
+            var current_node = self.protoArray.nodes.items[current_idx];
+            if (current_idx == 0) {
+                current_node.parent = null;
+            } else {
+                // all other nodes should have parents, otherwise its an irrecoverable error as we have already
+                // modified forkchoice and can't be restored
+                const old_parent_idx = current_node.parent orelse @panic("invalid parent of the rebased unfinalized");
+                const new_parent_idx = old_indices_to_new.get(old_parent_idx);
+                current_node.parent = new_parent_idx;
+            }
+
+            // fix bestchild and descendant
+            if (current_node.bestChild) |old_best_child_idx| {
+                // we should be able to lookup new index otherwise its an irrecoverable error
+                const new_best_child_idx = old_indices_to_new.get(old_best_child_idx) orelse @panic("invalid old index lookup for rebased best child");
+                current_node.bestChild = new_best_child_idx;
+
+                // best descendant should always be there when there is a best child
+                const old_best_descendant_idx = current_node.bestDescendant orelse @panic("invalid forkchoice with null best descendant for a non null best child");
+                // we should be able to lookup new index otherwise its an irrecoverable error
+                const new_best_descendant_idx = old_indices_to_new.get(old_best_descendant_idx) orelse @panic("invalid old index loopkup for rebase best descendant");
+                current_node.bestDescendant = new_best_descendant_idx;
+            } else {
+                // confirm best descandant is also null
+                if (current_node.bestDescendant != null) {
+                    @panic("invalid forkchoice with non null best descendant but with null best child");
+                }
+            }
+            self.protoArray.nodes.items[current_idx] = current_node;
+            current_idx += 1;
+        }
+
+        // confirm the first entry in forkchoice is the target anchor
+        if (!std.mem.eql(u8, &self.protoArray.nodes.items[0].blockRoot, &targetAnchorRoot)) {
+            @panic("invalid forkchoice rebasing with forkchoice base not matching target anchor");
+        }
+
+        // cleanup the vote tracker and remove all the entries which are not in canonical
+        var iterator = self.attestations.iterator();
+        while (iterator.next()) |entry| {
+            // fix applied index
+            if (entry.value_ptr.appliedIndex) |applied_index| {
+                const new_index_lookup = old_indices_to_new.get(applied_index);
+                // this simple assignmet suffices both for cases where new index is found i.e. is canonical
+                // or not, in which case it needs to point to null
+                entry.value_ptr.appliedIndex = new_index_lookup;
+            }
+
+            // fix latestknown
+            if (entry.value_ptr.latestKnown) |*latest_known| {
+                const new_index_lookup = old_indices_to_new.get(latest_known.index);
+                // if we find the index then update it else change it to null as it was non canonical
+                if (new_index_lookup) |new_index| {
+                    latest_known.index = new_index;
+                } else {
+                    entry.value_ptr.latestKnown = null;
+                }
+            }
+
+            // fix latestNew
+            if (entry.value_ptr.latestNew) |*latest_new| {
+                const new_index_lookup = old_indices_to_new.get(latest_new.index);
+                // if we find the index then update it else change it to null as it was non canonical
+                if (new_index_lookup) |new_index| {
+                    latest_new.index = new_index;
+                } else {
+                    entry.value_ptr.latestNew = null;
+                }
+            }
+        }
+
+        if (canonicalViewOrNull == null) {
+            canonical_view.deinit();
+        }
+        return;
     }
 
     pub fn getCanonicalAncestorAtDepth(self: *Self, min_depth: usize) !ProtoBlock {

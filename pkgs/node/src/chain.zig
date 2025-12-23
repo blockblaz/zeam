@@ -183,7 +183,7 @@ pub const BeamChain = struct {
                             finalized.slot,
                             pruningAnchor.slot,
                         });
-                        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(self.allocator, pruningAnchor.blockRoot, finalized.root);
+                        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(pruningAnchor.blockRoot, finalized.root, null);
                         const depth_confirmed_roots = analysis_result[0];
                         const non_finalized_descendants = analysis_result[1];
                         const non_canonical_roots = analysis_result[2];
@@ -343,9 +343,9 @@ pub const BeamChain = struct {
         const is_timely = fc_head.timeliness;
 
         const states_count = self.states.count();
+        const fc_nodes_count = self.forkChoice.protoArray.nodes.items.len;
 
-        self.module_logger.debug("Cached States: {d}", .{states_count});
-
+        self.module_logger.debug("cached states={d}, forkchoice nodes={d}", .{ states_count, fc_nodes_count });
         self.module_logger.info(
             \\
             \\+===============================================================+
@@ -643,7 +643,7 @@ pub const BeamChain = struct {
         // Update finalized slot indices and cleanup if finalization has advanced
         if (latestFinalized.slot > self.last_emitted_finalized.slot) {
             self.processFinalizationAdvancement(&batch, self.last_emitted_finalized, latestFinalized) catch |err| {
-                self.module_logger.err("Failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
                     self.last_emitted_finalized.slot,
                     latestFinalized.slot,
                     err,
@@ -693,8 +693,12 @@ pub const BeamChain = struct {
     fn processFinalizationAdvancement(self: *Self, batch: *database.Db.WriteBatch, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint) !void {
         self.module_logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
 
-        // 1. Fetch all newly finalized roots
-        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(self.allocator, latestFinalized.root, previousFinalized.root);
+        // 1. Do canonoical analysis to segment forkchoice
+        var canonical_view = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer canonical_view.deinit();
+        try self.forkChoice.getCanonicalView(&canonical_view, latestFinalized.root, null);
+        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(latestFinalized.root, null, &canonical_view);
+
         const finalized_roots = analysis_result[0];
         const non_finalized_descendants = analysis_result[1];
         const non_canonical_roots = analysis_result[2];
@@ -766,6 +770,9 @@ pub const BeamChain = struct {
         //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
         //     }
         // }
+
+        // 5 Rebase forkchouce
+        try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
 
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
