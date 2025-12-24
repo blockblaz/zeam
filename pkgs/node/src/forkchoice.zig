@@ -64,6 +64,7 @@ pub const ProtoArray = struct {
             .parentRoot = block.parentRoot,
             .stateRoot = block.stateRoot,
             .timeliness = block.timeliness,
+            .confirmed = block.confirmed,
             .parent = parent,
             .weight = 0,
             .bestChild = null,
@@ -79,24 +80,6 @@ pub const ProtoArray = struct {
         if (block_index) |blkidx| {
             const node = self.nodes.items[blkidx];
             return node;
-        } else {
-            return null;
-        }
-    }
-
-    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
-        const nodeOrNull = self.getNode(blockRoot);
-        if (nodeOrNull) |node| {
-            // TODO cast doesn't seem to be working find resolution
-            // const block = utils.Cast(ProtoBlock, node);
-            const block = ProtoBlock{
-                .slot = node.slot,
-                .blockRoot = node.blockRoot,
-                .parentRoot = node.parentRoot,
-                .stateRoot = node.stateRoot,
-                .timeliness = node.timeliness,
-            };
-            return block;
         } else {
             return null;
         }
@@ -171,6 +154,7 @@ const OnBlockOpts = struct {
     currentSlot: types.Slot,
     blockDelayMs: u64,
     blockRoot: ?types.Root = null,
+    confirmed: bool = false,
 };
 
 pub const ForkChoiceStore = struct {
@@ -254,6 +238,7 @@ pub const ForkChoice = struct {
             .parentRoot = anchor_block_header.parent_root,
             .stateRoot = anchor_block_header.state_root,
             .timeliness = true,
+            .confirmed = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
@@ -778,7 +763,7 @@ pub const ForkChoice = struct {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
-        const parent_block_or_null = self.protoArray.getBlock(parent_root);
+        const parent_block_or_null = self.getBlock(parent_root);
         if (parent_block_or_null) |parent_block| {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
@@ -794,10 +779,12 @@ pub const ForkChoice = struct {
                 return ForkChoiceError.NotFinalizedDesendant;
             }
 
-            // update the checkpoints
-            const justified = state.latest_justified;
-            const finalized = state.latest_finalized;
-            self.fcStore.update(justified, finalized);
+            // update the checkpoints if the block is confirmed
+            if (opts.confirmed) {
+                const justified = state.latest_justified;
+                const finalized = state.latest_finalized;
+                self.fcStore.update(justified, finalized);
+            }
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
@@ -812,6 +799,7 @@ pub const ForkChoice = struct {
                 .parentRoot = parent_root,
                 .stateRoot = block.state_root,
                 .timeliness = is_timely,
+                .confirmed = opts.confirmed,
             };
 
             try self.protoArray.onBlock(proto_block, opts.currentSlot);
@@ -821,13 +809,44 @@ pub const ForkChoice = struct {
         }
     }
 
+    pub fn confirmBlock(self: *Self, blockRoot: types.Root, state: *const types.BeamState) !void {
+        if (self.protoArray.indices.get(blockRoot)) |block_idx| {
+            self.protoArray.nodes.items[block_idx].confirmed = true;
+            const justified = state.latest_justified;
+            const finalized = state.latest_finalized;
+            self.fcStore.update(justified, finalized);
+        } else {
+            return ForkChoiceError.InvalidForkchoiceBlock;
+        }
+    }
+
     pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
-        const block_or_null = self.protoArray.getBlock(blockRoot);
-        if (block_or_null) |_| {
-            return true;
+        const block_or_null = self.getBlock(blockRoot);
+        // we can only say we have the block if its fully confirmed to be imported
+        if (block_or_null) |block| {
+            return (block.confirmed == true);
         }
 
         return false;
+    }
+
+    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
+        const nodeOrNull = self.protoArray.getNode(blockRoot);
+        if (nodeOrNull) |node| {
+            // TODO cast doesn't seem to be working find resolution
+            // const block = utils.Cast(ProtoBlock, node);
+            const block = ProtoBlock{
+                .slot = node.slot,
+                .blockRoot = node.blockRoot,
+                .parentRoot = node.parentRoot,
+                .stateRoot = node.stateRoot,
+                .timeliness = node.timeliness,
+                .confirmed = node.confirmed,
+            };
+            return block;
+        } else {
+            return null;
+        }
     }
 };
 
@@ -848,6 +867,7 @@ const ForkChoiceError = error{
     InvalidAnchor,
     InvalidTargetAnchor,
     InvalidCanonicalTraversal,
+    InvalidForkchoiceBlock,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added

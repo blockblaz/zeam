@@ -282,6 +282,11 @@ pub const ProtoBlock = struct {
     parentRoot: Root,
     stateRoot: Root,
     timeliness: bool,
+    // the protoblock entry might get added even at produce block even before validator signs it
+    // which is when we would not even have persisted the signed block, so we need to track this
+    // and make sure we persit the signed block before publishing and voting on it, and especially
+    // in voting. also this needs to be handled in pruning
+    confirmed: bool,
 
     pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);

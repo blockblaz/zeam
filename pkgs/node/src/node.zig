@@ -111,8 +111,21 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .block => |signed_block| {
-                const parent_root = signed_block.message.block.parent_root;
-                if (!self.chain.forkChoice.hasBlock(parent_root)) {
+                const block = signed_block.message.block;
+                const parent_root = block.parent_root;
+                const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
+
+                self.logger.info("received gossip block for slot={any} parent_root={any} proposer={d}{} hasParentBlock={any} from peer={s}{}", .{
+                    block.slot,
+                    std.fmt.fmtSliceHexLower(&parent_root),
+                    block.proposer_index,
+                    self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+                    hasParentBlock,
+                    sender_peer_id,
+                    self.node_registry.getNodeNameFromPeerId(sender_peer_id),
+                });
+
+                if (!hasParentBlock) {
                     const roots = [_]types.Root{parent_root};
                     self.fetchBlockByRoots(&roots) catch |err| {
                         self.logger.warn("failed to fetch block by root: {any}", .{err});
@@ -126,7 +139,20 @@ pub const BeamNode = struct {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                 }
             },
-            .attestation => {},
+            .attestation => |signed_attestation| {
+                const slot = signed_attestation.message.data.slot;
+                const validator_id = signed_attestation.message.validator_id;
+                const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
+
+                const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+                self.logger.info("received gossip attestation for slot={d} validator={d}{} from peer={s}{}", .{
+                    slot,
+                    validator_id,
+                    validator_node_name,
+                    sender_peer_id,
+                    sender_node_name,
+                });
+            },
         }
 
         try self.chain.onGossip(data, sender_peer_id);
@@ -479,25 +505,16 @@ pub const BeamNode = struct {
     }
 
     pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
-        // 1. publish gossip message
-        const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.network.publish(&gossip_msg);
-
         const block = signed_block.message.block;
-        self.logger.info("published block to network: slot={d} proposer={d}{}", .{
-            block.slot,
-            block.proposer_index,
-            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
-        });
 
-        // 2. Process locally through chain
+        // 1. Process locally through chain so that produced block first can be confirmed
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (!hasBlock) {
-            self.logger.info("seems like block was not locally produced, adding to the chain: slot={d} proposer={d}", .{
+            self.logger.info("adding produced signed block to the chain: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
@@ -512,28 +529,45 @@ pub const BeamNode = struct {
                 self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else {
-            self.logger.debug("skip adding produced block to chain as already present: slot={d} proposer={d}", .{
+            self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
         }
+
+        // 2. publish gossip message
+        const gossip_msg = networks.GossipMessage{ .block = signed_block };
+        try self.network.publish(&gossip_msg);
+        self.logger.info("published block to network: slot={d} proposer={d}{}", .{
+            block.slot,
+            block.proposer_index,
+            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+        });
+
+        // 3. followup with additional housekeeping tasks
+        self.chain.onBlockFollowup(true);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        // 1. publish gossip message
+        const message = signed_attestation.message;
+        const data = message.data;
+
+        // 1. Process locally through chain
+        self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
+            data.slot,
+            message.validator_id,
+        });
+        try self.chain.onAttestation(signed_attestation);
+
+        // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        const message = signed_attestation.message;
-        const data = message.data;
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
             message.validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
         });
-
-        // 2. Process locally through chain
-        return self.chain.onAttestation(signed_attestation);
     }
 
     pub fn run(self: *Self) !void {
