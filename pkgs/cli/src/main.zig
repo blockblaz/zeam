@@ -80,7 +80,7 @@ const ZeamArgs = struct {
     log_filename: []const u8 = "consensus", // Default logger filename
     log_file_active_level: std.log.Level = .debug, //default log file ActiveLevel
     monocolor_file_log: bool = false, //dont log colors in log files
-    console_log_level: std.log.Level = .info, //default console log level
+    console_log_level: std.log.Level = .debug, //default console log level
     help: bool = false,
     version: bool = false,
 

@@ -154,7 +154,7 @@ const OnBlockOpts = struct {
     currentSlot: types.Slot,
     blockDelayMs: u64,
     blockRoot: ?types.Root = null,
-    confirmed: bool = false,
+    confirmed: bool,
 };
 
 pub const ForkChoiceStore = struct {
@@ -779,12 +779,9 @@ pub const ForkChoice = struct {
                 return ForkChoiceError.NotFinalizedDesendant;
             }
 
-            // update the checkpoints if the block is confirmed
-            if (opts.confirmed) {
-                const justified = state.latest_justified;
-                const finalized = state.latest_finalized;
-                self.fcStore.update(justified, finalized);
-            }
+            const justified = state.latest_justified;
+            const finalized = state.latest_finalized;
+            self.fcStore.update(justified, finalized);
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
@@ -809,12 +806,9 @@ pub const ForkChoice = struct {
         }
     }
 
-    pub fn confirmBlock(self: *Self, blockRoot: types.Root, state: *const types.BeamState) !void {
+    pub fn confirmBlock(self: *Self, blockRoot: types.Root) !void {
         if (self.protoArray.indices.get(blockRoot)) |block_idx| {
             self.protoArray.nodes.items[block_idx].confirmed = true;
-            const justified = state.latest_justified;
-            const finalized = state.latest_finalized;
-            self.fcStore.update(justified, finalized);
         } else {
             return ForkChoiceError.InvalidForkchoiceBlock;
         }
@@ -913,10 +907,10 @@ test "forkchoice block tree" {
 
         // shouldn't accept a future slot
         const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
 
         try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
+        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
 

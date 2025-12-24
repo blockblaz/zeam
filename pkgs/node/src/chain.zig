@@ -298,6 +298,8 @@ pub const BeamChain = struct {
             .currentSlot = block.slot,
             .blockDelayMs = 0,
             .blockRoot = block_root,
+            // confirmed in publish
+            .confirmed = false,
         });
 
         return .{
@@ -518,6 +520,8 @@ pub const BeamChain = struct {
                 .currentSlot = block.slot,
                 .blockDelayMs = 0,
                 .blockRoot = block_root,
+                // confirmed in next steps post written to db
+                .confirmed = false,
             });
 
             // 4. fc onattestations
@@ -578,7 +582,7 @@ pub const BeamChain = struct {
                 err,
             });
         };
-        try self.forkChoice.confirmBlock(block_root, post_state);
+        try self.forkChoice.confirmBlock(block_root);
 
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
             std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
