@@ -301,6 +301,7 @@ pub const BeamChain = struct {
             // confirmed in publish
             .confirmed = false,
         });
+        _ = try self.forkChoice.updateHead();
 
         return .{
             .block = block,
