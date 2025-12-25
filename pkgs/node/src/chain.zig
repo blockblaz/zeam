@@ -325,7 +325,28 @@ pub const BeamChain = struct {
             .root = head_proto.blockRoot,
             .slot = head_proto.slot,
         };
+        const head_str = try head.toJsonString(self.allocator);
+        defer self.allocator.free(head_str);
+
+        const safe_target_proto = self.forkChoice.safeTarget;
+        const safe_target: types.Checkpoint = .{
+            .root = safe_target_proto.blockRoot,
+            .slot = safe_target_proto.slot,
+        };
+        const safe_target_str = try safe_target.toJsonString(self.allocator);
+        defer self.allocator.free(safe_target_str);
+
+        self.module_logger.info("constructing attestation data at slot={d} with chain head={s} safe_target={s}", .{
+            slot,
+            head_str,
+            safe_target_str,
+        });
+
         const target = try self.forkChoice.getAttestationTarget();
+        const target_str = try target.toJsonString(self.allocator);
+        defer self.allocator.free(target_str);
+
+        self.module_logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
 
         const attestation_data = types.AttestationData{
             .slot = slot,
