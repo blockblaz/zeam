@@ -269,6 +269,9 @@ pub const BeamState = struct {
     }
 
     pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+        const block_timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
+        defer _ = block_timer.observe();
+
         // start block processing
         try self.process_block_header(allocator, staged_block, logger);
         // PQ devner-0 has no execution

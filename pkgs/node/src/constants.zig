@@ -16,3 +16,7 @@ pub const MAX_BLOCK_FETCH_DEPTH = 64;
 // Maximum number of blocks to keep in the fetched blocks cache
 // This prevents unbounded memory growth from malicious peers sending orphaned blocks
 pub const MAX_CACHED_BLOCKS = 1024;
+
+// Periodic state pruning interval: prune non-canonical states every N slots
+// Set to 7200 slots (approximately 8 hours in Lean, assuming 4 seconds per slot)
+pub const FORKCHOICE_PRUNING_INTERVAL_SLOTS: u64 = 7200;
