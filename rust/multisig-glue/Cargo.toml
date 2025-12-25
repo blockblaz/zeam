@@ -1,0 +1,14 @@
+[package]
+name = "multisig-glue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lean-multisig = { git = "https://github.com/leanEthereum/leanMultisig", rev = "d756c081a87b25ae1786528d62d9f380f7d99890" }
+# xmss is a workspace member of lean-multisig, imported separately to access WotsSignature
+# which is not re-exported at the lean-multisig crate root
+xmss = { git = "https://github.com/leanEthereum/leanMultisig", rev = "d756c081a87b25ae1786528d62d9f380f7d99890" }
+
+[lib]
+crate-type = ["staticlib"]
+name = "multisig_glue"
