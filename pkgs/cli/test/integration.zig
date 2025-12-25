@@ -496,8 +496,9 @@ test "SSE events integration test - wait for justification and finalization" {
     var got_justification = false;
     var got_finalization = false;
 
+    var current_ns = std.time.nanoTimestamp();
     // FIXED: This loop now works correctly with the improved readEvent() function
-    while (std.time.nanoTimestamp() < deadline_ns and !(got_justification and got_finalization)) {
+    while (current_ns < deadline_ns and !(got_justification and got_finalization)) {
         const event = try sse_client.readEvent();
         if (event) |e| {
             // Check for justification with slot > 0
@@ -526,6 +527,19 @@ test "SSE events integration test - wait for justification and finalization" {
             // IMPORTANT: Free the event memory after processing
             e.deinit(allocator);
         }
+
+        current_ns = std.time.nanoTimestamp();
+        std.debug.print("CURRENT TIME:{d} DEADLINE={d} START={d} PASSED={d} TIMEOUT={d} (in ms)\n", .{
+            @divTrunc(current_ns, std.time.ns_per_ms),
+            @divTrunc(deadline_ns, std.time.ns_per_ms),
+            @divTrunc(start_ns, std.time.ns_per_ms),
+            @divTrunc(current_ns - start_ns, std.time.ns_per_ms),
+            timeout_ms,
+        });
+        std.debug.print("STATUS: got_justification={any} got_finalization={any}\n", .{
+            got_justification,
+            got_finalization,
+        });
     }
 
     // Check if we received connection event
