@@ -16,6 +16,18 @@ const zkvm_targets: []const zkvmTarget = &.{
 
 const ProverChoice = enum { dummy, risc0, openvm, all };
 
+fn setTestRunLabel(b: *Builder, run_step: *std.Build.Step.Run, name: []const u8) void {
+    run_step.step.name = b.fmt("test {s}", .{name});
+}
+
+fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compile_step: *std.Build.Step.Compile) void {
+    const source_name = if (compile_step.root_module.root_source_file) |root_source|
+        root_source.getDisplayName()
+    else
+        compile_step.step.name;
+    setTestRunLabel(b, run_step, source_name);
+}
+
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
@@ -418,6 +430,7 @@ pub fn build(b: *Builder) !void {
     });
     types_tests.root_module.addImport("ssz", ssz);
     const run_types_test = b.addRunArtifact(types_tests);
+    setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
 
     const transition_tests = b.addTest(.{
@@ -432,6 +445,7 @@ pub fn build(b: *Builder) !void {
     transition_tests.root_module.addImport("@zeam/metrics", zeam_metrics);
     transition_tests.root_module.addImport("ssz", ssz);
     const run_transition_test = b.addRunArtifact(transition_tests);
+    setTestRunLabelFromCompile(b, run_transition_test, transition_tests);
     test_step.dependOn(&run_transition_test.step);
 
     const manager_tests = b.addTest(.{
@@ -442,6 +456,7 @@ pub fn build(b: *Builder) !void {
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
     addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
+    setTestRunLabelFromCompile(b, run_manager_test, manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
     const node_tests = b.addTest(.{
@@ -451,6 +466,7 @@ pub fn build(b: *Builder) !void {
     });
     addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
+    setTestRunLabelFromCompile(b, run_node_test, node_tests);
     test_step.dependOn(&run_node_test.step);
 
     const cli_tests = b.addTest(.{
@@ -462,6 +478,7 @@ pub fn build(b: *Builder) !void {
     cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
+    setTestRunLabelFromCompile(b, run_cli_test, cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
     const params_tests = b.addTest(.{
@@ -470,6 +487,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_params_tests = b.addRunArtifact(params_tests);
+    setTestRunLabelFromCompile(b, run_params_tests, params_tests);
     test_step.dependOn(&run_params_tests.step);
 
     const network_tests = b.addTest(.{
@@ -482,6 +500,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("ssz", ssz);
     addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
+    setTestRunLabelFromCompile(b, run_network_tests, network_tests);
     test_step.dependOn(&run_network_tests.step);
 
     const configs_tests = b.addTest(.{
@@ -496,6 +515,7 @@ pub fn build(b: *Builder) !void {
     configs_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, configs_tests, target, prover);
     const run_configs_tests = b.addRunArtifact(configs_tests);
+    setTestRunLabelFromCompile(b, run_configs_tests, configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
     const utils_tests = b.addTest(.{
@@ -504,6 +524,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
+    setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
     test_step.dependOn(&run_utils_tests.step);
 
     const database_tests = b.addTest(.{
@@ -512,6 +533,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_database_tests = b.addRunArtifact(database_tests);
+    setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
     const xmss_tests = b.addTest(.{
@@ -524,6 +546,7 @@ pub fn build(b: *Builder) !void {
     xmss_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_tests, target, prover);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
     const spectests = b.addTest(.{
@@ -553,6 +576,7 @@ pub fn build(b: *Builder) !void {
     });
     tools_cli_tests.root_module.addImport("enr", enr);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    setTestRunLabelFromCompile(b, run_tools_cli_test, tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
     test_step.dependOn(tools_test_step);
@@ -560,6 +584,7 @@ pub fn build(b: *Builder) !void {
     // Create simtest step that runs only integration tests
     const simtests = b.step("simtest", "Run integration tests");
     const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
+    setTestRunLabelFromCompile(b, run_cli_integration_test, cli_integration_tests);
     simtests.dependOn(&run_cli_integration_test.step);
 
     // Create spectest step that runs spec tests
