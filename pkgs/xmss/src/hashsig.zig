@@ -106,6 +106,15 @@ extern fn hashsig_verify_ssz(
     signature_len: usize,
 ) i32;
 
+/// Convert signature JSON (proposerSignature object) into SSZ bytes.
+/// Returns number of bytes written, or 0 on error.
+extern fn hashsig_signature_ssz_from_json(
+    signature_json_ptr: [*]const u8,
+    signature_json_len: usize,
+    out_ptr: [*]u8,
+    out_len: usize,
+) usize;
+
 pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 
 /// Verify signature using SSZ-encoded bytes
@@ -134,6 +143,21 @@ pub fn verifySsz(
         -1 => return HashSigError.InvalidSignature,
         else => return HashSigError.VerificationFailed,
     }
+}
+
+/// Fill `out` with SSZ signature bytes parsed from a signature JSON object.
+pub fn signatureSszFromJson(signature_json: []const u8, out: []u8) HashSigError!usize {
+    const written = hashsig_signature_ssz_from_json(
+        signature_json.ptr,
+        signature_json.len,
+        out.ptr,
+        out.len,
+    );
+
+    if (written == 0) {
+        return HashSigError.DeserializationFailed;
+    }
+    return written;
 }
 
 /// Wrapper for the hash signature key pair

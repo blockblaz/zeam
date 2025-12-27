@@ -42,6 +42,8 @@ pub fn baseRelRoot(comptime spec_fork: Fork) []const u8 {
 
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
+const ssz = @import("ssz");
+const xmss = @import("@zeam/xmss");
 
 // Signature structure constants from leansig
 // path: 8 siblings, each is 8 u32 = 256 bytes
@@ -200,6 +202,38 @@ fn runCase(
     // Determine if we expect failure based on test name/path
     const expect_failure = std.mem.indexOf(u8, ctx.fixture_label, "invalid") != null or
         std.mem.indexOf(u8, ctx.case_name, "invalid") != null;
+
+    // Debug: print signature info
+    const sig = &signed_block.signature.proposer_signature;
+    std.debug.print("fixture {s}: signature first 32 bytes: {x}\n", .{ ctx.fixture_label, sig[0..32].* });
+    std.debug.print("fixture {s}: signature last 32 bytes: {x}\n", .{ ctx.fixture_label, sig[sig.len - 32 ..].* });
+
+    // Debug: print proposer attestation data and computed message hash
+    const proposer_att = signed_block.message.proposer_attestation;
+    std.debug.print("fixture {s}: proposer_attestation.validator_id: {d}\n", .{ ctx.fixture_label, proposer_att.validator_id });
+    std.debug.print("fixture {s}: proposer_attestation.data.slot: {d}\n", .{ ctx.fixture_label, proposer_att.data.slot });
+    std.debug.print("fixture {s}: proposer_attestation.data.head.root: {x}\n", .{ ctx.fixture_label, proposer_att.data.head.root });
+    std.debug.print("fixture {s}: proposer_attestation.data.head.slot: {d}\n", .{ ctx.fixture_label, proposer_att.data.head.slot });
+
+    // Compute message hash for debugging
+    var debug_message: [32]u8 = undefined;
+    ssz.hashTreeRoot(types.AttestationData, proposer_att.data, &debug_message, allocator) catch |err| {
+        std.debug.print("fixture {s}: hashTreeRoot failed: {s}\n", .{ ctx.fixture_label, @errorName(err) });
+    };
+    std.debug.print("fixture {s}: computed message hash: {x}\n", .{ ctx.fixture_label, debug_message });
+
+    // Debug: print pubkey
+    const validators = anchor_state.validators.constSlice();
+    if (proposer_att.validator_id < validators.len) {
+        const pubkey = validators[proposer_att.validator_id].getPubkey();
+        std.debug.print("fixture {s}: pubkey first 20 bytes: {x}\n", .{ ctx.fixture_label, pubkey[0..20].* });
+        std.debug.print("fixture {s}: pubkey all 52 bytes: {x}\n", .{ ctx.fixture_label, pubkey[0..52].* });
+    }
+
+    // Debug: print signature details  
+    std.debug.print("fixture {s}: sig offset_path (bytes 0-3): {x}\n", .{ ctx.fixture_label, sig[0..4].* });
+    std.debug.print("fixture {s}: sig rho (bytes 4-31): {x}\n", .{ ctx.fixture_label, sig[4..32].* });
+    std.debug.print("fixture {s}: sig offset_hashes (bytes 32-35): {x}\n", .{ ctx.fixture_label, sig[32..36].* });
 
     // Verify signatures
     const verify_result = state_transition.verifySignatures(allocator, &anchor_state, &signed_block);
@@ -469,115 +503,42 @@ fn parseSignature(
     obj: std.json.ObjectMap,
     field_name: []const u8,
 ) FixtureError!types.SIGBYTES {
-    const sig_obj = try expect.expectObject(FixtureError, obj, &.{field_name}, ctx, field_name);
+    const sig_value = obj.get(field_name) orelse {
+        std.debug.print(
+            "fixture {s} case {s}: missing field {s}\n",
+            .{ ctx.fixture_label, ctx.case_name, field_name },
+        );
+        return FixtureError.InvalidFixture;
+    };
 
-    // SSZ Container serialization for Signature:
-    // Signature = Container(path: HashTreeOpening, rho: Randomness, hashes: HashDigestList)
-    //
-    // Fixed part (36 bytes):
-    //   - offset_path: 4 bytes (offset to path data)
-    //   - rho_data: 28 bytes (7 Fp values, each 4 bytes - fixed size Vector)
-    //   - offset_hashes: 4 bytes (offset to hashes data)
-    //
-    // Variable part:
-    //   - path data (HashTreeOpening serialized)
-    //   - hashes data (HashDigestList serialized)
-    //
-    // HashTreeOpening = Container(siblings: HashDigestList)
-    // Fixed part: 4 bytes (offset to siblings data)
-    // Variable part: siblings data
-    //
-    // HashDigestList = List[HashDigestVector, NODE_LIST_LIMIT]
-    // HashDigestVector = Vector[Fp, 8] = 32 bytes (8 * 4 bytes each)
-    // Since HashDigestVector is fixed size, the list is serialized as:
-    //   - concatenated fixed-size items (no offsets needed)
+    // Re-serialize just the signature object and let Rust parse/SSZ-encode it.
+    var json_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer json_buf.deinit();
+
+    std.json.stringify(sig_value, .{}, json_buf.writer()) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}: failed to stringify signature JSON: {s}\n",
+            .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
 
     var sig_bytes: types.SIGBYTES = std.mem.zeroes(types.SIGBYTES);
+    const written = xmss.signatureSszFromJson(json_buf.items, sig_bytes[0..]) catch {
+        std.debug.print(
+            "fixture {s} case {s}: Rust JSON→SSZ conversion failed\n",
+            .{ ctx.fixture_label, ctx.case_name },
+        );
+        return FixtureError.InvalidFixture;
+    };
 
-    // Parse path siblings
-    const path_obj = try expect.expectObject(FixtureError, sig_obj, &.{"path"}, ctx, "path");
-    const siblings_obj = try expect.expectObject(FixtureError, path_obj, &.{"siblings"}, ctx, "path.siblings");
-    const siblings_data = try expect.expectArrayField(FixtureError, siblings_obj, &.{"data"}, ctx, "path.siblings.data");
-
-    // Parse rho (fixed size: 7 * 4 = 28 bytes)
-    const rho_obj = try expect.expectObject(FixtureError, sig_obj, &.{"rho"}, ctx, "rho");
-    const rho_arr = try parseU32Array7(ctx, rho_obj, "rho.data");
-
-    // Parse hashes
-    const hashes_obj = try expect.expectObject(FixtureError, sig_obj, &.{"hashes"}, ctx, "hashes");
-    const hashes_data = try expect.expectArrayField(FixtureError, hashes_obj, &.{"data"}, ctx, "hashes.data");
-
-    // Calculate sizes for SSZ serialization
-    const num_siblings = siblings_data.items.len;
-    const num_hashes = hashes_data.items.len;
-
-    // Each HashDigestVector = 8 Fp * 4 bytes = 32 bytes
-    const sibling_size: usize = 8 * 4; // 32 bytes per sibling
-    const hash_size: usize = 8 * 4; // 32 bytes per hash
-
-    // HashTreeOpening SSZ:
-    // Fixed part: 4 bytes (offset to siblings)
-    // Variable part: siblings data (concatenated HashDigestVectors)
-    const path_fixed_part: usize = 4;
-    const path_variable_size = num_siblings * sibling_size;
-    const path_total_size = path_fixed_part + path_variable_size;
-
-    // HashDigestList SSZ (for hashes): just concatenated fixed-size items
-    const hashes_size = num_hashes * hash_size;
-
-    // Signature fixed part: offset_path (4) + rho (28) + offset_hashes (4) = 36 bytes
-    const sig_fixed_part: usize = 36;
-
-    // Calculate offsets
-    const offset_path: u32 = @intCast(sig_fixed_part); // path starts after fixed part
-    const offset_hashes: u32 = @intCast(sig_fixed_part + path_total_size); // hashes start after path
-
-    var write_pos: usize = 0;
-
-    // Write Signature fixed part:
-    // 1. offset_path (4 bytes)
-    std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], offset_path, .little);
-    write_pos += 4;
-
-    // 2. rho data (28 bytes - fixed size)
-    for (rho_arr) |val| {
-        std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], val, .little);
-        write_pos += 4;
+    if (written > sig_bytes.len) {
+        std.debug.print(
+            "fixture {s} case {s}: Rust JSON→SSZ wrote {d} bytes, max {d}\n",
+            .{ ctx.fixture_label, ctx.case_name, written, sig_bytes.len },
+        );
+        return FixtureError.InvalidFixture;
     }
-
-    // 3. offset_hashes (4 bytes)
-    std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], offset_hashes, .little);
-    write_pos += 4;
-
-    // Now write_pos should be at sig_fixed_part (36)
-
-    // Write path (HashTreeOpening):
-    // Fixed part: offset to siblings (4 bytes, pointing to byte 4 within path)
-    const path_siblings_offset: u32 = 4; // siblings data starts at offset 4 within HashTreeOpening
-    std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], path_siblings_offset, .little);
-    write_pos += 4;
-
-    // Variable part: siblings data
-    for (siblings_data.items) |sibling_val| {
-        const sibling_obj = try expect.expectObjectValue(FixtureError, sibling_val, ctx, "sibling");
-        const u32_arr = try parseU32Array8(ctx, sibling_obj, "sibling.data");
-        for (u32_arr) |val| {
-            std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], val, .little);
-            write_pos += 4;
-        }
-    }
-
-    // Write hashes (HashDigestList - just concatenated items since they're fixed size)
-    for (hashes_data.items) |hash_val| {
-        const hash_obj = try expect.expectObjectValue(FixtureError, hash_val, ctx, "hash");
-        const u32_arr = try parseU32Array8(ctx, hash_obj, "hash.data");
-        for (u32_arr) |val| {
-            std.mem.writeInt(u32, sig_bytes[write_pos..][0..4], val, .little);
-            write_pos += 4;
-        }
-    }
-
-    _ = hashes_size; // Used in offset_hashes calculation
 
     return sig_bytes;
 }
