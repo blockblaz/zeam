@@ -2048,18 +2048,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethereum_ssz_derive"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d247bc40823c365a62e572441a8f8b12df03f171713f06bc76180fcd56ab71"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2659,7 +2647,11 @@ name = "hashsig-glue"
 version = "0.1.0"
 dependencies = [
  "ethereum_ssz",
- "leansig 0.1.0 (git+https://github.com/leanEthereum/leanSig?rev=f10dcbefac2502d356d93f686e8b4ecd8dc8840a)",
+ "hex",
+ "leansig 0.1.0 (git+https://github.com/leanEthereum/leanSig?rev=b621826f948ffc133dd893131aac2c7efa7f90e0)",
+ "p3-field 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
+ "p3-koala-bear 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
+ "p3-symmetric 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "serde",
@@ -3364,11 +3356,10 @@ dependencies = [
 [[package]]
 name = "leansig"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanSig?rev=f10dcbefac2502d356d93f686e8b4ecd8dc8840a#f10dcbefac2502d356d93f686e8b4ecd8dc8840a"
+source = "git+https://github.com/leanEthereum/leanSig?rev=b621826f948ffc133dd893131aac2c7efa7f90e0#b621826f948ffc133dd893131aac2c7efa7f90e0"
 dependencies = [
  "dashmap",
  "ethereum_ssz",
- "ethereum_ssz_derive",
  "num-bigint 0.4.6",
  "num-traits",
  "p3-baby-bear 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
