@@ -186,8 +186,10 @@ pub const BeamState = struct {
         // this completes latest block header for parentRoot checks of new block
 
         if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
+            const slot_timer = zeam_metrics.lean_state_transition_state_root_in_slot_time_seconds.start();
             var prev_state_root: [32]u8 = undefined;
             try ssz.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            _ = slot_timer.observe();
             self.latest_block_header.state_root = prev_state_root;
         }
     }
@@ -237,8 +239,10 @@ pub const BeamState = struct {
         }
 
         // 4. verify latest block header is the parent
+        const header_timer = zeam_metrics.lean_state_transition_block_header_hash_time_seconds.start();
         var head_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        _ = header_timer.observe();
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
             logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
@@ -313,7 +317,9 @@ pub const BeamState = struct {
             justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
+        const get_just_timer = zeam_metrics.lean_state_transition_get_justification_time_seconds.start();
         try self.getJustification(allocator, &justifications);
+        _ = get_just_timer.observe();
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -427,7 +433,9 @@ pub const BeamState = struct {
             }
         }
 
+        const with_just_timer = zeam_metrics.lean_state_transition_with_justifications_time_seconds.start();
         try self.withJustifications(allocator, &justifications);
+        _ = with_just_timer.observe();
 
         logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
         const justified_str_final = try self.latest_justified.toJsonString(allocator);

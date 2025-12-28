@@ -135,8 +135,10 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
     const validateResult = opts.validateResult;
     if (validateResult) {
         // verify the post state root
+        const validation_timer = zeam_metrics.lean_state_transition_state_root_validation_time_seconds.start();
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
+        _ = validation_timer.observe();
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
             opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;

@@ -56,6 +56,12 @@ const Metrics = struct {
     lean_fork_choice_applydeltas_time_seconds: ForkChoiceApplyDeltasHistogram,
     lean_chain_signature_verification_time_seconds: ChainSignatureVerificationHistogram,
     lean_chain_proposer_attestation_time_seconds: ChainProposerAttestationHistogram,
+    // State transition internal metrics
+    lean_state_transition_state_root_validation_time_seconds: StateRootValidationHistogram,
+    lean_state_transition_state_root_in_slot_time_seconds: StateRootInSlotHistogram,
+    lean_state_transition_block_header_hash_time_seconds: BlockHeaderHashHistogram,
+    lean_state_transition_get_justification_time_seconds: GetJustificationHistogram,
+    lean_state_transition_with_justifications_time_seconds: WithJustificationsHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -75,6 +81,12 @@ const Metrics = struct {
     const ForkChoiceApplyDeltasHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const ChainSignatureVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 });
     const ChainProposerAttestationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    // State transition internal histogram types
+    const StateRootValidationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 });
+    const StateRootInSlotHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const BlockHeaderHashHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const GetJustificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const WithJustificationsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const LeanHeadSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestJustifiedSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestFinalizedSlotGauge = metrics_lib.Gauge(u64);
@@ -255,6 +267,36 @@ fn observeChainProposerAttestation(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeStateRootValidation(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.StateRootValidationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeStateRootInSlot(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.StateRootInSlotHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeBlockHeaderHash(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockHeaderHashHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeGetJustification(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.GetJustificationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeWithJustifications(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.WithJustificationsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -335,6 +377,26 @@ pub var lean_chain_proposer_attestation_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeChainProposerAttestation,
 };
+pub var lean_state_transition_state_root_validation_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeStateRootValidation,
+};
+pub var lean_state_transition_state_root_in_slot_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeStateRootInSlot,
+};
+pub var lean_state_transition_block_header_hash_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeBlockHeaderHash,
+};
+pub var lean_state_transition_get_justification_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeGetJustification,
+};
+pub var lean_state_transition_with_justifications_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeWithJustifications,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -375,6 +437,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_fork_choice_applydeltas_time_seconds = Metrics.ForkChoiceApplyDeltasHistogram.init("lean_fork_choice_applydeltas_time_seconds", .{ .help = "Weight delta propagation and best descendant updates." }, .{}),
         .lean_chain_signature_verification_time_seconds = Metrics.ChainSignatureVerificationHistogram.init("lean_chain_signature_verification_time_seconds", .{ .help = "XMSS signature verification for block attestations." }, .{}),
         .lean_chain_proposer_attestation_time_seconds = Metrics.ChainProposerAttestationHistogram.init("lean_chain_proposer_attestation_time_seconds", .{ .help = "Proposer attestation processing." }, .{}),
+        .lean_state_transition_state_root_validation_time_seconds = Metrics.StateRootValidationHistogram.init("lean_state_transition_state_root_validation_time_seconds", .{ .help = "State root validation in apply_transition." }, .{}),
+        .lean_state_transition_state_root_in_slot_time_seconds = Metrics.StateRootInSlotHistogram.init("lean_state_transition_state_root_in_slot_time_seconds", .{ .help = "State root computation in process_slot." }, .{}),
+        .lean_state_transition_block_header_hash_time_seconds = Metrics.BlockHeaderHashHistogram.init("lean_state_transition_block_header_hash_time_seconds", .{ .help = "Block header hash in process_block_header." }, .{}),
+        .lean_state_transition_get_justification_time_seconds = Metrics.GetJustificationHistogram.init("lean_state_transition_get_justification_time_seconds", .{ .help = "Justifications HashMap creation from state." }, .{}),
+        .lean_state_transition_with_justifications_time_seconds = Metrics.WithJustificationsHistogram.init("lean_state_transition_with_justifications_time_seconds", .{ .help = "State update with justifications HashMap." }, .{}),
     };
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
@@ -397,6 +464,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_fork_choice_applydeltas_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_applydeltas_time_seconds);
     lean_chain_signature_verification_time_seconds.context = @ptrCast(&metrics.lean_chain_signature_verification_time_seconds);
     lean_chain_proposer_attestation_time_seconds.context = @ptrCast(&metrics.lean_chain_proposer_attestation_time_seconds);
+    lean_state_transition_state_root_validation_time_seconds.context = @ptrCast(&metrics.lean_state_transition_state_root_validation_time_seconds);
+    lean_state_transition_state_root_in_slot_time_seconds.context = @ptrCast(&metrics.lean_state_transition_state_root_in_slot_time_seconds);
+    lean_state_transition_block_header_hash_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_header_hash_time_seconds);
+    lean_state_transition_get_justification_time_seconds.context = @ptrCast(&metrics.lean_state_transition_get_justification_time_seconds);
+    lean_state_transition_with_justifications_time_seconds.context = @ptrCast(&metrics.lean_state_transition_with_justifications_time_seconds);
 
     g_initialized = true;
 }
