@@ -86,6 +86,9 @@ pub const ProtoArray = struct {
     }
 
     pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
+        const applydeltas_timer = zeam_metrics.lean_fork_choice_applydeltas_time_seconds.start();
+        defer _ = applydeltas_timer.observe();
+
         if (deltas.len != self.nodes.items.len) {
             return ForkChoiceError.InvalidDeltas;
         }
@@ -639,6 +642,9 @@ pub const ForkChoice = struct {
     }
 
     pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+        const computedeltas_timer = zeam_metrics.lean_fork_choice_computedeltas_time_seconds.start();
+        defer _ = computedeltas_timer.observe();
+
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
             try self.deltas.append(0);

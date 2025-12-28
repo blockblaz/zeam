@@ -46,6 +46,16 @@ const Metrics = struct {
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
     lean_pq_signature_attestation_signing_time_seconds: PQSignatureSigningHistogram,
     lean_pq_signature_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
+    // Granular metrics for block processing breakdown
+    lean_fork_choice_updatehead_time_seconds: ForkChoiceUpdateHeadHistogram,
+    lean_chain_database_write_time_seconds: ChainDatabaseWriteHistogram,
+    lean_chain_attestation_loop_time_seconds: ChainAttestationLoopHistogram,
+    lean_chain_state_clone_time_seconds: ChainStateCloneHistogram,
+    lean_chain_onblockfollowup_time_seconds: ChainOnBlockFollowupHistogram,
+    lean_fork_choice_computedeltas_time_seconds: ForkChoiceComputeDeltasHistogram,
+    lean_fork_choice_applydeltas_time_seconds: ForkChoiceApplyDeltasHistogram,
+    lean_chain_signature_verification_time_seconds: ChainSignatureVerificationHistogram,
+    lean_chain_proposer_attestation_time_seconds: ChainProposerAttestationHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -55,6 +65,16 @@ const Metrics = struct {
     const AttestationsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const PQSignatureSigningHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const PQSignatureVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    // Granular histogram types
+    const ForkChoiceUpdateHeadHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1 });
+    const ChainDatabaseWriteHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1 });
+    const ChainAttestationLoopHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const ChainStateCloneHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const ChainOnBlockFollowupHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1 });
+    const ForkChoiceComputeDeltasHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const ForkChoiceApplyDeltasHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const ChainSignatureVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 });
+    const ChainProposerAttestationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const LeanHeadSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestJustifiedSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestFinalizedSlotGauge = metrics_lib.Gauge(u64);
@@ -181,6 +201,60 @@ fn observePQSignatureAttestationVerification(ctx: ?*anyopaque, value: f32) void 
     histogram.observe(value);
 }
 
+fn observeForkChoiceUpdateHead(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ForkChoiceUpdateHeadHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainDatabaseWrite(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainDatabaseWriteHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainAttestationLoop(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainAttestationLoopHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainStateClone(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainStateCloneHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainOnBlockFollowup(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainOnBlockFollowupHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeForkChoiceComputeDeltas(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ForkChoiceComputeDeltasHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeForkChoiceApplyDeltas(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ForkChoiceApplyDeltasHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainSignatureVerification(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainSignatureVerificationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeChainProposerAttestation(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ChainProposerAttestationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -225,6 +299,43 @@ pub var lean_pq_signature_attestation_verification_time_seconds: Histogram = .{
     .observe = &observePQSignatureAttestationVerification,
 };
 
+pub var lean_fork_choice_updatehead_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeForkChoiceUpdateHead,
+};
+pub var lean_chain_database_write_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainDatabaseWrite,
+};
+pub var lean_chain_attestation_loop_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainAttestationLoop,
+};
+pub var lean_chain_state_clone_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainStateClone,
+};
+pub var lean_chain_onblockfollowup_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnBlockFollowup,
+};
+pub var lean_fork_choice_computedeltas_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeForkChoiceComputeDeltas,
+};
+pub var lean_fork_choice_applydeltas_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeForkChoiceApplyDeltas,
+};
+pub var lean_chain_signature_verification_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainSignatureVerification,
+};
+pub var lean_chain_proposer_attestation_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainProposerAttestation,
+};
+
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
     if (g_initialized) return;
@@ -255,6 +366,15 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
         .lean_pq_signature_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_signature_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
         .lean_pq_signature_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_signature_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
+        .lean_fork_choice_updatehead_time_seconds = Metrics.ForkChoiceUpdateHeadHistogram.init("lean_fork_choice_updatehead_time_seconds", .{ .help = "Fork choice head computation." }, .{}),
+        .lean_chain_database_write_time_seconds = Metrics.ChainDatabaseWriteHistogram.init("lean_chain_database_write_time_seconds", .{ .help = "Block and state database writes." }, .{}),
+        .lean_chain_attestation_loop_time_seconds = Metrics.ChainAttestationLoopHistogram.init("lean_chain_attestation_loop_time_seconds", .{ .help = "Attestation validation in block processing." }, .{}),
+        .lean_chain_state_clone_time_seconds = Metrics.ChainStateCloneHistogram.init("lean_chain_state_clone_time_seconds", .{ .help = "SSZ state cloning." }, .{}),
+        .lean_chain_onblockfollowup_time_seconds = Metrics.ChainOnBlockFollowupHistogram.init("lean_chain_onblockfollowup_time_seconds", .{ .help = "Event emission and finalization checks." }, .{}),
+        .lean_fork_choice_computedeltas_time_seconds = Metrics.ForkChoiceComputeDeltasHistogram.init("lean_fork_choice_computedeltas_time_seconds", .{ .help = "Validator weight delta computation." }, .{}),
+        .lean_fork_choice_applydeltas_time_seconds = Metrics.ForkChoiceApplyDeltasHistogram.init("lean_fork_choice_applydeltas_time_seconds", .{ .help = "Weight delta propagation and best descendant updates." }, .{}),
+        .lean_chain_signature_verification_time_seconds = Metrics.ChainSignatureVerificationHistogram.init("lean_chain_signature_verification_time_seconds", .{ .help = "XMSS signature verification for block attestations." }, .{}),
+        .lean_chain_proposer_attestation_time_seconds = Metrics.ChainProposerAttestationHistogram.init("lean_chain_proposer_attestation_time_seconds", .{ .help = "Proposer attestation processing." }, .{}),
     };
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
@@ -268,6 +388,15 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_attestation_validation_time_seconds.context = @ptrCast(&metrics.lean_attestation_validation_time_seconds);
     lean_pq_signature_attestation_signing_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_signing_time_seconds);
     lean_pq_signature_attestation_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_verification_time_seconds);
+    lean_fork_choice_updatehead_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_updatehead_time_seconds);
+    lean_chain_database_write_time_seconds.context = @ptrCast(&metrics.lean_chain_database_write_time_seconds);
+    lean_chain_attestation_loop_time_seconds.context = @ptrCast(&metrics.lean_chain_attestation_loop_time_seconds);
+    lean_chain_state_clone_time_seconds.context = @ptrCast(&metrics.lean_chain_state_clone_time_seconds);
+    lean_chain_onblockfollowup_time_seconds.context = @ptrCast(&metrics.lean_chain_onblockfollowup_time_seconds);
+    lean_fork_choice_computedeltas_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_computedeltas_time_seconds);
+    lean_fork_choice_applydeltas_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_applydeltas_time_seconds);
+    lean_chain_signature_verification_time_seconds.context = @ptrCast(&metrics.lean_chain_signature_verification_time_seconds);
+    lean_chain_proposer_attestation_time_seconds.context = @ptrCast(&metrics.lean_chain_proposer_attestation_time_seconds);
 
     g_initialized = true;
 }
