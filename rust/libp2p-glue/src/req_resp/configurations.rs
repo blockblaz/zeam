@@ -8,6 +8,9 @@ pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 /// Timeout applied to reading requests and responses from a substream.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Idle timeout for server-side response streams.
+pub const RESPONSE_CHANNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 pub fn max_message_size() -> usize {
     MAX_MESSAGE_SIZE
 }
