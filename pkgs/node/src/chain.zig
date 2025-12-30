@@ -458,7 +458,8 @@ pub const BeamChain = struct {
                     };
                     // followup with additional housekeeping tasks
                     self.onBlockFollowup(true);
-                    defer self.allocator.free(missing_roots);
+                    // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
+                    // which is responsible for freeing it after optionally fetching those roots.
 
                     // Return both the block root and missing attestation roots so the node can:
                     // 1. Call processCachedDescendants(block_root) to retry any cached children

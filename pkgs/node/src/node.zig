@@ -20,6 +20,7 @@ pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
+const forkchoice = @import("./forkchoice.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
@@ -130,7 +131,7 @@ pub const BeamNode = struct {
                 if (!hasParentBlock) {
                     const roots = [_]types.Root{parent_root};
                     self.fetchBlockByRoots(&roots, 0) catch |err| {
-                        self.logger.warn("Failed to fetch block by root: {any}", .{err});
+                        self.logger.warn("failed to fetch block by root: {any}", .{err});
                     };
                 }
 
@@ -157,7 +158,25 @@ pub const BeamNode = struct {
             },
         }
 
-        const result = try self.chain.onGossip(data, sender_peer_id);
+        const result = self.chain.onGossip(data, sender_peer_id) catch |err| {
+            // If a block is rejected because it's before finalized, drop it and prune any cached
+            // descendants we might still be holding onto.
+            if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                if (data.* == .block) {
+                    const signed_block = data.block;
+                    var block_root: types.Root = undefined;
+                    if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                        self.logger.info(
+                            "gossip block 0x{s} rejected as pre-finalized; pruning cached descendants",
+                            .{std.fmt.fmtSliceHexLower(block_root[0..])},
+                        );
+                        self.pruneCachedBlockSubtree(block_root);
+                    } else |_| {}
+                }
+                return;
+            }
+            return err;
+        };
         self.handleGossipProcessingResult(result);
     }
 
@@ -165,7 +184,7 @@ pub const BeamNode = struct {
         // Process successfully imported blocks to retry any cached descendants
         if (result.processed_block_root) |processed_root| {
             self.logger.debug(
-                "Gossip block 0x{s} successfully processed, checking for cached descendants",
+                "gossip block 0x{s} successfully processed, checking for cached descendants",
                 .{std.fmt.fmtSliceHexLower(processed_root[0..])},
             );
             self.processCachedDescendants(processed_root);
@@ -180,7 +199,7 @@ pub const BeamNode = struct {
         if (missing_roots.len > 0 and owns_missing_roots) {
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
                 self.logger.warn(
-                    "Failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
                     .{ missing_roots.len, err },
                 );
             };
@@ -199,6 +218,10 @@ pub const BeamNode = struct {
         var descendants_to_process = std.ArrayList(types.Root).init(self.allocator);
         defer descendants_to_process.deinit();
 
+        // TODO: Optimize this to use a more efficient data structure
+        // It is a O(n^2) operation to find all children of a parent and their descendants
+        // We should use a more efficient data structure to store the cached blocks
+        // along with the children roots so it's linear time operation in terms of the number of children
         var it = self.network.fetched_blocks.iterator();
         while (it.next()) |entry| {
             const cached_block = entry.value_ptr.*;
@@ -234,6 +257,14 @@ pub const BeamNode = struct {
                             "Cached block 0x{s} still missing parent, keeping in cache",
                             .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
                         );
+                    } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                        // This block is now before finalized (finalization advanced while it was cached).
+                        // Prune this block and all its cached descendants; they are no longer useful.
+                        self.logger.info(
+                            "cached block 0x{s} rejected as pre-finalized; pruning cached descendants",
+                            .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                        );
+                        self.pruneCachedBlockSubtree(descendant_root);
                     } else {
                         self.logger.warn(
                             "Failed to process cached block 0x{s}: {any}",
@@ -259,9 +290,58 @@ pub const BeamNode = struct {
 
                 // Fetch any missing attestation head blocks
                 self.fetchBlockByRoots(missing_roots, 0) catch |fetch_err| {
-                    self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
+                    self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
                 };
             }
+        }
+    }
+
+    /// Remove `root` and all cached descendants from `network.fetched_blocks`, and clear any matching
+    /// entries from `network.pending_block_roots`.
+    ///
+    /// This is used when a cached block is rejected as `PreFinalizedSlot` (i.e. before finalized).
+    fn pruneCachedBlockSubtree(self: *Self, root: types.Root) void {
+        var stack = std.ArrayList(types.Root).init(self.allocator);
+        defer stack.deinit();
+
+        stack.append(root) catch return;
+
+        var pruned_count: usize = 0;
+        while (stack.items.len > 0) {
+            const current_root = stack.pop().?;
+            // Collect immediate cached children first (don't mutate the map during iteration).
+            var children = std.ArrayList(types.Root).init(self.allocator);
+            defer children.deinit();
+
+            // TODO: Optimize this to use a more efficient data structure
+            // It is a O(n^2) operation to find all children of a parent and their descendants
+            // We should use a more efficient data structure to store the cached blocks
+            // along with the children roots so it's linear time operation in terms of the number of children
+            var it = self.network.fetched_blocks.iterator();
+            while (it.next()) |entry| {
+                const cached = entry.value_ptr.*;
+                if (std.mem.eql(u8, cached.message.block.parent_root[0..], current_root[0..])) {
+                    children.append(entry.key_ptr.*) catch {};
+                }
+            }
+
+            // Enqueue children for recursive pruning.
+            for (children.items) |child_root| {
+                stack.append(child_root) catch {};
+            }
+
+            // Remove the current root from caches/tracking.
+            if (self.network.removeFetchedBlock(current_root)) {
+                pruned_count += 1;
+            }
+            _ = self.network.removePendingBlockRoot(current_root);
+        }
+
+        if (pruned_count > 0) {
+            self.logger.debug(
+                "pruned {d} cached block(s) from pre-finalized subtree rooted at 0x{s}",
+                .{ pruned_count, std.fmt.fmtSliceHexLower(root[0..]) },
+            );
         }
     }
 
@@ -325,7 +405,20 @@ pub const BeamNode = struct {
                     return;
                 }
 
-                self.logger.warn("Failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
+                if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                    self.logger.info(
+                        "discarding pre-finalized block 0x{s} from peer {s}{}, pruning cached descendants",
+                        .{
+                            std.fmt.fmtSliceHexLower(block_root[0..]),
+                            block_ctx.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                        },
+                    );
+                    self.pruneCachedBlockSubtree(block_root);
+                    return;
+                }
+
+                self.logger.warn("failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
                     std.fmt.fmtSliceHexLower(block_root[0..]),
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -345,7 +438,7 @@ pub const BeamNode = struct {
 
             // Fetch any missing attestation head blocks
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
             self.logger.warn("failed to compute block root from RPC response from peer={s}{}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
@@ -683,7 +776,7 @@ pub const BeamNode = struct {
             defer self.allocator.free(missing_roots);
 
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else {
             self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
@@ -1059,4 +1152,239 @@ test "Node: processCachedDescendants basic flow" {
 
     // Verify block2 is now in the chain
     try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
+}
+
+fn makeTestSignedBlockWithParent(
+    allocator: std.mem.Allocator,
+    slot: usize,
+    parent_root: types.Root,
+) !*types.SignedBlockWithAttestation {
+    const block_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    errdefer allocator.destroy(block_ptr);
+
+    block_ptr.* = .{
+        .message = .{
+            .block = .{
+                .slot = slot,
+                .parent_root = parent_root,
+                .proposer_index = 0,
+                .state_root = [_]u8{0} ** 32,
+                .body = .{
+                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = slot,
+                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                },
+            },
+        },
+        .signature = try types.BlockSignatures.init(allocator),
+    };
+
+    return block_ptr;
+}
+
+test "Node: pruneCachedBlockSubtree prunes root and all cached descendants" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    // Tree:
+    //   A
+    //  / \
+    // B   D
+    // |
+    // C
+    // plus an unrelated E
+    const root_a: types.Root = [_]u8{0xAA} ** 32;
+    const root_b: types.Root = [_]u8{0xBB} ** 32;
+    const root_c: types.Root = [_]u8{0xCC} ** 32;
+    const root_d: types.Root = [_]u8{0xDD} ** 32;
+    const root_e: types.Root = [_]u8{0xEE} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_b));
+    try node.network.cacheFetchedBlock(root_d, try makeTestSignedBlockWithParent(allocator, 4, root_a));
+    try node.network.cacheFetchedBlock(root_e, try makeTestSignedBlockWithParent(allocator, 5, zero_root));
+
+    // Pending roots (A subtree + unrelated E)
+    try node.network.trackPendingBlockRoot(root_a, 0);
+    try node.network.trackPendingBlockRoot(root_c, 0);
+    try node.network.trackPendingBlockRoot(root_e, 0);
+
+    node.pruneCachedBlockSubtree(root_a);
+
+    // Entire subtree removed
+    try std.testing.expect(!node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_c));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_d));
+    // Unrelated remains
+    try std.testing.expect(node.network.hasFetchedBlock(root_e));
+
+    // Pending roots cleared for subtree but not for unrelated
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_a));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_c));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_e));
+}
+
+test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_a: types.Root = [_]u8{0xAA} ** 32;
+    const root_b: types.Root = [_]u8{0xBB} ** 32;
+    const root_c: types.Root = [_]u8{0xCC} ** 32;
+    const root_d: types.Root = [_]u8{0xDD} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_b));
+    try node.network.cacheFetchedBlock(root_d, try makeTestSignedBlockWithParent(allocator, 4, root_a));
+
+    try node.network.trackPendingBlockRoot(root_a, 0);
+    try node.network.trackPendingBlockRoot(root_b, 0);
+    try node.network.trackPendingBlockRoot(root_c, 0);
+    try node.network.trackPendingBlockRoot(root_d, 0);
+
+    node.pruneCachedBlockSubtree(root_b);
+
+    // B subtree removed
+    try std.testing.expect(!node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_c));
+    // Siblings/ancestors remain
+    try std.testing.expect(node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(node.network.hasFetchedBlock(root_d));
+
+    // Pending cleared for B subtree only
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_a));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_b));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_c));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_d));
+}
+
+test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is not cached" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_x: types.Root = [_]u8{0x11} ** 32;
+    const root_child: types.Root = [_]u8{0x22} ** 32;
+    const root_other: types.Root = [_]u8{0x33} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    // Only cache descendants, not the root_x itself
+    try node.network.cacheFetchedBlock(root_child, try makeTestSignedBlockWithParent(allocator, 2, root_x));
+    try node.network.cacheFetchedBlock(root_other, try makeTestSignedBlockWithParent(allocator, 3, zero_root));
+
+    try node.network.trackPendingBlockRoot(root_x, 0);
+    try node.network.trackPendingBlockRoot(root_child, 0);
+    try node.network.trackPendingBlockRoot(root_other, 0);
+
+    node.pruneCachedBlockSubtree(root_x);
+
+    // Child removed even though root_x wasn't cached
+    try std.testing.expect(!node.network.hasFetchedBlock(root_child));
+    try std.testing.expect(node.network.hasFetchedBlock(root_other));
+
+    // Pending cleared for root_x and its subtree only
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_x));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_child));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_other));
 }
