@@ -80,6 +80,7 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
+    justifications_cache: std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)),
 
     const Self = @This();
 
@@ -116,6 +117,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
+            .justifications_cache = std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)).init(allocator),
         };
     }
 
@@ -126,6 +128,18 @@ pub const BeamChain = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
+
+        // Clean up justifications cache
+        var cache_it = self.justifications_cache.iterator();
+        while (cache_it.next()) |entry| {
+            var just_it = entry.value_ptr.iterator();
+            while (just_it.next()) |just_entry| {
+                self.allocator.free(just_entry.value_ptr.*);
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.justifications_cache.deinit();
+
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         self.anchor_state.deinit();
