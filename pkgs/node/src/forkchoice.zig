@@ -844,7 +844,7 @@ pub const ForkChoice = struct {
     }
 };
 
-const ForkChoiceError = error{
+pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
     FutureSlot,
