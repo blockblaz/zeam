@@ -11,7 +11,7 @@ pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
 
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
-pub const MAX_BLOCK_FETCH_DEPTH = 64;
+pub const MAX_BLOCK_FETCH_DEPTH = 512;
 
 // Maximum number of blocks to keep in the fetched blocks cache
 // This prevents unbounded memory growth from malicious peers sending orphaned blocks
