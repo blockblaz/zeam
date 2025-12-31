@@ -105,7 +105,7 @@ pub unsafe extern "C" fn xmss_generate_phony_signatures(
         let log_lifetimes = slice::from_raw_parts(log_lifetimes_ptr, log_lifetimes_len);
         if log_lifetimes
             .iter()
-            .any(|&ll| ll < XMSS_MIN_LOG_LIFETIME || ll > XMSS_MAX_LOG_LIFETIME)
+            .any(|&ll| !(XMSS_MIN_LOG_LIFETIME..=XMSS_MAX_LOG_LIFETIME).contains(&ll))
         {
             return -1;
         }

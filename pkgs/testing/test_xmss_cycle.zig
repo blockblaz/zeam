@@ -246,7 +246,7 @@ test "XMSS aggregation: mismatched counts fail" {
 test "XMSS aggregation: invalid log lifetime rejected" {
     const allocator = std.testing.allocator;
 
-    const log_lifetimes = [_]usize{ 1 };
+    const log_lifetimes = [_]usize{1};
     const pub_keys = try allocator.alloc(xmss.aggregate.CXmssPublicKey, log_lifetimes.len);
     defer allocator.free(pub_keys);
     const signatures = try allocator.alloc(xmss.aggregate.CXmssSignature, log_lifetimes.len);
