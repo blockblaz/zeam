@@ -1,8 +1,8 @@
 use lean_multisig::{
     xmss_aggregate_signatures, xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
     xmss_generate_phony_signatures as lm_xmss_generate_phony_signatures,
-    xmss_verify_aggregated_signatures, XmssPublicKey, XmssSignature, XMSS_MAX_LOG_LIFETIME,
-    XMSS_MIN_LOG_LIFETIME, F,
+    xmss_verify_aggregated_signatures, XmssPublicKey, XmssSignature, F, XMSS_MAX_LOG_LIFETIME,
+    XMSS_MIN_LOG_LIFETIME,
 };
 use std::slice;
 use xmss::WotsSignature;
