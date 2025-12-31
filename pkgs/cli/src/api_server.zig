@@ -29,6 +29,10 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
 fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
     defer connection.stream.close();
 
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const request_allocator = arena.allocator();
+
     var buffer: [4096]u8 = undefined;
     var http_server = std.http.Server.init(connection, &buffer);
     var request = http_server.receiveHead() catch |err| {
@@ -39,12 +43,12 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
     // Route handling
     if (std.mem.eql(u8, request.head.target, "/events")) {
         // Handle SSE connection - this will keep the connection alive
-        SimpleMetricsServer.handleSSEEvents(connection.stream, allocator) catch |err| {
+        SimpleMetricsServer.handleSSEEvents(connection.stream, request_allocator) catch |err| {
             std.log.warn("SSE connection failed: {}", .{err});
         };
     } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
         // Handle metrics request
-        var metrics_output = std.ArrayList(u8).init(allocator);
+        var metrics_output = std.ArrayList(u8).init(request_allocator);
         defer metrics_output.deinit();
 
         api.writeMetrics(metrics_output.writer()) catch {
@@ -67,7 +71,7 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
         }) catch {};
     } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
         // Handle fork choice graph request
-        handleForkChoiceGraph(&request, allocator, forkchoice) catch |err| {
+        handleForkChoiceGraph(&request, request_allocator, forkchoice) catch |err| {
             std.log.warn("Fork choice graph request failed: {}", .{err});
             _ = request.respond("Internal Server Error\n", .{}) catch {};
         };
