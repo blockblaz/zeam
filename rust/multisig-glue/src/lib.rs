@@ -1,6 +1,8 @@
 use lean_multisig::{
     xmss_aggregate_signatures, xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
-    xmss_verify_aggregated_signatures, XmssPublicKey, XmssSignature, F,
+    xmss_generate_phony_signatures as lm_xmss_generate_phony_signatures,
+    xmss_verify_aggregated_signatures, XmssPublicKey, XmssSignature, XMSS_MAX_LOG_LIFETIME,
+    XMSS_MIN_LOG_LIFETIME, F,
 };
 use std::slice;
 use xmss::WotsSignature;
@@ -66,6 +68,101 @@ unsafe fn convert_signature(c_sig: &CXmssSignature) -> XmssSignature {
         },
         slot: c_sig.slot,
         merkle_proof,
+    }
+}
+
+/// Generate phony XMSS signatures and C-friendly structures for tests
+/// Returns 0 on success, -1 on error
+/// # Safety
+/// This is meant to be called from zig, so the pointers will always dereference correctly
+#[no_mangle]
+pub unsafe extern "C" fn xmss_generate_phony_signatures(
+    log_lifetimes_ptr: *const usize,
+    log_lifetimes_len: usize,
+    message_hash_ptr: *const u32,
+    slot: u64,
+    out_pub_keys_ptr: *mut CXmssPublicKey,
+    out_pub_keys_len: usize,
+    out_signatures_ptr: *mut CXmssSignature,
+    out_signatures_len: usize,
+    out_merkle_buf_ptr: *mut u32,
+    out_merkle_buf_len: usize,
+) -> i32 {
+    if log_lifetimes_ptr.is_null()
+        || message_hash_ptr.is_null()
+        || out_pub_keys_ptr.is_null()
+        || out_signatures_ptr.is_null()
+        || out_merkle_buf_ptr.is_null()
+    {
+        return -1;
+    }
+
+    if out_pub_keys_len != log_lifetimes_len || out_signatures_len != log_lifetimes_len {
+        return -1;
+    }
+
+    unsafe {
+        let log_lifetimes = slice::from_raw_parts(log_lifetimes_ptr, log_lifetimes_len);
+        if log_lifetimes
+            .iter()
+            .any(|&ll| ll < XMSS_MIN_LOG_LIFETIME || ll > XMSS_MAX_LOG_LIFETIME)
+        {
+            return -1;
+        }
+
+        let message_hash_u32 = slice::from_raw_parts(message_hash_ptr, 8);
+        let message_hash: [F; 8] = std::array::from_fn(|i| u32_to_field(message_hash_u32[i]));
+
+        let required_merkle_words: usize = log_lifetimes.iter().map(|ll| ll * 8).sum();
+        if out_merkle_buf_len < required_merkle_words {
+            return -1;
+        }
+
+        let (pub_keys, signatures) =
+            lm_xmss_generate_phony_signatures(log_lifetimes, message_hash, slot);
+
+        let out_pub_keys = slice::from_raw_parts_mut(out_pub_keys_ptr, out_pub_keys_len);
+        let out_signatures = slice::from_raw_parts_mut(out_signatures_ptr, out_signatures_len);
+        let merkle_buf = slice::from_raw_parts_mut(out_merkle_buf_ptr, out_merkle_buf_len);
+
+        let mut merkle_offset = 0usize;
+        for i in 0..log_lifetimes_len {
+            let pk = &pub_keys[i];
+            out_pub_keys[i] = CXmssPublicKey {
+                merkle_root: std::array::from_fn(|j| field_to_u32(pk.merkle_root[j])),
+                first_slot: pk.first_slot,
+                log_lifetime: pk.log_lifetime,
+            };
+
+            let sig = &signatures[i];
+            let chain_tips: [[u32; 8]; 66] = std::array::from_fn(|r| {
+                std::array::from_fn(|c| field_to_u32(sig.wots_signature.chain_tips[r][c]))
+            });
+            let randomness: [u32; 8] =
+                std::array::from_fn(|j| field_to_u32(sig.wots_signature.randomness[j]));
+
+            let proof_len = sig.merkle_proof.len();
+            let proof_words = proof_len * 8;
+            for (proof_idx, digest) in sig.merkle_proof.iter().enumerate() {
+                for j in 0..8 {
+                    merkle_buf[merkle_offset + proof_idx * 8 + j] = field_to_u32(digest[j]);
+                }
+            }
+
+            out_signatures[i] = CXmssSignature {
+                wots_signature: CWotsSignature {
+                    chain_tips,
+                    randomness,
+                },
+                slot: sig.slot,
+                merkle_proof_ptr: merkle_buf[merkle_offset..].as_ptr(),
+                merkle_proof_len: proof_len,
+            };
+
+            merkle_offset += proof_words;
+        }
+
+        0
     }
 }
 
