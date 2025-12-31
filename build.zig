@@ -23,22 +23,26 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
     switch (prover) {
         .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
@@ -526,6 +530,20 @@ pub fn build(b: *Builder) !void {
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
+    const xmss_cycle_tests = b.addTest(.{
+        .root_source_file = b.path("pkgs/testing/test_xmss_cycle.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    xmss_cycle_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
+    xmss_cycle_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    xmss_cycle_tests.root_module.addImport("@zeam/types", zeam_types);
+    xmss_cycle_tests.root_module.addImport("ssz", ssz);
+    xmss_cycle_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, xmss_cycle_tests, target, prover);
+    const run_xmss_cycle_tests = b.addRunArtifact(xmss_cycle_tests);
+    test_step.dependOn(&run_xmss_cycle_tests.step);
+
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
         .optimize = optimize,
@@ -639,17 +657,17 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue", "-p", "multisig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
             "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
             "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
-            "risc0-glue", "-p",        "hashsig-glue",
+            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
             "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
             "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
-            "openvm-glue", "-p",        "hashsig-glue",
+            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
