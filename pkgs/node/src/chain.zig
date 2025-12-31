@@ -504,7 +504,9 @@ pub const BeamChain = struct {
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                self.module_logger.warn("Failed to broadcast head event: {any}", .{err});
+                if (err != error.BroadcasterNotInitialized) {
+                    self.module_logger.warn("Failed to broadcast head event: {any}", .{err});
+                }
                 chain_event.deinit(self.allocator);
             };
         } else |err| {
@@ -528,7 +530,9 @@ pub const BeamChain = struct {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("Failed to broadcast justification event: {any}", .{err});
+                    if (err != error.BroadcasterNotInitialized) {
+                        self.module_logger.warn("Failed to broadcast justification event: {any}", .{err});
+                    }
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_justified_slot = latest_justified.slot;
@@ -542,7 +546,9 @@ pub const BeamChain = struct {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("Failed to broadcast finalization event: {any}", .{err});
+                    if (err != error.BroadcasterNotInitialized) {
+                        self.module_logger.warn("Failed to broadcast finalization event: {any}", .{err});
+                    }
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_finalized_slot = latest_finalized.slot;
