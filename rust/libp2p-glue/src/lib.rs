@@ -30,6 +30,7 @@ use std::sync::Mutex;
 
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
+    configurations::RESPONSE_CHANNEL_IDLE_TIMEOUT,
     varint::{encode_varint, MAX_VARINT_BYTES},
     LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage, ReqRespMessageError,
     ReqRespMessageReceived, RequestMessage, ResponseMessage,
@@ -53,7 +54,7 @@ static mut ZIG_HANDLER1: Option<u64> = None;
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
-    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
+    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
     static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
     static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
@@ -363,8 +364,12 @@ pub unsafe fn send_rpc_response_chunk(
     let response_bytes = response_slice.to_vec();
 
     let channel = {
-        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-        response_map.get(&channel_id).cloned()
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        let channel = response_map.get(&channel_id).cloned();
+        if channel.is_some() {
+            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
+        }
+        channel
     };
 
     if let Some(channel) = channel {
@@ -872,6 +877,39 @@ impl Network {
                 }
             }
 
+            Some(response_channel_timeout) = poll_fn(|cx| {
+                let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+                std::pin::Pin::new(&mut *map).poll_next(cx)
+            }) => {
+                match response_channel_timeout {
+                    Ok((channel_id, channel)) => {
+                        logger::rustLogger.warn(
+                            self.network_id,
+                            &format!(
+                                "[reqresp] Response channel {} expired after {:?} (peer: {}, protocol: {})",
+                                channel_id,
+                                RESPONSE_CHANNEL_IDLE_TIMEOUT,
+                                channel.peer_id,
+                                channel.protocol.as_str(),
+                            ),
+                        );
+
+                        // Best-effort: close the response stream so the remote does not hang.
+                        swarm.behaviour_mut().reqresp.finish_response_stream(
+                            channel.peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                        );
+                    }
+                    Err(e) => {
+                        logger::rustLogger.error(
+                            self.network_id,
+                            &format!("[reqresp] Error in response channel delay map: {}", e),
+                        );
+                    }
+                }
+            }
+
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -932,6 +970,13 @@ impl Network {
                                     peer_id_cstr.as_ptr(),
                                 )
                             };
+
+                            // Drop any pending response channels tied to this connection.
+                            // We can't finish streams here (the connection is already gone), but we must
+                            // remove them from the map to avoid leaking entries until idle TTL.
+                            RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
+                                !(pending.peer_id == peer_id && pending.connection_id == connection_id)
+                            });
 
                             if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
                                 self.schedule_reconnection(peer_id, peer_addr, 1);
@@ -1149,9 +1194,11 @@ impl Network {
                                     .lock()
                                     .unwrap()
                                     .retain(|_, pending| {
-                                        !(pending.peer_id == peer_id
-                                            && pending.connection_id == connection_id
-                                            && pending.stream_id == stream_id)
+                                        !(
+                                            pending.peer_id == peer_id
+                                                && pending.connection_id == connection_id
+                                                && pending.stream_id == stream_id
+                                        )
                                     });
                             }
                             Err(ReqRespMessageError::Outbound { request_id, err }) => {
