@@ -529,7 +529,20 @@ pub const BeamChain = struct {
             break :computedroot cblock_root;
         };
 
-        const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
+        const post_state = if (blockInfo.postState) |post_state_ptr| cachedstate: {
+            // PATH 1: Block with precomputed state (proposer or DB replay)
+            // These blocks skip apply_transition() so cache metrics aren't recorded
+            // Track this path for visibility
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_chain_blocks_with_cached_state_total.incr();
+            }
+            break :cachedstate post_state_ptr;
+        } else computedstate: {
+            // PATH 2: Block needs fresh validation - cache is used here
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_chain_blocks_with_computed_state_total.incr();
+            }
+
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
@@ -547,6 +560,7 @@ pub const BeamChain = struct {
                 //
                 .logger = self.stf_logger,
                 .validSignatures = true,
+                .justifications_cache = if (self.config.spec.cache_justifications orelse false) &self.justifications_cache else null,
             });
             break :computedstate cpost_state;
         };

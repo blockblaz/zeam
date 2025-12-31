@@ -62,6 +62,9 @@ const Metrics = struct {
     lean_state_transition_block_header_hash_time_seconds: BlockHeaderHashHistogram,
     lean_state_transition_get_justification_time_seconds: GetJustificationHistogram,
     lean_state_transition_with_justifications_time_seconds: WithJustificationsHistogram,
+    // Block processing path counters
+    lean_chain_blocks_with_cached_state_total: BlocksWithCachedStateCounter,
+    lean_chain_blocks_with_computed_state_total: BlocksWithComputedStateCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -97,6 +100,8 @@ const Metrics = struct {
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const BlocksWithCachedStateCounter = metrics_lib.Counter(u64);
+    const BlocksWithComputedStateCounter = metrics_lib.Counter(u64);
 };
 
 /// Timer struct returned to the application.
@@ -442,6 +447,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_block_header_hash_time_seconds = Metrics.BlockHeaderHashHistogram.init("lean_state_transition_block_header_hash_time_seconds", .{ .help = "Block header hash in process_block_header." }, .{}),
         .lean_state_transition_get_justification_time_seconds = Metrics.GetJustificationHistogram.init("lean_state_transition_get_justification_time_seconds", .{ .help = "Justifications HashMap creation from state." }, .{}),
         .lean_state_transition_with_justifications_time_seconds = Metrics.WithJustificationsHistogram.init("lean_state_transition_with_justifications_time_seconds", .{ .help = "State update with justifications HashMap." }, .{}),
+        .lean_chain_blocks_with_cached_state_total = Metrics.BlocksWithCachedStateCounter.init("lean_chain_blocks_with_cached_state_total", .{ .help = "Blocks processed with precomputed state (skip apply_transition)." }, .{}),
+        .lean_chain_blocks_with_computed_state_total = Metrics.BlocksWithComputedStateCounter.init("lean_chain_blocks_with_computed_state_total", .{ .help = "Blocks processed with computed state (call apply_transition with cache)." }, .{}),
     };
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
