@@ -7,8 +7,19 @@ const node = @import("@zeam/node");
 const QUERY_SLOTS_PREFIX = "?slots=";
 const DEFAULT_MAX_SLOTS: usize = 50;
 const MAX_ALLOWED_SLOTS: usize = 200;
+const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
 
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node.fcFactory.ForkChoice) !void {
+pub const APIServerHandle = struct {
+    thread: std.Thread,
+    ctx: *SimpleMetricsServer,
+
+    pub fn stop(self: *APIServerHandle) void {
+        self.ctx.stop.store(true, .seq_cst);
+        self.thread.join();
+    }
+};
+
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node.fcFactory.ForkChoice) !APIServerHandle {
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
     const ctx = try allocator.create(SimpleMetricsServer);
@@ -17,37 +28,24 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
         .allocator = allocator,
         .port = port,
         .forkchoice = forkchoice,
+        .stop = std.atomic.Value(bool).init(false),
     };
 
     const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
-    thread.detach();
 
     std.log.info("Metrics server started on port {d}", .{port});
+    return .{
+        .thread = thread,
+        .ctx = ctx,
+    };
 }
 
-/// Handle individual HTTP connections in a separate thread
-fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
-    defer connection.stream.close();
-
+fn handleNonSSERequest(request: *std.http.Server.Request, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const request_allocator = arena.allocator();
 
-    var buffer: [4096]u8 = undefined;
-    var http_server = std.http.Server.init(connection, &buffer);
-    var request = http_server.receiveHead() catch |err| {
-        std.log.warn("Failed to receive HTTP head: {}", .{err});
-        return;
-    };
-
-    // Route handling
-    if (std.mem.eql(u8, request.head.target, "/events")) {
-        // Handle SSE connection - this will keep the connection alive
-        SimpleMetricsServer.handleSSEEvents(connection.stream, request_allocator) catch |err| {
-            std.log.warn("SSE connection failed: {}", .{err});
-        };
-    } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
-        // Handle metrics request
+    if (std.mem.eql(u8, request.head.target, "/metrics")) {
         var metrics_output = std.ArrayList(u8).init(request_allocator);
         defer metrics_output.deinit();
 
@@ -62,7 +60,6 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
             },
         }) catch {};
     } else if (std.mem.eql(u8, request.head.target, "/health")) {
-        // Handle health check
         const response = "{\"status\":\"healthy\",\"service\":\"zeam-metrics\"}";
         _ = request.respond(response, .{
             .extra_headers = &.{
@@ -70,14 +67,34 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
             },
         }) catch {};
     } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
-        // Handle fork choice graph request
-        handleForkChoiceGraph(&request, request_allocator, forkchoice) catch |err| {
+        handleForkChoiceGraph(request, request_allocator, forkchoice) catch |err| {
             std.log.warn("Fork choice graph request failed: {}", .{err});
             _ = request.respond("Internal Server Error\n", .{}) catch {};
         };
     } else {
         _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
     }
+}
+
+fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
+    var buffer: [4096]u8 = undefined;
+    var http_server = std.http.Server.init(connection, &buffer);
+    var request = http_server.receiveHead() catch |err| {
+        std.log.warn("Failed to receive HTTP head: {}", .{err});
+        connection.stream.close();
+        return;
+    };
+
+    if (std.mem.eql(u8, request.head.target, "/events")) {
+        _ = std.Thread.spawn(.{}, SimpleMetricsServer.handleSSEConnection, .{ connection.stream, allocator }) catch |err| {
+            std.log.warn("Failed to spawn SSE handler: {}", .{err});
+            connection.stream.close();
+        };
+        return;
+    }
+
+    handleNonSSERequest(&request, allocator, forkchoice);
+    connection.stream.close();
 }
 
 fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) !void {
@@ -286,26 +303,36 @@ const SimpleMetricsServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
     forkchoice: *node.fcFactory.ForkChoice,
+    stop: std.atomic.Value(bool),
 
     fn run(self: *SimpleMetricsServer) !void {
         defer self.allocator.destroy(self);
         const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
-        var server = try address.listen(.{ .reuse_address = true });
+        var server = try address.listen(.{ .reuse_address = true, .force_nonblocking = true });
         defer server.deinit();
 
         std.log.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
 
         while (true) {
-            const connection = server.accept() catch continue;
-
-            // For SSE connections, we need to handle them differently
-            // We'll spawn a new thread for each connection to handle persistence
-            _ = std.Thread.spawn(.{}, handleConnection, .{ connection, self.allocator, self.forkchoice }) catch |err| {
-                std.log.warn("Failed to spawn connection handler: {}", .{err});
-                connection.stream.close();
+            if (self.stop.load(.acquire)) break;
+            const connection = server.accept() catch |err| {
+                if (err == error.WouldBlock) {
+                    std.time.sleep(ACCEPT_POLL_NS);
+                    continue;
+                }
+                std.log.warn("Failed to accept connection: {}", .{err});
                 continue;
             };
+
+            routeConnection(connection, self.allocator, self.forkchoice);
         }
+    }
+
+    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
+        SimpleMetricsServer.handleSSEEvents(stream, allocator) catch |err| {
+            std.log.warn("SSE connection failed: {}", .{err});
+        };
+        stream.close();
     }
 
     fn handleSSEEvents(stream: std.net.Stream, allocator: std.mem.Allocator) !void {

@@ -459,6 +459,9 @@ fn mainInner() !void {
             const registry_1 = shared_registry;
             const registry_2 = shared_registry;
 
+            var api_server_handle: ?api_server.APIServerHandle = null;
+            defer if (api_server_handle) |*handle| handle.stop();
+
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
                 // options
@@ -474,7 +477,7 @@ fn mainInner() !void {
                 .node_registry = registry_1,
             });
 
-            api_server.startAPIServer(allocator, beamcmd.metricsPort, &beam_node_1.chain.forkChoice) catch |err| {
+            api_server_handle = api_server.startAPIServer(allocator, beamcmd.metricsPort, &beam_node_1.chain.forkChoice) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
                 return err;
             };
