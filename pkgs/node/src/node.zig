@@ -563,7 +563,15 @@ test "Node peer tracking on connect/disconnect" {
     defer loop.deinit();
 
     var logger_config = zeam_utils.getTestLoggerConfig();
-    var mock = try networks.Mock.init(allocator, &loop, logger_config.logger(.mock));
+
+    // Create empty node registry for test - shared between Mock and node
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    // Create Mock with shared registry instead of null
+    var mock = try networks.Mock.init(allocator, &loop, logger_config.logger(.mock), test_registry);
     defer mock.deinit();
 
     const backend = mock.getNetworkInterface();
@@ -608,12 +616,6 @@ test "Node peer tracking on connect/disconnect" {
 
     var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop);
     defer clock.deinit(allocator);
-
-    // Create empty node registry for test
-    const test_registry = try allocator.create(NodeNameRegistry);
-    defer allocator.destroy(test_registry);
-    test_registry.* = NodeNameRegistry.init(allocator);
-    defer test_registry.deinit();
 
     var node: BeamNode = undefined;
     try node.init(allocator, .{
@@ -670,4 +672,11 @@ test "Node peer tracking on connect/disconnect" {
     // Disconnect peer 3
     try mock.peerEventHandler.onPeerDisconnected(peer3_id);
     try std.testing.expectEqual(@as(usize, 0), node.network.getPeerCount());
+
+    // Process pending async operations (status request timer callbacks and their responses)
+    var iterations: u32 = 0;
+    while (iterations < 5) : (iterations += 1) {
+        std.time.sleep(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
+        try loop.run(.until_done);
+    }
 }
