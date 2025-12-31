@@ -64,6 +64,7 @@ pub const ProtoArray = struct {
             .parentRoot = block.parentRoot,
             .stateRoot = block.stateRoot,
             .timeliness = block.timeliness,
+            .confirmed = block.confirmed,
             .parent = parent,
             .weight = 0,
             .bestChild = null,
@@ -79,24 +80,6 @@ pub const ProtoArray = struct {
         if (block_index) |blkidx| {
             const node = self.nodes.items[blkidx];
             return node;
-        } else {
-            return null;
-        }
-    }
-
-    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
-        const nodeOrNull = self.getNode(blockRoot);
-        if (nodeOrNull) |node| {
-            // TODO cast doesn't seem to be working find resolution
-            // const block = utils.Cast(ProtoBlock, node);
-            const block = ProtoBlock{
-                .slot = node.slot,
-                .blockRoot = node.blockRoot,
-                .parentRoot = node.parentRoot,
-                .stateRoot = node.stateRoot,
-                .timeliness = node.timeliness,
-            };
-            return block;
         } else {
             return null;
         }
@@ -171,6 +154,7 @@ const OnBlockOpts = struct {
     currentSlot: types.Slot,
     blockDelayMs: u64,
     blockRoot: ?types.Root = null,
+    confirmed: bool,
 };
 
 pub const ForkChoiceStore = struct {
@@ -254,6 +238,7 @@ pub const ForkChoice = struct {
             .parentRoot = anchor_block_header.parent_root,
             .stateRoot = anchor_block_header.state_root,
             .timeliness = true,
+            .confirmed = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
@@ -314,26 +299,240 @@ pub const ForkChoice = struct {
         return false;
     }
 
+    pub fn getCanonicalView(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
+        const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
+        const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
+
+        // first get all canonical blocks till previous anchors
+        var current_idx = target_anchor_idx;
+        while (current_idx >= prev_anchor_idx) {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            try canonical_view.put(current_node.blockRoot, {});
+
+            if (current_idx != prev_anchor_idx) {
+                current_idx = current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal;
+                // extra soundness check
+                if (current_idx < prev_anchor_idx) {
+                    return ForkChoiceError.InvalidCanonicalTraversal;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // add all the potential downstream canonical blocks to the map i.e. unfinalized descendants
+        current_idx = target_anchor_idx + 1;
+        while (current_idx < self.protoArray.nodes.items.len) {
+            // if the parent of this node is already in the canonical_blocks, this is a potential canonical block
+            const current_node = self.protoArray.nodes.items[current_idx];
+            const parent_node = self.protoArray.nodes.items[current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal];
+            if (canonical_view.contains(parent_node.blockRoot)) {
+                try canonical_view.put(current_node.blockRoot, {});
+            }
+            current_idx += 1;
+        }
+    }
+
     /// Get all ancestor block roots from the current finalized block,
     /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
     /// Stops traversal when previousFinalizedSlot is reached or at genesis.
-    pub fn getAncestorsOfFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
-        var ancestors = std.ArrayList(types.Root).init(allocator);
+    pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
+        var canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+        var potential_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+        var non_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
 
-        var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
+        // get some info about previous and target anchors
+        const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
+        const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
+        const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
 
-        while (current_idx_or_null) |current_idx| {
+        // get all canonical view of the chain finalized and unfinalized anchored at the targetAnchorRoot
+        var canonical_blocks = canonicalViewOrNull orelse blk: {
+            var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
+            try self.getCanonicalView(&local_view, targetAnchorRoot, prevAnchorRootOrNull);
+            break :blk &local_view;
+        };
+
+        // now we can split forkchoice into 3 parts (excluding target anchor)
+        // traversing all the way from the bottom to the prev_anchor_idx
+        var current_idx = self.protoArray.nodes.items.len - 1;
+        while (current_idx >= prev_anchor_idx) {
             const current_node = self.protoArray.nodes.items[current_idx];
-            if (current_node.slot < previousFinalizedSlot) {
-                return error.InvalidFinalizationTraversal;
-            } else if (current_node.slot == previousFinalizedSlot) {
+            if (canonical_blocks.contains(current_node.blockRoot)) {
+                if (current_node.slot <= target_anchor_slot) {
+                    _ = try canonical_roots.append(current_node.blockRoot);
+                } else if (current_node.slot > target_anchor_slot) {
+                    _ = try potential_canonical_roots.append(current_node.blockRoot);
+                }
+            } else {
+                _ = try non_canonical_roots.append(current_node.blockRoot);
+            }
+            if (current_idx == 0) {
                 break;
             } else {
-                try ancestors.append(current_node.blockRoot);
-                current_idx_or_null = current_node.parent;
+                current_idx -= 1;
             }
         }
-        return ancestors.toOwnedSlice();
+        // confirm first root in canonical_roots is the new anchor because it should have been pushed first
+        if (!std.mem.eql(u8, &canonical_roots.items[0], &targetAnchorRoot)) {
+            for (canonical_roots.items, 0..) |root, index| {
+                self.logger.err("canonical root at index={d} {s}", .{
+                    index,
+                    std.fmt.fmtSliceHexLower(&root),
+                });
+            }
+            self.logger.err("targetAnchorRoot is {s}", .{std.fmt.fmtSliceHexLower(&targetAnchorRoot)});
+            return ForkChoiceError.InvalidCanonicalTraversal;
+        }
+
+        const result = [_]([]types.Root){
+            try canonical_roots.toOwnedSlice(),
+            //
+            try potential_canonical_roots.toOwnedSlice(),
+            try non_canonical_roots.toOwnedSlice(),
+        };
+
+        // only way to conditionally deinit locally allocated map created in a orelse block scope
+        if (canonicalViewOrNull == null) {
+            canonical_blocks.deinit();
+        }
+        return result;
+    }
+
+    pub fn rebase(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
+        const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
+        const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
+
+        var canonical_view = canonicalViewOrNull orelse blk: {
+            var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
+            try self.getCanonicalView(&local_view, targetAnchorRoot, null);
+            break :blk &local_view;
+        };
+
+        // prune, intetesting thing to note is the entire subtree of targetAnchorRoot is not affected and is to be
+        // preserved as it is, because nothing from there is getting pruned
+        var shifted_left: usize = 0;
+        var old_indices_to_new = std.AutoHashMap(usize, usize).init(self.allocator);
+        defer old_indices_to_new.deinit();
+
+        var current_idx: usize = 0;
+        while (current_idx < self.protoArray.nodes.items.len) {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            // we preserve the tree all the way down from the target anchor and its unfinalized potential canonical descendants
+            if (canonical_view.contains(current_node.blockRoot) and current_node.slot >= target_anchor_slot) {
+                try self.protoArray.indices.put(current_node.blockRoot, current_idx);
+                try old_indices_to_new.put((current_idx + shifted_left), current_idx);
+
+                // go to the next node
+                current_idx += 1;
+            } else {
+                // remove the node and continue back to the loop with updating current idx
+                // because after removal next node would be refered at the same current idx
+                _ = self.protoArray.nodes.orderedRemove(current_idx);
+                // don't need order preserving on deltas as they are always set to zero before their use
+                _ = self.deltas.swapRemove(current_idx);
+                _ = self.protoArray.indices.remove(current_node.blockRoot);
+                shifted_left += 1;
+            }
+        }
+
+        // correct parent, bestchild and best decendant indices using the created old to new map
+        current_idx = 0;
+        while (current_idx < self.protoArray.nodes.items.len) {
+            // fix parent
+            var current_node = self.protoArray.nodes.items[current_idx];
+            if (current_idx == 0) {
+                current_node.parent = null;
+            } else {
+                // all other nodes should have parents, otherwise its an irrecoverable error as we have already
+                // modified forkchoice and can't be restored
+                const old_parent_idx = current_node.parent orelse @panic("invalid parent of the rebased unfinalized");
+                const new_parent_idx = old_indices_to_new.get(old_parent_idx);
+                current_node.parent = new_parent_idx;
+            }
+
+            // fix bestchild and descendant
+            if (current_node.bestChild) |old_best_child_idx| {
+                // we should be able to lookup new index otherwise its an irrecoverable error
+                const new_best_child_idx = old_indices_to_new.get(old_best_child_idx) orelse @panic("invalid old index lookup for rebased best child");
+                current_node.bestChild = new_best_child_idx;
+
+                // best descendant should always be there when there is a best child
+                const old_best_descendant_idx = current_node.bestDescendant orelse @panic("invalid forkchoice with null best descendant for a non null best child");
+                // we should be able to lookup new index otherwise its an irrecoverable error
+                const new_best_descendant_idx = old_indices_to_new.get(old_best_descendant_idx) orelse @panic("invalid old index loopkup for rebase best descendant");
+                current_node.bestDescendant = new_best_descendant_idx;
+            } else {
+                // confirm best descandant is also null
+                if (current_node.bestDescendant != null) {
+                    @panic("invalid forkchoice with non null best descendant but with null best child");
+                }
+            }
+            self.protoArray.nodes.items[current_idx] = current_node;
+            current_idx += 1;
+        }
+
+        // confirm the first entry in forkchoice is the target anchor
+        if (!std.mem.eql(u8, &self.protoArray.nodes.items[0].blockRoot, &targetAnchorRoot)) {
+            @panic("invalid forkchoice rebasing with forkchoice base not matching target anchor");
+        }
+
+        // cleanup the vote tracker and remove all the entries which are not in canonical
+        var iterator = self.attestations.iterator();
+        while (iterator.next()) |entry| {
+            // fix applied index
+            if (entry.value_ptr.appliedIndex) |applied_index| {
+                const new_index_lookup = old_indices_to_new.get(applied_index);
+                // this simple assignmet suffices both for cases where new index is found i.e. is canonical
+                // or not, in which case it needs to point to null
+                entry.value_ptr.appliedIndex = new_index_lookup;
+            }
+
+            // fix latestknown
+            if (entry.value_ptr.latestKnown) |*latest_known| {
+                const new_index_lookup = old_indices_to_new.get(latest_known.index);
+                // if we find the index then update it else change it to null as it was non canonical
+                if (new_index_lookup) |new_index| {
+                    latest_known.index = new_index;
+                } else {
+                    entry.value_ptr.latestKnown = null;
+                }
+            }
+
+            // fix latestNew
+            if (entry.value_ptr.latestNew) |*latest_new| {
+                const new_index_lookup = old_indices_to_new.get(latest_new.index);
+                // if we find the index then update it else change it to null as it was non canonical
+                if (new_index_lookup) |new_index| {
+                    latest_new.index = new_index;
+                } else {
+                    entry.value_ptr.latestNew = null;
+                }
+            }
+        }
+
+        if (canonicalViewOrNull == null) {
+            canonical_view.deinit();
+        }
+        return;
+    }
+
+    pub fn getCanonicalAncestorAtDepth(self: *Self, min_depth: usize) !ProtoBlock {
+        var depth = min_depth;
+        var current_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
+        if (current_idx < depth) {
+            current_idx = 0;
+            depth = 0;
+        }
+
+        while (depth > 0 and current_idx > 0) {
+            const current_node = self.protoArray.nodes.items[current_idx];
+            current_idx = current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal;
+            depth -= 1;
+        }
+
+        const ancestor_at_depth = zeam_utils.Cast(ProtoBlock, self.protoArray.nodes.items[current_idx]);
+        return ancestor_at_depth;
     }
 
     pub fn tickInterval(self: *Self, hasProposal: bool) !void {
@@ -564,7 +763,7 @@ pub const ForkChoice = struct {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
-        const parent_block_or_null = self.protoArray.getBlock(parent_root);
+        const parent_block_or_null = self.getBlock(parent_root);
         if (parent_block_or_null) |parent_block| {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
@@ -580,7 +779,6 @@ pub const ForkChoice = struct {
                 return ForkChoiceError.NotFinalizedDesendant;
             }
 
-            // update the checkpoints
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
             self.fcStore.update(justified, finalized);
@@ -598,6 +796,7 @@ pub const ForkChoice = struct {
                 .parentRoot = parent_root,
                 .stateRoot = block.state_root,
                 .timeliness = is_timely,
+                .confirmed = opts.confirmed,
             };
 
             try self.protoArray.onBlock(proto_block, opts.currentSlot);
@@ -607,13 +806,41 @@ pub const ForkChoice = struct {
         }
     }
 
+    pub fn confirmBlock(self: *Self, blockRoot: types.Root) !void {
+        if (self.protoArray.indices.get(blockRoot)) |block_idx| {
+            self.protoArray.nodes.items[block_idx].confirmed = true;
+        } else {
+            return ForkChoiceError.InvalidForkchoiceBlock;
+        }
+    }
+
     pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
-        const block_or_null = self.protoArray.getBlock(blockRoot);
-        if (block_or_null) |_| {
-            return true;
+        const block_or_null = self.getBlock(blockRoot);
+        // we can only say we have the block if its fully confirmed to be imported
+        if (block_or_null) |block| {
+            return (block.confirmed == true);
         }
 
         return false;
+    }
+
+    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
+        const nodeOrNull = self.protoArray.getNode(blockRoot);
+        if (nodeOrNull) |node| {
+            // TODO cast doesn't seem to be working find resolution
+            // const block = utils.Cast(ProtoBlock, node);
+            const block = ProtoBlock{
+                .slot = node.slot,
+                .blockRoot = node.blockRoot,
+                .parentRoot = node.parentRoot,
+                .stateRoot = node.stateRoot,
+                .timeliness = node.timeliness,
+                .confirmed = node.confirmed,
+            };
+            return block;
+        } else {
+            return null;
+        }
     }
 };
 
@@ -631,6 +858,10 @@ const ForkChoiceError = error{
     InvalidBestDescendant,
     InvalidHeadIndex,
     InvalidTargetSearch,
+    InvalidAnchor,
+    InvalidTargetAnchor,
+    InvalidCanonicalTraversal,
+    InvalidForkchoiceBlock,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -676,10 +907,10 @@ test "forkchoice block tree" {
 
         // shouldn't accept a future slot
         const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0 }));
+        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
 
         try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0 });
+        _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
 

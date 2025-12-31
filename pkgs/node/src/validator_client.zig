@@ -98,8 +98,9 @@ pub const ValidatorClient = struct {
     pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
             // 1. construct the block
-            self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
+            self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+            self.logger.info("produced block for slot={d} proposer={d} with root={s}", .{ slot, slot_proposer_id, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
 
             // 2. construct proposer attestation for the produced block which should already be in forkchoice
             // including its attestations
@@ -108,6 +109,9 @@ pub const ValidatorClient = struct {
                 .validator_id = slot_proposer_id,
                 .data = proposer_attestation_data,
             };
+            const attestation_str = try proposer_attestation_data.toJsonString(self.allocator);
+            defer self.allocator.free(attestation_str);
+            self.logger.info("packing proposer attestation for slot={d} proposer={d}: {s}", .{ slot, slot_proposer_id, attestation_str });
 
             // 3. construct the message to be signed
             const block_with_attestation = types.BlockWithAttestation{
@@ -128,11 +132,7 @@ pub const ValidatorClient = struct {
                 .signature = signatures,
             };
 
-            const signed_block_json = try signed_block.toJson(self.allocator);
-            const block_str = try jsonToString(self.allocator, signed_block_json);
-            defer self.allocator.free(block_str);
-
-            self.logger.info("validator produced block slot={d} block={s}", .{ slot, block_str });
+            self.logger.info("signed produced block with attestation for slot={d} root={s}", .{ slot, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
 
             // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);
