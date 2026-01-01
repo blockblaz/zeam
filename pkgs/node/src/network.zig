@@ -44,7 +44,10 @@ pub const PendingRPC = union(enum) {
 };
 
 pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPC);
-pub const PendingBlockRootSet = std.AutoHashMap(types.Root, void);
+// key: block root, value: depth
+pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
+// key: block root, value: pointer to block
+pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlockWithAttestation);
 
 pub const BlocksByRootRequestResult = struct {
     peer_id: []const u8,
@@ -56,7 +59,8 @@ pub const Network = struct {
     backend: networks.NetworkInterface,
     connected_peers: *StringHashMap(PeerInfo),
     pending_rpc_requests: PendingRPCMap,
-    pending_block_roots: PendingBlockRootSet,
+    pending_block_roots: PendingBlockRootMap,
+    fetched_blocks: FetchedBlockMap,
 
     const Self = @This();
 
@@ -70,8 +74,11 @@ pub const Network = struct {
         var pending_rpc_requests = PendingRPCMap.init(allocator);
         errdefer pending_rpc_requests.deinit();
 
-        var pending_block_roots = PendingBlockRootSet.init(allocator);
+        var pending_block_roots = PendingBlockRootMap.init(allocator);
         errdefer pending_block_roots.deinit();
+
+        var fetched_blocks = FetchedBlockMap.init(allocator);
+        errdefer fetched_blocks.deinit();
 
         return Self{
             .allocator = allocator,
@@ -79,6 +86,7 @@ pub const Network = struct {
             .connected_peers = connected_peers,
             .pending_rpc_requests = pending_rpc_requests,
             .pending_block_roots = pending_block_roots,
+            .fetched_blocks = fetched_blocks,
         };
     }
 
@@ -90,6 +98,14 @@ pub const Network = struct {
         self.pending_rpc_requests.deinit();
 
         self.pending_block_roots.deinit();
+
+        var fetched_it = self.fetched_blocks.iterator();
+        while (fetched_it.next()) |entry| {
+            var block_ptr = entry.value_ptr.*;
+            block_ptr.deinit();
+            self.allocator.destroy(block_ptr);
+        }
+        self.fetched_blocks.deinit();
 
         var peer_it = self.connected_peers.iterator();
         while (peer_it.next()) |entry| {
@@ -230,8 +246,12 @@ pub const Network = struct {
         return self.pending_block_roots.get(root) != null;
     }
 
-    pub fn trackPendingBlockRoot(self: *Self, root: types.Root) !void {
-        try self.pending_block_roots.put(root, {});
+    pub fn getPendingBlockRootDepth(self: *Self, root: types.Root) ?u32 {
+        return self.pending_block_roots.get(root);
+    }
+
+    pub fn trackPendingBlockRoot(self: *Self, root: types.Root, depth: u32) !void {
+        try self.pending_block_roots.put(root, depth);
     }
 
     pub fn removePendingBlockRoot(self: *Self, root: types.Root) bool {
@@ -240,9 +260,31 @@ pub const Network = struct {
 
     pub fn shouldRequestBlocksByRoot(self: *Self, roots: []const types.Root) bool {
         for (roots) |root| {
-            if (!self.hasPendingBlockRoot(root)) {
+            if (!self.hasPendingBlockRoot(root) and !self.hasFetchedBlock(root)) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    pub fn hasFetchedBlock(self: *Self, root: types.Root) bool {
+        return self.fetched_blocks.get(root) != null;
+    }
+
+    pub fn getFetchedBlock(self: *Self, root: types.Root) ?*types.SignedBlockWithAttestation {
+        return self.fetched_blocks.get(root);
+    }
+
+    pub fn cacheFetchedBlock(self: *Self, root: types.Root, block: *types.SignedBlockWithAttestation) !void {
+        try self.fetched_blocks.put(root, block);
+    }
+
+    pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
+        if (self.fetched_blocks.fetchRemove(root)) |entry| {
+            var block_ptr = entry.value;
+            block_ptr.deinit();
+            self.allocator.destroy(block_ptr);
+            return true;
         }
         return false;
     }
@@ -289,6 +331,7 @@ pub const Network = struct {
         self: *Self,
         peer_id: []const u8,
         roots: []const types.Root,
+        depth: u32,
         handler: networks.OnReqRespResponseCbHandler,
     ) !u64 {
         if (roots.len == 0) return error.NoBlockRootsRequested;
@@ -326,7 +369,7 @@ pub const Network = struct {
 
         for (roots) |root| {
             if (self.hasPendingBlockRoot(root)) continue;
-            self.trackPendingBlockRoot(root) catch |err| {
+            self.trackPendingBlockRoot(root, depth) catch |err| {
                 self.finalizePendingRequest(request_id);
                 return err;
             };
@@ -338,6 +381,7 @@ pub const Network = struct {
     pub fn ensureBlocksByRootRequest(
         self: *Self,
         roots: []const types.Root,
+        depth: u32,
         handler: networks.OnReqRespResponseCbHandler,
     ) !?BlocksByRootRequestResult {
         if (roots.len == 0) return null;
@@ -346,7 +390,7 @@ pub const Network = struct {
 
         const peer = self.selectPeer() orelse return error.NoPeersAvailable;
 
-        const request_id = try self.sendBlocksByRootRequest(peer, roots, handler);
+        const request_id = try self.sendBlocksByRootRequest(peer, roots, depth, handler);
 
         return BlocksByRootRequestResult{
             .peer_id = peer,

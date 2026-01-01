@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const aggregate = @import("aggregate.zig");
+
 /// Opaque pointer to the Rust KeyPair struct
 pub const HashSigKeyPair = opaque {};
 
