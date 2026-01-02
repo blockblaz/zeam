@@ -9,7 +9,7 @@ const keymanager = @import("@zeam/key-manager");
 
 const transition = @import("./transition.zig");
 
-const MockChainData = struct {
+pub const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
     blocks: []types.SignedBlockWithAttestation,
