@@ -186,8 +186,10 @@ pub const BeamState = struct {
         // this completes latest block header for parentRoot checks of new block
 
         if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
+            const slot_timer = zeam_metrics.lean_state_transition_state_root_in_slot_time_seconds.start();
             var prev_state_root: [32]u8 = undefined;
             try ssz.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            _ = slot_timer.observe();
             self.latest_block_header.state_root = prev_state_root;
         }
     }
@@ -237,8 +239,10 @@ pub const BeamState = struct {
         }
 
         // 4. verify latest block header is the parent
+        const header_timer = zeam_metrics.lean_state_transition_block_header_hash_time_seconds.start();
         var head_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        _ = header_timer.observe();
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
             logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
@@ -268,23 +272,27 @@ pub const BeamState = struct {
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
 
-    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, opts: anytype) !void {
         const block_timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
         defer _ = block_timer.observe();
 
         // start block processing
-        try self.process_block_header(allocator, staged_block, logger);
+        try self.process_block_header(allocator, staged_block, opts.logger);
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
-        try self.process_operations(allocator, staged_block, logger);
+        try self.process_operations(allocator, staged_block, opts);
     }
 
-    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, opts: anytype) !void {
+        // Compute current block root for cache population
+        var current_block_root: Root = undefined;
+        try ssz.hashTreeRoot(BeamBlock, staged_block, &current_block_root, allocator);
+
         // 1. process attestations
-        try self.process_attestations(allocator, staged_block.body.attestations, logger);
+        try self.process_attestations(allocator, staged_block.body.attestations, staged_block.parent_root, current_block_root, opts);
     }
 
-    fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, logger: zeam_utils.ModuleLogger) !void {
+    fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, parent_root: Root, current_block_root: Root, opts: anytype) !void {
         const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
         defer _ = attestations_timer.observe();
 
@@ -293,13 +301,13 @@ pub const BeamState = struct {
             zeam_metrics.metrics.lean_state_transition_attestations_processed_total.incrBy(attestation_count);
         }
 
-        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
+        opts.logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
         const justified_str = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str);
         const finalized_str = try self.latest_finalized.toJsonString(allocator);
         defer allocator.free(finalized_str);
 
-        logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
+        opts.logger.debug("prestate justified={s} finalized={s}", .{ justified_str, finalized_str });
 
         // work directly with SSZ types
         // historical_block_hashes and justified_slots are already SSZ types in state
@@ -313,7 +321,26 @@ pub const BeamState = struct {
             justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
-        try self.getJustification(allocator, &justifications);
+
+        // Try to use cached justifications if available
+        const get_just_timer = zeam_metrics.lean_state_transition_get_justification_time_seconds.start();
+        if (opts.justifications_cache) |cache| {
+            if (cache.get(parent_root)) |cached_map| {
+                // Cache hit - clone the cached justifications map
+                var it = cached_map.iterator();
+                while (it.next()) |entry| {
+                    const cloned_value = try allocator.dupe(u8, entry.value_ptr.*);
+                    try justifications.put(allocator, entry.key_ptr.*, cloned_value);
+                }
+            } else {
+                // Cache miss - build from state
+                try self.getJustification(allocator, &justifications);
+            }
+        } else {
+            // No cache available - build from state
+            try self.getJustification(allocator, &justifications);
+        }
+        _ = get_just_timer.observe();
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -326,7 +353,7 @@ pub const BeamState = struct {
             const attestation_str = try attestation_data.toJsonString(allocator);
             defer allocator.free(attestation_str);
 
-            logger.debug("processing attestation={s} validator_id={d}\n....\n", .{ attestation_str, validator_id });
+            opts.logger.debug("processing attestation={s} validator_id={d}\n....\n", .{ attestation_str, validator_id });
 
             if (source_slot >= self.justified_slots.len()) {
                 return StateTransitionError.InvalidSlotIndex;
@@ -357,7 +384,7 @@ pub const BeamState = struct {
                 target_not_ahead or
                 !is_target_justifiable)
             {
-                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                opts.logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
                     is_source_justified,
                     is_target_already_justified,
                     has_correct_source_root,
@@ -389,7 +416,7 @@ pub const BeamState = struct {
                     target_justifications_count += 1;
                 }
             }
-            logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, attestation_data.target.root, target_justifications });
+            opts.logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, attestation_data.target.root, target_justifications });
 
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
@@ -406,7 +433,7 @@ pub const BeamState = struct {
                 const justified_str_new = try self.latest_justified.toJsonString(allocator);
                 defer allocator.free(justified_str_new);
 
-                logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
+                opts.logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
 
                 // source is finalized if target is the next valid justifiable hash
                 var can_target_finalize = true;
@@ -416,26 +443,41 @@ pub const BeamState = struct {
                         break;
                     }
                 }
-                logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
+                opts.logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
                 if (can_target_finalize == true) {
                     self.latest_finalized = attestation_data.source;
                     const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
                     defer allocator.free(finalized_str_new);
 
-                    logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
+                    opts.logger.debug("\n\n\n-----------------DOUBLE HURRAY FINALIZATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{finalized_str_new});
                 }
             }
         }
 
+        const with_just_timer = zeam_metrics.lean_state_transition_with_justifications_time_seconds.start();
         try self.withJustifications(allocator, &justifications);
+        _ = with_just_timer.observe();
 
-        logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
+        opts.logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
         const justified_str_final = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str_final);
         const finalized_str_final = try self.latest_finalized.toJsonString(allocator);
         defer allocator.free(finalized_str_final);
 
-        logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+        opts.logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+
+        // Populate cache with processed justifications for next block to reuse
+        if (opts.justifications_cache) |cache| {
+            // Clone the justifications map before it gets freed
+            var cloned_map: std.AutoHashMapUnmanaged(Root, []u8) = .empty;
+            var it = justifications.iterator();
+            while (it.next()) |entry| {
+                const cloned_value = try allocator.dupe(u8, entry.value_ptr.*);
+                try cloned_map.put(allocator, entry.key_ptr.*, cloned_value);
+            }
+            // Store in cache for future blocks
+            try cache.put(current_block_root, cloned_map);
+        }
     }
 
     pub fn genGenesisBlock(self: *const Self, allocator: Allocator, genesis_block: *block.BeamBlock) !void {

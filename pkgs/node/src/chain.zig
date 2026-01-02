@@ -85,6 +85,7 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
+    justifications_cache: std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)),
 
     const Self = @This();
 
@@ -121,6 +122,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
+            .justifications_cache = std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)).init(allocator),
         };
     }
 
@@ -131,6 +133,18 @@ pub const BeamChain = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
+
+        // Clean up justifications cache
+        var cache_it = self.justifications_cache.iterator();
+        while (cache_it.next()) |entry| {
+            var just_it = entry.value_ptr.iterator();
+            while (just_it.next()) |just_entry| {
+                self.allocator.free(just_entry.value_ptr.*);
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.justifications_cache.deinit();
+
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         self.anchor_state.deinit();
@@ -531,20 +545,38 @@ pub const BeamChain = struct {
             break :computedroot cblock_root;
         };
 
-        const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
+        const post_state = if (blockInfo.postState) |post_state_ptr| cachedstate: {
+            // PATH 1: Block with precomputed state (proposer or DB replay)
+            // These blocks skip apply_transition() so cache metrics aren't recorded
+            // Track this path for visibility
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_chain_blocks_with_cached_state_total.incr();
+            }
+            break :cachedstate post_state_ptr;
+        } else computedstate: {
+            // PATH 2: Block needs fresh validation - cache is used here
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_chain_blocks_with_computed_state_total.incr();
+            }
+
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
+            const clone_timer = zeam_metrics.lean_chain_state_clone_time_seconds.start();
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
+            _ = clone_timer.observe();
 
             // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
+            const sig_verify_timer = zeam_metrics.lean_chain_signature_verification_time_seconds.start();
             try stf.verifySignatures(self.allocator, pre_state, &signedBlock);
+            _ = sig_verify_timer.observe();
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
                 //
                 .logger = self.stf_logger,
                 .validSignatures = true,
+                .justifications_cache = if (self.config.spec.cache_justifications orelse false) &self.justifications_cache else null,
             });
             break :computedstate cpost_state;
         };
@@ -568,6 +600,7 @@ pub const BeamChain = struct {
                 block.slot,
             });
 
+            const attestation_loop_timer = zeam_metrics.lean_chain_attestation_loop_time_seconds.start();
             for (block.body.attestations.constSlice(), 0..) |attestation, index| {
                 // Validate attestation before processing (from block = true)
                 self.validateAttestation(attestation, true) catch |e| {
@@ -593,15 +626,19 @@ pub const BeamChain = struct {
                 };
                 zeam_metrics.incrementLeanAttestationsValid(true);
             }
+            _ = attestation_loop_timer.observe();
 
             // 5. fc update head
+            const updatehead_timer = zeam_metrics.lean_fork_choice_updatehead_time_seconds.start();
             _ = try self.forkChoice.updateHead();
+            _ = updatehead_timer.observe();
 
             break :fcprocessing freshFcBlock;
         };
         try self.states.put(fcBlock.blockRoot, post_state);
 
         // 6. import proposer attestation as if it was transmitted on network after block
+        const proposer_attest_timer = zeam_metrics.lean_chain_proposer_attestation_time_seconds.start();
         const proposer_signature = signatures[block.body.attestations.len()];
         const signed_proposer_attestation = types.SignedAttestation{
             .message = signedBlock.message.proposer_attestation,
@@ -610,16 +647,19 @@ pub const BeamChain = struct {
         self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
         };
+        _ = proposer_attest_timer.observe();
 
         const processing_time = onblock_timer.observe();
 
         // 7. Save block and state to database and confirm the block in forkchoice
+        const db_write_timer = zeam_metrics.lean_chain_database_write_time_seconds.start();
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
             self.module_logger.err("failed to update block database for block root=0x{s}: {any}", .{
                 std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
                 err,
             });
         };
+        _ = db_write_timer.observe();
         try self.forkChoice.confirmBlock(block_root);
 
         self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
@@ -633,6 +673,9 @@ pub const BeamChain = struct {
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool) void {
+        const followup_timer = zeam_metrics.lean_chain_onblockfollowup_time_seconds.start();
+        defer _ = followup_timer.observe();
+
         // 8. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
         const new_head = self.forkChoice.head;
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
