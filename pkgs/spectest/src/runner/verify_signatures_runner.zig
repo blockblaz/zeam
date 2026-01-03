@@ -45,6 +45,9 @@ const state_transition = @import("@zeam/state-transition");
 const ssz = @import("ssz");
 const xmss = @import("@zeam/xmss");
 
+const DEFAULT_SIGNATURE_SSZ_LEN: usize = types.SIGSIZE;
+const TEST_SIGNATURE_SSZ_LEN: usize = 424;
+
 // Signature structure constants from leansig
 // path: 8 siblings, each is 8 u32 = 256 bytes
 // rho: 7 u32 = 28 bytes
@@ -181,6 +184,15 @@ fn runCase(
         },
     };
 
+    const signature_ssz_len: usize = blk: {
+        const lean_env_val = case_obj.get("leanEnv") orelse break :blk DEFAULT_SIGNATURE_SSZ_LEN;
+        const lean_env = switch (lean_env_val) {
+            .string => |s| s,
+            else => break :blk DEFAULT_SIGNATURE_SSZ_LEN,
+        };
+        break :blk if (std.mem.eql(u8, lean_env, "test")) TEST_SIGNATURE_SSZ_LEN else DEFAULT_SIGNATURE_SSZ_LEN;
+    };
+
     // Parse the anchorState to get validators
     const anchor_state_value = case_obj.get("anchorState") orelse {
         std.debug.print("fixture {s} case {s}: missing anchorState\n", .{ ctx.fixture_label, ctx.case_name });
@@ -203,40 +215,13 @@ fn runCase(
     const expect_failure = std.mem.indexOf(u8, ctx.fixture_label, "invalid") != null or
         std.mem.indexOf(u8, ctx.case_name, "invalid") != null;
 
-    // Debug: print signature info
-    const sig = &signed_block.signature.proposer_signature;
-    std.debug.print("fixture {s}: signature first 32 bytes: {x}\n", .{ ctx.fixture_label, sig[0..32].* });
-    std.debug.print("fixture {s}: signature last 32 bytes: {x}\n", .{ ctx.fixture_label, sig[sig.len - 32 ..].* });
-
-    // Debug: print proposer attestation data and computed message hash
-    const proposer_att = signed_block.message.proposer_attestation;
-    std.debug.print("fixture {s}: proposer_attestation.validator_id: {d}\n", .{ ctx.fixture_label, proposer_att.validator_id });
-    std.debug.print("fixture {s}: proposer_attestation.data.slot: {d}\n", .{ ctx.fixture_label, proposer_att.data.slot });
-    std.debug.print("fixture {s}: proposer_attestation.data.head.root: {x}\n", .{ ctx.fixture_label, proposer_att.data.head.root });
-    std.debug.print("fixture {s}: proposer_attestation.data.head.slot: {d}\n", .{ ctx.fixture_label, proposer_att.data.head.slot });
-
-    // Compute message hash for debugging
-    var debug_message: [32]u8 = undefined;
-    ssz.hashTreeRoot(types.AttestationData, proposer_att.data, &debug_message, allocator) catch |err| {
-        std.debug.print("fixture {s}: hashTreeRoot failed: {s}\n", .{ ctx.fixture_label, @errorName(err) });
-    };
-    std.debug.print("fixture {s}: computed message hash: {x}\n", .{ ctx.fixture_label, debug_message });
-
-    // Debug: print pubkey
-    const validators = anchor_state.validators.constSlice();
-    if (proposer_att.validator_id < validators.len) {
-        const pubkey = validators[proposer_att.validator_id].getPubkey();
-        std.debug.print("fixture {s}: pubkey first 20 bytes: {x}\n", .{ ctx.fixture_label, pubkey[0..20].* });
-        std.debug.print("fixture {s}: pubkey all 52 bytes: {x}\n", .{ ctx.fixture_label, pubkey[0..52].* });
-    }
-
-    // Debug: print signature details  
-    std.debug.print("fixture {s}: sig offset_path (bytes 0-3): {x}\n", .{ ctx.fixture_label, sig[0..4].* });
-    std.debug.print("fixture {s}: sig rho (bytes 4-31): {x}\n", .{ ctx.fixture_label, sig[4..32].* });
-    std.debug.print("fixture {s}: sig offset_hashes (bytes 32-35): {x}\n", .{ ctx.fixture_label, sig[32..36].* });
-
     // Verify signatures
-    const verify_result = state_transition.verifySignatures(allocator, &anchor_state, &signed_block);
+    const verify_result = state_transition.verifySignaturesWithSignatureLen(
+        allocator,
+        &anchor_state,
+        &signed_block,
+        signature_ssz_len,
+    );
 
     if (expect_failure) {
         if (verify_result) |_| {
