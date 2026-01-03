@@ -2,7 +2,6 @@ const ssz = @import("ssz");
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
-const utils = types.utils;
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
@@ -61,6 +60,20 @@ pub fn verifySignatures(
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
 ) !void {
+    return verifySignaturesWithSignatureLen(
+        allocator,
+        state,
+        signed_block,
+        types.SIGSIZE,
+    );
+}
+
+pub fn verifySignaturesWithSignatureLen(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    signed_block: *const types.SignedBlockWithAttestation,
+    signature_ssz_len: usize,
+) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
     const signature_groups = signed_block.signature.attestation_signatures.constSlice();
 
@@ -78,33 +91,40 @@ pub fn verifySignatures(
         }
 
         for (validator_indices.items, signatures) |validator_index, signature| {
-            try verifySingleAttestation(
+            try verifySingleAttestationWithSignatureLen(
                 allocator,
                 state,
                 validator_index,
                 &aggregated_attestation.data,
                 &signature,
+                signature_ssz_len,
             );
         }
     }
 
     const proposer_attestation = signed_block.message.proposer_attestation;
-    try verifySingleAttestation(
+    try verifySingleAttestationWithSignatureLen(
         allocator,
         state,
         @intCast(proposer_attestation.validator_id),
         &proposer_attestation.data,
         &signed_block.signature.proposer_signature,
+        signature_ssz_len,
     );
 }
 
-pub fn verifySingleAttestation(
+fn verifySingleAttestationWithSignatureLen(
     allocator: Allocator,
     state: *const types.BeamState,
     validator_index: usize,
     attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
+    signature_ssz_len: usize,
 ) !void {
+    if (signature_ssz_len > signatureBytes.len) {
+        return StateTransitionError.InvalidBlockSignatures;
+    }
+
     const validatorIndex = validator_index;
     const validators = state.validators.constSlice();
     if (validatorIndex >= validators.len) {
@@ -120,8 +140,25 @@ pub fn verifySingleAttestation(
 
     const epoch: u32 = @intCast(attestation_data.slot);
 
-    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
+    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes.*[0..signature_ssz_len]);
     _ = verification_timer.observe();
+}
+
+pub fn verifySingleAttestation(
+    allocator: Allocator,
+    state: *const types.BeamState,
+    validator_index: usize,
+    attestation_data: *const types.AttestationData,
+    signatureBytes: *const types.SIGBYTES,
+) !void {
+    return verifySingleAttestationWithSignatureLen(
+        allocator,
+        state,
+        validator_index,
+        attestation_data,
+        signatureBytes,
+        signatureBytes.len,
+    );
 }
 
 // TODO(gballet) check if beam block needs to be a pointer
