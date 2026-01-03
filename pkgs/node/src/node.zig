@@ -1010,7 +1010,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .proposer_index = 0,
                 .state_root = [_]u8{0} ** 32,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1023,7 +1023,7 @@ test "Node: fetched blocks cache and deduplication" {
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
@@ -1035,7 +1035,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .proposer_index = 0,
                 .state_root = [_]u8{0} ** 32,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1048,7 +1048,7 @@ test "Node: fetched blocks cache and deduplication" {
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     // Cache blocks
@@ -1170,7 +1170,7 @@ fn makeTestSignedBlockWithParent(
                 .proposer_index = 0,
                 .state_root = [_]u8{0} ** 32,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1183,7 +1183,7 @@ fn makeTestSignedBlockWithParent(
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     return block_ptr;

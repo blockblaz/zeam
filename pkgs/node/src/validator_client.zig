@@ -123,9 +123,9 @@ pub const ValidatorClient = struct {
             //    attestation signatures
             var signatures = produced_block.signatures;
 
-            // 5. Sign proposer attestation (last signature)
+            // 5. Sign proposer attestation and attach to block signatures
             const proposer_signature = try self.key_manager.signAttestation(&proposer_attestation, self.allocator);
-            try signatures.append(proposer_signature);
+            signatures.proposer_signature = proposer_signature;
 
             const signed_block = types.SignedBlockWithAttestation{
                 .message = block_with_attestation,

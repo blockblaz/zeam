@@ -136,7 +136,7 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var attestations = try block.Attestations.init(std.testing.allocator);
+    const attestations = try block.AggregatedAttestations.init(std.testing.allocator);
 
     var test_block = block.SignedBlockWithAttestation{
         .message = .{
