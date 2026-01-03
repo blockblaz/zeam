@@ -17,8 +17,4 @@ serde_json = "1.0"
 crate-type = ["staticlib"]
 name = "hashsig_glue"
 
-[dev-dependencies]
-hex = "0.4.3"
-p3-field = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a33a312" }
-p3-koala-bear = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a33a312" }
-p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git", rev = "a33a312" }
+

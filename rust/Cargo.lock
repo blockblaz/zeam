@@ -2647,11 +2647,7 @@ name = "hashsig-glue"
 version = "0.1.0"
 dependencies = [
  "ethereum_ssz",
- "hex",
  "leansig 0.1.0 (git+https://github.com/leanEthereum/leanSig?rev=b621826f948ffc133dd893131aac2c7efa7f90e0)",
- "p3-field 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
- "p3-koala-bear 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
- "p3-symmetric 0.3.0 (git+https://github.com/Plonky3/Plonky3.git?rev=a33a312)",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "serde",
