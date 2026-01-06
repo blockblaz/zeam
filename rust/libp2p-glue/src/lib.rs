@@ -1286,11 +1286,14 @@ impl Behaviour {
         let message_id_fn = |message: &gossipsub::Message| Self::message_id_fn(message);
 
         // Set a custom gossipsub configuration
+        // When we run with only a few peers (e.g. local devnets) libp2p would reject
+        // publishes with `InsufficientPeers` because the default mesh parameters expect
+        // ≥6 peers. Use smaller thresholds so we can still publish when < 6 peers exist.
         let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .mesh_n(8)
-            .mesh_n_low(6)
-            .mesh_n_high(12)
-            .gossip_lazy(6)
+            .mesh_n(4)
+            .mesh_n_low(2)
+            .mesh_n_high(6)
+            .gossip_lazy(3)
             .heartbeat_interval(Duration::from_millis(700))
             .validation_mode(gossipsub::ValidationMode::Anonymous)
             .history_length(6)

@@ -651,6 +651,13 @@ pub const ForkChoice = struct {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
+        // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
+        // This prevents creating invalid attestations where source slot exceeds target slot
+        // If the calculated target is older than latest_justified, use latest_justified instead
+        if (nodes[target_idx].slot < self.fcStore.latest_justified.slot) {
+            return self.fcStore.latest_justified;
+        }
+
         return types.Checkpoint{
             .root = nodes[target_idx].blockRoot,
             .slot = nodes[target_idx].slot,

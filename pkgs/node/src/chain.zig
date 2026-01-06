@@ -1002,6 +1002,54 @@ pub const BeamChain = struct {
             .head_slot = head.slot,
         };
     }
+
+    /// Check if the chain is synced by verifying we're at or past the justified slot
+    /// and synced with peer finalized checkpoints.
+    /// Once past justified and synced with peers, validators can safely participate in consensus.
+    /// If blocks are produced while slightly behind peers, they will naturally get reorged.
+    pub fn isSynced(self: *Self) bool {
+        const our_head_slot = self.forkChoice.head.slot;
+        const our_justified_slot = self.forkChoice.fcStore.latest_justified.slot;
+        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+
+        // If no peers connected, we can't verify sync status - assume not synced
+        if (self.connected_peers.count() == 0) {
+            return false;
+        }
+
+        // We must be at or past the justified slot to participate
+        if (our_head_slot < our_justified_slot) {
+            self.module_logger.debug("not synced: our head slot {d} < our justified slot {d}", .{
+                our_head_slot,
+                our_justified_slot,
+            });
+            return false;
+        }
+
+        // Find the maximum finalized slot reported by any peer
+        var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+
+        var peer_iter = self.connected_peers.iterator();
+        while (peer_iter.next()) |entry| {
+            const peer_info = entry.value_ptr;
+            if (peer_info.latest_status) |status| {
+                if (status.finalized_slot > max_peer_finalized_slot) {
+                    max_peer_finalized_slot = status.finalized_slot;
+                }
+            }
+        }
+
+        // We must also be synced with peers (at or past max peer finalized slot)
+        if (our_head_slot < max_peer_finalized_slot) {
+            self.module_logger.debug("not synced: our head slot {d} < max peer finalized slot {d}", .{
+                our_head_slot,
+                max_peer_finalized_slot,
+            });
+            return false;
+        }
+
+        return true;
+    }
 };
 
 pub const BlockProcessingError = error{MissingPreState};
