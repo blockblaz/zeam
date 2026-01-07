@@ -52,24 +52,6 @@ pub const JustificationRoots = ssz.utils.List(Root, params.HISTORICAL_ROOTS_LIMI
 pub const JustifiedSlots = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT);
 pub const JustificationValidators = ssz.utils.Bitlist(params.HISTORICAL_ROOTS_LIMIT * params.VALIDATOR_REGISTRY_LIMIT);
 
-fn hasDuplicateAttestationData(attestations: AggregatedAttestations, allocator: Allocator) !bool {
-    var seen = std.AutoHashMap(Root, bool).init(allocator);
-    defer seen.deinit();
-
-    for (attestations.constSlice()) |aggregated_attestation| {
-        var data_root: Root = undefined;
-        try ssz.hashTreeRoot(attestation.AttestationData, aggregated_attestation.data, &data_root, allocator);
-
-        const entry = try seen.getOrPut(data_root);
-        if (entry.found_existing) {
-            return true;
-        }
-        entry.value_ptr.* = true;
-    }
-
-    return false;
-}
-
 pub const BeamState = struct {
     config: BeamStateConfig,
     slot: Slot,
@@ -294,10 +276,6 @@ pub const BeamState = struct {
         // start block processing
         try self.process_block_header(allocator, staged_block, logger);
 
-        if (try hasDuplicateAttestationData(staged_block.body.attestations, allocator)) {
-            logger.err("process-block: duplicate attestation data detected", .{});
-            return StateTransitionError.DuplicateAttestationData;
-        }
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
         try self.process_operations(allocator, staged_block, logger);
@@ -377,7 +355,7 @@ pub const BeamState = struct {
             const stored_target_root = try self.historical_block_hashes.get(target_slot);
             const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
-            const has_known_root = has_correct_source_root or has_correct_target_root;
+            const has_known_root = has_correct_source_root and has_correct_target_root;
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
 
