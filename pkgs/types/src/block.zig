@@ -141,7 +141,12 @@ pub const BeamBlock = struct {
 
     pub fn blockToHeader(self: *const Self, allocator: Allocator) !BeamBlockHeader {
         var body_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(BeamBlockBody, self.body, &body_root, allocator);
+        try ssz.hashTreeRoot(
+            BeamBlockBody,
+            self.body,
+            &body_root,
+            allocator,
+        );
 
         return BeamBlockHeader{
             .slot = self.slot,
@@ -154,7 +159,12 @@ pub const BeamBlock = struct {
 
     pub fn blockToLatestBlockHeader(self: *const Self, allocator: Allocator, header: *BeamBlockHeader) !void {
         var body_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(BeamBlockBody, self.body, &body_root, allocator);
+        try ssz.hashTreeRoot(
+            BeamBlockBody,
+            self.body,
+            &body_root,
+            allocator,
+        );
 
         header.* = .{
             .slot = self.slot,
