@@ -1080,6 +1080,13 @@ pub const ForkChoice = struct {
         return self.head;
     }
 
+    /// Get the current safe target block (thread-safe)
+    pub fn getSafeTarget(self: *Self) ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.safeTarget;
+    }
+
     /// Get the latest justified checkpoint
     pub fn getLatestJustified(self: *Self) types.Checkpoint {
         self.mutex.lockShared();

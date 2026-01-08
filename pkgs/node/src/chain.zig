@@ -334,7 +334,7 @@ pub const BeamChain = struct {
         const head_str = try head.toJsonString(self.allocator);
         defer self.allocator.free(head_str);
 
-        const safe_target_proto = self.forkChoice.safeTarget;
+        const safe_target_proto = self.forkChoice.getSafeTarget();
         const safe_target: types.Checkpoint = .{
             .root = safe_target_proto.blockRoot,
             .slot = safe_target_proto.slot,
