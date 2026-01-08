@@ -1058,6 +1058,18 @@ pub const ForkChoice = struct {
         return self.confirmBlockUnlocked(blockRoot);
     }
 
+    pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.computeDeltasUnlocked(from_known);
+    }
+
+    pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
+    }
+
     //  SAFE GETTERS FOR SHARED STATE
     // These provide thread-safe access to internal state
 
@@ -1630,6 +1642,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
+        .mutex = Thread.RwLock{},
     };
 
     return .{
@@ -1823,7 +1836,7 @@ test "rebase: bestChild and bestDescendant remapping" {
 
     // Apply deltas to establish weights and bestChild/bestDescendant
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 0);
+    try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Verify pre-rebase bestChild/bestDescendant
     // C(2) should have bestChild=3(D) since D branch has all 4 votes
@@ -1923,7 +1936,7 @@ test "rebase: weight preservation after rebase" {
 
     // Apply deltas to establish weights
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 0);
+    try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Record pre-rebase weights for nodes that will remain
     const pre_rebase_weight_C = ctx.fork_choice.protoArray.nodes.items[2].weight; // C
@@ -2578,6 +2591,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
+        .mutex = Thread.RwLock{},
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
