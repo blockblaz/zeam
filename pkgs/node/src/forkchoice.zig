@@ -364,7 +364,7 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn getAncestorsOfFinalizedUnlocked(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
         var ancestors = std.ArrayList(types.Root).init(allocator);
-        
+
         var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
 
         while (current_idx_or_null) |current_idx| {
