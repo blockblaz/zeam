@@ -18,9 +18,10 @@ pub fn registerNode(node_ptr: *anyopaque) void {
     global_node_ptr = node_ptr;
 }
 
-/// Internal function to get finalized state from the registered node
+/// Internal function to get finalized lean state (BeamState) from the registered node
 /// This function casts the opaque pointer and accesses the chain structure
 /// The node structure is: Node { beam_node: BeamNode { chain: *BeamChain { ... } } }
+/// Returns the finalized checkpoint lean state (BeamState) if available
 fn getFinalizedStateInternal(_allocator: std.mem.Allocator) ?*const types.BeamState {
     _ = _allocator;
     node_ptr_mutex.lock();
@@ -70,20 +71,20 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16) !void {
 }
 
 /// Handle finalized checkpoint state endpoint
-/// Serves the finalized checkpoint state as SSZ octet-stream at /lean/states/finalized
+/// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
 fn handleFinalizedCheckpointState(request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
-    // Retrieve the finalized state
-    const finalized_state = getFinalizedStateInternal(allocator) orelse {
-        _ = request.respond("Not Found: Finalized checkpoint state not available\n", .{ .status = .not_found }) catch {};
+    // Retrieve the finalized lean state (BeamState)
+    const finalized_lean_state = getFinalizedStateInternal(allocator) orelse {
+        _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
         return;
     };
 
-    // Serialize state to SSZ
+    // Serialize lean state (BeamState) to SSZ
     var ssz_output = std.ArrayList(u8).init(allocator);
     defer ssz_output.deinit();
 
-    ssz.serialize(types.BeamState, finalized_state.*, &ssz_output) catch |err| {
-        std.log.err("Failed to serialize finalized state to SSZ: {}", .{err});
+    ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
+        std.log.err("Failed to serialize finalized lean state to SSZ: {}", .{err});
         _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
         return;
     };
@@ -92,14 +93,14 @@ fn handleFinalizedCheckpointState(request: *std.http.Server.Request, allocator: 
     var content_length_buf: [32]u8 = undefined;
     const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
 
-    // Respond with SSZ octet-stream
+    // Respond with lean state (BeamState) as SSZ octet-stream
     _ = request.respond(ssz_output.items, .{
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/octet-stream" },
             .{ .name = "content-length", .value = content_length_str },
         },
     }) catch |err| {
-        std.log.warn("Failed to respond with finalized state: {}", .{err});
+        std.log.warn("Failed to respond with finalized lean state: {}", .{err});
         return err;
     };
 }
