@@ -16,6 +16,18 @@ const zkvm_targets: []const zkvmTarget = &.{
 
 const ProverChoice = enum { dummy, risc0, openvm, all };
 
+fn setTestRunLabel(b: *Builder, run_step: *std.Build.Step.Run, name: []const u8) void {
+    run_step.step.name = b.fmt("test {s}", .{name});
+}
+
+fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compile_step: *std.Build.Step.Compile) void {
+    const source_name = if (compile_step.root_module.root_source_file) |root_source|
+        root_source.getDisplayName()
+    else
+        compile_step.step.name;
+    setTestRunLabel(b, run_step, source_name);
+}
+
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
@@ -23,22 +35,26 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
     switch (prover) {
         .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
@@ -418,6 +434,7 @@ pub fn build(b: *Builder) !void {
     });
     types_tests.root_module.addImport("ssz", ssz);
     const run_types_test = b.addRunArtifact(types_tests);
+    setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
 
     const transition_tests = b.addTest(.{
@@ -432,6 +449,7 @@ pub fn build(b: *Builder) !void {
     transition_tests.root_module.addImport("@zeam/metrics", zeam_metrics);
     transition_tests.root_module.addImport("ssz", ssz);
     const run_transition_test = b.addRunArtifact(transition_tests);
+    setTestRunLabelFromCompile(b, run_transition_test, transition_tests);
     test_step.dependOn(&run_transition_test.step);
 
     const manager_tests = b.addTest(.{
@@ -442,6 +460,7 @@ pub fn build(b: *Builder) !void {
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
     addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
+    setTestRunLabelFromCompile(b, run_manager_test, manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
     const node_tests = b.addTest(.{
@@ -451,6 +470,7 @@ pub fn build(b: *Builder) !void {
     });
     addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
+    setTestRunLabelFromCompile(b, run_node_test, node_tests);
     test_step.dependOn(&run_node_test.step);
 
     const cli_tests = b.addTest(.{
@@ -462,6 +482,7 @@ pub fn build(b: *Builder) !void {
     cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
+    setTestRunLabelFromCompile(b, run_cli_test, cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
     const params_tests = b.addTest(.{
@@ -470,6 +491,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_params_tests = b.addRunArtifact(params_tests);
+    setTestRunLabelFromCompile(b, run_params_tests, params_tests);
     test_step.dependOn(&run_params_tests.step);
 
     const network_tests = b.addTest(.{
@@ -482,6 +504,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("ssz", ssz);
     addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
+    setTestRunLabelFromCompile(b, run_network_tests, network_tests);
     test_step.dependOn(&run_network_tests.step);
 
     const configs_tests = b.addTest(.{
@@ -496,6 +519,7 @@ pub fn build(b: *Builder) !void {
     configs_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, configs_tests, target, prover);
     const run_configs_tests = b.addRunArtifact(configs_tests);
+    setTestRunLabelFromCompile(b, run_configs_tests, configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
     const utils_tests = b.addTest(.{
@@ -504,6 +528,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
+    setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
     test_step.dependOn(&run_utils_tests.step);
 
     const database_tests = b.addTest(.{
@@ -512,6 +537,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_database_tests = b.addRunArtifact(database_tests);
+    setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
     const xmss_tests = b.addTest(.{
@@ -524,7 +550,22 @@ pub fn build(b: *Builder) !void {
     xmss_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_tests, target, prover);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
+
+    const xmss_cycle_tests = b.addTest(.{
+        .root_source_file = b.path("pkgs/testing/test_xmss_cycle.zig"),
+        .optimize = optimize,
+        .target = target,
+    });
+    xmss_cycle_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
+    xmss_cycle_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    xmss_cycle_tests.root_module.addImport("@zeam/types", zeam_types);
+    xmss_cycle_tests.root_module.addImport("ssz", ssz);
+    xmss_cycle_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, xmss_cycle_tests, target, prover);
+    const run_xmss_cycle_tests = b.addRunArtifact(xmss_cycle_tests);
+    test_step.dependOn(&run_xmss_cycle_tests.step);
 
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
@@ -553,6 +594,7 @@ pub fn build(b: *Builder) !void {
     });
     tools_cli_tests.root_module.addImport("enr", enr);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    setTestRunLabelFromCompile(b, run_tools_cli_test, tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
     test_step.dependOn(tools_test_step);
@@ -560,6 +602,7 @@ pub fn build(b: *Builder) !void {
     // Create simtest step that runs only integration tests
     const simtests = b.step("simtest", "Run integration tests");
     const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
+    setTestRunLabelFromCompile(b, run_cli_integration_test, cli_integration_tests);
     simtests.dependOn(&run_cli_integration_test.step);
 
     // Create spectest step that runs spec tests
@@ -638,18 +681,19 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "cargo", "+nightly",      "-C", path,          "-Z", "unstable-options",
+            "build", "--release",     "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "-p",    "multisig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
-            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
-            "risc0-glue", "-p",        "hashsig-glue",
+            "cargo",      "+nightly",  "-C",            path, "-Z",            "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue",   "-p",
+            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
-            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
-            "openvm-glue", "-p",        "hashsig-glue",
+            "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
+            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",

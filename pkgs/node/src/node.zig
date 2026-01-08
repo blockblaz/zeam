@@ -9,15 +9,18 @@ const networks = @import("@zeam/network");
 const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
+const stf = @import("@zeam/state-transition");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
+const testing = @import("./testing.zig");
 
 pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
+const forkchoice = @import("./forkchoice.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
@@ -111,11 +114,24 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .block => |signed_block| {
-                const parent_root = signed_block.message.block.parent_root;
-                if (!self.chain.forkChoice.hasBlock(parent_root)) {
+                const block = signed_block.message.block;
+                const parent_root = block.parent_root;
+                const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
+
+                self.logger.info("received gossip block for slot={any} parent_root={any} proposer={d}{} hasParentBlock={any} from peer={s}{}", .{
+                    block.slot,
+                    std.fmt.fmtSliceHexLower(&parent_root),
+                    block.proposer_index,
+                    self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+                    hasParentBlock,
+                    sender_peer_id,
+                    self.node_registry.getNodeNameFromPeerId(sender_peer_id),
+                });
+
+                if (!hasParentBlock) {
                     const roots = [_]types.Root{parent_root};
-                    self.fetchBlockByRoots(&roots) catch |err| {
-                        self.logger.warn("Failed to fetch block by root: {any}", .{err});
+                    self.fetchBlockByRoots(&roots, 0) catch |err| {
+                        self.logger.warn("failed to fetch block by root: {any}", .{err});
                     };
                 }
 
@@ -123,13 +139,71 @@ pub const BeamNode = struct {
                 if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                     _ = self.network.removePendingBlockRoot(block_root);
                 } else |err| {
-                    self.logger.warn("Failed to compute block root for incoming gossip block: {any}", .{err});
+                    self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                 }
             },
-            .attestation => {},
+            .attestation => |signed_attestation| {
+                const slot = signed_attestation.message.data.slot;
+                const validator_id = signed_attestation.message.validator_id;
+                const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
+
+                const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+                self.logger.info("received gossip attestation for slot={d} validator={d}{} from peer={s}{}", .{
+                    slot,
+                    validator_id,
+                    validator_node_name,
+                    sender_peer_id,
+                    sender_node_name,
+                });
+            },
         }
 
-        try self.chain.onGossip(data, sender_peer_id);
+        const result = self.chain.onGossip(data, sender_peer_id) catch |err| {
+            // If a block is rejected because it's before finalized, drop it and prune any cached
+            // descendants we might still be holding onto.
+            if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                if (data.* == .block) {
+                    const signed_block = data.block;
+                    var block_root: types.Root = undefined;
+                    if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                        self.logger.info(
+                            "gossip block 0x{s} rejected as pre-finalized; pruning cached descendants",
+                            .{std.fmt.fmtSliceHexLower(block_root[0..])},
+                        );
+                        self.pruneCachedBlockSubtree(block_root);
+                    } else |_| {}
+                }
+                return;
+            }
+            return err;
+        };
+        self.handleGossipProcessingResult(result);
+    }
+
+    fn handleGossipProcessingResult(self: *Self, result: chainFactory.GossipProcessingResult) void {
+        // Process successfully imported blocks to retry any cached descendants
+        if (result.processed_block_root) |processed_root| {
+            self.logger.debug(
+                "gossip block 0x{s} successfully processed, checking for cached descendants",
+                .{std.fmt.fmtSliceHexLower(processed_root[0..])},
+            );
+            self.processCachedDescendants(processed_root);
+        }
+
+        // Fetch any attestation head roots that were missing while processing the block.
+        // We only own the slice when the block was actually processed (onBlock allocates it).
+        const missing_roots = result.missing_attestation_roots;
+        const owns_missing_roots = result.processed_block_root != null;
+        defer if (owns_missing_roots) self.allocator.free(missing_roots);
+
+        if (missing_roots.len > 0 and owns_missing_roots) {
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn(
+                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    .{ missing_roots.len, err },
+                );
+            };
+        }
     }
 
     fn getReqRespResponseHandler(self: *Self) networks.OnReqRespResponseCbHandler {
@@ -139,20 +213,212 @@ pub const BeamNode = struct {
         };
     }
 
-    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) void {
+    fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
+        // Find all cached blocks that have this parent
+        var descendants_to_process = std.ArrayList(types.Root).init(self.allocator);
+        defer descendants_to_process.deinit();
+
+        // TODO: Optimize this to use a more efficient data structure
+        // It is a O(n^2) operation to find all children of a parent and their descendants
+        // We should use a more efficient data structure to store the cached blocks
+        // along with the children roots so it's linear time operation in terms of the number of children
+        var it = self.network.fetched_blocks.iterator();
+        while (it.next()) |entry| {
+            const cached_block = entry.value_ptr.*;
+            if (std.mem.eql(u8, &cached_block.message.block.parent_root, &parent_root)) {
+                descendants_to_process.append(entry.key_ptr.*) catch |err| {
+                    self.logger.warn("Failed to track descendant for processing: {any}", .{err});
+                    continue;
+                };
+            }
+        }
+
+        if (descendants_to_process.items.len == 0) {
+            return;
+        }
+
+        self.logger.debug(
+            "Found {d} cached descendant(s) of block 0x{s}",
+            .{ descendants_to_process.items.len, std.fmt.fmtSliceHexLower(parent_root[0..]) },
+        );
+
+        // Try to process each descendant
+        for (descendants_to_process.items) |descendant_root| {
+            if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                self.logger.debug(
+                    "Attempting to process cached block 0x{s}",
+                    .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                );
+
+                const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
+                    if (err == chainFactory.BlockProcessingError.MissingPreState) {
+                        // Parent still missing, keep it cached
+                        self.logger.debug(
+                            "Cached block 0x{s} still missing parent, keeping in cache",
+                            .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                        );
+                    } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                        // This block is now before finalized (finalization advanced while it was cached).
+                        // Prune this block and all its cached descendants; they are no longer useful.
+                        self.logger.info(
+                            "cached block 0x{s} rejected as pre-finalized; pruning cached descendants",
+                            .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                        );
+                        self.pruneCachedBlockSubtree(descendant_root);
+                    } else {
+                        self.logger.warn(
+                            "Failed to process cached block 0x{s}: {any}",
+                            .{ std.fmt.fmtSliceHexLower(descendant_root[0..]), err },
+                        );
+                        // Remove from cache on other errors
+                        _ = self.network.removeFetchedBlock(descendant_root);
+                    }
+                    continue;
+                };
+                defer self.allocator.free(missing_roots);
+
+                self.logger.info(
+                    "Successfully processed cached block 0x{s}",
+                    .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                );
+
+                // Remove from cache now that it's been processed
+                _ = self.network.removeFetchedBlock(descendant_root);
+
+                // Recursively check for this block's descendants
+                self.processCachedDescendants(descendant_root);
+
+                // Fetch any missing attestation head blocks
+                self.fetchBlockByRoots(missing_roots, 0) catch |fetch_err| {
+                    self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
+                };
+            }
+        }
+    }
+
+    /// Remove `root` and all cached descendants from `network.fetched_blocks`, and clear any matching
+    /// entries from `network.pending_block_roots`.
+    ///
+    /// This is used when a cached block is rejected as `PreFinalizedSlot` (i.e. before finalized).
+    fn pruneCachedBlockSubtree(self: *Self, root: types.Root) void {
+        var stack = std.ArrayList(types.Root).init(self.allocator);
+        defer stack.deinit();
+
+        stack.append(root) catch return;
+
+        var pruned_count: usize = 0;
+        while (stack.items.len > 0) {
+            const current_root = stack.pop().?;
+            // Collect immediate cached children first (don't mutate the map during iteration).
+            var children = std.ArrayList(types.Root).init(self.allocator);
+            defer children.deinit();
+
+            // TODO: Optimize this to use a more efficient data structure
+            // It is a O(n^2) operation to find all children of a parent and their descendants
+            // We should use a more efficient data structure to store the cached blocks
+            // along with the children roots so it's linear time operation in terms of the number of children
+            var it = self.network.fetched_blocks.iterator();
+            while (it.next()) |entry| {
+                const cached = entry.value_ptr.*;
+                if (std.mem.eql(u8, cached.message.block.parent_root[0..], current_root[0..])) {
+                    children.append(entry.key_ptr.*) catch {};
+                }
+            }
+
+            // Enqueue children for recursive pruning.
+            for (children.items) |child_root| {
+                stack.append(child_root) catch {};
+            }
+
+            // Remove the current root from caches/tracking.
+            if (self.network.removeFetchedBlock(current_root)) {
+                pruned_count += 1;
+            }
+            _ = self.network.removePendingBlockRoot(current_root);
+        }
+
+        if (pruned_count > 0) {
+            self.logger.debug(
+                "pruned {d} cached block(s) from pre-finalized subtree rooted at 0x{s}",
+                .{ pruned_count, std.fmt.fmtSliceHexLower(root[0..]) },
+            );
+        }
+    }
+
+    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) !void {
         var block_root: types.Root = undefined;
         if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+            const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
-                self.logger.warn("Received unexpected block root 0x{s} from peer {s}{}", .{
+                self.logger.warn("received unexpected block root 0x{s} from peer {s}{}", .{
                     std.fmt.fmtSliceHexLower(block_root[0..]),
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
             }
 
+            // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
-                self.logger.warn("Failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
+                // Check if the error is due to missing parent
+                if (err == chainFactory.BlockProcessingError.MissingPreState) {
+                    // Check if we've hit the max depth
+                    if (current_depth >= constants.MAX_BLOCK_FETCH_DEPTH) {
+                        self.logger.warn(
+                            "Reached max block fetch depth ({d}) for block 0x{s}, discarding",
+                            .{ constants.MAX_BLOCK_FETCH_DEPTH, std.fmt.fmtSliceHexLower(block_root[0..]) },
+                        );
+                        return;
+                    }
+
+                    // Check if cache is full to prevent unbounded growth
+                    if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
+                        self.logger.warn(
+                            "Block cache full ({d} blocks), discarding block 0x{s}",
+                            .{ constants.MAX_CACHED_BLOCKS, std.fmt.fmtSliceHexLower(block_root[0..]) },
+                        );
+                        return;
+                    }
+
+                    // Cache this block for later processing
+                    const block_ptr = try self.allocator.create(types.SignedBlockWithAttestation);
+                    errdefer self.allocator.destroy(block_ptr);
+
+                    try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block.*, block_ptr);
+                    errdefer block_ptr.deinit();
+
+                    try self.network.cacheFetchedBlock(block_root, block_ptr);
+
+                    self.logger.debug(
+                        "Cached block 0x{s} at depth {d}, fetching parent 0x{s}",
+                        .{
+                            std.fmt.fmtSliceHexLower(block_root[0..]),
+                            current_depth,
+                            std.fmt.fmtSliceHexLower(signed_block.message.block.parent_root[0..]),
+                        },
+                    );
+
+                    // Fetch the parent block with increased depth
+                    const parent_root = signed_block.message.block.parent_root;
+                    const roots = [_]types.Root{parent_root};
+                    try self.fetchBlockByRoots(&roots, current_depth + 1);
+                    return;
+                }
+
+                if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                    self.logger.info(
+                        "discarding pre-finalized block 0x{s} from peer {s}{}, pruning cached descendants",
+                        .{
+                            std.fmt.fmtSliceHexLower(block_root[0..]),
+                            block_ctx.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                        },
+                    );
+                    self.pruneCachedBlockSubtree(block_root);
+                    return;
+                }
+
+                self.logger.warn("failed to import block fetched via RPC 0x{s} from peer {s}{}: {any}", .{
                     std.fmt.fmtSliceHexLower(block_root[0..]),
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -162,18 +428,27 @@ pub const BeamNode = struct {
             };
             defer self.allocator.free(missing_roots);
 
-            self.fetchBlockByRoots(missing_roots) catch |err| {
-                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+            self.logger.debug(
+                "Successfully processed block 0x{s}, checking for cached descendants",
+                .{std.fmt.fmtSliceHexLower(block_root[0..])},
+            );
+
+            // Block was successfully added, try to process any cached descendants
+            self.processCachedDescendants(block_root);
+
+            // Fetch any missing attestation head blocks
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
-            self.logger.warn("Failed to compute block root from RPC response from peer={s}{}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
+            self.logger.warn("failed to compute block root from RPC response from peer={s}{}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
     }
 
-    fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) void {
+    fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
         const request_id = event.request_id;
         const ctx_ptr = self.network.getPendingRequestPtr(request_id) orelse {
-            self.logger.warn("Received RPC response for unknown request_id={d}", .{request_id});
+            self.logger.warn("received RPC response for unknown request_id={d}", .{request_id});
             return;
         };
         const peer_id = switch (ctx_ptr.*) {
@@ -187,36 +462,36 @@ pub const BeamNode = struct {
                 .status => |status_resp| {
                     switch (ctx_ptr.*) {
                         .status => |*status_ctx| {
-                            self.logger.info("Received status response from peer {s}{} head_slot={d}, finalized_slot={d}", .{
+                            self.logger.info("received status response from peer {s}{} head_slot={d}, finalized_slot={d}", .{
                                 status_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 status_resp.head_slot,
                                 status_resp.finalized_slot,
                             });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn("Status response received for unknown peer {s}{}", .{
+                                self.logger.warn("status response received for unknown peer {s}{}", .{
                                     status_ctx.peer_id,
                                     self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 });
                             }
                         },
                         else => {
-                            self.logger.warn("Status response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
                 .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
                         .blocks_by_root => |*block_ctx| {
-                            self.logger.info("Received blocks-by-root chunk from peer {s}{}", .{
+                            self.logger.info("received blocks-by-root chunk from peer {s}{}", .{
                                 block_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             });
 
-                            self.processBlockByRootChunk(block_ctx, &block_resp);
+                            try self.processBlockByRootChunk(block_ctx, &block_resp);
                         },
                         else => {
-                            self.logger.warn("Blocks-by-root response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
@@ -224,7 +499,7 @@ pub const BeamNode = struct {
             .failure => |err_payload| {
                 switch (ctx_ptr.*) {
                     .status => |status_ctx| {
-                        self.logger.warn("Status request to peer {s}{} failed ({d}): {s}", .{
+                        self.logger.warn("status request to peer {s}{} failed ({d}): {s}", .{
                             status_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                             err_payload.code,
@@ -232,7 +507,7 @@ pub const BeamNode = struct {
                         });
                     },
                     .blocks_by_root => |block_ctx| {
-                        self.logger.warn("Blocks-by-root request to peer {s}{} failed ({d}): {s}", .{
+                        self.logger.warn("blocks-by-root request to peer {s}{} failed ({d}): {s}", .{
                             block_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             err_payload.code,
@@ -250,7 +525,7 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.handleReqRespResponse(event);
+        try self.handleReqRespResponse(event);
     }
 
     pub fn getOnGossipCbHandler(self: *Self) !networks.OnGossipCbHandler {
@@ -309,6 +584,7 @@ pub const BeamNode = struct {
     fn fetchBlockByRoots(
         self: *Self,
         roots: []const types.Root,
+        depth: u32,
     ) !void {
         if (roots.len == 0) return;
 
@@ -325,17 +601,17 @@ pub const BeamNode = struct {
         if (missing_roots.items.len == 0) return;
 
         const handler = self.getReqRespResponseHandler();
-        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, handler) catch |err| blk: {
+        const maybe_request = self.network.ensureBlocksByRootRequest(missing_roots.items, depth, handler) catch |err| blk: {
             switch (err) {
                 error.NoPeersAvailable => {
                     self.logger.warn(
-                        "No peers available to request {d} block(s) by root",
+                        "no peers available to request {d} block(s) by root",
                         .{missing_roots.items.len},
                     );
                 },
                 else => {
                     self.logger.warn(
-                        "Failed to send blocks-by-root request to peer: {any}",
+                        "failed to send blocks-by-root request to peer: {any}",
                         .{err},
                     );
                 },
@@ -344,7 +620,7 @@ pub const BeamNode = struct {
         };
 
         if (maybe_request) |request_info| {
-            self.logger.debug("Requested {d} block(s) by root from peer {s}{}, request_id={d}", .{
+            self.logger.debug("requested {d} block(s) by root from peer {s}{}, request_id={d}", .{
                 missing_roots.items.len,
                 request_info.peer_id,
                 self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
@@ -358,7 +634,7 @@ pub const BeamNode = struct {
 
         try self.network.connectPeer(peer_id);
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.info("Peer connected: {s}{}, total peers: {d}", .{
+        self.logger.info("peer connected: {s}{}, total peers: {d}", .{
             peer_id,
             node_name,
             self.network.getPeerCount(),
@@ -368,7 +644,7 @@ pub const BeamNode = struct {
         const status = self.chain.getStatus();
 
         const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("Failed to send status request to peer {s}{} {any}", .{
+            self.logger.warn("failed to send status request to peer {s}{} {any}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
@@ -376,7 +652,7 @@ pub const BeamNode = struct {
             return;
         };
 
-        self.logger.info("Sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+        self.logger.info("sent status request to peer {s}{}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
             peer_id,
             self.node_registry.getNodeNameFromPeerId(peer_id),
             request_id,
@@ -389,7 +665,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("Peer disconnected: {s}{}, total peers: {d}", .{
+            self.logger.info("peer disconnected: {s}{}, total peers: {d}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 self.network.getPeerCount(),
@@ -421,7 +697,7 @@ pub const BeamNode = struct {
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
         if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.time) {
-            self.logger.warn("Skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
+            self.logger.warn("skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
                 self.chain.forkChoice.fcStore.time,
                 itime_intervals,
             });
@@ -442,7 +718,7 @@ pub const BeamNode = struct {
         const interval: usize = @intCast(itime_intervals);
 
         self.chain.onInterval(interval) catch |e| {
-            self.logger.err("Error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+            self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
             // no point going further if chain is not ticked properly
             return e;
         };
@@ -450,7 +726,7 @@ pub const BeamNode = struct {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
             var validator_output = validator.onInterval(interval) catch |e| {
-                self.logger.err("Error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                 return e;
             };
 
@@ -462,13 +738,13 @@ pub const BeamNode = struct {
                     switch (gossip_msg) {
                         .block => |signed_block| {
                             self.publishBlock(signed_block) catch |e| {
-                                self.logger.err("Error publishing block from validator: err={any}", .{e});
+                                self.logger.err("error publishing block from validator: err={any}", .{e});
                                 return e;
                             };
                         },
                         .attestation => |signed_attestation| {
                             self.publishAttestation(signed_attestation) catch |e| {
-                                self.logger.err("Error publishing attestation from validator: err={any}", .{e});
+                                self.logger.err("error publishing attestation from validator: err={any}", .{e});
                                 return e;
                             };
                         },
@@ -479,25 +755,16 @@ pub const BeamNode = struct {
     }
 
     pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
-        // 1. publish gossip message
-        const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.network.publish(&gossip_msg);
-
         const block = signed_block.message.block;
-        self.logger.info("Published block to network: slot={d} proposer={d}{}", .{
-            block.slot,
-            block.proposer_index,
-            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
-        });
 
-        // 2. Process locally through chain
+        // 1. Process locally through chain so that produced block first can be confirmed
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (!hasBlock) {
-            self.logger.info("Seems like block was not locally produced, adding to the chain: slot={d} proposer={d}", .{
+            self.logger.info("adding produced signed block to the chain: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
@@ -508,32 +775,49 @@ pub const BeamNode = struct {
             });
             defer self.allocator.free(missing_roots);
 
-            self.fetchBlockByRoots(missing_roots) catch |err| {
-                self.logger.warn("Failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else {
-            self.logger.debug("Skip adding produced block to chain as already present: slot={d} proposer={d}", .{
+            self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
         }
+
+        // 2. publish gossip message
+        const gossip_msg = networks.GossipMessage{ .block = signed_block };
+        try self.network.publish(&gossip_msg);
+        self.logger.info("published block to network: slot={d} proposer={d}{}", .{
+            block.slot,
+            block.proposer_index,
+            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+        });
+
+        // 3. followup with additional housekeeping tasks
+        self.chain.onBlockFollowup(true);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        // 1. publish gossip message
+        const message = signed_attestation.message;
+        const data = message.data;
+
+        // 1. Process locally through chain
+        self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
+            data.slot,
+            message.validator_id,
+        });
+        try self.chain.onAttestation(signed_attestation);
+
+        // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        const message = signed_attestation.message;
-        const data = message.data;
-        self.logger.info("Published attestation to network: slot={d} validator={d}{}", .{
+        self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
             message.validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
         });
-
-        // 2. Process locally through chain
-        return self.chain.onAttestation(signed_attestation);
     }
 
     pub fn run(self: *Self) !void {
@@ -558,11 +842,8 @@ test "Node peer tracking on connect/disconnect" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
-
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    var logger_config = zeam_utils.getTestLoggerConfig();
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
 
     // Create empty node registry for test - shared between Mock and node
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -570,8 +851,7 @@ test "Node peer tracking on connect/disconnect" {
     test_registry.* = NodeNameRegistry.init(allocator);
     defer test_registry.deinit();
 
-    // Create Mock with shared registry instead of null
-    var mock = try networks.Mock.init(allocator, &loop, logger_config.logger(.mock), test_registry);
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), test_registry);
     defer mock.deinit();
 
     const backend = mock.getNetworkInterface();
@@ -599,7 +879,7 @@ test "Node peer tracking on connect/disconnect" {
     const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
     defer allocator.free(data_dir);
 
-    var db = try database.Db.open(allocator, logger_config.logger(.database), data_dir);
+    var db = try database.Db.open(allocator, ctx.loggerConfig().logger(.database), data_dir);
     defer db.deinit();
 
     const spec_name = try allocator.dupe(u8, "zeamdev");
@@ -614,7 +894,7 @@ test "Node peer tracking on connect/disconnect" {
         },
     };
 
-    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop);
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
     defer clock.deinit(allocator);
 
     var node: BeamNode = undefined;
@@ -622,11 +902,11 @@ test "Node peer tracking on connect/disconnect" {
         .config = chain_config,
         .anchorState = &anchor_state,
         .backend = backend,
-        .clock = &clock,
+        .clock = ctx.clockPtr(),
         .validator_ids = null,
         .nodeId = 0,
         .db = db,
-        .logger_config = &logger_config,
+        .logger_config = &ctx.logger_config,
         .node_registry = test_registry,
     });
     defer node.deinit();
@@ -677,6 +957,434 @@ test "Node peer tracking on connect/disconnect" {
     var iterations: u32 = 0;
     while (iterations < 5) : (iterations += 1) {
         std.time.sleep(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
-        try loop.run(.until_done);
+        try ctx.loopPtr().run(.until_done);
     }
+}
+
+test "Node: fetched blocks cache and deduplication" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root1: types.Root = [_]u8{1} ** 32;
+    const root2: types.Root = [_]u8{2} ** 32;
+    const root3: types.Root = [_]u8{3} ** 32;
+
+    // Create simple blocks with minimal initialization
+    const block1_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    block1_ptr.* = .{
+        .message = .{
+            .block = .{
+                .slot = 1,
+                .parent_root = [_]u8{0} ** 32,
+                .proposer_index = 0,
+                .state_root = [_]u8{0} ** 32,
+                .body = .{
+                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 1,
+                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                },
+            },
+        },
+        .signature = try types.BlockSignatures.init(allocator),
+    };
+
+    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    block2_ptr.* = .{
+        .message = .{
+            .block = .{
+                .slot = 2,
+                .parent_root = root1,
+                .proposer_index = 0,
+                .state_root = [_]u8{0} ** 32,
+                .body = .{
+                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = 2,
+                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                },
+            },
+        },
+        .signature = try types.BlockSignatures.init(allocator),
+    };
+
+    // Cache blocks
+    try node.network.cacheFetchedBlock(root1, block1_ptr);
+    try node.network.cacheFetchedBlock(root2, block2_ptr);
+
+    // Verify they're cached
+    try std.testing.expect(node.network.hasFetchedBlock(root1));
+    try std.testing.expect(node.network.hasFetchedBlock(root2));
+
+    // Track root3 as pending
+    try node.network.trackPendingBlockRoot(root3, 0);
+
+    // Test shouldRequestBlocksByRoot deduplication
+    // Should not request already cached or pending blocks
+    const cached_and_pending = [_]types.Root{ root1, root2, root3 };
+    try std.testing.expect(!node.network.shouldRequestBlocksByRoot(&cached_and_pending));
+
+    // Should request new blocks
+    const new_root: types.Root = [_]u8{4} ** 32;
+    const with_new = [_]types.Root{new_root};
+    try std.testing.expect(node.network.shouldRequestBlocksByRoot(&with_new));
+}
+
+test "Node: processCachedDescendants basic flow" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+    var mock_chain = try stf.genMockChain(allocator, 3, ctx.genesisConfig());
+    defer mock_chain.deinit(allocator);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[1]);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[2]);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    // Create a chain of blocks: genesis -> block1 -> block2
+    // We'll cache block2 (missing block1), then when block1 arrives,
+    // processCachedDescendants should process block2. Blocks are generated
+    // via the block builder so signatures, state roots, and proposer data are valid.
+    const block1 = mock_chain.blocks[1];
+    const block2 = mock_chain.blocks[2];
+    const block1_root = mock_chain.blockRoots[1];
+    const block2_root = mock_chain.blockRoots[2];
+    const block1_slot: usize = @intCast(block1.message.block.slot);
+    const block2_slot: usize = @intCast(block2.message.block.slot);
+
+    // Cache block2 (which will fail to process because block1 is missing)
+    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    try types.sszClone(allocator, types.SignedBlockWithAttestation, block2, block2_ptr);
+    try node.network.cacheFetchedBlock(block2_root, block2_ptr);
+
+    // Verify block2 is cached
+    try std.testing.expect(node.network.hasFetchedBlock(block2_root));
+
+    // Verify block2 is not in the chain yet
+    try std.testing.expect(!node.chain.forkChoice.hasBlock(block2_root));
+
+    // Advance forkchoice time to block1 slot and add block1 to the chain
+    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
+    const missing_roots1 = try node.chain.onBlock(block1, .{});
+    defer allocator.free(missing_roots1);
+
+    // Verify block1 is now in the chain
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block1_root));
+
+    // Now call processCachedDescendants with block1_root. This should discover
+    // cached block2 as a descendant and process it automatically.
+    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false);
+    node.processCachedDescendants(block1_root);
+
+    // Verify block2 was removed from cache because it was successfully processed
+    try std.testing.expect(!node.network.hasFetchedBlock(block2_root));
+
+    // Verify block2 is now in the chain
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
+}
+
+fn makeTestSignedBlockWithParent(
+    allocator: std.mem.Allocator,
+    slot: usize,
+    parent_root: types.Root,
+) !*types.SignedBlockWithAttestation {
+    const block_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    errdefer allocator.destroy(block_ptr);
+
+    block_ptr.* = .{
+        .message = .{
+            .block = .{
+                .slot = slot,
+                .parent_root = parent_root,
+                .proposer_index = 0,
+                .state_root = [_]u8{0} ** 32,
+                .body = .{
+                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                },
+            },
+            .proposer_attestation = .{
+                .validator_id = 0,
+                .data = .{
+                    .slot = slot,
+                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                },
+            },
+        },
+        .signature = try types.BlockSignatures.init(allocator),
+    };
+
+    return block_ptr;
+}
+
+test "Node: pruneCachedBlockSubtree prunes root and all cached descendants" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    // Tree:
+    //   A
+    //  / \
+    // B   D
+    // |
+    // C
+    // plus an unrelated E
+    const root_a: types.Root = [_]u8{0xAA} ** 32;
+    const root_b: types.Root = [_]u8{0xBB} ** 32;
+    const root_c: types.Root = [_]u8{0xCC} ** 32;
+    const root_d: types.Root = [_]u8{0xDD} ** 32;
+    const root_e: types.Root = [_]u8{0xEE} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_b));
+    try node.network.cacheFetchedBlock(root_d, try makeTestSignedBlockWithParent(allocator, 4, root_a));
+    try node.network.cacheFetchedBlock(root_e, try makeTestSignedBlockWithParent(allocator, 5, zero_root));
+
+    // Pending roots (A subtree + unrelated E)
+    try node.network.trackPendingBlockRoot(root_a, 0);
+    try node.network.trackPendingBlockRoot(root_c, 0);
+    try node.network.trackPendingBlockRoot(root_e, 0);
+
+    node.pruneCachedBlockSubtree(root_a);
+
+    // Entire subtree removed
+    try std.testing.expect(!node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_c));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_d));
+    // Unrelated remains
+    try std.testing.expect(node.network.hasFetchedBlock(root_e));
+
+    // Pending roots cleared for subtree but not for unrelated
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_a));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_c));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_e));
+}
+
+test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_a: types.Root = [_]u8{0xAA} ** 32;
+    const root_b: types.Root = [_]u8{0xBB} ** 32;
+    const root_c: types.Root = [_]u8{0xCC} ** 32;
+    const root_d: types.Root = [_]u8{0xDD} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_b));
+    try node.network.cacheFetchedBlock(root_d, try makeTestSignedBlockWithParent(allocator, 4, root_a));
+
+    try node.network.trackPendingBlockRoot(root_a, 0);
+    try node.network.trackPendingBlockRoot(root_b, 0);
+    try node.network.trackPendingBlockRoot(root_c, 0);
+    try node.network.trackPendingBlockRoot(root_d, 0);
+
+    node.pruneCachedBlockSubtree(root_b);
+
+    // B subtree removed
+    try std.testing.expect(!node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(!node.network.hasFetchedBlock(root_c));
+    // Siblings/ancestors remain
+    try std.testing.expect(node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(node.network.hasFetchedBlock(root_d));
+
+    // Pending cleared for B subtree only
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_a));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_b));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_c));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_d));
+}
+
+test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is not cached" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_x: types.Root = [_]u8{0x11} ** 32;
+    const root_child: types.Root = [_]u8{0x22} ** 32;
+    const root_other: types.Root = [_]u8{0x33} ** 32;
+    const zero_root: types.Root = [_]u8{0} ** 32;
+
+    // Only cache descendants, not the root_x itself
+    try node.network.cacheFetchedBlock(root_child, try makeTestSignedBlockWithParent(allocator, 2, root_x));
+    try node.network.cacheFetchedBlock(root_other, try makeTestSignedBlockWithParent(allocator, 3, zero_root));
+
+    try node.network.trackPendingBlockRoot(root_x, 0);
+    try node.network.trackPendingBlockRoot(root_child, 0);
+    try node.network.trackPendingBlockRoot(root_other, 0);
+
+    node.pruneCachedBlockSubtree(root_x);
+
+    // Child removed even though root_x wasn't cached
+    try std.testing.expect(!node.network.hasFetchedBlock(root_child));
+    try std.testing.expect(node.network.hasFetchedBlock(root_other));
+
+    // Pending cleared for root_x and its subtree only
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_x));
+    try std.testing.expect(!node.network.hasPendingBlockRoot(root_child));
+    try std.testing.expect(node.network.hasPendingBlockRoot(root_other));
 }

@@ -645,6 +645,7 @@ fn processBlockStep(
         .currentSlot = block.slot,
         .blockDelayMs = 0,
         .blockRoot = block_root,
+        .confirmed = true,
     }) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{}: forkchoice onBlock failed {s}\n",

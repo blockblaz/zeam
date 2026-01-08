@@ -351,6 +351,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Unsupported RPC protocol from peer={s}{} on channel={d}: {s}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, protocol_slice },
         );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Unsupported RPC protocol");
         return;
     };
 
@@ -360,6 +361,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Invalid RPC request frame from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request frame");
         return;
     };
     const request_bytes = snappyframesz.decode(zigHandler.allocator, request_payload) catch |err| {
@@ -367,6 +369,7 @@ export fn handleRPCRequestFromRustBridge(
             "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to decode RPC request");
         return;
     };
     defer zigHandler.allocator.free(request_bytes);
@@ -383,12 +386,14 @@ export fn handleRPCRequestFromRustBridge(
         } else {
             zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{}", .{ label, peer_id_slice, node_name });
         }
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
         return;
     };
     defer request.deinit();
 
     const request_str = request.toJsonString(zigHandler.allocator) catch |e| {
         zigHandler.logger.err("Failed to convert RPC request to JSON string from peer={s}{}: {any}", .{ peer_id_slice, node_name, e });
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to format RPC request");
         return;
     };
     defer zigHandler.allocator.free(request_str);
