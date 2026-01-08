@@ -325,7 +325,6 @@ pub const BeamChain = struct {
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
         const slot = opts.slot;
 
-        // const head = try self.forkChoice.getProposalHead(slot);
         const head_proto = self.forkChoice.getHead();
         const head: types.Checkpoint = .{
             .root = head_proto.blockRoot,

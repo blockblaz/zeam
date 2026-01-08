@@ -358,29 +358,6 @@ pub const ForkChoice = struct {
         return false;
     }
 
-    /// Get all ancestor block roots from the current finalized block,
-    /// traversing backwards, and collecting all blocks with slot > previousFinalizedSlot.
-    /// Stops traversal when previousFinalizedSlot is reached or at genesis.
-    // Internal unlocked version - assumes caller holds lock
-    fn getAncestorsOfFinalizedUnlocked(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
-        var ancestors = std.ArrayList(types.Root).init(allocator);
-
-        var current_idx_or_null = self.protoArray.indices.get(currentFinalized);
-
-        while (current_idx_or_null) |current_idx| {
-            const current_node = self.protoArray.nodes.items[current_idx];
-            if (current_node.slot < previousFinalizedSlot) {
-                return error.InvalidFinalizationTraversal;
-            } else if (current_node.slot == previousFinalizedSlot) {
-                break;
-            } else {
-                try ancestors.append(current_node.blockRoot);
-                current_idx_or_null = current_node.parent;
-            }
-        }
-        return ancestors.toOwnedSlice();
-    }
-
     /// Builds a canonical view hashmap containing all blocks in the canonical chain
     /// from targetAnchor back to prevAnchor, plus all their unfinalized descendants.
     // Internal unlocked version - assumes caller holds lock
@@ -688,24 +665,6 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn getProposalHeadUnlocked(self: *Self, slot: types.Slot) !types.Checkpoint {
-        const time_intervals = slot * constants.INTERVALS_PER_SLOT;
-        // this could be called independently by the validator when its a separate process
-        // and FC would need to be protected by mutex to make it thread safe but for now
-        // this is deterministally called after the fc has been ticked ahead
-        // so the following call should be a no-op
-        try self.onIntervalUnlocked(time_intervals, true);
-        // accept any new attestations in case previous ontick was a no-op and either the validator
-        // wasn't registered or there have been new attestations
-        const head = try self.acceptNewAttestationsUnlocked();
-
-        return types.Checkpoint{
-            .root = head.blockRoot,
-            .slot = head.slot,
-        };
-    }
-
-    // Internal unlocked version - assumes caller holds lock
     fn getProposalAttestationsUnlocked(self: *Self) ![]types.SignedAttestation {
         var included_attestations = std.ArrayList(types.SignedAttestation).init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
@@ -990,12 +949,6 @@ pub const ForkChoice = struct {
         return self.updateSafeTargetUnlocked();
     }
 
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
-        self.mutex.lock(); // Write lock - mutates via onInterval
-        defer self.mutex.unlock();
-        return self.getProposalHeadUnlocked(slot);
-    }
-
     //  READ-ONLY API - SHARED LOCK
 
     pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
@@ -1020,12 +973,6 @@ pub const ForkChoice = struct {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.getBlockUnlocked(blockRoot);
-    }
-
-    pub fn getAncestorsOfFinalized(self: *Self, allocator: Allocator, currentFinalized: types.Root, previousFinalizedSlot: types.Slot) ![]types.Root {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
-        return self.getAncestorsOfFinalizedUnlocked(allocator, currentFinalized, previousFinalizedSlot);
     }
 
     pub fn getCanonicalView(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
