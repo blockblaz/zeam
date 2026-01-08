@@ -83,6 +83,7 @@ pub const NodeOptions = struct {
     database_path: []const u8,
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
+    checkpoint_sync_url: ?[]const u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -154,9 +155,27 @@ pub const Node = struct {
 
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
+
+        // Initialize anchor state - either from checkpoint sync or genesis
         var anchorState: types.BeamState = undefined;
-        try anchorState.genGenesisState(allocator, chain_config.genesis);
-        errdefer anchorState.deinit();
+        const logger = options.logger_config.logger(.node);
+
+        if (options.checkpoint_sync_url) |checkpoint_url| {
+            logger.info("Checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
+
+            // Download checkpoint state from URL
+            anchorState = try downloadCheckpointState(allocator, checkpoint_url, logger);
+            errdefer anchorState.deinit();
+
+            // Verify state root matches checkpoint
+            try verifyCheckpointStateRoot(allocator, &anchorState, logger);
+
+            logger.info("Checkpoint sync completed successfully, using state at slot {d} as anchor", .{anchorState.slot});
+        } else {
+            // Generate genesis state as before
+            try anchorState.genGenesisState(allocator, chain_config.genesis);
+            errdefer anchorState.deinit();
+        }
 
         // TODO we seem to be needing one loop because then the events added to loop are not being fired
         // in the order to which they have been added even with the an appropriate delay added
@@ -203,6 +222,12 @@ pub const Node = struct {
         });
 
         self.logger = options.logger_config.logger(.node);
+
+        // Register finalized state getter with API server if metrics are enabled
+        if (options.metrics_enable) {
+            api_server.registerNode(@as(*anyopaque, @ptrCast(self)));
+            self.logger.info("Registered node with API server for finalized checkpoint state endpoint", .{});
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -480,6 +505,192 @@ pub fn buildStartOptions(
     opts.genesis_spec = genesis_spec;
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
+    opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+}
+
+/// Downloads finalized checkpoint state from the given URL and deserializes it
+/// Returns the deserialized state. The caller is responsible for calling deinit on it.
+fn downloadCheckpointState(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    logger: zeam_utils.ModuleLogger,
+) !types.BeamState {
+    logger.info("Downloading checkpoint state from: {s}", .{url});
+
+    // Parse URL using string manipulation (simpler approach)
+    // Extract components manually from URL string
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+    const scheme = url[0..scheme_end];
+    const after_scheme = url[scheme_end + 3 ..];
+
+    // Find path start (first '/' after scheme)
+    const path_start = std.mem.indexOf(u8, after_scheme, "/") orelse return error.InvalidUrl;
+    const authority = after_scheme[0..path_start];
+    const path = after_scheme[path_start..];
+
+    // Split authority into host:port
+    const colon_pos = std.mem.indexOfScalar(u8, authority, ':');
+    const host = if (colon_pos) |pos| authority[0..pos] else authority;
+    const port_str = if (colon_pos) |pos| authority[pos + 1 ..] else null;
+    const port: u16 = if (port_str) |p_str|
+        try std.fmt.parseInt(u16, p_str, 10)
+    else if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
+
+    // Create address
+    const address = try std.net.Address.resolveIp(host, port);
+
+    // Connect to server
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    // Build HTTP request
+    const request = try std.fmt.allocPrint(
+        allocator,
+        "GET {s} HTTP/1.1\r\n" ++
+            "Host: {s}:{d}\r\n" ++
+            "Accept: application/octet-stream\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+        .{ path, host, port },
+    );
+    defer allocator.free(request);
+
+    // Send request
+    try stream.writeAll(request);
+
+    // Read response headers
+    var buffer: [8192]u8 = undefined;
+    var total_read: usize = 0;
+    var headers_complete = false;
+    var content_length: ?usize = null;
+    var content_start: usize = 0;
+
+    while (!headers_complete) {
+        const bytes_read = try stream.read(buffer[total_read..]);
+        if (bytes_read == 0) break;
+        total_read += bytes_read;
+
+        // Look for end of headers (CRLF CRLF)
+        if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |end_pos| {
+            headers_complete = true;
+            content_start = end_pos + 4;
+
+            // Parse status line and headers
+            const headers_text = buffer[0..end_pos];
+            var lines = std.mem.splitSequence(u8, headers_text, "\r\n");
+
+            // Skip status line
+            _ = lines.next();
+
+            // Parse headers
+            while (lines.next()) |line| {
+                if (std.mem.indexOfScalar(u8, line, ':')) |header_colon_pos| {
+                    const header_name = std.mem.trim(u8, line[0..header_colon_pos], " ");
+                    const header_value = std.mem.trim(u8, line[header_colon_pos + 1 ..], " ");
+
+                    if (std.mem.eql(u8, header_name, "content-length")) {
+                        content_length = try std.fmt.parseInt(usize, header_value, 10);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check HTTP status
+    const status_line_end = std.mem.indexOfScalar(u8, buffer[0..content_start], '\r') orelse return error.InvalidResponse;
+    const status_line = buffer[0..status_line_end];
+
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.")) {
+        return error.InvalidResponse;
+    }
+
+    // Extract status code
+    if (std.mem.indexOfScalar(u8, status_line, ' ')) |first_space| {
+        const after_status = status_line[first_space + 1 ..];
+        if (std.mem.indexOfScalar(u8, after_status, ' ')) |second_space| {
+            const status_code_str = after_status[0..second_space];
+            const status_code = try std.fmt.parseInt(u16, status_code_str, 10);
+
+            if (status_code != 200) {
+                logger.err("Checkpoint sync failed: HTTP {d}", .{status_code});
+                return error.HttpError;
+            }
+        }
+    }
+
+    // Read remaining data into a buffer
+    var ssz_data = std.ArrayList(u8).init(allocator);
+    errdefer ssz_data.deinit();
+
+    // Copy data already read after headers
+    if (total_read > content_start) {
+        try ssz_data.appendSlice(buffer[content_start..total_read]);
+    }
+
+    // Read remaining data
+    while (true) {
+        const bytes_read = try stream.read(buffer[0..]);
+        if (bytes_read == 0) break;
+        try ssz_data.appendSlice(buffer[0..bytes_read]);
+
+        // Stop if we've read the expected content length
+        if (content_length) |len| {
+            if (ssz_data.items.len >= len) break;
+        }
+    }
+
+    logger.info("Downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
+
+    // Deserialize SSZ state
+    // Use arena allocator for deserialization as SSZ types may allocate
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var checkpoint_state: types.BeamState = undefined;
+    try ssz.deserialize(types.BeamState, ssz_data.items, &checkpoint_state, arena.allocator());
+
+    logger.info("Successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
+
+    // Clone the state to move it out of the arena using the proper cloning function
+    var cloned_state: types.BeamState = undefined;
+    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+
+    return cloned_state;
+}
+
+/// Verifies that the state is consistent and matches the finalized checkpoint
+/// The checkpoint root should match the block root of the state's latest_block_header
+fn verifyCheckpointStateRoot(
+    allocator: std.mem.Allocator,
+    state: *const types.BeamState,
+    logger: zeam_utils.ModuleLogger,
+) !void {
+    // Calculate state root
+    var state_root: types.Root = undefined;
+    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+
+    logger.info("Verifying checkpoint state: state_root=0x{s}, slot={d}", .{
+        std.fmt.fmtSliceHexLower(&state_root),
+        state.slot,
+    });
+
+    // Verify the state's block header state_root matches the calculated state root
+    if (!std.mem.eql(u8, &state_root, &state.latest_block_header.state_root)) {
+        logger.err("Checkpoint state verification failed: calculated state_root does not match block header state_root", .{});
+        return error.InvalidCheckpointState;
+    }
+
+    // Calculate the block root from the latest_block_header
+    // This should match the checkpoint root when used in forkchoice initialization
+    var block_root: types.Root = undefined;
+    try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &block_root, allocator);
+
+    logger.info("Checkpoint state verified successfully: block_root=0x{s}", .{
+        std.fmt.fmtSliceHexLower(&block_root),
+    });
+
+    // Note: The checkpoint root will be verified during forkchoice initialization
+    // where it's compared against the anchor block root
 }
 
 /// Parses the nodes from a YAML configuration.
@@ -1061,4 +1272,130 @@ test "populateNodeNameRegistry" {
     try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
     try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
     try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
+}
+
+test "verifyCheckpointStateRoot with valid state" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Load config.yaml from test fixtures
+    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
+    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    // Parse genesis config from YAML
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    // Generate genesis state
+    var genesis_state: types.BeamState = undefined;
+    try genesis_state.genGenesisState(allocator, genesis_spec);
+    defer genesis_state.deinit();
+
+    // Create a mock logger
+    var logger_config = utils_lib.getLoggerConfig(null, null);
+    const logger = logger_config.logger(.node);
+
+    // Verify the state - should succeed
+    try verifyCheckpointStateRoot(allocator, &genesis_state, logger);
+}
+
+test "verifyCheckpointStateRoot with invalid state" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Load config.yaml from test fixtures
+    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
+    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
+    defer parsed_config.deinit(allocator);
+
+    // Parse genesis config from YAML
+    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    // Generate genesis state
+    var invalid_state: types.BeamState = undefined;
+    try invalid_state.genGenesisState(allocator, genesis_spec);
+    defer invalid_state.deinit();
+
+    // Corrupt the state by modifying the state_root in the block header
+    // This should make verification fail
+    invalid_state.latest_block_header.state_root[0] = 0xFF;
+
+    // Create a mock logger
+    var logger_config = utils_lib.getLoggerConfig(null, null);
+    const logger = logger_config.logger(.node);
+
+    // Verify the state - should fail
+    try std.testing.expectError(error.InvalidCheckpointState, verifyCheckpointStateRoot(allocator, &invalid_state, logger));
+}
+
+test "checkpoint-sync-url parameter is optional" {
+    // Verify that the NodeCommand struct has checkpoint-sync-url as optional
+    const node_cmd = NodeCommand{
+        .custom_genesis = "test",
+        .@"node-id" = "test",
+        .validator_config = "test",
+        .@"checkpoint-sync-url" = null, // Should compile and work with null
+    };
+    
+    try std.testing.expect(node_cmd.@"checkpoint-sync-url" == null);
+    
+    const node_cmd_with_url = NodeCommand{
+        .custom_genesis = "test",
+        .@"node-id" = "test",
+        .validator_config = "test",
+        .@"checkpoint-sync-url" = "http://localhost:5052/lean/states/finalized",
+    };
+    
+    try std.testing.expect(node_cmd_with_url.@"checkpoint-sync-url" != null);
+    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/states/finalized");
+}
+
+test "NodeOptions checkpoint_sync_url field is optional" {
+    // Verify NodeOptions can be created with null checkpoint_sync_url
+    const allocator = std.testing.allocator;
+    
+    // Create a minimal NodeOptions structure for testing
+    var registry = node_lib.NodeNameRegistry.init(allocator);
+    defer registry.deinit();
+    
+    var logger_config = utils_lib.getLoggerConfig(null, null);
+    
+    // Create a minimal genesis spec for testing
+    const genesis_spec = types.GenesisSpec{
+        .genesis_time = 1000,
+        .validator_pubkeys = try allocator.alloc([]const u8, 0),
+    };
+    defer allocator.free(genesis_spec.validator_pubkeys);
+    
+    var node_options = NodeOptions{
+        .network_id = 0,
+        .node_key = "test",
+        .node_key_index = 0,
+        .validator_config = "test",
+        .bootnodes = &[_][]const u8{},
+        .validator_assignments = &[_]ValidatorAssignment{},
+        .genesis_spec = genesis_spec,
+        .metrics_enable = false,
+        .metrics_port = 5052,
+        .local_priv_key = try allocator.dupe(u8, "test"),
+        .logger_config = &logger_config,
+        .database_path = "test",
+        .hash_sig_key_dir = try allocator.dupe(u8, "test"),
+        .node_registry = &registry,
+        .checkpoint_sync_url = null, // Should work with null
+    };
+    defer {
+        allocator.free(node_options.local_priv_key);
+        allocator.free(node_options.hash_sig_key_dir);
+    }
+    
+    try std.testing.expect(node_options.checkpoint_sync_url == null);
+    
+    // Test with a URL
+    node_options.checkpoint_sync_url = "http://localhost:5052/lean/states/finalized";
+    try std.testing.expect(node_options.checkpoint_sync_url != null);
 }

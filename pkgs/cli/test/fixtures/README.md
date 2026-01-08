@@ -250,6 +250,79 @@ mkdir -p data/test_node0 data/test_node1
 - **Node IDs:** Use `--node-id` with values from `validators.yaml` (zeam_0, quadrivium_0, ream_0)
 - **Data Directories:** Each node needs its own database path to avoid conflicts
 
+## Checkpoint Sync
+
+Zeam supports checkpoint sync, which allows nodes to start from a trusted finalized checkpoint state instead of syncing from genesis. This significantly speeds up initial synchronization by downloading the finalized state from another node and verifying it before syncing forward.
+
+### How Checkpoint Sync Works
+
+1. **Fetch**: The client downloads the finalized checkpoint state as SSZ from the provided URL
+2. **Verify**: The state root is verified to ensure consistency
+3. **Anchor**: The checkpoint state is used as the anchor state for forkchoice initialization
+4. **Sync Forward**: The client syncs forward from the checkpoint to the head using normal block-by-root syncing
+
+### Using Checkpoint Sync
+
+To enable checkpoint sync, add the `--checkpoint-sync-url` parameter:
+
+```bash
+./zig-out/bin/zeam node \
+  --custom_genesis ./genesis \
+  --node-id "zeam_1" \
+  --validator_config genesis_bootnode \
+  --override_genesis_time $GENESIS_TIME \
+  --data-dir ./data/test_node1 \
+  --checkpoint-sync-url http://localhost:5052/lean/states/finalized
+```
+
+The URL should point to a zeam node's checkpoint state endpoint (e.g., `http://localhost:5052/lean/states/finalized` if the source node has metrics enabled on port 5052).
+
+### Checkpoint Sync Server
+
+To serve checkpoint state from a zeam node, enable the metrics server:
+
+```bash
+./zig-out/bin/zeam node \
+  --custom_genesis ./genesis \
+  --node-id "zeam_0" \
+  --validator_config genesis_bootnode \
+  --override_genesis_time $GENESIS_TIME \
+  --data-dir ./data/test_node0 \
+  --metrics-enable \
+  --metrics-port 5052
+```
+
+This node will serve the finalized checkpoint state at `http://localhost:5052/lean/states/finalized`.
+
+### Checkpoint Sync Example
+
+**Terminal 1 (Source node with metrics):**
+
+```bash
+./zig-out/bin/zeam node \
+  --custom_genesis ./genesis \
+  --node-id "zeam_0" \
+  --validator_config genesis_bootnode \
+  --override_genesis_time 1759210782 \
+  --data-dir ./data/test_node0 \
+  --metrics-enable \
+  --metrics-port 5052
+```
+
+**Terminal 2 (Node using checkpoint sync):**
+
+```bash
+./zig-out/bin/zeam node \
+  --custom_genesis ./genesis \
+  --node-id "zeam_1" \
+  --validator_config genesis_bootnode \
+  --override_genesis_time 1759210782 \
+  --data-dir ./data/test_node1 \
+  --checkpoint-sync-url http://localhost:5052/lean/states/finalized
+```
+
+**Note:** The `--checkpoint-sync-url` parameter is optional. If not provided, the node will start from genesis as usual.
+
 ## Command Summary
 
 For quick reference, here are the commands assuming `GENESIS_TIME=1759210782`:
