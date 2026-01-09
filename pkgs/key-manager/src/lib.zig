@@ -3,6 +3,7 @@ const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
 const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 const KeyManagerError = error{
@@ -97,7 +98,7 @@ pub const KeyManager = struct {
 
         const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
+        try ssz.hashTreeRoot(Sha256, types.Attestation, attestation.*, &message, allocator);
 
         const epoch: u32 = @intCast(attestation.data.slot);
 

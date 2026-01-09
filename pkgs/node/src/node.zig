@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 pub const database = @import("@zeam/database");
@@ -136,7 +137,7 @@ pub const BeamNode = struct {
                 }
 
                 var block_root: types.Root = undefined;
-                if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                if (ssz.hashTreeRoot(Sha256, types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                     _ = self.network.removePendingBlockRoot(block_root);
                 } else |err| {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
@@ -165,7 +166,7 @@ pub const BeamNode = struct {
                 if (data.* == .block) {
                     const signed_block = data.block;
                     var block_root: types.Root = undefined;
-                    if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                    if (ssz.hashTreeRoot(Sha256, types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                         self.logger.info(
                             "gossip block 0x{s} rejected as pre-finalized; pruning cached descendants",
                             .{std.fmt.fmtSliceHexLower(block_root[0..])},
@@ -347,7 +348,7 @@ pub const BeamNode = struct {
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) !void {
         var block_root: types.Root = undefined;
-        if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+        if (ssz.hashTreeRoot(Sha256, types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
@@ -759,7 +760,7 @@ pub const BeamNode = struct {
 
         // 1. Process locally through chain so that produced block first can be confirmed
         var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
+        try ssz.hashTreeRoot(Sha256, types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
