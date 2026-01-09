@@ -16,6 +16,7 @@ pub const verifySingleAttestation = transition.verifySingleAttestation;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
+pub const MockChainData = mockImport.MockChainData;
 
 test "ssz import" {
     const data: u16 = 0x5566;
