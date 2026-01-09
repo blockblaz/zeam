@@ -813,6 +813,9 @@ pub const BeamChain = struct {
             });
         }
 
+        // Update the latest finalized slot metadata
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, latestFinalized.slot);
+
         // 3. commit all batch ops for finalized indices before we prune
         self.db.commit(&batch);
 
