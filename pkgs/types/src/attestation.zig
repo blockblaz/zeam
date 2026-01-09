@@ -205,6 +205,17 @@ test "encode decode signed attestation roundtrip" {
     try ssz.serialize(SignedAttestation, signed_attestation, &encoded);
     try std.testing.expect(encoded.items.len > 0);
 
+    // Convert to hex and compare with expected value.
+    // Expected value is "0" * 6496 (6496 hex characters = 3248 bytes).
+    const expected_hex_len = 6496;
+    const expected_value = try std.testing.allocator.alloc(u8, expected_hex_len);
+    defer std.testing.allocator.free(expected_value);
+    @memset(expected_value, '0');
+
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    defer std.testing.allocator.free(encoded_hex);
+    try std.testing.expectEqualStrings(expected_value, encoded_hex);
+
     var decoded: SignedAttestation = undefined;
     try ssz.deserialize(SignedAttestation, encoded.items[0..], &decoded, std.testing.allocator);
 
