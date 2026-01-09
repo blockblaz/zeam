@@ -50,8 +50,7 @@ pub const BeamBlockBody = struct {
     attestations: AggregatedAttestations,
 
     pub fn deinit(self: *BeamBlockBody) void {
-        for (self.attestations.constSlice()) |att_value| {
-            var att = att_value;
+        for (self.attestations.slice()) |*att| {
             att.deinit();
         }
         self.attestations.deinit();
@@ -201,8 +200,7 @@ pub const BlockSignatures = struct {
     attestation_signatures: AttestationSignatures,
 
     pub fn deinit(self: *BlockSignatures) void {
-        for (self.attestation_signatures.constSlice()) |group_value| {
-            var group = group_value;
+        for (self.attestation_signatures.slice()) |*group| {
             group.deinit();
         }
         self.attestation_signatures.deinit();
@@ -328,7 +326,14 @@ pub const AggregatedAttestationsResult = struct {
     attestation_signatures: AttestationSignatures,
 
     pub fn deinit(self: *AggregatedAttestationsResult) void {
+        for (self.attestations.slice()) |*att| {
+            att.deinit();
+        }
         self.attestations.deinit();
+
+        for (self.attestation_signatures.slice()) |*sig_group| {
+            sig_group.deinit();
+        }
         self.attestation_signatures.deinit();
     }
 };
@@ -364,14 +369,7 @@ pub fn aggregateSignedAttestations(
             const new_group = try AggregationGroup.init(allocator, signed_attestation);
             try groups.append(new_group);
             const inserted_index = groups.items.len - 1;
-            root_indices.put(root, inserted_index) catch |err| {
-                if (groups.pop()) |removed| {
-                    var cleanup = removed;
-                    cleanup.bits.deinit();
-                    cleanup.signatures.deinit();
-                }
-                return err;
-            };
+            root_indices.put(root, inserted_index) catch |err| return err;
         }
     }
 

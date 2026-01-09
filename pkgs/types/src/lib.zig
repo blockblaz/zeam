@@ -8,6 +8,7 @@ pub const BeamBlockBody = block.BeamBlockBody;
 pub const BlockWithAttestation = block.BlockWithAttestation;
 pub const SignedBlockWithAttestation = block.SignedBlockWithAttestation;
 pub const AggregatedAttestations = block.AggregatedAttestations;
+pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
 pub const AttestationSignatures = block.AttestationSignatures;
 pub const BlockSignatures = block.BlockSignatures;
 pub const aggregateSignedAttestations = block.aggregateSignedAttestations;

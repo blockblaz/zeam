@@ -119,13 +119,13 @@ pub const ValidatorClient = struct {
                 .proposer_attestation = proposer_attestation,
             };
 
-            // 4. Prepare signatures by adding the proposer signature to the already received list of
-            //    attestation signatures
-            var signatures = produced_block.signatures;
-
-            // 5. Sign proposer attestation and attach to block signatures
+            // 4. Sign proposer attestation and build block signatures from the already-aggregated
+            //    attestation signatures returned by block production.
             const proposer_signature = try self.key_manager.signAttestation(&proposer_attestation, self.allocator);
-            signatures.proposer_signature = proposer_signature;
+            const signatures = types.BlockSignatures{
+                .attestation_signatures = produced_block.attestation_signatures,
+                .proposer_signature = proposer_signature,
+            };
 
             const signed_block = types.SignedBlockWithAttestation{
                 .message = block_with_attestation,

@@ -16,7 +16,6 @@ const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
-const jsonToString = zeam_utils.jsonToString;
 
 const utils = @import("./utils.zig");
 pub const fcFactory = @import("./forkchoice.zig");
@@ -59,8 +58,17 @@ pub const GossipProcessingResult = struct {
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
-    // signatures corresponding to attestations in the blockbody
-    signatures: types.BlockSignatures,
+
+    // Aggregated signatures corresponding to attestations in the block body.
+    attestation_signatures: types.AttestationSignatures,
+
+    pub fn deinit(self: *ProducedBlock) void {
+        self.block.deinit();
+        for (self.attestation_signatures.slice()) |*sig_group| {
+            sig_group.deinit();
+        }
+        self.attestation_signatures.deinit();
+    }
 };
 
 pub const BeamChain = struct {
@@ -253,11 +261,18 @@ pub const BeamChain = struct {
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
-        const post_state = try self.allocator.create(types.BeamState);
+        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+        errdefer if (post_state_opt) |post_state_ptr| {
+            post_state_ptr.deinit();
+            self.allocator.destroy(post_state_ptr);
+        };
+        const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        var aggregation = try types.aggregateSignedAttestations(self.allocator, signed_attestations);
-        errdefer aggregation.deinit();
+        var aggregation_opt: ?types.AggregatedAttestationsResult = try types.aggregateSignedAttestations(self.allocator, signed_attestations);
+        errdefer if (aggregation_opt) |*aggregation| aggregation.deinit();
+
+        const aggregation = &aggregation_opt.?;
 
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
@@ -274,13 +289,18 @@ pub const BeamChain = struct {
         };
         errdefer block.deinit();
 
-        const block_signatures = types.BlockSignatures{
-            .attestation_signatures = aggregation.attestation_signatures,
-            .proposer_signature = types.ZERO_SIGBYTES,
-        };
+        var attestation_signatures = aggregation.attestation_signatures;
+        errdefer {
+            for (attestation_signatures.slice()) |*sig_group| {
+                sig_group.deinit();
+            }
+            attestation_signatures.deinit();
+        }
 
-        var block_json = try block.toJson(self.allocator);
-        const block_str = try jsonToString(self.allocator, block_json);
+        // Ownership moved into `block` + `attestation_signatures`.
+        aggregation_opt = null;
+
+        const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
 
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
@@ -288,8 +308,7 @@ pub const BeamChain = struct {
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
 
-        block_json = try block.toJson(self.allocator);
-        const block_str_2 = try jsonToString(self.allocator, block_json);
+        const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
 
         self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
@@ -297,7 +316,17 @@ pub const BeamChain = struct {
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+
         try self.states.put(block_root, post_state);
+        post_state_opt = null;
+
+        var forkchoice_added = false;
+        errdefer if (!forkchoice_added) {
+            if (self.states.fetchRemove(block_root)) |entry| {
+                entry.value.deinit();
+                self.allocator.destroy(entry.value);
+            }
+        };
 
         // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
@@ -309,12 +338,13 @@ pub const BeamChain = struct {
             // confirmed in publish
             .confirmed = false,
         });
+        forkchoice_added = true;
         _ = try self.forkChoice.updateHead();
 
         return .{
             .block = block,
             .blockRoot = block_root,
-            .signatures = block_signatures,
+            .attestation_signatures = attestation_signatures,
         };
     }
 
