@@ -505,8 +505,8 @@ pub const BeamChain = struct {
                 return .{};
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.data.slot;
-                const validator_id = signed_attestation.message.validator_id;
+                const slot = signed_attestation.message.slot;
+                const validator_id = signed_attestation.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -519,7 +519,7 @@ pub const BeamChain = struct {
                 });
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_attestation.message, false) catch |err| {
+                self.validateAttestation(signed_attestation.toAttestation(), false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     return .{}; // Drop invalid gossip attestations
@@ -1045,16 +1045,16 @@ pub const BeamChain = struct {
 
     pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
-        try self.validateAttestation(signedAttestation.message, false);
+        const attestation = signedAttestation.toAttestation();
+        try self.validateAttestation(attestation, false);
 
-        const attestation = signedAttestation.message;
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
 
         try stf.verifySingleAttestation(
             self.allocator,
             state,
-            @intCast(attestation.validator_id),
-            &attestation.data,
+            @intCast(signedAttestation.validator_id),
+            &signedAttestation.message,
             &signedAttestation.signature,
         );
 
@@ -1308,238 +1308,220 @@ test "attestation validation - comprehensive" {
         const source_slot: types.Slot = 1;
         const target_slot: types.Slot = 2;
         const valid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = target_slot,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[target_slot],
                     .slot = target_slot,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[target_slot],
-                        .slot = target_slot,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[source_slot],
-                        .slot = source_slot,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[target_slot],
-                        .slot = target_slot,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[source_slot],
+                    .slot = source_slot,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[target_slot],
+                    .slot = target_slot,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
         // Should pass validation
-        try beam_chain.validateAttestation(valid_attestation.message, false);
+        try beam_chain.validateAttestation(valid_attestation.toAttestation(), false);
     }
 
     // Test 2: Unknown source block
     {
         const unknown_root = [_]u8{0xFF} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 3: Unknown target block
     {
         const unknown_root = [_]u8{0xEE} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
+                    .slot = 2,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 4: Unknown head block
     {
         const unknown_root = [_]u8{0xDD} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
     // Test 5: Source slot exceeds target slot (block slots)
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 6: Source checkpoint slot exceeds target checkpoint slot
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 7: Source checkpoint slot mismatch
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 0,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 8: Target checkpoint slot mismatch
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 1, // Checkpoint claims slot 1 (mismatch)
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 1, // Checkpoint claims slot 1 (mismatch)
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 9: Attestation too far in future (for gossip)
     {
         const future_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = 3, // Future slot (current is 2)
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                .slot = 3, // Future slot (current is 2)
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
             .signature = [_]u8{0} ** types.SIGSIZE,
         };
-        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.message, false));
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.toAttestation(), false));
     }
 }
 
@@ -1594,22 +1576,20 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Current time is at slot 1, create attestation for slot 2 (next slot)
     const next_slot_attestation: types.SignedAttestation = .{
+        .validator_id = 0,
         .message = .{
-            .validator_id = 0,
-            .data = .{
-                .slot = 2,
-                .head = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .source = types.Checkpoint{
-                    .root = mock_chain.blockRoots[0],
-                    .slot = 0,
-                },
-                .target = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
+            .slot = 2,
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[0],
+                .slot = 0,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
             },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
@@ -1617,35 +1597,33 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Gossip attestations: should FAIL for next slot (current + 1)
     // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false));
 
     // Block attestations: should PASS for next slot (current + 1)
     // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
-    try beam_chain.validateAttestation(next_slot_attestation.message, true);
+    try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), true);
     const too_far_attestation: types.SignedAttestation = .{
+        .validator_id = 0,
         .message = .{
-            .validator_id = 0,
-            .data = .{
-                .slot = 3, // Too far in future
-                .head = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .source = types.Checkpoint{
-                    .root = mock_chain.blockRoots[0],
-                    .slot = 0,
-                },
-                .target = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
+            .slot = 3, // Too far in future
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[0],
+                .slot = 0,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
             },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
     };
     // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, true));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
@@ -1722,7 +1700,8 @@ test "attestation processing - valid block attestation" {
     const signature = try key_manager.signAttestation(&message, allocator);
 
     const valid_attestation: types.SignedAttestation = .{
-        .message = message,
+        .validator_id = message.validator_id,
+        .message = message.data,
         .signature = signature,
     };
 

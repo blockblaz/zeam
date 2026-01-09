@@ -287,7 +287,7 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     errdefer groups.deinit();
 
     for (0..num_aggregated_attestations) |_| {
-        const signatures = try attestation.AggregatedSignatures.init(allocator);
+        const signatures = try attestation.NaiveAggregatedSignature.init(allocator);
         try groups.append(signatures);
     }
 
@@ -300,21 +300,21 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
 const AggregationGroup = struct {
     data: attestation.AttestationData,
     bits: attestation.AggregationBits,
-    signatures: attestation.AggregatedSignatures,
+    signatures: attestation.NaiveAggregatedSignature,
 
     fn init(allocator: Allocator, signed_attestation: attestation.SignedAttestation) !AggregationGroup {
         var bits = try attestation.AggregationBits.init(allocator);
         errdefer bits.deinit();
 
-        const validator_index: usize = @intCast(signed_attestation.message.validator_id);
+        const validator_index: usize = @intCast(signed_attestation.validator_id);
         try attestation.aggregationBitsSet(&bits, validator_index, true);
 
-        var signatures = try attestation.AggregatedSignatures.init(allocator);
+        var signatures = try attestation.NaiveAggregatedSignature.init(allocator);
         errdefer signatures.deinit();
         try signatures.append(signed_attestation.signature);
 
         return AggregationGroup{
-            .data = signed_attestation.message.data,
+            .data = signed_attestation.message,
             .bits = bits,
             .signatures = signatures,
         };
@@ -359,10 +359,10 @@ pub fn aggregateSignedAttestations(
     defer root_indices.deinit();
 
     for (signed_attestations) |signed_attestation| {
-        const root = try attestation.attestationDataRoot(allocator, signed_attestation.message.data);
+        const root = try signed_attestation.message.sszRoot(allocator);
         if (root_indices.get(root)) |group_index| {
             var group = &groups.items[group_index];
-            const validator_index: usize = @intCast(signed_attestation.message.validator_id);
+            const validator_index: usize = @intCast(signed_attestation.validator_id);
             try attestation.aggregationBitsSet(&group.bits, validator_index, true);
             try group.signatures.append(signed_attestation.signature);
         } else {
@@ -574,7 +574,7 @@ test "encode decode signed block with non-empty attestation signatures" {
     var attestation_signatures = try AttestationSignatures.init(std.testing.allocator);
     errdefer attestation_signatures.deinit();
 
-    var validator_signatures = try attestation.AggregatedSignatures.init(std.testing.allocator);
+    var validator_signatures = try attestation.NaiveAggregatedSignature.init(std.testing.allocator);
     errdefer validator_signatures.deinit();
 
     var test_sig1: SIGBYTES = undefined;
