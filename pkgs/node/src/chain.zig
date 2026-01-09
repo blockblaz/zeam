@@ -43,6 +43,7 @@ pub const ChainOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
     node_registry: *const NodeNameRegistry,
+    force_block_generation: bool = false,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -85,6 +86,7 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
+    force_block_generation: bool,
 
     const Self = @This();
 
@@ -121,6 +123,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
+            .force_block_generation = opts.force_block_generation,
         };
     }
 
@@ -1013,7 +1016,8 @@ pub const BeamChain = struct {
         const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // If no peers connected, we can't verify sync status - assume not synced
-        if (self.connected_peers.count() == 0) {
+        // Unless force_block_generation is enabled, which allows block generation without peers
+        if (self.connected_peers.count() == 0 or self.force_block_generation) {
             return false;
         }
 
