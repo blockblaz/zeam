@@ -47,7 +47,7 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
     errdefer if (attestation_signatures_cleanup) attestation_signatures.deinit();
 
     if (signatures.len > 0) {
-        var validator_signatures = try types.AggregatedSignatures.init(allocator);
+        var validator_signatures = try types.NaiveAggregatedSignature.init(allocator);
         var validator_signatures_cleanup = true;
         errdefer if (validator_signatures_cleanup) validator_signatures.deinit();
 

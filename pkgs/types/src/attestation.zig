@@ -41,13 +41,18 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
 pub const NaiveAggregatedSignature = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
-pub const AggregatedSignatures = NaiveAggregatedSignature;
 
 pub const AttestationData = struct {
     slot: Slot,
     head: Checkpoint,
     target: Checkpoint,
     source: Checkpoint,
+
+    pub fn sszRoot(self: *const AttestationData, allocator: Allocator) !Root {
+        var root: Root = undefined;
+        try ssz.hashTreeRoot(AttestationData, self.*, &root, allocator);
+        return root;
+    }
 
     pub fn toJson(self: *const AttestationData, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
@@ -84,13 +89,14 @@ pub const Attestation = struct {
 };
 
 pub const SignedAttestation = struct {
-    message: Attestation,
+    validator_id: ValidatorIndex,
+    message: AttestationData,
     signature: SIGBYTES,
 
     pub fn toJson(self: *const SignedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.message.validator_id)) });
-        try obj.put("message", try self.message.data.toJson(allocator));
+        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
+        try obj.put("message", try self.message.toJson(allocator));
         try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
         return json.Value{ .object = obj };
     }
@@ -102,7 +108,7 @@ pub const SignedAttestation = struct {
     }
 
     pub fn toAttestation(self: *const SignedAttestation) Attestation {
-        return self.message;
+        return .{ .validator_id = self.validator_id, .data = self.message };
     }
 };
 
@@ -135,7 +141,7 @@ pub const AggregatedAttestation = struct {
 
 pub const SignedAggregatedAttestation = struct {
     message: AggregatedAttestation,
-    signature: AggregatedSignatures,
+    signature: NaiveAggregatedSignature,
 
     pub fn toJson(self: *const SignedAggregatedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
@@ -182,22 +188,14 @@ pub fn aggregationBitsToValidatorIndices(bits: *const AggregationBits, allocator
     return indices;
 }
 
-pub fn attestationDataRoot(allocator: Allocator, data: AttestationData) ![32]u8 {
-    var root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(AttestationData, data, &root, allocator);
-    return root;
-}
-
 test "encode decode signed attestation roundtrip" {
     const signed_attestation = SignedAttestation{
+        .validator_id = 0,
         .message = .{
-            .validator_id = 0,
-            .data = .{
-                .slot = 0,
-                .head = .{ .root = ZERO_HASH, .slot = 0 },
-                .target = .{ .root = ZERO_HASH, .slot = 0 },
-                .source = .{ .root = ZERO_HASH, .slot = 0 },
-            },
+            .slot = 0,
+            .head = .{ .root = ZERO_HASH, .slot = 0 },
+            .target = .{ .root = ZERO_HASH, .slot = 0 },
+            .source = .{ .root = ZERO_HASH, .slot = 0 },
         },
         .signature = ZERO_SIGBYTES,
     };
@@ -210,13 +208,13 @@ test "encode decode signed attestation roundtrip" {
     var decoded: SignedAttestation = undefined;
     try ssz.deserialize(SignedAttestation, encoded.items[0..], &decoded, std.testing.allocator);
 
-    try std.testing.expect(decoded.message.validator_id == signed_attestation.message.validator_id);
-    try std.testing.expect(decoded.message.data.slot == signed_attestation.message.data.slot);
-    try std.testing.expect(decoded.message.data.head.slot == signed_attestation.message.data.head.slot);
-    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.head.root, &signed_attestation.message.data.head.root));
-    try std.testing.expect(decoded.message.data.target.slot == signed_attestation.message.data.target.slot);
-    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.target.root, &signed_attestation.message.data.target.root));
-    try std.testing.expect(decoded.message.data.source.slot == signed_attestation.message.data.source.slot);
-    try std.testing.expect(std.mem.eql(u8, &decoded.message.data.source.root, &signed_attestation.message.data.source.root));
+    try std.testing.expect(decoded.validator_id == signed_attestation.validator_id);
+    try std.testing.expect(decoded.message.slot == signed_attestation.message.slot);
+    try std.testing.expect(decoded.message.head.slot == signed_attestation.message.head.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.head.root, &signed_attestation.message.head.root));
+    try std.testing.expect(decoded.message.target.slot == signed_attestation.message.target.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.target.root, &signed_attestation.message.target.root));
+    try std.testing.expect(decoded.message.source.slot == signed_attestation.message.source.slot);
+    try std.testing.expect(std.mem.eql(u8, &decoded.message.source.root, &signed_attestation.message.source.root));
     try std.testing.expect(std.mem.eql(u8, &decoded.signature, &signed_attestation.signature));
 }

@@ -167,7 +167,8 @@ pub const ValidatorClient = struct {
             const signature = try self.key_manager.signAttestation(&attestation, self.allocator);
 
             const signed_attestation: types.SignedAttestation = .{
-                .message = attestation,
+                .validator_id = validator_id,
+                .message = attestation_data,
                 .signature = signature,
             };
 

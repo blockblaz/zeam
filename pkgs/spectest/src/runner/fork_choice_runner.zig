@@ -691,7 +691,8 @@ fn processBlockStep(
     }
 
     const signed_attestation = types.SignedAttestation{
-        .message = proposer_attestation,
+        .validator_id = proposer_attestation.validator_id,
+        .message = proposer_attestation.data,
         .signature = types.ZERO_SIGBYTES,
     };
     try ctx.fork_choice.onAttestation(signed_attestation, false);
@@ -950,7 +951,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("attestationSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "attestationSlot");
-            if (attestation.message.data.slot != expected) {
+            if (attestation.message.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} attestation slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -961,7 +962,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("headSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "headSlot");
-            if (attestation.message.data.head.slot != expected) {
+            if (attestation.message.head.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} head slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -972,7 +973,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("sourceSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "sourceSlot");
-            if (attestation.message.data.source.slot != expected) {
+            if (attestation.message.source.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} source slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -983,7 +984,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("targetSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "targetSlot");
-            if (attestation.message.data.target.slot != expected) {
+            if (attestation.message.target.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} target slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },

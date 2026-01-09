@@ -282,7 +282,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         for (attestations.items) |attestation| {
             const signature = try key_manager.signAttestation(&attestation, allocator);
             try signed_attestations.append(.{
-                .message = attestation,
+                .validator_id = attestation.validator_id,
+                .message = attestation.data,
                 .signature = signature,
             });
         }

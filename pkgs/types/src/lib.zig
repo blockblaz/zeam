@@ -17,7 +17,6 @@ pub const createBlockSignatures = block.createBlockSignatures;
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;
 pub const NaiveAggregatedSignature = attestation.NaiveAggregatedSignature;
-pub const AggregatedSignatures = attestation.AggregatedSignatures;
 pub const AttestationData = attestation.AttestationData;
 pub const Attestation = attestation.Attestation;
 pub const SignedAttestation = attestation.SignedAttestation;
@@ -26,7 +25,6 @@ pub const SignedAggregatedAttestation = attestation.SignedAggregatedAttestation;
 pub const aggregationBitsEnsureLength = attestation.aggregationBitsEnsureLength;
 pub const aggregationBitsSet = attestation.aggregationBitsSet;
 pub const aggregationBitsToValidatorIndices = attestation.aggregationBitsToValidatorIndices;
-pub const attestationDataRoot = attestation.attestationDataRoot;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

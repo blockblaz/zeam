@@ -156,7 +156,7 @@ pub const NodeTestContext = struct {
         errdefer attestation_signatures.deinit();
 
         for (block.message.block.body.attestations.constSlice()) |aggregated_attestation| {
-            var validator_signatures = try types.AggregatedSignatures.init(allocator);
+            var validator_signatures = try types.NaiveAggregatedSignature.init(allocator);
             errdefer validator_signatures.deinit();
 
             var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
