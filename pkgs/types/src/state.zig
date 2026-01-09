@@ -6,12 +6,13 @@ const zeam_utils = @import("@zeam/utils");
 const zeam_metrics = @import("@zeam/metrics");
 
 const block = @import("./block.zig");
+const attestation = @import("./attestation.zig");
 const utils = @import("./utils.zig");
 const mini_3sf = @import("./mini_3sf.zig");
 const validator = @import("./validator.zig");
 
 const Allocator = std.mem.Allocator;
-const Attestations = block.Attestations;
+const AggregatedAttestations = block.AggregatedAttestations;
 const BeamBlock = block.BeamBlock;
 const BeamBlockHeader = block.BeamBlockHeader;
 const Root = utils.Root;
@@ -274,6 +275,7 @@ pub const BeamState = struct {
 
         // start block processing
         try self.process_block_header(allocator, staged_block, logger);
+
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
         try self.process_operations(allocator, staged_block, logger);
@@ -284,7 +286,7 @@ pub const BeamState = struct {
         try self.process_attestations(allocator, staged_block.body.attestations, logger);
     }
 
-    fn process_attestations(self: *Self, allocator: Allocator, attestations: Attestations, logger: zeam_utils.ModuleLogger) !void {
+    fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, logger: zeam_utils.ModuleLogger) !void {
         const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
         defer _ = attestations_timer.observe();
 
@@ -317,16 +319,22 @@ pub const BeamState = struct {
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
-        for (attestations.constSlice()) |attestation| {
-            const validator_id: usize = @intCast(attestation.validator_id);
-            const attestation_data = attestation.data;
+        for (attestations.constSlice()) |aggregated_attestation| {
+            var validator_indices = try attestation.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+            defer validator_indices.deinit();
+
+            if (validator_indices.items.len == 0) {
+                continue;
+            }
+
+            const attestation_data = aggregated_attestation.data;
             // check if attestation is sane
             const source_slot: usize = @intCast(attestation_data.source.slot);
             const target_slot: usize = @intCast(attestation_data.target.slot);
             const attestation_str = try attestation_data.toJsonString(allocator);
             defer allocator.free(attestation_str);
 
-            logger.debug("processing attestation={s} validator_id={d}\n....\n", .{ attestation_str, validator_id });
+            logger.debug("processing attestation={s} validators={any}\n....\n", .{ attestation_str, validator_indices.items });
 
             if (source_slot >= self.justified_slots.len()) {
                 return StateTransitionError.InvalidSlotIndex;
@@ -343,8 +351,11 @@ pub const BeamState = struct {
 
             const is_source_justified = try self.justified_slots.get(source_slot);
             const is_target_already_justified = try self.justified_slots.get(target_slot);
-            const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &(try self.historical_block_hashes.get(source_slot)));
-            const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &(try self.historical_block_hashes.get(target_slot)));
+            const stored_source_root = try self.historical_block_hashes.get(source_slot);
+            const stored_target_root = try self.historical_block_hashes.get(target_slot);
+            const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
+            const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
+            const has_known_root = has_correct_source_root and has_correct_target_root;
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
 
@@ -352,24 +363,18 @@ pub const BeamState = struct {
                 // not present in 3sf mini but once a target is justified no need to run loop
                 // as we remove the target from justifications map as soon as its justified
                 is_target_already_justified or
-                !has_correct_source_root or
-                !has_correct_target_root or
+                !has_known_root or
                 target_not_ahead or
                 !is_target_justifiable)
             {
-                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(correct_source_root={}) or !(correct_target_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
+                logger.debug("skipping the attestation as not viable: !(source_justified={}) or target_already_justified={} !(known_root={}) or target_not_ahead={} or !(target_justifiable={})", .{
                     is_source_justified,
                     is_target_already_justified,
-                    has_correct_source_root,
-                    has_correct_target_root,
+                    has_known_root,
                     target_not_ahead,
                     is_target_justifiable,
                 });
                 continue;
-            }
-
-            if (validator_id >= num_validators) {
-                return StateTransitionError.InvalidValidatorId;
             }
 
             var target_justifications = justifications.get(attestation_data.target.root) orelse targetjustifications: {
@@ -381,7 +386,12 @@ pub const BeamState = struct {
                 break :targetjustifications targetjustifications;
             };
 
-            target_justifications[validator_id] = 1;
+            for (validator_indices.items) |validator_index| {
+                if (validator_index >= num_validators) {
+                    return StateTransitionError.InvalidValidatorId;
+                }
+                target_justifications[validator_index] = 1;
+            }
             try justifications.put(allocator, attestation_data.target.root, target_justifications);
             var target_justifications_count: usize = 0;
             for (target_justifications) |justified| {
