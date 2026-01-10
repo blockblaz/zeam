@@ -13,7 +13,10 @@ const MAX_SSE_CONNECTIONS: usize = 32;
 const MAX_GRAPH_INFLIGHT: usize = 2;
 const RATE_LIMIT_RPS: f64 = 2.0;
 const RATE_LIMIT_BURST: f64 = 5.0;
-const RATE_LIMIT_MAX_ENTRIES: usize = 1024; // Max tracked IPs to bound memory.
+const RATE_LIMIT_MAX_ENTRIES: usize = 256; // Max tracked IPs to bound memory.
+const RATE_LIMIT_CLEANUP_THRESHOLD: usize = RATE_LIMIT_MAX_ENTRIES / 2; // Trigger lazy cleanup.
+const RATE_LIMIT_STALE_NS: u64 = 10 * std.time.ns_per_min; // Evict entries idle past TTL.
+const RATE_LIMIT_CLEANUP_COOLDOWN_NS: u64 = 60 * std.time.ns_per_s;
 
 pub const APIServerHandle = struct {
     thread: std.Thread,
@@ -459,6 +462,7 @@ const RateLimiter = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMap(RateLimitEntry),
     mutex: std.Thread.Mutex = .{},
+    last_cleanup_ns: u64 = 0,
 
     fn init(allocator: std.mem.Allocator) !RateLimiter {
         return .{
@@ -484,6 +488,12 @@ const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        if (self.entries.count() > RATE_LIMIT_CLEANUP_THRESHOLD and now - self.last_cleanup_ns > RATE_LIMIT_CLEANUP_COOLDOWN_NS) {
+            // Opportunistic TTL cleanup with cooldown to prevent repeated full scans on the hot path.
+            self.evictStale(now);
+            self.last_cleanup_ns = now;
+        }
+
         // Hard cap on tracked IPs to bound memory in long-lived processes.
         if (self.entries.count() >= RATE_LIMIT_MAX_ENTRIES and !self.entries.contains(key)) {
             return false;
@@ -505,23 +515,42 @@ const RateLimiter = struct {
         entry.tokens -= 1.0;
         return true;
     }
+
+    fn evictStale(self: *RateLimiter, now: u64) void {
+        // Collect keys first to avoid mutating the map while iterating.
+        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        defer to_remove.deinit();
+
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.last_refill_ns > RATE_LIMIT_STALE_NS) {
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.entries.remove(key)) {
+                self.allocator.free(key);
+            }
+        }
+    }
 };
 
 fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
     return switch (addr.any.family) {
         std.posix.AF.INET => blk: {
-            const ip = addr.in.addr;
             // IPv4 as dotted quad.
+            const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
             const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-                ip & 0xFF,
-                (ip >> 8) & 0xFF,
-                (ip >> 16) & 0xFF,
-                (ip >> 24) & 0xFF,
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
             }) catch return null;
             break :blk len;
         },
         std.posix.AF.INET6 => blk: {
-            const ip6 = addr.in6.addr;
+            const ip6 = addr.in6.sa.addr;
             // IPv6 as hex string.
             const len = std.fmt.bufPrint(buf, "{s}", .{std.fmt.fmtSliceHexLower(&ip6)}) catch return null;
             break :blk len;
