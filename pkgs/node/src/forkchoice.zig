@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
 
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
@@ -85,7 +86,8 @@ pub const ProtoArray = struct {
         }
     }
 
-    pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn applyDeltasUnlocked(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
         if (deltas.len != self.nodes.items.len) {
             return ForkChoiceError.InvalidDeltas;
         }
@@ -220,8 +222,22 @@ pub const ForkChoice = struct {
     // get added
     deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
+    // Thread-safe access protection
+    mutex: Thread.RwLock,
 
     const Self = @This();
+
+    /// Thread-safe snapshot for observability
+    pub const Snapshot = struct {
+        head: ProtoNode,
+        latest_justified_root: [32]u8,
+        latest_finalized_root: [32]u8,
+        nodes: []ProtoNode,
+
+        pub fn deinit(self: Snapshot, allocator: Allocator) void {
+            allocator.free(self.nodes);
+        }
+    };
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
         const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
@@ -262,9 +278,52 @@ pub const ForkChoice = struct {
             .safeTarget = anchor_block,
             .deltas = deltas,
             .logger = opts.logger,
+            .mutex = Thread.RwLock{},
         };
-        _ = try fc.updateHead();
+        // No lock needed during init - struct not yet accessible to other threads
+        _ = try fc.updateHeadUnlocked();
         return fc;
+    }
+
+    /// Thread-safe snapshot for observability
+    /// Holds shared lock only during copy, caller formats JSON lock-free
+    pub fn snapshot(self: *Self, allocator: Allocator) !Snapshot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+
+        // Quick copy - ProtoNode has no pointer members, shallow copy is safe
+        const nodes_copy = try allocator.alloc(ProtoNode, self.protoArray.nodes.items.len);
+        @memcpy(nodes_copy, self.protoArray.nodes.items);
+
+        // Get the full ProtoNode for head from protoArray
+        const head_idx = self.protoArray.indices.get(self.head.blockRoot) orelse {
+            // Fallback: create a ProtoNode from ProtoBlock if not found
+            const head_node = ProtoNode{
+                .slot = self.head.slot,
+                .blockRoot = self.head.blockRoot,
+                .parentRoot = self.head.parentRoot,
+                .stateRoot = self.head.stateRoot,
+                .timeliness = self.head.timeliness,
+                .confirmed = self.head.confirmed,
+                .parent = null,
+                .weight = 0,
+                .bestChild = null,
+                .bestDescendant = null,
+            };
+            return Snapshot{
+                .head = head_node,
+                .latest_justified_root = self.fcStore.latest_justified.root,
+                .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .nodes = nodes_copy,
+            };
+        };
+
+        return Snapshot{
+            .head = self.protoArray.nodes.items[head_idx],
+            .latest_justified_root = self.fcStore.latest_justified.root,
+            .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .nodes = nodes_copy,
+        };
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -301,7 +360,8 @@ pub const ForkChoice = struct {
 
     /// Builds a canonical view hashmap containing all blocks in the canonical chain
     /// from targetAnchor back to prevAnchor, plus all their unfinalized descendants.
-    pub fn getCanonicalView(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn getCanonicalViewUnlocked(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
         const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
         const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
 
@@ -346,7 +406,8 @@ pub const ForkChoice = struct {
     /// - non_canonical_roots: Blocks not in the canonical set (orphans)
     ///
     /// If canonicalViewOrNull is provided, it reuses an existing canonical view for efficiency.
-    pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
+    // Internal unlocked version - assumes caller holds lock
+    fn getCanonicalityAnalysisUnlocked(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
         var canonical_roots = std.ArrayList(types.Root).init(self.allocator);
         var potential_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
         var non_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
@@ -359,7 +420,7 @@ pub const ForkChoice = struct {
         // get all canonical view of the chain finalized and unfinalized anchored at the targetAnchorRoot
         var canonical_blocks = canonicalViewOrNull orelse blk: {
             var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
-            try self.getCanonicalView(&local_view, targetAnchorRoot, prevAnchorRootOrNull);
+            try self.getCanonicalViewUnlocked(&local_view, targetAnchorRoot, prevAnchorRootOrNull);
             break :blk &local_view;
         };
 
@@ -410,13 +471,14 @@ pub const ForkChoice = struct {
     }
 
     /// Rebases the forkchoice tree to a new anchor, pruning non-canonical blocks.
-    pub fn rebase(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn rebaseUnlocked(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
         const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
         const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
 
         var canonical_view = canonicalViewOrNull orelse blk: {
             var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
-            try self.getCanonicalView(&local_view, targetAnchorRoot, null);
+            try self.getCanonicalViewUnlocked(&local_view, targetAnchorRoot, null);
             break :blk &local_view;
         };
 
@@ -532,7 +594,8 @@ pub const ForkChoice = struct {
     /// Depth 0 returns the head itself. Traverses parent pointers (not slot arithmetic),
     /// so missed slots don't affect depth counting. If depth exceeds chain length,
     /// clamps to genesis.
-    pub fn getCanonicalAncestorAtDepth(self: *Self, min_depth: usize) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn getCanonicalAncestorAtDepthUnlocked(self: *Self, min_depth: usize) !ProtoBlock {
         var depth = min_depth;
         var current_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
 
@@ -554,7 +617,8 @@ pub const ForkChoice = struct {
         return ancestor_at_depth;
     }
 
-    pub fn tickInterval(self: *Self, hasProposal: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
 
@@ -562,28 +626,30 @@ pub const ForkChoice = struct {
             0 => {
                 self.fcStore.timeSlots += 1;
                 if (hasProposal) {
-                    _ = try self.acceptNewAttestations();
+                    _ = try self.acceptNewAttestationsUnlocked();
                 }
             },
             1 => {},
             2 => {
-                _ = try self.updateSafeTarget();
+                _ = try self.updateSafeTargetUnlocked();
             },
             3 => {
-                _ = try self.acceptNewAttestations();
+                _ = try self.acceptNewAttestationsUnlocked();
             },
             else => @panic("invalid interval"),
         }
         self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool) !void {
         while (self.fcStore.time < time_intervals) {
-            try self.tickInterval(has_proposal and (self.fcStore.time + 1) == time_intervals);
+            try self.tickIntervalUnlocked(has_proposal and (self.fcStore.time + 1) == time_intervals);
         }
     }
 
-    pub fn acceptNewAttestations(self: *Self) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.latestNew) |new_attestation| {
@@ -595,27 +661,11 @@ pub const ForkChoice = struct {
             try self.attestations.put(validator_id, attestation_tracker);
         }
 
-        return self.updateHead();
+        return self.updateHeadUnlocked();
     }
 
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
-        const time_intervals = slot * constants.INTERVALS_PER_SLOT;
-        // this could be called independently by the validator when its a separate process
-        // and FC would need to be protected by mutex to make it thread safe but for now
-        // this is deterministally called after the fc has been ticked ahead
-        // so the following call should be a no-op
-        try self.onInterval(time_intervals, true);
-        // accept any new attestations in case previous ontick was a no-op and either the validator
-        // wasn't registered or there have been new attestations
-        const head = try self.acceptNewAttestations();
-
-        return types.Checkpoint{
-            .root = head.blockRoot,
-            .slot = head.slot,
-        };
-    }
-
-    pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
+    // Internal unlocked version - assumes caller holds lock
+    fn getProposalAttestationsUnlocked(self: *Self) ![]types.SignedAttestation {
         var included_attestations = std.ArrayList(types.SignedAttestation).init(self.allocator);
         const latest_justified = self.fcStore.latest_justified;
 
@@ -636,7 +686,8 @@ pub const ForkChoice = struct {
         return included_attestations.toOwnedSlice();
     }
 
-    pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
+    // Internal unlocked version - assumes caller holds lock
+    fn getAttestationTargetUnlocked(self: *Self) !types.Checkpoint {
         var target_idx = self.protoArray.indices.get(self.head.blockRoot) orelse return ForkChoiceError.InvalidHeadIndex;
         const nodes = self.protoArray.nodes.items;
 
@@ -657,7 +708,8 @@ pub const ForkChoice = struct {
         };
     }
 
-    pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+    // Internal unlocked version - assumes caller holds lock
+    fn computeDeltasUnlocked(self: *Self, from_known: bool) ![]isize {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
             try self.deltas.append(0);
@@ -690,9 +742,10 @@ pub const ForkChoice = struct {
         return self.deltas.items;
     }
 
-    pub fn computeFCHead(self: *Self, from_known: bool, cutoff_weight: u64) !ProtoBlock {
-        const deltas = try self.computeDeltas(from_known);
-        try self.protoArray.applyDeltas(deltas, cutoff_weight);
+    // Internal unlocked version - assumes caller holds lock
+    fn computeFCHeadUnlocked(self: *Self, from_known: bool, cutoff_weight: u64) !ProtoBlock {
+        const deltas = try self.computeDeltasUnlocked(from_known);
+        try self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
 
         // head is the best descendant of latest justified
         const justified_idx = self.protoArray.indices.get(self.fcStore.latest_justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
@@ -715,20 +768,23 @@ pub const ForkChoice = struct {
         return fcHead;
     }
 
-    pub fn updateHead(self: *Self) !ProtoBlock {
-        self.head = try self.computeFCHead(true, 0);
+    // Internal unlocked version - assumes caller holds lock
+    fn updateHeadUnlocked(self: *Self) !ProtoBlock {
+        self.head = try self.computeFCHeadUnlocked(true, 0);
         // Update the lean_head_slot metric
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
         return self.head;
     }
 
-    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHead(false, cutoff_weight);
+        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
         return self.safeTarget;
     }
 
-    pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn onAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
@@ -778,11 +834,12 @@ pub const ForkChoice = struct {
     }
 
     // we process state outside forkchoice onblock to parallize verifications and just use the post state here
-    pub fn onBlock(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn onBlockUnlocked(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
-        const parent_block_or_null = self.getBlock(parent_root);
+        const parent_block_or_null = self.getBlockUnlocked(parent_root);
         if (parent_block_or_null) |parent_block| {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
@@ -825,7 +882,8 @@ pub const ForkChoice = struct {
         }
     }
 
-    pub fn confirmBlock(self: *Self, blockRoot: types.Root) !void {
+    // Internal unlocked version - assumes caller holds lock
+    fn confirmBlockUnlocked(self: *Self, blockRoot: types.Root) !void {
         if (self.protoArray.indices.get(blockRoot)) |block_idx| {
             self.protoArray.nodes.items[block_idx].confirmed = true;
         } else {
@@ -833,17 +891,8 @@ pub const ForkChoice = struct {
         }
     }
 
-    pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
-        const block_or_null = self.getBlock(blockRoot);
-        // we can only say we have the block if its fully confirmed to be imported
-        if (block_or_null) |block| {
-            return (block.confirmed == true);
-        }
-
-        return false;
-    }
-
-    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
+    // Internal unlocked version - assumes caller holds lock
+    fn getBlockUnlocked(self: *Self, blockRoot: types.Root) ?ProtoBlock {
         const nodeOrNull = self.protoArray.getNode(blockRoot);
         if (nodeOrNull) |node| {
             // TODO cast doesn't seem to be working find resolution
@@ -860,6 +909,173 @@ pub const ForkChoice = struct {
         } else {
             return null;
         }
+    }
+
+    // Internal unlocked version - assumes caller holds lock
+    fn hasBlockUnlocked(self: *Self, blockRoot: types.Root) bool {
+        return self.protoArray.indices.contains(blockRoot);
+    }
+
+    //  PUBLIC API - LOCK AT BOUNDARY
+    // These methods acquire locks and delegate to unlocked helpers
+
+    pub fn updateHead(self: *Self) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.updateHeadUnlocked();
+    }
+
+    pub fn onBlock(self: *Self, block: types.BeamBlock, state: *const types.BeamState, opts: OnBlockOpts) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onBlockUnlocked(block, state, opts);
+    }
+
+    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onIntervalUnlocked(time_intervals, has_proposal);
+    }
+
+    pub fn onAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onAttestationUnlocked(signed_attestation, is_from_block);
+    }
+
+    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.updateSafeTargetUnlocked();
+    }
+
+    //  READ-ONLY API - SHARED LOCK
+
+    pub fn getProposalAttestations(self: *Self) ![]types.SignedAttestation {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getProposalAttestationsUnlocked();
+    }
+
+    pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getAttestationTargetUnlocked();
+    }
+
+    pub fn hasBlock(self: *Self, blockRoot: types.Root) bool {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.hasBlockUnlocked(blockRoot);
+    }
+
+    pub fn getBlock(self: *Self, blockRoot: types.Root) ?ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getBlockUnlocked(blockRoot);
+    }
+
+    pub fn getCanonicalView(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) !void {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getCanonicalViewUnlocked(canonical_view, targetAnchorRoot, prevAnchorRootOrNull);
+    }
+
+    pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getCanonicalityAnalysisUnlocked(targetAnchorRoot, prevAnchorRootOrNull, canonicalViewOrNull);
+    }
+
+    pub fn rebase(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.rebaseUnlocked(targetAnchorRoot, canonicalViewOrNull);
+    }
+
+    pub fn getCanonicalAncestorAtDepth(self: *Self, min_depth: usize) !ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getCanonicalAncestorAtDepthUnlocked(min_depth);
+    }
+
+    pub fn confirmBlock(self: *Self, blockRoot: types.Root) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.confirmBlockUnlocked(blockRoot);
+    }
+
+    pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.computeDeltasUnlocked(from_known);
+    }
+
+    pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
+    }
+
+    //  SAFE GETTERS FOR SHARED STATE
+    // These provide thread-safe access to internal state
+
+    /// Get a copy of the current head block
+    pub fn getHead(self: *Self) ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.head;
+    }
+
+    /// Get the current safe target block (thread-safe)
+    pub fn getSafeTarget(self: *Self) ProtoBlock {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.safeTarget;
+    }
+
+    /// Get the latest justified checkpoint
+    pub fn getLatestJustified(self: *Self) types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.latest_justified;
+    }
+
+    /// Get the latest finalized checkpoint
+    pub fn getLatestFinalized(self: *Self) types.Checkpoint {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.latest_finalized;
+    }
+
+    /// Get the current time in slots
+    pub fn getCurrentSlot(self: *Self) types.Slot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.fcStore.timeSlots;
+    }
+
+    /// Check if a block exists and get its slot (thread-safe)
+    pub fn getBlockSlot(self: *Self, blockRoot: types.Root) ?types.Slot {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        const idx = self.protoArray.indices.get(blockRoot) orelse return null;
+        return self.protoArray.nodes.items[idx].slot;
+    }
+
+    /// Get a ProtoNode by root (returns a copy)
+    pub fn getProtoNode(self: *Self, blockRoot: types.Root) ?ProtoNode {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        const idx = self.protoArray.indices.get(blockRoot) orelse return null;
+        return self.protoArray.nodes.items[idx];
+    }
+
+    /// Get the current number of nodes in the forkchoice tree
+    pub fn getNodeCount(self: *Self) usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.nodes.items.len;
     }
 };
 
@@ -1065,6 +1281,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
+        .mutex = Thread.RwLock{},
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit();
@@ -1379,6 +1596,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
+        .mutex = Thread.RwLock{},
     };
 
     return .{
@@ -1572,7 +1790,7 @@ test "rebase: bestChild and bestDescendant remapping" {
 
     // Apply deltas to establish weights and bestChild/bestDescendant
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 0);
+    try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Verify pre-rebase bestChild/bestDescendant
     // C(2) should have bestChild=3(D) since D branch has all 4 votes
@@ -1672,7 +1890,7 @@ test "rebase: weight preservation after rebase" {
 
     // Apply deltas to establish weights
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 0);
+    try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Record pre-rebase weights for nodes that will remain
     const pre_rebase_weight_C = ctx.fork_choice.protoArray.nodes.items[2].weight; // C
@@ -2327,6 +2545,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
+        .mutex = Thread.RwLock{},
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
