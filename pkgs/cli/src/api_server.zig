@@ -8,6 +8,12 @@ const QUERY_SLOTS_PREFIX = "?slots=";
 const DEFAULT_MAX_SLOTS: usize = 50;
 const MAX_ALLOWED_SLOTS: usize = 200;
 const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
+// Conservative defaults for a local metrics server.
+const MAX_SSE_CONNECTIONS: usize = 32;
+const MAX_GRAPH_INFLIGHT: usize = 2;
+const RATE_LIMIT_RPS: f64 = 2.0;
+const RATE_LIMIT_BURST: f64 = 5.0;
+const RATE_LIMIT_MAX_ENTRIES: usize = 1024; // Max tracked IPs to bound memory.
 
 pub const APIServerHandle = struct {
     thread: std.Thread,
@@ -22,6 +28,9 @@ pub const APIServerHandle = struct {
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node.fcFactory.ForkChoice) !APIServerHandle {
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
+    var rate_limiter = try RateLimiter.init(allocator);
+    errdefer rate_limiter.deinit();
+
     const ctx = try allocator.create(SimpleMetricsServer);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
@@ -29,6 +38,9 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
         .port = port,
         .forkchoice = forkchoice,
         .stop = std.atomic.Value(bool).init(false),
+        .sse_active = 0,
+        .graph_inflight = 0,
+        .rate_limiter = rate_limiter,
     };
 
     const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
@@ -40,7 +52,40 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
     };
 }
 
-fn handleNonSSERequest(request: *std.http.Server.Request, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
+fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice, ctx: *SimpleMetricsServer) void {
+    var buffer: [4096]u8 = undefined;
+    var http_server = std.http.Server.init(connection, &buffer);
+    var request = http_server.receiveHead() catch |err| {
+        std.log.warn("Failed to receive HTTP head: {}", .{err});
+        connection.stream.close();
+        return;
+    };
+
+    if (std.mem.eql(u8, request.head.target, "/events")) {
+        if (!ctx.tryAcquireSSE()) {
+            _ = request.respond("Service Unavailable\n", .{ .status = .service_unavailable }) catch {};
+            connection.stream.close();
+            return;
+        }
+        _ = std.Thread.spawn(.{}, SimpleMetricsServer.handleSSEConnection, .{ connection.stream, allocator, ctx }) catch |err| {
+            std.log.warn("Failed to spawn SSE handler: {}", .{err});
+            ctx.releaseSSE();
+            connection.stream.close();
+        };
+        return;
+    }
+
+    handleNonSSERequestWithAddr(&request, allocator, forkchoice, ctx, connection.address);
+    connection.stream.close();
+}
+
+fn handleNonSSERequestWithAddr(
+    request: *std.http.Server.Request,
+    allocator: std.mem.Allocator,
+    forkchoice: *node.fcFactory.ForkChoice,
+    ctx: *SimpleMetricsServer,
+    client_addr: std.net.Address,
+) void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const request_allocator = arena.allocator();
@@ -67,7 +112,7 @@ fn handleNonSSERequest(request: *std.http.Server.Request, allocator: std.mem.All
             },
         }) catch {};
     } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
-        handleForkChoiceGraph(request, request_allocator, forkchoice) catch |err| {
+        handleForkChoiceGraph(request, request_allocator, forkchoice, ctx, client_addr) catch |err| {
             std.log.warn("Fork choice graph request failed: {}", .{err});
             _ = request.respond("Internal Server Error\n", .{}) catch {};
         };
@@ -76,28 +121,24 @@ fn handleNonSSERequest(request: *std.http.Server.Request, allocator: std.mem.All
     }
 }
 
-fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) void {
-    var buffer: [4096]u8 = undefined;
-    var http_server = std.http.Server.init(connection, &buffer);
-    var request = http_server.receiveHead() catch |err| {
-        std.log.warn("Failed to receive HTTP head: {}", .{err});
-        connection.stream.close();
-        return;
-    };
-
-    if (std.mem.eql(u8, request.head.target, "/events")) {
-        _ = std.Thread.spawn(.{}, SimpleMetricsServer.handleSSEConnection, .{ connection.stream, allocator }) catch |err| {
-            std.log.warn("Failed to spawn SSE handler: {}", .{err});
-            connection.stream.close();
-        };
+fn handleForkChoiceGraph(
+    request: *std.http.Server.Request,
+    allocator: std.mem.Allocator,
+    forkchoice: *node.fcFactory.ForkChoice,
+    ctx: *SimpleMetricsServer,
+    client_addr: std.net.Address,
+) !void {
+    // Per-IP token bucket + global in-flight cap for the graph endpoint.
+    if (!ctx.rate_limiter.allow(client_addr)) {
+        _ = request.respond("Too Many Requests\n", .{ .status = .too_many_requests }) catch {};
         return;
     }
+    if (!ctx.tryAcquireGraph()) {
+        _ = request.respond("Too Many Requests\n", .{ .status = .too_many_requests }) catch {};
+        return;
+    }
+    defer ctx.releaseGraph();
 
-    handleNonSSERequest(&request, allocator, forkchoice);
-    connection.stream.close();
-}
-
-fn handleForkChoiceGraph(request: *std.http.Server.Request, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice) !void {
     var max_slots: usize = DEFAULT_MAX_SLOTS;
     if (std.mem.indexOf(u8, request.head.target, QUERY_SLOTS_PREFIX)) |query_start| {
         const slots_param = request.head.target[query_start + QUERY_SLOTS_PREFIX.len ..];
@@ -304,9 +345,15 @@ const SimpleMetricsServer = struct {
     port: u16,
     forkchoice: *node.fcFactory.ForkChoice,
     stop: std.atomic.Value(bool),
+    sse_active: usize,
+    graph_inflight: usize,
+    rate_limiter: RateLimiter,
+    sse_mutex: std.Thread.Mutex = .{},
+    graph_mutex: std.Thread.Mutex = .{},
 
     fn run(self: *SimpleMetricsServer) !void {
         defer self.allocator.destroy(self);
+        defer self.rate_limiter.deinit();
         const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
         var server = try address.listen(.{ .reuse_address = true, .force_nonblocking = true });
         defer server.deinit();
@@ -324,15 +371,16 @@ const SimpleMetricsServer = struct {
                 continue;
             };
 
-            routeConnection(connection, self.allocator, self.forkchoice);
+            routeConnection(connection, self.allocator, self.forkchoice, self);
         }
     }
 
-    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
+    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator, ctx: *SimpleMetricsServer) void {
         SimpleMetricsServer.handleSSEEvents(stream, allocator) catch |err| {
             std.log.warn("SSE connection failed: {}", .{err});
         };
         stream.close();
+        ctx.releaseSSE();
     }
 
     fn handleSSEEvents(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
@@ -370,4 +418,114 @@ const SimpleMetricsServer = struct {
             std.time.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
         }
     }
+
+    fn tryAcquireSSE(self: *SimpleMetricsServer) bool {
+        self.sse_mutex.lock();
+        defer self.sse_mutex.unlock();
+        // Limit long-lived SSE connections to avoid unbounded threads.
+        if (self.sse_active >= MAX_SSE_CONNECTIONS) return false;
+        self.sse_active += 1;
+        return true;
+    }
+
+    fn releaseSSE(self: *SimpleMetricsServer) void {
+        self.sse_mutex.lock();
+        defer self.sse_mutex.unlock();
+        if (self.sse_active > 0) self.sse_active -= 1;
+    }
+
+    fn tryAcquireGraph(self: *SimpleMetricsServer) bool {
+        self.graph_mutex.lock();
+        defer self.graph_mutex.unlock();
+        // Cap concurrent graph JSON generation.
+        if (self.graph_inflight >= MAX_GRAPH_INFLIGHT) return false;
+        self.graph_inflight += 1;
+        return true;
+    }
+
+    fn releaseGraph(self: *SimpleMetricsServer) void {
+        self.graph_mutex.lock();
+        defer self.graph_mutex.unlock();
+        if (self.graph_inflight > 0) self.graph_inflight -= 1;
+    }
 };
+
+const RateLimitEntry = struct {
+    tokens: f64,
+    last_refill_ns: u64,
+};
+
+const RateLimiter = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMap(RateLimitEntry),
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator) !RateLimiter {
+        return .{
+            .allocator = allocator,
+            .entries = std.StringHashMap(RateLimitEntry).init(allocator),
+        };
+    }
+
+    fn deinit(self: *RateLimiter) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.entries.deinit();
+    }
+
+    fn allow(self: *RateLimiter, addr: std.net.Address) bool {
+        const now_signed = std.time.nanoTimestamp();
+        const now: u64 = if (now_signed > 0) @intCast(now_signed) else 0;
+        var key_buf: [64]u8 = undefined;
+        const key = addrToKey(&key_buf, addr) orelse return true;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Hard cap on tracked IPs to bound memory in long-lived processes.
+        if (self.entries.count() >= RATE_LIMIT_MAX_ENTRIES and !self.entries.contains(key)) {
+            return false;
+        }
+
+        const entry = self.entries.getPtr(key) orelse blk: {
+            const owned_key = self.allocator.dupe(u8, key) catch return false;
+            _ = self.entries.put(owned_key, .{ .tokens = RATE_LIMIT_BURST, .last_refill_ns = now }) catch return false;
+            break :blk self.entries.getPtr(owned_key) orelse return false;
+        };
+
+        // Token bucket refill based on elapsed time.
+        const elapsed_ns = if (now > entry.last_refill_ns) now - entry.last_refill_ns else 0;
+        const refill = (@as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s))) * RATE_LIMIT_RPS;
+        entry.tokens = @min(RATE_LIMIT_BURST, entry.tokens + refill);
+        entry.last_refill_ns = now;
+
+        if (entry.tokens < 1.0) return false;
+        entry.tokens -= 1.0;
+        return true;
+    }
+};
+
+fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
+    return switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const ip = addr.in.addr;
+            // IPv4 as dotted quad.
+            const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+                ip & 0xFF,
+                (ip >> 8) & 0xFF,
+                (ip >> 16) & 0xFF,
+                (ip >> 24) & 0xFF,
+            }) catch return null;
+            break :blk len;
+        },
+        std.posix.AF.INET6 => blk: {
+            const ip6 = addr.in6.addr;
+            // IPv6 as hex string.
+            const len = std.fmt.bufPrint(buf, "{s}", .{std.fmt.fmtSliceHexLower(&ip6)}) catch return null;
+            break :blk len;
+        },
+        else => null,
+    };
+}
