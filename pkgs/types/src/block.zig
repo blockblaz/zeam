@@ -1,5 +1,7 @@
 const std = @import("std");
 const ssz = @import("ssz");
+const hash_zig = @import("hash-zig");
+const PoseidonHasher = hash_zig.ssz.SszHasher;
 
 const params = @import("@zeam/params");
 
@@ -135,6 +137,7 @@ pub const BeamBlock = struct {
     pub fn blockToHeader(self: *const Self, allocator: Allocator) !BeamBlockHeader {
         var body_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
+            PoseidonHasher,
             BeamBlockBody,
             self.body,
             &body_root,
@@ -155,6 +158,7 @@ pub const BeamBlock = struct {
     pub fn blockToLatestBlockHeader(self: *const Self, allocator: Allocator, header: *BeamBlockHeader) !void {
         var body_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
+            PoseidonHasher,
             BeamBlockBody,
             self.body,
             &body_root,
@@ -378,6 +382,7 @@ test "ssz seralize/deserialize signed beam block" {
     // successful merklization
     var block_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(
+        PoseidonHasher,
         BeamBlock,
         signed_block.message.block,
         &block_root,

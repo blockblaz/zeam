@@ -88,6 +88,10 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     }).module("ssz.zig");
+    const hash_zig = b.dependency("hash-zig", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("hash-zig");
     const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
@@ -179,6 +183,7 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     zeam_types.addImport("ssz", ssz);
+    zeam_types.addImport("hash-zig", hash_zig);
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
@@ -221,6 +226,7 @@ pub fn build(b: *Builder) !void {
     zeam_key_manager.addImport("@zeam/types", zeam_types);
     zeam_key_manager.addImport("@zeam/metrics", zeam_metrics);
     zeam_key_manager.addImport("ssz", ssz);
+    zeam_key_manager.addImport("hash-zig", hash_zig);
 
     // add zeam-state-transition
     const zeam_state_transition = b.addModule("@zeam/state-transition", .{
@@ -232,6 +238,7 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/params", zeam_params);
     zeam_state_transition.addImport("@zeam/types", zeam_types);
     zeam_state_transition.addImport("ssz", ssz);
+    zeam_state_transition.addImport("hash-zig", hash_zig);
     zeam_state_transition.addImport("@zeam/api", zeam_api);
     zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
     zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
@@ -291,6 +298,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_beam_node.addImport("xev", xev);
     zeam_beam_node.addImport("ssz", ssz);
+    zeam_beam_node.addImport("hash-zig", hash_zig);
     zeam_beam_node.addImport("@zeam/utils", zeam_utils);
     zeam_beam_node.addImport("@zeam/params", zeam_params);
     zeam_beam_node.addImport("@zeam/types", zeam_types);
@@ -313,6 +321,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("@zeam/params", zeam_params);
     zeam_spectests.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_spectests.addImport("ssz", ssz);
+    zeam_spectests.addImport("hash-zig", hash_zig);
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
@@ -334,6 +343,7 @@ pub fn build(b: *Builder) !void {
 
     // addimport to root module is even required afer declaring it in mod
     cli_exe.root_module.addImport("ssz", ssz);
+    cli_exe.root_module.addImport("hash-zig", hash_zig);
     cli_exe.root_module.addImport("build_options", build_options_module);
     cli_exe.root_module.addImport("simargs", simargs);
     cli_exe.root_module.addImport("xev", xev);
@@ -562,6 +572,7 @@ pub fn build(b: *Builder) !void {
     xmss_cycle_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
     xmss_cycle_tests.root_module.addImport("@zeam/types", zeam_types);
     xmss_cycle_tests.root_module.addImport("ssz", ssz);
+    xmss_cycle_tests.root_module.addImport("hash-zig", hash_zig);
     xmss_cycle_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_cycle_tests, target, prover);
     const run_xmss_cycle_tests = b.addRunArtifact(xmss_cycle_tests);
@@ -578,6 +589,7 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
+    spectests.root_module.addImport("hash-zig", hash_zig);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
 
@@ -717,6 +729,11 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
         }).module("ssz.zig");
 
+        const hash_zig = b.dependency("hash-zig", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("hash-zig");
+
         // add metrics
         const metrics = b.dependency("metrics", .{
             .target = target,
@@ -752,6 +769,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .root_source_file = b.path("pkgs/types/src/lib.zig"),
         });
         zeam_types.addImport("ssz", ssz);
+        zeam_types.addImport("hash-zig", hash_zig);
         zeam_types.addImport("@zeam/params", zeam_params);
         zeam_types.addImport("@zeam/utils", zeam_utils);
         zeam_types.addImport("@zeam/metrics", zeam_metrics);
@@ -774,6 +792,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
         zeam_state_transition.addImport("@zeam/params", zeam_params);
         zeam_state_transition.addImport("@zeam/types", zeam_types);
         zeam_state_transition.addImport("ssz", ssz);
+        zeam_state_transition.addImport("hash-zig", hash_zig);
         zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
         zeam_state_transition.addImport("zkvm", zkvm_module);
 

@@ -1,5 +1,7 @@
 const std = @import("std");
 const json = std.json;
+const hash_zig = @import("hash-zig");
+const PoseidonHasher = hash_zig.ssz.SszHasher;
 const Allocator = std.mem.Allocator;
 
 const ssz = @import("ssz");
@@ -226,6 +228,7 @@ pub const ForkChoice = struct {
         const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
+            PoseidonHasher,
             types.BeamBlockHeader,
             anchor_block_header,
             &anchor_block_root,
@@ -804,7 +807,7 @@ pub const ForkChoice = struct {
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+                try ssz.hashTreeRoot(PoseidonHasher, types.BeamBlock, block, &cblock_root, self.allocator);
                 break :computedroot cblock_root;
             };
             const is_timely = self.isBlockTimely(opts.blockDelayMs);
