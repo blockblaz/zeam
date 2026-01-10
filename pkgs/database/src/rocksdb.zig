@@ -300,6 +300,23 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 );
             }
 
+            /// Put the latest finalized slot metadata to this write batch
+            pub fn putLatestFinalizedSlot(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+            ) void {
+                const key = "latest_finalized_slot";
+                self.putToBatch(
+                    types.Slot,
+                    key,
+                    slot,
+                    cn,
+                    "updated latest finalized slot metadata: slot={d}",
+                    .{slot},
+                );
+            }
+
             /// Put an unfinalized slot index entry to this write batch
             pub fn putUnfinalizedSlotIndex(
                 self: *WriteBatch,
@@ -566,6 +583,56 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 "loaded finalized slot index from database: slot={d}",
                 .{slot},
             );
+        }
+
+        /// Load the latest finalized slot metadata from the database
+        pub fn loadLatestFinalizedSlot(self: *Self, comptime cn: ColumnNamespace) ?types.Slot {
+            const key = "latest_finalized_slot";
+            return self.loadFromDatabase(
+                types.Slot,
+                key,
+                cn,
+                "loaded latest finalized slot metadata",
+                .{},
+            );
+        }
+
+        /// Attempts to load the latest finalized state from the database
+        /// Returns null if no finalized state is found (e.g., first run)
+        pub fn loadLatestFinalizedState(
+            self: *Self,
+        ) !?struct { state: *types.BeamState, slot: types.Slot } {
+            // Load the latest finalized slot from metadata
+            const finalized_slot = self.loadLatestFinalizedSlot(database.DbDefaultNamespace) orelse {
+                self.logger.info("no finalized state found in database, will use genesis", .{});
+                return null;
+            };
+
+            self.logger.info("found latest finalized slot {d}, loading block root...", .{finalized_slot});
+
+            // Load the block root for this finalized slot
+            const block_root = self.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot) orelse {
+                self.logger.warn("finalized slot {d} found in metadata but not in finalized index", .{finalized_slot});
+                return null;
+            };
+
+            // Load the state from the database
+            if (self.loadState(database.DbStatesNamespace, block_root)) |state| {
+                // Clone the state to allocator-managed memory
+                const state_ptr = try self.allocator.create(types.BeamState);
+                errdefer self.allocator.destroy(state_ptr);
+
+                try types.sszClone(self.allocator, types.BeamState, state, state_ptr);
+
+                // Clean up the loaded state (it was allocated in loadState)
+                @constCast(&state).deinit();
+
+                self.logger.info("successfully loaded finalized state at slot {d}", .{finalized_slot});
+                return .{ .state = state_ptr, .slot = finalized_slot };
+            } else {
+                self.logger.warn("finalized slot {d} found in index but state not in database", .{finalized_slot});
+                return null;
+            }
         }
 
         /// Load an unfinalized slot index from the database
@@ -1092,4 +1159,78 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_justified.root, &test_state.latest_justified.root));
     try std.testing.expect(loaded_state_data.latest_finalized.slot == test_state.latest_finalized.slot);
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_finalized.root, &test_state.latest_finalized.root));
+}
+
+test "loadLatestFinalizedState" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    // Test 1: Empty database should return null
+    const empty_result = try db.loadLatestFinalizedState();
+    try std.testing.expect(empty_result == null);
+
+    // Test 2: Add multiple finalized states and verify it returns the latest one
+    var batch = db.initWriteBatch();
+    defer batch.deinit();
+
+    // Create three finalized states at different slots
+    const slot1: types.Slot = 100;
+    const slot2: types.Slot = 200;
+    const slot3: types.Slot = 300;
+
+    const root1 = test_helpers.createDummyRoot(0x11);
+    const root2 = test_helpers.createDummyRoot(0x22);
+    const root3 = test_helpers.createDummyRoot(0x33);
+
+    var state1 = try test_helpers.createDummyState(allocator, slot1, 4, 93, 0, 0, 0xAA, 0xBB);
+    defer state1.deinit();
+    var state2 = try test_helpers.createDummyState(allocator, slot2, 4, 93, 0, 0, 0xCC, 0xDD);
+    defer state2.deinit();
+    var state3 = try test_helpers.createDummyState(allocator, slot3, 4, 93, 0, 0, 0xEE, 0xFF);
+    defer state3.deinit();
+
+    // Save states to database
+    batch.putState(database.DbStatesNamespace, root1, state1);
+    batch.putState(database.DbStatesNamespace, root2, state2);
+    batch.putState(database.DbStatesNamespace, root3, state3);
+
+    // Save finalized slot indices
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot1, root1);
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot2, root2);
+    batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot3, root3);
+
+    // Save latest finalized slot metadata
+    batch.putLatestFinalizedSlot(database.DbDefaultNamespace, slot3);
+
+    db.commit(&batch);
+
+    // Load the latest finalized state
+    const result = try db.loadLatestFinalizedState();
+    try std.testing.expect(result != null);
+
+    const latest = result.?;
+    defer {
+        latest.state.deinit();
+        allocator.destroy(latest.state);
+    }
+
+    // Verify it's the state from slot3 (the highest slot)
+    try std.testing.expect(latest.slot == slot3);
+    try std.testing.expect(latest.state.slot == state3.slot);
+    try std.testing.expect(latest.state.latest_justified.slot == state3.latest_justified.slot);
+    try std.testing.expect(std.mem.eql(u8, &latest.state.latest_justified.root, &state3.latest_justified.root));
+    try std.testing.expect(latest.state.latest_finalized.slot == state3.latest_finalized.slot);
+    try std.testing.expect(std.mem.eql(u8, &latest.state.latest_finalized.root, &state3.latest_finalized.root));
 }
