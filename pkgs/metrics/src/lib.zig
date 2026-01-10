@@ -46,6 +46,10 @@ const Metrics = struct {
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
     lean_pq_signature_attestation_signing_time_seconds: PQSignatureSigningHistogram,
     lean_pq_signature_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
+    // Network peer metrics
+    lean_connected_peers: LeanConnectedPeersGauge,
+    lean_peer_connection_events_total: PeerConnectionEventsCounter,
+    lean_peer_disconnection_events_total: PeerDisconnectionEventsCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -65,6 +69,10 @@ const Metrics = struct {
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    // Network peer metric types
+    const LeanConnectedPeersGauge = metrics_lib.Gauge(u64);
+    const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
+    const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
 };
 
 /// Timer struct returned to the application.
@@ -147,26 +155,6 @@ fn observeFCAttestationValidationTimeHistogram(ctx: ?*anyopaque, value: f32) voi
     const histogram_ptr = ctx orelse return; // No-op if not initialized
     const histogram: *Metrics.ForkChoiceAttestationValidationTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
     histogram.observe(value);
-}
-
-/// Increments the lean_attestations_valid_total counter with appropriate label
-pub fn incrementLeanAttestationsValid(is_from_block: bool) void {
-    if (!g_initialized or isZKVM()) return;
-
-    const source_label = if (is_from_block) "block" else "gossip";
-    metrics.lean_attestations_valid_total.incr(.{ .source = source_label }) catch |err| {
-        std.log.warn("Failed to increment valid attestations metric: {any}", .{err});
-    };
-}
-
-/// Updated function to handle labeled invalid attestations
-pub fn incrementLeanAttestationsInvalid(is_from_block: bool) void {
-    if (!g_initialized or isZKVM()) return;
-
-    const source_label = if (is_from_block) "block" else "gossip";
-    metrics.lean_attestations_invalid_total.incr(.{ .source = source_label }) catch |err| {
-        std.log.warn("Failed to increment invalid attestations metric: {any}", .{err});
-    };
 }
 
 fn observePQSignatureAttestationSigning(ctx: ?*anyopaque, value: f32) void {
@@ -255,6 +243,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
         .lean_pq_signature_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_signature_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
         .lean_pq_signature_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_signature_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
+        // Network peer metrics
+        .lean_connected_peers = Metrics.LeanConnectedPeersGauge.init("lean_connected_peers", .{ .help = "Number of currently connected peers." }, .{}),
+        .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total peer connection events by direction and result." }, .{}),
+        .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total peer disconnection events by direction and reason." }, .{}),
     };
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
