@@ -369,7 +369,7 @@ pub fn aggregateSignedAttestations(
             const new_group = try AggregationGroup.init(allocator, signed_attestation);
             try groups.append(new_group);
             const inserted_index = groups.items.len - 1;
-            root_indices.put(root, inserted_index) catch |err| return err;
+            try root_indices.put(root, inserted_index);
         }
     }
 
