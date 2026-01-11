@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const expect = @import("../json_expect.zig");
 const forks = @import("../fork.zig");
@@ -245,7 +246,7 @@ fn runCase(
             var header_for_check = pre_state.latest_block_header;
             if (std.mem.eql(u8, &header_for_check.state_root, &types.ZERO_HASH)) {
                 var pre_state_root: types.Root = undefined;
-                ssz.hashTreeRoot(types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
+                ssz.hashTreeRoot(Sha256, types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: unable to hash pre-state ({s})\n",
                         .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -256,7 +257,7 @@ fn runCase(
             }
 
             var header_root: types.Root = undefined;
-            ssz.hashTreeRoot(types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
+            ssz.hashTreeRoot(Sha256, types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
                 std.debug.print(
                     "fixture {s} case {s}: unable to hash latest block header ({s})\n",
                     .{ ctx.fixture_label, ctx.case_name, @errorName(err) },

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ssz = @import("ssz");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
@@ -187,7 +188,7 @@ pub const BeamState = struct {
 
         if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
             var prev_state_root: [32]u8 = undefined;
-            try ssz.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            try ssz.hashTreeRoot(Sha256, *BeamState, self, &prev_state_root, allocator);
             self.latest_block_header.state_root = prev_state_root;
         }
     }
@@ -238,7 +239,7 @@ pub const BeamState = struct {
 
         // 4. verify latest block header is the parent
         var head_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        try ssz.hashTreeRoot(Sha256, block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
             logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
@@ -441,6 +442,7 @@ pub const BeamState = struct {
     pub fn genGenesisBlock(self: *const Self, allocator: Allocator, genesis_block: *block.BeamBlock) !void {
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
+            Sha256,
             BeamState,
             self.*,
             &state_root,
@@ -456,6 +458,7 @@ pub const BeamState = struct {
         var beam_block_header = self.latest_block_header;
         var state_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(
+            Sha256,
             BeamState,
             self.*,
             &state_root,
@@ -621,6 +624,7 @@ test "ssz seralize/deserialize signed beam state" {
     // successful merklization
     var state_root: [32]u8 = undefined;
     try ssz.hashTreeRoot(
+        Sha256,
         BeamState,
         state,
         &state_root,
@@ -722,7 +726,7 @@ test "genesis block hash comparison" {
 
     // Compute hash of first genesis block
     var genesis_block_hash1: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
+    try ssz.hashTreeRoot(Sha256, block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
     std.debug.print("genesis_block_hash1 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
 
     // Create a second genesis state with same config but regenerated (should produce same hash)
@@ -735,7 +739,7 @@ test "genesis block hash comparison" {
     defer genesis_block1_copy.deinit();
 
     var genesis_block_hash1_copy: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1_copy, &genesis_block_hash1_copy, allocator);
+    try ssz.hashTreeRoot(Sha256, block.BeamBlock, genesis_block1_copy, &genesis_block_hash1_copy, allocator);
 
     // Same genesis spec should produce same hash
     try std.testing.expect(std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash1_copy));
@@ -764,7 +768,7 @@ test "genesis block hash comparison" {
     defer genesis_block2.deinit();
 
     var genesis_block_hash2: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
+    try ssz.hashTreeRoot(Sha256, block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
     std.debug.print("genesis_block_hash2 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
 
     // Different validators should produce different genesis block hash
@@ -794,7 +798,7 @@ test "genesis block hash comparison" {
     defer genesis_block3.deinit();
 
     var genesis_block_hash3: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
+    try ssz.hashTreeRoot(Sha256, block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
     std.debug.print("genesis_block_hash3 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
 
     // Different genesis_time should produce different genesis block hash

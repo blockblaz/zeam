@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const enr_lib = @import("enr");
 const ENR = enr_lib.ENR;
 const utils_lib = @import("@zeam/utils");
@@ -1016,7 +1017,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
 
     // Get state root by hashing the state directly
     var state_root_from_genesis: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+    try ssz.hashTreeRoot(Sha256, types.BeamState, genesis_state, &state_root_from_genesis, allocator);
 
     // Generate block header using genStateBlockHeader
     const state_block_header = try genesis_state.genStateBlockHeader(allocator);
