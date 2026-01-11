@@ -10,6 +10,7 @@ const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 const stf = @import("@zeam/state-transition");
+const zeam_metrics = @import("@zeam/metrics");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -629,16 +630,21 @@ pub const BeamNode = struct {
         }
     }
 
-    pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
+    pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         try self.network.connectPeer(peer_id);
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.info("peer connected: {s}{}, total peers: {d}", .{
+        self.logger.info("peer connected: {s}{}, direction={s}, total peers: {d}", .{
             peer_id,
             node_name,
+            @tagName(direction),
             self.network.getPeerCount(),
         });
+
+        // Record metrics
+        zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
+        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -661,16 +667,35 @@ pub const BeamNode = struct {
         });
     }
 
-    pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
+    pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("peer disconnected: {s}{}, total peers: {d}", .{
+            self.logger.info("peer disconnected: {s}{}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
+                @tagName(direction),
+                @tagName(reason),
                 self.network.getPeerCount(),
             });
+
+            // Record metrics
+            zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
+            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
         }
+    }
+
+    pub fn onPeerConnectionFailed(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, result: networks.ConnectionResult) !void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        self.logger.info("peer connection failed: {s}, direction={s}, result={s}", .{
+            peer_id,
+            @tagName(direction),
+            @tagName(result),
+        });
+
+        // Record metrics for failed connection attempts
+        zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = @tagName(result) }) catch {};
     }
 
     pub fn getPeerEventHandler(self: *Self) networks.OnPeerEventCbHandler {
@@ -678,6 +703,7 @@ pub const BeamNode = struct {
             .ptr = self,
             .onPeerConnectedCb = onPeerConnected,
             .onPeerDisconnectedCb = onPeerDisconnected,
+            .onPeerConnectionFailedCb = onPeerConnectionFailed,
         };
     }
 
@@ -921,36 +947,36 @@ test "Node peer tracking on connect/disconnect" {
     const peer2_id = "PEE_POW_2";
     const peer3_id = "PEE_POW_3";
 
-    // Connect peer 1
-    try mock.peerEventHandler.onPeerConnected(peer1_id);
+    // Connect peer 1 (simulate inbound connection)
+    try mock.peerEventHandler.onPeerConnected(peer1_id, .inbound);
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
 
-    // Connect peer 2
-    try mock.peerEventHandler.onPeerConnected(peer2_id);
+    // Connect peer 2 (simulate outbound connection)
+    try mock.peerEventHandler.onPeerConnected(peer2_id, .outbound);
     try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
 
     // Connect peer 3
-    try mock.peerEventHandler.onPeerConnected(peer3_id);
+    try mock.peerEventHandler.onPeerConnected(peer3_id, .inbound);
     try std.testing.expectEqual(@as(usize, 3), node.network.getPeerCount());
 
     // Verify peer 1 exists
     try std.testing.expect(node.network.hasPeer(peer1_id));
 
-    // Disconnect peer 2
-    try mock.peerEventHandler.onPeerDisconnected(peer2_id);
+    // Disconnect peer 2 (remote close)
+    try mock.peerEventHandler.onPeerDisconnected(peer2_id, .outbound, .remote_close);
     try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
     try std.testing.expect(!node.network.hasPeer(peer2_id));
 
-    // Disconnect peer 1
-    try mock.peerEventHandler.onPeerDisconnected(peer1_id);
+    // Disconnect peer 1 (timeout)
+    try mock.peerEventHandler.onPeerDisconnected(peer1_id, .inbound, .timeout);
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
     try std.testing.expect(!node.network.hasPeer(peer1_id));
 
     // Verify peer 3 is still connected
     try std.testing.expect(node.network.hasPeer(peer3_id));
 
-    // Disconnect peer 3
-    try mock.peerEventHandler.onPeerDisconnected(peer3_id);
+    // Disconnect peer 3 (local close)
+    try mock.peerEventHandler.onPeerDisconnected(peer3_id, .inbound, .local_close);
     try std.testing.expectEqual(@as(usize, 0), node.network.getPeerCount());
 
     // Process pending async operations (status request timer callbacks and their responses)

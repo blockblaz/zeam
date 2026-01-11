@@ -11,6 +11,28 @@ const consensus_params = @import("@zeam/params");
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
 
+// Connection direction for peer events
+pub const PeerDirection = enum(u32) {
+    inbound = 0,
+    outbound = 1,
+    unknown = 2,
+};
+
+// Connection result for connection events
+pub const ConnectionResult = enum(u32) {
+    success = 0,
+    timeout = 1,
+    error_ = 2, // 'error' is reserved in Zig
+};
+
+// Disconnection reason for disconnection events
+pub const DisconnectionReason = enum(u32) {
+    timeout = 0,
+    remote_close = 1,
+    local_close = 2,
+    error_ = 3,
+};
+
 const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
@@ -622,18 +644,28 @@ const MessagePublishWrapper = struct {
     }
 };
 
-pub const OnPeerEventCbType = *const fn (*anyopaque, peer_id: []const u8) anyerror!void;
+pub const OnPeerConnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection) anyerror!void;
+pub const OnPeerDisconnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void;
+pub const OnPeerConnectionFailedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void;
+
 pub const OnPeerEventCbHandler = struct {
     ptr: *anyopaque,
-    onPeerConnectedCb: OnPeerEventCbType,
-    onPeerDisconnectedCb: OnPeerEventCbType,
+    onPeerConnectedCb: OnPeerConnectedCbType,
+    onPeerDisconnectedCb: OnPeerDisconnectedCbType,
+    onPeerConnectionFailedCb: ?OnPeerConnectionFailedCbType = null,
 
-    pub fn onPeerConnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
-        return self.onPeerConnectedCb(self.ptr, peer_id);
+    pub fn onPeerConnected(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection) anyerror!void {
+        return self.onPeerConnectedCb(self.ptr, peer_id, direction);
     }
 
-    pub fn onPeerDisconnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
-        return self.onPeerDisconnectedCb(self.ptr, peer_id);
+    pub fn onPeerDisconnected(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
+        return self.onPeerDisconnectedCb(self.ptr, peer_id, direction, reason);
+    }
+
+    pub fn onPeerConnectionFailed(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
+        if (self.onPeerConnectionFailedCb) |cb| {
+            return cb(self.ptr, peer_id, direction, result);
+        }
     }
 };
 
@@ -664,22 +696,31 @@ pub const PeerEventHandler = struct {
         try self.handlers.append(self.allocator, handler);
     }
 
-    pub fn onPeerConnected(self: *Self, peer_id: []const u8) anyerror!void {
+    pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{}, handlers={d}", .{ self.networkId, peer_id, node_name, self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
-            handler.onPeerConnected(peer_id) catch |e| {
+            handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
             };
         }
     }
 
-    pub fn onPeerDisconnected(self: *Self, peer_id: []const u8) anyerror!void {
+    pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{}, handlers={d}", .{ self.networkId, peer_id, node_name, self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
-            handler.onPeerDisconnected(peer_id) catch |e| {
+            handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
+            };
+        }
+    }
+
+    pub fn onPeerConnectionFailed(self: *Self, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
+        for (self.handlers.items) |handler| {
+            handler.onPeerConnectionFailed(peer_id, direction, result) catch |e| {
+                self.logger.err("network-{d}:: onPeerConnectionFailed handler error={any}", .{ self.networkId, e });
             };
         }
     }

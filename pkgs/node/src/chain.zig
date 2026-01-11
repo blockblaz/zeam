@@ -497,13 +497,13 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
-                    zeam_metrics.incrementLeanAttestationsInvalid(false);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     return .{}; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(false);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
@@ -512,7 +512,7 @@ pub const BeamChain = struct {
                     validator_id,
                     validator_node_name,
                 });
-                zeam_metrics.incrementLeanAttestationsValid(false);
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
         }
@@ -574,7 +574,7 @@ pub const BeamChain = struct {
             for (block.body.attestations.constSlice(), 0..) |attestation, index| {
                 // Validate attestation before processing (from block = true)
                 self.validateAttestation(attestation, true) catch |e| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(true);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
                         try missing_roots.append(attestation.data.head.root);
                     }
@@ -590,11 +590,11 @@ pub const BeamChain = struct {
                 const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
 
                 self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(true);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
                     continue;
                 };
-                zeam_metrics.incrementLeanAttestationsValid(true);
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
             }
 
             // 5. fc update head
