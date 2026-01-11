@@ -119,8 +119,7 @@ pub const Node = struct {
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
-    // Track heap-allocated anchor_state for cleanup
-    anchor_state_owned: ?*types.BeamState = null,
+    anchor_state: *types.BeamState,
 
     const Self = @This();
 
@@ -179,28 +178,18 @@ pub const Node = struct {
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
 
+        self.logger = options.logger_config.logger(.node);
+
+        const anchorState: *types.BeamState = try allocator.create(types.BeamState);
+        errdefer allocator.destroy(anchorState);
+        self.anchor_state = anchorState;
+
         // Try to load the latest finalized state from the database, fallback to genesis
-        const chain_logger = options.logger_config.logger(.chain);
-        var anchorState: *types.BeamState = undefined;
-        if (try db.loadLatestFinalizedState()) |latest_finalized| {
-            anchorState = latest_finalized.state;
-            self.anchor_state_owned = anchorState;
-            chain_logger.info("resuming from finalized slot {d}", .{latest_finalized.slot});
-        } else {
-            // First run or no finalized state, use genesis
-            const genesis_state = try allocator.create(types.BeamState);
-            errdefer allocator.destroy(genesis_state);
-            try genesis_state.genGenesisState(allocator, chain_config.genesis);
-            anchorState = genesis_state;
-            self.anchor_state_owned = anchorState;
-            chain_logger.info("starting from genesis", .{});
-        }
-        errdefer {
-            if (self.anchor_state_owned) |owned| {
-                owned.deinit();
-                allocator.destroy(owned);
-            }
-        }
+        db.loadLatestFinalizedState(self.anchor_state) catch |err| {
+            self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+        };
+        errdefer self.anchor_state.deinit();
 
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
@@ -214,7 +203,7 @@ pub const Node = struct {
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
-            .anchorState = anchorState,
+            .anchorState = self.anchor_state,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = validator_ids,
@@ -223,8 +212,6 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
-
-        self.logger = options.logger_config.logger(.node);
     }
 
     pub fn deinit(self: *Self) void {
@@ -236,11 +223,8 @@ pub const Node = struct {
         self.db.deinit();
         self.loop.deinit();
         event_broadcaster.deinitGlobalBroadcaster();
-
-        // Cleanup owned anchor_state if we allocated one
-        if (self.anchor_state_owned) |owned| {
-            self.allocator.destroy(owned);
-        }
+        self.anchor_state.deinit();
+        self.allocator.destroy(self.anchor_state);
     }
 
     pub fn run(self: *Node) !void {

@@ -101,6 +101,11 @@ pub const ValidatorClient = struct {
             if (!self.chain.isSynced()) {
                 const current_slot = self.chain.forkChoice.fcStore.timeSlots;
                 const head_slot = self.chain.forkChoice.head.slot;
+                if (current_slot < head_slot) {
+                    self.logger.err("current slot {d} is less than head slot {d}", .{ current_slot, head_slot });
+                    return null;
+                }
+
                 self.logger.warn("skipping block production for slot={d} proposer={d}: chain not synced (current_slot={d}, head_slot={d}, behind={d})", .{
                     slot,
                     slot_proposer_id,

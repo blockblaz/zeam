@@ -43,7 +43,7 @@ pub const ChainOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
     node_registry: *const NodeNameRegistry,
-    force_block_generation: bool = false,
+    force_block_production: bool = false,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -86,7 +86,7 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
-    force_block_generation: bool,
+    force_block_production: bool,
 
     const Self = @This();
 
@@ -123,7 +123,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
-            .force_block_generation = opts.force_block_generation,
+            .force_block_production = opts.force_block_production,
         };
     }
 
@@ -136,7 +136,7 @@ pub const BeamChain = struct {
         self.states.deinit();
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
-        self.anchor_state.deinit();
+        // self.anchor_state.deinit();
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -903,14 +903,16 @@ pub const BeamChain = struct {
         };
 
         const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown target block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{s}", .{
+                data.target.slot,
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
         const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown head block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{s}", .{
+                data.head.slot,
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
@@ -1019,8 +1021,8 @@ pub const BeamChain = struct {
         const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // If no peers connected, we can't verify sync status - assume not synced
-        // Unless force_block_generation is enabled, which allows block generation without peers
-        if (self.connected_peers.count() == 0 or self.force_block_generation) {
+        // Unless force_block_production is enabled, which allows block generation without peers
+        if (self.connected_peers.count() == 0 and !self.force_block_production) {
             return false;
         }
 
