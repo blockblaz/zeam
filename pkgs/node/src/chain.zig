@@ -1013,7 +1013,7 @@ pub const BeamChain = struct {
 
     /// Check if the chain is synced by verifying we're at or past the finalized slot
     /// and synced with peer finalized checkpoints.
-    /// Once past justified and synced with peers, validators can safely participate in consensus.
+    /// Once past finalized and synced with peers, validators can safely participate in consensus.
     /// If blocks are produced while slightly behind peers, they will naturally get reorged.
     pub fn isSynced(self: *Self) bool {
         const our_head_slot = self.forkChoice.head.slot;
