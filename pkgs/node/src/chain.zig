@@ -1011,27 +1011,17 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Check if the chain is synced by verifying we're at or past the justified slot
+    /// Check if the chain is synced by verifying we're at or past the finalized slot
     /// and synced with peer finalized checkpoints.
     /// Once past justified and synced with peers, validators can safely participate in consensus.
     /// If blocks are produced while slightly behind peers, they will naturally get reorged.
     pub fn isSynced(self: *Self) bool {
         const our_head_slot = self.forkChoice.head.slot;
-        const our_justified_slot = self.forkChoice.fcStore.latest_justified.slot;
         const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // If no peers connected, we can't verify sync status - assume not synced
         // Unless force_block_production is enabled, which allows block generation without peers
         if (self.connected_peers.count() == 0 and !self.force_block_production) {
-            return false;
-        }
-
-        // We must be at or past the justified slot to participate
-        if (our_head_slot < our_justified_slot) {
-            self.module_logger.debug("not synced: our head slot {d} < our justified slot {d}", .{
-                our_head_slot,
-                our_justified_slot,
-            });
             return false;
         }
 
