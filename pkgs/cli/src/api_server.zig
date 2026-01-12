@@ -43,8 +43,9 @@ fn getFinalizedStateInternal(_allocator: std.mem.Allocator) ?*const types.BeamSt
 
 /// Simple metrics server that runs in a background thread
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig) !void {
-    // Note: event_broadcaster.initGlobalBroadcaster is already called in node.zig
-    // No need to initialize it again here
+    // Initialize the global event broadcaster for SSE events
+    // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
+    try event_broadcaster.initGlobalBroadcaster(allocator);
 
     // Create a logger instance for the API server
     const logger = logger_config.logger(.metrics);
