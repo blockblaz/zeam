@@ -105,6 +105,11 @@ To run a local devnet with multiple nodes for testing and development, see the [
 
 or checkout the [lean-quickstart](https://github.com/blockblaz/lean-quickstart) submodule (`git submodule update --init lean-quickstart`) use the handy command line tool to spin up two nodes for local interop.
 
+### Testing Scenarios
+
+1. Test blocks by root [parent-sync](./resources/parent-sync.md)
+
+
 ### Reporting Issues
 
 Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH). 
