@@ -1011,14 +1011,14 @@ pub const BeamChain = struct {
         };
     }
 
-<<<<<<< HEAD
     /// Get the finalized checkpoint state (BeamState) if available in memory
     /// Returns null if the state was pruned from memory
     /// TODO: Load from database if state was pruned
     pub fn getFinalizedState(self: *const Self) ?*const types.BeamState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
         return self.states.get(finalized_checkpoint.root);
-=======
+    }
+
     /// Check if the chain is synced by verifying we're at or past the finalized slot
     /// and synced with peer finalized checkpoints.
     /// Once past finalized and synced with peers, validators can safely participate in consensus.
@@ -1056,7 +1056,6 @@ pub const BeamChain = struct {
         }
 
         return true;
->>>>>>> main
     }
 };
 
