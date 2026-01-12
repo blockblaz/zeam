@@ -1011,19 +1011,25 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Check if the chain is synced by verifying we're at or past the finalized slot
-    /// and synced with peer finalized checkpoints.
-    /// Once past finalized and synced with peers, validators can safely participate in consensus.
-    /// If blocks are produced while slightly behind peers, they will naturally get reorged.
-    pub fn isSynced(self: *Self) bool {
-        const our_head_slot = self.forkChoice.head.slot;
-        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+    pub const SyncStatus = union(enum) {
+        synced,
+        no_peers,
+        behind_peers: struct {
+            head_slot: types.Slot,
+            max_peer_finalized_slot: types.Slot,
+        },
+    };
 
+    /// Returns detailed sync status information.
+    pub fn getSyncStatus(self: *Self) SyncStatus {
         // If no peers connected, we can't verify sync status - assume not synced
         // Unless force_block_production is enabled, which allows block generation without peers
         if (self.connected_peers.count() == 0 and !self.force_block_production) {
-            return false;
+            return .no_peers;
         }
+
+        const our_head_slot = self.forkChoice.head.slot;
+        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // Find the maximum finalized slot reported by any peer
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
@@ -1040,14 +1046,13 @@ pub const BeamChain = struct {
 
         // We must also be synced with peers (at or past max peer finalized slot)
         if (our_head_slot < max_peer_finalized_slot) {
-            self.module_logger.debug("not synced: our head slot {d} < max peer finalized slot {d}", .{
-                our_head_slot,
-                max_peer_finalized_slot,
-            });
-            return false;
+            return .{ .behind_peers = .{
+                .head_slot = our_head_slot,
+                .max_peer_finalized_slot = max_peer_finalized_slot,
+            } };
         }
 
-        return true;
+        return .synced;
     }
 };
 
