@@ -331,7 +331,6 @@ pub const ForkChoice = struct {
             const parent_node = self.protoArray.nodes.items[parent_idx];
             // parent should be canonical but no parent should be before target anchor
             // because then it would be on a side branch to target anchor
-            // TODO: add test case to getcanonical view for this, example scenario from debugging
             //
             // root=be35ab6546a38c4d5d42b588ac952867f19e03d1f12b4474f3b627db15739431 slot=30 index=7 parent=4 (arrived late)
             // root=35ba9cb9ea2e0e8d1248f40dc9d2142e0de2d18812be529ff024c7bcb5cd4b31 slot=31 index=5 parent=4
@@ -345,6 +344,8 @@ pub const ForkChoice = struct {
             // now without the parent index >= target_anchor_idx check slot=30 also ends up being added in canonical
             // because its parent is correctly canonical and has already been added to canonical_view in first while loop
             // however target anchor is slot=31 and hence slot=30 shouldn't be on a downstream unfinalized subtree
+            //
+            // test cases for the above are already present in the rebase testing
 
             if (parent_idx >= target_anchor_idx and canonical_view.contains(parent_node.blockRoot)) {
                 try canonical_view.put(current_node.blockRoot, {});
@@ -2170,36 +2171,26 @@ test "rebase: edge case - missed slots preserved in remaining tree" {
     // Rebase to D (0xDD, slot 5)
     try ctx.fork_choice.rebase(createTestRoot(0xDD), null);
 
-    // Verify 5 nodes remain: D, E, F, H, I
-    // (G is removed due to slot 4 < 5, but H and I are kept despite orphaning)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 5);
+    // Verify 5 nodes remain: D, E, F
+    // (G is removed due to slot 4 < 5 as well as H and I)
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 3);
 
     // Verify canonical chain slots
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[0].slot == 5); // D
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[1].slot == 6); // E
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[2].slot == 8); // F
 
-    // H and I are kept but orphaned (G was removed)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[3].slot == 6); // H
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[4].slot == 7); // I
-
     // Verify contiguous indices
     try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0xDD)).? == 0);
     try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0xEE)).? == 1);
     try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0xFF)).? == 2);
-    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x22)).? == 3); // H
-    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x33)).? == 4); // I
+    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x22)) == null); // H
+    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x33)) == null); // I
 
     // Verify parent chain for canonical branch
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[0].parent == null); // D is anchor
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[1].parent.? == 0); // E -> D
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[2].parent.? == 1); // F -> E
-
-    // Verify orphan branch parent pointers
-    // H's parent (G) was removed, so H becomes orphaned (parent = null)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[3].parent == null); // H orphaned
-    // I's parent (H) was preserved, so I still points to H (now at index 3)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[4].parent.? == 3); // I -> H
 }
 
 test "rebase: error - InvalidTargetAnchor for non-existent root" {
@@ -2268,9 +2259,9 @@ test "rebase: complex fork with attestations on multiple branches" {
     // Rebase to D (0xDD)
     try ctx.fork_choice.rebase(createTestRoot(0xDD), null);
 
-    // Verify 5 nodes remain: D, E, F, H, I
-    // (G is removed due to slot 4 < 5, but H and I are kept despite orphaning)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 5);
+    // Verify 5 nodes remain: D, E, F,
+    // (G is removed due to slot 4 < 5 as well as H and I)
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 3);
 
     // Verify canonical attestations are remapped
     // E: was 4, now 1
@@ -2278,22 +2269,16 @@ test "rebase: complex fork with attestations on multiple branches" {
     // F: was 5, now 2
     try std.testing.expect(ctx.fork_choice.attestations.get(1).?.latestKnown.?.index == 2);
 
-    // Verify fork attestations are ALSO remapped (H and I are kept, slots >= 5)
-    // H: was 7, now 3
-    try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 3);
-    // I: was 8, now 4
-    try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 4);
+    // Verify fork attestations are ALSO removed
+    // H
+    try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown == null);
+    // I
+    try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown == null);
 
-    // Verify G is removed (slot 4 < 5) but H and I remain
+    // Verify G, H and I removed
     try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x11)) == null); // G removed
-    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x22)).? == 3); // H at index 3
-    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x33)).? == 4); // I at index 4
-
-    // Verify orphan branch parent pointers
-    // H's parent (G) was removed, so H becomes orphaned (parent = null)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[3].parent == null); // H orphaned
-    // I's parent (H) was preserved, so I still points to H (now at index 3)
-    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[4].parent.? == 3); // I -> H
+    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x22)) == null); // H
+    try std.testing.expect(ctx.fork_choice.protoArray.indices.get(createTestRoot(0x33)) == null); // I
 }
 
 test "rebase: heavy attestation load - all validators tracked correctly" {
