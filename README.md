@@ -109,6 +109,10 @@ or checkout the [lean-quickstart](https://github.com/blockblaz/lean-quickstart) 
 
 Zeam supports checkpoint sync for faster initial synchronization. You can start a node from a trusted finalized checkpoint state by using the `--checkpoint-sync-url` parameter. See the [Local Devnet Setup Guide](./pkgs/cli/test/fixtures/README.md#checkpoint-sync) for detailed documentation and examples.
 
+### Testing Scenarios
+
+1. Test blocks by root [parent-sync](./resources/parent-sync.md)
+
 ### Reporting Issues
 
 Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH). 

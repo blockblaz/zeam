@@ -98,18 +98,22 @@ pub const ValidatorClient = struct {
     pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
             // Check if chain is synced before producing a block
-            if (!self.chain.isSynced()) {
-                const current_slot = self.chain.forkChoice.fcStore.timeSlots;
-                const head_slot = self.chain.forkChoice.head.slot;
-
-                self.logger.warn("skipping block production for slot={d} proposer={d}: chain not synced (current_slot={d}, head_slot={d}, behind={d})", .{
-                    slot,
-                    slot_proposer_id,
-                    current_slot,
-                    head_slot,
-                    current_slot - head_slot,
-                });
-                return null;
+            const sync_status = self.chain.getSyncStatus();
+            switch (sync_status) {
+                .synced => {},
+                .no_peers => {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: no peers connected", .{ slot, slot_proposer_id });
+                    return null;
+                },
+                .behind_peers => |info| {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                        slot,
+                        slot_proposer_id,
+                        info.head_slot,
+                        info.max_peer_finalized_slot,
+                    });
+                    return null;
+                },
             }
 
             // 1. construct the block
@@ -161,17 +165,21 @@ pub const ValidatorClient = struct {
         if (self.ids.len == 0) return null;
 
         // Check if chain is synced before producing attestations
-        if (!self.chain.isSynced()) {
-            const current_slot = self.chain.forkChoice.fcStore.timeSlots;
-            const head_slot = self.chain.forkChoice.head.slot;
-
-            self.logger.warn("skipping attestation production for slot={d}: chain not synced (current_slot={d}, head_slot={d}, behind={d})", .{
-                slot,
-                current_slot,
-                head_slot,
-                current_slot - head_slot,
-            });
-            return null;
+        const sync_status = self.chain.getSyncStatus();
+        switch (sync_status) {
+            .synced => {},
+            .no_peers => {
+                self.logger.warn("skipping attestation production for slot={d}: no peers connected", .{slot});
+                return null;
+            },
+            .behind_peers => |info| {
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, max_peer_finalized_slot={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.max_peer_finalized_slot,
+                });
+                return null;
+            },
         }
 
         const slot_proposer_id = self.getSlotProposer(slot);
