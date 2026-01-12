@@ -327,8 +327,26 @@ pub const ForkChoice = struct {
         while (current_idx < self.protoArray.nodes.items.len) {
             // if the parent of this node is already in the canonical_blocks, this is a potential canonical block
             const current_node = self.protoArray.nodes.items[current_idx];
-            const parent_node = self.protoArray.nodes.items[current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal];
-            if (canonical_view.contains(parent_node.blockRoot)) {
+            const parent_idx = current_node.parent orelse return ForkChoiceError.InvalidCanonicalTraversal;
+            const parent_node = self.protoArray.nodes.items[parent_idx];
+            // parent should be canonical but no parent should be before target anchor
+            // because then it would be on a side branch to target anchor
+            // TODO: add test case to getcanonical view for this, example scenario from debugging
+            //
+            // root=be35ab6546a38c4d5d42b588ac952867f19e03d1f12b4474f3b627db15739431 slot=30 index=7 parent=4 (arrived late)
+            // root=35ba9cb9ea2e0e8d1248f40dc9d2142e0de2d18812be529ff024c7bcb5cd4b31 slot=31 index=5 parent=4
+            // root=50ebab7c7948a768f298d9dc0b9863c0095d8df55f15e761b7eb032f3177ba6c slot=24 index=4 parent=3
+            // root=c06f61119634e626d5e947ac7baaa8242b707a012880370875efeb2c0539ce7b slot=22 index=3 parent=2
+            // root=57018d16f19782f832e8585657862930dd1acd217f308e60d23ad5a8efbb5f81 slot=21 index=2 parent=1
+            // root=788b12ebd124982cc09433b1aadc655c7d876214ea2905f1b594564308c80e86 slot=20 index=1 parent=0
+            // root=d754cf64f908c488eafc7453db7383be232a568f8e411c43bff809eb7a8e3028 slot=19 index=0 parent=null
+            // targetAnchorRoot is 35ba9cb9ea2e0e8d1248f40dc9d2142e0de2d18812be529ff024c7bcb5cd4b31
+            //
+            // now without the parent index >= target_anchor_idx check slot=30 also ends up being added in canonical
+            // because its parent is correctly canonical and has already been added to canonical_view in first while loop
+            // however target anchor is slot=31 and hence slot=30 shouldn't be on a downstream unfinalized subtree
+
+            if (parent_idx >= target_anchor_idx and canonical_view.contains(parent_node.blockRoot)) {
                 try canonical_view.put(current_node.blockRoot, {});
             }
             current_idx += 1;
@@ -370,6 +388,12 @@ pub const ForkChoice = struct {
             const current_node = self.protoArray.nodes.items[current_idx];
             if (canonical_blocks.contains(current_node.blockRoot)) {
                 if (current_node.slot <= target_anchor_slot) {
+                    self.logger.debug("adding confirmed canonical root={s} slot={d} index={d} parent={any}", .{
+                        std.fmt.fmtSliceHexLower(&current_node.blockRoot),
+                        current_node.slot,
+                        current_idx,
+                        current_node.parent,
+                    });
                     _ = try canonical_roots.append(current_node.blockRoot);
                 } else if (current_node.slot > target_anchor_slot) {
                     _ = try potential_canonical_roots.append(current_node.blockRoot);
