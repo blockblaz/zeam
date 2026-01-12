@@ -303,8 +303,11 @@ fn mainInner() !void {
                 return err;
             };
 
+            // Create logger config for API server
+            var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+
             // Start metrics HTTP server
-            api_server.startAPIServer(allocator, beamcmd.metricsPort) catch |err| {
+            api_server.startAPIServer(allocator, beamcmd.metricsPort, &api_logger_config) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
                 return err;
             };

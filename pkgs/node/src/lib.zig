@@ -4,6 +4,7 @@ pub const Clock = clockFactory.Clock;
 const nodeFactory = @import("./node.zig");
 pub const BeamNode = nodeFactory.BeamNode;
 
+pub const chainFactory = @import("./chain.zig");
 pub const fcFactory = @import("./forkchoice.zig");
 pub const constants = @import("./constants.zig");
 

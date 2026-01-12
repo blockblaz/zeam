@@ -1002,6 +1002,14 @@ pub const BeamChain = struct {
             .head_slot = head.slot,
         };
     }
+
+    /// Get the finalized checkpoint state (BeamState) if available in memory
+    /// Returns null if the state was pruned from memory
+    /// TODO: Load from database if state was pruned
+    pub fn getFinalizedState(self: *const Self) ?*const types.BeamState {
+        const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
+        return self.states.get(finalized_checkpoint.root);
+    }
 };
 
 pub const BlockProcessingError = error{MissingPreState};
