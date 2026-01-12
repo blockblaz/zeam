@@ -43,6 +43,7 @@ pub const ChainOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
     node_registry: *const NodeNameRegistry,
+    force_block_production: bool = false,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -85,6 +86,7 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
+    force_block_production: bool,
 
     const Self = @This();
 
@@ -121,6 +123,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
+            .force_block_production = opts.force_block_production,
         };
     }
 
@@ -133,7 +136,7 @@ pub const BeamChain = struct {
         self.states.deinit();
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
-        self.anchor_state.deinit();
+        // self.anchor_state.deinit();
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -494,13 +497,13 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message, false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
-                    zeam_metrics.incrementLeanAttestationsInvalid(false);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     return .{}; // Drop invalid gossip attestations
                 };
 
                 // Process validated attestation
                 self.onAttestation(signed_attestation) catch |err| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(false);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
@@ -509,7 +512,7 @@ pub const BeamChain = struct {
                     validator_id,
                     validator_node_name,
                 });
-                zeam_metrics.incrementLeanAttestationsValid(false);
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
         }
@@ -571,7 +574,7 @@ pub const BeamChain = struct {
             for (block.body.attestations.constSlice(), 0..) |attestation, index| {
                 // Validate attestation before processing (from block = true)
                 self.validateAttestation(attestation, true) catch |e| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(true);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
                         try missing_roots.append(attestation.data.head.root);
                     }
@@ -587,11 +590,11 @@ pub const BeamChain = struct {
                 const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
 
                 self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
-                    zeam_metrics.incrementLeanAttestationsInvalid(true);
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
                     continue;
                 };
-                zeam_metrics.incrementLeanAttestationsValid(true);
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
             }
 
             // 5. fc update head
@@ -810,6 +813,9 @@ pub const BeamChain = struct {
             });
         }
 
+        // Update the latest finalized slot metadata
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, latestFinalized.slot);
+
         // 3. commit all batch ops for finalized indices before we prune
         self.db.commit(&batch);
 
@@ -897,14 +903,16 @@ pub const BeamChain = struct {
         };
 
         const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown target block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{s}", .{
+                data.target.slot,
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
         const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown head block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{s}", .{
+                data.head.slot,
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
@@ -1003,12 +1011,52 @@ pub const BeamChain = struct {
         };
     }
 
+<<<<<<< HEAD
     /// Get the finalized checkpoint state (BeamState) if available in memory
     /// Returns null if the state was pruned from memory
     /// TODO: Load from database if state was pruned
     pub fn getFinalizedState(self: *const Self) ?*const types.BeamState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
         return self.states.get(finalized_checkpoint.root);
+=======
+    /// Check if the chain is synced by verifying we're at or past the finalized slot
+    /// and synced with peer finalized checkpoints.
+    /// Once past finalized and synced with peers, validators can safely participate in consensus.
+    /// If blocks are produced while slightly behind peers, they will naturally get reorged.
+    pub fn isSynced(self: *Self) bool {
+        const our_head_slot = self.forkChoice.head.slot;
+        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+
+        // If no peers connected, we can't verify sync status - assume not synced
+        // Unless force_block_production is enabled, which allows block generation without peers
+        if (self.connected_peers.count() == 0 and !self.force_block_production) {
+            return false;
+        }
+
+        // Find the maximum finalized slot reported by any peer
+        var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+
+        var peer_iter = self.connected_peers.iterator();
+        while (peer_iter.next()) |entry| {
+            const peer_info = entry.value_ptr;
+            if (peer_info.latest_status) |status| {
+                if (status.finalized_slot > max_peer_finalized_slot) {
+                    max_peer_finalized_slot = status.finalized_slot;
+                }
+            }
+        }
+
+        // We must also be synced with peers (at or past max peer finalized slot)
+        if (our_head_slot < max_peer_finalized_slot) {
+            self.module_logger.debug("not synced: our head slot {d} < max peer finalized slot {d}", .{
+                our_head_slot,
+                max_peer_finalized_slot,
+            });
+            return false;
+        }
+
+        return true;
+>>>>>>> main
     }
 };
 

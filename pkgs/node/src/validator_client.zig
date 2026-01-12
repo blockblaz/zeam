@@ -97,6 +97,21 @@ pub const ValidatorClient = struct {
 
     pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
+            // Check if chain is synced before producing a block
+            if (!self.chain.isSynced()) {
+                const current_slot = self.chain.forkChoice.fcStore.timeSlots;
+                const head_slot = self.chain.forkChoice.head.slot;
+
+                self.logger.warn("skipping block production for slot={d} proposer={d}: chain not synced (current_slot={d}, head_slot={d}, behind={d})", .{
+                    slot,
+                    slot_proposer_id,
+                    current_slot,
+                    head_slot,
+                    current_slot - head_slot,
+                });
+                return null;
+            }
+
             // 1. construct the block
             self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
@@ -144,6 +159,21 @@ pub const ValidatorClient = struct {
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
+
+        // Check if chain is synced before producing attestations
+        if (!self.chain.isSynced()) {
+            const current_slot = self.chain.forkChoice.fcStore.timeSlots;
+            const head_slot = self.chain.forkChoice.head.slot;
+
+            self.logger.warn("skipping attestation production for slot={d}: chain not synced (current_slot={d}, head_slot={d}, behind={d})", .{
+                slot,
+                current_slot,
+                head_slot,
+                current_slot - head_slot,
+            });
+            return null;
+        }
+
         const slot_proposer_id = self.getSlotProposer(slot);
 
         self.logger.info("constructing attestation message for slot={d}", .{slot});

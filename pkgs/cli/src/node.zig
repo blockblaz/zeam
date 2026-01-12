@@ -120,6 +120,7 @@ pub const Node = struct {
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
+    anchor_state: *types.BeamState,
 
     const Self = @This();
 
@@ -156,27 +157,6 @@ pub const Node = struct {
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
 
-        // Initialize anchor state - either from checkpoint sync or genesis
-        var anchorState: types.BeamState = undefined;
-        const logger = options.logger_config.logger(.node);
-
-        if (options.checkpoint_sync_url) |checkpoint_url| {
-            logger.info("Checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
-
-            // Download checkpoint state from URL
-            anchorState = try downloadCheckpointState(allocator, checkpoint_url, logger);
-            errdefer anchorState.deinit();
-
-            // Verify state root matches checkpoint
-            try verifyCheckpointStateRoot(allocator, &anchorState, logger);
-
-            logger.info("Checkpoint sync completed successfully, using state at slot {d} as anchor", .{anchorState.slot});
-        } else {
-            // Generate genesis state as before
-            try anchorState.genGenesisState(allocator, chain_config.genesis);
-            errdefer anchorState.deinit();
-        }
-
         // TODO we seem to be needing one loop because then the events added to loop are not being fired
         // in the order to which they have been added even with the an appropriate delay added
         // behavior of this further needs to be investigated but for now we will share the same loop
@@ -199,6 +179,33 @@ pub const Node = struct {
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
 
+        self.logger = options.logger_config.logger(.node);
+
+        const anchorState: *types.BeamState = try allocator.create(types.BeamState);
+        errdefer allocator.destroy(anchorState);
+        self.anchor_state = anchorState;
+
+        // Initialize anchor state with priority: checkpoint URL > database > genesis
+        if (options.checkpoint_sync_url) |checkpoint_url| {
+            self.logger.info("Checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
+
+            // Download checkpoint state from URL
+            self.anchor_state.* = try downloadCheckpointState(allocator, checkpoint_url, self.logger);
+            errdefer self.anchor_state.deinit();
+
+            // Verify state root matches checkpoint
+            try verifyCheckpointStateRoot(allocator, self.anchor_state, self.logger);
+
+            self.logger.info("Checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
+        } else {
+            // Try to load the latest finalized state from the database, fallback to genesis
+            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
+                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+            };
+        }
+        errdefer self.anchor_state.deinit();
+
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
         errdefer self.key_manager.deinit();
@@ -211,7 +218,7 @@ pub const Node = struct {
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
-            .anchorState = &anchorState,
+            .anchorState = self.anchor_state,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = validator_ids,
@@ -220,8 +227,6 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
-
-        self.logger = options.logger_config.logger(.node);
 
         // Register finalized state getter with API server if metrics are enabled
         if (options.metrics_enable) {
@@ -241,6 +246,8 @@ pub const Node = struct {
         self.db.deinit();
         self.loop.deinit();
         event_broadcaster.deinitGlobalBroadcaster();
+        self.anchor_state.deinit();
+        self.allocator.destroy(self.anchor_state);
     }
 
     pub fn run(self: *Node) !void {

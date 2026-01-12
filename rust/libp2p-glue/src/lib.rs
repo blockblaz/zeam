@@ -60,6 +60,8 @@ lazy_static::lazy_static! {
     static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
         Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
     static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
+    // Track connection directions for disconnect events (network_id, peer_id, connection_id) -> direction
+    static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
 }
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -567,11 +569,29 @@ extern "C" {
 }
 
 extern "C" {
-    fn handlePeerConnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+    fn handlePeerConnectedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char,
+        direction: u32, // 0=inbound, 1=outbound, 2=unknown
+    );
 }
 
 extern "C" {
-    fn handlePeerDisconnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+    fn handlePeerDisconnectedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char,
+        direction: u32, // 0=inbound, 1=outbound, 2=unknown
+        reason: u32,    // 0=timeout, 1=remote_close, 2=local_close, 3=error
+    );
+}
+
+extern "C" {
+    fn handlePeerConnectionFailedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char, // may be null for unknown peers
+        direction: u32,         // 0=inbound, 1=outbound
+        result: u32,            // 1=timeout, 2=error
+    );
 }
 
 extern "C" {
@@ -915,11 +935,23 @@ impl Network {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             logger::rustLogger.info(self.network_id, &format!("Listening on {}", address));
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint: _, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                             let peer_id_str = peer_id.to_string();
+
+                            // Determine direction from endpoint: Dialer=outbound, Listener=inbound
+                            let direction: u32 = if endpoint.is_dialer() { 1 } else { 0 };
+
                             logger::rustLogger.info(
                                 self.network_id,
-                                &format!("Connection established with peer: {}", peer_id_str),
+                                &format!("Connection established with peer: {} direction={}",
+                                    peer_id_str,
+                                    if direction == 0 { "inbound" } else { "outbound" }),
+                            );
+
+                            // Store direction for later use on disconnect
+                            CONNECTION_DIRECTIONS.lock().unwrap().insert(
+                                (self.network_id, peer_id, connection_id),
+                                direction,
                             );
 
                             RECONNECT_QUEUE.lock().unwrap().remove(&(self.network_id, peer_id));
@@ -935,7 +967,7 @@ impl Network {
                                 }
                             };
                             unsafe {
-                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr(), direction)
                             };
                         }
                         SwarmEvent::ConnectionClosed {
@@ -945,6 +977,29 @@ impl Network {
                             ..
                         } => {
                             let peer_id_string = peer_id.to_string();
+
+                            // Retrieve and remove stored direction
+                            let direction = CONNECTION_DIRECTIONS
+                                .lock()
+                                .unwrap()
+                                .remove(&(self.network_id, peer_id, connection_id))
+                                .unwrap_or(2); // 2 = unknown if not found
+
+                            // Map cause to reason enum: 0=timeout, 1=remote_close, 2=local_close, 3=error
+                            let reason: u32 = match &cause {
+                                None => 1, // remote_close (graceful close, no error)
+                                Some(err) => {
+                                    let err_str = format!("{:?}", err);
+                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("KeepAlive") {
+                                        0 // timeout
+                                    } else if err_str.contains("Reset") || err_str.contains("ConnectionReset") {
+                                        1 // remote_close
+                                    } else {
+                                        3 // error (generic)
+                                    }
+                                }
+                            };
+
                             let cause_desc = match &cause {
                                 Some(err) => format!("{err:?}"),
                                 None => "None".to_string(),
@@ -952,8 +1007,8 @@ impl Network {
                             logger::rustLogger.info(
                                 self.network_id,
                                 &format!(
-                                    "Connection closed: peer={} connection_id={:?} cause={}",
-                                    peer_id_string, connection_id, cause_desc
+                                    "Connection closed: peer={} connection_id={:?} direction={} reason={} cause={}",
+                                    peer_id_string, connection_id, direction, reason, cause_desc
                                 ),
                             );
 
@@ -968,6 +1023,8 @@ impl Network {
                                 handlePeerDisconnectedFromRustBridge(
                                     self.zig_handler,
                                     peer_id_cstr.as_ptr(),
+                                    direction,
+                                    reason,
                                 )
                             };
 
@@ -984,12 +1041,42 @@ impl Network {
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+                            // Determine if timeout or other error: 1=timeout, 2=error
+                            let result: u32 = {
+                                let err_str = format!("{:?}", error);
+                                if err_str.contains("Timeout") || err_str.contains("timeout") {
+                                    1 // timeout
+                                } else {
+                                    2 // error
+                                }
+                            };
+
                             logger::rustLogger.warn(
                                 self.network_id,
-                                &format!("Outgoing connection failed: peer={} error={:?}", peer_str, error),
+                                &format!("Outgoing connection failed: peer={} error={:?} result={}", peer_str, error, result),
                             );
 
+                            // Notify Zig of failed connection attempt and handle reconnection
                             if let Some(pid) = peer_id {
+                                let peer_id_cstr = match CString::new(pid.to_string()) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        // Invalid peer_id string - can't communicate with Zig, don't retry
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", pid));
+                                        continue;
+                                    }
+                                };
+                                unsafe {
+                                    handlePeerConnectionFailedFromRustBridge(
+                                        self.zig_handler,
+                                        peer_id_cstr.as_ptr(),
+                                        1, // outbound
+                                        result,
+                                    )
+                                };
+
+                                // Schedule reconnection if this was a tracked connection attempt
                                 if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
                                     .lock()
                                     .unwrap()

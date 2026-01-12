@@ -674,23 +674,67 @@ export fn handleRPCErrorFromRustBridge(
     }
 }
 
-export fn handlePeerConnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+export fn handlePeerConnectedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: [*:0]const u8,
+    direction: u32,
+) void {
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    zigHandler.logger.info("network-{d}:: Peer connected: {s}{}", .{ zigHandler.params.networkId, peer_id_slice, node_name });
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    zigHandler.logger.info("network-{d}:: Peer connected: {s}{} direction={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        node_name,
+        @tagName(dir),
+    });
 
-    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice) catch |e| {
+    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice, dir) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer connected event: {any}", .{ zigHandler.params.networkId, e });
     };
 }
 
-export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+export fn handlePeerDisconnectedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: [*:0]const u8,
+    direction: u32,
+    reason: u32,
+) void {
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{}", .{ zigHandler.params.networkId, peer_id_slice, node_name });
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    const rsn = @as(interface.DisconnectionReason, @enumFromInt(reason));
+    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{} direction={s} reason={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        node_name,
+        @tagName(dir),
+        @tagName(rsn),
+    });
 
-    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice) catch |e| {
+    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
+    };
+}
+
+export fn handlePeerConnectionFailedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: ?[*:0]const u8,
+    direction: u32,
+    result: u32,
+) void {
+    const peer_id_slice = if (peer_id) |p| std.mem.span(p) else "unknown";
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    const res = @as(interface.ConnectionResult, @enumFromInt(result));
+    zigHandler.logger.info("network-{d}:: Peer connection failed: {s} direction={s} result={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        @tagName(dir),
+        @tagName(res),
+    });
+
+    zigHandler.peerEventHandler.onPeerConnectionFailed(peer_id_slice, dir, res) catch |e| {
+        zigHandler.logger.err("network-{d}:: Error handling peer connection failed event: {any}", .{ zigHandler.params.networkId, e });
     };
 }
 
