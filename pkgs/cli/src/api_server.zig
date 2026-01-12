@@ -8,41 +8,10 @@ const utils_lib = @import("@zeam/utils");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const ModuleLogger = utils_lib.ModuleLogger;
 
-/// Global chain pointer (set after node initialization)
-/// Using anyopaque to avoid circular dependency with node.zig
-var global_chain_ptr: ?*anyopaque = null;
-var chain_ptr_mutex = std.Thread.Mutex{};
-
-/// Register the chain instance to enable finalized state endpoint
-/// The chain_ptr must point to a BeamChain
-pub fn registerChain(chain_ptr: *anyopaque) void {
-    chain_ptr_mutex.lock();
-    defer chain_ptr_mutex.unlock();
-    global_chain_ptr = chain_ptr;
-}
-
-/// Internal function to get finalized lean state (BeamState) from the registered chain
-/// Returns the finalized checkpoint lean state (BeamState) if available
-fn getFinalizedStateInternal() ?*const types.BeamState {
-    chain_ptr_mutex.lock();
-    defer chain_ptr_mutex.unlock();
-
-    const chain_ptr = global_chain_ptr orelse return null;
-
-    // Cast the opaque pointer directly to BeamChain pointer
-    // This is safer than casting through the Node structure
-    const chainFactory = @import("@zeam/node").chainFactory;
-    const BeamChain = chainFactory.BeamChain;
-
-    const chain: *const BeamChain = @ptrCast(@alignCast(chain_ptr));
-
-    // Use the public method to safely get the finalized state
-    return chain.getFinalizedState();
-}
-
 /// API server that runs in a background thread
 /// Handles metrics, SSE events, health checks, and checkpoint state endpoints
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig) !void {
+/// chain_ptr is optional - if null, the finalized state endpoint will return 503
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain_ptr: ?*anyopaque) !void {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
@@ -57,6 +26,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
         .allocator = allocator,
         .port = port,
         .logger = logger,
+        .chain_ptr = chain_ptr,
     };
 
     // Start server in background thread
@@ -71,6 +41,7 @@ const ApiServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
     logger: ModuleLogger,
+    chain_ptr: ?*anyopaque,
 
     const Self = @This();
 
@@ -168,8 +139,19 @@ const ApiServer = struct {
     /// Handle finalized checkpoint state endpoint
     /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
     fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
-        // Retrieve the finalized lean state (BeamState)
-        const finalized_lean_state = getFinalizedStateInternal() orelse {
+        // Get the chain pointer
+        const chain_ptr = self.chain_ptr orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        // Cast the opaque pointer to BeamChain
+        const chainFactory = @import("@zeam/node").chainFactory;
+        const BeamChain = chainFactory.BeamChain;
+        const chain: *const BeamChain = @ptrCast(@alignCast(chain_ptr));
+
+        // Get finalized state from chain (chain handles its own locking internally)
+        const finalized_lean_state = chain.getFinalizedState() orelse {
             _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
             return;
         };

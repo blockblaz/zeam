@@ -137,7 +137,9 @@ pub const Node = struct {
 
         if (options.metrics_enable) {
             try api.init(allocator);
-            try api_server.startAPIServer(allocator, options.metrics_port, options.logger_config);
+            // Pass null for chain - it will be initialized later. The checkpoint sync endpoint
+            // will return 503 until the server is started with a chain pointer.
+            try api_server.startAPIServer(allocator, options.metrics_port, options.logger_config, null);
         }
 
         // some base mainnet spec would be loaded to build this up
@@ -228,13 +230,10 @@ pub const Node = struct {
             .node_registry = options.node_registry,
         });
 
-        // Register finalized state getter with API server if metrics are enabled
-        if (options.metrics_enable) {
-            // Register the chain pointer directly instead of the node pointer
-            // This avoids unsafe pointer casting through the Node structure
-            api_server.registerChain(@as(*anyopaque, @ptrCast(self.beam_node.chain)));
-            self.logger.info("registered chain with API server for finalized checkpoint state endpoint", .{});
-        }
+        // Note: API server chain pointer should be set when the server is started
+        // In the current architecture, the API server is started before Node initialization,
+        // so the chain pointer cannot be set here. The checkpoint sync endpoint will
+        // return 503 until the server is started with a chain pointer.
     }
 
     pub fn deinit(self: *Self) void {

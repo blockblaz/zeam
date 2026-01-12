@@ -307,7 +307,8 @@ fn mainInner() !void {
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             // Start metrics HTTP server
-            api_server.startAPIServer(allocator, beamcmd.metricsPort, &api_logger_config) catch |err| {
+            // Pass null for chain - in .beam command mode, chains are created later and the checkpoint sync endpoint won't be available
+            api_server.startAPIServer(allocator, beamcmd.metricsPort, &api_logger_config, null) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
                 return err;
             };
