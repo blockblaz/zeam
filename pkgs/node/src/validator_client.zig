@@ -97,6 +97,25 @@ pub const ValidatorClient = struct {
 
     pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
+            // Check if chain is synced before producing a block
+            const sync_status = self.chain.getSyncStatus();
+            switch (sync_status) {
+                .synced => {},
+                .no_peers => {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: no peers connected", .{ slot, slot_proposer_id });
+                    return null;
+                },
+                .behind_peers => |info| {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                        slot,
+                        slot_proposer_id,
+                        info.head_slot,
+                        info.max_peer_finalized_slot,
+                    });
+                    return null;
+                },
+            }
+
             // 1. construct the block
             self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
@@ -144,6 +163,25 @@ pub const ValidatorClient = struct {
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
+
+        // Check if chain is synced before producing attestations
+        const sync_status = self.chain.getSyncStatus();
+        switch (sync_status) {
+            .synced => {},
+            .no_peers => {
+                self.logger.warn("skipping attestation production for slot={d}: no peers connected", .{slot});
+                return null;
+            },
+            .behind_peers => |info| {
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.max_peer_finalized_slot,
+                });
+                return null;
+            },
+        }
+
         const slot_proposer_id = self.getSlotProposer(slot);
 
         self.logger.info("constructing attestation message for slot={d}", .{slot});

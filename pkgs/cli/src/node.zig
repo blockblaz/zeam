@@ -119,6 +119,7 @@ pub const Node = struct {
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
+    anchor_state: *types.BeamState,
 
     const Self = @This();
 
@@ -154,9 +155,6 @@ pub const Node = struct {
 
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
-        var anchorState: types.BeamState = undefined;
-        try anchorState.genGenesisState(allocator, chain_config.genesis);
-        errdefer anchorState.deinit();
 
         // TODO we seem to be needing one loop because then the events added to loop are not being fired
         // in the order to which they have been added even with the an appropriate delay added
@@ -180,6 +178,19 @@ pub const Node = struct {
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
 
+        self.logger = options.logger_config.logger(.node);
+
+        const anchorState: *types.BeamState = try allocator.create(types.BeamState);
+        errdefer allocator.destroy(anchorState);
+        self.anchor_state = anchorState;
+
+        // Try to load the latest finalized state from the database, fallback to genesis
+        db.loadLatestFinalizedState(self.anchor_state) catch |err| {
+            self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+        };
+        errdefer self.anchor_state.deinit();
+
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
         errdefer self.key_manager.deinit();
@@ -192,7 +203,7 @@ pub const Node = struct {
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
-            .anchorState = &anchorState,
+            .anchorState = self.anchor_state,
             .backend = self.network.getNetworkInterface(),
             .clock = &self.clock,
             .validator_ids = validator_ids,
@@ -201,8 +212,6 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
-
-        self.logger = options.logger_config.logger(.node);
     }
 
     pub fn deinit(self: *Self) void {
@@ -214,6 +223,8 @@ pub const Node = struct {
         self.db.deinit();
         self.loop.deinit();
         event_broadcaster.deinitGlobalBroadcaster();
+        self.anchor_state.deinit();
+        self.allocator.destroy(self.anchor_state);
     }
 
     pub fn run(self: *Node) !void {
