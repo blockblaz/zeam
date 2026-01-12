@@ -187,7 +187,7 @@ pub const Node = struct {
 
         // Initialize anchor state with priority: checkpoint URL > database > genesis
         if (options.checkpoint_sync_url) |checkpoint_url| {
-            self.logger.info("Checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
+            self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Download checkpoint state from URL
             self.anchor_state.* = try downloadCheckpointState(allocator, checkpoint_url, self.logger);
@@ -196,7 +196,7 @@ pub const Node = struct {
             // Verify state root matches checkpoint
             try verifyCheckpointStateRoot(allocator, self.anchor_state, self.logger);
 
-            self.logger.info("Checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
+            self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
         } else {
             // Try to load the latest finalized state from the database, fallback to genesis
             db.loadLatestFinalizedState(self.anchor_state) catch |err| {
@@ -233,7 +233,7 @@ pub const Node = struct {
             // Register the chain pointer directly instead of the node pointer
             // This avoids unsafe pointer casting through the Node structure
             api_server.registerChain(@as(*anyopaque, @ptrCast(self.beam_node.chain)));
-            self.logger.info("Registered chain with API server for finalized checkpoint state endpoint", .{});
+            self.logger.info("registered chain with API server for finalized checkpoint state endpoint", .{});
         }
     }
 
@@ -524,7 +524,7 @@ fn downloadCheckpointState(
     url: []const u8,
     logger: zeam_utils.ModuleLogger,
 ) !types.BeamState {
-    logger.info("Downloading checkpoint state from: {s}", .{url});
+    logger.info("downloading checkpoint state from: {s}", .{url});
 
     // Parse URL using string manipulation (simpler approach)
     // Extract components manually from URL string
@@ -648,7 +648,7 @@ fn downloadCheckpointState(
         }
     }
 
-    logger.info("Downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
+    logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
 
     // Deserialize SSZ state
     // Use arena allocator for deserialization as SSZ types may allocate
@@ -658,7 +658,7 @@ fn downloadCheckpointState(
     var checkpoint_state: types.BeamState = undefined;
     try ssz.deserialize(types.BeamState, ssz_data.items, &checkpoint_state, arena.allocator());
 
-    logger.info("Successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
+    logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
 
     // Clone the state to move it out of the arena using the proper cloning function
     var cloned_state: types.BeamState = undefined;
@@ -678,14 +678,14 @@ fn verifyCheckpointStateRoot(
     var state_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
 
-    logger.info("Verifying checkpoint state: state_root=0x{s}, slot={d}", .{
+    logger.info("verifying checkpoint state: state_root=0x{s}, slot={d}", .{
         std.fmt.fmtSliceHexLower(&state_root),
         state.slot,
     });
 
     // Verify the state's block header state_root matches the calculated state root
     if (!std.mem.eql(u8, &state_root, &state.latest_block_header.state_root)) {
-        logger.err("Checkpoint state verification failed: calculated state_root does not match block header state_root", .{});
+        logger.err("checkpoint state verification failed: calculated state_root does not match block header state_root", .{});
         return error.InvalidCheckpointState;
     }
 
@@ -694,7 +694,7 @@ fn verifyCheckpointStateRoot(
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &block_root, allocator);
 
-    logger.info("Checkpoint state verified successfully: block_root=0x{s}", .{
+    logger.info("checkpoint state verified successfully: block_root=0x{s}", .{
         std.fmt.fmtSliceHexLower(&block_root),
     });
 

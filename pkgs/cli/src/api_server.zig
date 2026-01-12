@@ -23,8 +23,7 @@ pub fn registerChain(chain_ptr: *anyopaque) void {
 
 /// Internal function to get finalized lean state (BeamState) from the registered chain
 /// Returns the finalized checkpoint lean state (BeamState) if available
-fn getFinalizedStateInternal(_allocator: std.mem.Allocator) ?*const types.BeamState {
-    _ = _allocator;
+fn getFinalizedStateInternal() ?*const types.BeamState {
     chain_ptr_mutex.lock();
     defer chain_ptr_mutex.unlock();
 
@@ -41,17 +40,18 @@ fn getFinalizedStateInternal(_allocator: std.mem.Allocator) ?*const types.BeamSt
     return chain.getFinalizedState();
 }
 
-/// Simple metrics server that runs in a background thread
+/// API server that runs in a background thread
+/// Handles metrics, SSE events, health checks, and checkpoint state endpoints
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig) !void {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
     // Create a logger instance for the API server
-    const logger = logger_config.logger(.metrics);
+    const logger = logger_config.logger(.api_server);
 
-    // Create a simple HTTP server context
-    const ctx = try allocator.create(SimpleMetricsServer);
+    // Create the API server context
+    const ctx = try allocator.create(ApiServer);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
@@ -60,67 +60,87 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
     };
 
     // Start server in background thread
-    const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
+    const thread = try std.Thread.spawn(.{}, ApiServer.run, .{ctx});
     thread.detach();
 
-    logger.info("Metrics server thread spawned for port {d}", .{port});
+    logger.info("API server thread spawned for port {d}", .{port});
 }
 
-/// Handle finalized checkpoint state endpoint
-/// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
-fn handleFinalizedCheckpointState(request: *std.http.Server.Request, allocator: std.mem.Allocator, logger: ModuleLogger) !void {
-    // Retrieve the finalized lean state (BeamState)
-    const finalized_lean_state = getFinalizedStateInternal(allocator) orelse {
-        _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
-        return;
-    };
+/// API server context
+const ApiServer = struct {
+    allocator: std.mem.Allocator,
+    port: u16,
+    logger: ModuleLogger,
 
-    // Serialize lean state (BeamState) to SSZ
-    var ssz_output = std.ArrayList(u8).init(allocator);
-    defer ssz_output.deinit();
+    const Self = @This();
 
-    ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
-        logger.err("Failed to serialize finalized lean state to SSZ: {}", .{err});
-        _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
-        return;
-    };
+    fn run(self: *Self) void {
+        // `startAPIServer` creates this, so we need to free it here
+        defer self.allocator.destroy(self);
 
-    // Format content-length header value
-    var content_length_buf: [32]u8 = undefined;
-    const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
-
-    // Respond with lean state (BeamState) as SSZ octet-stream
-    _ = request.respond(ssz_output.items, .{
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/octet-stream" },
-            .{ .name = "content-length", .value = content_length_str },
-        },
-    }) catch |err| {
-        logger.warn("Failed to respond with finalized lean state: {}", .{err});
-        return err;
-    };
-}
-
-/// Handle individual HTTP connections in a separate thread
-fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, logger: ModuleLogger) void {
-    defer connection.stream.close();
-
-    var buffer: [4096]u8 = undefined;
-    var http_server = std.http.Server.init(connection, &buffer);
-    var request = http_server.receiveHead() catch |err| {
-        logger.warn("Failed to receive HTTP head: {}", .{err});
-        return;
-    };
-
-    // Route handling
-    if (std.mem.eql(u8, request.head.target, "/events")) {
-        // Handle SSE connection - this will keep the connection alive
-        SimpleMetricsServer.handleSSEEvents(connection.stream, allocator, logger) catch |err| {
-            logger.warn("SSE connection failed: {}", .{err});
+        const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
+            self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
+            return;
         };
-    } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
-        // Handle metrics request
-        var metrics_output = std.ArrayList(u8).init(allocator);
+
+        var server = address.listen(.{ .reuse_address = true }) catch |err| {
+            self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
+            return;
+        };
+        defer server.deinit();
+
+        self.logger.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+
+        while (true) {
+            const connection = server.accept() catch continue;
+
+            // For SSE connections, we need to handle them differently
+            // We'll spawn a new thread for each connection to handle persistence
+            _ = std.Thread.spawn(.{}, Self.handleConnection, .{ self, connection }) catch |err| {
+                self.logger.warn("failed to spawn connection handler: {}", .{err});
+                connection.stream.close();
+                continue;
+            };
+        }
+    }
+
+    /// Handle individual HTTP connections in a separate thread
+    fn handleConnection(self: *const Self, connection: std.net.Server.Connection) void {
+        defer connection.stream.close();
+
+        var buffer: [4096]u8 = undefined;
+        var http_server = std.http.Server.init(connection, &buffer);
+        var request = http_server.receiveHead() catch |err| {
+            self.logger.warn("failed to receive HTTP head: {}", .{err});
+            return;
+        };
+
+        // Route handling
+        if (std.mem.eql(u8, request.head.target, "/events")) {
+            // Handle SSE connection - this will keep the connection alive
+            self.handleSSEEvents(connection.stream) catch |err| {
+                self.logger.warn("SSE connection failed: {}", .{err});
+            };
+        } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
+            // Handle metrics request
+            self.handleMetrics(&request);
+        } else if (std.mem.eql(u8, request.head.target, "/health")) {
+            // Handle health check
+            self.handleHealth(&request);
+        } else if (std.mem.eql(u8, request.head.target, "/lean/states/finalized")) {
+            // Handle finalized checkpoint state endpoint
+            self.handleFinalizedCheckpointState(&request) catch |err| {
+                self.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
+        } else {
+            _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
+        }
+    }
+
+    /// Handle metrics endpoint
+    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
+        var metrics_output = std.ArrayList(u8).init(self.allocator);
         defer metrics_output.deinit();
 
         api.writeMetrics(metrics_output.writer()) catch {
@@ -133,63 +153,55 @@ fn handleConnection(connection: std.net.Server.Connection, allocator: std.mem.Al
                 .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },
         }) catch {};
-    } else if (std.mem.eql(u8, request.head.target, "/health")) {
-        // Handle health check
-        const response = "{\"status\":\"healthy\",\"service\":\"zeam-metrics\"}";
+    }
+
+    /// Handle health check endpoint
+    fn handleHealth(_: *const Self, request: *std.http.Server.Request) void {
+        const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
         _ = request.respond(response, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
         }) catch {};
-    } else if (std.mem.eql(u8, request.head.target, "/lean/states/finalized")) {
-        // Handle finalized checkpoint state endpoint
-        handleFinalizedCheckpointState(&request, allocator, logger) catch |err| {
-            logger.warn("Failed to handle finalized checkpoint state request: {}", .{err});
-            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
-        };
-    } else {
-        _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
     }
-}
 
-/// Simple metrics server context
-const SimpleMetricsServer = struct {
-    allocator: std.mem.Allocator,
-    port: u16,
-    logger: ModuleLogger,
-
-    fn run(self: *SimpleMetricsServer) void {
-        // `startMetricsServer` creates this, so we need to free it here
-        defer self.allocator.destroy(self);
-
-        const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
-            self.logger.err("Failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
+    /// Handle finalized checkpoint state endpoint
+    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
+    fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
+        // Retrieve the finalized lean state (BeamState)
+        const finalized_lean_state = getFinalizedStateInternal() orelse {
+            _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
             return;
         };
 
-        var server = address.listen(.{ .reuse_address = true }) catch |err| {
-            self.logger.err("Failed to listen on port {d}: {}", .{ self.port, err });
+        // Serialize lean state (BeamState) to SSZ
+        var ssz_output = std.ArrayList(u8).init(self.allocator);
+        defer ssz_output.deinit();
+
+        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
+            self.logger.err("failed to serialize finalized lean state to SSZ: {}", .{err});
+            _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
             return;
         };
-        defer server.deinit();
 
-        self.logger.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+        // Format content-length header value
+        var content_length_buf: [32]u8 = undefined;
+        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
 
-        while (true) {
-            const connection = server.accept() catch continue;
-
-            // For SSE connections, we need to handle them differently
-            // We'll spawn a new thread for each connection to handle persistence
-            _ = std.Thread.spawn(.{}, handleConnection, .{ connection, self.allocator, self.logger }) catch |err| {
-                self.logger.warn("Failed to spawn connection handler: {}", .{err});
-                connection.stream.close();
-                continue;
-            };
-        }
+        // Respond with lean state (BeamState) as SSZ octet-stream
+        _ = request.respond(ssz_output.items, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/octet-stream" },
+                .{ .name = "content-length", .value = content_length_str },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with finalized lean state: {}", .{err});
+            return err;
+        };
     }
 
-    fn handleSSEEvents(stream: std.net.Stream, allocator: std.mem.Allocator, logger: ModuleLogger) !void {
-        _ = allocator;
+    /// Handle SSE events endpoint
+    fn handleSSEEvents(self: *const Self, stream: std.net.Stream) !void {
         // Set SSE headers manually by writing HTTP response
         const sse_headers = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/event-stream\r\n" ++
@@ -215,7 +227,7 @@ const SimpleMetricsServer = struct {
             // Send periodic heartbeat to keep connection alive
             const heartbeat = ": heartbeat\n\n";
             stream.writeAll(heartbeat) catch |err| {
-                logger.warn("SSE connection closed: {}", .{err});
+                self.logger.warn("SSE connection closed: {}", .{err});
                 break;
             };
 
