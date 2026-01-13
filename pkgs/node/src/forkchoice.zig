@@ -12,6 +12,8 @@ const params = @import("@zeam/params");
 
 const constants = @import("./constants.zig");
 
+const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
+
 const ProtoBlock = types.ProtoBlock;
 const ProtoMeta = struct {
     parent: ?usize,
@@ -1347,7 +1349,7 @@ fn createTestSignedAttestation(validator_id: usize, head_root: types.Root, slot:
             .target = .{ .root = head_root, .slot = slot },
             .source = .{ .root = createTestRoot(0xAA), .slot = 0 },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+        .signature = ZERO_SIGBYTES,
     };
 }
 

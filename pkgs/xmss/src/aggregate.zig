@@ -1,56 +1,27 @@
-pub const CXmssPublicKey = extern struct {
-    merkle_root: [8]u32,
-    first_slot: u64,
-    log_lifetime: usize,
-};
+const std = @import("std");
 
-pub const CWotsSignature = extern struct {
-    chain_tips: [66][8]u32,
-    randomness: [8]u32,
-};
-
-pub const CXmssSignature = extern struct {
-    wots_signature: CWotsSignature,
-    slot: u64,
-    merkle_proof_ptr: [*]const u32,
-    merkle_proof_len: usize,
-};
-
+// External C functions from multisig-glue (uses leanMultisig devnet2)
 extern fn xmss_setup_prover() void;
 extern fn xmss_setup_verifier() void;
+
 extern fn xmss_aggregate(
-    pub_keys_ptr: [*]const CXmssPublicKey,
-    pub_keys_len: usize,
-    signatures_ptr: [*]const CXmssSignature,
-    signatures_len: usize,
-    message_hash_ptr: [*]const u32,
-    slot: u64,
-    out_proof_ptr: [*]u8,
-    out_proof_capacity: usize,
-    out_proof_len: *usize,
-) i32;
+    public_keys: [*]const *const anyopaque,
+    num_keys: usize,
+    signatures: [*]const *const anyopaque,
+    num_sigs: usize,
+    message_hash_ptr: [*]const u8,
+    epoch: u32,
+) ?*anyopaque;
 
 extern fn xmss_verify_aggregated(
-    pub_keys_ptr: [*]const CXmssPublicKey,
-    pub_keys_len: usize,
-    message_hash_ptr: [*]const u32,
-    proof_ptr: [*]const u8,
-    proof_len: usize,
-    slot: u64,
-) i32;
+    public_keys: [*]const *const anyopaque,
+    num_keys: usize,
+    message_hash_ptr: [*]const u8,
+    agg_sig: *const anyopaque,
+    epoch: u32,
+) bool;
 
-extern fn xmss_generate_phony_signatures(
-    log_lifetimes_ptr: [*]const usize,
-    log_lifetimes_len: usize,
-    message_hash_ptr: [*]const u32,
-    slot: u64,
-    out_pub_keys_ptr: [*]CXmssPublicKey,
-    out_pub_keys_len: usize,
-    out_signatures_ptr: [*]CXmssSignature,
-    out_signatures_len: usize,
-    out_merkle_buf_ptr: [*]u32,
-    out_merkle_buf_len: usize,
-) i32;
+extern fn xmss_free_aggregate_signature(agg_sig: *anyopaque) void;
 
 pub const AggregationError = error{
     GenerationFailed,
@@ -67,69 +38,60 @@ pub fn setupVerifier() void {
     xmss_setup_verifier();
 }
 
-pub fn generatePhonySignatures(
-    log_lifetimes: []const usize,
-    message_hash: *const [8]u32,
-    slot: u64,
-    pub_keys: []CXmssPublicKey,
-    signatures: []CXmssSignature,
-    merkle_buf: []u32,
-) AggregationError!void {
-    const result = xmss_generate_phony_signatures(
-        log_lifetimes.ptr,
-        log_lifetimes.len,
-        message_hash,
-        slot,
-        pub_keys.ptr,
-        pub_keys.len,
-        signatures.ptr,
-        signatures.len,
-        merkle_buf.ptr,
-        merkle_buf.len,
-    );
-    if (result != 0) return AggregationError.GenerationFailed;
-}
-
-pub fn aggregate(
-    pub_keys: []const CXmssPublicKey,
-    signatures: []const CXmssSignature,
-    message_hash: *const [8]u32,
-    slot: u64,
-    proof_buf: []u8,
-    out_proof_len: *usize,
-) AggregationError!void {
-    const result = xmss_aggregate(
-        pub_keys.ptr,
-        pub_keys.len,
-        signatures.ptr,
-        signatures.len,
-        message_hash,
-        slot,
-        proof_buf.ptr,
-        proof_buf.len,
-        out_proof_len,
-    );
-    if (result != 0) return AggregationError.AggregationFailed;
-}
-
-pub fn verifyAggregated(
-    pub_keys: []const CXmssPublicKey,
-    message_hash: *const [8]u32,
-    proof: []const u8,
-    slot: u64,
-) AggregationError!void {
-    const result = xmss_verify_aggregated(
-        pub_keys.ptr,
-        pub_keys.len,
-        message_hash,
-        proof.ptr,
-        proof.len,
-        slot,
-    );
-    switch (result) {
-        1 => {},
-        0 => return AggregationError.InvalidSignature,
-        -1 => return AggregationError.VerificationFailed,
-        else => return AggregationError.VerificationFailed,
+/// Opaque handle to aggregated signature allocated in Rust
+pub const AggregateSignature = opaque {
+    /// Free the aggregate signature
+    pub fn deinit(self: *AggregateSignature) void {
+        xmss_free_aggregate_signature(@ptrCast(self));
     }
+};
+
+/// Aggregate signatures from hashsig-glue handles
+/// Returns opaque handle to Devnet2XmssAggregateSignature
+/// Caller must call deinit() on the returned signature
+pub fn aggregate(
+    keypairs: []*const anyopaque,
+    signatures: []*const anyopaque,
+    message_hash: *const [32]u8,
+    epoch: u32,
+    allocator: std.mem.Allocator,
+) AggregationError!*AggregateSignature {
+    _ = allocator; // No longer needed - we're not allocating or copying anything!
+
+    if (keypairs.len != signatures.len) {
+        return AggregationError.AggregationFailed;
+    }
+
+    const agg_sig = xmss_aggregate(
+        keypairs.ptr,
+        keypairs.len,
+        signatures.ptr,
+        signatures.len,
+        message_hash,
+        epoch,
+    );
+
+    if (agg_sig == null) return AggregationError.AggregationFailed;
+
+    // Return the opaque pointer directly
+    return @ptrCast(agg_sig.?);
+}
+
+/// Verify aggregated signatures using hashsig-glue keypair handles
+/// Takes aggregate signature handle directly
+pub fn verifyAggregated(
+    keypairs: []*const anyopaque,
+    message_hash: *const [32]u8,
+    agg_sig: *const AggregateSignature,
+    epoch: u32,
+) AggregationError!void {
+    const is_valid = xmss_verify_aggregated(
+        keypairs.ptr,
+        keypairs.len,
+        message_hash,
+        @ptrCast(agg_sig),
+        epoch,
+    );
+
+    if (!is_valid) return AggregationError.InvalidSignature;
 }

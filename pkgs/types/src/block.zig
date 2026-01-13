@@ -471,7 +471,7 @@ test "ssz seralize/deserialize signed beam block" {
                 .data = .{
                     .slot = 9,
                     .head = .{ .slot = 9, .root = [_]u8{1} ** 32 },
-                    .source = .{ .slot = 0, .root = [_]u8{0} ** 32 },
+                    .source = .{ .slot = 0, .root = ZERO_HASH },
                     .target = .{ .slot = 9, .root = [_]u8{1} ** 32 },
                 },
             },
