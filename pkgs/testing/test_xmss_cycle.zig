@@ -67,7 +67,7 @@ test "TestKeyManager: sign and verify attestation" {
 
     // Hash the attestation
     var message: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.Attestation, attestation, &message, allocator);
+    try ssz.hashTreeRoot(types.AttestationData, attestation.data, &message, allocator);
 
     // Verify
     try xmss.verifySsz(

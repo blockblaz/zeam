@@ -656,7 +656,7 @@ test "Mock messaging across two subscribers" {
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
-    var attestations = try types.Attestations.init(allocator);
+    var attestations = try types.AggregatedAttestations.init(allocator);
 
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);

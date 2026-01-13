@@ -466,7 +466,7 @@ fn buildBlock(
         }
     }
 
-    const attestations = try types.Attestations.init(allocator);
+    const attestations = try types.AggregatedAttestations.init(allocator);
     return types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,

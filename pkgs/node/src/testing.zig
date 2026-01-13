@@ -152,20 +152,36 @@ pub const NodeTestContext = struct {
         allocator: Allocator,
         block: *types.SignedBlockWithAttestation,
     ) !void {
-        var signatures = try types.BlockSignatures.init(allocator);
-        var signatures_initialized = false;
-        defer if (!signatures_initialized) signatures.deinit();
+        var attestation_signatures = try types.AttestationSignatures.init(allocator);
+        errdefer attestation_signatures.deinit();
 
-        for (block.message.block.body.attestations.constSlice()) |attestation| {
-            const signature = try self.key_manager.signAttestation(&attestation, allocator);
-            try signatures.append(signature);
+        for (block.message.block.body.attestations.constSlice()) |aggregated_attestation| {
+            var validator_signatures = try types.NaiveAggregatedSignature.init(allocator);
+            errdefer validator_signatures.deinit();
+
+            var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+            defer indices.deinit();
+
+            for (indices.items) |validator_index| {
+                var attestation = types.Attestation{
+                    .validator_id = @intCast(validator_index),
+                    .data = aggregated_attestation.data,
+                };
+                const signature = try self.key_manager.signAttestation(&attestation, allocator);
+                try validator_signatures.append(signature);
+            }
+
+            try attestation_signatures.append(validator_signatures);
         }
 
         const proposer_signature = try self.key_manager.signAttestation(&block.message.proposer_attestation, allocator);
-        try signatures.append(proposer_signature);
+
+        const signatures = types.BlockSignatures{
+            .attestation_signatures = attestation_signatures,
+            .proposer_signature = proposer_signature,
+        };
 
         block.signature.deinit();
         block.signature = signatures;
-        signatures_initialized = true;
     }
 };
