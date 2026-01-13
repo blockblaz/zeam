@@ -148,7 +148,7 @@ const ApiServer = struct {
         // Cast the opaque pointer to BeamChain
         const chainFactory = @import("@zeam/node").chainFactory;
         const BeamChain = chainFactory.BeamChain;
-        const chain: *const BeamChain = @ptrCast(@alignCast(chain_ptr));
+        const chain: *BeamChain = @ptrCast(@alignCast(chain_ptr));
 
         // Get finalized state from chain (chain handles its own locking internally)
         const finalized_lean_state = chain.getFinalizedState() orelse {

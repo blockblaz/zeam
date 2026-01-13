@@ -1011,12 +1011,37 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Get the finalized checkpoint state (BeamState) if available in memory
-    /// Returns null if the state was pruned from memory
-    /// TODO: Load from database if state was pruned
-    pub fn getFinalizedState(self: *const Self) ?*const types.BeamState {
+    /// Get the finalized checkpoint state (BeamState) if available
+    /// First checks in-memory cache, then falls back to database
+    /// Returns null if the state is not available in either location
+    pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
-        return self.states.get(finalized_checkpoint.root);
+
+        // First try to get from in-memory cache
+        if (self.states.get(finalized_checkpoint.root)) |state| {
+            return state;
+        }
+
+        // Fallback: try to load from database
+        const state_ptr = self.allocator.create(types.BeamState) catch |err| {
+            self.module_logger.warn("failed to allocate memory for finalized state: {}", .{err});
+            return null;
+        };
+
+        self.db.loadLatestFinalizedState(state_ptr) catch |err| {
+            self.allocator.destroy(state_ptr);
+            self.module_logger.debug("finalized state not available in database: {}", .{err});
+            return null;
+        };
+
+        // Cache the loaded state for future calls
+        self.states.put(finalized_checkpoint.root, state_ptr) catch |err| {
+            // Still return the state even if caching fails
+            self.module_logger.warn("failed to cache finalized state: {}", .{err});
+        };
+
+        self.module_logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
+        return state_ptr;
     }
 
     pub const SyncStatus = union(enum) {

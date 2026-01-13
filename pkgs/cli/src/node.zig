@@ -188,18 +188,29 @@ pub const Node = struct {
         self.anchor_state = anchorState;
 
         // Initialize anchor state with priority: checkpoint URL > database > genesis
+        var checkpoint_sync_succeeded = false;
         if (options.checkpoint_sync_url) |checkpoint_url| {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
-            // Download checkpoint state from URL
-            self.anchor_state.* = try downloadCheckpointState(allocator, checkpoint_url, self.logger);
-            errdefer self.anchor_state.deinit();
+            // Try checkpoint sync, fall back to database/genesis on failure
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
+                self.anchor_state.* = downloaded_state;
 
-            // Verify state root matches checkpoint
-            try verifyCheckpointStateRoot(allocator, self.anchor_state, self.logger);
+                // Verify state root matches checkpoint
+                if (verifyCheckpointStateRoot(allocator, self.anchor_state, self.logger)) {
+                    self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
+                    checkpoint_sync_succeeded = true;
+                } else |verify_err| {
+                    self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
+                    self.anchor_state.deinit();
+                }
+            } else |download_err| {
+                self.logger.warn("checkpoint sync failed: {}, falling back to database/genesis", .{download_err});
+            }
+        }
 
-            self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
-        } else {
+        // Fall back to database/genesis if checkpoint sync was not attempted or failed
+        if (!checkpoint_sync_succeeded) {
             // Try to load the latest finalized state from the database, fallback to genesis
             db.loadLatestFinalizedState(self.anchor_state) catch |err| {
                 self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
@@ -525,126 +536,55 @@ fn downloadCheckpointState(
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    // Parse URL using string manipulation (simpler approach)
-    // Extract components manually from URL string
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
-    const scheme = url[0..scheme_end];
-    const after_scheme = url[scheme_end + 3 ..];
+    // Parse URL using std.Uri
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
-    // Find path start (first '/' after scheme)
-    const path_start = std.mem.indexOf(u8, after_scheme, "/") orelse return error.InvalidUrl;
-    const authority = after_scheme[0..path_start];
-    const path = after_scheme[path_start..];
+    // Initialize HTTP client
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
 
-    // Split authority into host:port
-    const colon_pos = std.mem.indexOfScalar(u8, authority, ':');
-    const host = if (colon_pos) |pos| authority[0..pos] else authority;
-    const port_str = if (colon_pos) |pos| authority[pos + 1 ..] else null;
-    const port: u16 = if (port_str) |p_str|
-        try std.fmt.parseInt(u16, p_str, 10)
-    else if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
+    // Buffer for server response headers
+    var server_header_buffer: [16 * 1024]u8 = undefined;
 
-    // Create address
-    const address = try std.net.Address.resolveIp(host, port);
+    // Open HTTP request
+    var req = client.open(.GET, uri, .{
+        .server_header_buffer = &server_header_buffer,
+    }) catch |err| {
+        logger.err("failed to open HTTP connection: {}", .{err});
+        return error.ConnectionFailed;
+    };
+    defer req.deinit();
 
-    // Connect to server
-    var stream = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
+    // Send the request
+    req.send() catch |err| {
+        logger.err("failed to send HTTP request: {}", .{err});
+        return error.RequestFailed;
+    };
 
-    // Build HTTP request
-    const request = try std.fmt.allocPrint(
-        allocator,
-        "GET {s} HTTP/1.1\r\n" ++
-            "Host: {s}:{d}\r\n" ++
-            "Accept: application/octet-stream\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n",
-        .{ path, host, port },
-    );
-    defer allocator.free(request);
-
-    // Send request
-    try stream.writeAll(request);
-
-    // Read response headers
-    var buffer: [8192]u8 = undefined;
-    var total_read: usize = 0;
-    var headers_complete = false;
-    var content_length: ?usize = null;
-    var content_start: usize = 0;
-
-    while (!headers_complete) {
-        const bytes_read = try stream.read(buffer[total_read..]);
-        if (bytes_read == 0) break;
-        total_read += bytes_read;
-
-        // Look for end of headers (CRLF CRLF)
-        if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |end_pos| {
-            headers_complete = true;
-            content_start = end_pos + 4;
-
-            // Parse status line and headers
-            const headers_text = buffer[0..end_pos];
-            var lines = std.mem.splitSequence(u8, headers_text, "\r\n");
-
-            // Skip status line
-            _ = lines.next();
-
-            // Parse headers
-            while (lines.next()) |line| {
-                if (std.mem.indexOfScalar(u8, line, ':')) |header_colon_pos| {
-                    const header_name = std.mem.trim(u8, line[0..header_colon_pos], " ");
-                    const header_value = std.mem.trim(u8, line[header_colon_pos + 1 ..], " ");
-
-                    if (std.mem.eql(u8, header_name, "content-length")) {
-                        content_length = try std.fmt.parseInt(usize, header_value, 10);
-                    }
-                }
-            }
-        }
-    }
+    // Wait for response
+    req.wait() catch |err| {
+        logger.err("failed to receive HTTP response: {}", .{err});
+        return error.ResponseFailed;
+    };
 
     // Check HTTP status
-    const status_line_end = std.mem.indexOfScalar(u8, buffer[0..content_start], '\r') orelse return error.InvalidResponse;
-    const status_line = buffer[0..status_line_end];
-
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.")) {
-        return error.InvalidResponse;
+    if (req.response.status != .ok) {
+        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(req.response.status)});
+        return error.HttpError;
     }
 
-    // Extract status code
-    if (std.mem.indexOfScalar(u8, status_line, ' ')) |first_space| {
-        const after_status = status_line[first_space + 1 ..];
-        if (std.mem.indexOfScalar(u8, after_status, ' ')) |second_space| {
-            const status_code_str = after_status[0..second_space];
-            const status_code = try std.fmt.parseInt(u16, status_code_str, 10);
-
-            if (status_code != 200) {
-                logger.err("Checkpoint sync failed: HTTP {d}", .{status_code});
-                return error.HttpError;
-            }
-        }
-    }
-
-    // Read remaining data into a buffer
+    // Read response body
     var ssz_data = std.ArrayList(u8).init(allocator);
     errdefer ssz_data.deinit();
 
-    // Copy data already read after headers
-    if (total_read > content_start) {
-        try ssz_data.appendSlice(buffer[content_start..total_read]);
-    }
-
-    // Read remaining data
+    var buffer: [8192]u8 = undefined;
     while (true) {
-        const bytes_read = try stream.read(buffer[0..]);
+        const bytes_read = req.reader().read(&buffer) catch |err| {
+            logger.err("failed to read response body: {}", .{err});
+            return error.ReadFailed;
+        };
         if (bytes_read == 0) break;
         try ssz_data.appendSlice(buffer[0..bytes_read]);
-
-        // Stop if we've read the expected content length
-        if (content_length) |len| {
-            if (ssz_data.items.len >= len) break;
-        }
     }
 
     logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
