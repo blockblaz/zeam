@@ -34,29 +34,6 @@ const FrameDecodeError = error{
 
 const LeanSupportedProtocol = interface.LeanSupportedProtocol;
 
-fn getAttestationSlot(signed_attestation: anytype) u64 {
-    const MsgT = @TypeOf(signed_attestation.message);
-    if (@hasField(MsgT, "data")) {
-        return @as(u64, @intCast(@field(@field(signed_attestation.message, "data"), "slot")));
-    }
-    if (@hasField(MsgT, "slot")) {
-        return @as(u64, @intCast(@field(signed_attestation.message, "slot")));
-    }
-    return 0;
-}
-
-fn getAttestationValidatorId(signed_attestation: anytype) ?u64 {
-    const MsgT = @TypeOf(signed_attestation.message);
-    if (@hasField(MsgT, "validator_id")) {
-        return @as(u64, @intCast(@field(signed_attestation.message, "validator_id")));
-    }
-    const SignedT = @TypeOf(signed_attestation);
-    if (@hasField(SignedT, "validator_id")) {
-        return @as(u64, @intCast(@field(signed_attestation, "validator_id")));
-    }
-    return null;
-}
-
 fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, value, &scratch);
@@ -358,8 +335,20 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             );
         },
         .attestation => |signed_attestation| {
-            const slot = getAttestationSlot(signed_attestation);
-            const validator_id = getAttestationValidatorId(signed_attestation);
+            const msg = signed_attestation.message;
+            const slot: u64 = if (@hasField(@TypeOf(msg), "data"))
+                @as(u64, @intCast(@field(@field(msg, "data"), "slot")))
+            else if (@hasField(@TypeOf(msg), "slot"))
+                @as(u64, @intCast(@field(msg, "slot")))
+            else
+                0;
+
+            const validator_id: ?u64 = if (@hasField(@TypeOf(msg), "validator_id"))
+                @as(u64, @intCast(@field(msg, "validator_id")))
+            else if (@hasField(@TypeOf(signed_attestation), "validator_id"))
+                @as(u64, @intCast(@field(signed_attestation, "validator_id")))
+            else
+                null;
             zigHandler.logger.debug(
                 "network-{d}:: received gossip attestation slot={d} validator={any} (compressed={d}B, raw={d}B) from peer={s}{}",
                 .{
