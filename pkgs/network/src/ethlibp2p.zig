@@ -34,6 +34,29 @@ const FrameDecodeError = error{
 
 const LeanSupportedProtocol = interface.LeanSupportedProtocol;
 
+fn getAttestationSlot(signed_attestation: anytype) u64 {
+    const MsgT = @TypeOf(signed_attestation.message);
+    if (@hasField(MsgT, "data")) {
+        return @as(u64, @intCast(@field(@field(signed_attestation.message, "data"), "slot")));
+    }
+    if (@hasField(MsgT, "slot")) {
+        return @as(u64, @intCast(@field(signed_attestation.message, "slot")));
+    }
+    return 0;
+}
+
+fn getAttestationValidatorId(signed_attestation: anytype) ?u64 {
+    const MsgT = @TypeOf(signed_attestation.message);
+    if (@hasField(MsgT, "validator_id")) {
+        return @as(u64, @intCast(@field(signed_attestation.message, "validator_id")));
+    }
+    const SignedT = @TypeOf(signed_attestation);
+    if (@hasField(SignedT, "validator_id")) {
+        return @as(u64, @intCast(@field(signed_attestation, "validator_id")));
+    }
+    return null;
+}
+
 fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, value, &scratch);
@@ -335,12 +358,14 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             );
         },
         .attestation => |signed_attestation| {
+            const slot = getAttestationSlot(signed_attestation);
+            const validator_id = getAttestationValidatorId(signed_attestation);
             zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                "network-{d}:: received gossip attestation slot={d} validator={any} (compressed={d}B, raw={d}B) from peer={s}{}",
                 .{
                     zigHandler.params.networkId,
-                    signed_attestation.message.data.slot,
-                    signed_attestation.message.validator_id,
+                    slot,
+                    validator_id,
                     message_bytes.len,
                     uncompressed_message.len,
                     sender_peer_id_slice,
