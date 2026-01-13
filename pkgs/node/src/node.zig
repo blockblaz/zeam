@@ -146,8 +146,8 @@ pub const BeamNode = struct {
                 }
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.data.slot;
-                const validator_id = signed_attestation.message.validator_id;
+                const slot = signed_attestation.message.slot;
+                const validator_id = signed_attestation.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -827,13 +827,13 @@ pub const BeamNode = struct {
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const message = signed_attestation.message;
-        const data = message.data;
+        const data = signed_attestation.message;
+        const validator_id = signed_attestation.validator_id;
 
         // 1. Process locally through chain
         self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
             data.slot,
-            message.validator_id,
+            validator_id,
         });
         try self.chain.onAttestation(signed_attestation);
 
@@ -843,8 +843,8 @@ pub const BeamNode = struct {
 
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
-            message.validator_id,
-            self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
+            validator_id,
+            self.node_registry.getNodeNameFromValidatorIndex(validator_id),
         });
     }
 
@@ -1038,7 +1038,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .proposer_index = 0,
                 .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1051,7 +1051,7 @@ test "Node: fetched blocks cache and deduplication" {
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
@@ -1063,7 +1063,7 @@ test "Node: fetched blocks cache and deduplication" {
                 .proposer_index = 0,
                 .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1076,7 +1076,7 @@ test "Node: fetched blocks cache and deduplication" {
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     // Cache blocks
@@ -1198,7 +1198,7 @@ fn makeTestSignedBlockWithParent(
                 .proposer_index = 0,
                 .state_root = types.ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
@@ -1211,7 +1211,7 @@ fn makeTestSignedBlockWithParent(
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     return block_ptr;

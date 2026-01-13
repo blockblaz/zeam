@@ -1012,11 +1012,14 @@ test "save and load block" {
     try std.testing.expect(loaded.block.body.attestations.len() == 0);
 
     // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 2);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
+    const signature_groups = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(signature_groups.len() == 1);
+    const loaded_group = try signature_groups.get(0);
+    try std.testing.expect(loaded_group.len() == test_signatures.len);
+    for (test_signatures, 0..) |expected_sig, idx| {
+        const loaded_sig = try loaded_group.get(idx);
+        try std.testing.expect(std.mem.eql(u8, &loaded_sig, &expected_sig));
+    }
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -1134,13 +1137,14 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
 
     // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 3);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    const loaded_sig3 = try loaded_block.?.signature.get(2);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig3, &test_sig3));
+    const batch_signature_groups = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(batch_signature_groups.len() == 1);
+    const loaded_group = try batch_signature_groups.get(0);
+    try std.testing.expect(loaded_group.len() == test_signatures.len);
+    for (test_signatures, 0..) |expected_sig, idx| {
+        const loaded_sig = try loaded_group.get(idx);
+        try std.testing.expect(std.mem.eql(u8, &loaded_sig, &expected_sig));
+    }
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);
