@@ -189,8 +189,8 @@ pub const Node = struct {
             if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
                 self.anchor_state.* = downloaded_state;
 
-                // Verify state root matches checkpoint
-                if (verifyCheckpointStateRoot(allocator, self.anchor_state, self.logger)) {
+                // Verify state against genesis config
+                if (verifyCheckpointStateRoot(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
                     self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
                     checkpoint_sync_succeeded = true;
                 } else |verify_err| {
@@ -600,32 +600,46 @@ fn downloadCheckpointState(
     return cloned_state;
 }
 
-/// Verifies and logs checkpoint state information
-/// Computes the state root and block root for the downloaded state
-/// Note: The actual checkpoint verification happens during forkchoice initialization
-/// where the block root is compared against the anchor block root
+/// Verifies checkpoint state against the genesis configuration
+/// Validates that the downloaded state is consistent with expected genesis parameters
+/// Also computes and logs the state root and block root
 fn verifyCheckpointStateRoot(
     allocator: std.mem.Allocator,
     state: *const types.BeamState,
+    genesis_spec: *const types.GenesisSpec,
     logger: zeam_utils.ModuleLogger,
 ) !void {
-    // Calculate state root for logging
-    var state_root: types.Root = undefined;
-    try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
+    // Verify number of validators matches genesis config
+    const expected_validators = genesis_spec.numValidators();
+    const actual_validators = state.validators.len();
+    if (actual_validators != expected_validators) {
+        logger.err("checkpoint state verification failed: validator count mismatch (expected={d}, got={d})", .{
+            expected_validators,
+            actual_validators,
+        });
+        return error.ValidatorCountMismatch;
+    }
 
-    // Calculate the block root from the latest_block_header
+    // Verify state has validators
+    if (actual_validators == 0) {
+        logger.err("checkpoint state verification failed: no validators in state", .{});
+        return error.NoValidators;
+    }
+
+    // Generate state block header with correct state_root
+    // (latest_block_header.state_root is zero; genStateBlockHeader computes and sets it)
+    const state_block_header = try state.genStateBlockHeader(allocator);
+
+    // Calculate the block root from the properly constructed block header
     var block_root: types.Root = undefined;
-    try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &block_root, allocator);
+    try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
 
-    logger.info("checkpoint state info: slot={d}, state_root=0x{s}, block_root=0x{s}", .{
+    logger.info("checkpoint state verified: slot={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
         state.slot,
-        std.fmt.fmtSliceHexLower(&state_root),
+        actual_validators,
+        std.fmt.fmtSliceHexLower(&state_block_header.state_root),
         std.fmt.fmtSliceHexLower(&block_root),
     });
-
-    // Note: latest_block_header.state_root is typically zero bytes due to circular dependency
-    // (state root includes the block header which would contain the state root).
-    // Actual checkpoint verification happens during forkchoice initialization.
 }
 
 /// Parses the nodes from a YAML configuration.

@@ -112,6 +112,7 @@ Zeam supports checkpoint sync for faster initial synchronization. You can start 
 ### Testing Scenarios
 
 1. Test blocks by root [parent-sync](./resources/parent-sync.md)
+2. Test checkpoint sync [checkpoint-sync](./resources/checkpoint-sync.md)
 
 ### Reporting Issues
 
