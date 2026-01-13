@@ -946,7 +946,7 @@ impl Network {
                             // a `/p2p/<peer_id>` component (in which case we couldn't pre-populate `peer_addr_map`).
                             if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
                                 self.peer_addr_map
-                                    .entry(peer_id.clone())
+                                    .entry(peer_id)
                                     .or_insert_with(|| address.clone());
                             }
 
