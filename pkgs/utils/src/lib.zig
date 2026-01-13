@@ -37,6 +37,10 @@ const json_factory = @import("./json.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const jsonToString = json_factory.jsonToString;
 
+const fmt_factory = @import("./fmt.zig");
+// Avoid to use `usingnamespace` to make upgrade easier in the future.
+pub const LazyJson = fmt_factory.LazyJson;
+
 test {
     @import("std").testing.refAllDeclsRecursive(@This());
 }

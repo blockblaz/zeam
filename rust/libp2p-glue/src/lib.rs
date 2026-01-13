@@ -941,6 +941,17 @@ impl Network {
                             // Determine direction from endpoint: Dialer=outbound, Listener=inbound
                             let direction: u32 = if endpoint.is_dialer() { 1 } else { 0 };
 
+                            // If this was an outbound connection, remember the address we successfully dialed.
+                            // This enables reconnection even when the initial connect multiaddr did not include
+                            // a `/p2p/<peer_id>` component (in which case we couldn't pre-populate `peer_addr_map`).
+                            if endpoint.is_dialer() {
+                                if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                    self.peer_addr_map
+                                        .entry(peer_id.clone())
+                                        .or_insert_with(|| address.clone());
+                                }
+                            }
+
                             logger::rustLogger.info(
                                 self.network_id,
                                 &format!("Connection established with peer: {} direction={}",
@@ -990,7 +1001,7 @@ impl Network {
                                 None => 1, // remote_close (graceful close, no error)
                                 Some(err) => {
                                     let err_str = format!("{:?}", err);
-                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("KeepAlive") {
+                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("TimedOut") || err_str.contains("KeepAlive") {
                                         0 // timeout
                                     } else if err_str.contains("Reset") || err_str.contains("ConnectionReset") {
                                         1 // remote_close
