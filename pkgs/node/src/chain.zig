@@ -95,6 +95,8 @@ pub const BeamChain = struct {
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
+    // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
+    cached_finalized_state: ?*types.BeamState = null,
 
     const Self = @This();
 
@@ -142,6 +144,13 @@ pub const BeamChain = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
+
+        // Clean up cached finalized state if present
+        if (self.cached_finalized_state) |cached_state| {
+            cached_state.deinit();
+            self.allocator.destroy(cached_state);
+        }
+
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         // self.anchor_state.deinit();
@@ -1082,14 +1091,19 @@ pub const BeamChain = struct {
     }
 
     /// Get the finalized checkpoint state (BeamState) if available
-    /// First checks in-memory cache, then falls back to database
-    /// Returns null if the state is not available in either location
+    /// First checks in-memory states map, then cached DB state, then falls back to database
+    /// Returns null if the state is not available in any location
     pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
 
-        // First try to get from in-memory cache
+        // First try to get from in-memory states map
         if (self.states.get(finalized_checkpoint.root)) |state| {
             return state;
+        }
+
+        // Check if we already have a cached state from DB
+        if (self.cached_finalized_state) |cached_state| {
+            return cached_state;
         }
 
         // Fallback: try to load from database
@@ -1104,11 +1118,8 @@ pub const BeamChain = struct {
             return null;
         };
 
-        // Cache the loaded state for future calls
-        self.states.put(finalized_checkpoint.root, state_ptr) catch |err| {
-            // Still return the state even if caching fails
-            self.module_logger.warn("failed to cache finalized state: {}", .{err});
-        };
+        // Cache in separate field (not in states map to avoid affecting pruning)
+        self.cached_finalized_state = state_ptr;
 
         self.module_logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
         return state_ptr;
