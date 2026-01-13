@@ -944,12 +944,10 @@ impl Network {
                             // If this was an outbound connection, remember the address we successfully dialed.
                             // This enables reconnection even when the initial connect multiaddr did not include
                             // a `/p2p/<peer_id>` component (in which case we couldn't pre-populate `peer_addr_map`).
-                            if endpoint.is_dialer() {
-                                if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
-                                    self.peer_addr_map
-                                        .entry(peer_id.clone())
-                                        .or_insert_with(|| address.clone());
-                                }
+                            if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                self.peer_addr_map
+                                    .entry(peer_id.clone())
+                                    .or_insert_with(|| address.clone());
                             }
 
                             logger::rustLogger.info(

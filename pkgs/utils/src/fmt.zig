@@ -38,4 +38,3 @@ pub fn LazyJson(comptime T: type) type {
         }
     };
 }
-
