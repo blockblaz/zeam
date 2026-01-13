@@ -348,7 +348,7 @@ test "ssz seralize/deserialize signed beam block" {
                     },
                     .source = .{
                         .slot = 0,
-                        .root = [_]u8{0} ** 32,
+                        .root = ZERO_HASH,
                     },
                     .target = .{
                         .slot = 9,

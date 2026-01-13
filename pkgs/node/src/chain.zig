@@ -26,6 +26,7 @@ const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
 
 const NodeNameRegistry = networks.NodeNameRegistry;
+const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -1308,7 +1309,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         // Should pass validation
         try beam_chain.validateAttestation(valid_attestation.message, false);
@@ -1336,7 +1337,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1363,7 +1364,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1390,7 +1391,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1415,7 +1416,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1441,7 +1442,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1467,7 +1468,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1493,7 +1494,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
     }
@@ -1519,7 +1520,7 @@ test "attestation validation - comprehensive" {
                     },
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.message, false));
     }
@@ -1594,7 +1595,7 @@ test "attestation validation - gossip vs block future slot handling" {
                 },
             },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+        .signature = ZERO_SIGBYTES,
     };
 
     // Gossip attestations: should FAIL for next slot (current + 1)
@@ -1623,7 +1624,7 @@ test "attestation validation - gossip vs block future slot handling" {
                 },
             },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+        .signature = ZERO_SIGBYTES,
     };
     // Both should fail for slot 3 when current is slot 1
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));

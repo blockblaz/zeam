@@ -33,6 +33,8 @@ const yaml = @import("yaml");
 const node = @import("node.zig");
 const enr_lib = @import("enr");
 
+const ZERO_HASH = types.ZERO_HASH;
+
 pub const NodeCommand = struct {
     help: bool = false,
     custom_genesis: []const u8,
@@ -288,7 +290,7 @@ fn mainInner() !void {
                 };
 
                 // verify the block
-                state_proving_manager.verify_transition(proof, [_]u8{0} ** 32, [_]u8{0} ** 32, options) catch |err| {
+                state_proving_manager.verify_transition(proof, types.ZERO_HASH, ZERO_HASH, options) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "verify proof", .{ .slot = block.slot });
                     return err;
                 };
