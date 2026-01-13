@@ -7,11 +7,14 @@ const ssz = @import("ssz");
 const utils_lib = @import("@zeam/utils");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const ModuleLogger = utils_lib.ModuleLogger;
+const node_lib = @import("@zeam/node");
+const BeamChain = node_lib.chainFactory.BeamChain;
 
 /// API server that runs in a background thread
 /// Handles metrics, SSE events, health checks, and checkpoint state endpoints
-/// chain_ptr is optional - if null, the finalized state endpoint will return 503
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain_ptr: ?*anyopaque) !void {
+/// chain is optional - if null, the finalized state endpoint will return 503
+/// (API server starts before chain initialization, so chain may not be available yet)
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !void {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
@@ -26,7 +29,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
         .allocator = allocator,
         .port = port,
         .logger = logger,
-        .chain_ptr = chain_ptr,
+        .chain = chain,
     };
 
     // Start server in background thread
@@ -41,7 +44,7 @@ const ApiServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
     logger: ModuleLogger,
-    chain_ptr: ?*anyopaque,
+    chain: ?*BeamChain,
 
     const Self = @This();
 
@@ -139,16 +142,11 @@ const ApiServer = struct {
     /// Handle finalized checkpoint state endpoint
     /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
     fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
-        // Get the chain pointer
-        const chain_ptr = self.chain_ptr orelse {
+        // Get the chain (may be null if API server started before chain initialization)
+        const chain = self.chain orelse {
             _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
             return;
         };
-
-        // Cast the opaque pointer to BeamChain
-        const chainFactory = @import("@zeam/node").chainFactory;
-        const BeamChain = chainFactory.BeamChain;
-        const chain: *BeamChain = @ptrCast(@alignCast(chain_ptr));
 
         // Get finalized state from chain (chain handles its own locking internally)
         const finalized_lean_state = chain.getFinalizedState() orelse {

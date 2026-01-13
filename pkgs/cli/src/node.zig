@@ -135,13 +135,6 @@ pub const Node = struct {
         // Initialize event broadcaster
         try event_broadcaster.initGlobalBroadcaster(allocator);
 
-        if (options.metrics_enable) {
-            try api.init(allocator);
-            // Pass null for chain - it will be initialized later. The checkpoint sync endpoint
-            // will return 503 until the server is started with a chain pointer.
-            try api_server.startAPIServer(allocator, options.metrics_port, options.logger_config, null);
-        }
-
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
             \\{"preset": "mainnet", "name": "devnet0"}
@@ -241,10 +234,11 @@ pub const Node = struct {
             .node_registry = options.node_registry,
         });
 
-        // Note: API server chain pointer should be set when the server is started
-        // In the current architecture, the API server is started before Node initialization,
-        // so the chain pointer cannot be set here. The checkpoint sync endpoint will
-        // return 503 until the server is started with a chain pointer.
+        // Start API server after chain is initialized so we can pass the chain pointer
+        if (options.metrics_enable) {
+            try api.init(allocator);
+            try api_server.startAPIServer(allocator, options.metrics_port, options.logger_config, self.beam_node.chain);
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -606,39 +600,32 @@ fn downloadCheckpointState(
     return cloned_state;
 }
 
-/// Verifies that the state is consistent and matches the finalized checkpoint
-/// The checkpoint root should match the block root of the state's latest_block_header
+/// Verifies and logs checkpoint state information
+/// Computes the state root and block root for the downloaded state
+/// Note: The actual checkpoint verification happens during forkchoice initialization
+/// where the block root is compared against the anchor block root
 fn verifyCheckpointStateRoot(
     allocator: std.mem.Allocator,
     state: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
 ) !void {
-    // Calculate state root
+    // Calculate state root for logging
     var state_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamState, state.*, &state_root, allocator);
 
-    logger.info("verifying checkpoint state: state_root=0x{s}, slot={d}", .{
-        std.fmt.fmtSliceHexLower(&state_root),
-        state.slot,
-    });
-
-    // Verify the state's block header state_root matches the calculated state root
-    if (!std.mem.eql(u8, &state_root, &state.latest_block_header.state_root)) {
-        logger.err("checkpoint state verification failed: calculated state_root does not match block header state_root", .{});
-        return error.InvalidCheckpointState;
-    }
-
     // Calculate the block root from the latest_block_header
-    // This should match the checkpoint root when used in forkchoice initialization
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state.latest_block_header, &block_root, allocator);
 
-    logger.info("checkpoint state verified successfully: block_root=0x{s}", .{
+    logger.info("checkpoint state info: slot={d}, state_root=0x{s}, block_root=0x{s}", .{
+        state.slot,
+        std.fmt.fmtSliceHexLower(&state_root),
         std.fmt.fmtSliceHexLower(&block_root),
     });
 
-    // Note: The checkpoint root will be verified during forkchoice initialization
-    // where it's compared against the anchor block root
+    // Note: latest_block_header.state_root is typically zero bytes due to circular dependency
+    // (state root includes the block header which would contain the state root).
+    // Actual checkpoint verification happens during forkchoice initialization.
 }
 
 /// Parses the nodes from a YAML configuration.
@@ -1220,69 +1207,6 @@ test "populateNodeNameRegistry" {
     try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
     try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
     try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
-}
-
-test "verifyCheckpointStateRoot with genesis state fails" {
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    // Load config.yaml from test fixtures
-    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
-    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
-    defer parsed_config.deinit(allocator);
-
-    // Parse genesis config from YAML
-    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
-    defer allocator.free(genesis_spec.validator_pubkeys);
-
-    // Generate genesis state
-    var genesis_state: types.BeamState = undefined;
-    try genesis_state.genGenesisState(allocator, genesis_spec);
-    defer genesis_state.deinit();
-
-    // Create a mock logger
-    var logger_config = utils_lib.getLoggerConfig(null, null);
-    const logger = logger_config.logger(.node);
-
-    // For genesis states, verification will fail because state_root creates a circular dependency:
-    // state_root is part of the state being hashed, so it can't match the computed hash.
-    // This is expected behavior - genesis states cannot be verified as checkpoint states.
-    // Checkpoint states from APIs will have state_root correctly set through state transitions
-    // where process_slot() handles the state_root update correctly after processing.
-    const verification_result = verifyCheckpointStateRoot(allocator, &genesis_state, logger);
-    try std.testing.expectError(error.InvalidCheckpointState, verification_result);
-}
-
-test "verifyCheckpointStateRoot with invalid state" {
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    // Load config.yaml from test fixtures
-    const config_filepath = "pkgs/cli/test/fixtures/config.yaml";
-    var parsed_config = try utils.loadFromYAMLFile(allocator, config_filepath);
-    defer parsed_config.deinit(allocator);
-
-    // Parse genesis config from YAML
-    const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
-    defer allocator.free(genesis_spec.validator_pubkeys);
-
-    // Generate genesis state
-    var invalid_state: types.BeamState = undefined;
-    try invalid_state.genGenesisState(allocator, genesis_spec);
-    defer invalid_state.deinit();
-
-    // Corrupt the state by modifying the state_root in the block header
-    // This should make verification fail
-    invalid_state.latest_block_header.state_root[0] = 0xFF;
-
-    // Create a mock logger
-    var logger_config = utils_lib.getLoggerConfig(null, null);
-    const logger = logger_config.logger(.node);
-
-    // Verify the state - should fail
-    try std.testing.expectError(error.InvalidCheckpointState, verifyCheckpointStateRoot(allocator, &invalid_state, logger));
 }
 
 test "checkpoint-sync-url parameter is optional" {
