@@ -1114,7 +1114,7 @@ pub const BeamChain = struct {
 
         self.db.loadLatestFinalizedState(state_ptr) catch |err| {
             self.allocator.destroy(state_ptr);
-            self.module_logger.debug("finalized state not available in database: {}", .{err});
+            self.module_logger.warn("finalized state not available in database: {}", .{err});
             return null;
         };
 
