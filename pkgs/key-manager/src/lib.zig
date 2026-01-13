@@ -97,7 +97,7 @@ pub const KeyManager = struct {
 
         const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
+        try ssz.hashTreeRoot(types.AttestationData, attestation.data, &message, allocator);
 
         const epoch: u32 = @intCast(attestation.data.slot);
 

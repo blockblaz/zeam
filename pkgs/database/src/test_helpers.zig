@@ -4,13 +4,15 @@ const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
 pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.SIGBYTES) !types.SignedBlockWithAttestation {
+    const attestations_list = try types.AggregatedAttestations.init(allocator);
+
     var test_block = types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,
         .parent_root = undefined,
         .state_root = undefined,
         .body = types.BeamBlockBody{
-            .attestations = try types.Attestations.init(allocator),
+            .attestations = attestations_list,
         },
     };
     @memset(&test_block.parent_root, parent_root_fill);
@@ -40,13 +42,28 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
         .proposer_attestation = proposer_attestation,
     };
 
-    var block_signatures = try types.BlockSignatures.init(allocator);
-    errdefer block_signatures.deinit();
+    var attestation_signatures = try types.AttestationSignatures.init(allocator);
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) attestation_signatures.deinit();
 
-    // Add all provided signatures to the list
-    for (signatures) |sig| {
-        try block_signatures.append(sig);
+    if (signatures.len > 0) {
+        var validator_signatures = try types.NaiveAggregatedSignature.init(allocator);
+        var validator_signatures_cleanup = true;
+        errdefer if (validator_signatures_cleanup) validator_signatures.deinit();
+
+        for (signatures) |sig| {
+            try validator_signatures.append(sig);
+        }
+
+        try attestation_signatures.append(validator_signatures);
+        validator_signatures_cleanup = false;
     }
+
+    const block_signatures = types.BlockSignatures{
+        .attestation_signatures = attestation_signatures,
+        .proposer_signature = types.ZERO_SIGBYTES,
+    };
+    attestation_signatures_cleanup = false;
 
     const signed_block = types.SignedBlockWithAttestation{
         .message = block_with_attestation,

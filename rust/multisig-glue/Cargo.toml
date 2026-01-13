@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-lean-multisig = { git = "https://github.com/leanEthereum/leanMultisig", rev = "d756c081a87b25ae1786528d62d9f380f7d99890" }
-# xmss is a workspace member of lean-multisig, imported separately to access WotsSignature
-# which is not re-exported at the lean-multisig crate root
-xmss = { git = "https://github.com/leanEthereum/leanMultisig", rev = "d756c081a87b25ae1786528d62d9f380f7d99890" }
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "52e270cf45655a7abe39a05c0b6cdee309f44480" }
+leansig = { git = "https://github.com/leanEthereum/leansig.git" }
+whir-p3 = { git = "https://github.com/TomWambsgans/whir-p3", branch = "lean-vm-simple" }
+p3-koala-bear = { git = "https://github.com/TomWambsgans/Plonky3.git", branch = "lean-vm-simple" }
 
 [lib]
 crate-type = ["staticlib"]

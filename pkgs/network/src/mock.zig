@@ -10,6 +10,8 @@ const NetworkInterface = interface.NetworkInterface;
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
 
+const ZERO_HASH = types.ZERO_HASH;
+
 pub const Mock = struct {
     allocator: Allocator,
     logger: zeam_utils.ModuleLogger,
@@ -656,7 +658,7 @@ test "Mock messaging across two subscribers" {
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
-    var attestations = try types.Attestations.init(allocator);
+    var attestations = try types.AggregatedAttestations.init(allocator);
 
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
@@ -681,7 +683,7 @@ test "Mock messaging across two subscribers" {
                     },
                     .source = .{
                         .slot = 0,
-                        .root = [_]u8{0} ** 32,
+                        .root = ZERO_HASH,
                     },
                     .target = .{
                         .slot = 1,

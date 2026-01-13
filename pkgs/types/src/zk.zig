@@ -12,6 +12,7 @@ const validator = @import("./validator.zig");
 const Allocator = std.mem.Allocator;
 
 const bytesToHex = utils.BytesToHex;
+const ZERO_HASH = utils.ZERO_HASH;
 const json = std.json;
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
@@ -136,7 +137,7 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var attestations = try block.Attestations.init(std.testing.allocator);
+    const attestations = try block.AggregatedAttestations.init(std.testing.allocator);
 
     var test_block = block.SignedBlockWithAttestation{
         .message = .{
@@ -159,7 +160,7 @@ test "ssz seralize/deserialize signed stf prover input" {
                     },
                     .source = .{
                         .slot = 0,
-                        .root = [_]u8{0} ** 32,
+                        .root = ZERO_HASH,
                     },
                     .target = .{
                         .slot = 9,
