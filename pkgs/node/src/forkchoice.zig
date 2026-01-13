@@ -653,7 +653,7 @@ pub const ForkChoice = struct {
                 .latestKnown orelse ProtoAttestation{}).attestation;
 
             if (validator_attestation) |signed_attestation| {
-                if (std.mem.eql(u8, &latest_justified.root, &signed_attestation.message.data.source.root)) {
+                if (std.mem.eql(u8, &latest_justified.root, &signed_attestation.message.source.root)) {
                     try included_attestations.append(signed_attestation);
                 }
             }
@@ -766,11 +766,11 @@ pub const ForkChoice = struct {
 
         // attestation has to be of an ancestor of the current slot
         const attestation = signed_attestation.message;
-        const validator_id = attestation.validator_id;
-        const attestation_slot = attestation.data.slot;
+        const validator_id = signed_attestation.validator_id;
+        const attestation_slot = attestation.slot;
 
         // This get should never fail after validation, but we keep the check for safety
-        const new_head_index = self.protoArray.indices.get(attestation.data.head.root) orelse {
+        const new_head_index = self.protoArray.indices.get(attestation.head.root) orelse {
             // Track whether this is from gossip or block processing
             return ForkChoiceError.InvalidAttestation;
         };
@@ -1340,14 +1340,12 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
 // Helper function to create a SignedAttestation for testing
 fn createTestSignedAttestation(validator_id: usize, head_root: types.Root, slot: types.Slot) types.SignedAttestation {
     return types.SignedAttestation{
+        .validator_id = @intCast(validator_id),
         .message = .{
-            .validator_id = validator_id,
-            .data = .{
-                .slot = slot,
-                .head = .{ .root = head_root, .slot = slot },
-                .target = .{ .root = head_root, .slot = slot },
-                .source = .{ .root = createTestRoot(0xAA), .slot = 0 },
-            },
+            .slot = slot,
+            .head = .{ .root = head_root, .slot = slot },
+            .target = .{ .root = head_root, .slot = slot },
+            .source = .{ .root = createTestRoot(0xAA), .slot = 0 },
         },
         .signature = [_]u8{0} ** types.SIGSIZE,
     };
