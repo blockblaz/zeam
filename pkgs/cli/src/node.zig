@@ -603,7 +603,7 @@ fn downloadCheckpointState(
 /// Verifies checkpoint state against the genesis configuration
 /// Validates that the downloaded state is consistent with expected genesis parameters
 /// Also computes and logs the state root and block root
-fn verifyCheckpointStateRoot(
+fn verifyCheckpointState(
     allocator: std.mem.Allocator,
     state: *const types.BeamState,
     genesis_spec: *const types.GenesisSpec,
