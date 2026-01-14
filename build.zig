@@ -28,6 +28,12 @@ fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compil
     setTestRunLabel(b, run_step, source_name);
 }
 
+fn fileExists(path: []const u8) bool {
+    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
@@ -616,6 +622,13 @@ pub fn build(b: *Builder) !void {
     const run_spectests_after_generate = b.addRunArtifact(spectests);
     run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
     const run_spectests = b.addRunArtifact(spectests);
+
+    if (!fileExists("pkgs/spectest/src/generated/index.zig")) {
+        // `spectest:run` expects generated tests to exist already, but a fresh checkout has
+        // none. Generate a stub index (or real tests if fixtures exist) to keep the command
+        // usable without requiring a separate `spectest:generate` invocation first.
+        spectests.step.dependOn(&run_spectest_generate.step);
+    }
 
     const spectests_step = b.step("spectest", "Regenerate and run spec tests");
     spectests_step.dependOn(&run_spectests_after_generate.step);
