@@ -38,3 +38,38 @@ pub fn LazyJson(comptime T: type) type {
         }
     };
 }
+
+test "LazyJson formats JSON and frees allocation" {
+    const allocator = std.testing.allocator;
+
+    const OkJson = struct {
+        pub fn toJsonString(self: *const @This(), alloc: Allocator) ![]const u8 {
+            _ = self;
+            return try alloc.dupe(u8, "{\"ok\":true}");
+        }
+    };
+
+    const value: OkJson = .{};
+    const out = try std.fmt.allocPrint(allocator, "{}", .{LazyJson(OkJson).init(allocator, &value)});
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("{\"ok\":true}", out);
+}
+
+test "LazyJson formats error on toJsonString failure" {
+    const allocator = std.testing.allocator;
+
+    const FailJson = struct {
+        pub fn toJsonString(self: *const @This(), alloc: Allocator) ![]const u8 {
+            _ = self;
+            _ = alloc;
+            return error.Failed;
+        }
+    };
+
+    const value: FailJson = .{};
+    const out = try std.fmt.allocPrint(allocator, "{}", .{LazyJson(FailJson).init(allocator, &value)});
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "<json error:"));
+}

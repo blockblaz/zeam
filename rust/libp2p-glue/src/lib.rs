@@ -1020,10 +1020,10 @@ impl Network {
                                 }
                             };
 
-                            let cause_desc = match &cause {
-                                Some(err) => format!("{err:?}"),
-                                None => "None".to_string(),
-                            };
+                                let cause_desc = match &cause {
+                                    Some(err) => format!("{err:?}"),
+                                    None => "None".to_string(),
+                                };
                                 logger::rustLogger.info(
                                     self.network_id,
                                     &format!(
