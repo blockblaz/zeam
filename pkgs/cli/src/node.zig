@@ -190,7 +190,7 @@ pub const Node = struct {
                 self.anchor_state.* = downloaded_state;
 
                 // Verify state against genesis config
-                if (verifyCheckpointStateRoot(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
+                if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
                     self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
                     checkpoint_sync_succeeded = true;
                 } else |verify_err| {
