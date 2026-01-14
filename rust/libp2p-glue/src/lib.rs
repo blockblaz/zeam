@@ -850,13 +850,24 @@ impl Network {
                 let mut queue = RECONNECT_QUEUE.lock().unwrap();
                 std::pin::Pin::new(&mut *queue).poll_next(cx)
             }) => {
-                match reconnect_result {
-                    Ok(((network_id, peer_id), (addr, attempt))) => {
-                        if network_id == self.network_id {
-                            logger::rustLogger.info(
-                                self.network_id,
-                                &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
-                            );
+                    match reconnect_result {
+                        Ok(((network_id, peer_id), (addr, attempt))) => {
+                            if network_id == self.network_id {
+                                if swarm.is_connected(&peer_id) {
+                                    logger::rustLogger.debug(
+                                        self.network_id,
+                                        &format!(
+                                            "Skipping reconnection attempt to peer {} because it is already connected",
+                                            peer_id
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                logger::rustLogger.info(
+                                    self.network_id,
+                                    &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
+                                );
 
                             RECONNECT_ATTEMPTS
                                 .lock()
@@ -941,6 +952,15 @@ impl Network {
                             // Determine direction from endpoint: Dialer=outbound, Listener=inbound
                             let direction: u32 = if endpoint.is_dialer() { 1 } else { 0 };
 
+                            // If this was an outbound connection, remember the address we successfully dialed.
+                            // This enables reconnection even when the initial connect multiaddr did not include
+                            // a `/p2p/<peer_id>` component (in which case we couldn't pre-populate `peer_addr_map`).
+                            if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                self.peer_addr_map
+                                    .entry(peer_id)
+                                    .or_insert_with(|| address.clone());
+                            }
+
                             logger::rustLogger.info(
                                 self.network_id,
                                 &format!("Connection established with peer: {} direction={}",
@@ -970,13 +990,13 @@ impl Network {
                                 handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr(), direction)
                             };
                         }
-                        SwarmEvent::ConnectionClosed {
-                            peer_id,
-                            connection_id,
-                            cause,
-                            ..
-                        } => {
-                            let peer_id_string = peer_id.to_string();
+                            SwarmEvent::ConnectionClosed {
+                                peer_id,
+                                connection_id,
+                                cause,
+                                ..
+                            } => {
+                                let peer_id_string = peer_id.to_string();
 
                             // Retrieve and remove stored direction
                             let direction = CONNECTION_DIRECTIONS
@@ -990,7 +1010,7 @@ impl Network {
                                 None => 1, // remote_close (graceful close, no error)
                                 Some(err) => {
                                     let err_str = format!("{:?}", err);
-                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("KeepAlive") {
+                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("TimedOut") || err_str.contains("KeepAlive") {
                                         0 // timeout
                                     } else if err_str.contains("Reset") || err_str.contains("ConnectionReset") {
                                         1 // remote_close
@@ -1000,45 +1020,59 @@ impl Network {
                                 }
                             };
 
-                            let cause_desc = match &cause {
-                                Some(err) => format!("{err:?}"),
-                                None => "None".to_string(),
-                            };
-                            logger::rustLogger.info(
-                                self.network_id,
-                                &format!(
-                                    "Connection closed: peer={} connection_id={:?} direction={} reason={} cause={}",
-                                    peer_id_string, connection_id, direction, reason, cause_desc
-                                ),
-                            );
+                                let cause_desc = match &cause {
+                                    Some(err) => format!("{err:?}"),
+                                    None => "None".to_string(),
+                                };
+                                logger::rustLogger.info(
+                                    self.network_id,
+                                    &format!(
+                                        "Connection closed: peer={} connection_id={:?} direction={} reason={} cause={}",
+                                        peer_id_string, connection_id, direction, reason, cause_desc
+                                    ),
+                                );
 
-                            let peer_id_cstr = match CString::new(peer_id_string.as_str()) {
-                                Ok(cstr) => cstr,
-                                Err(_) => {
-                                    logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
+                                // Drop any pending response channels tied to this connection.
+                                // We can't finish streams here (the connection is already gone), but we must
+                                // remove them from the map to avoid leaking entries until idle TTL.
+                                RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
+                                    !(pending.peer_id == peer_id && pending.connection_id == connection_id)
+                                });
+
+                                // `ConnectionClosed` is emitted per connection. If the peer still has other
+                                // established connections, avoid emitting a peer-disconnected event to Zig
+                                // and avoid scheduling reconnection.
+                                if swarm.is_connected(&peer_id) {
+                                    logger::rustLogger.debug(
+                                        self.network_id,
+                                        &format!(
+                                            "Peer {} still has an established connection; skipping disconnect notification/reconnect",
+                                            peer_id_string
+                                        ),
+                                    );
                                     continue;
                                 }
-                            };
-                            unsafe {
-                                handlePeerDisconnectedFromRustBridge(
-                                    self.zig_handler,
-                                    peer_id_cstr.as_ptr(),
-                                    direction,
-                                    reason,
-                                )
-                            };
 
-                            // Drop any pending response channels tied to this connection.
-                            // We can't finish streams here (the connection is already gone), but we must
-                            // remove them from the map to avoid leaking entries until idle TTL.
-                            RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
-                                !(pending.peer_id == peer_id && pending.connection_id == connection_id)
-                            });
+                                let peer_id_cstr = match CString::new(peer_id_string.as_str()) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
+                                        continue;
+                                    }
+                                };
+                                unsafe {
+                                    handlePeerDisconnectedFromRustBridge(
+                                        self.zig_handler,
+                                        peer_id_cstr.as_ptr(),
+                                        direction,
+                                        reason,
+                                    )
+                                };
 
-                            if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
-                                self.schedule_reconnection(peer_id, peer_addr, 1);
+                                if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
+                                    self.schedule_reconnection(peer_id, peer_addr, 1);
+                                }
                             }
-                        }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
 
