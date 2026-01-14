@@ -95,7 +95,7 @@ const ZeamArgs = struct {
         beam: struct {
             help: bool = false,
             mockNetwork: bool = false,
-            apiPort: u16 = constants.DEFAULT_API_PORT,
+            @"api-port": u16 = constants.DEFAULT_API_PORT,
             data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
         },
         prove: struct {
@@ -178,7 +178,7 @@ const ZeamArgs = struct {
         try writer.writeAll(", command=");
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
-            .beam => |cmd| try writer.print("beam(mockNetwork={}, apiPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.apiPort, cmd.data_dir }),
+            .beam => |cmd| try writer.print("beam(mockNetwork={}, api-port={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.@"api-port", cmd.data_dir }),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
@@ -310,8 +310,8 @@ fn mainInner() !void {
 
             // Start metrics HTTP server
             // Pass null for chain - in .beam command mode, chains are created later and the checkpoint sync endpoint won't be available
-            api_server.startAPIServer(allocator, beamcmd.apiPort, &api_logger_config, null) catch |err| {
-                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.apiPort });
+            api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
                 return err;
             };
 

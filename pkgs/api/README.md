@@ -145,10 +145,10 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 ./zig-out/bin/zeam beam
 
 # Custom port
-./zig-out/bin/zeam beam --apiPort 8080
+./zig-out/bin/zeam beam --api-port 8080
 
 # Mock network for testing
-./zig-out/bin/zeam beam --mockNetwork --apiPort 8080
+./zig-out/bin/zeam beam --mockNetwork --api-port 8080
 ```
 
 ### Generate Prometheus Config
@@ -166,7 +166,7 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 Start a node:
 
 ```sh
-./zig-out/bin/zeam beam --mockNetwork --apiPort 9668
+./zig-out/bin/zeam beam --mockNetwork --api-port 9668
 ```
 
 Test endpoints:
