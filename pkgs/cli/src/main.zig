@@ -51,7 +51,7 @@ pub const NodeCommand = struct {
     //   and one must use all the nodes in genesis nodes.yaml as peers
     validator_config: []const u8,
     metrics_enable: bool = false,
-    metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
+    @"api-port": u16 = constants.DEFAULT_API_PORT,
     override_genesis_time: ?u64,
     @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
@@ -68,7 +68,7 @@ pub const NodeCommand = struct {
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
         .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
-        .metrics_port = "Port to use for publishing metrics",
+        .@"api-port" = "Port for the API server (metrics, health, events, checkpoint state)",
         .metrics_enable = "Enable metrics endpoint",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
@@ -95,7 +95,7 @@ const ZeamArgs = struct {
         beam: struct {
             help: bool = false,
             mockNetwork: bool = false,
-            metricsPort: u16 = constants.DEFAULT_METRICS_PORT,
+            apiPort: u16 = constants.DEFAULT_API_PORT,
             data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
         },
         prove: struct {
@@ -117,17 +117,17 @@ const ZeamArgs = struct {
 
             __commands__: union(enum) {
                 genconfig: struct {
-                    metrics_port: u16 = constants.DEFAULT_METRICS_PORT,
+                    @"api-port": u16 = constants.DEFAULT_API_PORT,
                     filename: []const u8 = "prometheus.yml",
                     help: bool = false,
 
                     pub const __shorts__ = .{
-                        .metrics_port = .p,
+                        .@"api-port" = .p,
                         .filename = .f,
                     };
 
                     pub const __messages__ = .{
-                        .metrics_port = "Port to use for publishing metrics",
+                        .@"api-port" = "Port for the API server to scrape metrics from",
                         .filename = "output name for the config file",
                     };
                 },
@@ -178,12 +178,12 @@ const ZeamArgs = struct {
         try writer.writeAll(", command=");
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
-            .beam => |cmd| try writer.print("beam(mockNetwork={}, metricsPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.metricsPort, cmd.data_dir }),
+            .beam => |cmd| try writer.print("beam(mockNetwork={}, apiPort={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.apiPort, cmd.data_dir }),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
-                .genconfig => |genconfig| try writer.print("prometheus.genconfig(metrics_port={d}, filename=\"{s}\")", .{ genconfig.metrics_port, genconfig.filename }),
+                .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
             },
-            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", metrics_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.metrics_port }),
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", api_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.@"api-port" }),
         }
         try writer.writeAll(")");
     }
@@ -310,8 +310,8 @@ fn mainInner() !void {
 
             // Start metrics HTTP server
             // Pass null for chain - in .beam command mode, chains are created later and the checkpoint sync endpoint won't be available
-            api_server.startAPIServer(allocator, beamcmd.metricsPort, &api_logger_config, null) catch |err| {
-                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.metricsPort });
+            api_server.startAPIServer(allocator, beamcmd.apiPort, &api_logger_config, null) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.apiPort });
                 return err;
             };
 
@@ -515,7 +515,7 @@ fn mainInner() !void {
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
-                const generated_config = generatePrometheusConfig(allocator, genconfig.metrics_port) catch |err| {
+                const generated_config = generatePrometheusConfig(allocator, genconfig.@"api-port") catch |err| {
                     ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
                     return err;
                 };
@@ -550,7 +550,7 @@ fn mainInner() !void {
                 .validator_config = leancmd.validator_config,
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
-                .metrics_port = leancmd.metrics_port,
+                .api_port = leancmd.@"api-port",
                 .bootnodes = undefined,
                 .genesis_spec = undefined,
                 .validator_assignments = undefined,

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Default port for metrics server
-pub const DEFAULT_METRICS_PORT: u16 = 9667;
+pub const DEFAULT_API_PORT: u16 = 9667;
 
 /// Default server IP address for local connections
 pub const DEFAULT_SERVER_IP: []const u8 = "127.0.0.1";
