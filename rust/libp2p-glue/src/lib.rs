@@ -990,13 +990,13 @@ impl Network {
                                 handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr(), direction)
                             };
                         }
-                        SwarmEvent::ConnectionClosed {
-                            peer_id,
-                            connection_id,
-                            cause,
-                            ..
+                            SwarmEvent::ConnectionClosed {
+                                peer_id,
+                                connection_id,
+                                cause,
+                                ..
                             } => {
-                            let peer_id_string = peer_id.to_string();
+                                let peer_id_string = peer_id.to_string();
 
                             // Retrieve and remove stored direction
                             let direction = CONNECTION_DIRECTIONS
