@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "52e270cf45655a7abe39a05c0b6cdee309f44480" }
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "4543620b8e33c16112dcf1fff7f250344913a729" }
 leansig = { git = "https://github.com/leanEthereum/leansig.git" }
 whir-p3 = { git = "https://github.com/TomWambsgans/whir-p3", branch = "lean-vm-simple" }
 p3-koala-bear = { git = "https://github.com/TomWambsgans/Plonky3.git", branch = "lean-vm-simple" }
+ssz = { package = "ethereum_ssz", version = "0.10" }
 
 [lib]
 crate-type = ["staticlib"]

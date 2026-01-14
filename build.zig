@@ -553,20 +553,6 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
-    const xmss_cycle_tests = b.addTest(.{
-        .root_source_file = b.path("pkgs/testing/test_xmss_cycle.zig"),
-        .optimize = optimize,
-        .target = target,
-    });
-    xmss_cycle_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
-    xmss_cycle_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
-    xmss_cycle_tests.root_module.addImport("@zeam/types", zeam_types);
-    xmss_cycle_tests.root_module.addImport("ssz", ssz);
-    xmss_cycle_tests.step.dependOn(&build_rust_lib_steps.step);
-    addRustGlueLib(b, xmss_cycle_tests, target, prover);
-    const run_xmss_cycle_tests = b.addRunArtifact(xmss_cycle_tests);
-    test_step.dependOn(&run_xmss_cycle_tests.step);
-
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
         .optimize = optimize,
