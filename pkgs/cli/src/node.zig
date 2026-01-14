@@ -609,6 +609,15 @@ fn verifyCheckpointStateRoot(
     genesis_spec: *const types.GenesisSpec,
     logger: zeam_utils.ModuleLogger,
 ) !void {
+    // Verify genesis timestamp matches
+    if (state.config.genesis_time != genesis_spec.genesis_time) {
+        logger.err("checkpoint state verification failed: genesis time mismatch (expected={d}, got={d})", .{
+            genesis_spec.genesis_time,
+            state.config.genesis_time,
+        });
+        return error.GenesisTimeMismatch;
+    }
+
     // Verify number of validators matches genesis config
     const expected_validators = genesis_spec.numValidators();
     const actual_validators = state.validators.len();
@@ -626,6 +635,16 @@ fn verifyCheckpointStateRoot(
         return error.NoValidators;
     }
 
+    // Verify each validator pubkey matches genesis config
+    const state_validators = state.validators.constSlice();
+    for (genesis_spec.validator_pubkeys, 0..) |expected_pubkey, i| {
+        const actual_pubkey = state_validators[i].pubkey;
+        if (!std.mem.eql(u8, &expected_pubkey, &actual_pubkey)) {
+            logger.err("checkpoint state verification failed: validator pubkey mismatch at index {d}", .{i});
+            return error.ValidatorPubkeyMismatch;
+        }
+    }
+
     // Generate state block header with correct state_root
     // (latest_block_header.state_root is zero; genStateBlockHeader computes and sets it)
     const state_block_header = try state.genStateBlockHeader(allocator);
@@ -634,8 +653,9 @@ fn verifyCheckpointStateRoot(
     var block_root: types.Root = undefined;
     try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
 
-    logger.info("checkpoint state verified: slot={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
+    logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
         state.slot,
+        state.config.genesis_time,
         actual_validators,
         std.fmt.fmtSliceHexLower(&state_block_header.state_root),
         std.fmt.fmtSliceHexLower(&block_root),
