@@ -335,31 +335,10 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             );
         },
         .attestation => |signed_attestation| {
-            const msg = signed_attestation.message;
-            // The attestation message layout can vary (e.g. some types wrap the slot inside a nested `data`
-            // field, while others expose `slot` directly). We use `@hasField/@field` here so logging doesn't
-            // force a single unified struct and still compiles across build targets.
-            const MsgType = @TypeOf(msg);
-
-            var slot: u64 = 0;
-            if (@hasField(MsgType, "data")) {
-                const data = @field(msg, "data");
-                if (@hasField(@TypeOf(data), "slot")) {
-                    slot = @as(u64, @intCast(@field(data, "slot")));
-                }
-            } else if (@hasField(MsgType, "slot")) {
-                slot = @as(u64, @intCast(@field(msg, "slot")));
-            }
-
-            const SignedType = @TypeOf(signed_attestation);
-            var validator_id: ?u64 = null;
-            if (@hasField(MsgType, "validator_id")) {
-                validator_id = @as(u64, @intCast(@field(msg, "validator_id")));
-            } else if (@hasField(SignedType, "validator_id")) {
-                validator_id = @as(u64, @intCast(@field(signed_attestation, "validator_id")));
-            }
+            const slot = signed_attestation.message.slot;
+            const validator_id = signed_attestation.validator_id;
             zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation slot={d} validator={any} (compressed={d}B, raw={d}B) from peer={s}{}",
+                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
                 .{
                     zigHandler.params.networkId,
                     slot,
