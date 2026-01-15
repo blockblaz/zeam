@@ -759,7 +759,7 @@ fn parseSignature(
     };
 
     // Re-serialize just the signature object and let Rust parse/SSZ-encode it.
-    var json_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    var json_buf = std.ArrayList(u8).init(ctx.allocator);
     defer json_buf.deinit();
 
     std.json.stringify(sig_value, .{}, json_buf.writer()) catch |err| {
