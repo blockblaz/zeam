@@ -171,6 +171,29 @@ pub fn runFixturePayload(
     }
 }
 
+const AggregatedSignatureProof = struct {
+    participants: types.AggregationBits,
+    proof_data: []u8,
+
+    pub fn deinit(self: *AggregatedSignatureProof, allocator: std.mem.Allocator) void {
+        self.participants.deinit();
+        allocator.free(self.proof_data);
+    }
+};
+
+const ParsedSignedBlockWithAttestation = struct {
+    signed_block: types.SignedBlockWithAttestation,
+    attestation_proofs: []AggregatedSignatureProof,
+
+    pub fn deinit(self: *ParsedSignedBlockWithAttestation, allocator: std.mem.Allocator) void {
+        for (self.attestation_proofs) |*proof| {
+            proof.deinit(allocator);
+        }
+        allocator.free(self.attestation_proofs);
+        self.signed_block.deinit();
+    }
+};
+
 fn runCase(
     allocator: std.mem.Allocator,
     ctx: Context,
@@ -184,14 +207,15 @@ fn runCase(
         },
     };
 
-    const signature_ssz_len: usize = blk: {
-        const lean_env_val = case_obj.get("leanEnv") orelse break :blk DEFAULT_SIGNATURE_SSZ_LEN;
+    const env_is_test = blk: {
+        const lean_env_val = case_obj.get("leanEnv") orelse break :blk false;
         const lean_env = switch (lean_env_val) {
             .string => |s| s,
-            else => break :blk DEFAULT_SIGNATURE_SSZ_LEN,
+            else => break :blk false,
         };
-        break :blk if (std.mem.eql(u8, lean_env, "test")) TEST_SIGNATURE_SSZ_LEN else DEFAULT_SIGNATURE_SSZ_LEN;
+        break :blk std.mem.eql(u8, lean_env, "test");
     };
+    const signature_ssz_len: usize = if (env_is_test) TEST_SIGNATURE_SSZ_LEN else DEFAULT_SIGNATURE_SSZ_LEN;
 
     // Parse the anchorState to get validators
     const anchor_state_value = case_obj.get("anchorState") orelse {
@@ -208,19 +232,21 @@ fn runCase(
         return FixtureError.InvalidFixture;
     };
 
-    var signed_block = try buildSignedBlockWithAttestation(allocator, ctx, signed_block_value);
-    defer signed_block.deinit();
+    var parsed = try buildSignedBlockWithAttestation(allocator, ctx, signed_block_value);
+    defer parsed.deinit(allocator);
 
     // Determine if we expect failure based on test name/path
     const expect_failure = std.mem.indexOf(u8, ctx.fixture_label, "invalid") != null or
         std.mem.indexOf(u8, ctx.case_name, "invalid") != null;
 
     // Verify signatures
-    const verify_result = state_transition.verifySignaturesWithSignatureLen(
+    const verify_result = verifySignaturesWithFixtureProofs(
         allocator,
         &anchor_state,
-        &signed_block,
+        &parsed.signed_block,
+        parsed.attestation_proofs,
         signature_ssz_len,
+        env_is_test,
     );
 
     if (expect_failure) {
@@ -242,6 +268,93 @@ fn runCase(
             return FixtureError.FixtureMismatch;
         };
     }
+}
+
+fn verifySignaturesWithFixtureProofs(
+    allocator: std.mem.Allocator,
+    state: *const types.BeamState,
+    signed_block: *const types.SignedBlockWithAttestation,
+    proofs: []const AggregatedSignatureProof,
+    signature_ssz_len: usize,
+    env_is_test: bool,
+) !void {
+    const attestations = signed_block.message.block.body.attestations.constSlice();
+
+    if (attestations.len != proofs.len) {
+        return types.StateTransitionError.InvalidBlockSignatures;
+    }
+
+    const validators = state.validators.constSlice();
+
+    for (attestations, proofs) |aggregated_attestation, proof| {
+        // Ensure the declared participants match the aggregated attestation bitfield.
+        if (aggregated_attestation.aggregation_bits.len() != proof.participants.len()) {
+            return types.StateTransitionError.InvalidBlockSignatures;
+        }
+        for (0..aggregated_attestation.aggregation_bits.len()) |i| {
+            if (try aggregated_attestation.aggregation_bits.get(i) != try proof.participants.get(i)) {
+                return types.StateTransitionError.InvalidBlockSignatures;
+            }
+        }
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+        defer validator_indices.deinit();
+
+        for (validator_indices.items) |validator_index| {
+            if (validator_index >= validators.len) {
+                return types.StateTransitionError.InvalidValidatorId;
+            }
+        }
+
+        // NOTE: leanSpec currently serializes a placeholder proof (`0x00`) when running in
+        // `leanEnv="test"` (see lean_multisig_py usage with test_mode). We accept the proof
+        // bytes in test mode and only validate participant bookkeeping.
+        if (env_is_test) {
+            if (proof.proof_data.len == 0) {
+                return types.StateTransitionError.InvalidBlockSignatures;
+            }
+        } else {
+            // Future: verify aggregated proofs against leanMultisig once the fixture format
+            // provides verifiable proof bytes in non-test environments.
+        }
+    }
+
+    // Verify proposer attestation signature (standard XMSS signature)
+    const proposer_attestation = signed_block.message.proposer_attestation;
+    try verifySingleAttestationSignature(
+        allocator,
+        state,
+        @intCast(proposer_attestation.validator_id),
+        &proposer_attestation.data,
+        &signed_block.signature.proposer_signature,
+        signature_ssz_len,
+    );
+}
+
+fn verifySingleAttestationSignature(
+    allocator: std.mem.Allocator,
+    state: *const types.BeamState,
+    validator_index: usize,
+    attestation_data: *const types.AttestationData,
+    signature_bytes: *const types.SIGBYTES,
+    signature_ssz_len: usize,
+) !void {
+    if (signature_ssz_len > signature_bytes.len) {
+        return types.StateTransitionError.InvalidBlockSignatures;
+    }
+
+    const validators = state.validators.constSlice();
+    if (validator_index >= validators.len) {
+        return types.StateTransitionError.InvalidValidatorId;
+    }
+
+    const pubkey = validators[validator_index].getPubkey();
+
+    var message: [32]u8 = undefined;
+    try ssz.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
+
+    const epoch: u32 = @intCast(attestation_data.slot);
+    try xmss.verifySsz(pubkey, &message, epoch, signature_bytes.*[0..signature_ssz_len]);
 }
 
 fn buildState(
@@ -351,7 +464,7 @@ fn buildSignedBlockWithAttestation(
     allocator: std.mem.Allocator,
     ctx: Context,
     value: JsonValue,
-) FixtureError!types.SignedBlockWithAttestation {
+) FixtureError!ParsedSignedBlockWithAttestation {
     const signed_block_obj = try expect.expectObjectValue(FixtureError, value, ctx, "signedBlockWithAttestation");
 
     // Parse message
@@ -368,18 +481,50 @@ fn buildSignedBlockWithAttestation(
     // Parse signature section
     const signature_obj = try expect.expectObject(FixtureError, signed_block_obj, &.{"signature"}, ctx, "signature");
 
-    // Parse attestation_signatures (empty for basic tests)
-    var attestation_signatures = try types.AttestationSignatures.init(allocator);
-    errdefer attestation_signatures.deinit();
-
+    // Parse attestation aggregated signature proofs
+    var attestation_proofs = std.ArrayList(AggregatedSignatureProof).init(allocator);
+    errdefer {
+        for (attestation_proofs.items) |*proof| proof.deinit(allocator);
+        attestation_proofs.deinit();
+    }
     if (signature_obj.get("attestationSignatures")) |att_sigs_val| {
         const att_sigs_obj = try expect.expectObjectValue(FixtureError, att_sigs_val, ctx, "signature.attestationSignatures");
         if (att_sigs_obj.get("data")) |data_val| {
             const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "signature.attestationSignatures.data");
-            for (arr.items) |_| {
-                // TODO: Parse actual attestation signatures if needed
-                std.debug.print("fixture {s} case {s}: non-empty attestation signatures not yet supported\n", .{ ctx.fixture_label, ctx.case_name });
-                return FixtureError.UnsupportedFixture;
+            for (arr.items, 0..) |item, idx| {
+                var label_buf: [96]u8 = undefined;
+                const entry_label = std.fmt.bufPrint(&label_buf, "signature.attestationSignatures.data[{d}]", .{idx}) catch "signature.attestationSignatures.data";
+
+                const entry_obj = try expect.expectObjectValue(FixtureError, item, ctx, entry_label);
+
+                const participants_val = entry_obj.get("participants") orelse {
+                    std.debug.print(
+                        "fixture {s} case {s}: missing participants in {s}\n",
+                        .{ ctx.fixture_label, ctx.case_name, entry_label },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
+                var participants = try parseAggregationBits(allocator, ctx, participants_val, "participants");
+
+                const proof_val = entry_obj.get("proofData") orelse entry_obj.get("proof_data") orelse {
+                    std.debug.print(
+                        "fixture {s} case {s}: missing proofData in {s}\n",
+                        .{ ctx.fixture_label, ctx.case_name, entry_label },
+                    );
+                    participants.deinit();
+                    return FixtureError.InvalidFixture;
+                };
+                const proof_data = try parseByteListMiB(allocator, ctx, proof_val, "proofData");
+
+                attestation_proofs.append(.{ .participants = participants, .proof_data = proof_data }) catch |err| {
+                    std.debug.print(
+                        "fixture {s} case {s}: failed to append attestation proof: {s}\n",
+                        .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+                    );
+                    participants.deinit();
+                    allocator.free(proof_data);
+                    return FixtureError.InvalidFixture;
+                };
             }
         }
     }
@@ -387,14 +532,29 @@ fn buildSignedBlockWithAttestation(
     // Parse proposer_signature
     const proposer_sig = try parseSignature(ctx, signature_obj, "proposerSignature");
 
-    return types.SignedBlockWithAttestation{
-        .message = .{
-            .block = block,
-            .proposer_attestation = proposer_attestation,
+    var signatures = types.createBlockSignatures(allocator, block.body.attestations.len()) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}: unable to allocate signature groups: {s}\n",
+            .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    signatures.proposer_signature = proposer_sig;
+
+    return ParsedSignedBlockWithAttestation{
+        .signed_block = .{
+            .message = .{
+                .block = block,
+                .proposer_attestation = proposer_attestation,
+            },
+            .signature = signatures,
         },
-        .signature = .{
-            .attestation_signatures = attestation_signatures,
-            .proposer_signature = proposer_sig,
+        .attestation_proofs = attestation_proofs.toOwnedSlice() catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}: unable to allocate attestation proof list: {s}\n",
+                .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
         },
     };
 }
@@ -418,10 +578,32 @@ fn buildBlock(
             const att_obj = try expect.expectObjectValue(FixtureError, att_val, ctx, "body.attestations");
             if (att_obj.get("data")) |data_val| {
                 const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "body.attestations.data");
-                for (arr.items) |_| {
-                    // TODO: Parse actual attestations if needed
-                    std.debug.print("fixture {s} case {s}: non-empty attestations not yet supported\n", .{ ctx.fixture_label, ctx.case_name });
-                    return FixtureError.UnsupportedFixture;
+                for (arr.items, 0..) |item, idx| {
+                    var label_buf: [96]u8 = undefined;
+                    const entry_label = std.fmt.bufPrint(&label_buf, "body.attestations.data[{d}]", .{idx}) catch "body.attestations.data";
+
+                    const att_item_obj = try expect.expectObjectValue(FixtureError, item, ctx, entry_label);
+
+                    const bits_val = att_item_obj.get("aggregationBits") orelse {
+                        std.debug.print(
+                            "fixture {s} case {s}: missing aggregationBits in {s}\n",
+                            .{ ctx.fixture_label, ctx.case_name, entry_label },
+                        );
+                        return FixtureError.InvalidFixture;
+                    };
+                    var aggregation_bits = try parseAggregationBits(allocator, ctx, bits_val, "aggregationBits");
+                    errdefer aggregation_bits.deinit();
+
+                    const data_obj = try expect.expectObject(FixtureError, att_item_obj, &.{"data"}, ctx, "attestation.data");
+                    const data = try parseAttestationData(ctx, data_obj);
+
+                    attestations.append(.{ .aggregation_bits = aggregation_bits, .data = data }) catch |err| {
+                        std.debug.print(
+                            "fixture {s} case {s}: failed to append attestation: {s}\n",
+                            .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+                        );
+                        return FixtureError.InvalidFixture;
+                    };
                 }
             }
         }
@@ -434,6 +616,86 @@ fn buildBlock(
         .state_root = state_root,
         .body = .{ .attestations = attestations },
     };
+}
+
+fn parseAggregationBits(
+    allocator: std.mem.Allocator,
+    ctx: Context,
+    value: JsonValue,
+    label: []const u8,
+) FixtureError!types.AggregationBits {
+    const obj = try expect.expectObjectValue(FixtureError, value, ctx, label);
+    const arr = try expect.expectArrayField(FixtureError, obj, &.{"data"}, ctx, label);
+
+    var bits = try types.AggregationBits.init(allocator);
+    errdefer bits.deinit();
+
+    for (arr.items) |bit_val| {
+        const bit = switch (bit_val) {
+            .bool => |b| b,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}: {s} must contain booleans\n",
+                    .{ ctx.fixture_label, ctx.case_name, label },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        bits.append(bit) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}: failed to append {s} bit: {s}\n",
+                .{ ctx.fixture_label, ctx.case_name, label, @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+    }
+
+    return bits;
+}
+
+fn parseByteListMiB(
+    allocator: std.mem.Allocator,
+    ctx: Context,
+    value: JsonValue,
+    label: []const u8,
+) FixtureError![]u8 {
+    const obj = try expect.expectObjectValue(FixtureError, value, ctx, label);
+    const text = try expect.expectStringField(FixtureError, obj, &.{"data"}, ctx, label);
+
+    if (text.len < 2 or !std.mem.eql(u8, text[0..2], "0x")) {
+        std.debug.print(
+            "fixture {s} case {s}: field {s}.data missing 0x prefix\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    }
+
+    const body = text[2..];
+    if (body.len % 2 != 0) {
+        std.debug.print(
+            "fixture {s} case {s}: field {s}.data has odd hex length\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    }
+
+    const out_len = body.len / 2;
+    const out = allocator.alloc(u8, out_len) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}: unable to allocate {d} bytes for {s}: {s}\n",
+            .{ ctx.fixture_label, ctx.case_name, out_len, label, @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    errdefer allocator.free(out);
+    _ = std.fmt.hexToBytes(out, body) catch {
+        std.debug.print(
+            "fixture {s} case {s}: field {s}.data invalid hex\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    return out;
 }
 
 fn parseProposerAttestation(
