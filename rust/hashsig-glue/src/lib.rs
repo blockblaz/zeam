@@ -2,12 +2,12 @@ use leansig::{signature::SignatureScheme, MESSAGE_LENGTH};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
-use serde_json::Value;
 
 const PROD_SIGNATURE_SSZ_LEN: usize = 3112;
 const TEST_SIGNATURE_SSZ_LEN: usize = 424;
@@ -549,10 +549,16 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
         }
 
         let attempt: Result<bool, ()> = match signature_len {
-            TEST_SIGNATURE_SSZ_LEN => verify_with_scheme::<HashSigSchemeTest>(pk_data, sig_data, epoch, message_array),
-            PROD_SIGNATURE_SSZ_LEN => verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array),
+            TEST_SIGNATURE_SSZ_LEN => {
+                verify_with_scheme::<HashSigSchemeTest>(pk_data, sig_data, epoch, message_array)
+            }
+            PROD_SIGNATURE_SSZ_LEN => {
+                verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array)
+            }
             _ => verify_with_scheme::<HashSigSchemeTest>(pk_data, sig_data, epoch, message_array)
-                .or_else(|_| verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array)),
+                .or_else(|_| {
+                    verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array)
+                }),
         };
 
         match attempt {
@@ -623,6 +629,12 @@ fn write_u32_le(dst: &mut [u8], offset: usize, v: u32) -> Option<()> {
 ///   "hashes": {"data": [ {"data": [u32;8]}, ... ]} }
 ///
 /// Returns number of bytes written, or 0 on error.
+///
+/// # Safety
+/// - `signature_json_ptr` must be either null or point to `signature_json_len` readable bytes.
+/// - `out_ptr` must be either null or point to `out_len` writable bytes.
+/// - Both buffers must be valid for the duration of the call and must not overlap in a way that
+///   violates Rust aliasing rules.
 #[no_mangle]
 pub unsafe extern "C" fn hashsig_signature_ssz_from_json(
     signature_json_ptr: *const u8,
@@ -681,21 +693,18 @@ pub unsafe extern "C" fn hashsig_signature_ssz_from_json(
     let path_fixed_part: usize = 4;
     let sig_fixed_part: usize = 36;
 
-    let path_variable_size = siblings_vec.len().checked_mul(sibling_size).unwrap_or(usize::MAX);
-    if path_variable_size == usize::MAX {
-        return 0;
-    }
+    let path_variable_size = siblings_vec.len().saturating_mul(sibling_size);
     let path_total_size = match path_fixed_part.checked_add(path_variable_size) {
         Some(v) => v,
         None => return 0,
     };
 
-    let hashes_size = hashes_vec.len().checked_mul(hash_size).unwrap_or(usize::MAX);
-    if hashes_size == usize::MAX {
-        return 0;
-    }
+    let hashes_size = hashes_vec.len().saturating_mul(hash_size);
 
-    let total_size = match sig_fixed_part.checked_add(path_total_size).and_then(|v| v.checked_add(hashes_size)) {
+    let total_size = match sig_fixed_part
+        .checked_add(path_total_size)
+        .and_then(|v| v.checked_add(hashes_size))
+    {
         Some(v) => v,
         None => return 0,
     };
@@ -767,4 +776,3 @@ pub unsafe extern "C" fn hashsig_signature_ssz_from_json(
 
     total_size
 }
-

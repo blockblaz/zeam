@@ -616,18 +616,20 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
+    const run_spectest_format = b.addSystemCommand(&.{ "zig", "fmt", "pkgs/spectest/src/generated" });
+    run_spectest_format.step.dependOn(&run_spectest_generate.step);
     const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
-    spectest_generate_step.dependOn(&run_spectest_generate.step);
+    spectest_generate_step.dependOn(&run_spectest_format.step);
 
     const run_spectests_after_generate = b.addRunArtifact(spectests);
-    run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
+    run_spectests_after_generate.step.dependOn(&run_spectest_format.step);
     const run_spectests = b.addRunArtifact(spectests);
 
     if (!fileExists("pkgs/spectest/src/generated/index.zig")) {
         // `spectest:run` expects generated tests to exist already, but a fresh checkout has
         // none. Generate a stub index (or real tests if fixtures exist) to keep the command
         // usable without requiring a separate `spectest:generate` invocation first.
-        spectests.step.dependOn(&run_spectest_generate.step);
+        spectests.step.dependOn(&run_spectest_format.step);
     }
 
     const spectests_step = b.step("spectest", "Regenerate and run spec tests");
