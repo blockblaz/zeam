@@ -20,7 +20,7 @@ const RATE_LIMIT_CLEANUP_COOLDOWN_NS: u64 = 60 * std.time.ns_per_s;
 
 pub const APIServerHandle = struct {
     thread: std.Thread,
-    ctx: *SimpleMetricsServer,
+    ctx: *ApiServer,
 
     pub fn stop(self: *APIServerHandle) void {
         self.ctx.stop.store(true, .seq_cst);
@@ -34,7 +34,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
     var rate_limiter = try RateLimiter.init(allocator);
     errdefer rate_limiter.deinit();
 
-    const ctx = try allocator.create(SimpleMetricsServer);
+    const ctx = try allocator.create(ApiServer);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
@@ -46,7 +46,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
         .rate_limiter = rate_limiter,
     };
 
-    const thread = try std.Thread.spawn(.{}, SimpleMetricsServer.run, .{ctx});
+    const thread = try std.Thread.spawn(.{}, ApiServer.run, .{ctx});
 
     std.log.info("Metrics server started on port {d}", .{port});
     return .{
@@ -55,7 +55,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
     };
 }
 
-fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, forkchoice: *node.fcFactory.ForkChoice, ctx: *SimpleMetricsServer) void {
+fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, ctx: *ApiServer) void {
     var buffer: [4096]u8 = undefined;
     var http_server = std.http.Server.init(connection, &buffer);
     var request = http_server.receiveHead() catch |err| {
@@ -70,7 +70,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
             connection.stream.close();
             return;
         }
-        _ = std.Thread.spawn(.{}, SimpleMetricsServer.handleSSEConnection, .{ connection.stream, allocator, ctx }) catch |err| {
+        _ = std.Thread.spawn(.{}, ApiServer.handleSSEConnection, .{ connection.stream, allocator, ctx }) catch |err| {
             std.log.warn("Failed to spawn SSE handler: {}", .{err});
             ctx.releaseSSE();
             connection.stream.close();
@@ -78,15 +78,14 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         return;
     }
 
-    handleNonSSERequestWithAddr(&request, allocator, forkchoice, ctx, connection.address);
+    handleNonSSERequestWithAddr(&request, allocator, ctx, connection.address);
     connection.stream.close();
 }
 
 fn handleNonSSERequestWithAddr(
     request: *std.http.Server.Request,
     allocator: std.mem.Allocator,
-    forkchoice: *node.fcFactory.ForkChoice,
-    ctx: *SimpleMetricsServer,
+    ctx: *ApiServer,
     client_addr: std.net.Address,
 ) void {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -115,7 +114,7 @@ fn handleNonSSERequestWithAddr(
             },
         }) catch {};
     } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
-        handleForkChoiceGraph(request, request_allocator, forkchoice, ctx, client_addr) catch |err| {
+        handleForkChoiceGraph(request, request_allocator, ctx, client_addr) catch |err| {
             std.log.warn("Fork choice graph request failed: {}", .{err});
             _ = request.respond("Internal Server Error\n", .{}) catch {};
         };
@@ -127,8 +126,7 @@ fn handleNonSSERequestWithAddr(
 fn handleForkChoiceGraph(
     request: *std.http.Server.Request,
     allocator: std.mem.Allocator,
-    forkchoice: *node.fcFactory.ForkChoice,
-    ctx: *SimpleMetricsServer,
+    ctx: *ApiServer,
     client_addr: std.net.Address,
 ) !void {
     // Per-IP token bucket + global in-flight cap for the graph endpoint.
@@ -157,7 +155,7 @@ fn handleForkChoiceGraph(
     var graph_json = std.ArrayList(u8).init(allocator);
     defer graph_json.deinit();
 
-    try buildGraphJSON(forkchoice, graph_json.writer(), max_slots, allocator);
+    try buildGraphJSON(ctx.forkchoice, graph_json.writer(), max_slots, allocator);
 
     _ = request.respond(graph_json.items, .{
         .extra_headers = &.{
@@ -342,8 +340,8 @@ fn buildGraphJSON(
     , .{ nodes_list.items, edges_list.items });
 }
 
-/// Simple metrics server context
-const SimpleMetricsServer = struct {
+/// API server context
+const ApiServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
     forkchoice: *node.fcFactory.ForkChoice,
@@ -354,7 +352,7 @@ const SimpleMetricsServer = struct {
     sse_mutex: std.Thread.Mutex = .{},
     graph_mutex: std.Thread.Mutex = .{},
 
-    fn run(self: *SimpleMetricsServer) !void {
+    fn run(self: *ApiServer) !void {
         defer self.allocator.destroy(self);
         defer self.rate_limiter.deinit();
         const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
@@ -374,12 +372,12 @@ const SimpleMetricsServer = struct {
                 continue;
             };
 
-            routeConnection(connection, self.allocator, self.forkchoice, self);
+            routeConnection(connection, self.allocator, self);
         }
     }
 
-    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator, ctx: *SimpleMetricsServer) void {
-        SimpleMetricsServer.handleSSEEvents(stream, allocator) catch |err| {
+    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator, ctx: *ApiServer) void {
+        ApiServer.handleSSEEvents(stream, allocator) catch |err| {
             std.log.warn("SSE connection failed: {}", .{err});
         };
         stream.close();
@@ -422,7 +420,7 @@ const SimpleMetricsServer = struct {
         }
     }
 
-    fn tryAcquireSSE(self: *SimpleMetricsServer) bool {
+    fn tryAcquireSSE(self: *ApiServer) bool {
         self.sse_mutex.lock();
         defer self.sse_mutex.unlock();
         // Limit long-lived SSE connections to avoid unbounded threads.
@@ -431,13 +429,13 @@ const SimpleMetricsServer = struct {
         return true;
     }
 
-    fn releaseSSE(self: *SimpleMetricsServer) void {
+    fn releaseSSE(self: *ApiServer) void {
         self.sse_mutex.lock();
         defer self.sse_mutex.unlock();
         if (self.sse_active > 0) self.sse_active -= 1;
     }
 
-    fn tryAcquireGraph(self: *SimpleMetricsServer) bool {
+    fn tryAcquireGraph(self: *ApiServer) bool {
         self.graph_mutex.lock();
         defer self.graph_mutex.unlock();
         // Cap concurrent graph JSON generation.
@@ -446,7 +444,7 @@ const SimpleMetricsServer = struct {
         return true;
     }
 
-    fn releaseGraph(self: *SimpleMetricsServer) void {
+    fn releaseGraph(self: *ApiServer) void {
         self.graph_mutex.lock();
         defer self.graph_mutex.unlock();
         if (self.graph_inflight > 0) self.graph_inflight -= 1;
