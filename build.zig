@@ -172,6 +172,14 @@ pub fn build(b: *Builder) !void {
     });
     zeam_metrics.addImport("metrics", metrics);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_xmss.addImport("ssz", ssz);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -182,6 +190,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
+    zeam_types.addImport("@zeam/xmss", zeam_xmss);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -203,13 +212,6 @@ pub fn build(b: *Builder) !void {
     zeam_api.addImport("@zeam/metrics", zeam_metrics);
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
-
-    // add zeam-xmss
-    const zeam_xmss = b.addModule("@zeam/xmss", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
-    });
 
     // add zeam-key-manager
     const zeam_key_manager = b.addModule("@zeam/key-manager", .{
