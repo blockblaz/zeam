@@ -28,6 +28,12 @@ fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compil
     setTestRunLabel(b, run_step, source_name);
 }
 
+fn fileExists(path: []const u8) bool {
+    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
@@ -316,6 +322,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("@zeam/xmss", zeam_xmss);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -578,6 +585,10 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
+    spectests.root_module.addImport("@zeam/xmss", zeam_xmss);
+
+    spectests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, spectests, target, prover);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
 
@@ -613,12 +624,21 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
+    const run_spectest_format = b.addSystemCommand(&.{ "zig", "fmt", "pkgs/spectest/src/generated" });
+    run_spectest_format.step.dependOn(&run_spectest_generate.step);
     const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
-    spectest_generate_step.dependOn(&run_spectest_generate.step);
+    spectest_generate_step.dependOn(&run_spectest_format.step);
 
     const run_spectests_after_generate = b.addRunArtifact(spectests);
-    run_spectests_after_generate.step.dependOn(&run_spectest_generate.step);
+    run_spectests_after_generate.step.dependOn(&run_spectest_format.step);
     const run_spectests = b.addRunArtifact(spectests);
+
+    if (!fileExists("pkgs/spectest/src/generated/index.zig")) {
+        // `spectest:run` expects generated tests to exist already, but a fresh checkout has
+        // none. Generate a stub index (or real tests if fixtures exist) to keep the command
+        // usable without requiring a separate `spectest:generate` invocation first.
+        spectests.step.dependOn(&run_spectest_format.step);
+    }
 
     const spectests_step = b.step("spectest", "Regenerate and run spec tests");
     spectests_step.dependOn(&run_spectests_after_generate.step);
