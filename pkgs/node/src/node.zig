@@ -823,7 +823,7 @@ pub const BeamNode = struct {
         });
 
         // 3. followup with additional housekeeping tasks
-        self.chain.onBlockFollowup(true);
+        self.chain.onBlockFollowup(true, &signed_block);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {

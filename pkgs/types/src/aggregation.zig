@@ -92,7 +92,7 @@ pub const AggregatedSignatureProof = struct {
         aggregated_signature_proof: *Self,
     ) !void {
         aggregated_signature_proof.participants = participants;
-        try xmss.aggregateSignatures(public_keys, signatures, message_hash, epoch, &aggregated_signature_proof.proof_data);
+        try xmss.aggregateSignatures(public_keys, signatures, message_hash, @intCast(epoch), &aggregated_signature_proof.proof_data);
     }
 
     pub fn verify(self: *const Self, public_keys: []*const xmss.HashSigPublicKey, message_hash: *const [32]u8, epoch: u64) !void {
