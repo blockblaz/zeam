@@ -145,6 +145,12 @@ RUN mkdir -p /runtime-libs && \
 # Runtime stage - using scratch for absolute minimal size
 FROM scratch AS runtime
 
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+
 # Copy the architecture-specific libraries and loader
 COPY --from=runtime-prep /runtime-libs/ /
 

@@ -75,6 +75,14 @@ zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 docker build -f Dockerfile.prebuilt -t zeam:local .
 ```
 
+For publishing to a public registry, add OCI labels for better traceability:
+```bash
+docker build -f Dockerfile.prebuilt \
+  --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
+  --build-arg GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
+  -t blockblaz/zeam:latest .
+```
+
 #### Prerequisites
 
  - Zeam requires zig version 0.14.1 to build.
