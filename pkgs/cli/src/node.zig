@@ -77,12 +77,13 @@ pub const NodeOptions = struct {
     validator_assignments: []ValidatorAssignment,
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
-    metrics_port: u16,
+    api_port: u16,
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
     database_path: []const u8,
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
+    checkpoint_sync_url: ?[]const u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -134,11 +135,6 @@ pub const Node = struct {
         // Initialize event broadcaster
         try event_broadcaster.initGlobalBroadcaster(allocator);
 
-        if (options.metrics_enable) {
-            try api.init(allocator);
-            try api_server.startAPIServer(allocator, options.metrics_port);
-        }
-
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
             \\{"preset": "mainnet", "name": "devnet0"}
@@ -184,11 +180,36 @@ pub const Node = struct {
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
 
-        // Try to load the latest finalized state from the database, fallback to genesis
-        db.loadLatestFinalizedState(self.anchor_state) catch |err| {
-            self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
-            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-        };
+        // Initialize anchor state with priority: checkpoint URL > database > genesis
+        var checkpoint_sync_succeeded = false;
+        if (options.checkpoint_sync_url) |checkpoint_url| {
+            self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
+
+            // Try checkpoint sync, fall back to database/genesis on failure
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
+                self.anchor_state.* = downloaded_state;
+
+                // Verify state against genesis config
+                if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
+                    self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
+                    checkpoint_sync_succeeded = true;
+                } else |verify_err| {
+                    self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
+                    self.anchor_state.deinit();
+                }
+            } else |download_err| {
+                self.logger.warn("checkpoint sync failed: {}, falling back to database/genesis", .{download_err});
+            }
+        }
+
+        // Fall back to database/genesis if checkpoint sync was not attempted or failed
+        if (!checkpoint_sync_succeeded) {
+            // Try to load the latest finalized state from the database, fallback to genesis
+            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
+                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+            };
+        }
         errdefer self.anchor_state.deinit();
 
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
@@ -212,6 +233,12 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
+
+        // Start API server after chain is initialized so we can pass the chain pointer
+        if (options.metrics_enable) {
+            try api.init(allocator);
+            try api_server.startAPIServer(allocator, options.api_port, options.logger_config, self.beam_node.chain);
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -491,6 +518,148 @@ pub fn buildStartOptions(
     opts.genesis_spec = genesis_spec;
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
+    opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+}
+
+/// Downloads finalized checkpoint state from the given URL and deserializes it
+/// Returns the deserialized state. The caller is responsible for calling deinit on it.
+fn downloadCheckpointState(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    logger: zeam_utils.ModuleLogger,
+) !types.BeamState {
+    logger.info("downloading checkpoint state from: {s}", .{url});
+
+    // Parse URL using std.Uri
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+
+    // Initialize HTTP client
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    // Buffer for server response headers
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+
+    // Open HTTP request
+    var req = client.open(.GET, uri, .{
+        .server_header_buffer = &server_header_buffer,
+    }) catch |err| {
+        logger.err("failed to open HTTP connection: {}", .{err});
+        return error.ConnectionFailed;
+    };
+    defer req.deinit();
+
+    // Send the request
+    req.send() catch |err| {
+        logger.err("failed to send HTTP request: {}", .{err});
+        return error.RequestFailed;
+    };
+
+    // Wait for response
+    req.wait() catch |err| {
+        logger.err("failed to receive HTTP response: {}", .{err});
+        return error.ResponseFailed;
+    };
+
+    // Check HTTP status
+    if (req.response.status != .ok) {
+        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(req.response.status)});
+        return error.HttpError;
+    }
+
+    // Read response body
+    var ssz_data = std.ArrayList(u8).init(allocator);
+    errdefer ssz_data.deinit();
+
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const bytes_read = req.reader().read(&buffer) catch |err| {
+            logger.err("failed to read response body: {}", .{err});
+            return error.ReadFailed;
+        };
+        if (bytes_read == 0) break;
+        try ssz_data.appendSlice(buffer[0..bytes_read]);
+    }
+
+    logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
+
+    // Deserialize SSZ state
+    // Use arena allocator for deserialization as SSZ types may allocate
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var checkpoint_state: types.BeamState = undefined;
+    try ssz.deserialize(types.BeamState, ssz_data.items, &checkpoint_state, arena.allocator());
+
+    logger.info("successfully deserialized checkpoint state at slot {d}", .{checkpoint_state.slot});
+
+    // Clone the state to move it out of the arena using the proper cloning function
+    var cloned_state: types.BeamState = undefined;
+    try types.sszClone(allocator, types.BeamState, checkpoint_state, &cloned_state);
+
+    return cloned_state;
+}
+
+/// Verifies checkpoint state against the genesis configuration
+/// Validates that the downloaded state is consistent with expected genesis parameters
+/// Also computes and logs the state root and block root
+fn verifyCheckpointState(
+    allocator: std.mem.Allocator,
+    state: *const types.BeamState,
+    genesis_spec: *const types.GenesisSpec,
+    logger: zeam_utils.ModuleLogger,
+) !void {
+    // Verify genesis timestamp matches
+    if (state.config.genesis_time != genesis_spec.genesis_time) {
+        logger.err("checkpoint state verification failed: genesis time mismatch (expected={d}, got={d})", .{
+            genesis_spec.genesis_time,
+            state.config.genesis_time,
+        });
+        return error.GenesisTimeMismatch;
+    }
+
+    // Verify number of validators matches genesis config
+    const expected_validators = genesis_spec.numValidators();
+    const actual_validators = state.validators.len();
+    if (actual_validators != expected_validators) {
+        logger.err("checkpoint state verification failed: validator count mismatch (expected={d}, got={d})", .{
+            expected_validators,
+            actual_validators,
+        });
+        return error.ValidatorCountMismatch;
+    }
+
+    // Verify state has validators
+    if (actual_validators == 0) {
+        logger.err("checkpoint state verification failed: no validators in state", .{});
+        return error.NoValidators;
+    }
+
+    // Verify each validator pubkey matches genesis config
+    const state_validators = state.validators.constSlice();
+    for (genesis_spec.validator_pubkeys, 0..) |expected_pubkey, i| {
+        const actual_pubkey = state_validators[i].pubkey;
+        if (!std.mem.eql(u8, &expected_pubkey, &actual_pubkey)) {
+            logger.err("checkpoint state verification failed: validator pubkey mismatch at index {d}", .{i});
+            return error.ValidatorPubkeyMismatch;
+        }
+    }
+
+    // Generate state block header with correct state_root
+    // (latest_block_header.state_root is zero; genStateBlockHeader computes and sets it)
+    const state_block_header = try state.genStateBlockHeader(allocator);
+
+    // Calculate the block root from the properly constructed block header
+    var block_root: types.Root = undefined;
+    try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
+
+    logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
+        state.slot,
+        state.config.genesis_time,
+        actual_validators,
+        std.fmt.fmtSliceHexLower(&state_block_header.state_root),
+        std.fmt.fmtSliceHexLower(&block_root),
+    });
 }
 
 /// Parses the nodes from a YAML configuration.
@@ -1072,4 +1241,74 @@ test "populateNodeNameRegistry" {
     try std.testing.expectEqualStrings("zeam_0", registry.getNodeNameFromPeerId("16Uiu2HAmKgamysJowVqBeftDWr3XBETpmwvjcusbcuai17uWFgLf").name.?);
     try std.testing.expectEqualStrings("ream_0", registry.getNodeNameFromPeerId("16Uiu2HAmSH2XVgZqYHWucap5kuPzLnt2TsNQkoppVxB5eJGvaXwm").name.?);
     try std.testing.expectEqualStrings("quadrivium_0", registry.getNodeNameFromPeerId("16Uiu2HAmQj1RDNAxopeeeCFPRr3zhJYmH6DEPHYKmxLViLahWcFE").name.?);
+}
+
+test "checkpoint-sync-url parameter is optional" {
+    // Verify that the NodeCommand struct has checkpoint-sync-url as optional
+    const node_cmd = NodeCommand{
+        .custom_genesis = "test",
+        .@"node-id" = "test",
+        .validator_config = "test",
+        .override_genesis_time = null,
+        .@"checkpoint-sync-url" = null, // Should compile and work with null
+    };
+
+    try std.testing.expect(node_cmd.@"checkpoint-sync-url" == null);
+
+    const node_cmd_with_url = NodeCommand{
+        .custom_genesis = "test",
+        .@"node-id" = "test",
+        .validator_config = "test",
+        .override_genesis_time = null,
+        .@"checkpoint-sync-url" = "http://localhost:5052/lean/states/finalized",
+    };
+
+    try std.testing.expect(node_cmd_with_url.@"checkpoint-sync-url" != null);
+    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/states/finalized");
+}
+
+test "NodeOptions checkpoint_sync_url field is optional" {
+    // Verify NodeOptions can be created with null checkpoint_sync_url
+    const allocator = std.testing.allocator;
+
+    // Create a minimal NodeOptions structure for testing
+    var registry = node_lib.NodeNameRegistry.init(allocator);
+    defer registry.deinit();
+
+    var logger_config = utils_lib.getLoggerConfig(null, null);
+
+    // Create a minimal genesis spec for testing
+    const genesis_spec = types.GenesisSpec{
+        .genesis_time = 1000,
+        .validator_pubkeys = try allocator.alloc(types.Bytes52, 0),
+    };
+    defer allocator.free(genesis_spec.validator_pubkeys);
+
+    var node_options = NodeOptions{
+        .network_id = 0,
+        .node_key = "test",
+        .node_key_index = 0,
+        .validator_config = "test",
+        .bootnodes = &[_][]const u8{},
+        .validator_assignments = &[_]ValidatorAssignment{},
+        .genesis_spec = genesis_spec,
+        .metrics_enable = false,
+        .api_port = 5052,
+        .local_priv_key = try allocator.dupe(u8, "test"),
+        .logger_config = &logger_config,
+        .database_path = "test",
+        .hash_sig_key_dir = try allocator.dupe(u8, "test"),
+        .node_registry = &registry,
+        .checkpoint_sync_url = null, // Should work with null
+    };
+    defer {
+        allocator.free(node_options.local_priv_key);
+        allocator.free(node_options.hash_sig_key_dir);
+    }
+
+    try std.testing.expect(node_options.checkpoint_sync_url == null);
+
+    // Test with a URL
+    node_options.checkpoint_sync_url = "http://localhost:5052/lean/states/finalized";
+    try std.testing.expect(node_options.checkpoint_sync_url != null);
 }

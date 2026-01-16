@@ -116,7 +116,7 @@ The API system is initialized at startup in `pkgs/cli/src/main.zig`:
 try api.init(allocator);
 
 // Start HTTP server in background thread
-try api_server.startAPIServer(allocator, metricsPort);
+try api_server.startAPIServer(allocator, apiPort);
 ```
 
 The server exposes:
@@ -141,14 +141,14 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 ### Running the Node
 
 ```sh
-# Default metrics port (9667)
+# Default API port (9667)
 ./zig-out/bin/zeam beam
 
 # Custom port
-./zig-out/bin/zeam beam --metricsPort 8080
+./zig-out/bin/zeam beam --api-port 8080
 
 # Mock network for testing
-./zig-out/bin/zeam beam --mockNetwork --metricsPort 8080
+./zig-out/bin/zeam beam --mockNetwork --api-port 8080
 ```
 
 ### Generate Prometheus Config
@@ -158,7 +158,7 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 ./zig-out/bin/zeam prometheus genconfig -f prometheus/prometheus.yml
 
 # Custom port
-./zig-out/bin/zeam prometheus genconfig --metricsPort 8080 -f prometheus.yml
+./zig-out/bin/zeam prometheus genconfig --api-port 8080 -f prometheus.yml
 ```
 
 ## Testing
@@ -166,7 +166,7 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 Start a node:
 
 ```sh
-./zig-out/bin/zeam beam --mockNetwork --metricsPort 9668
+./zig-out/bin/zeam beam --mockNetwork --api-port 9668
 ```
 
 Test endpoints:

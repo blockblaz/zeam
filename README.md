@@ -105,10 +105,14 @@ To run a local devnet with multiple nodes for testing and development, see the [
 
 or checkout the [lean-quickstart](https://github.com/blockblaz/lean-quickstart) submodule (`git submodule update --init lean-quickstart`) use the handy command line tool to spin up two nodes for local interop.
 
+#### Checkpoint Sync
+
+Zeam supports checkpoint sync for faster initial synchronization. You can start a node from a trusted finalized checkpoint state by using the `--checkpoint-sync-url` parameter. See the [Local Devnet Setup Guide](./pkgs/cli/test/fixtures/README.md#checkpoint-sync) for detailed documentation and examples.
+
 ### Testing Scenarios
 
 1. Test blocks by root [parent-sync](./resources/parent-sync.md)
-
+2. Test checkpoint sync [checkpoint-sync](./resources/checkpoint-sync.md)
 
 ### Reporting Issues
 
