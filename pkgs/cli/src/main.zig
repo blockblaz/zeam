@@ -331,7 +331,8 @@ fn mainInner() !void {
 
             // Create key manager FIRST to get validator pubkeys for genesis
             const key_manager_lib = @import("@zeam/key-manager");
-            // Using 3 validators: so by default beam cmd command runs two nodes to interop
+            // Using 3 validators for 3-node setup with initial sync testing
+            // Nodes 1,2 start immediately; Node 3 starts after finalization to test sync
             const num_validators: usize = 3;
             var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
             defer key_manager.deinit();
@@ -366,9 +367,11 @@ fn mainInner() !void {
             // Create loggers first so they can be passed to network implementations
             var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
             var logger2_config = utils_lib.getScopedLoggerConfig(.n2, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+            var logger3_config = utils_lib.getScopedLoggerConfig(.n3, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
             var backend1: networks.NetworkInterface = undefined;
             var backend2: networks.NetworkInterface = undefined;
+            var backend3: networks.NetworkInterface = undefined;
 
             // These are owned by the network implementations and will be freed in their deinit functions
             // We will run network1 and network2 after the nodes are running to avoid race conditions
@@ -393,17 +396,20 @@ fn mainInner() !void {
             shared_registry.* = node_lib.NodeNameRegistry.init(allocator);
             errdefer shared_registry.deinit();
 
-            try shared_registry.addValidatorMapping(1, "zeam_n1");
-            try shared_registry.addValidatorMapping(2, "zeam_n2");
+            try shared_registry.addValidatorMapping(0, "zeam_n1");
+            try shared_registry.addValidatorMapping(1, "zeam_n2");
+            try shared_registry.addValidatorMapping(2, "zeam_n3"); // Node 3 gets validator 2 (delayed start)
 
             try shared_registry.addPeerMapping("zeam_n1", "zeam_n1");
             try shared_registry.addPeerMapping("zeam_n2", "zeam_n2");
+            try shared_registry.addPeerMapping("zeam_n3", "zeam_n3");
 
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
                 network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network), shared_registry);
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
+                backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
                 network1 = try allocator.create(networks.EthLibp2p);
@@ -455,23 +461,29 @@ fn mainInner() !void {
             var clock = try allocator.create(Clock);
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
 
-            //one missing validator is by design
-            var validator_ids_1 = [_]usize{1};
-            var validator_ids_2 = [_]usize{2};
+            // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
+            var validator_ids_1 = [_]usize{0};
+            var validator_ids_2 = [_]usize{1};
+            var validator_ids_3 = [_]usize{2}; // Node 3 gets validator 2, starts delayed
 
             const data_dir_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.data_dir});
             defer allocator.free(data_dir_1);
             const data_dir_2 = try std.fmt.allocPrint(allocator, "{s}/node2", .{beamcmd.data_dir});
             defer allocator.free(data_dir_2);
+            const data_dir_3 = try std.fmt.allocPrint(allocator, "{s}/node3", .{beamcmd.data_dir});
+            defer allocator.free(data_dir_3);
 
             var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), data_dir_1);
             defer db_1.deinit();
             var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
             defer db_2.deinit();
+            var db_3 = try database.Db.open(allocator, logger3_config.logger(.database), data_dir_3);
+            defer db_3.deinit();
 
-            // Use the same shared registry for both beam nodes
+            // Use the same shared registry for all beam nodes
             const registry_1 = shared_registry;
             const registry_2 = shared_registry;
+            const registry_3 = shared_registry;
 
             var beam_node_1: BeamNode = undefined;
             try beam_node_1.init(allocator, .{
@@ -503,8 +515,98 @@ fn mainInner() !void {
                 .node_registry = registry_2,
             });
 
+            // Node 3 setup - delayed start for initial sync testing
+            // This node starts after nodes 1,2 reach finalization and will sync from peers
+            // We use a DelayedNodeStarter to start node 3 after finalization is reached
+            const DelayedNodeStarter = struct {
+                allocator: std.mem.Allocator,
+                beam_node: *BeamNode,
+                chain_config: ChainConfig,
+                anchor_state: *types.BeamState,
+                backend: networks.NetworkInterface,
+                clock_ptr: *Clock,
+                validator_ids: []usize,
+                key_manager: *const key_manager_lib.KeyManager,
+                db: database.Db,
+                logger_config: *utils_lib.ZeamLoggerConfig,
+                node_registry: *const node_lib.NodeNameRegistry,
+                started: bool = false,
+                // Number of intervals to wait before starting node 3 (allows time for finalization)
+                // With 3 validators, finalization happens at around slot 3-4, so we wait ~20 slots
+                // to be safe (20 slots * 4 intervals/slot = 80 intervals)
+                start_after_intervals: usize = 80,
+
+                const SelfDelayed = @This();
+
+                pub fn checkAndStart(self: *SelfDelayed, current_interval: usize) !void {
+                    if (self.started) return;
+                    if (current_interval < self.start_after_intervals) return;
+
+                    std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{current_interval});
+                    std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
+
+                    try self.beam_node.init(self.allocator, .{
+                        .nodeId = 2,
+                        .config = self.chain_config,
+                        .anchorState = self.anchor_state,
+                        .backend = self.backend,
+                        .clock = self.clock_ptr,
+                        .validator_ids = self.validator_ids,
+                        .key_manager = self.key_manager,
+                        .db = self.db,
+                        .logger_config = self.logger_config,
+                        .node_registry = self.node_registry,
+                    });
+
+                    try self.beam_node.run();
+                    self.started = true;
+
+                    std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
+                }
+            };
+
+            var beam_node_3: BeamNode = undefined;
+            var delayed_starter = DelayedNodeStarter{
+                .allocator = allocator,
+                .beam_node = &beam_node_3,
+                .chain_config = chain_config,
+                .anchor_state = &anchorState,
+                .backend = backend3,
+                .clock_ptr = clock,
+                .validator_ids = &validator_ids_3,
+                .key_manager = &key_manager,
+                .db = db_3,
+                .logger_config = &logger3_config,
+                .node_registry = registry_3,
+            };
+
+            // Wrapper to integrate delayed starter with clock intervals
+            const DelayedStartWrapper = struct {
+                starter: *DelayedNodeStarter,
+
+                const SelfWrapper = @This();
+
+                pub fn onInterval(ptr: *anyopaque, interval: isize) !void {
+                    const self: *SelfWrapper = @ptrCast(@alignCast(ptr));
+                    if (interval > 0) {
+                        try self.starter.checkAndStart(@intCast(interval));
+                    }
+                }
+            };
+
+            var delayed_wrapper = DelayedStartWrapper{ .starter = &delayed_starter };
+            const delayed_cb = try allocator.create(node_lib.utils.OnIntervalCbWrapper);
+            delayed_cb.* = .{
+                .ptr = &delayed_wrapper,
+                .onIntervalCb = DelayedStartWrapper.onInterval,
+            };
+
+            // Start nodes 1, 2 immediately (node 3 starts delayed after finalization)
             try beam_node_1.run();
             try beam_node_2.run();
+
+            // Register delayed starter callback with clock
+            try clock.subscribeOnSlot(delayed_cb);
 
             if (!mock_network) {
                 try network1.run();

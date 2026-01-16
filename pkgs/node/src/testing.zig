@@ -139,6 +139,12 @@ pub const NodeTestContext = struct {
         return &self.clock;
     }
 
+    /// Fix up the db's logger pointer to point to this struct's logger_config.
+    /// Must be called after init() when the struct has a stable address.
+    pub fn fixupDbLogger(self: *NodeTestContext) void {
+        self.db.logger = self.logger_config.logger(.database);
+    }
+
     pub fn dbInstance(self: *NodeTestContext) database.Db {
         return self.db;
     }

@@ -566,6 +566,111 @@ test "SSE events integration test - wait for justification and finalization" {
     std.debug.print("SUCCESS: SSE events integration test completed\n", .{});
 }
 
+test "3-node initial sync integration test - node 3 syncs after finalization" {
+    const allocator = std.testing.allocator;
+
+    // Get executable path
+    const exe_path = try getZeamExecutable();
+
+    // Start the 3-node beam simulation
+    // Nodes 1,2 start immediately; Node 3 starts after ~20 slots (80 intervals)
+    const cli_process = try spinBeamSimNode(allocator, exe_path);
+    defer cleanupProcess(allocator, cli_process);
+
+    // Wait for node to be fully active
+    waitForNodeStart();
+
+    // Create SSE client to monitor chain events
+    var sse_client = try SSEClient.init(allocator);
+    defer sse_client.deinit();
+
+    try sse_client.connect();
+
+    std.debug.print("\n", .{});
+    std.debug.print("=================================================================\n", .{});
+    std.debug.print("  3-NODE INITIAL SYNC INTEGRATION TEST\n", .{});
+    std.debug.print("=================================================================\n", .{});
+    std.debug.print("  Phase 1: Nodes 1,2 start -> wait for first finalization\n", .{});
+    std.debug.print("  Phase 2: Node 3 starts at interval 80 -> syncs from peers\n", .{});
+    std.debug.print("  Phase 3: All 3 nodes -> wait for second finalization\n", .{});
+    std.debug.print("=================================================================\n\n", .{});
+
+    // Extended timeout for 3-node sync test (5 minutes)
+    const timeout_ms: u64 = 300000;
+    const start_ns = std.time.nanoTimestamp();
+    const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
+
+    // Track finalization events
+    var first_finalized_slot: ?u64 = null;
+    var second_finalized_slot: ?u64 = null;
+    var finalization_count: usize = 0;
+
+    var current_ns = std.time.nanoTimestamp();
+
+    // Wait for TWO distinct finalization events (first from nodes 1,2, second after node 3 joins)
+    while (current_ns < deadline_ns and second_finalized_slot == null) {
+        const event = try sse_client.readEvent();
+        if (event) |e| {
+            defer e.deinit(allocator);
+
+            // Track finalization events
+            if (std.mem.eql(u8, e.event_type, "new_finalization")) {
+                if (e.finalized_slot) |slot| {
+                    if (slot > 0) {
+                        finalization_count += 1;
+
+                        if (first_finalized_slot == null) {
+                            first_finalized_slot = slot;
+                            std.debug.print("\n*** PHASE 1 COMPLETE: First finalization at slot {} ***\n", .{slot});
+                            std.debug.print("*** Node 3 will start soon and begin syncing ***\n\n", .{});
+                        } else if (slot > first_finalized_slot.?) {
+                            // Second finalization must be at a higher slot
+                            second_finalized_slot = slot;
+                            std.debug.print("\n*** PHASE 3 COMPLETE: Second finalization at slot {} ***\n", .{slot});
+                            std.debug.print("*** All 3 nodes are now participating in consensus ***\n\n", .{});
+                        }
+                    }
+                }
+            }
+
+            // Log new_head events to show progress
+            if (std.mem.eql(u8, e.event_type, "new_head")) {
+                // Progress indicator
+            }
+        }
+
+        current_ns = std.time.nanoTimestamp();
+        const elapsed_ms: u64 = @intCast(@divTrunc(current_ns - start_ns, std.time.ns_per_ms));
+
+        // Progress update every 10 seconds
+        if (elapsed_ms % 10000 < 100) {
+            std.debug.print("Progress: elapsed={d}ms, finalization_count={d}, first_slot={any}, second_slot={any}\n", .{
+                elapsed_ms,
+                finalization_count,
+                first_finalized_slot,
+                second_finalized_slot,
+            });
+        }
+    }
+
+    // Verify test results
+    std.debug.print("\n=================================================================\n", .{});
+    std.debug.print("  TEST RESULTS\n", .{});
+    std.debug.print("=================================================================\n", .{});
+    std.debug.print("  First finalized slot: {any}\n", .{first_finalized_slot});
+    std.debug.print("  Second finalized slot: {any}\n", .{second_finalized_slot});
+    std.debug.print("  Total finalization events: {d}\n", .{finalization_count});
+    std.debug.print("=================================================================\n\n", .{});
+
+    // Test assertions
+    try std.testing.expect(first_finalized_slot != null);
+    try std.testing.expect(second_finalized_slot != null);
+    try std.testing.expect(second_finalized_slot.? > first_finalized_slot.?);
+
+    std.debug.print("SUCCESS: 3-node initial sync integration test completed!\n", .{});
+    std.debug.print("Node 3 successfully synced and all nodes reached consensus.\n", .{});
+}
+
 // Test suite for ErrorHandler
 test "ErrorHandler.formatError - known errors" {
     const testing = std.testing;

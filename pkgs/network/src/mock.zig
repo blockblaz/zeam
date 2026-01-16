@@ -60,6 +60,10 @@ pub const Mock = struct {
         method: interface.LeanSupportedProtocol,
         sender_peer_id: []const u8,
         finished: bool = false,
+        // Buffer responses for async delivery to avoid timing issues
+        // where the caller hasn't finished setting up request tracking
+        buffered_responses: std.ArrayListUnmanaged(interface.ReqRespResponse) = .empty,
+        error_response: ?struct { code: u32, message: []const u8 } = null,
     };
 
     fn mockStreamGetPeerId(ptr: *anyopaque) ?[]const u8 {
@@ -125,6 +129,67 @@ pub const Mock = struct {
                 const mock = task.mock;
                 mock.logger.err("mock:: Synthetic response scheduling failed: {any}", .{err});
                 task.release();
+                mock.allocator.destroy(completion);
+            }
+            return .disarm;
+        };
+
+        if (ud) |task| {
+            const allocator = task.mock.allocator;
+            defer allocator.destroy(completion);
+            task.dispatch();
+        }
+
+        return .disarm;
+    }
+
+    // DeferredResponseTask delivers buffered responses asynchronously
+    // This fixes the timing issue where responses were delivered before
+    // the caller finished setting up request tracking
+    const DeferredResponseTask = struct {
+        mock: *Mock,
+        request_id: u64,
+        method: interface.LeanSupportedProtocol,
+        responses: []interface.ReqRespResponse,
+        error_response: ?struct { code: u32, message: []const u8 },
+
+        fn dispatch(self: *DeferredResponseTask) void {
+            const mock = self.mock;
+
+            // Deliver error if present
+            if (self.error_response) |err_resp| {
+                mock.notifyError(self.request_id, self.method, err_resp.code, err_resp.message);
+                mock.allocator.free(self.responses);
+                mock.allocator.destroy(self);
+                return;
+            }
+
+            // Deliver all buffered success responses
+            // Note: notifySuccess takes ownership of the response via event.deinit(),
+            // so we must NOT call resp.deinit() here to avoid double-free
+            for (self.responses) |resp| {
+                mock.notifySuccess(self.request_id, self.method, resp);
+            }
+            mock.allocator.free(self.responses);
+
+            // Notify completion
+            mock.notifyCompleted(self.request_id, self.method);
+
+            mock.allocator.destroy(self);
+        }
+    };
+
+    fn deferredResponseCallback(ud: ?*DeferredResponseTask, _: *xev.Loop, completion: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        _ = r catch |err| {
+            if (ud) |task| {
+                const mock = task.mock;
+                mock.logger.err("mock:: Deferred response scheduling failed: {any}", .{err});
+                // Clean up responses
+                for (task.responses) |*resp| {
+                    resp.deinit();
+                }
+                mock.allocator.free(task.responses);
+                mock.allocator.destroy(task);
                 mock.allocator.destroy(completion);
             }
             return .disarm;
@@ -437,8 +502,10 @@ pub const Mock = struct {
             return StreamError.StreamAlreadyFinished;
         }
 
+        // Buffer the response for async delivery instead of immediate notification
+        // This fixes timing issues where responses arrive before request tracking is set up
         const cloned = try ctx.mock.cloneResponse(response);
-        ctx.mock.notifySuccess(ctx.request_id, ctx.method, cloned);
+        try ctx.buffered_responses.append(ctx.mock.allocator, cloned);
     }
 
     fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerror!void {
@@ -446,17 +513,20 @@ pub const Mock = struct {
         if (ctx.finished) {
             return StreamError.StreamAlreadyFinished;
         }
+        // Buffer the error for async delivery
+        ctx.error_response = .{ .code = code, .message = message };
         ctx.finished = true;
-        ctx.mock.finalizeServerStream(ctx);
-        ctx.mock.notifyError(ctx.request_id, ctx.method, code, message);
+        // Schedule async delivery - don't finalize stream here, let the timer callback do it
+        ctx.mock.scheduleDeferredResponse(ctx);
     }
 
     fn serverStreamFinish(ptr: *anyopaque) anyerror!void {
         const ctx: *MockServerStream = @ptrCast(@alignCast(ptr));
         if (ctx.finished) return;
         ctx.finished = true;
-        ctx.mock.finalizeServerStream(ctx);
-        ctx.mock.notifyCompleted(ctx.request_id, ctx.method);
+        // Schedule async delivery of buffered responses
+        // This ensures the caller has finished setting up request tracking
+        ctx.mock.scheduleDeferredResponse(ctx);
     }
 
     fn serverStreamIsFinished(ptr: *anyopaque) bool {
@@ -472,6 +542,61 @@ pub const Mock = struct {
 
     fn finalizeServerStream(self: *Self, ctx: *MockServerStream) void {
         self.removeActiveStream(ctx.request_id);
+    }
+
+    fn scheduleDeferredResponse(self: *Self, ctx: *MockServerStream) void {
+        // Create deferred task with buffered responses
+        const task = self.allocator.create(DeferredResponseTask) catch |err| {
+            self.logger.err("mock:: Failed to create deferred response task: {any}", .{err});
+            // Clean up buffered responses on error
+            for (ctx.buffered_responses.items) |*resp| {
+                resp.deinit();
+            }
+            ctx.buffered_responses.deinit(self.allocator);
+            self.finalizeServerStream(ctx);
+            return;
+        };
+
+        // Transfer ownership of buffered responses to the task
+        const responses = ctx.buffered_responses.toOwnedSlice(self.allocator) catch |err| {
+            self.logger.err("mock:: Failed to transfer buffered responses: {any}", .{err});
+            self.allocator.destroy(task);
+            for (ctx.buffered_responses.items) |*resp| {
+                resp.deinit();
+            }
+            ctx.buffered_responses.deinit(self.allocator);
+            self.finalizeServerStream(ctx);
+            return;
+        };
+
+        task.* = .{
+            .mock = self,
+            .request_id = ctx.request_id,
+            .method = ctx.method,
+            .responses = responses,
+            .error_response = if (ctx.error_response) |err| .{ .code = err.code, .message = err.message } else null,
+        };
+
+        const completion = self.allocator.create(xev.Completion) catch |err| {
+            self.logger.err("mock:: Failed to allocate completion for deferred response: {any}", .{err});
+            // Dispatch immediately as fallback
+            task.dispatch();
+            self.finalizeServerStream(ctx);
+            return;
+        };
+
+        // Schedule delivery with 1ms delay to allow caller to finish setup
+        self.timer.run(
+            self.gossipHandler.loop,
+            completion,
+            1,
+            DeferredResponseTask,
+            task,
+            deferredResponseCallback,
+        );
+
+        // Finalize the stream (remove from active streams)
+        self.finalizeServerStream(ctx);
     }
 
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
@@ -867,6 +992,10 @@ test "Mock status RPC between peers" {
     request.deinit();
 
     try std.testing.expect(request_id != 0);
+
+    // Run the event loop to process the async deferred response delivery
+    try loop.run(.until_done);
+
     try std.testing.expect(peer_a.received_status != null);
     const received = peer_a.received_status.?;
     try std.testing.expect(std.mem.eql(u8, &received.finalized_root, &status_b.finalized_root));

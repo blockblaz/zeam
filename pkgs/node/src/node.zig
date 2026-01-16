@@ -477,6 +477,27 @@ pub const BeamNode = struct {
                                     self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 });
                             }
+
+                            // Proactive initial sync: if peer is ahead of us, request their head block
+                            // This triggers parent syncing which will fetch all blocks back to our current state
+                            const our_head_slot = self.chain.forkChoice.head.slot;
+                            if (status_resp.head_slot > our_head_slot) {
+                                self.logger.info("peer {s}{} is ahead (peer_head_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{s}", .{
+                                    status_ctx.peer_id,
+                                    self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                    status_resp.head_slot,
+                                    our_head_slot,
+                                    std.fmt.fmtSliceHexLower(&status_resp.head_root),
+                                });
+                                const roots = [_]types.Root{status_resp.head_root};
+                                self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                    self.logger.warn("failed to initiate sync by fetching head block from peer {s}{}: {any}", .{
+                                        status_ctx.peer_id,
+                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                        err,
+                                    });
+                                };
+                            }
                         },
                         else => {
                             self.logger.warn("status response did not match tracked request_id={d} from peer={s}{}", .{ request_id, peer_id, node_name });
@@ -872,6 +893,7 @@ test "Node peer tracking on connect/disconnect" {
     const allocator = arena_allocator.allocator();
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     // Create empty node registry for test - shared between Mock and node
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -996,6 +1018,7 @@ test "Node: fetched blocks cache and deduplication" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1108,6 +1131,7 @@ test "Node: processCachedDescendants basic flow" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1224,6 +1248,7 @@ test "Node: pruneCachedBlockSubtree prunes root and all cached descendants" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1299,6 +1324,7 @@ test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1365,6 +1391,7 @@ test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is no
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
+    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
