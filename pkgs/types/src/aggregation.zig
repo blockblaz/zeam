@@ -11,7 +11,7 @@ const json = std.json;
 const attestation = @import("./attestation.zig");
 
 const AggregationBits = attestation.AggregationBits;
-const MultisigAggregatedSignature = xmss.MultisigAggregatedSignature;
+const ByteListMiB = xmss.ByteListMiB;
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
@@ -34,11 +34,9 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 }
 
 // Types
-pub const AttestationSignatures = ssz.utils.List(AggregatedSignatureProof, params.VALIDATOR_REGISTRY_LIMIT);
-
 pub const AggregatedSignatureProof = struct {
     participants: attestation.AggregationBits,
-    proof_data: MultisigAggregatedSignature,
+    proof_data: ByteListMiB,
 
     const Self = @This();
 
@@ -46,7 +44,7 @@ pub const AggregatedSignatureProof = struct {
         var participants = try attestation.AggregationBits.init(allocator);
         errdefer participants.deinit();
 
-        var proof_data = try MultisigAggregatedSignature.init(allocator);
+        var proof_data = try ByteListMiB.init(allocator);
         errdefer proof_data.deinit();
 
         return Self{
@@ -62,8 +60,20 @@ pub const AggregatedSignatureProof = struct {
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("participants", try self.participants.toJson(allocator));
-        try obj.put("proof_data", try self.proof_data.toJson(allocator));
+
+        // Serialize participants as array of booleans
+        var participants_array = json.Array.init(allocator);
+        errdefer participants_array.deinit();
+        for (0..self.participants.len()) |i| {
+            try participants_array.append(json.Value{ .bool = try self.participants.get(i) });
+        }
+        try obj.put("participants", json.Value{ .array = participants_array });
+
+        // Serialize proof_data as hex string
+        const proof_bytes = self.proof_data.constSlice();
+        const proof_hex = try utils.BytesToHex(allocator, proof_bytes);
+        try obj.put("proof_data", json.Value{ .string = proof_hex });
+
         return json.Value{ .object = obj };
     }
 
@@ -86,6 +96,6 @@ pub const AggregatedSignatureProof = struct {
     }
 
     pub fn verify(self: *const Self, public_keys: []*const xmss.HashSigPublicKey, message_hash: *const [32]u8, epoch: u64) !void {
-        try xmss.verifyAggregatedPayload(public_keys, message_hash, epoch, &self.proof_data);
+        try xmss.verifyAggregatedPayload(public_keys, message_hash, @intCast(epoch), &self.proof_data);
     }
 };

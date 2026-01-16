@@ -1,11 +1,11 @@
 const aggregate = @import("aggregation.zig");
 pub const MAX_AGGREGATE_SIGNATURE_SIZE = aggregate.MAX_AGGREGATE_SIGNATURE_SIZE;
-pub const MultisigAggregatedSignature = aggregate.MultisigAggregatedSignature;
+pub const ByteListMiB = aggregate.ByteListMiB;
 pub const AggregationError = aggregate.AggregationError;
 pub const setupProver = aggregate.setupProver;
 pub const setupVerifier = aggregate.setupVerifier;
 pub const aggregateSignatures = aggregate.aggregateSignatures;
-pub const verifyAggregated = aggregate.verifyAggregatedPayload;
+pub const verifyAggregatedPayload = aggregate.verifyAggregatedPayload;
 pub const aggregate_module = aggregate;
 
 const hashsig = @import("hashsig.zig");

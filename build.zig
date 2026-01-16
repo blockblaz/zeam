@@ -303,6 +303,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,

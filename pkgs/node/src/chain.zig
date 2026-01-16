@@ -612,21 +612,28 @@ pub const BeamChain = struct {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit();
 
-                const group_signatures = if (index < signature_groups.len)
-                    signature_groups[index].constSlice()
+                // Get participant indices from the signature proof
+                const signature_proof = if (index < signature_groups.len)
+                    &signature_groups[index]
                 else
-                    &[_]types.SIGBYTES{};
+                    null;
 
-                if (validator_indices.items.len != group_signatures.len) {
+                var participant_indices = if (signature_proof) |proof|
+                    try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
+                else
+                    std.ArrayList(usize).init(self.allocator);
+                defer participant_indices.deinit();
+
+                if (validator_indices.items.len != participant_indices.items.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.module_logger.err(
-                        "attestation signature mismatch index={d} validators={d} signatures={d}",
-                        .{ index, validator_indices.items.len, group_signatures.len },
+                        "attestation signature mismatch index={d} validators={d} participants={d}",
+                        .{ index, validator_indices.items.len, participant_indices.items.len },
                     );
                     continue;
                 }
 
-                for (validator_indices.items, group_signatures) |validator_index, signature| {
+                for (validator_indices.items) |validator_index| {
                     const validator_id: types.ValidatorIndex = @intCast(validator_index);
                     const attestation = types.Attestation{
                         .validator_id = validator_id,
@@ -646,10 +653,12 @@ pub const BeamChain = struct {
                         continue;
                     };
 
+                    // Note: With aggregated signatures, individual signatures are not available.
+                    // The signature verification happens via AggregatedSignatureProof.verify() in state-transition.
                     const signed_attestation = types.SignedAttestation{
                         .validator_id = validator_id,
                         .message = attestation.data,
-                        .signature = signature,
+                        .signature = types.ZERO_SIGBYTES,
                     };
 
                     self.forkChoice.onAttestation(signed_attestation, true) catch |e| {

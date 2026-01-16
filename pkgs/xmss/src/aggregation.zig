@@ -8,7 +8,7 @@ pub const AggregationError = error{ SerializationFailed, DeserializationFailed, 
 pub const MAX_AGGREGATE_SIGNATURE_SIZE: usize = 1 << 20;
 
 // Variable-length byte list for multisig aggregated signatures.
-pub const MultisigAggregatedSignature = ssz.utils.List(u8, MAX_AGGREGATE_SIGNATURE_SIZE);
+pub const ByteListMiB = ssz.utils.List(u8, MAX_AGGREGATE_SIGNATURE_SIZE);
 
 pub const Devnet2XmssAggregateSignature = opaque {};
 
@@ -55,7 +55,7 @@ pub fn setupVerifier() void {
     xmss_setup_verifier();
 }
 
-pub fn aggregateSignatures(public_keys: []*const hashsig.HashSigPublicKey, signatures: []*const hashsig.HashSigSignature, message_hash: *const [32]u8, epoch: u32, multisig_aggregated_signature: *MultisigAggregatedSignature) !void {
+pub fn aggregateSignatures(public_keys: []*const hashsig.HashSigPublicKey, signatures: []*const hashsig.HashSigSignature, message_hash: *const [32]u8, epoch: u32, multisig_aggregated_signature: *ByteListMiB) !void {
     if (public_keys.len != signatures.len) {
         return AggregationError.PublicKeysSignatureLengthMismatch;
     }
@@ -91,7 +91,7 @@ pub fn aggregateSignatures(public_keys: []*const hashsig.HashSigPublicKey, signa
     }
 }
 
-pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, message_hash: *const [32]u8, epoch: u32, agg_sig: *const MultisigAggregatedSignature) !void {
+pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, message_hash: *const [32]u8, epoch: u32, agg_sig: *const ByteListMiB) !void {
     // Get bytes from MultisigAggregatedSignature
     const sig_bytes = agg_sig.constSlice();
 
@@ -122,7 +122,7 @@ test "aggregateSignatures returns PublicKeysSignatureLengthMismatch for mismatch
     var signatures = [_]*const hashsig.HashSigSignature{};
     const message_hash = [_]u8{0} ** 32;
 
-    var multisig_aggregated_signature = try MultisigAggregatedSignature.init(std.testing.allocator);
+    var multisig_aggregated_signature = try ByteListMiB.init(std.testing.allocator);
     defer multisig_aggregated_signature.deinit();
     const result = aggregateSignatures(&public_keys, &signatures, &message_hash, 0, &multisig_aggregated_signature);
     try std.testing.expectError(AggregationError.PublicKeysSignatureLengthMismatch, result);
@@ -168,7 +168,7 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     var signatures = [_]*const hashsig.HashSigSignature{signature.handle};
 
     // Aggregate
-    var multisig_aggregated_signature = try MultisigAggregatedSignature.init(allocator);
+    var multisig_aggregated_signature = try ByteListMiB.init(allocator);
     defer multisig_aggregated_signature.deinit();
     try aggregateSignatures(&public_keys, &signatures, &message_hash, epoch, &multisig_aggregated_signature);
 

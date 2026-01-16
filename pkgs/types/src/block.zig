@@ -4,6 +4,7 @@ const ssz = @import("ssz");
 const params = @import("@zeam/params");
 
 const attestation = @import("./attestation.zig");
+const aggregation = @import("./aggregation.zig");
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
@@ -12,7 +13,7 @@ const Allocator = std.mem.Allocator;
 const AggregatedAttestation = attestation.AggregatedAttestation;
 pub const AggregatedAttestations = ssz.utils.List(AggregatedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
 const Attestation = attestation.Attestation;
-pub const AttestationSignatures = ssz.utils.List(attestation.NaiveAggregatedSignature, params.VALIDATOR_REGISTRY_LIMIT);
+pub const AttestationSignatures = ssz.utils.List(aggregation.AggregatedSignatureProof, params.VALIDATOR_REGISTRY_LIMIT);
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
@@ -213,16 +214,7 @@ pub const BlockSignatures = struct {
         errdefer groups_array.deinit();
 
         for (self.attestation_signatures.constSlice()) |group| {
-            var sig_array = json.Array.init(allocator);
-            var success = false;
-            defer if (!success) sig_array.deinit();
-
-            for (group.constSlice()) |sig| {
-                try sig_array.append(json.Value{ .string = try bytesToHex(allocator, &sig) });
-            }
-
-            try groups_array.append(json.Value{ .array = sig_array });
-            success = true;
+            try groups_array.append(try group.toJson(allocator));
         }
 
         try obj.put("attestation_signatures", json.Value{ .array = groups_array });
@@ -287,7 +279,7 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     errdefer groups.deinit();
 
     for (0..num_aggregated_attestations) |_| {
-        const signatures = try attestation.NaiveAggregatedSignature.init(allocator);
+        const signatures = try aggregation.AggregatedSignatureProof.init(allocator);
         try groups.append(signatures);
     }
 
@@ -300,20 +292,22 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
 const AggregationGroup = struct {
     data: attestation.AttestationData,
     bits: attestation.AggregationBits,
-    signatures: attestation.NaiveAggregatedSignature,
+    signatures: aggregation.AggregatedSignatureProof,
 
-    fn init(allocator: Allocator, signed_attestation: attestation.SignedAttestation) !AggregationGroup {
+    const Self = @This();
+
+    fn init(allocator: Allocator, signed_attestation: attestation.SignedAttestation) !Self {
         var bits = try attestation.AggregationBits.init(allocator);
         errdefer bits.deinit();
 
         const validator_index: usize = @intCast(signed_attestation.validator_id);
         try attestation.aggregationBitsSet(&bits, validator_index, true);
 
-        var signatures = try attestation.NaiveAggregatedSignature.init(allocator);
+        var signatures = try aggregation.AggregatedSignatureProof.init(allocator);
         errdefer signatures.deinit();
-        try signatures.append(signed_attestation.signature);
+        try attestation.aggregationBitsSet(&signatures.participants, validator_index, true);
 
-        return AggregationGroup{
+        return Self{
             .data = signed_attestation.message,
             .bits = bits,
             .signatures = signatures,
@@ -364,7 +358,7 @@ pub fn aggregateSignedAttestations(
             var group = &groups.items[group_index];
             const validator_index: usize = @intCast(signed_attestation.validator_id);
             try attestation.aggregationBitsSet(&group.bits, validator_index, true);
-            try group.signatures.append(signed_attestation.signature);
+            try attestation.aggregationBitsSet(&group.signatures.participants, validator_index, true);
         } else {
             const new_group = try AggregationGroup.init(allocator, signed_attestation);
             try groups.append(new_group);
@@ -574,18 +568,14 @@ test "encode decode signed block with non-empty attestation signatures" {
     var attestation_signatures = try AttestationSignatures.init(std.testing.allocator);
     errdefer attestation_signatures.deinit();
 
-    var validator_signatures = try attestation.NaiveAggregatedSignature.init(std.testing.allocator);
-    errdefer validator_signatures.deinit();
+    var signature_proof = try aggregation.AggregatedSignatureProof.init(std.testing.allocator);
+    errdefer signature_proof.deinit();
 
-    var test_sig1: SIGBYTES = undefined;
-    var test_sig2: SIGBYTES = undefined;
-    @memset(&test_sig1, 0x12);
-    @memset(&test_sig2, 0x34);
+    // Set participants for validators 0 and 1
+    try attestation.aggregationBitsSet(&signature_proof.participants, 0, true);
+    try attestation.aggregationBitsSet(&signature_proof.participants, 1, true);
 
-    try validator_signatures.append(test_sig1);
-    try validator_signatures.append(test_sig2);
-
-    try attestation_signatures.append(validator_signatures);
+    try attestation_signatures.append(signature_proof);
 
     var signed_block_with_attestation = SignedBlockWithAttestation{
         .message = .{
@@ -624,5 +614,5 @@ test "encode decode signed block with non-empty attestation signatures" {
     try std.testing.expect(decoded.message.block.slot == signed_block_with_attestation.message.block.slot);
     try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
-    try std.testing.expect(decoded_group.len() == 2);
+    try std.testing.expect(decoded_group.participants.len() == 2);
 }
