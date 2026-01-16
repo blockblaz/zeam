@@ -530,7 +530,7 @@ fn buildSignedBlockWithAttestation(
     }
 
     // Parse proposer_signature
-    const proposer_sig = try parseSignature(ctx, signature_obj, "proposerSignature");
+    const proposer_sig = try parseSignature(allocator, ctx, signature_obj, "proposerSignature");
 
     var signatures = types.createBlockSignatures(allocator, block.body.attestations.len()) catch |err| {
         std.debug.print(
@@ -746,6 +746,7 @@ fn parseAttestationData(
 }
 
 fn parseSignature(
+    allocator: std.mem.Allocator,
     ctx: Context,
     obj: std.json.ObjectMap,
     field_name: []const u8,
@@ -759,7 +760,7 @@ fn parseSignature(
     };
 
     // Re-serialize just the signature object and let Rust parse/SSZ-encode it.
-    var json_buf = std.ArrayList(u8).init(ctx.allocator);
+    var json_buf = std.ArrayList(u8).init(allocator);
     defer json_buf.deinit();
 
     std.json.stringify(sig_value, .{}, json_buf.writer()) catch |err| {
