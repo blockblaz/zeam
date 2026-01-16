@@ -134,7 +134,11 @@ pub const BeamState = struct {
                 const bit_index = i * num_validators + j;
                 byte.* = if (try self.justifications_validators.get(bit_index)) 1 else 0;
             }
-            try justifications.put(allocator, blockRoot, validator_data);
+            if (!std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH)) {
+                try justifications.put(allocator, blockRoot, validator_data);
+            } else {
+                allocator.free(validator_data);
+            }
         }
     }
 
@@ -151,7 +155,9 @@ pub const BeamState = struct {
             if (kv.value_ptr.*.len != self.validatorCount()) {
                 return error.InvalidJustificationLength;
             }
-            try new_justifications_roots.append(kv.key_ptr.*);
+            if (!std.mem.eql(u8, &kv.key_ptr.*, &utils.ZERO_HASH)) {
+                try new_justifications_roots.append(kv.key_ptr.*);
+            }
         }
 
         // Sort the roots, confirm this sorting via a test
