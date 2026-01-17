@@ -31,6 +31,26 @@ pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, Inva
 
 const json = std.json;
 
+pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
+
 // prepare the state to be pre state of the slot
 pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     if (candidate < finalized) {

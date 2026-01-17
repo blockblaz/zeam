@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, signatures: []const types.SIGBYTES) !types.SignedBlockWithAttestation {
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, attestation_signatures: types.AttestationSignatures) !types.SignedBlockWithAttestation {
     const attestations_list = try types.AggregatedAttestations.init(allocator);
 
     var test_block = types.BeamBlock{
@@ -42,28 +42,10 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
         .proposer_attestation = proposer_attestation,
     };
 
-    var attestation_signatures = try types.AttestationSignatures.init(allocator);
-    var attestation_signatures_cleanup = true;
-    errdefer if (attestation_signatures_cleanup) attestation_signatures.deinit();
-
-    if (signatures.len > 0) {
-        var validator_signatures = try types.NaiveAggregatedSignature.init(allocator);
-        var validator_signatures_cleanup = true;
-        errdefer if (validator_signatures_cleanup) validator_signatures.deinit();
-
-        for (signatures) |sig| {
-            try validator_signatures.append(sig);
-        }
-
-        try attestation_signatures.append(validator_signatures);
-        validator_signatures_cleanup = false;
-    }
-
     const block_signatures = types.BlockSignatures{
         .attestation_signatures = attestation_signatures,
         .proposer_signature = types.ZERO_SIGBYTES,
     };
-    attestation_signatures_cleanup = false;
 
     const signed_block = types.SignedBlockWithAttestation{
         .message = block_with_attestation,
@@ -118,4 +100,22 @@ pub fn createDummyRoot(fill_byte: u8) types.Root {
     var root: types.Root = undefined;
     @memset(&root, fill_byte);
     return root;
+}
+
+/// Helper function to create dummy attestation signatures with AggregatedSignatureProof objects
+pub fn createDummyAttestationSignatures(allocator: Allocator, num_proofs: usize) !types.AttestationSignatures {
+    var attestation_signatures = try types.AttestationSignatures.init(allocator);
+    errdefer attestation_signatures.deinit();
+
+    for (0..num_proofs) |i| {
+        var signature_proof = try types.AggregatedSignatureProof.init(allocator);
+        errdefer signature_proof.deinit();
+
+        // Set a participant bit for each proof
+        try types.aggregationBitsSet(&signature_proof.participants, i, true);
+
+        try attestation_signatures.append(signature_proof);
+    }
+
+    return attestation_signatures;
 }

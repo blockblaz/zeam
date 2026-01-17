@@ -87,7 +87,7 @@ dependencies = [
 [[package]]
 name = "air"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "multilinear-toolkit",
  "p3-util 0.3.0 (git+https://github.com/TomWambsgans/Plonky3.git?branch=lean-vm-simple)",
@@ -3288,7 +3288,7 @@ dependencies = [
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "air 0.1.0",
  "lean_vm",
@@ -3311,7 +3311,7 @@ dependencies = [
 [[package]]
 name = "lean_prover"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "air 0.1.0",
  "itertools 0.14.0",
@@ -3337,7 +3337,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "air 0.1.0",
  "colored",
@@ -3886,7 +3886,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "lookup"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "multilinear-toolkit",
  "p3-challenger 0.3.0",
@@ -4142,6 +4142,7 @@ dependencies = [
 name = "multisig-glue"
 version = "0.1.0"
 dependencies = [
+ "ethereum_ssz",
  "leansig 0.1.0 (git+https://github.com/leanEthereum/leansig.git)",
  "p3-koala-bear 0.3.0 (git+https://github.com/TomWambsgans/Plonky3.git?branch=lean-vm-simple)",
  "rec_aggregation",
@@ -6745,10 +6746,11 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "air 0.1.0",
  "bincode",
+ "ethereum_ssz",
  "hex",
  "lean_compiler",
  "lean_prover",
@@ -7814,7 +7816,7 @@ dependencies = [
 [[package]]
 name = "sub_protocols"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "derive_more 2.1.0",
  "lookup",
@@ -8492,7 +8494,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "multilinear-toolkit",
  "p3-challenger 0.3.0",
@@ -9063,7 +9065,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 [[package]]
 name = "witness_generation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=52e270cf45655a7abe39a05c0b6cdee309f44480#52e270cf45655a7abe39a05c0b6cdee309f44480"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=4543620b8e33c16112dcf1fff7f250344913a729#4543620b8e33c16112dcf1fff7f250344913a729"
 dependencies = [
  "air 0.1.0",
  "derive_more 2.1.0",

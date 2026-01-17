@@ -3,6 +3,7 @@ use rec_aggregation::xmss_aggregate::{
     xmss_aggregate_signatures, xmss_setup_aggregation_program, xmss_verify_aggregated_signatures,
     Devnet2XmssAggregateSignature,
 };
+use ssz::{Decode, Encode};
 use std::slice;
 
 // Import the same leansig types that hashsig-glue uses
@@ -23,6 +24,16 @@ pub struct PublicKey {
 #[repr(C)]
 pub struct Signature {
     pub inner: HashSigSignature,
+}
+
+/// Serialize a Devnet2XmssAggregateSignature to SSZ-encoded bytes.
+pub fn to_ssz_bytes(agg_sig: &Devnet2XmssAggregateSignature) -> Vec<u8> {
+    agg_sig.as_ssz_bytes()
+}
+
+/// Deserialize a Devnet2XmssAggregateSignature from SSZ-encoded bytes.
+pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Devnet2XmssAggregateSignature, ssz::DecodeError> {
+    Devnet2XmssAggregateSignature::from_ssz_bytes(bytes)
 }
 
 #[no_mangle]
@@ -161,5 +172,58 @@ pub unsafe extern "C" fn xmss_free_aggregate_signature(
     if !agg_sig.is_null() {
         // Reconstruct the Box to drop and free it.
         drop(Box::from_raw(agg_sig));
+    }
+}
+
+/// Serialize an aggregate signature to SSZ-encoded bytes.
+/// Returns number of bytes written, or 0 on error.
+///
+/// # Safety
+/// - `agg_sig` must be a valid pointer previously returned by `xmss_aggregate`.
+/// - `buffer` must point to a valid buffer of at least `buffer_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xmss_aggregate_signature_to_bytes(
+    agg_sig: *const Devnet2XmssAggregateSignature,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> usize {
+    if agg_sig.is_null() || buffer.is_null() {
+        return 0;
+    }
+
+    let agg_sig_ref = &*agg_sig;
+
+    let ssz_bytes = to_ssz_bytes(agg_sig_ref);
+
+    if ssz_bytes.len() > buffer_len {
+        return 0;
+    }
+
+    let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
+    output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
+    ssz_bytes.len()
+}
+
+/// Deserialize an aggregate signature from SSZ-encoded bytes.
+/// Returns pointer to Devnet2XmssAggregateSignature on success, null on error.
+///
+/// # Safety
+/// - `bytes` must point to a valid buffer of at least `bytes_len` bytes.
+/// - The returned pointer (if non-null) is heap-allocated and must be freed
+///   exactly once via `xmss_free_aggregate_signature`.
+#[no_mangle]
+pub unsafe extern "C" fn xmss_aggregate_signature_from_bytes(
+    bytes: *const u8,
+    bytes_len: usize,
+) -> *mut Devnet2XmssAggregateSignature {
+    if bytes.is_null() || bytes_len == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let input_slice = slice::from_raw_parts(bytes, bytes_len);
+
+    match from_ssz_bytes(input_slice) {
+        Ok(agg_sig) => Box::into_raw(Box::new(agg_sig)),
+        Err(_) => std::ptr::null_mut(),
     }
 }
