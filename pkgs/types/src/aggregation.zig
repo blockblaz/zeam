@@ -91,8 +91,11 @@ pub const AggregatedSignatureProof = struct {
         epoch: u64,
         aggregated_signature_proof: *Self,
     ) !void {
-        aggregated_signature_proof.participants = participants;
         try xmss.aggregateSignatures(public_keys, signatures, message_hash, @intCast(epoch), &aggregated_signature_proof.proof_data);
+
+        // Transfer ownership only after aggregation succeeds
+        aggregated_signature_proof.participants.deinit();
+        aggregated_signature_proof.participants = participants;
     }
 
     pub fn verify(self: *const Self, public_keys: []*const xmss.HashSigPublicKey, message_hash: *const [32]u8, epoch: u64) !void {

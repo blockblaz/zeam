@@ -216,12 +216,21 @@ pub const SignatureKey = struct {
     data_root: Root,
 };
 
-/// Map type for gossip signatures: SignatureKey -> individual XMSS signature bytes
-const GossipSignaturesMap = std.AutoHashMap(SignatureKey, types.SIGBYTES);
+const StoredGossipSignature = struct {
+    slot: types.Slot,
+    signature: types.SIGBYTES,
+};
+
+/// Map type for gossip signatures: SignatureKey -> individual XMSS signature bytes + slot metadata
+const GossipSignaturesMap = std.AutoHashMap(SignatureKey, StoredGossipSignature);
 
 /// Map type for aggregated payloads from blocks: SignatureKey -> list of AggregatedSignatureProof
 /// Using ArrayList since each key can map to multiple proofs from different blocks
-const AggregatedPayloadsList = std.ArrayList(AggregatedSignatureProof);
+const StoredAggregatedPayload = struct {
+    slot: types.Slot,
+    proof: AggregatedSignatureProof,
+};
+const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
 const AggregatedPayloadsMap = std.AutoHashMap(SignatureKey, AggregatedPayloadsList);
 
 pub const ForkChoice = struct {
@@ -305,8 +314,8 @@ pub const ForkChoice = struct {
         // Deinit each list in the aggregated_payloads map
         var it = self.aggregated_payloads.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.items) |*proof| {
-                proof.deinit();
+            for (entry.value_ptr.items) |*stored| {
+                stored.proof.deinit();
             }
             entry.value_ptr.deinit();
         }
@@ -861,7 +870,10 @@ pub const ForkChoice = struct {
                     .validator_id = validator_id,
                     .data_root = data_root,
                 };
-                try self.gossip_signatures.put(sig_key, signed_attestation.signature);
+                try self.gossip_signatures.put(sig_key, .{
+                    .slot = attestation_slot,
+                    .signature = signed_attestation.signature,
+                });
             }
         }
         try self.attestations.put(validator_id, attestation_tracker);
@@ -886,73 +898,73 @@ pub const ForkChoice = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
         }
-        try gop.value_ptr.append(proof);
+        try gop.value_ptr.append(.{
+            .slot = attestation_data.slot,
+            .proof = proof,
+        });
     }
 
     /// Prune gossip_signatures and aggregated_payloads for attestations at or before the finalized slot.
     /// This is called after finalization to clean up signature data that is no longer needed.
     pub fn pruneSignatureMaps(self: *Self, finalized_slot: types.Slot) !void {
-        var keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
-        defer keys_to_remove.deinit();
+        var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
+        defer gossip_keys_to_remove.deinit();
 
-        // Iterate through attestations to find entries with slots <= finalized_slot
-        var att_iter = self.attestations.iterator();
-        while (att_iter.next()) |entry| {
-            const validator_id = entry.key_ptr.*;
-            const tracker = entry.value_ptr.*;
+        var payload_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
+        defer payload_keys_to_remove.deinit();
 
-            // Check latestKnown attestation
-            if (tracker.latestKnown) |known| {
-                if (known.slot <= finalized_slot) {
-                    if (known.attestation_data) |att_data| {
-                        const data_root = att_data.sszRoot(self.allocator) catch continue;
-                        const sig_key = SignatureKey{
-                            .validator_id = @intCast(validator_id),
-                            .data_root = data_root,
-                        };
-                        try keys_to_remove.append(sig_key);
-                    }
-                }
-            }
-
-            // Check latestNew attestation
-            if (tracker.latestNew) |new| {
-                if (new.slot <= finalized_slot) {
-                    if (new.attestation_data) |att_data| {
-                        const data_root = att_data.sszRoot(self.allocator) catch continue;
-                        const sig_key = SignatureKey{
-                            .validator_id = @intCast(validator_id),
-                            .data_root = data_root,
-                        };
-                        try keys_to_remove.append(sig_key);
-                    }
-                }
-            }
-        }
-
-        // Remove entries from both maps
         var gossip_removed: usize = 0;
         var payloads_removed: usize = 0;
 
-        for (keys_to_remove.items) |sig_key| {
-            // Remove from gossip_signatures
+        // Identify gossip signatures that are at or before the finalized slot
+        var gossip_it = self.gossip_signatures.iterator();
+        while (gossip_it.next()) |entry| {
+            if (entry.value_ptr.slot <= finalized_slot) {
+                try gossip_keys_to_remove.append(entry.key_ptr.*);
+            }
+        }
+
+        for (gossip_keys_to_remove.items) |sig_key| {
             if (self.gossip_signatures.remove(sig_key)) {
                 gossip_removed += 1;
             }
+        }
 
-            // Remove from aggregated_payloads (also deinit the list and proofs)
-            if (self.aggregated_payloads.fetchRemove(sig_key)) |kv| {
-                var list = kv.value;
-                for (list.items) |*proof| {
-                    proof.deinit();
+        // Prune aggregated payload proofs by slot as well
+        var payload_it = self.aggregated_payloads.iterator();
+        while (payload_it.next()) |entry| {
+            var list = entry.value_ptr;
+            var write_index: usize = 0;
+            var removed_here: usize = 0;
+
+            for (list.items) |*stored| {
+                if (stored.slot <= finalized_slot) {
+                    stored.proof.deinit();
+                    removed_here += 1;
+                } else {
+                    list.items[write_index] = stored.*;
+                    write_index += 1;
                 }
-                list.deinit();
-                payloads_removed += 1;
+            }
+
+            if (removed_here > 0) {
+                payloads_removed += removed_here;
+                list.items = list.items[0..write_index];
+            }
+
+            if (list.items.len == 0) {
+                try payload_keys_to_remove.append(entry.key_ptr.*);
+            }
+        }
+
+        for (payload_keys_to_remove.items) |sig_key| {
+            if (self.aggregated_payloads.fetchRemove(sig_key)) |kv| {
+                kv.value.deinit();
             }
         }
 
         if (gossip_removed > 0 or payloads_removed > 0) {
-            self.logger.debug("pruned signature maps: gossip_signatures={d} aggregated_payloads={d} for finalized_slot={d}", .{
+            self.logger.debug("pruned signature maps: gossip_signatures={d} aggregated_payload_proofs={d} for finalized_slot={d}", .{
                 gossip_removed,
                 payloads_removed,
                 finalized_slot,
@@ -1619,7 +1631,7 @@ const RebaseTestContext = struct {
         var it = self.fork_choice.aggregated_payloads.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |*proof| {
-                proof.deinit();
+                proof.proof.deinit();
             }
             entry.value_ptr.deinit();
         }

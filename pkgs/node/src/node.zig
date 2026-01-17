@@ -436,6 +436,10 @@ pub const BeamNode = struct {
                 .{std.fmt.fmtSliceHexLower(block_root[0..])},
             );
 
+            // Store aggregated signature proofs from this block so they can be reused
+            // in future block production. This is the same followup done for gossiped blocks.
+            self.chain.onBlockFollowup(true, signed_block);
+
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
 

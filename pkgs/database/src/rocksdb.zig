@@ -985,14 +985,16 @@ test "save and load block" {
 
     // Create dummy attestation signatures using helper
     var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    errdefer {
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
         for (attestation_signatures.slice()) |*sig| {
             sig.deinit();
         }
         attestation_signatures.deinit();
-    }
+    };
 
     var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     // Save the block
@@ -1089,14 +1091,16 @@ test "batch write and commit" {
 
     // Create dummy attestation signatures using helper
     var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
-    errdefer {
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
         for (attestation_signatures.slice()) |*sig| {
             sig.deinit();
         }
         attestation_signatures.deinit();
-    }
+    };
 
     var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     const test_state_root = test_helpers.createDummyRoot(0xEE);

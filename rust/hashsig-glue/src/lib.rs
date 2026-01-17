@@ -189,12 +189,15 @@ pub unsafe extern "C" fn hashsig_keypair_free(keypair: *mut KeyPair) {
 /// Note: The returned pointer is only valid as long as the KeyPair is alive
 /// # Safety
 /// This is meant to be called from zig, so the pointers will always dereference correctly
+/// The caller must ensure that the keypair pointer is valid or null
 #[no_mangle]
-pub extern "C" fn hashsig_keypair_get_public_key(keypair: *const KeyPair) -> *const PublicKey {
+pub unsafe extern "C" fn hashsig_keypair_get_public_key(
+    keypair: *const KeyPair,
+) -> *const PublicKey {
     if keypair.is_null() {
         return ptr::null();
     }
-    unsafe { &(*keypair).public_key }
+    &(*keypair).public_key
 }
 
 /// Get a pointer to the private key from a keypair
@@ -202,12 +205,15 @@ pub extern "C" fn hashsig_keypair_get_public_key(keypair: *const KeyPair) -> *co
 /// Note: The returned pointer is only valid as long as the KeyPair is alive
 /// # Safety
 /// This is meant to be called from zig, so the pointers will always dereference correctly
+/// The caller must ensure that the keypair pointer is valid or null
 #[no_mangle]
-pub extern "C" fn hashsig_keypair_get_private_key(keypair: *const KeyPair) -> *const PrivateKey {
+pub unsafe extern "C" fn hashsig_keypair_get_private_key(
+    keypair: *const KeyPair,
+) -> *const PrivateKey {
     if keypair.is_null() {
         return ptr::null();
     }
-    unsafe { &(*keypair).private_key }
+    &(*keypair).private_key
 }
 
 /// Construct a standalone public key from SSZ-encoded bytes.

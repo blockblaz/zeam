@@ -81,9 +81,14 @@ pub fn verifySignatures(
         var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
         defer participant_indices.deinit();
 
-        // Verify that the participants match the attestation aggregation bits
+        // Verify that the participants EXACTLY match the attestation aggregation bits.
         if (validator_indices.items.len != participant_indices.items.len) {
             return StateTransitionError.InvalidBlockSignatures;
+        }
+        for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
+            if (att_idx != proof_idx) {
+                return StateTransitionError.InvalidBlockSignatures;
+            }
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
