@@ -690,12 +690,11 @@ fn processBlockStep(
         }
     }
 
-    const signed_attestation = types.SignedAttestation{
+    const attestation = types.Attestation{
         .validator_id = proposer_attestation.validator_id,
-        .message = proposer_attestation.data,
-        .signature = types.ZERO_SIGBYTES,
+        .data = proposer_attestation.data,
     };
-    try ctx.fork_choice.onAttestation(signed_attestation, false);
+    try ctx.fork_choice.onAttestation(attestation, false);
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {

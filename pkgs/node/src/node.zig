@@ -839,7 +839,7 @@ pub const BeamNode = struct {
             data.slot,
             validator_id,
         });
-        try self.chain.onAttestation(signed_attestation);
+        try self.chain.onGossipAttestation(signed_attestation);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };

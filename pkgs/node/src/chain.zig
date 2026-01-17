@@ -868,7 +868,7 @@ pub const BeamChain = struct {
                 };
 
                 // Process validated attestation
-                self.onAttestation(signed_attestation) catch |err| {
+                self.onGossipAttestation(signed_attestation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
@@ -999,7 +999,7 @@ pub const BeamChain = struct {
                         .signature = types.ZERO_SIGBYTES,
                     };
 
-                    self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                    self.forkChoice.onGossipAttestation(signed_attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                         self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
                         continue;
@@ -1022,7 +1022,7 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
-        self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
+        self.forkChoice.onGossipAttestation(signed_proposer_attestation, false) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -1444,7 +1444,7 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
+    pub fn onGossipAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
         const attestation = signedAttestation.toAttestation();
         try self.validateAttestation(attestation, false);
@@ -1459,7 +1459,7 @@ pub const BeamChain = struct {
             &signedAttestation.signature,
         );
 
-        return self.forkChoice.onAttestation(signedAttestation, false);
+        return self.forkChoice.onGossipAttestation(signedAttestation, false);
     }
 
     pub fn getStatus(self: *Self) types.Status {
@@ -2186,7 +2186,7 @@ test "attestation processing - valid block attestation" {
     };
 
     // Process attestation through chain (this validates and then processes)
-    try beam_chain.onAttestation(valid_attestation);
+    try beam_chain.onGossipAttestation(valid_attestation);
 
     // Verify the attestation was recorded in attestations
     const attestations_tracker = beam_chain.forkChoice.attestations.get(1);
