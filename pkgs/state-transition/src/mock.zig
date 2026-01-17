@@ -278,8 +278,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         }
 
         // Build gossip signatures map from attestations
-        var gossip_signatures = types.SignaturesMap.init(allocator);
-        defer gossip_signatures.deinit();
+        var signatures_map = types.SignaturesMap.init(allocator);
+        defer signatures_map.deinit();
 
         for (attestations.items) |attestation| {
             // Get the serialized signature bytes
@@ -288,7 +288,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             // Compute data root for the signature key
             const data_root = try attestation.data.sszRoot(allocator);
 
-            try gossip_signatures.put(
+            try signatures_map.put(
                 .{ .validator_id = attestation.validator_id, .data_root = data_root },
                 .{ .slot = attestation.data.slot, .signature = sig_buffer },
             );
@@ -312,8 +312,8 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         };
         try aggregation.computeAggregatedSignatures(
             attestations.items,
-            beam_state.validators,
-            &gossip_signatures,
+            &beam_state.validators,
+            &signatures_map,
             null, // no pre-aggregated payloads in mock
         );
 

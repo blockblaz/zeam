@@ -140,6 +140,9 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clean up forkchoice resources (gossip_signatures, aggregated_payloads)
+        self.forkChoice.deinit();
+
         var it = self.states.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -303,7 +306,7 @@ pub const BeamChain = struct {
         };
         try aggregation.computeAggregatedSignatures(
             attestations,
-            pre_state.validators,
+            &pre_state.validators,
             &self.forkChoice.gossip_signatures,
             &self.forkChoice.aggregated_payloads,
         );
@@ -682,17 +685,9 @@ pub const BeamChain = struct {
                         continue;
                     };
 
-                    // Note: With aggregated signatures, individual signatures are not available.
-                    // The signature verification happens via AggregatedSignatureProof.verify() in state-transition.
-                    const signed_attestation = types.SignedAttestation{
-                        .validator_id = validator_id,
-                        .message = attestation.data,
-                        .signature = types.ZERO_SIGBYTES,
-                    };
-
-                    self.forkChoice.onGossipAttestation(signed_attestation, true) catch |e| {
+                    self.forkChoice.onAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                        self.module_logger.err("error processing block attestation={any} e={any}", .{ attestation, e });
                         continue;
                     };
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
