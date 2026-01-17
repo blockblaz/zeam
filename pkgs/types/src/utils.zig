@@ -53,6 +53,38 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     return false;
 }
 
+pub fn justifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
+    if (slot <= finalized_slot) {
+        return null;
+    }
+    const base: types.Slot = finalized_slot + 1;
+    return @intCast(slot - base);
+}
+
+pub fn isSlotJustified(finalized_slot: types.Slot, justified_slots: *const types.JustifiedSlots, slot: types.Slot) !bool {
+    const idx_opt = justifiedSlotsIndex(finalized_slot, slot);
+    if (idx_opt == null) {
+        return true;
+    }
+    const idx = idx_opt.?;
+    if (idx >= justified_slots.len()) {
+        return StateTransitionError.InvalidJustificationIndex;
+    }
+    return try justified_slots.get(idx);
+}
+
+pub fn setSlotJustified(finalized_slot: types.Slot, justified_slots: *types.JustifiedSlots, slot: types.Slot, value: bool) !void {
+    const idx_opt = justifiedSlotsIndex(finalized_slot, slot);
+    if (idx_opt == null) {
+        return;
+    }
+    const idx = idx_opt.?;
+    if (idx >= justified_slots.len()) {
+        return StateTransitionError.InvalidJustificationIndex;
+    }
+    try justified_slots.set(idx, value);
+}
+
 // Helper function to convert bytes to hex string
 pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
