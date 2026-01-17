@@ -209,29 +209,13 @@ pub const ForkChoiceParams = struct {
     logger: zeam_utils.ModuleLogger,
 };
 
-/// SignatureKey is used to index signatures by (validator_id, data_root).
-/// This is the composite key for both gossip_signatures and aggregated_payloads maps.
-pub const SignatureKey = struct {
-    validator_id: ValidatorIndex,
-    data_root: Root,
-};
-
-const StoredGossipSignature = struct {
-    slot: types.Slot,
-    signature: types.SIGBYTES,
-};
-
-/// Map type for gossip signatures: SignatureKey -> individual XMSS signature bytes + slot metadata
-const GossipSignaturesMap = std.AutoHashMap(SignatureKey, StoredGossipSignature);
-
-/// Map type for aggregated payloads from blocks: SignatureKey -> list of AggregatedSignatureProof
-/// Using ArrayList since each key can map to multiple proofs from different blocks
-const StoredAggregatedPayload = struct {
-    slot: types.Slot,
-    proof: AggregatedSignatureProof,
-};
-const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
-const AggregatedPayloadsMap = std.AutoHashMap(SignatureKey, AggregatedPayloadsList);
+// Use shared signature map types from types package
+const SignatureKey = types.SignatureKey;
+const StoredSignature = types.StoredSignature;
+const SignaturesMap = types.SignaturesMap;
+const StoredAggregatedPayload = types.StoredAggregatedPayload;
+const AggregatedPayloadsList = types.AggregatedPayloadsList;
+const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
 
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
@@ -249,7 +233,7 @@ pub const ForkChoice = struct {
     deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
     // Per-validator XMSS signatures learned from gossip, keyed by (validator_id, attestation_data_root)
-    gossip_signatures: GossipSignaturesMap,
+    gossip_signatures: SignaturesMap,
     // Aggregated signature proofs learned from blocks, keyed by (validator_id, attestation_data_root)
     // Values are lists since we may receive multiple proofs for the same key from different blocks
     aggregated_payloads: AggregatedPayloadsMap,
@@ -283,7 +267,7 @@ pub const ForkChoice = struct {
         };
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
         const deltas = std.ArrayList(isize).init(allocator);
-        const gossip_signatures = GossipSignaturesMap.init(allocator);
+        const gossip_signatures = SignaturesMap.init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
 
         var fc = Self{
@@ -1273,7 +1257,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
-        .gossip_signatures = GossipSignaturesMap.init(allocator),
+        .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
     };
     defer fork_choice.attestations.deinit();
@@ -1589,7 +1573,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
-        .gossip_signatures = GossipSignaturesMap.init(allocator),
+        .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
     };
 
@@ -2535,7 +2519,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
         .deltas = std.ArrayList(isize).init(allocator),
         .logger = module_logger,
-        .gossip_signatures = GossipSignaturesMap.init(allocator),
+        .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're

@@ -24,8 +24,13 @@ pub const AggregatedAttestations = block.AggregatedAttestations;
 pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
 pub const AttestationSignatures = block.AttestationSignatures;
 pub const BlockSignatures = block.BlockSignatures;
-pub const aggregateSignedAttestations = block.aggregateSignedAttestations;
 pub const createBlockSignatures = block.createBlockSignatures;
+pub const SignatureKey = block.SignatureKey;
+pub const StoredSignature = block.StoredSignature;
+pub const SignaturesMap = block.SignaturesMap;
+pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
+pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
+pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

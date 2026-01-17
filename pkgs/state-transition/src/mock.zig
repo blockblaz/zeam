@@ -277,90 +277,45 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
-        var signed_attestations = std.ArrayList(types.SignedAttestation).init(allocator);
-        defer signed_attestations.deinit();
-
-        // Keep signature handles for aggregation
-        var signature_handles = std.ArrayList(xmss.Signature).init(allocator);
-        defer {
-            for (signature_handles.items) |*sig| {
-                sig.deinit();
-            }
-            signature_handles.deinit();
-        }
+        // Build gossip signatures map from attestations
+        var gossip_signatures = types.SignaturesMap.init(allocator);
+        defer gossip_signatures.deinit();
 
         for (attestations.items) |attestation| {
-            // Get signature handle for aggregation
-            var sig_handle = try key_manager.signAttestationWithHandle(&attestation, allocator);
-            errdefer sig_handle.deinit();
+            // Get the serialized signature bytes
+            const sig_buffer = try key_manager.signAttestation(&attestation, allocator);
 
-            // Also get the serialized signature bytes
-            var sig_buffer: types.SIGBYTES = undefined;
-            const bytes_written = try sig_handle.toBytes(&sig_buffer);
-            if (bytes_written < types.SIGSIZE) {
-                @memset(sig_buffer[bytes_written..], 0);
-            }
+            // Compute data root for the signature key
+            const data_root = try attestation.data.sszRoot(allocator);
 
-            try signed_attestations.append(.{
-                .validator_id = attestation.validator_id,
-                .message = attestation.data,
-                .signature = sig_buffer,
-            });
-
-            try signature_handles.append(sig_handle);
+            try gossip_signatures.put(
+                .{ .validator_id = attestation.validator_id, .data_root = data_root },
+                .{ .slot = attestation.data.slot, .signature = sig_buffer },
+            );
         }
 
-        // Group attestations (this creates AggregatedSignatureProof with just participants set)
-        var aggregation = try types.aggregateSignedAttestations(allocator, signed_attestations.items);
+        // Compute aggregated signatures using the shared method
+        var aggregation = try types.AggregatedAttestationsResult.init(allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
-        errdefer if (agg_att_cleanup) aggregation.attestations.deinit();
+        errdefer if (agg_att_cleanup) {
+            for (aggregation.attestations.slice()) |*att| {
+                att.deinit();
+            }
+            aggregation.attestations.deinit();
+        };
         errdefer if (agg_sig_cleanup) {
             for (aggregation.attestation_signatures.slice()) |*sig| {
                 sig.deinit();
             }
             aggregation.attestation_signatures.deinit();
         };
-
-        // Now perform actual aggregation for each group
-        // Since all attestations in this slot have the same data, there's only one group
-        if (aggregation.attestation_signatures.len() > 0) {
-            for (aggregation.attestation_signatures.slice(), aggregation.attestations.slice()) |*sig_proof, agg_att| {
-                // Get validator indices from the aggregation bits
-                var validator_indices = try types.aggregationBitsToValidatorIndices(&agg_att.aggregation_bits, allocator);
-                defer validator_indices.deinit();
-
-                if (validator_indices.items.len > 0) {
-                    // Collect public keys and signatures for this group
-                    var pub_keys = try allocator.alloc(*const xmss.HashSigPublicKey, validator_indices.items.len);
-                    defer allocator.free(pub_keys);
-
-                    var sig_ptrs = try allocator.alloc(*const xmss.HashSigSignature, validator_indices.items.len);
-                    defer allocator.free(sig_ptrs);
-
-                    for (validator_indices.items, 0..) |val_idx, i| {
-                        pub_keys[i] = try key_manager.getPublicKeyHandle(val_idx);
-                        // Find the signature handle for this validator
-                        for (signed_attestations.items, 0..) |signed_att, j| {
-                            if (signed_att.validator_id == val_idx) {
-                                sig_ptrs[i] = signature_handles.items[j].handle;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Compute message hash
-                    var message_hash: [32]u8 = undefined;
-                    try ssz.hashTreeRoot(types.AttestationData, agg_att.data, &message_hash, allocator);
-
-                    const epoch: u32 = @intCast(agg_att.data.slot);
-
-                    // Perform the actual aggregation
-                    xmss.setupProver();
-                    try xmss.aggregateSignatures(pub_keys, sig_ptrs, &message_hash, epoch, &sig_proof.proof_data);
-                }
-            }
-        }
+        try aggregation.computeAggregatedSignatures(
+            attestations.items,
+            beam_state.validators,
+            &gossip_signatures,
+            null, // no pre-aggregated payloads in mock
+        );
 
         const proposer_index = slot % genesis_config.numValidators();
         var block = types.BeamBlock{
