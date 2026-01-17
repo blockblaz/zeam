@@ -70,9 +70,7 @@ pub fn verifySignatures(
 
     const validators = state.validators.constSlice();
 
-    for (attestations, 0..) |aggregated_attestation, i| {
-        const signature_proof = &signature_proofs[i];
-
+    for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
         // Get validator indices from the attestation's aggregation bits
         var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
         defer validator_indices.deinit();
@@ -92,13 +90,13 @@ pub fn verifySignatures(
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
-        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
-        defer {
-            for (pubkey_wrappers.items) |*wrapper| {
-                wrapper.deinit();
-            }
-            pubkey_wrappers.deinit();
-        }
+        // var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        // defer {
+        //     for (pubkey_wrappers.items) |*wrapper| {
+        //         wrapper.deinit();
+        //     }
+        //     pubkey_wrappers.deinit();
+        // }
 
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
         defer public_keys.deinit();
@@ -109,11 +107,10 @@ pub fn verifySignatures(
             }
             const validator = &validators[validator_index];
             const pubkey_bytes = validator.getPubkey();
-            const pubkey_wrapper = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+            const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
                 return StateTransitionError.InvalidBlockSignatures;
             };
-            try pubkey_wrappers.append(pubkey_wrapper);
-            try public_keys.append(pubkey_wrappers.items[pubkey_wrappers.items.len - 1].handle);
+            try public_keys.append(pubkey.handle);
         }
 
         // Compute message hash from attestation data

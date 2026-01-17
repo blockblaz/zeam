@@ -18,25 +18,7 @@ const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
 
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);

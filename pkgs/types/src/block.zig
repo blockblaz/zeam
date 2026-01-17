@@ -26,25 +26,7 @@ const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
 
 // Types
 pub const BeamBlockBody = struct {
@@ -292,7 +274,7 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
 const AggregationGroup = struct {
     data: attestation.AttestationData,
     bits: attestation.AggregationBits,
-    signatures: aggregation.AggregatedSignatureProof,
+    signature_proof: aggregation.AggregatedSignatureProof,
 
     const Self = @This();
 
@@ -310,7 +292,7 @@ const AggregationGroup = struct {
         return Self{
             .data = signed_attestation.message,
             .bits = bits,
-            .signatures = signatures,
+            .signature_proof = signatures,
         };
     }
 };
@@ -346,7 +328,7 @@ pub fn aggregateSignedAttestations(
     defer groups.deinit();
     errdefer for (groups.items) |*group| {
         group.bits.deinit();
-        group.signatures.deinit();
+        group.signature_proof.deinit();
     };
 
     var root_indices = std.AutoHashMap(Root, usize).init(allocator);
@@ -358,7 +340,7 @@ pub fn aggregateSignedAttestations(
             var group = &groups.items[group_index];
             const validator_index: usize = @intCast(signed_attestation.validator_id);
             try attestation.aggregationBitsSet(&group.bits, validator_index, true);
-            try attestation.aggregationBitsSet(&group.signatures.participants, validator_index, true);
+            try attestation.aggregationBitsSet(&group.signature_proof.participants, validator_index, true);
         } else {
             const new_group = try AggregationGroup.init(allocator, signed_attestation);
             try groups.append(new_group);
@@ -369,7 +351,7 @@ pub fn aggregateSignedAttestations(
 
     for (groups.items) |group| {
         try aggregated_attestations.append(.{ .aggregation_bits = group.bits, .data = group.data });
-        try attestation_signatures.append(group.signatures);
+        try attestation_signatures.append(group.signature_proof);
     }
 
     return .{

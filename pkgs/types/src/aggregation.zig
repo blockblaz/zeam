@@ -13,25 +13,7 @@ const attestation = @import("./attestation.zig");
 const AggregationBits = attestation.AggregationBits;
 const ByteListMiB = xmss.ByteListMiB;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
 
 // Types
 pub const AggregatedSignatureProof = struct {
@@ -94,7 +76,6 @@ pub const AggregatedSignatureProof = struct {
         try xmss.aggregateSignatures(public_keys, signatures, message_hash, @intCast(epoch), &aggregated_signature_proof.proof_data);
 
         // Transfer ownership only after aggregation succeeds
-        aggregated_signature_proof.participants.deinit();
         aggregated_signature_proof.participants = participants;
     }
 
