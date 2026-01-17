@@ -892,6 +892,130 @@ test "isSlotJustified errors on out of bounds" {
     );
 }
 
+test "duplicate roots in root_to_slots mapping" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    // Phase 1: Build a chain and justify slot 1.
+    try state.process_slots(std.testing.allocator, 1, logger);
+    var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_1.deinit();
+    try state.process_block(std.testing.allocator, block_1, logger);
+
+    try state.process_slots(std.testing.allocator, 2, logger);
+    var block_2_parent_root: Root = undefined;
+    try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
+
+    var att_0_to_1 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = block_1.parent_root, .slot = 0 },
+        .{ .root = block_2_parent_root, .slot = 1 },
+    );
+    errdefer att_0_to_1.deinit();
+
+    var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
+    defer block_2.deinit();
+    try state.process_block(std.testing.allocator, block_2, logger);
+
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_justified.slot);
+
+    // Phase 2: Extend chain to populate more history entries.
+    try state.process_slots(std.testing.allocator, 3, logger);
+    var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_3.deinit();
+    try state.process_block(std.testing.allocator, block_3, logger);
+
+    try state.process_slots(std.testing.allocator, 4, logger);
+    var block_4 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_4.deinit();
+    try state.process_block(std.testing.allocator, block_4, logger);
+
+    try state.process_slots(std.testing.allocator, 5, logger);
+    var block_5 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_5.deinit();
+    try state.process_block_header(std.testing.allocator, block_5, logger);
+
+    // Phase 3: Inject duplicate roots to simulate missed blocks.
+    const slot_3_root = try state.historical_block_hashes.get(3);
+    const historical_slice = state.historical_block_hashes.constSlice();
+    var modified_hashes = try HistoricalBlockHashes.init(std.testing.allocator);
+    errdefer modified_hashes.deinit();
+    for (historical_slice, 0..) |root, i| {
+        var new_root = root;
+        if (i == 2 or i == 4) {
+            new_root = utils.ZERO_HASH;
+        }
+        try modified_hashes.append(new_root);
+    }
+
+    var pending_roots = try JustificationRoots.init(std.testing.allocator);
+    errdefer pending_roots.deinit();
+    try pending_roots.append(slot_3_root);
+
+    var pending_validators = try JustificationValidators.init(std.testing.allocator);
+    errdefer pending_validators.deinit();
+    try pending_validators.append(true);
+    try pending_validators.append(false);
+    try pending_validators.append(false);
+
+    state.historical_block_hashes.deinit();
+    state.historical_block_hashes = modified_hashes;
+    state.justifications_roots.deinit();
+    state.justifications_roots = pending_roots;
+    state.justifications_validators.deinit();
+    state.justifications_validators = pending_validators;
+
+    const root_2 = try state.historical_block_hashes.get(2);
+    const root_4 = try state.historical_block_hashes.get(4);
+    const root_3 = try state.historical_block_hashes.get(3);
+    try std.testing.expect(std.mem.eql(u8, &root_2, &utils.ZERO_HASH));
+    try std.testing.expect(std.mem.eql(u8, &root_4, &utils.ZERO_HASH));
+    try std.testing.expect(std.mem.eql(u8, &root_3, &slot_3_root));
+
+    // Phase 4: Trigger finalization to exercise pruning.
+    const source_1_root = try state.historical_block_hashes.get(1);
+    var att_1_to_2 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = source_1_root, .slot = 1 },
+        .{ .root = utils.ZERO_HASH, .slot = 2 },
+    );
+    errdefer att_1_to_2.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*att| {
+            att.deinit();
+        }
+        attestations_list.deinit();
+    }
+    var att_copy = att_1_to_2;
+    var appended = false;
+    defer if (!appended) att_copy.deinit();
+    try attestations_list.append(att_copy);
+    appended = true;
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger);
+
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
+
+    var found = false;
+    for (state.justifications_roots.constSlice()) |root| {
+        if (std.mem.eql(u8, &root, &slot_3_root)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "encode decode state roundtrip" {
     const block_header = BeamBlockHeader{
         .slot = 0,
