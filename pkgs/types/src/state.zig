@@ -127,10 +127,6 @@ pub const BeamState = struct {
         const num_validators = self.validatorCount();
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
-            if (std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH)) {
-                continue;
-            }
-
             const validator_data = try allocator.alloc(u8, num_validators);
             errdefer allocator.free(validator_data);
             // Copy existing justification data if available, otherwise return error
@@ -156,7 +152,6 @@ pub const BeamState = struct {
             if (kv.value_ptr.*.len != self.validatorCount()) {
                 return error.InvalidJustificationLength;
             }
-            if (std.mem.eql(u8, &kv.key_ptr.*, &utils.ZERO_HASH)) continue;
             try new_justifications_roots.append(kv.key_ptr.*);
         }
 
@@ -363,15 +358,27 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
-        var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
-        defer root_to_slot.deinit(allocator);
+        var root_to_slots: std.AutoHashMapUnmanaged(Root, std.ArrayListUnmanaged(Slot)) = .empty;
+        defer {
+            var iter = root_to_slots.iterator();
+            while (iter.next()) |entry| {
+                entry.value_ptr.*.deinit(allocator);
+            }
+            root_to_slots.deinit(allocator);
+        }
         const start_slot: usize = @intCast(finalized_slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
         if (start_slot < historical_len_usize) {
             var i: usize = start_slot;
             while (i < historical_len_usize) : (i += 1) {
                 const root = try self.historical_block_hashes.get(i);
-                try root_to_slot.put(allocator, root, @intCast(i));
+                if (root_to_slots.getPtr(root)) |slots| {
+                    try slots.append(allocator, @intCast(i));
+                } else {
+                    var slots = std.ArrayListUnmanaged(Slot){};
+                    try slots.append(allocator, @intCast(i));
+                    try root_to_slots.put(allocator, root, slots);
+                }
             }
         }
 
@@ -494,8 +501,18 @@ pub const BeamState = struct {
                         defer roots_to_remove.deinit();
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
-                            const slot_value = root_to_slot.get(entry.key_ptr.*) orelse 0;
-                            if (slot_value <= finalized_slot) {
+                            if (root_to_slots.get(entry.key_ptr.*)) |slots| {
+                                var keep = false;
+                                for (slots.items) |slot_value| {
+                                    if (slot_value > finalized_slot) {
+                                        keep = true;
+                                        break;
+                                    }
+                                }
+                                if (!keep) {
+                                    try roots_to_remove.append(entry.key_ptr.*);
+                                }
+                            } else {
                                 try roots_to_remove.append(entry.key_ptr.*);
                             }
                         }
