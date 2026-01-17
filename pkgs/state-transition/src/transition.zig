@@ -90,14 +90,6 @@ pub fn verifySignatures(
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
-        // var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
-        // defer {
-        //     for (pubkey_wrappers.items) |*wrapper| {
-        //         wrapper.deinit();
-        //     }
-        //     pubkey_wrappers.deinit();
-        // }
-
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
         defer public_keys.deinit();
 

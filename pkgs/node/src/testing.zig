@@ -208,7 +208,6 @@ pub const NodeTestContext = struct {
                 const epoch: u32 = @intCast(aggregated_attestation.data.slot);
 
                 // Perform the actual aggregation
-                xmss.setupProver();
                 try xmss.aggregateSignatures(pub_keys, sig_ptrs, &message_hash, epoch, &signature_proof.proof_data);
             }
 
