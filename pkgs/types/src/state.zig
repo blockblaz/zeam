@@ -286,21 +286,17 @@ pub const BeamState = struct {
             self.latest_finalized.root = staged_block.parent_root;
         }
 
-        // extend historical block hashes using SSZ Lists directly
+        // extend historical block hashes and justified slots structures using SSZ Lists directly
         try self.historical_block_hashes.append(staged_block.parent_root);
-
-        // Update justified slots relative to the finalized boundary.
-        // The first bit corresponds to (latest_finalized.slot + 1).
-        // Extend capacity up to the last materialized slot (block.slot - 1).
-        const finalized_slot: Slot = self.latest_finalized.slot;
-        const last_materialized_slot: Slot = staged_block.slot - 1;
-        try self.extendJustifiedSlots(finalized_slot, last_materialized_slot);
+        // if parent is genesis it is already justified
+        try self.justified_slots.append(if (self.latest_block_header.slot == 0) true else false);
 
         const block_slot: usize = @intCast(staged_block.slot);
         const missed_slots: usize = @intCast(block_slot - self.latest_block_header.slot - 1);
         for (0..missed_slots) |i| {
             _ = i;
             try self.historical_block_hashes.append(utils.ZERO_HASH);
+            try self.justified_slots.append(false);
         }
         logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
 
@@ -367,17 +363,15 @@ pub const BeamState = struct {
         }
         const start_slot: usize = @intCast(finalized_slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
-        if (start_slot < historical_len_usize) {
-            var i: usize = start_slot;
-            while (i < historical_len_usize) : (i += 1) {
-                const root = try self.historical_block_hashes.get(i);
-                if (root_to_slots.getPtr(root)) |slots| {
-                    try slots.append(allocator, @intCast(i));
-                } else {
-                    var slots = std.ArrayListUnmanaged(Slot){};
-                    try slots.append(allocator, @intCast(i));
-                    try root_to_slots.put(allocator, root, slots);
-                }
+        var i: usize = start_slot;
+        while (i < historical_len_usize) : (i += 1) {
+            const root = try self.historical_block_hashes.get(i);
+            if (root_to_slots.getPtr(root)) |slots| {
+                try slots.append(allocator, @intCast(i));
+            } else {
+                var slots = std.ArrayListUnmanaged(Slot){};
+                try slots.append(allocator, @intCast(i));
+                try root_to_slots.put(allocator, root, slots);
             }
         }
 
@@ -438,8 +432,8 @@ pub const BeamState = struct {
 
             var target_justifications = justifications.get(attestation_data.target.root) orelse targetjustifications: {
                 var targetjustifications = try allocator.alloc(u8, num_validators);
-                for (0..targetjustifications.len) |i| {
-                    targetjustifications[i] = 0;
+                for (0..targetjustifications.len) |idx| {
+                    targetjustifications[idx] = 0;
                 }
                 try justifications.put(allocator, attestation_data.target.root, targetjustifications);
                 break :targetjustifications targetjustifications;
