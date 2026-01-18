@@ -93,6 +93,15 @@ pub fn verifySignatures(
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
         defer public_keys.deinit();
 
+        // Store the PublicKey wrappers so we can free the Rust handles after verification
+        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        defer {
+            for (pubkey_wrappers.items) |*wrapper| {
+                wrapper.deinit();
+            }
+            pubkey_wrappers.deinit();
+        }
+
         for (validator_indices.items) |validator_index| {
             if (validator_index >= validators.len) {
                 return StateTransitionError.InvalidValidatorId;
@@ -103,6 +112,7 @@ pub fn verifySignatures(
                 return StateTransitionError.InvalidBlockSignatures;
             };
             try public_keys.append(pubkey.handle);
+            try pubkey_wrappers.append(pubkey);
         }
 
         // Compute message hash from attestation data
