@@ -286,18 +286,17 @@ pub const BeamState = struct {
             self.latest_finalized.root = staged_block.parent_root;
         }
 
-        // extend historical block hashes and justified slots structures using SSZ Lists directly
+        // extend historical block hashes structure using SSZ Lists directly
         try self.historical_block_hashes.append(staged_block.parent_root);
-        // Slots after the finalized boundary start as not justified; finalized slots are implicit.
-        try self.justified_slots.append(false);
 
         const block_slot: usize = @intCast(staged_block.slot);
         const missed_slots: usize = @intCast(block_slot - self.latest_block_header.slot - 1);
         for (0..missed_slots) |i| {
             _ = i;
             try self.historical_block_hashes.append(utils.ZERO_HASH);
-            try self.justified_slots.append(false);
         }
+        const last_materialized_slot: Slot = staged_block.slot - 1;
+        try self.extendJustifiedSlots(self.latest_finalized.slot, last_materialized_slot);
         logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
 
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
@@ -802,17 +801,15 @@ test "justified_slots do not include finalized boundary" {
     defer block_1.deinit();
     try state.process_block_header(std.testing.allocator, block_1, logger);
 
-    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
-    try std.testing.expectEqual(false, try state.justified_slots.get(0));
+    try std.testing.expectEqual(@as(usize, 0), state.justified_slots.len());
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_2.deinit();
     try state.process_block_header(std.testing.allocator, block_2, logger);
 
-    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
     try std.testing.expectEqual(false, try state.justified_slots.get(0));
-    try std.testing.expectEqual(false, try state.justified_slots.get(1));
 }
 
 test "justified_slots rebases when finalization advances" {
@@ -865,7 +862,7 @@ test "justified_slots rebases when finalization advances" {
     try state.process_block(std.testing.allocator, block_3, logger);
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
-    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
     try std.testing.expectEqual(true, try state.justified_slots.get(0));
 
     try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 1));
