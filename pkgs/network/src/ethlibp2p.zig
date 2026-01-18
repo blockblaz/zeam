@@ -1,5 +1,4 @@
 const std = @import("std");
-const json = std.json;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -10,7 +9,6 @@ const multiformats = @import("multiformats");
 const Multiaddr = multiformats.multiaddr.Multiaddr;
 const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
-const jsonToString = zeam_utils.jsonToString;
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -318,15 +316,53 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     };
 
-    const message_str = message.toJsonString(zigHandler.allocator) catch |e| {
-        zigHandler.logger.err("Failed to convert message to JSON string: {any}", .{e});
-        return;
-    };
-    defer zigHandler.allocator.free(message_str);
-
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} sender_peer_id={s}{}\n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes, sender_peer_id_slice, node_name });
+    switch (message) {
+        .block => |signed_block| {
+            const block = signed_block.message.block;
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    block.slot,
+                    block.proposer_index,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+        .attestation => |signed_attestation| {
+            const slot = signed_attestation.message.slot;
+            const validator_id = signed_attestation.validator_id;
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    slot,
+                    validator_id,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+    }
+
+    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
+    zigHandler.logger.debug(
+        "network-{d}:: gossip payload json topic={s} from peer={s}{}: {}",
+        .{
+            zigHandler.params.networkId,
+            std.mem.span(topic_str),
+            sender_peer_id_slice,
+            node_name,
+            zeam_utils.LazyJson(interface.GossipMessage).init(zigHandler.allocator, &message),
+        },
+    );
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
@@ -391,16 +427,22 @@ export fn handleRPCRequestFromRustBridge(
     };
     defer request.deinit();
 
-    const request_str = request.toJsonString(zigHandler.allocator) catch |e| {
-        zigHandler.logger.err("Failed to convert RPC request to JSON string from peer={s}{}: {any}", .{ peer_id_slice, node_name, e });
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to format RPC request");
-        return;
-    };
-    defer zigHandler.allocator.free(request_str);
-
     zigHandler.logger.debug(
-        "network-{d}:: !!!handleRPCRequestFromRustBridge peer={s}{} protocol={s} channel={d}:: request={s}",
-        .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_str },
+        "network-{d}:: received RPC request peer={s}{} protocol={s} channel={d} size={d}",
+        .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_bytes.len },
+    );
+
+    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
+    zigHandler.logger.debug(
+        "network-{d}:: rpc request json peer={s}{} protocol={s} channel={d}: {}",
+        .{
+            zigHandler.params.networkId,
+            peer_id_slice,
+            node_name,
+            rpc_protocol.protocolId(),
+            channel_id,
+            zeam_utils.LazyJson(interface.ReqRespRequest).init(zigHandler.allocator, &request),
+        },
     );
 
     const request_method = std.meta.activeTag(request);

@@ -77,7 +77,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         }
 
         // Try to connect to the metrics server
-        const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT) catch {
+        const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
             std.time.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
@@ -167,7 +167,7 @@ const ZeamRequest = struct {
     /// Internal helper to make HTTP requests to any endpoint
     fn makeRequest(self: ZeamRequest, endpoint: []const u8) ![]u8 {
         // Create connection to the server
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
         var connection = try net.tcpConnectToAddress(address);
         defer connection.close();
 
@@ -176,7 +176,7 @@ const ZeamRequest = struct {
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
             "Connection: close\r\n" ++
-            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT });
+            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
 
         try connection.writeAll(request);
 
@@ -217,7 +217,7 @@ const SSEClient = struct {
     parsed_events_queue: std.ArrayList(ChainEvent),
 
     fn init(allocator: std.mem.Allocator) !SSEClient {
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
         const connection = try net.tcpConnectToAddress(address);
 
         return SSEClient{

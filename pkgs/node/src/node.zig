@@ -26,6 +26,8 @@ const forkchoice = @import("./forkchoice.zig");
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
+const ZERO_HASH = types.ZERO_HASH;
+
 const NodeOpts = struct {
     config: configs.ChainConfig,
     anchorState: *types.BeamState,
@@ -144,8 +146,8 @@ pub const BeamNode = struct {
                 }
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.data.slot;
-                const validator_id = signed_attestation.message.validator_id;
+                const slot = signed_attestation.message.slot;
+                const validator_id = signed_attestation.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -825,13 +827,13 @@ pub const BeamNode = struct {
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const message = signed_attestation.message;
-        const data = message.data;
+        const data = signed_attestation.message;
+        const validator_id = signed_attestation.validator_id;
 
         // 1. Process locally through chain
         self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
             data.slot,
-            message.validator_id,
+            validator_id,
         });
         try self.chain.onAttestation(signed_attestation);
 
@@ -841,8 +843,8 @@ pub const BeamNode = struct {
 
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
-            message.validator_id,
-            self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
+            validator_id,
+            self.node_registry.getNodeNameFromValidatorIndex(validator_id),
         });
     }
 
@@ -1032,24 +1034,24 @@ test "Node: fetched blocks cache and deduplication" {
         .message = .{
             .block = .{
                 .slot = 1,
-                .parent_root = [_]u8{0} ** 32,
+                .parent_root = ZERO_HASH,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = 1,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
@@ -1059,22 +1061,22 @@ test "Node: fetched blocks cache and deduplication" {
                 .slot = 2,
                 .parent_root = root1,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = 2,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     // Cache blocks
@@ -1194,22 +1196,22 @@ fn makeTestSignedBlockWithParent(
                 .slot = slot,
                 .parent_root = parent_root,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = types.ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = slot,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     return block_ptr;
@@ -1261,7 +1263,7 @@ test "Node: pruneCachedBlockSubtree prunes root and all cached descendants" {
     const root_c: types.Root = [_]u8{0xCC} ** 32;
     const root_d: types.Root = [_]u8{0xDD} ** 32;
     const root_e: types.Root = [_]u8{0xEE} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
     try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
@@ -1328,7 +1330,7 @@ test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
     const root_b: types.Root = [_]u8{0xBB} ** 32;
     const root_c: types.Root = [_]u8{0xCC} ** 32;
     const root_d: types.Root = [_]u8{0xDD} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
     try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
@@ -1393,7 +1395,7 @@ test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is no
     const root_x: types.Root = [_]u8{0x11} ** 32;
     const root_child: types.Root = [_]u8{0x22} ** 32;
     const root_other: types.Root = [_]u8{0x33} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     // Only cache descendants, not the root_x itself
     try node.network.cacheFetchedBlock(root_child, try makeTestSignedBlockWithParent(allocator, 2, root_x));

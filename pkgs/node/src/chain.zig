@@ -16,7 +16,6 @@ const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
-const jsonToString = zeam_utils.jsonToString;
 
 const utils = @import("./utils.zig");
 pub const fcFactory = @import("./forkchoice.zig");
@@ -27,6 +26,7 @@ const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
 
 const NodeNameRegistry = networks.NodeNameRegistry;
+const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
 pub const BlockProductionParams = struct {
     slot: usize,
@@ -44,6 +44,7 @@ pub const ChainOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     db: database.Db,
     node_registry: *const NodeNameRegistry,
+    force_block_production: bool = false,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -60,8 +61,17 @@ pub const GossipProcessingResult = struct {
 pub const ProducedBlock = struct {
     block: types.BeamBlock,
     blockRoot: types.Root,
-    // signatures corresponding to attestations in the blockbody
-    signatures: types.BlockSignatures,
+
+    // Aggregated signatures corresponding to attestations in the block body.
+    attestation_signatures: types.AttestationSignatures,
+
+    pub fn deinit(self: *ProducedBlock) void {
+        self.block.deinit();
+        for (self.attestation_signatures.slice()) |*sig_group| {
+            sig_group.deinit();
+        }
+        self.attestation_signatures.deinit();
+    }
 };
 
 pub const BeamChain = struct {
@@ -86,6 +96,9 @@ pub const BeamChain = struct {
     last_emitted_finalized: types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
+    force_block_production: bool,
+    // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
+    cached_finalized_state: ?*types.BeamState = null,
 
     const Self = @This();
 
@@ -122,6 +135,7 @@ pub const BeamChain = struct {
             .last_emitted_finalized = fork_choice.fcStore.latest_finalized,
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
+            .force_block_production = opts.force_block_production,
         };
     }
 
@@ -132,9 +146,16 @@ pub const BeamChain = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.states.deinit();
+
+        // Clean up cached finalized state if present
+        if (self.cached_finalized_state) |cached_state| {
+            cached_state.deinit();
+            self.allocator.destroy(cached_state);
+        }
+
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
-        self.anchor_state.deinit();
+        // self.anchor_state.deinit();
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -254,8 +275,18 @@ pub const BeamChain = struct {
         const parent_root = chainHead.blockRoot;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
-        const post_state = try self.allocator.create(types.BeamState);
+        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+        errdefer if (post_state_opt) |post_state_ptr| {
+            post_state_ptr.deinit();
+            self.allocator.destroy(post_state_ptr);
+        };
+        const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
+
+        var aggregation_opt: ?types.AggregatedAttestationsResult = try types.aggregateSignedAttestations(self.allocator, signed_attestations);
+        errdefer if (aggregation_opt) |*aggregation| aggregation.deinit();
+
+        const aggregation = &aggregation_opt.?;
 
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
@@ -267,18 +298,23 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = blk: {
-                    var attestations_list = try types.Attestations.init(self.allocator);
-                    for (signed_attestations) |signed_attestation| {
-                        try attestations_list.append(signed_attestation.message);
-                    }
-                    break :blk attestations_list;
-                },
+                .attestations = aggregation.attestations,
             },
         };
+        errdefer block.deinit();
 
-        var block_json = try block.toJson(self.allocator);
-        const block_str = try jsonToString(self.allocator, block_json);
+        var attestation_signatures = aggregation.attestation_signatures;
+        errdefer {
+            for (attestation_signatures.slice()) |*sig_group| {
+                sig_group.deinit();
+            }
+            attestation_signatures.deinit();
+        }
+
+        // Ownership moved into `block` + `attestation_signatures`.
+        aggregation_opt = null;
+
+        const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
 
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
@@ -286,8 +322,7 @@ pub const BeamChain = struct {
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
 
-        block_json = try block.toJson(self.allocator);
-        const block_str_2 = try jsonToString(self.allocator, block_json);
+        const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
 
         self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
@@ -295,7 +330,17 @@ pub const BeamChain = struct {
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
         try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+
         try self.states.put(block_root, post_state);
+        post_state_opt = null;
+
+        var forkchoice_added = false;
+        errdefer if (!forkchoice_added) {
+            if (self.states.fetchRemove(block_root)) |entry| {
+                entry.value.deinit();
+                self.allocator.destroy(entry.value);
+            }
+        };
 
         // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
@@ -307,18 +352,13 @@ pub const BeamChain = struct {
             // confirmed in publish
             .confirmed = false,
         });
+        forkchoice_added = true;
         _ = try self.forkChoice.updateHead();
 
         return .{
             .block = block,
             .blockRoot = block_root,
-            .signatures = blk: {
-                var signatures_list = try types.BlockSignatures.init(self.allocator);
-                for (signed_attestations) |signed_attestation| {
-                    try signatures_list.append(signed_attestation.signature);
-                }
-                break :blk signatures_list;
-            },
+            .attestation_signatures = attestation_signatures,
         };
     }
 
@@ -493,8 +533,8 @@ pub const BeamChain = struct {
                 return .{};
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.data.slot;
-                const validator_id = signed_attestation.message.validator_id;
+                const slot = signed_attestation.message.slot;
+                const validator_id = signed_attestation.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -507,7 +547,7 @@ pub const BeamChain = struct {
                 });
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_attestation.message, false) catch |err| {
+                self.validateAttestation(signed_attestation.toAttestation(), false) catch |err| {
                     self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     return .{}; // Drop invalid gossip attestations
@@ -538,7 +578,6 @@ pub const BeamChain = struct {
         const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
 
         const block = signedBlock.message.block;
-        const signatures = signedBlock.signature.constSlice();
 
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
@@ -583,30 +622,67 @@ pub const BeamChain = struct {
                 block.slot,
             });
 
-            for (block.body.attestations.constSlice(), 0..) |attestation, index| {
-                // Validate attestation before processing (from block = true)
-                self.validateAttestation(attestation, true) catch |e| {
+            const aggregated_attestations = block.body.attestations.constSlice();
+            const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
+
+            if (aggregated_attestations.len != signature_groups.len) {
+                self.module_logger.err(
+                    "signature group count mismatch for block root=0x{s}: attestations={d} signature_groups={d}",
+                    .{ std.fmt.fmtSliceHexLower(&freshFcBlock.blockRoot), aggregated_attestations.len, signature_groups.len },
+                );
+            }
+
+            for (aggregated_attestations, 0..) |aggregated_attestation, index| {
+                var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
+                defer validator_indices.deinit();
+
+                const group_signatures = if (index < signature_groups.len)
+                    signature_groups[index].constSlice()
+                else
+                    &[_]types.SIGBYTES{};
+
+                if (validator_indices.items.len != group_signatures.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    if (e == AttestationValidationError.UnknownHeadBlock) {
-                        try missing_roots.append(attestation.data.head.root);
-                    }
-
-                    self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
-                        attestation.validator_id,
-                        e,
-                    });
-                    // Skip invalid attestations but continue processing the block
+                    self.module_logger.err(
+                        "attestation signature mismatch index={d} validators={d} signatures={d}",
+                        .{ index, validator_indices.items.len, group_signatures.len },
+                    );
                     continue;
-                };
+                }
 
-                const signed_attestation = types.SignedAttestation{ .message = attestation, .signature = signatures[index] };
+                for (validator_indices.items, group_signatures) |validator_index, signature| {
+                    const validator_id: types.ValidatorIndex = @intCast(validator_index);
+                    const attestation = types.Attestation{
+                        .validator_id = validator_id,
+                        .data = aggregated_attestation.data,
+                    };
 
-                self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
-                    continue;
-                };
-                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
+                    self.validateAttestation(attestation, true) catch |e| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        if (e == AttestationValidationError.UnknownHeadBlock) {
+                            try missing_roots.append(attestation.data.head.root);
+                        }
+
+                        self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
+                            validator_index,
+                            e,
+                        });
+                        continue;
+                    };
+
+                    const signed_attestation = types.SignedAttestation{
+                        .validator_id = validator_id,
+                        .message = attestation.data,
+                        .signature = signature,
+                    };
+
+                    self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                        continue;
+                    };
+                    zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
+                }
             }
 
             // 5. fc update head
@@ -616,10 +692,11 @@ pub const BeamChain = struct {
         };
         try self.states.put(fcBlock.blockRoot, post_state);
 
-        // 6. import proposer attestation as if it was transmitted on network after block
-        const proposer_signature = signatures[block.body.attestations.len()];
+        // 6. proposer attestation
+        const proposer_signature = signedBlock.signature.proposer_signature;
         const signed_proposer_attestation = types.SignedAttestation{
-            .message = signedBlock.message.proposer_attestation,
+            .validator_id = signedBlock.message.proposer_attestation.validator_id,
+            .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
         self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
@@ -823,6 +900,9 @@ pub const BeamChain = struct {
             });
         }
 
+        // Update the latest finalized slot metadata
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, latestFinalized.slot);
+
         // 3. commit all batch ops for finalized indices before we prune
         self.db.commit(&batch);
 
@@ -910,14 +990,16 @@ pub const BeamChain = struct {
         };
 
         const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown target block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{s}", .{
+                data.target.slot,
                 std.fmt.fmtSliceHexLower(&data.target.root),
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
         const head_block = self.forkChoice.getProtoNode(data.head.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown head block root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{s}", .{
+                data.head.slot,
                 std.fmt.fmtSliceHexLower(&data.head.root),
             });
             return AttestationValidationError.UnknownHeadBlock;
@@ -990,12 +1072,18 @@ pub const BeamChain = struct {
 
     pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
-        try self.validateAttestation(signedAttestation.message, false);
+        const attestation = signedAttestation.toAttestation();
+        try self.validateAttestation(attestation, false);
 
-        const attestation = signedAttestation.message;
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
 
-        try stf.verifySingleAttestation(self.allocator, state, &attestation, &signedAttestation.signature);
+        try stf.verifySingleAttestation(
+            self.allocator,
+            state,
+            @intCast(signedAttestation.validator_id),
+            &signedAttestation.message,
+            &signedAttestation.signature,
+        );
 
         return self.forkChoice.onAttestation(signedAttestation, false);
     }
@@ -1010,6 +1098,85 @@ pub const BeamChain = struct {
             .head_root = head.blockRoot,
             .head_slot = head.slot,
         };
+    }
+
+    /// Get the finalized checkpoint state (BeamState) if available
+    /// First checks in-memory states map, then cached DB state, then falls back to database
+    /// Returns null if the state is not available in any location
+    pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
+        const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
+
+        // First try to get from in-memory states map
+        if (self.states.get(finalized_checkpoint.root)) |state| {
+            return state;
+        }
+
+        // Check if we already have a cached state from DB
+        if (self.cached_finalized_state) |cached_state| {
+            return cached_state;
+        }
+
+        // Fallback: try to load from database
+        const state_ptr = self.allocator.create(types.BeamState) catch |err| {
+            self.module_logger.warn("failed to allocate memory for finalized state: {}", .{err});
+            return null;
+        };
+
+        self.db.loadLatestFinalizedState(state_ptr) catch |err| {
+            self.allocator.destroy(state_ptr);
+            self.module_logger.warn("finalized state not available in database: {}", .{err});
+            return null;
+        };
+
+        // Cache in separate field (not in states map to avoid affecting pruning)
+        self.cached_finalized_state = state_ptr;
+
+        self.module_logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
+        return state_ptr;
+    }
+
+    pub const SyncStatus = union(enum) {
+        synced,
+        no_peers,
+        behind_peers: struct {
+            head_slot: types.Slot,
+            max_peer_finalized_slot: types.Slot,
+        },
+    };
+
+    /// Returns detailed sync status information.
+    pub fn getSyncStatus(self: *Self) SyncStatus {
+        // If no peers connected, we can't verify sync status - assume not synced
+        // Unless force_block_production is enabled, which allows block generation without peers
+        if (self.connected_peers.count() == 0 and !self.force_block_production) {
+            return .no_peers;
+        }
+
+        const our_head_slot = self.forkChoice.head.slot;
+        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+
+        // Find the maximum finalized slot reported by any peer
+        var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+
+        var peer_iter = self.connected_peers.iterator();
+        while (peer_iter.next()) |entry| {
+            const peer_info = entry.value_ptr;
+            if (peer_info.latest_status) |status| {
+                if (status.finalized_slot > max_peer_finalized_slot) {
+                    max_peer_finalized_slot = status.finalized_slot;
+                }
+            }
+        }
+
+        // We must also be synced with peers (at or past max peer finalized slot)
+        if (our_head_slot < max_peer_finalized_slot) {
+            return .{ .behind_peers = .{
+                .head_slot = our_head_slot,
+                .max_peer_finalized_slot = max_peer_finalized_slot,
+            } };
+        }
+
+        return .synced;
     }
 };
 
@@ -1247,238 +1414,220 @@ test "attestation validation - comprehensive" {
         const source_slot: types.Slot = 1;
         const target_slot: types.Slot = 2;
         const valid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = target_slot,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[target_slot],
                     .slot = target_slot,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[target_slot],
-                        .slot = target_slot,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[source_slot],
-                        .slot = source_slot,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[target_slot],
-                        .slot = target_slot,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[source_slot],
+                    .slot = source_slot,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[target_slot],
+                    .slot = target_slot,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
         // Should pass validation
-        try beam_chain.validateAttestation(valid_attestation.message, false);
+        try beam_chain.validateAttestation(valid_attestation.toAttestation(), false);
     }
 
     // Test 2: Unknown source block
     {
         const unknown_root = [_]u8{0xFF} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 3: Unknown target block
     {
         const unknown_root = [_]u8{0xEE} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
+                    .slot = 2,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 4: Unknown head block
     {
         const unknown_root = [_]u8{0xDD} ** 32;
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = unknown_root, // Unknown block
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = unknown_root, // Unknown block
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
     // Test 5: Source slot exceeds target slot (block slots)
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 6: Source checkpoint slot exceeds target checkpoint slot
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 7: Source checkpoint slot mismatch
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 0,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 0,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 8: Target checkpoint slot mismatch
     {
         const invalid_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
+                .slot = 2,
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
                     .slot = 2,
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 1, // Checkpoint claims slot 1 (mismatch)
-                    },
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 1, // Checkpoint claims slot 1 (mismatch)
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.message, false));
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
     // Test 9: Attestation too far in future (for gossip)
     {
         const future_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
             .message = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = 3, // Future slot (current is 2)
-                    .head = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
-                    .source = types.Checkpoint{
-                        .root = mock_chain.blockRoots[1],
-                        .slot = 1,
-                    },
-                    .target = types.Checkpoint{
-                        .root = mock_chain.blockRoots[2],
-                        .slot = 2,
-                    },
+                .slot = 3, // Future slot (current is 2)
+                .head = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
+                },
+                .source = types.Checkpoint{
+                    .root = mock_chain.blockRoots[1],
+                    .slot = 1,
+                },
+                .target = types.Checkpoint{
+                    .root = mock_chain.blockRoots[2],
+                    .slot = 2,
                 },
             },
-            .signature = [_]u8{0} ** types.SIGSIZE,
+            .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.message, false));
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.toAttestation(), false));
     }
 }
 
@@ -1533,58 +1682,54 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Current time is at slot 1, create attestation for slot 2 (next slot)
     const next_slot_attestation: types.SignedAttestation = .{
+        .validator_id = 0,
         .message = .{
-            .validator_id = 0,
-            .data = .{
-                .slot = 2,
-                .head = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .source = types.Checkpoint{
-                    .root = mock_chain.blockRoots[0],
-                    .slot = 0,
-                },
-                .target = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
+            .slot = 2,
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[0],
+                .slot = 0,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
             },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+        .signature = ZERO_SIGBYTES,
     };
 
     // Gossip attestations: should FAIL for next slot (current + 1)
     // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false));
 
     // Block attestations: should PASS for next slot (current + 1)
     // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
-    try beam_chain.validateAttestation(next_slot_attestation.message, true);
+    try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), true);
     const too_far_attestation: types.SignedAttestation = .{
+        .validator_id = 0,
         .message = .{
-            .validator_id = 0,
-            .data = .{
-                .slot = 3, // Too far in future
-                .head = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
-                .source = types.Checkpoint{
-                    .root = mock_chain.blockRoots[0],
-                    .slot = 0,
-                },
-                .target = types.Checkpoint{
-                    .root = mock_chain.blockRoots[1],
-                    .slot = 1,
-                },
+            .slot = 3, // Too far in future
+            .head = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
+            },
+            .source = types.Checkpoint{
+                .root = mock_chain.blockRoots[0],
+                .slot = 0,
+            },
+            .target = types.Checkpoint{
+                .root = mock_chain.blockRoots[1],
+                .slot = 1,
             },
         },
-        .signature = [_]u8{0} ** types.SIGSIZE,
+        .signature = ZERO_SIGBYTES,
     };
     // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.message, true));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
@@ -1661,7 +1806,8 @@ test "attestation processing - valid block attestation" {
     const signature = try key_manager.signAttestation(&message, allocator);
 
     const valid_attestation: types.SignedAttestation = .{
-        .message = message,
+        .validator_id = message.validator_id,
+        .message = message.data,
         .signature = signature,
     };
 

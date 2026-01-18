@@ -691,7 +691,8 @@ fn processBlockStep(
     }
 
     const signed_attestation = types.SignedAttestation{
-        .message = proposer_attestation,
+        .validator_id = proposer_attestation.validator_id,
+        .message = proposer_attestation.data,
         .signature = types.ZERO_SIGBYTES,
     };
     try ctx.fork_choice.onAttestation(signed_attestation, false);
@@ -950,7 +951,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("attestationSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "attestationSlot");
-            if (attestation.message.data.slot != expected) {
+            if (attestation.message.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} attestation slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -961,7 +962,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("headSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "headSlot");
-            if (attestation.message.data.head.slot != expected) {
+            if (attestation.message.head.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} head slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -972,7 +973,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("sourceSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "sourceSlot");
-            if (attestation.message.data.source.slot != expected) {
+            if (attestation.message.source.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} source slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -983,7 +984,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("targetSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "targetSlot");
-            if (attestation.message.data.target.slot != expected) {
+            if (attestation.message.target.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} target slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -1201,12 +1202,12 @@ fn parseAttestations(
     case_name: []const u8,
     step_index: ?usize,
     value: JsonValue,
-) FixtureError!types.Attestations {
+) FixtureError!types.AggregatedAttestations {
     switch (value) {
-        .null => return try types.Attestations.init(allocator),
+        .null => return types.AggregatedAttestations.init(allocator) catch return FixtureError.InvalidFixture,
         .object => |obj| {
             const data_value = obj.get("data") orelse {
-                return try types.Attestations.init(allocator);
+                return types.AggregatedAttestations.init(allocator) catch return FixtureError.InvalidFixture;
             };
             const arr = switch (data_value) {
                 .array => |array| array,
@@ -1219,8 +1220,8 @@ fn parseAttestations(
                 },
             };
 
-            var attestations = try types.Attestations.init(allocator);
-            errdefer attestations.deinit();
+            var aggregated_attestations = types.AggregatedAttestations.init(allocator) catch return FixtureError.InvalidFixture;
+            errdefer aggregated_attestations.deinit();
 
             for (arr.items, 0..) |item, idx| {
                 const att_obj = switch (item) {
@@ -1234,16 +1235,57 @@ fn parseAttestations(
                     },
                 };
 
-                var validator_ctx_buf: [96]u8 = undefined;
-                const validator_ctx = std.fmt.bufPrint(&validator_ctx_buf, "attestations[{d}].validator_id", .{idx}) catch "attestations.validator_id";
-                const validator_id = try expectU64Field(
-                    att_obj,
-                    &.{ "validator_id", "validatorIndex", "validatorId" },
-                    fixture_path,
-                    case_name,
-                    step_index,
-                    validator_ctx,
-                );
+                const bits_value = att_obj.get("aggregationBits") orelse {
+                    std.debug.print(
+                        "fixture {s} case {s}{}: attestation #{} missing aggregationBits\n",
+                        .{ fixture_path, case_name, formatStep(step_index), idx },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
+                const bits_obj = switch (bits_value) {
+                    .object => |map| map,
+                    else => {
+                        std.debug.print(
+                            "fixture {s} case {s}{}: attestation #{} aggregationBits must be object\n",
+                            .{ fixture_path, case_name, formatStep(step_index), idx },
+                        );
+                        return FixtureError.InvalidFixture;
+                    },
+                };
+                const bits_data_value = bits_obj.get("data") orelse {
+                    std.debug.print(
+                        "fixture {s} case {s}{}: attestation #{} aggregationBits missing data\n",
+                        .{ fixture_path, case_name, formatStep(step_index), idx },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
+                const bits_arr = switch (bits_data_value) {
+                    .array => |array| array,
+                    else => {
+                        std.debug.print(
+                            "fixture {s} case {s}{}: attestation #{} aggregationBits.data must be array\n",
+                            .{ fixture_path, case_name, formatStep(step_index), idx },
+                        );
+                        return FixtureError.InvalidFixture;
+                    },
+                };
+
+                var aggregation_bits = types.AggregationBits.init(allocator) catch return FixtureError.InvalidFixture;
+                errdefer aggregation_bits.deinit();
+
+                for (bits_arr.items) |bit_value| {
+                    const bit = switch (bit_value) {
+                        .bool => |b| b,
+                        else => {
+                            std.debug.print(
+                                "fixture {s} case {s}{}: attestation #{} aggregationBits element must be bool\n",
+                                .{ fixture_path, case_name, formatStep(step_index), idx },
+                            );
+                            return FixtureError.InvalidFixture;
+                        },
+                    };
+                    aggregation_bits.append(bit) catch return FixtureError.InvalidFixture;
+                }
 
                 const data_obj = try expectObject(att_obj, "data", fixture_path, case_name, step_index);
 
@@ -1276,8 +1318,8 @@ fn parseAttestations(
                 const source_slot_ctx = std.fmt.bufPrint(&source_slot_ctx_buf, "attestations[{d}].data.source.slot", .{idx}) catch "attestations.source.slot";
                 const source_slot = try expectU64Field(source_obj, &.{"slot"}, fixture_path, case_name, step_index, source_slot_ctx);
 
-                const attestation = types.Attestation{
-                    .validator_id = validator_id,
+                const aggregated_attestation = types.AggregatedAttestation{
+                    .aggregation_bits = aggregation_bits,
                     .data = .{
                         .slot = att_slot,
                         .head = .{ .root = head_root, .slot = head_slot },
@@ -1286,7 +1328,7 @@ fn parseAttestations(
                     },
                 };
 
-                attestations.append(attestation) catch |err| {
+                aggregated_attestations.append(aggregated_attestation) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}{}: attestation #{} append failed: {s}\n",
                         .{ fixture_path, case_name, formatStep(step_index), idx, @errorName(err) },
@@ -1295,7 +1337,7 @@ fn parseAttestations(
                 };
             }
 
-            return attestations;
+            return aggregated_attestations;
         },
         else => {
             std.debug.print(

@@ -14,19 +14,23 @@ pub type HashSigPrivateKey = <HashSigScheme as SignatureScheme>::SecretKey;
 pub type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
 pub type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
 
+#[repr(C)]
 pub struct PrivateKey {
     inner: HashSigPrivateKey,
 }
 
+#[repr(C)]
 pub struct PublicKey {
     pub inner: HashSigPublicKey,
 }
 
+#[repr(C)]
 pub struct Signature {
     pub inner: HashSigSignature,
 }
 
 /// KeyPair structure for FFI - holds both public and private keys
+#[repr(C)]
 pub struct KeyPair {
     pub public_key: PublicKey,
     pub private_key: PrivateKey,

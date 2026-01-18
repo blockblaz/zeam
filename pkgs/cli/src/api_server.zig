@@ -2,7 +2,13 @@ const std = @import("std");
 const api = @import("@zeam/api");
 const constants = @import("constants.zig");
 const event_broadcaster = api.event_broadcaster;
-const node = @import("@zeam/node");
+const types = @import("@zeam/types");
+const ssz = @import("ssz");
+const utils_lib = @import("@zeam/utils");
+const LoggerConfig = utils_lib.ZeamLoggerConfig;
+const ModuleLogger = utils_lib.ModuleLogger;
+const node_lib = @import("@zeam/node");
+const BeamChain = node_lib.BeamChain;
 
 const QUERY_SLOTS_PREFIX = "?slots=";
 const DEFAULT_MAX_SLOTS: usize = 50;
@@ -26,20 +32,34 @@ pub const APIServerHandle = struct {
         self.ctx.stop.store(true, .seq_cst);
         self.thread.join();
     }
+
+    pub fn setChain(self: *APIServerHandle, chain: *BeamChain) void {
+        self.ctx.setChain(chain);
+    }
 };
 
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node.fcFactory.ForkChoice) !APIServerHandle {
+/// API server that runs in a background thread
+/// Handles metrics, SSE events, health checks, forkchoice graph, and checkpoint state endpoints
+/// chain is optional - if null, chain-dependent endpoints will return 503
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !APIServerHandle {
+    // Initialize the global event broadcaster for SSE events
+    // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
     var rate_limiter = try RateLimiter.init(allocator);
     errdefer rate_limiter.deinit();
 
+    // Create a logger instance for the API server
+    const logger = logger_config.logger(.api_server);
+
+    // Create the API server context
     const ctx = try allocator.create(ApiServer);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .port = port,
-        .forkchoice = forkchoice,
+        .logger = logger,
+        .chain = chain,
         .stop = std.atomic.Value(bool).init(false),
         .sse_active = 0,
         .graph_inflight = 0,
@@ -48,7 +68,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, forkchoice: *node
 
     const thread = try std.Thread.spawn(.{}, ApiServer.run, .{ctx});
 
-    std.log.info("Metrics server started on port {d}", .{port});
+    logger.info("API server started on port {d}", .{port});
     return .{
         .thread = thread,
         .ctx = ctx,
@@ -59,7 +79,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
     var buffer: [4096]u8 = undefined;
     var http_server = std.http.Server.init(connection, &buffer);
     var request = http_server.receiveHead() catch |err| {
-        std.log.warn("Failed to receive HTTP head: {}", .{err});
+        ctx.logger.warn("failed to receive HTTP head: {}", .{err});
         connection.stream.close();
         return;
     };
@@ -70,8 +90,8 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
             connection.stream.close();
             return;
         }
-        _ = std.Thread.spawn(.{}, ApiServer.handleSSEConnection, .{ connection.stream, allocator, ctx }) catch |err| {
-            std.log.warn("Failed to spawn SSE handler: {}", .{err});
+        _ = std.Thread.spawn(.{}, ApiServer.handleSSEConnection, .{ connection.stream, ctx }) catch |err| {
+            ctx.logger.warn("failed to spawn SSE handler: {}", .{err});
             ctx.releaseSSE();
             connection.stream.close();
         };
@@ -93,7 +113,85 @@ fn handleNonSSERequestWithAddr(
     const request_allocator = arena.allocator();
 
     if (std.mem.eql(u8, request.head.target, "/metrics")) {
-        var metrics_output = std.ArrayList(u8).init(request_allocator);
+        ctx.handleMetrics(request, request_allocator);
+    } else if (std.mem.eql(u8, request.head.target, "/health")) {
+        ctx.handleHealth(request);
+    } else if (std.mem.eql(u8, request.head.target, "/lean/states/finalized")) {
+        ctx.handleFinalizedCheckpointState(request) catch |err| {
+            ctx.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+        };
+    } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
+        handleForkChoiceGraph(request, request_allocator, ctx, client_addr) catch |err| {
+            ctx.logger.warn("fork choice graph request failed: {}", .{err});
+            _ = request.respond("Internal Server Error\n", .{}) catch {};
+        };
+    } else {
+        _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
+    }
+}
+
+/// API server context
+const ApiServer = struct {
+    allocator: std.mem.Allocator,
+    port: u16,
+    logger: ModuleLogger,
+    chain: ?*BeamChain,
+    chain_mutex: std.Thread.Mutex = .{},
+    stop: std.atomic.Value(bool),
+    sse_active: usize,
+    graph_inflight: usize,
+    rate_limiter: RateLimiter,
+    sse_mutex: std.Thread.Mutex = .{},
+    graph_mutex: std.Thread.Mutex = .{},
+
+    const Self = @This();
+
+    fn setChain(self: *ApiServer, chain: *BeamChain) void {
+        self.chain_mutex.lock();
+        defer self.chain_mutex.unlock();
+        self.chain = chain;
+    }
+
+    fn getChain(self: *ApiServer) ?*BeamChain {
+        self.chain_mutex.lock();
+        defer self.chain_mutex.unlock();
+        return self.chain;
+    }
+
+    fn run(self: *Self) !void {
+        defer self.allocator.destroy(self);
+        defer self.rate_limiter.deinit();
+        const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
+            self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
+            return;
+        };
+        var server = address.listen(.{ .reuse_address = true, .force_nonblocking = true }) catch |err| {
+            self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
+            return;
+        };
+        defer server.deinit();
+
+        self.logger.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+
+        while (true) {
+            if (self.stop.load(.acquire)) break;
+            const connection = server.accept() catch |err| {
+                if (err == error.WouldBlock) {
+                    std.time.sleep(ACCEPT_POLL_NS);
+                    continue;
+                }
+                self.logger.warn("failed to accept connection: {}", .{err});
+                continue;
+            };
+
+            routeConnection(connection, self.allocator, self);
+        }
+    }
+
+    /// Handle metrics endpoint
+    fn handleMetrics(_: *ApiServer, request: *std.http.Server.Request, allocator: std.mem.Allocator) void {
+        var metrics_output = std.ArrayList(u8).init(allocator);
         defer metrics_output.deinit();
 
         api.writeMetrics(metrics_output.writer()) catch {
@@ -106,22 +204,133 @@ fn handleNonSSERequestWithAddr(
                 .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },
         }) catch {};
-    } else if (std.mem.eql(u8, request.head.target, "/health")) {
-        const response = "{\"status\":\"healthy\",\"service\":\"zeam-metrics\"}";
+    }
+
+    /// Handle health check endpoint
+    fn handleHealth(_: *ApiServer, request: *std.http.Server.Request) void {
+        const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
         _ = request.respond(response, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
         }) catch {};
-    } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
-        handleForkChoiceGraph(request, request_allocator, ctx, client_addr) catch |err| {
-            std.log.warn("Fork choice graph request failed: {}", .{err});
-            _ = request.respond("Internal Server Error\n", .{}) catch {};
-        };
-    } else {
-        _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
     }
-}
+
+    /// Handle finalized checkpoint state endpoint
+    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
+    fn handleFinalizedCheckpointState(self: *ApiServer, request: *std.http.Server.Request) !void {
+        // Get the chain (may be null if API server started before chain initialization)
+        const chain = self.getChain() orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        // Get finalized state from chain (chain handles its own locking internally)
+        const finalized_lean_state = chain.getFinalizedState() orelse {
+            _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
+            return;
+        };
+
+        // Serialize lean state (BeamState) to SSZ
+        var ssz_output = std.ArrayList(u8).init(self.allocator);
+        defer ssz_output.deinit();
+
+        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
+            self.logger.err("failed to serialize finalized lean state to SSZ: {}", .{err});
+            _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+
+        // Format content-length header value
+        var content_length_buf: [32]u8 = undefined;
+        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{ssz_output.items.len});
+
+        // Respond with lean state (BeamState) as SSZ octet-stream
+        _ = request.respond(ssz_output.items, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/octet-stream" },
+                .{ .name = "content-length", .value = content_length_str },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with finalized lean state: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Handle SSE events endpoint
+    fn handleSSEEvents(self: *ApiServer, stream: std.net.Stream) !void {
+        // Set SSE headers manually by writing HTTP response
+        const sse_headers = "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Cache-Control: no-cache\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Headers: Cache-Control\r\n" ++
+            "\r\n";
+
+        // Send initial response with SSE headers
+        try stream.writeAll(sse_headers);
+
+        // Send initial connection event
+        const connection_event = "event: connection\ndata: {\"status\":\"connected\"}\n\n";
+        try stream.writeAll(connection_event);
+
+        // Register this connection with the global event broadcaster
+        try event_broadcaster.addGlobalConnection(stream);
+
+        // Keep the connection alive - the broadcaster will handle event streaming
+        // This thread will stay alive as long as the connection is active
+        while (true) {
+            // Send periodic heartbeat to keep connection alive
+            const heartbeat = ": heartbeat\n\n";
+            stream.writeAll(heartbeat) catch |err| {
+                self.logger.warn("SSE connection closed: {}", .{err});
+                break;
+            };
+
+            // Wait between SSE heartbeats
+            std.time.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
+        }
+    }
+
+    fn handleSSEConnection(stream: std.net.Stream, ctx: *ApiServer) void {
+        ctx.handleSSEEvents(stream) catch |err| {
+            ctx.logger.warn("SSE connection failed: {}", .{err});
+        };
+        stream.close();
+        ctx.releaseSSE();
+    }
+
+    fn tryAcquireSSE(self: *ApiServer) bool {
+        self.sse_mutex.lock();
+        defer self.sse_mutex.unlock();
+        // Limit long-lived SSE connections to avoid unbounded threads.
+        if (self.sse_active >= MAX_SSE_CONNECTIONS) return false;
+        self.sse_active += 1;
+        return true;
+    }
+
+    fn releaseSSE(self: *ApiServer) void {
+        self.sse_mutex.lock();
+        defer self.sse_mutex.unlock();
+        if (self.sse_active > 0) self.sse_active -= 1;
+    }
+
+    fn tryAcquireGraph(self: *ApiServer) bool {
+        self.graph_mutex.lock();
+        defer self.graph_mutex.unlock();
+        // Cap concurrent graph JSON generation.
+        if (self.graph_inflight >= MAX_GRAPH_INFLIGHT) return false;
+        self.graph_inflight += 1;
+        return true;
+    }
+
+    fn releaseGraph(self: *ApiServer) void {
+        self.graph_mutex.lock();
+        defer self.graph_mutex.unlock();
+        if (self.graph_inflight > 0) self.graph_inflight -= 1;
+    }
+};
 
 fn handleForkChoiceGraph(
     request: *std.http.Server.Request,
@@ -129,6 +338,11 @@ fn handleForkChoiceGraph(
     ctx: *ApiServer,
     client_addr: std.net.Address,
 ) !void {
+    const chain = ctx.getChain() orelse {
+        _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+        return;
+    };
+
     // Per-IP token bucket + global in-flight cap for the graph endpoint.
     if (!ctx.rate_limiter.allow(client_addr)) {
         _ = request.respond("Too Many Requests\n", .{ .status = .too_many_requests }) catch {};
@@ -155,7 +369,7 @@ fn handleForkChoiceGraph(
     var graph_json = std.ArrayList(u8).init(allocator);
     defer graph_json.deinit();
 
-    try buildGraphJSON(ctx.forkchoice, graph_json.writer(), max_slots, allocator);
+    try buildGraphJSON(&chain.forkChoice, graph_json.writer(), max_slots, allocator);
 
     _ = request.respond(graph_json.items, .{
         .extra_headers = &.{
@@ -167,7 +381,7 @@ fn handleForkChoiceGraph(
 
 /// Build fork choice graph in Grafana node-graph JSON format
 fn buildGraphJSON(
-    forkchoice: *node.fcFactory.ForkChoice,
+    forkchoice: *node_lib.fcFactory.ForkChoice,
     writer: anytype,
     max_slots: usize,
     allocator: std.mem.Allocator,
@@ -340,117 +554,6 @@ fn buildGraphJSON(
     , .{ nodes_list.items, edges_list.items });
 }
 
-/// API server context
-const ApiServer = struct {
-    allocator: std.mem.Allocator,
-    port: u16,
-    forkchoice: *node.fcFactory.ForkChoice,
-    stop: std.atomic.Value(bool),
-    sse_active: usize,
-    graph_inflight: usize,
-    rate_limiter: RateLimiter,
-    sse_mutex: std.Thread.Mutex = .{},
-    graph_mutex: std.Thread.Mutex = .{},
-
-    fn run(self: *ApiServer) !void {
-        defer self.allocator.destroy(self);
-        defer self.rate_limiter.deinit();
-        const address = try std.net.Address.parseIp4("0.0.0.0", self.port);
-        var server = try address.listen(.{ .reuse_address = true, .force_nonblocking = true });
-        defer server.deinit();
-
-        std.log.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
-
-        while (true) {
-            if (self.stop.load(.acquire)) break;
-            const connection = server.accept() catch |err| {
-                if (err == error.WouldBlock) {
-                    std.time.sleep(ACCEPT_POLL_NS);
-                    continue;
-                }
-                std.log.warn("Failed to accept connection: {}", .{err});
-                continue;
-            };
-
-            routeConnection(connection, self.allocator, self);
-        }
-    }
-
-    fn handleSSEConnection(stream: std.net.Stream, allocator: std.mem.Allocator, ctx: *ApiServer) void {
-        ApiServer.handleSSEEvents(stream, allocator) catch |err| {
-            std.log.warn("SSE connection failed: {}", .{err});
-        };
-        stream.close();
-        ctx.releaseSSE();
-    }
-
-    fn handleSSEEvents(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
-        _ = allocator;
-        // Set SSE headers manually by writing HTTP response
-        const sse_headers = "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/event-stream\r\n" ++
-            "Cache-Control: no-cache\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "Access-Control-Allow-Origin: *\r\n" ++
-            "Access-Control-Allow-Headers: Cache-Control\r\n" ++
-            "\r\n";
-
-        // Send initial response with SSE headers
-        try stream.writeAll(sse_headers);
-
-        // Send initial connection event
-        const connection_event = "event: connection\ndata: {\"status\":\"connected\"}\n\n";
-        try stream.writeAll(connection_event);
-
-        // Register this connection with the global event broadcaster
-        try event_broadcaster.addGlobalConnection(stream);
-
-        // Keep the connection alive - the broadcaster will handle event streaming
-        // This thread will stay alive as long as the connection is active
-        while (true) {
-            // Send periodic heartbeat to keep connection alive
-            const heartbeat = ": heartbeat\n\n";
-            stream.writeAll(heartbeat) catch |err| {
-                std.log.warn("SSE connection closed: {}", .{err});
-                break;
-            };
-
-            // Wait between SSE heartbeats
-            std.time.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
-        }
-    }
-
-    fn tryAcquireSSE(self: *ApiServer) bool {
-        self.sse_mutex.lock();
-        defer self.sse_mutex.unlock();
-        // Limit long-lived SSE connections to avoid unbounded threads.
-        if (self.sse_active >= MAX_SSE_CONNECTIONS) return false;
-        self.sse_active += 1;
-        return true;
-    }
-
-    fn releaseSSE(self: *ApiServer) void {
-        self.sse_mutex.lock();
-        defer self.sse_mutex.unlock();
-        if (self.sse_active > 0) self.sse_active -= 1;
-    }
-
-    fn tryAcquireGraph(self: *ApiServer) bool {
-        self.graph_mutex.lock();
-        defer self.graph_mutex.unlock();
-        // Cap concurrent graph JSON generation.
-        if (self.graph_inflight >= MAX_GRAPH_INFLIGHT) return false;
-        self.graph_inflight += 1;
-        return true;
-    }
-
-    fn releaseGraph(self: *ApiServer) void {
-        self.graph_mutex.lock();
-        defer self.graph_mutex.unlock();
-        if (self.graph_inflight > 0) self.graph_inflight -= 1;
-    }
-};
-
 const RateLimitEntry = struct {
     tokens: f64,
     last_refill_ns: u64,
@@ -489,25 +592,24 @@ const RateLimiter = struct {
         if (self.entries.count() > RATE_LIMIT_CLEANUP_THRESHOLD and now - self.last_cleanup_ns > RATE_LIMIT_CLEANUP_COOLDOWN_NS) {
             // Opportunistic TTL cleanup with cooldown to prevent repeated full scans on the hot path.
             self.evictStale(now);
-            self.last_cleanup_ns = now;
         }
 
-        // Hard cap on tracked IPs to bound memory in long-lived processes.
-        if (self.entries.count() >= RATE_LIMIT_MAX_ENTRIES and !self.entries.contains(key)) {
-            return false;
-        }
-
-        const entry = self.entries.getPtr(key) orelse blk: {
-            const owned_key = self.allocator.dupe(u8, key) catch return false;
-            _ = self.entries.put(owned_key, .{ .tokens = RATE_LIMIT_BURST, .last_refill_ns = now }) catch return false;
-            break :blk self.entries.getPtr(owned_key) orelse return false;
+        var entry = self.entries.getPtr(key) orelse blk: {
+            const owned_key = self.allocator.dupe(u8, key) catch return true;
+            self.entries.putNoClobber(owned_key, .{ .tokens = RATE_LIMIT_BURST, .last_refill_ns = now }) catch {
+                self.allocator.free(owned_key);
+                return true;
+            };
+            break :blk self.entries.getPtr(owned_key).?;
         };
 
-        // Token bucket refill based on elapsed time.
-        const elapsed_ns = if (now > entry.last_refill_ns) now - entry.last_refill_ns else 0;
-        const refill = (@as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s))) * RATE_LIMIT_RPS;
-        entry.tokens = @min(RATE_LIMIT_BURST, entry.tokens + refill);
-        entry.last_refill_ns = now;
+        // Refill
+        const elapsed_ns = now - entry.last_refill_ns;
+        if (elapsed_ns > 0) {
+            const refill = (@as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s))) * RATE_LIMIT_RPS;
+            entry.tokens = @min(RATE_LIMIT_BURST, entry.tokens + refill);
+            entry.last_refill_ns = now;
+        }
 
         if (entry.tokens < 1.0) return false;
         entry.tokens -= 1.0;
@@ -515,43 +617,37 @@ const RateLimiter = struct {
     }
 
     fn evictStale(self: *RateLimiter, now: u64) void {
-        // Collect keys first to avoid mutating the map while iterating.
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
-
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.last_refill_ns > RATE_LIMIT_STALE_NS) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                self.allocator.free(entry.key_ptr.*);
+                _ = self.entries.remove(entry.key_ptr.*);
             }
         }
-
-        for (to_remove.items) |key| {
-            if (self.entries.remove(key)) {
-                self.allocator.free(key);
-            }
-        }
+        self.last_cleanup_ns = now;
     }
 };
 
 fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
     return switch (addr.any.family) {
         std.posix.AF.INET => blk: {
-            // IPv4 as dotted quad.
-            const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-            const len = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-                bytes[0],
-                bytes[1],
-                bytes[2],
-                bytes[3],
-            }) catch return null;
-            break :blk len;
+            const addr_in = addr.in;
+            const bytes = std.mem.asBytes(&addr_in.sa.addr);
+            break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch return null;
         },
         std.posix.AF.INET6 => blk: {
-            const ip6 = addr.in6.sa.addr;
-            // IPv6 as hex string.
-            const len = std.fmt.bufPrint(buf, "{s}", .{std.fmt.fmtSliceHexLower(&ip6)}) catch return null;
-            break :blk len;
+            const addr_in6 = addr.in6;
+            const bytes = std.mem.asBytes(&addr_in6.sa.addr);
+            break :blk std.fmt.bufPrint(buf, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{
+                @as(u16, bytes[0]) << 8 | @as(u16, bytes[1]),
+                @as(u16, bytes[2]) << 8 | @as(u16, bytes[3]),
+                @as(u16, bytes[4]) << 8 | @as(u16, bytes[5]),
+                @as(u16, bytes[6]) << 8 | @as(u16, bytes[7]),
+                @as(u16, bytes[8]) << 8 | @as(u16, bytes[9]),
+                @as(u16, bytes[10]) << 8 | @as(u16, bytes[11]),
+                @as(u16, bytes[12]) << 8 | @as(u16, bytes[13]),
+                @as(u16, bytes[14]) << 8 | @as(u16, bytes[15]),
+            }) catch return null;
         },
         else => null,
     };
