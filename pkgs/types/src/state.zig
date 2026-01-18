@@ -288,8 +288,8 @@ pub const BeamState = struct {
 
         // extend historical block hashes and justified slots structures using SSZ Lists directly
         try self.historical_block_hashes.append(staged_block.parent_root);
-        // if parent is genesis it is already justified
-        try self.justified_slots.append(if (self.latest_block_header.slot == 0) true else false);
+        // Slots after the finalized boundary start as not justified; finalized slots are implicit.
+        try self.justified_slots.append(false);
 
         const block_slot: usize = @intCast(staged_block.slot);
         const missed_slots: usize = @intCast(block_slot - self.latest_block_header.slot - 1);
@@ -774,19 +774,10 @@ fn makeBlock(
     try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &parent_root, allocator);
 
     var attestations_list = try block.AggregatedAttestations.init(allocator);
-    errdefer {
-        for (attestations_list.slice()) |*att| {
-            att.deinit();
-        }
-        attestations_list.deinit();
-    }
+    errdefer attestations_list.deinit();
 
     for (attestations) |att| {
-        var att_copy = att;
-        var appended = false;
-        defer if (!appended) att_copy.deinit();
-        try attestations_list.append(att_copy);
-        appended = true;
+        try attestations_list.append(att);
     }
 
     const proposer_index: u64 = slot % @as(u64, @intCast(state.validatorCount()));
@@ -811,15 +802,17 @@ test "justified_slots do not include finalized boundary" {
     defer block_1.deinit();
     try state.process_block_header(std.testing.allocator, block_1, logger);
 
-    try std.testing.expectEqual(@as(usize, 0), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
+    try std.testing.expectEqual(false, try state.justified_slots.get(0));
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_2.deinit();
     try state.process_block_header(std.testing.allocator, block_2, logger);
 
-    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
     try std.testing.expectEqual(false, try state.justified_slots.get(0));
+    try std.testing.expectEqual(false, try state.justified_slots.get(1));
 }
 
 test "justified_slots rebases when finalization advances" {
@@ -844,9 +837,11 @@ test "justified_slots rebases when finalization advances" {
         .{ .root = block_1.parent_root, .slot = 0 },
         .{ .root = block_2_parent_root, .slot = 1 },
     );
-    errdefer att_0_to_1.deinit();
+    var att_0_to_1_transferred = false;
+    defer if (!att_0_to_1_transferred) att_0_to_1.deinit();
 
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
+    att_0_to_1_transferred = true;
     defer block_2.deinit();
     try state.process_block(std.testing.allocator, block_2, logger);
 
@@ -861,14 +856,16 @@ test "justified_slots rebases when finalization advances" {
         .{ .root = block_2.parent_root, .slot = 1 },
         .{ .root = block_3_parent_root, .slot = 2 },
     );
-    errdefer att_1_to_2.deinit();
+    var att_1_to_2_transferred = false;
+    defer if (!att_1_to_2_transferred) att_1_to_2.deinit();
 
     var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_1_to_2});
+    att_1_to_2_transferred = true;
     defer block_3.deinit();
     try state.process_block(std.testing.allocator, block_3, logger);
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
-    try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
+    try std.testing.expectEqual(@as(usize, 2), state.justified_slots.len());
     try std.testing.expectEqual(true, try state.justified_slots.get(0));
 
     try std.testing.expect(try utils.isSlotJustified(state.latest_finalized.slot, &state.justified_slots, 1));
@@ -908,9 +905,11 @@ test "duplicate roots in root_to_slots mapping" {
         .{ .root = block_1.parent_root, .slot = 0 },
         .{ .root = block_2_parent_root, .slot = 1 },
     );
-    errdefer att_0_to_1.deinit();
+    var att_0_to_1_transferred = false;
+    defer if (!att_0_to_1_transferred) att_0_to_1.deinit();
 
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
+    att_0_to_1_transferred = true;
     defer block_2.deinit();
     try state.process_block(std.testing.allocator, block_2, logger);
 
@@ -979,7 +978,8 @@ test "duplicate roots in root_to_slots mapping" {
         .{ .root = source_1_root, .slot = 1 },
         .{ .root = utils.ZERO_HASH, .slot = 2 },
     );
-    errdefer att_1_to_2.deinit();
+    var att_1_to_2_transferred = false;
+    defer if (!att_1_to_2_transferred) att_1_to_2.deinit();
 
     var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
     defer {
@@ -988,13 +988,12 @@ test "duplicate roots in root_to_slots mapping" {
         }
         attestations_list.deinit();
     }
-    var att_copy = att_1_to_2;
-    var appended = false;
-    defer if (!appended) att_copy.deinit();
-    try attestations_list.append(att_copy);
-    appended = true;
+    try attestations_list.append(att_1_to_2);
+    att_1_to_2_transferred = true;
 
     try state.process_attestations(std.testing.allocator, attestations_list, logger);
+
+    std.debug.print("dup_roots finalized={d} justified={d}\n", .{ state.latest_finalized.slot, state.latest_justified.slot });
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);

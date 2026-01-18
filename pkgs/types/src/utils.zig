@@ -135,6 +135,16 @@ pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !vo
     try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
+test "isSlotJustified treats finalized boundary as implicit" {
+    var justified_slots = try types.JustifiedSlots.init(std.testing.allocator);
+    defer justified_slots.deinit();
+
+    try justified_slots.append(false);
+
+    try std.testing.expect(try isSlotJustified(0, &justified_slots, 0));
+    try std.testing.expectEqual(false, try isSlotJustified(0, &justified_slots, 1));
+}
+
 test "ssz import" {
     const data: u16 = 0x5566;
     const serialized_data = [_]u8{ 0x66, 0x55 };
