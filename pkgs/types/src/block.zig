@@ -323,9 +323,10 @@ pub const AggregatedAttestationsResult = struct {
         };
     }
 
-    /// Compute aggregated signatures using two-phase algorithm:
+    /// Compute aggregated signatures using three-phase algorithm:
     /// Phase 1: Collect individual signatures from signatures_map (chain: gossip_signatures)
     /// Phase 2: Fallback to aggregated_payloads using greedy set-cover (if provided)
+    /// Phase 3: Remove signatures which are already coverd by stored prrofs and aggregate remaining signatures
     pub fn computeAggregatedSignatures(
         self: *Self,
         attestations_list: []const Attestation,
@@ -402,6 +403,7 @@ pub const AggregatedAttestationsResult = struct {
             }
 
             // Map from validator_id to index in signatures_map arrays
+            // Used to remove signatures from sigmap_sigs while aggregating which are already covered by stored proofs
             var vid_to_sigmap_idx = try allocator.alloc(?usize, max_validator);
             defer allocator.free(vid_to_sigmap_idx);
             @memset(vid_to_sigmap_idx, null);
@@ -418,8 +420,8 @@ pub const AggregatedAttestationsResult = struct {
             defer covered_by_stored.deinit();
 
             // Attempt to collect each validator's signature from signatures_map
-            var vit = group.validator_bits.iterator(.{});
-            while (vit.next()) |validator_id| {
+            var validator_it = group.validator_bits.iterator(.{});
+            while (validator_it.next()) |validator_id| {
                 const vid: ValidatorIndex = @intCast(validator_id);
                 if (signatures_map.get(.{ .validator_id = vid, .data_root = data_root })) |sig_entry| {
                     // Check if it's not a zero signature
@@ -489,25 +491,18 @@ pub const AggregatedAttestationsResult = struct {
 
                     for (candidates.items) |*stored| {
                         const proof = &stored.proof;
-                        const proof_len = proof.participants.len();
+                        const max_participants = proof.participants.len();
 
                         // Reset and populate proof_bits from participants
                         proof_bits.setRangeValue(.{ .start = 0, .end = proof_bits.capacity() }, false);
-                        if (proof_len > proof_bits.capacity()) {
-                            try proof_bits.resize(proof_len, false);
+                        if (max_participants > proof_bits.capacity()) {
+                            try proof_bits.resize(max_participants, false);
                         }
 
-                        var has_invalid_validator = false;
                         var coverage: usize = 0;
 
-                        for (0..proof_len) |i| {
+                        for (0..max_participants) |i| {
                             if (proof.participants.get(i) catch false) {
-                                // Check if this validator is in the original group at all
-                                if (i >= group.validator_bits.capacity() or !group.validator_bits.isSet(i)) {
-                                    // Validator not in group - reject proof
-                                    has_invalid_validator = true;
-                                    break;
-                                }
                                 // Count coverage of validators still in remaining (not yet covered by stored proofs)
                                 if (i < remaining.capacity() and remaining.isSet(i)) {
                                     proof_bits.set(i);
@@ -516,7 +511,7 @@ pub const AggregatedAttestationsResult = struct {
                             }
                         }
 
-                        if (has_invalid_validator or coverage == 0) {
+                        if (coverage == 0) {
                             continue;
                         }
 
@@ -1337,7 +1332,7 @@ test "computeAggregatedSignatures: partial signatures_map overlap maximizes cove
     var ctx = try TestContext.init(allocator, 5);
     defer ctx.deinit();
 
-    // Create attestations for validators 1,2,3,4 (not 0)
+    // Create attestations for validators 1,2,3,4
     var attestations_list = [_]attestation.Attestation{
         ctx.createAttestation(1),
         ctx.createAttestation(2),
@@ -1844,4 +1839,129 @@ test "computeAggregatedSignatures: complex 3 groups" {
     try std.testing.expect(found_3_4_5); // Group 2: pure stored
     try std.testing.expect(found_7_8_9); // Group 3: stored proof
     try std.testing.expect(found_6); // Group 3: remaining signatures_map (7 excluded)
+}
+
+// ============================================================================
+// Test 11: Validator without signature is excluded
+// signatures_map {1} + aggregated_payload {2,3} = attestations {1} + {2,3}, validator 4 excluded
+// ============================================================================
+test "computeAggregatedSignatures: validator without signature excluded" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try TestContext.init(allocator, 5);
+    defer ctx.deinit();
+
+    // Create attestations for validators 1, 2, 3, 4
+    var attestations_list = [_]attestation.Attestation{
+        ctx.createAttestation(1),
+        ctx.createAttestation(2),
+        ctx.createAttestation(3),
+        ctx.createAttestation(4),
+    };
+
+    // Add signature only for validator 1 to signatures_map
+    var signatures_map = SignaturesMap.init(allocator);
+    defer deinitSignaturesMap(&signatures_map);
+
+    try ctx.addToSignatureMap(&signatures_map, 1);
+
+    // Create aggregated proof for validators 2, 3 only
+    var payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&payloads_map);
+
+    const proof_2_3 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 2, 3 });
+    try ctx.addAggregatedPayload(&payloads_map, 2, proof_2_3);
+
+    // Create aggregation context and compute
+    var agg_ctx = try AggregatedAttestationsResult.init(allocator);
+    defer agg_ctx.deinit();
+
+    try agg_ctx.computeAggregatedSignatures(
+        &attestations_list,
+        &ctx.validators,
+        &signatures_map,
+        &payloads_map,
+    );
+
+    // Should have exactly 2 aggregated attestations:
+    // 1. signatures_map for validator 1
+    // 2. Aggregated proof for validators 2, 3
+    // Validator 4 should be excluded (no signature available)
+    try std.testing.expectEqual(@as(usize, 2), agg_ctx.attestations.len());
+    try std.testing.expectEqual(@as(usize, 2), agg_ctx.attestation_signatures.len());
+
+    // Verify one covers {1} and one covers {2, 3}
+    var found_1 = false;
+    var found_2_3 = false;
+
+    for (0..agg_ctx.attestations.len()) |i| {
+        const att_bits = &(try agg_ctx.attestations.get(i)).aggregation_bits;
+
+        // Check for validator 1 only
+        if (try TestContext.checkParticipants(att_bits, &[_]ValidatorIndex{1})) {
+            found_1 = true;
+        }
+        // Check for validators 2, 3
+        if (try TestContext.checkParticipants(att_bits, &[_]ValidatorIndex{ 2, 3 })) {
+            found_2_3 = true;
+        }
+
+        // Verify validator 4 is NOT included in any attestation
+        // If the bitlist has fewer than 5 elements, validator 4 can't be included
+        if (att_bits.len() > 4) {
+            try std.testing.expect(!(try att_bits.get(4)));
+        }
+    }
+
+    try std.testing.expect(found_1);
+    try std.testing.expect(found_2_3);
+}
+
+// ============================================================================
+// Test 12: Single attestation lookup key with all validators in aggregated payload
+// Attestations for validators 1,2 nothing in signatures_map,
+// aggregated_payload {1,2,3,4} indexed by validator 1 => all bits set
+// Validators 3 and 4 are included although not covered  by attestations_list
+// ============================================================================
+test "computeAggregatedSignatures: empty signatures_map with full aggregated payload" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try TestContext.init(allocator, 5);
+    defer ctx.deinit();
+
+    // Create attestations for validators 1, 2
+    var attestations_list = [_]attestation.Attestation{
+        ctx.createAttestation(1),
+        ctx.createAttestation(2),
+    };
+
+    // Empty signatures_map - nothing found while iterating
+    var signatures_map = SignaturesMap.init(allocator);
+    defer deinitSignaturesMap(&signatures_map);
+
+    // Create aggregated proof for validators 1, 2, 3, 4 indexed by validator 1
+    var payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&payloads_map);
+
+    const proof_1_2_3_4 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2, 3, 4 });
+    try ctx.addAggregatedPayload(&payloads_map, 1, proof_1_2_3_4);
+
+    // Create aggregation context and compute
+    var agg_ctx = try AggregatedAttestationsResult.init(allocator);
+    defer agg_ctx.deinit();
+
+    try agg_ctx.computeAggregatedSignatures(
+        &attestations_list,
+        &ctx.validators,
+        &signatures_map,
+        &payloads_map,
+    );
+
+    // Should have exactly 1 aggregated attestation covering all 4 validators
+    try std.testing.expectEqual(@as(usize, 1), agg_ctx.attestations.len());
+    try std.testing.expectEqual(@as(usize, 1), agg_ctx.attestation_signatures.len());
+
+    // Verify attestation_bits are set for validators 1, 2, 3, 4
+    const att_bits = &(try agg_ctx.attestations.get(0)).aggregation_bits;
+    try std.testing.expect(try TestContext.checkParticipants(att_bits, &[_]ValidatorIndex{ 1, 2, 3, 4 }));
 }
