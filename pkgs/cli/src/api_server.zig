@@ -187,6 +187,15 @@ const ApiServer = struct {
 
             routeConnection(connection, self.allocator, self);
         }
+
+        // Allow active SSE threads to drain before destroying context
+        while (true) {
+            self.sse_mutex.lock();
+            const active = self.sse_active;
+            self.sse_mutex.unlock();
+            if (active == 0) break;
+            std.time.sleep(ACCEPT_POLL_NS);
+        }
     }
 
     /// Handle metrics endpoint
@@ -259,6 +268,8 @@ const ApiServer = struct {
 
     /// Handle SSE events endpoint
     fn handleSSEEvents(self: *ApiServer, stream: std.net.Stream) !void {
+        var registered = false;
+        errdefer if (!registered) stream.close();
         // Set SSE headers manually by writing HTTP response
         const sse_headers = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/event-stream\r\n" ++
@@ -276,14 +287,16 @@ const ApiServer = struct {
         try stream.writeAll(connection_event);
 
         // Register this connection with the global event broadcaster
-        try event_broadcaster.addGlobalConnection(stream);
+        const connection = try event_broadcaster.addGlobalConnection(stream);
+        registered = true;
 
         // Keep the connection alive - the broadcaster will handle event streaming
         // This thread will stay alive as long as the connection is active
         while (true) {
+            if (self.stop.load(.acquire)) break;
             // Send periodic heartbeat to keep connection alive
             const heartbeat = ": heartbeat\n\n";
-            stream.writeAll(heartbeat) catch |err| {
+            connection.sendRaw(heartbeat) catch |err| {
                 self.logger.warn("SSE connection closed: {}", .{err});
                 break;
             };
@@ -297,7 +310,7 @@ const ApiServer = struct {
         ctx.handleSSEEvents(stream) catch |err| {
             ctx.logger.warn("SSE connection failed: {}", .{err});
         };
-        stream.close();
+        event_broadcaster.removeGlobalConnection(stream);
         ctx.releaseSSE();
     }
 
@@ -617,11 +630,19 @@ const RateLimiter = struct {
     }
 
     fn evictStale(self: *RateLimiter, now: u64) void {
+        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        defer to_remove.deinit();
+
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.last_refill_ns > RATE_LIMIT_STALE_NS) {
-                self.allocator.free(entry.key_ptr.*);
-                _ = self.entries.remove(entry.key_ptr.*);
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.entries.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
             }
         }
         self.last_cleanup_ns = now;
@@ -632,7 +653,8 @@ fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
     return switch (addr.any.family) {
         std.posix.AF.INET => blk: {
             const addr_in = addr.in;
-            const bytes = std.mem.asBytes(&addr_in.sa.addr);
+            // Use @ptrCast to get network-order bytes (big-endian) regardless of host endianness
+            const bytes = @as(*const [4]u8, @ptrCast(&addr_in.sa.addr));
             break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch return null;
         },
         std.posix.AF.INET6 => blk: {

@@ -2,11 +2,13 @@
 
 ## Overview
 
-This package provides the HTTP API server for the Zeam node with three main endpoints:
+This package provides the HTTP API server for the Zeam node with the following endpoints:
 
 - Server-Sent Events (SSE) stream for real-time chain events at `/events`
 - Prometheus metrics endpoint at `/metrics`
 - Health check at `/health`
+- Fork choice graph visualization at `/api/forkchoice/graph` (Grafana node-graph compatible)
+- Finalized checkpoint state at `/lean/states/finalized` (SSZ octet-stream for checkpoint sync)
 
 ## Package Components
 
@@ -105,6 +107,32 @@ Returns node health status.
 curl http://localhost:9667/health
 ```
 
+### `/api/forkchoice/graph`
+
+Returns the fork choice tree as JSON compatible with Grafana's node-graph panel. Useful for visualizing chain forks, head selection, and finalization progress.
+
+```sh
+# Default (last 50 slots)
+curl http://localhost:9667/api/forkchoice/graph
+
+# Custom slot range (max 200)
+curl http://localhost:9667/api/forkchoice/graph?slots=100
+```
+
+**Note:** Returns 503 Service Unavailable if chain is not yet initialized. The graph includes all nodes from the finalized checkpoint up to head; if `head_slot - finalized_slot < slots`, the response will contain fewer than the requested number of slots.
+
+
+**Rate limiting:** 2 requests/second per IP with burst of 5. Max 2 concurrent graph generations.
+
+### `/lean/states/finalized`
+
+Returns the finalized checkpoint state as SSZ-encoded binary. Used for checkpoint sync - new nodes can download this to fast-sync instead of syncing from genesis.
+
+```sh
+curl http://localhost:9667/lean/states/finalized -o finalized_state.ssz
+```
+
+**Note**: Returns 503 if the chain isn’t initialized, 404 if no finalized state is available.
 ## Usage
 
 ### Initialization
@@ -116,13 +144,22 @@ The API system is initialized at startup in `pkgs/cli/src/main.zig`:
 try api.init(allocator);
 
 // Start HTTP server in background thread
-try api_server.startAPIServer(allocator, apiPort);
+// chain can be null for early startup (chain-dependent endpoints return 503 until set)
+var handle = try api_server.startAPIServer(allocator, port, logger_config, chain);
+
+// Later, set chain if started with null
+handle.setChain(beam_chain);
+
+// Graceful shutdown
+handle.stop();
 ```
 
 The server exposes:
-- SSE at `/events`
-- Metrics at `/metrics`
-- Health at `/health`
+- `/metrics` - Prometheus metrics
+- `/health` - Health check
+- `/events` - SSE chain events
+- `/api/forkchoice/graph` - Fork choice visualization (requires chain)
+- `/lean/states/finalized` - Checkpoint state SSZ (requires chain)
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
 
