@@ -430,10 +430,8 @@ pub const BeamState = struct {
             }
 
             var target_justifications = justifications.get(attestation_data.target.root) orelse targetjustifications: {
-                var targetjustifications = try allocator.alloc(u8, num_validators);
-                for (0..targetjustifications.len) |idx| {
-                    targetjustifications[idx] = 0;
-                }
+                const targetjustifications = try allocator.alloc(u8, num_validators);
+                @memset(targetjustifications, 0);
                 try justifications.put(allocator, attestation_data.target.root, targetjustifications);
                 break :targetjustifications targetjustifications;
             };
@@ -494,14 +492,11 @@ pub const BeamState = struct {
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
                             if (root_to_slots.get(entry.key_ptr.*)) |slots| {
-                                var keep = false;
                                 for (slots.items) |slot_value| {
                                     if (slot_value > finalized_slot) {
-                                        keep = true;
                                         break;
                                     }
-                                }
-                                if (!keep) {
+                                } else {
                                     try roots_to_remove.append(entry.key_ptr.*);
                                 }
                             } else {
