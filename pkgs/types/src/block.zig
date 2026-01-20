@@ -2,17 +2,20 @@ const std = @import("std");
 const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
+const xmss = @import("@zeam/xmss");
 
+const aggregation = @import("./aggregation.zig");
 const attestation = @import("./attestation.zig");
 const mini_3sf = @import("./mini_3sf.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
+const validator = @import("./validator.zig");
 
 const Allocator = std.mem.Allocator;
 const AggregatedAttestation = attestation.AggregatedAttestation;
 pub const AggregatedAttestations = ssz.utils.List(AggregatedAttestation, params.VALIDATOR_REGISTRY_LIMIT);
 const Attestation = attestation.Attestation;
-pub const AttestationSignatures = ssz.utils.List(attestation.NaiveAggregatedSignature, params.VALIDATOR_REGISTRY_LIMIT);
+pub const AttestationSignatures = ssz.utils.List(aggregation.AggregatedSignatureProof, params.VALIDATOR_REGISTRY_LIMIT);
 const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
@@ -21,29 +24,40 @@ const SIGSIZE = utils.SIGSIZE;
 const Root = utils.Root;
 const ZERO_HASH = utils.ZERO_HASH;
 const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
+const Validators = validator.Validators;
 
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
+
+// signatures_map types for aggregation
+/// SignatureKey is used to index signatures by (validator_id, data_root).
+pub const SignatureKey = struct {
+    validator_id: ValidatorIndex,
+    data_root: Root,
+};
+
+/// Stored signatures_map entry
+pub const StoredSignature = struct {
+    slot: Slot,
+    signature: SIGBYTES,
+};
+
+/// Map type for signatures_map: SignatureKey -> individual XMSS signature bytes + slot metadata
+pub const SignaturesMap = std.AutoHashMap(SignatureKey, StoredSignature);
+
+/// Stored aggregated payload entry
+pub const StoredAggregatedPayload = struct {
+    slot: Slot,
+    proof: aggregation.AggregatedSignatureProof,
+};
+
+/// List of aggregated payloads for a single key
+pub const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
+
+/// Map type for aggregated payloads: SignatureKey -> list of AggregatedSignatureProof
+pub const AggregatedPayloadsMap = std.AutoHashMap(SignatureKey, AggregatedPayloadsList);
 
 // Types
 pub const BeamBlockBody = struct {
@@ -213,16 +227,7 @@ pub const BlockSignatures = struct {
         errdefer groups_array.deinit();
 
         for (self.attestation_signatures.constSlice()) |group| {
-            var sig_array = json.Array.init(allocator);
-            var success = false;
-            defer if (!success) sig_array.deinit();
-
-            for (group.constSlice()) |sig| {
-                try sig_array.append(json.Value{ .string = try bytesToHex(allocator, &sig) });
-            }
-
-            try groups_array.append(json.Value{ .array = sig_array });
-            success = true;
+            try groups_array.append(try group.toJson(allocator));
         }
 
         try obj.put("attestation_signatures", json.Value{ .array = groups_array });
@@ -287,7 +292,7 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     errdefer groups.deinit();
 
     for (0..num_aggregated_attestations) |_| {
-        const signatures = try attestation.NaiveAggregatedSignature.init(allocator);
+        const signatures = try aggregation.AggregatedSignatureProof.init(allocator);
         try groups.append(signatures);
     }
 
@@ -297,35 +302,326 @@ pub fn createBlockSignatures(allocator: Allocator, num_aggregated_attestations: 
     };
 }
 
-const AggregationGroup = struct {
-    data: attestation.AttestationData,
-    bits: attestation.AggregationBits,
-    signatures: attestation.NaiveAggregatedSignature,
-
-    fn init(allocator: Allocator, signed_attestation: attestation.SignedAttestation) !AggregationGroup {
-        var bits = try attestation.AggregationBits.init(allocator);
-        errdefer bits.deinit();
-
-        const validator_index: usize = @intCast(signed_attestation.validator_id);
-        try attestation.aggregationBitsSet(&bits, validator_index, true);
-
-        var signatures = try attestation.NaiveAggregatedSignature.init(allocator);
-        errdefer signatures.deinit();
-        try signatures.append(signed_attestation.signature);
-
-        return AggregationGroup{
-            .data = signed_attestation.message,
-            .bits = bits,
-            .signatures = signatures,
-        };
-    }
-};
-
 pub const AggregatedAttestationsResult = struct {
     attestations: AggregatedAttestations,
     attestation_signatures: AttestationSignatures,
+    allocator: Allocator,
 
-    pub fn deinit(self: *AggregatedAttestationsResult) void {
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) !Self {
+        var attestations_list = try AggregatedAttestations.init(allocator);
+        errdefer attestations_list.deinit();
+
+        var signatures_list = try AttestationSignatures.init(allocator);
+        errdefer signatures_list.deinit();
+
+        return .{
+            .attestations = attestations_list,
+            .attestation_signatures = signatures_list,
+            .allocator = allocator,
+        };
+    }
+
+    /// Compute aggregated signatures using three-phase algorithm:
+    /// Phase 1: Collect individual signatures from signatures_map (chain: gossip_signatures)
+    /// Phase 2: Fallback to aggregated_payloads using greedy set-cover (if provided)
+    /// Phase 3: Remove signatures which are already coverd by stored prrofs and aggregate remaining signatures
+    pub fn computeAggregatedSignatures(
+        self: *Self,
+        attestations_list: []const Attestation,
+        validators: *const Validators,
+        signatures_map: *const SignaturesMap,
+        aggregated_payloads: ?*const AggregatedPayloadsMap,
+    ) !void {
+        const allocator = self.allocator;
+
+        // Group attestations by data root using bitsets for validator tracking
+        const AttestationGroup = struct {
+            data: attestation.AttestationData,
+            data_root: Root,
+            validator_bits: std.DynamicBitSet,
+        };
+
+        var groups = std.ArrayList(AttestationGroup).init(allocator);
+        defer {
+            for (groups.items) |*group| {
+                group.validator_bits.deinit();
+            }
+            groups.deinit();
+        }
+
+        var root_indices = std.AutoHashMap(Root, usize).init(allocator);
+        defer root_indices.deinit();
+
+        // Group attestations by data root
+        for (attestations_list) |att| {
+            const data_root = try att.data.sszRoot(allocator);
+            const vid: usize = @intCast(att.validator_id);
+            if (root_indices.get(data_root)) |group_index| {
+                var bits = &groups.items[group_index].validator_bits;
+                if (vid >= bits.capacity()) {
+                    try bits.resize(vid + 1, false);
+                }
+                bits.set(vid);
+            } else {
+                var new_bits = try std.DynamicBitSet.initEmpty(allocator, vid + 1);
+                new_bits.set(vid);
+                try groups.append(.{
+                    .data = att.data,
+                    .data_root = data_root,
+                    .validator_bits = new_bits,
+                });
+                try root_indices.put(data_root, groups.items.len - 1);
+            }
+        }
+
+        // Process each group
+        for (groups.items) |*group| {
+            const data_root = group.data_root;
+            const epoch: u64 = group.data.slot;
+            var message_hash: [32]u8 = undefined;
+            try ssz.hashTreeRoot(attestation.AttestationData, group.data, &message_hash, allocator);
+
+            // Phase 1: Collect signatures from signatures_map
+            const max_validator = group.validator_bits.capacity();
+
+            var sigmap_sigs = std.ArrayList(xmss.Signature).init(allocator);
+            defer {
+                for (sigmap_sigs.items) |*sig| {
+                    sig.deinit();
+                }
+                sigmap_sigs.deinit();
+            }
+
+            var sigmap_pks = std.ArrayList(xmss.PublicKey).init(allocator);
+            defer {
+                for (sigmap_pks.items) |*pk| {
+                    pk.deinit();
+                }
+                sigmap_pks.deinit();
+            }
+
+            // Map from validator_id to index in signatures_map arrays
+            // Used to remove signatures from sigmap_sigs while aggregating which are already covered by stored proofs
+            var vid_to_sigmap_idx = try allocator.alloc(?usize, max_validator);
+            defer allocator.free(vid_to_sigmap_idx);
+            @memset(vid_to_sigmap_idx, null);
+
+            // Bitsets for tracking validator states
+            var remaining = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+            defer remaining.deinit();
+
+            var sigmap_available = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+            defer sigmap_available.deinit();
+
+            // Track validators covered by stored proofs (to avoid redundancy with signatures_map)
+            var covered_by_stored = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+            defer covered_by_stored.deinit();
+
+            // Attempt to collect each validator's signature from signatures_map
+            var validator_it = group.validator_bits.iterator(.{});
+            while (validator_it.next()) |validator_id| {
+                const vid: ValidatorIndex = @intCast(validator_id);
+                if (signatures_map.get(.{ .validator_id = vid, .data_root = data_root })) |sig_entry| {
+                    // Check if it's not a zero signature
+                    if (!std.mem.eql(u8, &sig_entry.signature, &ZERO_SIGBYTES)) {
+                        // Deserialize signature
+                        var sig = xmss.Signature.fromBytes(&sig_entry.signature) catch {
+                            remaining.set(validator_id);
+                            continue;
+                        };
+                        errdefer sig.deinit();
+
+                        // Get public key from validator
+                        if (validator_id >= validators.len()) {
+                            sig.deinit();
+                            remaining.set(validator_id);
+                            continue;
+                        }
+
+                        const val = validators.get(validator_id) catch {
+                            sig.deinit();
+                            remaining.set(validator_id);
+                            continue;
+                        };
+                        const pk = xmss.PublicKey.fromBytes(&val.pubkey) catch {
+                            sig.deinit();
+                            remaining.set(validator_id);
+                            continue;
+                        };
+
+                        vid_to_sigmap_idx[validator_id] = sigmap_sigs.items.len;
+                        try sigmap_sigs.append(sig);
+                        try sigmap_pks.append(pk);
+                        sigmap_available.set(validator_id);
+                    } else {
+                        remaining.set(validator_id);
+                    }
+                } else {
+                    remaining.set(validator_id);
+                }
+            }
+
+            // Phase 2: Fallback to aggregated_payloads using greedy set-cover
+            if (aggregated_payloads) |agg_payloads| {
+                // Temporary bitset for computing coverage
+                var proof_bits = try std.DynamicBitSet.initEmpty(allocator, max_validator);
+                defer proof_bits.deinit();
+
+                while (remaining.count() > 0) {
+                    // Pick any remaining validator to look up proofs
+                    const target_id = remaining.findFirstSet() orelse break;
+                    const vid: ValidatorIndex = @intCast(target_id);
+
+                    // Remove the target_id from remaining if not covered by stored proofs
+                    const candidates = agg_payloads.get(.{ .validator_id = vid, .data_root = data_root }) orelse {
+                        remaining.unset(target_id);
+                        continue;
+                    };
+
+                    if (candidates.items.len == 0) {
+                        remaining.unset(target_id);
+                        continue;
+                    }
+
+                    // Find the proof covering the most remaining validators (greedy set-cover)
+                    var best_proof: ?*const aggregation.AggregatedSignatureProof = null;
+                    var max_coverage: usize = 0;
+
+                    for (candidates.items) |*stored| {
+                        const proof = &stored.proof;
+                        const max_participants = proof.participants.len();
+
+                        // Reset and populate proof_bits from participants
+                        proof_bits.setRangeValue(.{ .start = 0, .end = proof_bits.capacity() }, false);
+                        if (max_participants > proof_bits.capacity()) {
+                            try proof_bits.resize(max_participants, false);
+                        }
+
+                        var coverage: usize = 0;
+
+                        for (0..max_participants) |i| {
+                            if (proof.participants.get(i) catch false) {
+                                // Count coverage of validators still in remaining (not yet covered by stored proofs)
+                                if (i < remaining.capacity() and remaining.isSet(i)) {
+                                    proof_bits.set(i);
+                                    coverage += 1;
+                                }
+                            }
+                        }
+
+                        if (coverage == 0) {
+                            continue;
+                        }
+
+                        if (coverage > max_coverage) {
+                            max_coverage = coverage;
+                            best_proof = proof;
+                        }
+                    }
+
+                    if (best_proof == null or max_coverage == 0) {
+                        remaining.unset(target_id);
+                        continue;
+                    }
+
+                    // Clone and add the proof
+                    var cloned_proof: aggregation.AggregatedSignatureProof = undefined;
+                    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
+                    errdefer cloned_proof.deinit();
+
+                    // Create aggregated attestation matching the proof's participants
+                    // and update tracking bitsets in a single pass
+                    var att_bits = try attestation.AggregationBits.init(allocator);
+                    errdefer att_bits.deinit();
+
+                    for (0..cloned_proof.participants.len()) |i| {
+                        if (cloned_proof.participants.get(i) catch false) {
+                            try attestation.aggregationBitsSet(&att_bits, i, true);
+                            if (i < remaining.capacity()) {
+                                remaining.unset(i);
+                            }
+                            // Track ALL validators covered by stored proofs to remove from signatures_map later
+                            if (i >= covered_by_stored.capacity()) {
+                                try covered_by_stored.resize(i + 1, false);
+                            }
+                            covered_by_stored.set(i);
+                        }
+                    }
+
+                    try self.attestations.append(.{ .aggregation_bits = att_bits, .data = group.data });
+                    try self.attestation_signatures.append(cloned_proof);
+                }
+            }
+
+            // Finally, aggregate signatures_map for validators NOT covered by stored proofs
+            // This avoids redundancy: if a validator is in a stored proof, don't include them in signatures_map aggregation
+            var usable_count: usize = 0;
+            var git = sigmap_available.iterator(.{});
+            while (git.next()) |vid| {
+                if (vid >= covered_by_stored.capacity() or !covered_by_stored.isSet(vid)) {
+                    usable_count += 1;
+                }
+            }
+
+            if (usable_count > 0) {
+                var participants = try attestation.AggregationBits.init(allocator);
+                var participants_cleanup = true;
+                errdefer if (participants_cleanup) participants.deinit();
+
+                var pk_handles = try allocator.alloc(*const xmss.HashSigPublicKey, usable_count);
+                defer allocator.free(pk_handles);
+                var sig_handles = try allocator.alloc(*const xmss.HashSigSignature, usable_count);
+                defer allocator.free(sig_handles);
+
+                // Iterate sigmap_available in order, skipping validators already in stored proofs
+                var handle_idx: usize = 0;
+                var git2 = sigmap_available.iterator(.{});
+                while (git2.next()) |vid| {
+                    // Skip if already covered by a stored proof
+                    if (vid < covered_by_stored.capacity() and covered_by_stored.isSet(vid)) continue;
+
+                    try attestation.aggregationBitsSet(&participants, vid, true);
+                    const sigmap_idx = vid_to_sigmap_idx[vid].?;
+                    pk_handles[handle_idx] = sigmap_pks.items[sigmap_idx].handle;
+                    sig_handles[handle_idx] = sigmap_sigs.items[sigmap_idx].handle;
+                    handle_idx += 1;
+                }
+
+                var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+                errdefer proof.deinit();
+
+                try aggregation.AggregatedSignatureProof.aggregate(
+                    participants,
+                    pk_handles[0..handle_idx],
+                    sig_handles[0..handle_idx],
+                    &message_hash,
+                    epoch,
+                    &proof,
+                );
+                participants_cleanup = false; // proof now owns participants buffer
+
+                // Create aggregated attestation using proof's participants (which now owns the bits)
+                // We need to clone it since we're moving it into the attestation
+                var att_bits = try attestation.AggregationBits.init(allocator);
+                errdefer att_bits.deinit();
+
+                // Clone from proof.participants
+                const proof_participants_len = proof.participants.len();
+                for (0..proof_participants_len) |i| {
+                    if (proof.participants.get(i) catch false) {
+                        try attestation.aggregationBitsSet(&att_bits, i, true);
+                    }
+                }
+
+                try self.attestations.append(.{ .aggregation_bits = att_bits, .data = group.data });
+                try self.attestation_signatures.append(proof);
+            }
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
         for (self.attestations.slice()) |*att| {
             att.deinit();
         }
@@ -337,52 +633,6 @@ pub const AggregatedAttestationsResult = struct {
         self.attestation_signatures.deinit();
     }
 };
-
-pub fn aggregateSignedAttestations(
-    allocator: Allocator,
-    signed_attestations: []const attestation.SignedAttestation,
-) !AggregatedAttestationsResult {
-    var aggregated_attestations = try AggregatedAttestations.init(allocator);
-    errdefer aggregated_attestations.deinit();
-
-    var attestation_signatures = try AttestationSignatures.init(allocator);
-    errdefer attestation_signatures.deinit();
-
-    var groups = std.ArrayList(AggregationGroup).init(allocator);
-    defer groups.deinit();
-    errdefer for (groups.items) |*group| {
-        group.bits.deinit();
-        group.signatures.deinit();
-    };
-
-    var root_indices = std.AutoHashMap(Root, usize).init(allocator);
-    defer root_indices.deinit();
-
-    for (signed_attestations) |signed_attestation| {
-        const root = try signed_attestation.message.sszRoot(allocator);
-        if (root_indices.get(root)) |group_index| {
-            var group = &groups.items[group_index];
-            const validator_index: usize = @intCast(signed_attestation.validator_id);
-            try attestation.aggregationBitsSet(&group.bits, validator_index, true);
-            try group.signatures.append(signed_attestation.signature);
-        } else {
-            const new_group = try AggregationGroup.init(allocator, signed_attestation);
-            try groups.append(new_group);
-            const inserted_index = groups.items.len - 1;
-            try root_indices.put(root, inserted_index);
-        }
-    }
-
-    for (groups.items) |group| {
-        try aggregated_attestations.append(.{ .aggregation_bits = group.bits, .data = group.data });
-        try attestation_signatures.append(group.signatures);
-    }
-
-    return .{
-        .attestations = aggregated_attestations,
-        .attestation_signatures = attestation_signatures,
-    };
-}
 
 pub const BlockByRootRequest = struct {
     roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
@@ -574,18 +824,14 @@ test "encode decode signed block with non-empty attestation signatures" {
     var attestation_signatures = try AttestationSignatures.init(std.testing.allocator);
     errdefer attestation_signatures.deinit();
 
-    var validator_signatures = try attestation.NaiveAggregatedSignature.init(std.testing.allocator);
-    errdefer validator_signatures.deinit();
+    var signature_proof = try aggregation.AggregatedSignatureProof.init(std.testing.allocator);
+    errdefer signature_proof.deinit();
 
-    var test_sig1: SIGBYTES = undefined;
-    var test_sig2: SIGBYTES = undefined;
-    @memset(&test_sig1, 0x12);
-    @memset(&test_sig2, 0x34);
+    // Set participants for validators 0 and 1
+    try attestation.aggregationBitsSet(&signature_proof.participants, 0, true);
+    try attestation.aggregationBitsSet(&signature_proof.participants, 1, true);
 
-    try validator_signatures.append(test_sig1);
-    try validator_signatures.append(test_sig2);
-
-    try attestation_signatures.append(validator_signatures);
+    try attestation_signatures.append(signature_proof);
 
     var signed_block_with_attestation = SignedBlockWithAttestation{
         .message = .{
@@ -624,5 +870,5 @@ test "encode decode signed block with non-empty attestation signatures" {
     try std.testing.expect(decoded.message.block.slot == signed_block_with_attestation.message.block.slot);
     try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
-    try std.testing.expect(decoded_group.len() == 2);
+    try std.testing.expect(decoded_group.participants.len() == 2);
 }

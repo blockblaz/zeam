@@ -16,6 +16,7 @@ const event_broadcaster = api.event_broadcaster;
 
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
+const xmss = @import("@zeam/xmss");
 
 const utils = @import("./utils.zig");
 pub const fcFactory = @import("./forkchoice.zig");
@@ -139,6 +140,9 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clean up forkchoice resources (gossip_signatures, aggregated_payloads)
+        self.forkChoice.deinit();
+
         var it = self.states.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -268,8 +272,8 @@ pub const BeamChain = struct {
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const signed_attestations = try self.forkChoice.getProposalAttestations();
-        defer self.allocator.free(signed_attestations);
+        const attestations = try self.forkChoice.getProposalAttestations();
+        defer self.allocator.free(attestations);
 
         const parent_root = chainHead.blockRoot;
 
@@ -282,10 +286,30 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        var aggregation_opt: ?types.AggregatedAttestationsResult = try types.aggregateSignedAttestations(self.allocator, signed_attestations);
-        errdefer if (aggregation_opt) |*aggregation| aggregation.deinit();
-
-        const aggregation = &aggregation_opt.?;
+        // Use the two-phase aggregation algorithm:
+        // Phase 1: Collect individual signatures from gossip_signatures
+        // Phase 2: Fallback to aggregated_payloads using greedy set-cover
+        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        var agg_att_cleanup = true;
+        var agg_sig_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (aggregation.attestations.slice()) |*att| {
+                att.deinit();
+            }
+            aggregation.attestations.deinit();
+        };
+        errdefer if (agg_sig_cleanup) {
+            for (aggregation.attestation_signatures.slice()) |*sig| {
+                sig.deinit();
+            }
+            aggregation.attestation_signatures.deinit();
+        };
+        try aggregation.computeAggregatedSignatures(
+            attestations,
+            &pre_state.validators,
+            &self.forkChoice.gossip_signatures,
+            &self.forkChoice.aggregated_payloads,
+        );
 
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
@@ -300,18 +324,17 @@ pub const BeamChain = struct {
                 .attestations = aggregation.attestations,
             },
         };
+        agg_att_cleanup = false; // Ownership moved to block.body.attestations
         errdefer block.deinit();
 
         var attestation_signatures = aggregation.attestation_signatures;
+        agg_sig_cleanup = false; // Ownership moved to attestation_signatures
         errdefer {
             for (attestation_signatures.slice()) |*sig_group| {
                 sig_group.deinit();
             }
             attestation_signatures.deinit();
         }
-
-        // Ownership moved into `block` + `attestation_signatures`.
-        aggregation_opt = null;
 
         const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
@@ -497,7 +520,7 @@ pub const BeamChain = struct {
                         return err;
                     };
                     // followup with additional housekeeping tasks
-                    self.onBlockFollowup(true);
+                    self.onBlockFollowup(true, &signed_block);
                     // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
                     // which is responsible for freeing it after optionally fetching those roots.
 
@@ -539,7 +562,7 @@ pub const BeamChain = struct {
                 };
 
                 // Process validated attestation
-                self.onAttestation(signed_attestation) catch |err| {
+                self.onGossipAttestation(signed_attestation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
@@ -621,21 +644,28 @@ pub const BeamChain = struct {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit();
 
-                const group_signatures = if (index < signature_groups.len)
-                    signature_groups[index].constSlice()
+                // Get participant indices from the signature proof
+                const signature_proof = if (index < signature_groups.len)
+                    &signature_groups[index]
                 else
-                    &[_]types.SIGBYTES{};
+                    null;
 
-                if (validator_indices.items.len != group_signatures.len) {
+                var participant_indices = if (signature_proof) |proof|
+                    try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
+                else
+                    std.ArrayList(usize).init(self.allocator);
+                defer participant_indices.deinit();
+
+                if (validator_indices.items.len != participant_indices.items.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.module_logger.err(
-                        "attestation signature mismatch index={d} validators={d} signatures={d}",
-                        .{ index, validator_indices.items.len, group_signatures.len },
+                        "attestation signature mismatch index={d} validators={d} participants={d}",
+                        .{ index, validator_indices.items.len, participant_indices.items.len },
                     );
                     continue;
                 }
 
-                for (validator_indices.items, group_signatures) |validator_index, signature| {
+                for (validator_indices.items) |validator_index| {
                     const validator_id: types.ValidatorIndex = @intCast(validator_index);
                     const attestation = types.Attestation{
                         .validator_id = validator_id,
@@ -655,15 +685,9 @@ pub const BeamChain = struct {
                         continue;
                     };
 
-                    const signed_attestation = types.SignedAttestation{
-                        .validator_id = validator_id,
-                        .message = attestation.data,
-                        .signature = signature,
-                    };
-
-                    self.forkChoice.onAttestation(signed_attestation, true) catch |e| {
+                    self.forkChoice.onAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err("error processing block attestation={any} e={any}", .{ signed_attestation, e });
+                        self.module_logger.err("error processing block attestation={any} e={any}", .{ attestation, e });
                         continue;
                     };
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
@@ -684,7 +708,7 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
-        self.forkChoice.onAttestation(signed_proposer_attestation, false) catch |e| {
+        self.forkChoice.onGossipAttestation(signed_proposer_attestation, false) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -709,7 +733,7 @@ pub const BeamChain = struct {
         return missing_roots.toOwnedSlice();
     }
 
-    pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool) void {
+    pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlockWithAttestation) void {
         // 8. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
         const new_head = self.forkChoice.head;
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
@@ -766,6 +790,18 @@ pub const BeamChain = struct {
                     err,
                 });
             };
+
+            // Prune gossip_signatures and aggregated_payloads for finalized attestations
+            self.forkChoice.pruneSignatureMaps(latest_finalized.slot) catch |err| {
+                self.module_logger.warn("failed to prune signature maps: {any}", .{err});
+            };
+        }
+
+        // Store aggregated payloads from the block for future block building
+        if (signedBlock) |block| {
+            self.storeAggregatedPayloads(block) catch |err| {
+                self.module_logger.warn("failed to store aggregated payloads: {any}", .{err});
+            };
         }
 
         const states_count_after_block = self.states.count();
@@ -777,6 +813,39 @@ pub const BeamChain = struct {
 
         zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+    }
+
+    /// Store aggregated signature payloads from a block for future block building
+    fn storeAggregatedPayloads(self: *Self, signedBlock: *const types.SignedBlockWithAttestation) !void {
+        const block = signedBlock.message.block;
+        const aggregated_attestations = block.body.attestations.constSlice();
+        const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
+
+        for (aggregated_attestations, 0..) |aggregated_attestation, index| {
+            const signature_proof = if (index < signature_groups.len)
+                &signature_groups[index]
+            else
+                continue;
+
+            var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
+            defer validator_indices.deinit();
+
+            for (validator_indices.items) |validator_index| {
+                const validator_id: types.ValidatorIndex = @intCast(validator_index);
+
+                // Clone the proof since we need to store it and the block data may be freed
+                var cloned_proof: types.AggregatedSignatureProof = undefined;
+                types.sszClone(self.allocator, types.AggregatedSignatureProof, signature_proof.*, &cloned_proof) catch |e| {
+                    self.module_logger.warn("failed to clone aggregated proof for validator={d}: {any}", .{ validator_index, e });
+                    continue;
+                };
+
+                self.forkChoice.storeAggregatedPayload(validator_id, &aggregated_attestation.data, cloned_proof) catch |e| {
+                    self.module_logger.warn("failed to store aggregated payload for validator={d}: {any}", .{ validator_index, e });
+                    cloned_proof.deinit();
+                };
+            }
+        }
     }
 
     /// Update block database with block, state, and slot indices
@@ -1061,7 +1130,7 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
+    pub fn onGossipAttestation(self: *Self, signedAttestation: types.SignedAttestation) !void {
         // Validate attestation before processing (gossip = not from block)
         const attestation = signedAttestation.toAttestation();
         try self.validateAttestation(attestation, false);
@@ -1076,7 +1145,7 @@ pub const BeamChain = struct {
             &signedAttestation.signature,
         );
 
-        return self.forkChoice.onAttestation(signedAttestation, false);
+        return self.forkChoice.onGossipAttestation(signedAttestation, false);
     }
 
     pub fn getStatus(self: *Self) types.Status {
@@ -1803,7 +1872,7 @@ test "attestation processing - valid block attestation" {
     };
 
     // Process attestation through chain (this validates and then processes)
-    try beam_chain.onAttestation(valid_attestation);
+    try beam_chain.onGossipAttestation(valid_attestation);
 
     // Verify the attestation was recorded in attestations
     const attestations_tracker = beam_chain.forkChoice.attestations.get(1);

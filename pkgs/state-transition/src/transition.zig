@@ -55,39 +55,79 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     block.state_root = state_root;
 }
 
-// fill this up when we have signature scheme
+// Verify aggregated signatures using AggregatedSignatureProof
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
-    const signature_groups = signed_block.signature.attestation_signatures.constSlice();
+    const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
 
-    if (attestations.len != signature_groups.len) {
+    if (attestations.len != signature_proofs.len) {
         return StateTransitionError.InvalidBlockSignatures;
     }
 
-    for (attestations, 0..) |aggregated_attestation, i| {
+    const validators = state.validators.constSlice();
+
+    for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
+        // Get validator indices from the attestation's aggregation bits
         var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
         defer validator_indices.deinit();
 
-        const signatures = signature_groups[i].constSlice();
-        if (validator_indices.items.len != signatures.len) {
+        // Get validator indices from the signature proof's participants
+        var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
+        defer participant_indices.deinit();
+
+        // Verify that the participants EXACTLY match the attestation aggregation bits.
+        if (validator_indices.items.len != participant_indices.items.len) {
             return StateTransitionError.InvalidBlockSignatures;
         }
-
-        for (validator_indices.items, signatures) |validator_index, signature| {
-            try verifySingleAttestation(
-                allocator,
-                state,
-                validator_index,
-                &aggregated_attestation.data,
-                &signature,
-            );
+        for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
+            if (att_idx != proof_idx) {
+                return StateTransitionError.InvalidBlockSignatures;
+            }
         }
+
+        // Convert validator pubkey bytes to HashSigPublicKey handles
+        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
+        defer public_keys.deinit();
+
+        // Store the PublicKey wrappers so we can free the Rust handles after verification
+        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        defer {
+            for (pubkey_wrappers.items) |*wrapper| {
+                wrapper.deinit();
+            }
+            pubkey_wrappers.deinit();
+        }
+
+        for (validator_indices.items) |validator_index| {
+            if (validator_index >= validators.len) {
+                return StateTransitionError.InvalidValidatorId;
+            }
+            const validator = &validators[validator_index];
+            const pubkey_bytes = validator.getPubkey();
+            const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+                return StateTransitionError.InvalidBlockSignatures;
+            };
+            try public_keys.append(pubkey.handle);
+            try pubkey_wrappers.append(pubkey);
+        }
+
+        // Compute message hash from attestation data
+        var message_hash: [32]u8 = undefined;
+        try ssz.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+
+        const epoch: u64 = aggregated_attestation.data.slot;
+
+        // Verify the aggregated signature proof
+        const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
+        try signature_proof.verify(public_keys.items, &message_hash, epoch);
+        _ = verification_timer.observe();
     }
 
+    // Verify proposer signature (still individual)
     const proposer_attestation = signed_block.message.proposer_attestation;
     try verifySingleAttestation(
         allocator,
