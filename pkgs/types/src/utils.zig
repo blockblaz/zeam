@@ -27,7 +27,7 @@ pub const RootHex = [64]u8;
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
 pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex, DuplicateAttestationData };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData };
 
 const json = std.json;
 
@@ -53,7 +53,7 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     return false;
 }
 
-pub fn justifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
+pub fn getJustifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
     if (slot <= finalized_slot) {
         return null;
     }
@@ -62,7 +62,7 @@ pub fn justifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize 
 }
 
 pub fn isSlotJustified(finalized_slot: types.Slot, justified_slots: *const types.JustifiedSlots, slot: types.Slot) !bool {
-    const idx_opt = justifiedSlotsIndex(finalized_slot, slot);
+    const idx_opt = getJustifiedSlotsIndex(finalized_slot, slot);
     if (idx_opt == null) {
         return true;
     }
@@ -74,7 +74,7 @@ pub fn isSlotJustified(finalized_slot: types.Slot, justified_slots: *const types
 }
 
 pub fn setSlotJustified(finalized_slot: types.Slot, justified_slots: *types.JustifiedSlots, slot: types.Slot, value: bool) !void {
-    const idx_opt = justifiedSlotsIndex(finalized_slot, slot);
+    const idx_opt = getJustifiedSlotsIndex(finalized_slot, slot);
     if (idx_opt == null) {
         return;
     }

@@ -127,6 +127,9 @@ pub const BeamState = struct {
         const num_validators = self.validatorCount();
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
+            if (std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH)) {
+                return StateTransitionError.InvalidJustificationRoot;
+            }
             const validator_data = try allocator.alloc(u8, num_validators);
             errdefer allocator.free(validator_data);
             // Copy existing justification data if available, otherwise return error
@@ -180,8 +183,29 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
+    fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot)) !void {
+        const start_slot: usize = @intCast(finalized_slot + 1);
+        const historical_len_usize: usize = self.historical_block_hashes.len();
+        var i: usize = start_slot;
+        while (i < historical_len_usize) : (i += 1) {
+            const root = try self.historical_block_hashes.get(i);
+            const slot_i: Slot = @intCast(i);
+            if (root_to_slot.getPtr(root)) |slot_ptr| {
+                if (slot_i > slot_ptr.*) {
+                    slot_ptr.* = slot_i;
+                }
+            } else {
+                try root_to_slot.put(allocator, root, slot_i);
+            }
+        }
+    }
+
     fn extendJustifiedSlots(self: *Self, finalized_slot: Slot, target_slot: Slot) !void {
-        if (target_slot <= finalized_slot) {
+        if (target_slot < finalized_slot) {
+            return StateTransitionError.InvalidJustificationTargetSlot;
+        }
+        if (target_slot == finalized_slot) {
+            // Genesis or the first post-finalization block has no new slots to extend.
             return;
         }
         const base: Slot = finalized_slot + 1;
@@ -189,11 +213,11 @@ pub const BeamState = struct {
         const required_capacity: Slot = relative_index + 1;
         const current_len: Slot = @intCast(self.justified_slots.len());
         if (required_capacity <= current_len) {
-            return;
+            return StateTransitionError.InvalidJustificationCapacity;
         }
         const gap_size: Slot = required_capacity - current_len;
-        var i: Slot = 0;
-        while (i < gap_size) : (i += 1) {
+        const gap_size_usize: usize = @intCast(gap_size);
+        for (0..gap_size_usize) |_| {
             try self.justified_slots.append(false);
         }
     }
@@ -352,27 +376,9 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
-        var root_to_slots: std.AutoHashMapUnmanaged(Root, std.ArrayListUnmanaged(Slot)) = .empty;
-        defer {
-            var iter = root_to_slots.iterator();
-            while (iter.next()) |entry| {
-                entry.value_ptr.*.deinit(allocator);
-            }
-            root_to_slots.deinit(allocator);
-        }
-        const start_slot: usize = @intCast(finalized_slot + 1);
-        const historical_len_usize: usize = self.historical_block_hashes.len();
-        var i: usize = start_slot;
-        while (i < historical_len_usize) : (i += 1) {
-            const root = try self.historical_block_hashes.get(i);
-            if (root_to_slots.getPtr(root)) |slots| {
-                try slots.append(allocator, @intCast(i));
-            } else {
-                var slots = std.ArrayListUnmanaged(Slot){};
-                try slots.append(allocator, @intCast(i));
-                try root_to_slots.put(allocator, root, slots);
-            }
-        }
+        var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
+        defer root_to_slot.deinit(allocator);
+        try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot);
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -405,6 +411,15 @@ pub const BeamState = struct {
             const is_target_already_justified = try utils.isSlotJustified(finalized_slot, &self.justified_slots, target_slot);
             const stored_source_root = try self.historical_block_hashes.get(@intCast(source_slot));
             const stored_target_root = try self.historical_block_hashes.get(@intCast(target_slot));
+            const is_zero_source = std.mem.eql(u8, &attestation_data.source.root, &utils.ZERO_HASH);
+            const is_zero_target = std.mem.eql(u8, &attestation_data.target.root, &utils.ZERO_HASH);
+            if (is_zero_source or is_zero_target) {
+                logger.debug("skipping the attestation as not viable: source_zero_root={} target_zero_root={}", .{
+                    is_zero_source,
+                    is_zero_target,
+                });
+                continue;
+            }
             const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
             const has_known_root = has_correct_source_root and has_correct_target_root;
@@ -463,10 +478,10 @@ pub const BeamState = struct {
                 if (justifications.fetchRemove(attestation_data.target.root)) |kv| {
                     allocator.free(kv.value);
                 }
-                const justified_str_new = try self.latest_justified.toJsonString(allocator);
-                defer allocator.free(justified_str_new);
-
-                logger.debug("\n\n\n-----------------HURRAY JUSTIFICATION ------------\n{s}\n--------------\n---------------\n-------------------------\n\n\n", .{justified_str_new});
+                logger.debug(
+                    "\n\n\n-----------------HURRAY JUSTIFICATION ------------\nroot=0x{s} slot={d}\n--------------\n---------------\n-------------------------\n\n\n",
+                    .{ std.fmt.fmtSliceHexLower(&self.latest_justified.root), self.latest_justified.slot },
+                );
 
                 // source is finalized if target is the next valid justifiable hash
                 var can_target_finalize = true;
@@ -491,15 +506,8 @@ pub const BeamState = struct {
                         defer roots_to_remove.deinit();
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
-                            if (root_to_slots.get(entry.key_ptr.*)) |slots| {
-                                for (slots.items) |slot_value| {
-                                    if (slot_value > finalized_slot) {
-                                        break;
-                                    }
-                                } else {
-                                    try roots_to_remove.append(entry.key_ptr.*);
-                                }
-                            } else {
+                            const slot_value = root_to_slot.get(entry.key_ptr.*) orelse return StateTransitionError.InvalidJustificationRoot;
+                            if (slot_value <= finalized_slot) {
                                 try roots_to_remove.append(entry.key_ptr.*);
                             }
                         }
@@ -874,7 +882,7 @@ test "isSlotJustified errors on out of bounds" {
     );
 }
 
-test "duplicate roots in root_to_slots mapping" {
+test "pruning keeps pending justifications" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
     var state = try makeGenesisState(std.testing.allocator, 3);
@@ -924,18 +932,8 @@ test "duplicate roots in root_to_slots mapping" {
     defer block_5.deinit();
     try state.process_block_header(std.testing.allocator, block_5, logger);
 
-    // Phase 3: Inject duplicate roots to simulate missed blocks.
+    // Phase 3: Seed a pending justification.
     const slot_3_root = try state.historical_block_hashes.get(3);
-    const historical_slice = state.historical_block_hashes.constSlice();
-    var modified_hashes = try HistoricalBlockHashes.init(std.testing.allocator);
-    errdefer modified_hashes.deinit();
-    for (historical_slice, 0..) |root, i| {
-        var new_root = root;
-        if (i == 2 or i == 4) {
-            new_root = utils.ZERO_HASH;
-        }
-        try modified_hashes.append(new_root);
-    }
 
     var pending_roots = try JustificationRoots.init(std.testing.allocator);
     errdefer pending_roots.deinit();
@@ -947,28 +945,20 @@ test "duplicate roots in root_to_slots mapping" {
     try pending_validators.append(false);
     try pending_validators.append(false);
 
-    state.historical_block_hashes.deinit();
-    state.historical_block_hashes = modified_hashes;
     state.justifications_roots.deinit();
     state.justifications_roots = pending_roots;
     state.justifications_validators.deinit();
     state.justifications_validators = pending_validators;
 
-    const root_2 = try state.historical_block_hashes.get(2);
-    const root_4 = try state.historical_block_hashes.get(4);
-    const root_3 = try state.historical_block_hashes.get(3);
-    try std.testing.expect(std.mem.eql(u8, &root_2, &utils.ZERO_HASH));
-    try std.testing.expect(std.mem.eql(u8, &root_4, &utils.ZERO_HASH));
-    try std.testing.expect(std.mem.eql(u8, &root_3, &slot_3_root));
-
     // Phase 4: Trigger finalization to exercise pruning.
     const source_1_root = try state.historical_block_hashes.get(1);
+    const slot_2_root = try state.historical_block_hashes.get(2);
     var att_1_to_2 = try makeAggregatedAttestation(
         std.testing.allocator,
         &[_]usize{ 0, 1 },
         state.slot,
         .{ .root = source_1_root, .slot = 1 },
-        .{ .root = utils.ZERO_HASH, .slot = 2 },
+        .{ .root = slot_2_root, .slot = 2 },
     );
     var att_1_to_2_transferred = false;
     defer if (!att_1_to_2_transferred) att_1_to_2.deinit();
@@ -984,8 +974,6 @@ test "duplicate roots in root_to_slots mapping" {
     att_1_to_2_transferred = true;
 
     try state.process_attestations(std.testing.allocator, attestations_list, logger);
-
-    std.debug.print("dup_roots finalized={d} justified={d}\n", .{ state.latest_finalized.slot, state.latest_justified.slot });
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
