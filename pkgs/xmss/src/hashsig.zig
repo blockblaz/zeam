@@ -1,13 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const aggregate = @import("aggregate.zig");
+pub const aggregate = @import("aggregation.zig");
 
 /// Opaque pointer to the Rust KeyPair struct
 pub const HashSigKeyPair = opaque {};
 
 /// Opaque pointer to the Rust Signature struct
 pub const HashSigSignature = opaque {};
+
+/// Opaque pointer to the Rust PublicKey struct
+pub const HashSigPublicKey = opaque {};
+
+/// Opaque pointer to the Rust PrivateKey struct
+pub const HashSigPrivateKey = opaque {};
 
 /// Generate a new key pair
 extern fn hashsig_keypair_generate(
@@ -18,8 +24,8 @@ extern fn hashsig_keypair_generate(
 
 /// Reconstruct a key pair from SSZ-encoded bytes
 extern fn hashsig_keypair_from_ssz(
-    secret_key_ssz: [*]const u8,
-    secret_key_len: usize,
+    private_key_ssz: [*]const u8,
+    private_key_len: usize,
     public_key_ssz: [*]const u8,
     public_key_len: usize,
 ) ?*HashSigKeyPair;
@@ -27,25 +33,58 @@ extern fn hashsig_keypair_from_ssz(
 /// Free a key pair
 extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
 
-/// Sign a message
-/// Returns pointer to Signature on success, null on error
+/// Get pointer to public key from keypair (valid as long as keypair is alive)
+extern fn hashsig_keypair_get_public_key(keypair: *const HashSigKeyPair) ?*const HashSigPublicKey;
+
+/// Get pointer to private key from keypair (valid as long as keypair is alive)
+extern fn hashsig_keypair_get_private_key(keypair: *const HashSigKeyPair) ?*const HashSigPrivateKey;
+
+/// Sign a message using private key directly
 extern fn hashsig_sign(
-    keypair: *const HashSigKeyPair,
+    private_key: *const HashSigPrivateKey,
     message_ptr: [*]const u8,
     epoch: u32,
 ) ?*HashSigSignature;
 
-/// Free a signature
-extern fn hashsig_signature_free(signature: ?*HashSigSignature) void;
-
-/// Verify a signature
-/// Returns 1 if valid, 0 if invalid, -1 on error
+/// Verify a signature using public key directly
 extern fn hashsig_verify(
-    keypair: *const HashSigKeyPair,
+    public_key: *const HashSigPublicKey,
     message_ptr: [*]const u8,
     epoch: u32,
     signature: *const HashSigSignature,
 ) i32;
+
+/// Serialize a public key pointer to bytes
+extern fn hashsig_public_key_to_bytes(
+    public_key: *const HashSigPublicKey,
+    buffer: [*]u8,
+    buffer_len: usize,
+) usize;
+
+/// Serialize a private key pointer to bytes
+extern fn hashsig_private_key_to_bytes(
+    private_key: *const HashSigPrivateKey,
+    buffer: [*]u8,
+    buffer_len: usize,
+) usize;
+
+/// Free a signature
+extern fn hashsig_signature_free(signature: ?*HashSigSignature) void;
+
+/// Construct a signature from SSZ bytes
+extern fn hashsig_signature_from_ssz(
+    sig_bytes: [*]const u8,
+    sig_len: usize,
+) ?*HashSigSignature;
+
+/// Construct a public key from SSZ bytes
+extern fn hashsig_public_key_from_ssz(
+    pubkey_bytes: [*]const u8,
+    pubkey_len: usize,
+) ?*HashSigPublicKey;
+
+/// Free a standalone public key
+extern fn hashsig_public_key_free(pubkey: ?*HashSigPublicKey) void;
 
 /// Get the message length constant
 extern fn hashsig_message_length() usize;
@@ -53,20 +92,6 @@ extern fn hashsig_message_length() usize;
 /// Serialize a signature to bytes using SSZ encoding
 extern fn hashsig_signature_to_bytes(
     signature: *const HashSigSignature,
-    buffer: [*]u8,
-    buffer_len: usize,
-) usize;
-
-/// Serialize a public key to bytes using SSZ encoding
-extern fn hashsig_pubkey_to_bytes(
-    keypair: *const HashSigKeyPair,
-    buffer: [*]u8,
-    buffer_len: usize,
-) usize;
-
-/// Serialize a private key to bytes using SSZ encoding
-extern fn hashsig_privkey_to_bytes(
-    keypair: *const HashSigKeyPair,
     buffer: [*]u8,
     buffer_len: usize,
 ) usize;
@@ -114,6 +139,8 @@ pub fn verifySsz(
 /// Wrapper for the hash signature key pair
 pub const KeyPair = struct {
     handle: *HashSigKeyPair,
+    public_key: *const HashSigPublicKey,
+    private_key: *const HashSigPrivateKey,
     allocator: Allocator,
 
     const Self = @This();
@@ -137,8 +164,20 @@ pub const KeyPair = struct {
             return HashSigError.KeyGenerationFailed;
         };
 
+        const public_key = hashsig_keypair_get_public_key(handle) orelse {
+            hashsig_keypair_free(handle);
+            return HashSigError.KeyGenerationFailed;
+        };
+
+        const private_key = hashsig_keypair_get_private_key(handle) orelse {
+            hashsig_keypair_free(handle);
+            return HashSigError.KeyGenerationFailed;
+        };
+
         return Self{
             .handle = handle,
+            .public_key = public_key,
+            .private_key = private_key,
             .allocator = allocator,
         };
     }
@@ -146,24 +185,36 @@ pub const KeyPair = struct {
     /// Reconstruct a key pair from SSZ-encoded bytes
     pub fn fromSsz(
         allocator: Allocator,
-        secret_key_ssz: []const u8,
+        private_key_ssz: []const u8,
         public_key_ssz: []const u8,
     ) HashSigError!Self {
-        if (secret_key_ssz.len == 0 or public_key_ssz.len == 0) {
+        if (private_key_ssz.len == 0 or public_key_ssz.len == 0) {
             return HashSigError.DeserializationFailed;
         }
 
         const handle = hashsig_keypair_from_ssz(
-            secret_key_ssz.ptr,
-            secret_key_ssz.len,
+            private_key_ssz.ptr,
+            private_key_ssz.len,
             public_key_ssz.ptr,
             public_key_ssz.len,
         ) orelse {
             return HashSigError.DeserializationFailed;
         };
 
+        const public_key = hashsig_keypair_get_public_key(handle) orelse {
+            hashsig_keypair_free(handle);
+            return HashSigError.DeserializationFailed;
+        };
+
+        const private_key = hashsig_keypair_get_private_key(handle) orelse {
+            hashsig_keypair_free(handle);
+            return HashSigError.DeserializationFailed;
+        };
+
         return Self{
             .handle = handle,
+            .public_key = public_key,
+            .private_key = private_key,
             .allocator = allocator,
         };
     }
@@ -181,7 +232,7 @@ pub const KeyPair = struct {
         }
 
         const sig_handle = hashsig_sign(
-            self.handle,
+            self.private_key,
             message.ptr,
             epoch,
         ) orelse {
@@ -204,7 +255,7 @@ pub const KeyPair = struct {
         }
 
         const result = hashsig_verify(
-            self.handle,
+            self.public_key,
             message.ptr,
             epoch,
             signature.handle,
@@ -222,8 +273,8 @@ pub const KeyPair = struct {
 
     /// Serialize public key to bytes (SSZ format)
     pub fn pubkeyToBytes(self: *const Self, buffer: []u8) HashSigError!usize {
-        const bytes_written = hashsig_pubkey_to_bytes(
-            self.handle,
+        const bytes_written = hashsig_public_key_to_bytes(
+            self.public_key,
             buffer.ptr,
             buffer.len,
         );
@@ -237,8 +288,8 @@ pub const KeyPair = struct {
 
     /// Serialize private key to bytes (SSZ format)
     pub fn privkeyToBytes(self: *const Self, buffer: []u8) HashSigError!usize {
-        const bytes_written = hashsig_privkey_to_bytes(
-            self.handle,
+        const bytes_written = hashsig_private_key_to_bytes(
+            self.private_key,
             buffer.ptr,
             buffer.len,
         );
@@ -262,6 +313,22 @@ pub const Signature = struct {
 
     const Self = @This();
 
+    /// Deserialize a signature from SSZ bytes
+    pub fn fromBytes(bytes: []const u8) HashSigError!Self {
+        if (bytes.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_signature_from_ssz(
+            bytes.ptr,
+            bytes.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
+        };
+
+        return Self{ .handle = handle };
+    }
+
     /// Serialize signature to bytes (SSZ format)
     /// Returns the number of bytes written to the buffer
     pub fn toBytes(self: *const Self, buffer: []u8) HashSigError!usize {
@@ -284,13 +351,40 @@ pub const Signature = struct {
     }
 };
 
+/// Wrapper for standalone public keys reconstructed from SSZ bytes
+pub const PublicKey = struct {
+    handle: *HashSigPublicKey,
+
+    const Self = @This();
+
+    pub fn fromBytes(bytes: []const u8) HashSigError!Self {
+        if (bytes.len == 0) {
+            return HashSigError.DeserializationFailed;
+        }
+
+        const handle = hashsig_public_key_from_ssz(
+            bytes.ptr,
+            bytes.len,
+        ) orelse {
+            return HashSigError.DeserializationFailed;
+        };
+
+        return Self{ .handle = handle };
+    }
+
+    pub fn deinit(self: *Self) void {
+        hashsig_public_key_free(self.handle);
+    }
+};
+
 test "HashSig: generate keypair" {
     const allocator = std.testing.allocator;
 
     var keypair = try KeyPair.generate(allocator, "test_seed", 0, 2);
     defer keypair.deinit();
 
-    try std.testing.expect(@intFromPtr(keypair.handle) != 0);
+    try std.testing.expect(@intFromPtr(keypair.public_key) != 0);
+    try std.testing.expect(@intFromPtr(keypair.private_key) != 0);
 }
 
 test "HashSig: SSZ keypair roundtrip" {

@@ -436,6 +436,10 @@ pub const BeamNode = struct {
                 .{std.fmt.fmtSliceHexLower(block_root[0..])},
             );
 
+            // Store aggregated signature proofs from this block so they can be reused
+            // in future block production. This is the same followup done for gossiped blocks.
+            self.chain.onBlockFollowup(true, signed_block);
+
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
 
@@ -823,7 +827,7 @@ pub const BeamNode = struct {
         });
 
         // 3. followup with additional housekeeping tasks
-        self.chain.onBlockFollowup(true);
+        self.chain.onBlockFollowup(true, &signed_block);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
@@ -835,7 +839,7 @@ pub const BeamNode = struct {
             data.slot,
             validator_id,
         });
-        try self.chain.onAttestation(signed_attestation);
+        try self.chain.onGossipAttestation(signed_attestation);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
