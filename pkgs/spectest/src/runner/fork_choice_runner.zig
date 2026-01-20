@@ -940,7 +940,7 @@ fn verifyAttestationChecks(
             return FixtureError.FixtureMismatch;
         }
 
-        const attestation = proto.?.attestation orelse {
+        const attestation_data = proto.?.attestation_data orelse {
             std.debug.print(
                 "fixture {s} case {s}{}: validator {d} has no attestation payload\n",
                 .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -950,7 +950,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("attestationSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "attestationSlot");
-            if (attestation.message.slot != expected) {
+            if (attestation_data.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} attestation slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -961,7 +961,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("headSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "headSlot");
-            if (attestation.message.head.slot != expected) {
+            if (attestation_data.head.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} head slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -972,7 +972,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("sourceSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "sourceSlot");
-            if (attestation.message.source.slot != expected) {
+            if (attestation_data.source.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} source slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
@@ -983,7 +983,7 @@ fn verifyAttestationChecks(
 
         if (obj.get("targetSlot")) |slot_value| {
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "targetSlot");
-            if (attestation.message.target.slot != expected) {
+            if (attestation_data.target.slot != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{}: validator {d} target slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
