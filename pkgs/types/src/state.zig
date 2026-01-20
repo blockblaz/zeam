@@ -186,8 +186,7 @@ pub const BeamState = struct {
     fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot)) !void {
         const start_slot: usize = @intCast(finalized_slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
-        var i: usize = start_slot;
-        while (i < historical_len_usize) : (i += 1) {
+        for (start_slot..historical_len_usize) |i| {
             const root = try self.historical_block_hashes.get(i);
             const slot_i: Slot = @intCast(i);
             if (root_to_slot.getPtr(root)) |slot_ptr| {
@@ -485,9 +484,11 @@ pub const BeamState = struct {
 
                 // source is finalized if target is the next valid justifiable hash
                 var can_target_finalize = true;
-                var check_slot: Slot = source_slot + 1;
-                while (check_slot < target_slot) : (check_slot += 1) {
-                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, check_slot)) {
+                const start_slot_usize: usize = @intCast(source_slot + 1);
+                const end_slot_usize: usize = @intCast(target_slot);
+                for (start_slot_usize..end_slot_usize) |slot_usize| {
+                    const slot: Slot = @intCast(slot_usize);
+                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
                         can_target_finalize = false;
                         break;
                     }
