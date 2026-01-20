@@ -437,6 +437,8 @@ pub fn build(b: *Builder) !void {
     });
     types_tests.root_module.addImport("ssz", ssz);
     types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    types_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, types_tests, target, prover);
     const run_types_test = b.addRunArtifact(types_tests);
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
