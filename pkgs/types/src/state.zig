@@ -127,9 +127,7 @@ pub const BeamState = struct {
         const num_validators = self.validatorCount();
         // Initialize justifications from state
         for (self.justifications_roots.constSlice(), 0..) |blockRoot, i| {
-            if (std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH)) {
-                return StateTransitionError.InvalidJustificationRoot;
-            }
+            std.debug.assert(!std.mem.eql(u8, &blockRoot, &utils.ZERO_HASH));
             const validator_data = try allocator.alloc(u8, num_validators);
             errdefer allocator.free(validator_data);
             // Copy existing justification data if available, otherwise return error
@@ -507,7 +505,9 @@ pub const BeamState = struct {
                         defer roots_to_remove.deinit();
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
-                            const slot_value = root_to_slot.get(entry.key_ptr.*) orelse return StateTransitionError.InvalidJustificationRoot;
+                            const slot_value_opt = root_to_slot.get(entry.key_ptr.*);
+                            std.debug.assert(slot_value_opt != null);
+                            const slot_value = slot_value_opt.?;
                             if (slot_value <= finalized_slot) {
                                 try roots_to_remove.append(entry.key_ptr.*);
                             }
