@@ -19,6 +19,7 @@ const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
 
 const utils_lib = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const database = @import("@zeam/database");
 
@@ -307,6 +308,10 @@ fn mainInner() !void {
 
             var api_server_handle: ?api_server.APIServerHandle = null;
             defer if (api_server_handle) |*handle| handle.stop();
+
+            // Set node lifecycle metrics
+            zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
 
             // Create logger config for API server
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });

@@ -175,6 +175,9 @@ pub const BeamChain = struct {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
+        // Update current slot metric (wall-clock time slot)
+        zeam_metrics.metrics.lean_current_slot.set(slot);
+
         var has_proposal = false;
         if (interval == 0) {
             const num_validators: usize = @intCast(self.config.genesis.numValidators());
@@ -798,6 +801,8 @@ pub const BeamChain = struct {
         // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
         if (latest_finalized.slot > last_emitted_finalized.slot) {
             self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
+                // Record failed finalization attempt
+                zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
                 self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
                     last_emitted_finalized.slot,
                     latest_finalized.slot,
@@ -1020,6 +1025,9 @@ pub const BeamChain = struct {
         //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
         //     }
         // }
+
+        // Record successful finalization
+        zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
 
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }

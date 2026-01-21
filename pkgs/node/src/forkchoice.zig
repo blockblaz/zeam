@@ -863,9 +863,32 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn updateHeadUnlocked(self: *Self) !ProtoBlock {
+        const previous_head = self.head;
         self.head = try self.computeFCHeadUnlocked(true, 0);
+
         // Update the lean_head_slot metric
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
+
+        // Detect reorg: if head changed and previous head is not an ancestor of new head
+        if (!std.mem.eql(u8, &self.head.blockRoot, &previous_head.blockRoot)) {
+            // Build ancestor map while checking - reused in calculateReorgDepth if reorg detected
+            var new_head_ancestors = std.AutoHashMap(types.Root, void).init(self.allocator);
+            defer new_head_ancestors.deinit();
+
+            const is_extension = self.isAncestorOf(previous_head.blockRoot, self.head.blockRoot, &new_head_ancestors);
+            if (!is_extension) {
+                // Reorg detected - previous head is NOT an ancestor of new head
+                const depth = self.calculateReorgDepth(previous_head.blockRoot, &new_head_ancestors);
+                zeam_metrics.metrics.lean_fork_choice_reorgs_total.incr();
+                zeam_metrics.metrics.lean_fork_choice_reorg_depth.observe(@floatFromInt(depth));
+                self.logger.info("fork choice reorg detected: depth={d} old_head_slot={d} new_head_slot={d}", .{
+                    depth,
+                    previous_head.slot,
+                    self.head.slot,
+                });
+            }
+        }
+
         return self.head;
     }
 
@@ -873,7 +896,50 @@ pub const ForkChoice = struct {
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
+        // Update safe target slot metric
+        zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
+    }
+
+    /// Checks if potential_ancestor is an ancestor of descendant by walking up parent chain.
+    /// Populates ancestors_map with all visited nodes for reuse in calculateReorgDepth.
+    /// Note: descendant must exist in protoArray (it comes from computeFCHead which retrieves
+    /// it directly from protoArray.nodes). If not found, it indicates a bug in the code.
+    fn isAncestorOf(self: *Self, potential_ancestor: types.Root, descendant: types.Root, ancestors_map: *std.AutoHashMap(types.Root, void)) bool {
+        // descendant is guaranteed to exist - it comes from computeFCHeadUnlocked() which
+        // retrieves it directly from protoArray.nodes.
+        var maybe_idx: ?usize = self.protoArray.indices.get(descendant);
+        if (maybe_idx == null) unreachable; // invariant violation - descendant must exist
+
+        while (maybe_idx) |idx| {
+            const current_node = self.protoArray.nodes.items[idx];
+            ancestors_map.put(current_node.blockRoot, {}) catch {};
+            if (std.mem.eql(u8, &current_node.blockRoot, &potential_ancestor)) {
+                return true;
+            }
+            maybe_idx = current_node.parent;
+        }
+        return false;
+    }
+
+    /// Calculate the reorg depth by counting blocks from old head to common ancestor.
+    /// Uses pre-built new_head_ancestors map from isAncestorOf to avoid redundant traversal.
+    fn calculateReorgDepth(self: *Self, old_head_root: types.Root, new_head_ancestors: *std.AutoHashMap(types.Root, void)) usize {
+        // Walk up from old head counting blocks until we hit a common ancestor
+        // old_head_root could potentially be pruned in edge cases, so use defensive return 0
+        var depth: usize = 0;
+        var maybe_old_idx: ?usize = self.protoArray.indices.get(old_head_root);
+        if (maybe_old_idx == null) return 0; // defensive - old head could be pruned
+
+        while (maybe_old_idx) |idx| {
+            const old_node = self.protoArray.nodes.items[idx];
+            if (new_head_ancestors.contains(old_node.blockRoot)) {
+                return depth;
+            }
+            depth += 1;
+            maybe_old_idx = old_node.parent;
+        }
+        return depth;
     }
 
     pub fn onGossipAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {

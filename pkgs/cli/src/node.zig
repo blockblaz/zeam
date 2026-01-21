@@ -28,6 +28,8 @@ const database = @import("@zeam/database");
 const json = std.json;
 const utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const zeam_metrics = @import("@zeam/metrics");
+const build_options = @import("build_options");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -242,6 +244,10 @@ pub const Node = struct {
                 options.logger_config,
                 self.beam_node.chain,
             );
+
+            // Set node lifecycle metrics
+            zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
         }
 
         self.logger = options.logger_config.logger(.node);
