@@ -210,8 +210,8 @@ pub const BeamBlock = struct {
 };
 
 pub const BlockSignatures = struct {
-    proposer_signature: SIGBYTES,
     attestation_signatures: AttestationSignatures,
+    proposer_signature: SIGBYTES,
 
     pub fn deinit(self: *BlockSignatures) void {
         for (self.attestation_signatures.slice()) |*group| {
