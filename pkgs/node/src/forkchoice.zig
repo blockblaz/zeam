@@ -1262,6 +1262,14 @@ pub const ForkChoice = struct {
         return self.getCanonicalViewUnlocked(canonical_view, targetAnchorRoot, prevAnchorRootOrNull);
     }
 
+    /// Builds canonical view and analysis under a single shared lock for snapshot consistency.
+    pub fn getCanonicalViewAndAnalysis(self: *Self, canonical_view: *std.AutoHashMap(types.Root, void), targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root) ![3][]types.Root {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        try self.getCanonicalViewUnlocked(canonical_view, targetAnchorRoot, prevAnchorRootOrNull);
+        return self.getCanonicalityAnalysisUnlocked(targetAnchorRoot, prevAnchorRootOrNull, canonical_view);
+    }
+
     pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
@@ -1287,8 +1295,8 @@ pub const ForkChoice = struct {
     }
 
     pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.computeDeltasUnlocked(from_known);
     }
 

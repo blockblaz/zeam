@@ -942,8 +942,7 @@ pub const BeamChain = struct {
         // 1. Do canonoical analysis to segment forkchoice
         var canonical_view = std.AutoHashMap(types.Root, void).init(self.allocator);
         defer canonical_view.deinit();
-        try self.forkChoice.getCanonicalView(&canonical_view, latestFinalized.root, null);
-        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(latestFinalized.root, null, &canonical_view);
+        const analysis_result = try self.forkChoice.getCanonicalViewAndAnalysis(&canonical_view, latestFinalized.root, null);
 
         const finalized_roots = analysis_result[0];
         const non_finalized_descendants = analysis_result[1];
@@ -995,7 +994,7 @@ pub const BeamChain = struct {
 
         // 5 Rebase forkchouce
         if (pruneForkchoice)
-            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+            try self.forkChoice.rebase(latestFinalized.root, null);
 
         // TODO:
         // 6. Remove orphaned blocks from database and cleanup unfinalized indices of there are any
