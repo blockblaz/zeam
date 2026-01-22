@@ -633,7 +633,10 @@ fn processBlockStep(
     }
     try types.sszClone(ctx.allocator, types.BeamState, parent_state_ptr.*, new_state_ptr);
 
-    state_transition.apply_transition(ctx.allocator, new_state_ptr, block, .{ .logger = ctx.fork_logger, .validateResult = false }) catch |err| {
+    state_transition.apply_transition(ctx.allocator, new_state_ptr, block, .{
+        .logger = ctx.fork_logger,
+        .validateResult = false,
+    }) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{}: state transition failed {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },

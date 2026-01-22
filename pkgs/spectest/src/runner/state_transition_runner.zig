@@ -277,7 +277,11 @@ fn runCase(
             }
         }
 
-        state_transition.apply_transition(allocator, &pre_state, block, .{ .logger = logger }) catch |err| {
+        const validate_result = expect_exception != null;
+        state_transition.apply_transition(allocator, &pre_state, block, .{
+            .logger = logger,
+            .validateResult = validate_result,
+        }) catch |err| {
             encountered_error = true;
             if (expect_exception == null) {
                 std.debug.print(

@@ -42,11 +42,9 @@ pub fn baseRelRoot(comptime spec_fork: Fork) []const u8 {
 
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
+const key_manager = @import("@zeam/key-manager");
 const ssz = @import("ssz");
 const xmss = @import("@zeam/xmss");
-
-const DEFAULT_SIGNATURE_SSZ_LEN: usize = types.SIGSIZE;
-const TEST_SIGNATURE_SSZ_LEN: usize = 424;
 
 // Signature structure constants from leansig
 // path: 8 siblings, each is 8 u32 = 256 bytes
@@ -207,15 +205,17 @@ fn runCase(
         },
     };
 
-    const env_is_test = blk: {
-        const lean_env_val = case_obj.get("leanEnv") orelse break :blk false;
-        const lean_env = switch (lean_env_val) {
+    const lean_env = blk: {
+        const lean_env_val = case_obj.get("leanEnv") orelse break :blk null;
+        const lean_env_str = switch (lean_env_val) {
             .string => |s| s,
-            else => break :blk false,
+            else => break :blk null,
         };
-        break :blk std.mem.eql(u8, lean_env, "test");
+        break :blk lean_env_str;
     };
-    const signature_ssz_len: usize = if (env_is_test) TEST_SIGNATURE_SSZ_LEN else DEFAULT_SIGNATURE_SSZ_LEN;
+    const test_config = key_manager.XmssTestConfig.fromLeanEnv(lean_env);
+    const signature_ssz_len: usize = test_config.signature_ssz_len;
+    const allow_placeholder_aggregated_proof = test_config.allow_placeholder_aggregated_proof;
 
     // Parse the anchorState to get validators
     const anchor_state_value = case_obj.get("anchorState") orelse {
@@ -246,7 +246,7 @@ fn runCase(
         &parsed.signed_block,
         parsed.attestation_proofs,
         signature_ssz_len,
-        env_is_test,
+        allow_placeholder_aggregated_proof,
     );
 
     if (expect_failure) {
@@ -276,7 +276,7 @@ fn verifySignaturesWithFixtureProofs(
     signed_block: *const types.SignedBlockWithAttestation,
     proofs: []const AggregatedSignatureProof,
     signature_ssz_len: usize,
-    env_is_test: bool,
+    allow_placeholder_aggregated_proof: bool,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
 
@@ -306,10 +306,9 @@ fn verifySignaturesWithFixtureProofs(
             }
         }
 
-        // NOTE: leanSpec currently serializes a placeholder proof (`0x00`) when running in
-        // `leanEnv="test"` (see lean_multisig_py usage with test_mode). We accept the proof
-        // bytes in test mode and only validate participant bookkeeping.
-        if (env_is_test) {
+        // NOTE: leanSpec currently serializes a placeholder proof (`0x00`) in test mode.
+        // We accept the proof bytes and only validate participant bookkeeping.
+        if (allow_placeholder_aggregated_proof) {
             if (proof.proof_data.len == 0) {
                 return types.StateTransitionError.InvalidBlockSignatures;
             }

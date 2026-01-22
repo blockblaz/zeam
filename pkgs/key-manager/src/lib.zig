@@ -4,6 +4,180 @@ const types = @import("@zeam/types");
 const zeam_metrics = @import("@zeam/metrics");
 const ssz = @import("ssz");
 const Allocator = std.mem.Allocator;
+const JsonValue = std.json.Value;
+
+pub const XmssTestScheme = enum {
+    @"test",
+    prod,
+};
+
+pub const TEST_SIGNATURE_SSZ_LEN: usize = 424;
+
+pub const XmssTestConfig = struct {
+    scheme: XmssTestScheme,
+    signature_ssz_len: usize,
+    allow_placeholder_aggregated_proof: bool,
+
+    pub fn fromLeanEnv(lean_env: ?[]const u8) XmssTestConfig {
+        const scheme = schemeFromLeanEnv(lean_env);
+        return .{
+            .scheme = scheme,
+            .signature_ssz_len = switch (scheme) {
+                .@"test" => TEST_SIGNATURE_SSZ_LEN,
+                .prod => types.SIGSIZE,
+            },
+            .allow_placeholder_aggregated_proof = scheme == .@"test",
+        };
+    }
+};
+
+pub const TestKeyManagerError = error{
+    DuplicateKeyIndex,
+    InvalidKeyFile,
+    InvalidKeyIndex,
+    InvalidPublicKey,
+    NoKeysFound,
+    PublicKeyNotFound,
+};
+
+pub const TestKeyManager = struct {
+    allocator: Allocator,
+    config: XmssTestConfig,
+    pubkeys: std.AutoHashMap(usize, types.Bytes52),
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, lean_env: ?[]const u8) Self {
+        return Self{
+            .allocator = allocator,
+            .config = XmssTestConfig.fromLeanEnv(lean_env),
+            .pubkeys = std.AutoHashMap(usize, types.Bytes52).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.pubkeys.deinit();
+    }
+
+    pub fn loadLeanSpecKeys(self: *Self, keys_root: []const u8) !void {
+        const scheme_dir_name = switch (self.config.scheme) {
+            .@"test" => "test_scheme",
+            .prod => "prod_scheme",
+        };
+        const scheme_dir_path = try std.fs.path.join(self.allocator, &.{ keys_root, scheme_dir_name });
+        defer self.allocator.free(scheme_dir_path);
+        try self.loadKeysFromDir(scheme_dir_path);
+    }
+
+    pub fn loadKeysFromDir(self: *Self, keys_dir_path: []const u8) !void {
+        var dir = try std.fs.cwd().openDir(keys_dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        self.pubkeys.clearRetainingCapacity();
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            const index = parseKeyIndex(entry.name) catch continue;
+            const pubkey = try readPublicKeyFromJson(self.allocator, dir, entry.name);
+
+            const gop = try self.pubkeys.getOrPut(index);
+            if (gop.found_existing) {
+                return TestKeyManagerError.DuplicateKeyIndex;
+            }
+            gop.value_ptr.* = pubkey;
+        }
+
+        if (self.pubkeys.count() == 0) {
+            return TestKeyManagerError.NoKeysFound;
+        }
+    }
+
+    pub fn getPublicKeyBytes(self: *const Self, validator_index: usize) !types.Bytes52 {
+        return self.pubkeys.get(validator_index) orelse TestKeyManagerError.PublicKeyNotFound;
+    }
+
+    pub fn getAllPubkeys(
+        self: *const Self,
+        allocator: Allocator,
+        num_validators: usize,
+    ) ![]types.Bytes52 {
+        const pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+        errdefer allocator.free(pubkeys);
+
+        for (0..num_validators) |i| {
+            pubkeys[i] = try self.getPublicKeyBytes(i);
+        }
+
+        return pubkeys;
+    }
+
+    pub fn signatureSszLen(self: *const Self) usize {
+        return self.config.signature_ssz_len;
+    }
+
+    pub fn allowPlaceholderAggregatedProof(self: *const Self) bool {
+        return self.config.allow_placeholder_aggregated_proof;
+    }
+};
+
+fn schemeFromLeanEnv(lean_env: ?[]const u8) XmssTestScheme {
+    const env = lean_env orelse return .prod;
+    if (std.ascii.eqlIgnoreCase(env, "test")) return .@"test";
+    return .prod;
+}
+
+fn parseKeyIndex(file_name: []const u8) !usize {
+    if (!std.mem.endsWith(u8, file_name, ".json")) {
+        return TestKeyManagerError.InvalidKeyIndex;
+    }
+    const stem = file_name[0 .. file_name.len - ".json".len];
+    if (stem.len == 0) {
+        return TestKeyManagerError.InvalidKeyIndex;
+    }
+    return std.fmt.parseInt(usize, stem, 10) catch TestKeyManagerError.InvalidKeyIndex;
+}
+
+fn readPublicKeyFromJson(
+    allocator: Allocator,
+    dir: std.fs.Dir,
+    file_name: []const u8,
+) !types.Bytes52 {
+    const max_bytes: usize = 2 * 1024 * 1024;
+    const payload = dir.readFileAlloc(allocator, file_name, max_bytes) catch {
+        return TestKeyManagerError.InvalidKeyFile;
+    };
+    defer allocator.free(payload);
+
+    var parsed = std.json.parseFromSlice(JsonValue, allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+        return TestKeyManagerError.InvalidKeyFile;
+    };
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |map| map,
+        else => return TestKeyManagerError.InvalidKeyFile,
+    };
+    const pub_val = obj.get("public") orelse return TestKeyManagerError.InvalidKeyFile;
+    const pub_hex = switch (pub_val) {
+        .string => |s| s,
+        else => return TestKeyManagerError.InvalidKeyFile,
+    };
+
+    return parsePublicKeyHex(pub_hex);
+}
+
+fn parsePublicKeyHex(input: []const u8) !types.Bytes52 {
+    const hex_str = if (std.mem.startsWith(u8, input, "0x")) input[2..] else input;
+    if (hex_str.len != 104) {
+        return TestKeyManagerError.InvalidPublicKey;
+    }
+    var bytes: types.Bytes52 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex_str) catch {
+        return TestKeyManagerError.InvalidPublicKey;
+    };
+    return bytes;
+}
 
 const KeyManagerError = error{
     ValidatorKeyNotFound,
