@@ -795,18 +795,34 @@ fn parseSignature(
     return sig_bytes;
 }
 
+fn parseU32ArrayN(
+    comptime N: usize,
+    ctx: Context,
+    obj: std.json.ObjectMap,
+    label: []const u8,
+) FixtureError![N]u32 {
+    const data_arr = try expect.expectArrayField(FixtureError, obj, &.{"data"}, ctx, label);
+    if (data_arr.items.len != N) {
+        std.debug.print(
+            "fixture {s} case {s}: {s} length {d} != expected {d}\n",
+            .{ ctx.fixture_label, ctx.case_name, label, data_arr.items.len, N },
+        );
+        return FixtureError.InvalidFixture;
+    }
+
+    var result: [N]u32 = undefined;
+    for (data_arr.items, 0..) |val, i| {
+        result[i] = @intCast(try expect.expectU64Value(FixtureError, val, ctx, label));
+    }
+    return result;
+}
+
 fn parseU32Array8(
     ctx: Context,
     obj: std.json.ObjectMap,
     label: []const u8,
 ) FixtureError![8]u32 {
-    const data_arr = try expect.expectArrayField(FixtureError, obj, &.{"data"}, ctx, label);
-    var result: [8]u32 = undefined;
-    for (data_arr.items, 0..) |val, i| {
-        if (i >= 8) break;
-        result[i] = @intCast(try expect.expectU64Value(FixtureError, val, ctx, label));
-    }
-    return result;
+    return parseU32ArrayN(8, ctx, obj, label);
 }
 
 fn parseU32Array7(
@@ -814,13 +830,7 @@ fn parseU32Array7(
     obj: std.json.ObjectMap,
     label: []const u8,
 ) FixtureError![7]u32 {
-    const data_arr = try expect.expectArrayField(FixtureError, obj, &.{"data"}, ctx, label);
-    var result: [7]u32 = undefined;
-    for (data_arr.items, 0..) |val, i| {
-        if (i >= 7) break;
-        result[i] = @intCast(try expect.expectU64Value(FixtureError, val, ctx, label));
-    }
-    return result;
+    return parseU32ArrayN(7, ctx, obj, label);
 }
 
 fn parseCheckpoint(
