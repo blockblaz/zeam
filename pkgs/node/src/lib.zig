@@ -8,6 +8,7 @@ const chainFactory = @import("./chain.zig");
 pub const BeamChain = chainFactory.BeamChain;
 
 pub const fcFactory = @import("./forkchoice.zig");
+pub const tree_visualizer = @import("./tree_visualizer.zig");
 pub const constants = @import("./constants.zig");
 
 const networks = @import("@zeam/network");

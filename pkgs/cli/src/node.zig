@@ -122,7 +122,7 @@ pub const Node = struct {
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
-    api_server_handle: ?api_server.APIServerHandle,
+    api_server_handle: ?*api_server.ApiServer,
     anchor_state: *types.BeamState,
 
     const Self = @This();
@@ -254,7 +254,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.api_server_handle) |*handle| {
+        if (self.api_server_handle) |handle| {
             handle.stop();
         }
         self.clock.deinit(self.allocator);

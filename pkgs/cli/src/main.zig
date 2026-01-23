@@ -306,8 +306,8 @@ fn mainInner() !void {
                 return err;
             };
 
-            var api_server_handle: ?api_server.APIServerHandle = null;
-            defer if (api_server_handle) |*handle| handle.stop();
+            var api_server_handle: ?*api_server.ApiServer = null;
+            defer if (api_server_handle) |handle| handle.stop();
 
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
@@ -495,7 +495,7 @@ fn mainInner() !void {
                 .node_registry = registry_1,
             });
 
-            if (api_server_handle) |*handle| {
+            if (api_server_handle) |handle| {
                 handle.setChain(beam_node_1.chain);
             }
 
