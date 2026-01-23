@@ -107,6 +107,12 @@ const ApiServer = struct {
                 self.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/justified")) {
+            // Handle justified checkpoint endpoint
+            self.handleJustifiedCheckpoint(&request) catch |err| {
+                self.logger.warn("failed to handle justified checkpoint request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
         } else {
             _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
         }
@@ -176,6 +182,37 @@ const ApiServer = struct {
             },
         }) catch |err| {
             self.logger.warn("failed to respond with finalized lean state: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Handle justified checkpoint endpoint
+    /// Returns the latest justified checkpoint information as JSON at /lean/v0/states/justified
+    fn handleJustifiedCheckpoint(self: *const Self, request: *std.http.Server.Request) !void {
+        // Get the chain (may be null if API server started before chain initialization)
+        const chain = self.chain orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        // Get justified checkpoint from chain (chain handles its own locking internally)
+        const justified_checkpoint = chain.getJustifiedCheckpoint();
+
+        // Convert checkpoint to JSON string
+        const json_string = justified_checkpoint.toJsonString(self.allocator) catch |err| {
+            self.logger.err("failed to serialize justified checkpoint to JSON: {}", .{err});
+            _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer self.allocator.free(json_string);
+
+        // Respond with JSON
+        _ = request.respond(json_string, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with justified checkpoint: {}", .{err});
             return err;
         };
     }
