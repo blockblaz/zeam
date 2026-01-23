@@ -18,29 +18,10 @@ const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
 const bytesToHex = utils.BytesToHex;
 const json = std.json;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
 
 // Types
 pub const AggregationBits = ssz.utils.Bitlist(params.VALIDATOR_REGISTRY_LIMIT);
-pub const NaiveAggregatedSignature = ssz.utils.List(SIGBYTES, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const AttestationData = struct {
     slot: Slot,
@@ -133,31 +114,6 @@ pub const AggregatedAttestation = struct {
     }
 
     pub fn toJsonString(self: *const AggregatedAttestation, allocator: Allocator) ![]const u8 {
-        var json_value = try self.toJson(allocator);
-        defer freeJsonValue(&json_value, allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
-
-pub const SignedAggregatedAttestation = struct {
-    message: AggregatedAttestation,
-    signature: NaiveAggregatedSignature,
-
-    pub fn toJson(self: *const SignedAggregatedAttestation, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("message", try self.message.toJson(allocator));
-
-        var sig_array = json.Array.init(allocator);
-        errdefer sig_array.deinit();
-
-        for (self.signature.constSlice()) |sig| {
-            try sig_array.append(json.Value{ .string = try bytesToHex(allocator, &sig) });
-        }
-        try obj.put("signature", json.Value{ .array = sig_array });
-        return json.Value{ .object = obj };
-    }
-
-    pub fn toJsonString(self: *const SignedAggregatedAttestation, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
         defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);

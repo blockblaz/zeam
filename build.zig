@@ -172,6 +172,14 @@ pub fn build(b: *Builder) !void {
     });
     zeam_metrics.addImport("metrics", metrics);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_xmss.addImport("ssz", ssz);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -182,6 +190,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
+    zeam_types.addImport("@zeam/xmss", zeam_xmss);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -203,13 +212,6 @@ pub fn build(b: *Builder) !void {
     zeam_api.addImport("@zeam/metrics", zeam_metrics);
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
-
-    // add zeam-xmss
-    const zeam_xmss = b.addModule("@zeam/xmss", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
-    });
 
     // add zeam-key-manager
     const zeam_key_manager = b.addModule("@zeam/key-manager", .{
@@ -301,6 +303,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -433,6 +436,9 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     types_tests.root_module.addImport("ssz", ssz);
+    types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    types_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, types_tests, target, prover);
     const run_types_test = b.addRunArtifact(types_tests);
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
@@ -552,20 +558,6 @@ pub fn build(b: *Builder) !void {
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
     setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
-
-    const xmss_cycle_tests = b.addTest(.{
-        .root_source_file = b.path("pkgs/testing/test_xmss_cycle.zig"),
-        .optimize = optimize,
-        .target = target,
-    });
-    xmss_cycle_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
-    xmss_cycle_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
-    xmss_cycle_tests.root_module.addImport("@zeam/types", zeam_types);
-    xmss_cycle_tests.root_module.addImport("ssz", ssz);
-    xmss_cycle_tests.step.dependOn(&build_rust_lib_steps.step);
-    addRustGlueLib(b, xmss_cycle_tests, target, prover);
-    const run_xmss_cycle_tests = b.addRunArtifact(xmss_cycle_tests);
-    test_step.dependOn(&run_xmss_cycle_tests.step);
 
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,

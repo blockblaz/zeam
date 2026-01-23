@@ -50,6 +50,16 @@ const Metrics = struct {
     lean_connected_peers: LeanConnectedPeersGauge,
     lean_peer_connection_events_total: PeerConnectionEventsCounter,
     lean_peer_disconnection_events_total: PeerDisconnectionEventsCounter,
+    // Node lifecycle metrics
+    lean_node_info: LeanNodeInfoGauge,
+    lean_node_start_time_seconds: LeanNodeStartTimeGauge,
+    lean_current_slot: LeanCurrentSlotGauge,
+    lean_safe_target_slot: LeanSafeTargetSlotGauge,
+    // Fork choice reorg metrics
+    lean_fork_choice_reorgs_total: LeanForkChoiceReorgsTotalCounter,
+    lean_fork_choice_reorg_depth: LeanForkChoiceReorgDepthHistogram,
+    // Finalization metrics
+    lean_finalizations_total: LeanFinalizationsTotalCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -73,6 +83,16 @@ const Metrics = struct {
     const LeanConnectedPeersGauge = metrics_lib.Gauge(u64);
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
+    // Node lifecycle metric types
+    const LeanNodeInfoGauge = metrics_lib.GaugeVec(u64, struct { name: []const u8, version: []const u8 });
+    const LeanNodeStartTimeGauge = metrics_lib.Gauge(u64);
+    const LeanCurrentSlotGauge = metrics_lib.Gauge(u64);
+    const LeanSafeTargetSlotGauge = metrics_lib.Gauge(u64);
+    // Fork choice reorg metric types
+    const LeanForkChoiceReorgsTotalCounter = metrics_lib.Counter(u64);
+    const LeanForkChoiceReorgDepthHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 });
+    // Finalization metric types
+    const LeanFinalizationsTotalCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
 };
 
 /// Timer struct returned to the application.
@@ -247,6 +267,16 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_connected_peers = Metrics.LeanConnectedPeersGauge.init("lean_connected_peers", .{ .help = "Number of currently connected peers." }, .{}),
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total peer connection events by direction and result." }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total peer disconnection events by direction and reason." }, .{}),
+        // Node lifecycle metrics
+        .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)." }, .{}),
+        .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Unix timestamp when the node started." }, .{}),
+        .lean_current_slot = Metrics.LeanCurrentSlotGauge.init("lean_current_slot", .{ .help = "Current slot of the lean chain based on wall clock." }, .{}),
+        .lean_safe_target_slot = Metrics.LeanSafeTargetSlotGauge.init("lean_safe_target_slot", .{ .help = "Safe target slot with 2/3 weight threshold." }, .{}),
+        // Fork choice reorg metrics
+        .lean_fork_choice_reorgs_total = Metrics.LeanForkChoiceReorgsTotalCounter.init("lean_fork_choice_reorgs_total", .{ .help = "Total number of fork choice reorganizations." }, .{}),
+        .lean_fork_choice_reorg_depth = Metrics.LeanForkChoiceReorgDepthHistogram.init("lean_fork_choice_reorg_depth", .{ .help = "Depth of fork choice reorgs in blocks." }, .{}),
+        // Finalization metrics
+        .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total finalization attempts by result." }, .{}),
     };
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)

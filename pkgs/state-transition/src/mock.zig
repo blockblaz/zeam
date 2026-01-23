@@ -6,6 +6,7 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
+const xmss = @import("@zeam/xmss");
 
 const transition = @import("./transition.zig");
 
@@ -276,23 +277,45 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
-        var signed_attestations = std.ArrayList(types.SignedAttestation).init(allocator);
-        defer signed_attestations.deinit();
+        // Build gossip signatures map from attestations
+        var signatures_map = types.SignaturesMap.init(allocator);
+        defer signatures_map.deinit();
 
         for (attestations.items) |attestation| {
-            const signature = try key_manager.signAttestation(&attestation, allocator);
-            try signed_attestations.append(.{
-                .validator_id = attestation.validator_id,
-                .message = attestation.data,
-                .signature = signature,
-            });
+            // Get the serialized signature bytes
+            const sig_buffer = try key_manager.signAttestation(&attestation, allocator);
+
+            // Compute data root for the signature key
+            const data_root = try attestation.data.sszRoot(allocator);
+
+            try signatures_map.put(
+                .{ .validator_id = attestation.validator_id, .data_root = data_root },
+                .{ .slot = attestation.data.slot, .signature = sig_buffer },
+            );
         }
 
-        var aggregation = try types.aggregateSignedAttestations(allocator, signed_attestations.items);
+        // Compute aggregated signatures using the shared method
+        var aggregation = try types.AggregatedAttestationsResult.init(allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
-        errdefer if (agg_att_cleanup) aggregation.attestations.deinit();
-        errdefer if (agg_sig_cleanup) aggregation.attestation_signatures.deinit();
+        errdefer if (agg_att_cleanup) {
+            for (aggregation.attestations.slice()) |*att| {
+                att.deinit();
+            }
+            aggregation.attestations.deinit();
+        };
+        errdefer if (agg_sig_cleanup) {
+            for (aggregation.attestation_signatures.slice()) |*sig| {
+                sig.deinit();
+            }
+            aggregation.attestation_signatures.deinit();
+        };
+        try aggregation.computeAggregatedSignatures(
+            attestations.items,
+            &beam_state.validators,
+            &signatures_map,
+            null, // no pre-aggregated payloads in mock
+        );
 
         const proposer_index = slot % genesis_config.numValidators();
         var block = types.BeamBlock{
