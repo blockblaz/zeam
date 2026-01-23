@@ -21,94 +21,12 @@ pub const XmssTestConfig = struct {
     }
 };
 
-pub const TestKeyManagerError = error{
+pub const FixtureKeyError = error{
     DuplicateKeyIndex,
     InvalidKeyFile,
     InvalidKeyIndex,
     InvalidPublicKey,
     NoKeysFound,
-    PublicKeyNotFound,
-};
-
-pub const TestKeyManager = struct {
-    allocator: Allocator,
-    config: XmssTestConfig,
-    pubkeys: std.AutoHashMap(usize, types.Bytes52),
-
-    const Self = @This();
-
-    pub fn init(allocator: Allocator, lean_env: ?[]const u8) Self {
-        return Self{
-            .allocator = allocator,
-            .config = XmssTestConfig.fromLeanEnv(lean_env),
-            .pubkeys = std.AutoHashMap(usize, types.Bytes52).init(allocator),
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.pubkeys.deinit();
-    }
-
-    pub fn loadLeanSpecKeys(self: *Self, keys_root: []const u8) !void {
-        const scheme_dir_name = switch (self.config.scheme) {
-            .@"test" => "test_scheme",
-            .prod => "prod_scheme",
-        };
-        const scheme_dir_path = try std.fs.path.join(self.allocator, &.{ keys_root, scheme_dir_name });
-        defer self.allocator.free(scheme_dir_path);
-        try self.loadKeysFromDir(scheme_dir_path);
-    }
-
-    pub fn loadKeysFromDir(self: *Self, keys_dir_path: []const u8) !void {
-        var dir = try std.fs.cwd().openDir(keys_dir_path, .{ .iterate = true });
-        defer dir.close();
-
-        self.pubkeys.clearRetainingCapacity();
-
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .file) continue;
-            const index = parseKeyIndex(entry.name) catch continue;
-            const pubkey = try readPublicKeyFromJson(self.allocator, dir, entry.name);
-
-            const gop = try self.pubkeys.getOrPut(index);
-            if (gop.found_existing) {
-                return TestKeyManagerError.DuplicateKeyIndex;
-            }
-            gop.value_ptr.* = pubkey;
-        }
-
-        if (self.pubkeys.count() == 0) {
-            return TestKeyManagerError.NoKeysFound;
-        }
-    }
-
-    pub fn getPublicKeyBytes(self: *const Self, validator_index: usize) !types.Bytes52 {
-        return self.pubkeys.get(validator_index) orelse TestKeyManagerError.PublicKeyNotFound;
-    }
-
-    pub fn getAllPubkeys(
-        self: *const Self,
-        allocator: Allocator,
-        num_validators: usize,
-    ) ![]types.Bytes52 {
-        const pubkeys = try allocator.alloc(types.Bytes52, num_validators);
-        errdefer allocator.free(pubkeys);
-
-        for (0..num_validators) |i| {
-            pubkeys[i] = try self.getPublicKeyBytes(i);
-        }
-
-        return pubkeys;
-    }
-
-    pub fn signatureSszLen(self: *const Self) usize {
-        return self.config.signature_ssz_len;
-    }
-
-    pub fn allowPlaceholderAggregatedProof(self: *const Self) bool {
-        return self.config.allow_placeholder_aggregated_proof;
-    }
 };
 
 fn schemeFromLeanEnv(lean_env: ?[]const u8) xmss.HashSigScheme {
@@ -119,58 +37,72 @@ fn schemeFromLeanEnv(lean_env: ?[]const u8) xmss.HashSigScheme {
 
 fn parseKeyIndex(file_name: []const u8) !usize {
     if (!std.mem.endsWith(u8, file_name, ".json")) {
-        return TestKeyManagerError.InvalidKeyIndex;
+        return FixtureKeyError.InvalidKeyIndex;
     }
     const stem = file_name[0 .. file_name.len - ".json".len];
     if (stem.len == 0) {
-        return TestKeyManagerError.InvalidKeyIndex;
+        return FixtureKeyError.InvalidKeyIndex;
     }
-    return std.fmt.parseInt(usize, stem, 10) catch TestKeyManagerError.InvalidKeyIndex;
+    return std.fmt.parseInt(usize, stem, 10) catch FixtureKeyError.InvalidKeyIndex;
 }
+
+const fixture_key_file_max_bytes: usize = 2 * 1024 * 1024;
 
 fn readPublicKeyFromJson(
     allocator: Allocator,
     dir: std.fs.Dir,
     file_name: []const u8,
 ) !types.Bytes52 {
-    const max_bytes: usize = 2 * 1024 * 1024;
-    const payload = dir.readFileAlloc(allocator, file_name, max_bytes) catch {
-        return TestKeyManagerError.InvalidKeyFile;
+    const payload = dir.readFileAlloc(allocator, file_name, fixture_key_file_max_bytes) catch {
+        return FixtureKeyError.InvalidKeyFile;
     };
     defer allocator.free(payload);
 
     var parsed = std.json.parseFromSlice(JsonValue, allocator, payload, .{ .ignore_unknown_fields = true }) catch {
-        return TestKeyManagerError.InvalidKeyFile;
+        return FixtureKeyError.InvalidKeyFile;
     };
     defer parsed.deinit();
 
     const obj = switch (parsed.value) {
         .object => |map| map,
-        else => return TestKeyManagerError.InvalidKeyFile,
+        else => return FixtureKeyError.InvalidKeyFile,
     };
-    const pub_val = obj.get("public") orelse return TestKeyManagerError.InvalidKeyFile;
+    const pub_val = obj.get("public") orelse return FixtureKeyError.InvalidKeyFile;
     const pub_hex = switch (pub_val) {
         .string => |s| s,
-        else => return TestKeyManagerError.InvalidKeyFile,
+        else => return FixtureKeyError.InvalidKeyFile,
     };
 
     return parsePublicKeyHex(pub_hex);
 }
 
 fn parsePublicKeyHex(input: []const u8) !types.Bytes52 {
+    const public_key_hex_len: usize = 2 * @sizeOf(types.Bytes52);
     const hex_str = if (std.mem.startsWith(u8, input, "0x")) input[2..] else input;
-    if (hex_str.len != 104) {
-        return TestKeyManagerError.InvalidPublicKey;
+    if (hex_str.len != public_key_hex_len) {
+        return FixtureKeyError.InvalidPublicKey;
     }
     var bytes: types.Bytes52 = undefined;
     _ = std.fmt.hexToBytes(&bytes, hex_str) catch {
-        return TestKeyManagerError.InvalidPublicKey;
+        return FixtureKeyError.InvalidPublicKey;
     };
     return bytes;
 }
 
 const KeyManagerError = error{
     ValidatorKeyNotFound,
+    PrivateKeyMissing,
+    PublicKeyBufferTooSmall,
+};
+
+const PublicKeyEntry = struct {
+    bytes: types.Bytes52,
+    public_key: xmss.PublicKey,
+};
+
+const KeyEntry = union(enum) {
+    keypair: xmss.KeyPair,
+    public_key: PublicKeyEntry,
 };
 
 const CachedKeyPair = struct {
@@ -217,7 +149,7 @@ fn getOrCreateCachedKeyPair(
 }
 
 pub const KeyManager = struct {
-    keys: std.AutoHashMap(usize, xmss.KeyPair),
+    keys: std.AutoHashMap(usize, KeyEntry),
     allocator: Allocator,
     owns_keypairs: bool,
 
@@ -225,24 +157,72 @@ pub const KeyManager = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
-            .keys = std.AutoHashMap(usize, xmss.KeyPair).init(allocator),
+            .keys = std.AutoHashMap(usize, KeyEntry).init(allocator),
             .allocator = allocator,
             .owns_keypairs = true,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_keypairs) {
-            var it = self.keys.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit();
-            }
-        }
+        self.clearEntries();
         self.keys.deinit();
     }
 
     pub fn addKeypair(self: *Self, validator_id: usize, keypair: xmss.KeyPair) !void {
-        try self.keys.put(validator_id, keypair);
+        if (self.keys.getPtr(validator_id)) |entry| {
+            self.deinitEntry(entry);
+            entry.* = .{ .keypair = keypair };
+            return;
+        }
+        try self.keys.put(validator_id, .{ .keypair = keypair });
+    }
+
+    pub fn addPublicKey(self: *Self, validator_id: usize, pubkey_bytes: types.Bytes52) !void {
+        var public_key = try xmss.PublicKey.fromBytes(pubkey_bytes[0..]);
+        errdefer public_key.deinit();
+
+        const entry_value = PublicKeyEntry{ .bytes = pubkey_bytes, .public_key = public_key };
+        if (self.keys.getPtr(validator_id)) |entry| {
+            self.deinitEntry(entry);
+            entry.* = .{ .public_key = entry_value };
+            return;
+        }
+        try self.keys.put(validator_id, .{ .public_key = entry_value });
+    }
+
+    pub fn loadLeanSpecKeys(self: *Self, keys_root: []const u8, lean_env: ?[]const u8) !void {
+        const scheme_dir_name = switch (schemeFromLeanEnv(lean_env)) {
+            .@"test" => "test_scheme",
+            .prod => "prod_scheme",
+        };
+        const scheme_dir_path = try std.fs.path.join(self.allocator, &.{ keys_root, scheme_dir_name });
+        defer self.allocator.free(scheme_dir_path);
+        try self.loadKeysFromDir(scheme_dir_path);
+    }
+
+    pub fn loadKeysFromDir(self: *Self, keys_dir_path: []const u8) !void {
+        var dir = try std.fs.cwd().openDir(keys_dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        self.clearEntries();
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            const index = parseKeyIndex(entry.name) catch continue;
+            const pubkey = try readPublicKeyFromJson(self.allocator, dir, entry.name);
+            if (self.keys.get(index) != null) {
+                return FixtureKeyError.DuplicateKeyIndex;
+            }
+            self.addPublicKey(index, pubkey) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return FixtureKeyError.InvalidPublicKey,
+            };
+        }
+
+        if (self.keys.count() == 0) {
+            return FixtureKeyError.NoKeysFound;
+        }
     }
 
     pub fn loadFromKeypairDir(_: *Self, _: []const u8) !void {
@@ -273,8 +253,17 @@ pub const KeyManager = struct {
         validator_index: usize,
         buffer: []u8,
     ) !usize {
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
-        return try keypair.pubkeyToBytes(buffer);
+        const entry = self.keys.getPtr(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return switch (entry.*) {
+            .keypair => |keypair| try keypair.pubkeyToBytes(buffer),
+            .public_key => |pubkey| blk: {
+                if (buffer.len < pubkey.bytes.len) {
+                    return KeyManagerError.PublicKeyBufferTooSmall;
+                }
+                @memcpy(buffer[0..pubkey.bytes.len], pubkey.bytes[0..]);
+                break :blk pubkey.bytes.len;
+            },
+        };
     }
 
     /// Extract all validator public keys into an array
@@ -300,8 +289,11 @@ pub const KeyManager = struct {
         self: *const Self,
         validator_index: usize,
     ) !*const xmss.HashSigPublicKey {
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
-        return keypair.public_key;
+        const entry = self.keys.getPtr(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return switch (entry.*) {
+            .keypair => |keypair| keypair.public_key,
+            .public_key => |pubkey| pubkey.public_key.handle,
+        };
     }
 
     /// Sign an attestation and return the raw signature handle (for aggregation)
@@ -312,7 +304,11 @@ pub const KeyManager = struct {
         allocator: Allocator,
     ) !xmss.Signature {
         const validator_index: usize = @intCast(attestation.validator_id);
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        const entry = self.keys.getPtr(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        const keypair = switch (entry.*) {
+            .keypair => |*kp| kp,
+            .public_key => return KeyManagerError.PrivateKeyMissing,
+        };
 
         const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
@@ -323,6 +319,25 @@ pub const KeyManager = struct {
         _ = signing_timer.observe();
 
         return signature;
+    }
+
+    fn clearEntries(self: *Self) void {
+        var it = self.keys.iterator();
+        while (it.next()) |entry| {
+            self.deinitEntry(entry.value_ptr);
+        }
+        self.keys.clearRetainingCapacity();
+    }
+
+    fn deinitEntry(self: *Self, entry: *KeyEntry) void {
+        switch (entry.*) {
+            .keypair => |*keypair| {
+                if (self.owns_keypairs) {
+                    keypair.deinit();
+                }
+            },
+            .public_key => |*pubkey| pubkey.public_key.deinit(),
+        }
     }
 };
 
