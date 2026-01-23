@@ -2,11 +2,12 @@
 
 ## Overview
 
-This package provides the HTTP API server for the Zeam node with three main endpoints:
+This package provides the HTTP API server for the Zeam node with four main endpoints:
 
 - Server-Sent Events (SSE) stream for real-time chain events at `/events`
 - Prometheus metrics endpoint at `/metrics`
-- Health check at `/health`
+- Health check at `/lean/v0/health`
+- Finalized checkpoint state at `/lean/v0/states/finalized` (for checkpoint sync)
 
 ## Package Components
 
@@ -31,7 +32,7 @@ Provides real-time chain event streaming via Server-Sent Events:
 
 ### 2. Health Checks
 
-Simple health check endpoint at `/health`.
+Simple health check endpoint at `/lean/v0/health`.
 
 ## Event System
 
@@ -97,13 +98,26 @@ Streams real-time chain events (head, justification, finalization).
 curl -N http://localhost:9667/events
 ```
 
-### `/health`
+### `/lean/v0/health`
 
 Returns node health status.
 
 ```sh
-curl http://localhost:9667/health
+curl http://localhost:9667/lean/v0/health
 ```
+
+### `/lean/v0/states/finalized`
+
+Returns the finalized checkpoint state as SSZ-encoded binary for checkpoint sync.
+
+```sh
+curl http://localhost:9667/lean/v0/states/finalized -o finalized_state.ssz
+```
+
+Returns:
+- **Content-Type**: `application/octet-stream`
+- **Body**: SSZ-encoded `BeamState`
+- **Status 503**: Returned if no finalized state is available yet
 
 ## Usage
 
@@ -122,7 +136,8 @@ try api_server.startAPIServer(allocator, apiPort);
 The server exposes:
 - SSE at `/events`
 - Metrics at `/metrics`
-- Health at `/health`
+- Health at `/lean/v0/health`
+- Checkpoint state at `/lean/v0/states/finalized`
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
 
@@ -179,7 +194,10 @@ curl -N http://localhost:9668/events
 curl http://localhost:9668/metrics
 
 # Health
-curl http://localhost:9668/health
+curl http://localhost:9668/lean/v0/health
+
+# Checkpoint state
+curl http://localhost:9668/lean/v0/states/finalized -o state.ssz
 ```
 
 ## Visualization with Prometheus & Grafana
