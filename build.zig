@@ -28,7 +28,6 @@ fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compil
     setTestRunLabel(b, run_step, source_name);
 }
 
-
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
