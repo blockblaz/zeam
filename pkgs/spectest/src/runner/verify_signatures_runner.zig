@@ -216,6 +216,7 @@ fn runCase(
     const test_config = key_manager.XmssTestConfig.fromLeanEnv(lean_env);
     const signature_ssz_len: usize = test_config.signature_ssz_len;
     const allow_placeholder_aggregated_proof = test_config.allow_placeholder_aggregated_proof;
+    const signature_scheme = test_config.scheme;
 
     // Parse the anchorState to get validators
     const anchor_state_value = case_obj.get("anchorState") orelse {
@@ -246,6 +247,7 @@ fn runCase(
         &parsed.signed_block,
         parsed.attestation_proofs,
         signature_ssz_len,
+        signature_scheme,
         allow_placeholder_aggregated_proof,
     );
 
@@ -276,6 +278,7 @@ fn verifySignaturesWithFixtureProofs(
     signed_block: *const types.SignedBlockWithAttestation,
     proofs: []const AggregatedSignatureProof,
     signature_ssz_len: usize,
+    signature_scheme: xmss.HashSigScheme,
     allow_placeholder_aggregated_proof: bool,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
@@ -327,6 +330,7 @@ fn verifySignaturesWithFixtureProofs(
         &proposer_attestation.data,
         &signed_block.signature.proposer_signature,
         signature_ssz_len,
+        signature_scheme,
     );
 }
 
@@ -337,6 +341,7 @@ fn verifySingleAttestationSignature(
     attestation_data: *const types.AttestationData,
     signature_bytes: *const types.SIGBYTES,
     signature_ssz_len: usize,
+    signature_scheme: xmss.HashSigScheme,
 ) !void {
     if (signature_ssz_len > signature_bytes.len) {
         return types.StateTransitionError.InvalidBlockSignatures;
@@ -353,7 +358,7 @@ fn verifySingleAttestationSignature(
     try ssz.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
 
     const epoch: u32 = @intCast(attestation_data.slot);
-    try xmss.verifySsz(pubkey, &message, epoch, signature_bytes.*[0..signature_ssz_len]);
+    try xmss.verifySsz(pubkey, &message, epoch, signature_bytes.*[0..signature_ssz_len], signature_scheme);
 }
 
 fn buildState(

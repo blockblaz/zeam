@@ -12,6 +12,12 @@ use std::slice;
 const PROD_SIGNATURE_SSZ_LEN: usize = 3112;
 const TEST_SIGNATURE_SSZ_LEN: usize = 424;
 
+#[repr(u8)]
+enum HashSigSchemeId {
+    Test = 0,
+    Prod = 1,
+}
+
 /// Production instantiation (LeanSpec `prod`).
 pub type HashSigSchemeProd =
     leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
@@ -522,12 +528,23 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
     epoch: u32,
     signature_bytes: *const u8,
     signature_len: usize,
+    scheme_id: u8,
 ) -> i32 {
     if pubkey_bytes.is_null() || message.is_null() || signature_bytes.is_null() {
         return -1;
     }
 
     unsafe {
+        let expected_len = match scheme_id {
+            x if x == HashSigSchemeId::Test as u8 => TEST_SIGNATURE_SSZ_LEN,
+            x if x == HashSigSchemeId::Prod as u8 => PROD_SIGNATURE_SSZ_LEN,
+            _ => return -1,
+        };
+
+        if signature_len != expected_len {
+            return -1;
+        }
+
         let pk_data = slice::from_raw_parts(pubkey_bytes, pubkey_len);
         let sig_data = slice::from_raw_parts(signature_bytes, signature_len);
         let msg_data = slice::from_raw_parts(message, MESSAGE_LENGTH);
@@ -548,17 +565,14 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
             Ok(S::verify(&pk, epoch, message_array, &sig))
         }
 
-        let attempt: Result<bool, ()> = match signature_len {
-            TEST_SIGNATURE_SSZ_LEN => {
+        let attempt: Result<bool, ()> = match scheme_id {
+            x if x == HashSigSchemeId::Test as u8 => {
                 verify_with_scheme::<HashSigSchemeTest>(pk_data, sig_data, epoch, message_array)
             }
-            PROD_SIGNATURE_SSZ_LEN => {
+            x if x == HashSigSchemeId::Prod as u8 => {
                 verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array)
             }
-            _ => verify_with_scheme::<HashSigSchemeTest>(pk_data, sig_data, epoch, message_array)
-                .or_else(|_| {
-                    verify_with_scheme::<HashSigSchemeProd>(pk_data, sig_data, epoch, message_array)
-                }),
+            _ => return -1,
         };
 
         match attempt {

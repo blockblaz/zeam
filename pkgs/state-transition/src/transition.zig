@@ -60,20 +60,21 @@ pub fn verifySignatures(
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
 ) !void {
-    return verifySignaturesWithSignatureLen(
+    return verifySignaturesWithScheme(
         allocator,
         state,
         signed_block,
-        types.SIGSIZE,
+        .prod,
     );
 }
 
-pub fn verifySignaturesWithSignatureLen(
+pub fn verifySignaturesWithScheme(
     allocator: Allocator,
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
-    signature_ssz_len: usize,
+    signature_scheme: xmss.HashSigScheme,
 ) !void {
+    const signature_ssz_len = xmss.signatureSszLenForScheme(signature_scheme);
     const attestations = signed_block.message.block.body.attestations.constSlice();
     const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
 
@@ -142,24 +143,25 @@ pub fn verifySignaturesWithSignatureLen(
 
     // Verify proposer signature (still individual)
     const proposer_attestation = signed_block.message.proposer_attestation;
-    try verifySingleAttestationWithSignatureLen(
+    try verifySingleAttestationWithScheme(
         allocator,
         state,
         @intCast(proposer_attestation.validator_id),
         &proposer_attestation.data,
         &signed_block.signature.proposer_signature,
-        signature_ssz_len,
+        signature_scheme,
     );
 }
 
-fn verifySingleAttestationWithSignatureLen(
+pub fn verifySingleAttestationWithScheme(
     allocator: Allocator,
     state: *const types.BeamState,
     validator_index: usize,
     attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
-    signature_ssz_len: usize,
+    signature_scheme: xmss.HashSigScheme,
 ) !void {
+    const signature_ssz_len = xmss.signatureSszLenForScheme(signature_scheme);
     if (signature_ssz_len > signatureBytes.len) {
         return StateTransitionError.InvalidBlockSignatures;
     }
@@ -179,7 +181,7 @@ fn verifySingleAttestationWithSignatureLen(
 
     const epoch: u32 = @intCast(attestation_data.slot);
 
-    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes.*[0..signature_ssz_len]);
+    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes.*[0..signature_ssz_len], signature_scheme);
     _ = verification_timer.observe();
 }
 
@@ -190,13 +192,13 @@ pub fn verifySingleAttestation(
     attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
 ) !void {
-    return verifySingleAttestationWithSignatureLen(
+    return verifySingleAttestationWithScheme(
         allocator,
         state,
         validator_index,
         attestation_data,
         signatureBytes,
-        signatureBytes.len,
+        .prod,
     );
 }
 

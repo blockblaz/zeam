@@ -6,15 +6,8 @@ const ssz = @import("ssz");
 const Allocator = std.mem.Allocator;
 const JsonValue = std.json.Value;
 
-pub const XmssTestScheme = enum {
-    @"test",
-    prod,
-};
-
-pub const TEST_SIGNATURE_SSZ_LEN: usize = 424;
-
 pub const XmssTestConfig = struct {
-    scheme: XmssTestScheme,
+    scheme: xmss.HashSigScheme,
     signature_ssz_len: usize,
     allow_placeholder_aggregated_proof: bool,
 
@@ -22,10 +15,7 @@ pub const XmssTestConfig = struct {
         const scheme = schemeFromLeanEnv(lean_env);
         return .{
             .scheme = scheme,
-            .signature_ssz_len = switch (scheme) {
-                .@"test" => TEST_SIGNATURE_SSZ_LEN,
-                .prod => types.SIGSIZE,
-            },
+            .signature_ssz_len = xmss.signatureSszLenForScheme(scheme),
             .allow_placeholder_aggregated_proof = scheme == .@"test",
         };
     }
@@ -121,7 +111,7 @@ pub const TestKeyManager = struct {
     }
 };
 
-fn schemeFromLeanEnv(lean_env: ?[]const u8) XmssTestScheme {
+fn schemeFromLeanEnv(lean_env: ?[]const u8) xmss.HashSigScheme {
     const env = lean_env orelse return .prod;
     if (std.ascii.eqlIgnoreCase(env, "test")) return .@"test";
     return .prod;

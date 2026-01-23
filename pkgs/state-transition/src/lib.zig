@@ -12,8 +12,9 @@ pub const apply_raw_block = transition.apply_raw_block;
 pub const StateTransitionError = transition.StateTransitionError;
 pub const StateTransitionOpts = transition.StateTransitionOpts;
 pub const verifySignatures = transition.verifySignatures;
-pub const verifySignaturesWithSignatureLen = transition.verifySignaturesWithSignatureLen;
+pub const verifySignaturesWithScheme = transition.verifySignaturesWithScheme;
 pub const verifySingleAttestation = transition.verifySingleAttestation;
+pub const verifySingleAttestationWithScheme = transition.verifySingleAttestationWithScheme;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
