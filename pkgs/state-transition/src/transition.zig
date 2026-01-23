@@ -74,7 +74,6 @@ pub fn verifySignaturesWithScheme(
     signed_block: *const types.SignedBlockWithAttestation,
     signature_scheme: xmss.HashSigScheme,
 ) !void {
-    const signature_ssz_len = xmss.signatureSszLenForScheme(signature_scheme);
     const attestations = signed_block.message.block.body.attestations.constSlice();
     const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
 
