@@ -164,6 +164,11 @@ const ZeamRequest = struct {
         return self.makeRequest("/lean/v0/health");
     }
 
+    /// Make a request to the /lean/v0/states/justified endpoint and return the response
+    fn getJustified(self: ZeamRequest) ![]u8 {
+        return self.makeRequest("/lean/v0/states/justified");
+    }
+
     /// Internal helper to make HTTP requests to any endpoint
     fn makeRequest(self: ZeamRequest, endpoint: []const u8) ![]u8 {
         // Create connection to the server
@@ -564,6 +569,89 @@ test "SSE events integration test - wait for justification and finalization" {
     }
 
     std.debug.print("SUCCESS: SSE events integration test completed\n", .{});
+}
+
+test "API endpoints - health and justified checkpoint" {
+    const testing = std.testing;
+
+    std.debug.print("\n=== API Endpoints Test ===\n", .{});
+
+    // Get the executable path
+    const exe_path = try getZeamExecutable();
+    std.debug.print("Executable path: {s}\n", .{exe_path});
+
+    // Start the beam simulation node
+    var cli_process = try spinBeamSimNode(testing.allocator, exe_path);
+    defer {
+        _ = cli_process.kill() catch {};
+        _ = cli_process.wait() catch {};
+        testing.allocator.destroy(cli_process);
+    }
+
+    // Create a request client
+    const zeam_request = ZeamRequest{ .allocator = testing.allocator };
+
+    // Wait a bit for some blocks to be processed and justified
+    std.debug.print("Waiting for blocks to be processed...\n", .{});
+    std.time.sleep(5 * std.time.ns_per_s);
+
+    // Test /lean/v0/health endpoint
+    std.debug.print("Testing /lean/v0/health endpoint...\n", .{});
+    const health_response = try zeam_request.getHealth();
+    defer zeam_request.freeResponse(health_response);
+
+    try testing.expect(std.mem.indexOf(u8, health_response, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, health_response, "healthy") != null);
+    std.debug.print("✓ Health endpoint returned OK\n", .{});
+
+    // Test /lean/v0/states/justified endpoint
+    std.debug.print("Testing /lean/v0/states/justified endpoint...\n", .{});
+    const justified_response = try zeam_request.getJustified();
+    defer zeam_request.freeResponse(justified_response);
+
+    // Verify response is 200 OK
+    try testing.expect(std.mem.indexOf(u8, justified_response, "200 OK") != null);
+
+    // Verify JSON content type
+    try testing.expect(std.mem.indexOf(u8, justified_response, "application/json") != null);
+
+    // Parse and verify JSON structure - should contain "root" and "slot"
+    try testing.expect(std.mem.indexOf(u8, justified_response, "\"root\"") != null);
+    try testing.expect(std.mem.indexOf(u8, justified_response, "\"slot\"") != null);
+
+    // Find the JSON body (after the headers)
+    const body_start = std.mem.indexOf(u8, justified_response, "\r\n\r\n");
+    if (body_start) |start| {
+        const json_body = justified_response[start + 4 ..];
+        std.debug.print("Justified checkpoint response: {s}\n", .{json_body});
+
+        // Verify it looks like valid JSON
+        try testing.expect(json_body.len > 0);
+        try testing.expect(json_body[0] == '{');
+
+        // Parse the JSON to verify structure
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            testing.allocator,
+            json_body,
+            .{},
+        );
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        try testing.expect(obj.contains("root"));
+        try testing.expect(obj.contains("slot"));
+
+        // Verify slot is a number
+        const slot = obj.get("slot").?;
+        try testing.expect(slot == .integer);
+        std.debug.print("✓ Justified checkpoint: slot={d}, root={s}\n", .{
+            slot.integer,
+            obj.get("root").?.string,
+        });
+    }
+
+    std.debug.print("SUCCESS: API endpoints test completed\n", .{});
 }
 
 // Test suite for ErrorHandler
