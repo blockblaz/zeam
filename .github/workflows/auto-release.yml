@@ -1,9 +1,9 @@
-name: Auto Release on Release Branch
+name: Auto Release on Main Branch
 
 on:
   pull_request:
     types: [ closed ]
-    branches: [ release ]
+    branches: [ main ]
 
 env:
   REGISTRY: docker.io
@@ -14,11 +14,13 @@ permissions:
 
 jobs:
   create-tags:
-    # Only run if PR was merged to release branch (not just closed)
-    if: github.event.pull_request.merged == true
+    # Only run if PR was merged to main branch from release branch and has release label
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'release' &&
+      contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: ubuntu-latest
     outputs:
-      docker_only: ${{ steps.get_tags_labels.outputs.docker_only }}
       version: ${{ steps.get_tags_labels.outputs.version }}
       zeam_tag: ${{ steps.get_tags_labels.outputs.zeam_tag }}
       has_network_tag: ${{ steps.get_tags_labels.outputs.has_network_tag }}
@@ -36,24 +38,15 @@ jobs:
         LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
         echo "PR Labels: $LABELS"
 
-        # Check for "docker only" label
-        DOCKER_ONLY=$(echo $LABELS | jq -r '.[] | select(test("^docker only$"; "i"))' | head -n 1)
-
-        if [ -n "$DOCKER_ONLY" ] && [ "$DOCKER_ONLY" != "null" ]; then
-          echo "docker_only=true" >> $GITHUB_OUTPUT
-          echo "✅ Docker only deployment - skipping GitHub tags and releases"
-        else
-          echo "docker_only=false" >> $GITHUB_OUTPUT
-        fi
-
-        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.)
+        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.) - MANDATORY
         VERSION=$(echo $LABELS | jq -r '.[] | select(test("^(v|version:)?[0-9]+\\.[0-9]+\\.[0-9]+")) | gsub("^(v|version:)"; "")' | head -n 1)
 
         # Look for zeam network tags (devnet0, devnet1, testnet, mainnet)
         ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))'| head -n 1)
 
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-          echo "ℹ️ No version label found"
+          echo "❌ Version label is mandatory! Please add a version label (e.g. v1.0.0, version:1.0.0)"
+          exit 1
         else
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "git_tag=v$VERSION" >> $GITHUB_OUTPUT
@@ -69,18 +62,8 @@ jobs:
           echo "ℹ️ No network tag found (optional)"
         fi
 
-        # Require at least one label (version, network, or docker only)
-        if [ "$DOCKER_ONLY" = "docker only" ]; then
-          echo "ℹ️ Docker only deployment - no tags required"
-        elif { [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; } && { [ -z "$ZEAM_TAG" ] || [ "$ZEAM_TAG" = "null" ]; }; then
-          echo "❌ No usable label found! Please add a version (e.g. v1.0.0), network tag (e.g. devnet0, testnet, mainnet), or 'docker only' label"
-          exit 1
-        fi
-
     - name: Create and push git tags
       id: create_tags
-      # Skip if docker only label is present
-      if: ${{ steps.get_tags_labels.outputs.docker_only != 'true' }}
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -127,8 +110,6 @@ jobs:
 
     - name: Determine primary tag for release
       id: primary_tag
-      # Skip if docker only label is present
-      if: ${{ steps.get_tags_labels.outputs.docker_only != 'true' }}
       run: |
         # Determine which tag to use for the release (version takes precedence)
         if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
@@ -143,17 +124,38 @@ jobs:
         echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
         echo "✅ Primary tag for release: $PRIMARY_TAG"
 
-    # Only create a Github tag, not a release at this point
+    - name: Create GitHub Release
+      if: ${{ steps.get_tags_labels.outputs.has_network_tag == 'true' }}
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_tags_labels.outputs.zeam_tag }}
+        release_name: "Network Release ${{ steps.get_tags_labels.outputs.zeam_tag }}"
+        body: |
+          ## Zeam Release: ${{ steps.get_tags_labels.outputs.zeam_tag }}
+
+          This release includes:
+          - Version: ${{ steps.get_tags_labels.outputs.version }}
+          - Network: ${{ steps.get_tags_labels.outputs.zeam_tag }}
+          - Docker images available at: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}`
+
+          ### Docker Images
+          - Multi-arch: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}`
+          - AMD64: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}-amd64`
+          - ARM64: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}-arm64`
+        draft: false
+        prerelease: ${{ contains(steps.get_tags_labels.outputs.zeam_tag, 'devnet') }}
 
   build-and-push:
     needs: create-tags
     strategy:
       matrix:
         include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-22.04-arm
-            arch: arm64
+        - runner: ubuntu-latest
+          arch: amd64
+        - runner: ubuntu-22.04-arm
+          arch: arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -179,8 +181,8 @@ jobs:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
           type=raw,value=latest-${{ matrix.arch }}
-          type=raw,value=${{ needs.create-tags.outputs.version }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.version != 'null' }}
-          type=raw,value=${{ needs.create-tags.outputs.zeam_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.has_network_tag == 'true' }}
+          type=raw,value=${{ needs.create-tags.outputs.version }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.version != 'null' }}
+          type=raw,value=${{ needs.create-tags.outputs.zeam_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.has_network_tag == 'true' }}
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -227,7 +229,7 @@ jobs:
         provenance: false
 
   create-manifest:
-    needs: [create-tags, build-and-push]
+    needs: [ create-tags, build-and-push ]
     runs-on: ubuntu-latest
 
     steps:
@@ -248,14 +250,14 @@ jobs:
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-arm64
 
     - name: Create and push multi-arch manifest for version tag
-      if: ${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.version != 'null' }}
+      if: ${{ needs.create-tags.outputs.version != 'null' }}
       run: |
         docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }} \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-amd64 \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-arm64
 
     - name: Create and push multi-arch manifest for network tag
-      if: ${{ needs.create-tags.outputs.docker_only != 'true' && needs.create-tags.outputs.has_network_tag == 'true' }}
+      if: ${{ needs.create-tags.outputs.has_network_tag == 'true' }}
       run: |
         docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }} \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }}-amd64 \

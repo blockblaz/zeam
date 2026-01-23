@@ -28,6 +28,8 @@ const database = @import("@zeam/database");
 const json = std.json;
 const utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const zeam_metrics = @import("@zeam/metrics");
+const build_options = @import("build_options");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -77,7 +79,7 @@ pub const NodeOptions = struct {
     validator_assignments: []ValidatorAssignment,
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
-    metrics_port: u16,
+    api_port: u16,
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
     database_path: []const u8,
@@ -237,7 +239,10 @@ pub const Node = struct {
         // Start API server after chain is initialized so we can pass the chain pointer
         if (options.metrics_enable) {
             try api.init(allocator);
-            try api_server.startAPIServer(allocator, options.metrics_port, options.logger_config, self.beam_node.chain);
+            // Set node lifecycle metrics
+            zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
+            try api_server.startAPIServer(allocator, options.api_port, options.logger_config, self.beam_node.chain);
         }
     }
 
@@ -1293,7 +1298,7 @@ test "NodeOptions checkpoint_sync_url field is optional" {
         .validator_assignments = &[_]ValidatorAssignment{},
         .genesis_spec = genesis_spec,
         .metrics_enable = false,
-        .metrics_port = 5052,
+        .api_port = 5052,
         .local_priv_key = try allocator.dupe(u8, "test"),
         .logger_config = &logger_config,
         .database_path = "test",

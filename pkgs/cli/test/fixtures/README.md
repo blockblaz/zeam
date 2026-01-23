@@ -289,7 +289,7 @@ To serve checkpoint state from a zeam node, enable the metrics server:
   --override_genesis_time $GENESIS_TIME \
   --data-dir ./data/test_node0 \
   --metrics-enable \
-  --metrics-port 5052
+  --api-port 5052
 ```
 
 This node will serve the finalized checkpoint state at `http://localhost:5052/lean/states/finalized`.
@@ -306,7 +306,7 @@ This node will serve the finalized checkpoint state at `http://localhost:5052/le
   --override_genesis_time 1759210782 \
   --data-dir ./data/test_node0 \
   --metrics-enable \
-  --metrics-port 5052
+  --api-port 5052
 ```
 
 **Terminal 2 (Node using checkpoint sync):**

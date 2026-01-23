@@ -27,9 +27,29 @@ pub const RootHex = [64]u8;
 pub const ZERO_HASH = [_]u8{0x00} ** 32;
 pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 
-pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidSlotIndex, DuplicateAttestationData };
+pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData };
 
 const json = std.json;
+
+pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
+    switch (val.*) {
+        .object => |*o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                freeJsonValue(&entry.value_ptr.*, allocator);
+            }
+            o.deinit();
+        },
+        .array => |*a| {
+            for (a.items) |*item| {
+                freeJsonValue(item, allocator);
+            }
+            a.deinit();
+        },
+        .string => |s| allocator.free(s),
+        else => {},
+    }
+}
 
 // prepare the state to be pre state of the slot
 pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
@@ -51,6 +71,38 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     }
 
     return false;
+}
+
+pub fn getJustifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
+    if (slot <= finalized_slot) {
+        return null;
+    }
+    const base: types.Slot = finalized_slot + 1;
+    return @intCast(slot - base);
+}
+
+pub fn isSlotJustified(finalized_slot: types.Slot, justified_slots: *const types.JustifiedSlots, slot: types.Slot) !bool {
+    const idx_opt = getJustifiedSlotsIndex(finalized_slot, slot);
+    if (idx_opt == null) {
+        return true;
+    }
+    const idx = idx_opt.?;
+    if (idx >= justified_slots.len()) {
+        return StateTransitionError.InvalidJustificationIndex;
+    }
+    return try justified_slots.get(idx);
+}
+
+pub fn setSlotJustified(finalized_slot: types.Slot, justified_slots: *types.JustifiedSlots, slot: types.Slot, value: bool) !void {
+    const idx_opt = getJustifiedSlotsIndex(finalized_slot, slot);
+    if (idx_opt == null) {
+        return;
+    }
+    const idx = idx_opt.?;
+    if (idx >= justified_slots.len()) {
+        return StateTransitionError.InvalidJustificationIndex;
+    }
+    try justified_slots.set(idx, value);
 }
 
 // Helper function to convert bytes to hex string
@@ -101,6 +153,16 @@ pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !vo
 
     try ssz.serialize(T, data, &bytes);
     try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
+}
+
+test "isSlotJustified treats finalized boundary as implicit" {
+    var justified_slots = try types.JustifiedSlots.init(std.testing.allocator);
+    defer justified_slots.deinit();
+
+    try justified_slots.append(false);
+
+    try std.testing.expect(try isSlotJustified(0, &justified_slots, 0));
+    try std.testing.expectEqual(false, try isSlotJustified(0, &justified_slots, 1));
 }
 
 test "ssz import" {
