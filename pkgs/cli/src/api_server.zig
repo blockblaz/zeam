@@ -98,10 +98,10 @@ const ApiServer = struct {
         } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
             // Handle metrics request
             self.handleMetrics(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/health")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             // Handle health check
             self.handleHealth(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/lean/states/finalized")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             // Handle finalized checkpoint state endpoint
             self.handleFinalizedCheckpointState(&request) catch |err| {
                 self.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
@@ -140,7 +140,7 @@ const ApiServer = struct {
     }
 
     /// Handle finalized checkpoint state endpoint
-    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
+    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/v0/states/finalized
     fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
         // Get the chain (may be null if API server started before chain initialization)
         const chain = self.chain orelse {

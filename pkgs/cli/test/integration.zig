@@ -159,9 +159,9 @@ const ZeamRequest = struct {
         return self.makeRequest("/metrics");
     }
 
-    /// Make a request to the /health endpoint and return the response
+    /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/health");
+        return self.makeRequest("/lean/v0/health");
     }
 
     /// Internal helper to make HTTP requests to any endpoint
