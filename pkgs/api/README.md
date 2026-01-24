@@ -8,7 +8,7 @@ This package provides the HTTP API server for the Zeam node with five main endpo
 - Prometheus metrics endpoint at `/metrics`
 - Health check at `/lean/v0/health`
 - Finalized checkpoint state at `/lean/v0/states/finalized` (for checkpoint sync)
-- Justified checkpoint information at `/lean/v0/states/justified`
+- Justified checkpoint information at `/lean/v0/checkpoints/justified`
 
 ## Package Components
 
@@ -120,12 +120,12 @@ Returns:
 - **Body**: SSZ-encoded `BeamState`
 - **Status 503**: Returned if no finalized state is available yet
 
-### `/lean/v0/states/justified`
+### `/lean/v0/checkpoints/justified`
 
 Returns the latest justified checkpoint information as JSON.
 
 ```sh
-curl http://localhost:9667/lean/v0/states/justified
+curl http://localhost:9667/lean/v0/checkpoints/justified
 ```
 
 Returns:
@@ -153,7 +153,7 @@ The server exposes:
 - Metrics at `/metrics`
 - Health at `/lean/v0/health`
 - Checkpoint state at `/lean/v0/states/finalized`
-- Justified checkpoint at `/lean/v0/states/justified`
+- Justified checkpoint at `/lean/v0/checkpoints/justified`
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
 
@@ -216,7 +216,7 @@ curl http://localhost:9668/lean/v0/health
 curl http://localhost:9668/lean/v0/states/finalized -o state.ssz
 
 # Justified checkpoint
-curl http://localhost:9668/lean/v0/states/justified
+curl http://localhost:9668/lean/v0/checkpoints/justified
 ```
 
 ## Visualization with Prometheus & Grafana
