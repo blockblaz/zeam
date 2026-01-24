@@ -11,8 +11,8 @@ const node_lib = @import("@zeam/node");
 const BeamChain = node_lib.chainFactory.BeamChain;
 
 /// API server that runs in a background thread
-/// Handles metrics, SSE events, health checks, and checkpoint state endpoints
-/// chain is optional - if null, the finalized state endpoint will return 503
+/// Handles metrics, SSE events, health checks, checkpoint endpoints, and finalized state
+/// chain is optional - if null, endpoints will return 503
 /// (API server starts before chain initialization, so chain may not be available yet)
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !void {
     // Initialize the global event broadcaster for SSE events
@@ -107,7 +107,7 @@ const ApiServer = struct {
                 self.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
-        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/justified")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/checkpoints/justified")) {
             // Handle justified checkpoint endpoint
             self.handleJustifiedCheckpoint(&request) catch |err| {
                 self.logger.warn("failed to handle justified checkpoint request: {}", .{err});
@@ -187,7 +187,8 @@ const ApiServer = struct {
     }
 
     /// Handle justified checkpoint endpoint
-    /// Returns the latest justified checkpoint information as JSON at /lean/v0/states/justified
+    /// Returns checkpoint info as JSON at /lean/v0/checkpoints/justified
+    /// Useful for monitoring consensus progress and fork choice state
     fn handleJustifiedCheckpoint(self: *const Self, request: *std.http.Server.Request) !void {
         // Get the chain (may be null if API server started before chain initialization)
         const chain = self.chain orelse {
