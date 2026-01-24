@@ -1265,11 +1265,11 @@ test "checkpoint-sync-url parameter is optional" {
         .@"node-id" = "test",
         .validator_config = "test",
         .override_genesis_time = null,
-        .@"checkpoint-sync-url" = "http://localhost:5052/lean/states/finalized",
+        .@"checkpoint-sync-url" = "http://localhost:5052/lean/v0/states/finalized",
     };
 
     try std.testing.expect(node_cmd_with_url.@"checkpoint-sync-url" != null);
-    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/states/finalized");
+    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/v0/states/finalized");
 }
 
 test "NodeOptions checkpoint_sync_url field is optional" {
@@ -1314,6 +1314,6 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     try std.testing.expect(node_options.checkpoint_sync_url == null);
 
     // Test with a URL
-    node_options.checkpoint_sync_url = "http://localhost:5052/lean/states/finalized";
+    node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
 }

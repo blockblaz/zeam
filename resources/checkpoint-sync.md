@@ -20,7 +20,7 @@ Checkpoint sync allows a new node to quickly synchronize by downloading the fina
 2. Verify the first node has finalized state by checking its API:
 
    ```sh
-   curl -s http://localhost:9667/lean/states/finalized -o /dev/null -w "%{http_code}\n"
+   curl -s http://localhost:9667/lean/v0/states/finalized -o /dev/null -w "%{http_code}\n"
    ```
 
    You should see `200` once the node has finalized state available.
@@ -32,14 +32,14 @@ Checkpoint sync allows a new node to quickly synchronize by downloading the fina
    ```
 
    The second node will:
-   - Download the finalized state from zeam_0's API endpoint (`/lean/states/finalized`)
+   - Download the finalized state from zeam_0's API endpoint (`/lean/v0/states/finalized`)
    - Verify the state matches the expected genesis configuration (validator count)
    - Use this state as its anchor to sync forward
 
 4. Observe the logs on zeam_1. You should see messages like:
 
    ```
-   checkpoint sync enabled, downloading state from: http://localhost:9667/lean/states/finalized
+   checkpoint sync enabled, downloading state from: http://localhost:9667/lean/v0/states/finalized
    checkpoint state verified: slot=X, validators=N, state_root=0x..., block_root=0x...
    checkpoint sync completed successfully, using state at slot X as anchor
    ```
@@ -64,7 +64,7 @@ To test the fallback behavior when checkpoint sync fails:
 
 ## API Endpoint
 
-The checkpoint sync feature uses the `/lean/states/finalized` endpoint which returns:
+The checkpoint sync feature uses the `/lean/v0/states/finalized` endpoint which returns:
 - **Content-Type**: `application/octet-stream`
 - **Body**: SSZ-encoded `BeamState`
 - **Status 503**: Returned if no finalized state is available yet
