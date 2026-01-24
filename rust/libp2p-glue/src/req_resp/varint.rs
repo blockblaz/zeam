@@ -47,7 +47,7 @@ pub fn calculate_snappy_frame_size(src: &[u8]) -> Result<Option<usize>, ReqRespE
     }
 
     // Verify stream identifier
-    if &src[..SNAPPY_STREAM_IDENTIFIER.len()] != SNAPPY_STREAM_IDENTIFIER {
+    if src[..SNAPPY_STREAM_IDENTIFIER.len()] != SNAPPY_STREAM_IDENTIFIER {
         return Err(ReqRespError::InvalidData(
             "Invalid snappy stream identifier".into(),
         ));
