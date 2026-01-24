@@ -1203,6 +1203,12 @@ pub const BeamChain = struct {
         return state_ptr;
     }
 
+    /// Get the latest justified checkpoint
+    /// Returns the checkpoint with slot and root of the most recent justified checkpoint
+    pub fn getJustifiedCheckpoint(self: *Self) types.Checkpoint {
+        return self.forkChoice.fcStore.latest_justified;
+    }
+
     pub const SyncStatus = union(enum) {
         synced,
         no_peers,

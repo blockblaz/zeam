@@ -272,10 +272,10 @@ To enable checkpoint sync, add the `--checkpoint-sync-url` parameter:
   --validator_config genesis_bootnode \
   --override_genesis_time $GENESIS_TIME \
   --data-dir ./data/test_node1 \
-  --checkpoint-sync-url http://localhost:5052/lean/states/finalized
+  --checkpoint-sync-url http://localhost:5052/lean/v0/states/finalized
 ```
 
-The URL should point to a zeam node's checkpoint state endpoint (e.g., `http://localhost:5052/lean/states/finalized` if the source node has metrics enabled on port 5052).
+The URL should point to a zeam node's checkpoint state endpoint (e.g., `http://localhost:5052/lean/v0/states/finalized` if the source node has metrics enabled on port 5052).
 
 ### Checkpoint Sync Server
 
@@ -292,7 +292,7 @@ To serve checkpoint state from a zeam node, enable the metrics server:
   --api-port 5052
 ```
 
-This node will serve the finalized checkpoint state at `http://localhost:5052/lean/states/finalized`.
+This node will serve the finalized checkpoint state at `http://localhost:5052/lean/v0/states/finalized`.
 
 ### Checkpoint Sync Example
 
@@ -318,7 +318,7 @@ This node will serve the finalized checkpoint state at `http://localhost:5052/le
   --validator_config genesis_bootnode \
   --override_genesis_time 1759210782 \
   --data-dir ./data/test_node1 \
-  --checkpoint-sync-url http://localhost:5052/lean/states/finalized
+  --checkpoint-sync-url http://localhost:5052/lean/v0/states/finalized
 ```
 
 **Note:** The `--checkpoint-sync-url` parameter is optional. If not provided, the node will start from genesis as usual.
