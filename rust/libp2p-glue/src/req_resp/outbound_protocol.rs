@@ -114,7 +114,6 @@ impl Decoder for OutboundCodec {
         }
 
         // Response format: response_code (1 byte) + varint (uncompressed len) + snappy frame
-        // The varint encodes the uncompressed SSZ length, NOT the snappy frame size.
         let (uncompressed_len, prefix_len) = match decode_varint_prefix(&src[1..])? {
             Some(result) => result,
             None => return Ok(None),
