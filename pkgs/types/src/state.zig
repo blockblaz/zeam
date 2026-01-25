@@ -320,7 +320,7 @@ pub const BeamState = struct {
         }
         const last_materialized_slot: Slot = staged_block.slot - 1;
         try self.extendJustifiedSlots(self.latest_finalized.slot, last_materialized_slot);
-        logger.debug("processed missed_slots={d} justified_slots={any}, historical_block_hashes={any}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
+        logger.debug("processed missed_slots={d} justified_slots_len={d} historical_block_hashes_len={d}", .{ missed_slots, self.justified_slots.len(), self.historical_block_hashes.len() });
 
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
@@ -396,7 +396,7 @@ pub const BeamState = struct {
             const attestation_str = try attestation_data.toJsonString(allocator);
             defer allocator.free(attestation_str);
 
-            logger.debug("processing attestation={s} validators={any}\n....\n", .{ attestation_str, validator_indices.items });
+            logger.debug("processing attestation={s} validators_count={d}\n", .{ attestation_str, validator_indices.items.len });
 
             const historical_len: Slot = @intCast(self.historical_block_hashes.len());
             if (source_slot >= historical_len) {
@@ -463,7 +463,7 @@ pub const BeamState = struct {
                     target_justifications_count += 1;
                 }
             }
-            logger.debug("target jcount={d}: {any} justifications={any}\n", .{ target_justifications_count, attestation_data.target.root, target_justifications });
+            logger.debug("target jcount={d} target_root=0x{s} justifications_len={d}\n", .{ target_justifications_count, std.fmt.fmtSliceHexLower(&attestation_data.target.root), target_justifications.len });
 
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
