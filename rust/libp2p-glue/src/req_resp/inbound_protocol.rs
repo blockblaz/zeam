@@ -109,7 +109,8 @@ impl Encoder<ResponseMessage> for InboundCodec {
             ));
         }
 
-        let snappy_frame_size = calculate_snappy_frame_size(&item.payload[snappy_start..])?
+        let snappy_frame_size =
+            calculate_snappy_frame_size(&item.payload[snappy_start..], uncompressed_len)?
             .ok_or_else(|| {
                 ReqRespError::InvalidData("Incomplete snappy frame in response".into())
             })?;
@@ -156,21 +157,12 @@ impl Decoder for InboundCodec {
             return Ok(None);
         }
 
-        let snappy_frame_size = match calculate_snappy_frame_size(&src[prefix_len..])? {
+        let snappy_frame_size = match calculate_snappy_frame_size(&src[prefix_len..], uncompressed_len)? {
             Some(size) => size,
             None => return Ok(None),
         };
 
         let total_len = prefix_len + snappy_frame_size;
-
-        // snappy frame shouldn't be excessively larger than uncompressed
-        let max_snappy_overhead = 64 + (uncompressed_len / 10); // generous overhead allowance
-        if snappy_frame_size > uncompressed_len + max_snappy_overhead {
-            return Err(ReqRespError::InvalidData(format!(
-                "Snappy frame size {} is unexpectedly large for uncompressed size {}",
-                snappy_frame_size, uncompressed_len
-            )));
-        }
 
         if src.len() < total_len {
             return Ok(None);
