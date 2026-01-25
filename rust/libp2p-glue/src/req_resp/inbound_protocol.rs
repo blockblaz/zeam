@@ -3,7 +3,7 @@
 /// we changed the encode/decode logic to delegate the framing to zig side, but we still need to inspect the varint prefix to determine the frame length.
 use std::pin::Pin;
 
-use super::varint::{decode_varint_prefix, MAX_VARINT_BYTES};
+use super::varint::{calculate_snappy_frame_size, decode_varint_prefix};
 use crate::req_resp::{
     configurations::{max_message_size, REQUEST_TIMEOUT},
     error::ReqRespError,
@@ -89,30 +89,38 @@ impl Encoder<ResponseMessage> for InboundCodec {
             ));
         }
 
-        let (body_len, prefix_len) = decode_varint_prefix(&item.payload[1..])?
+        // Response format: response_code (1 byte) + varint (uncompressed len) + snappy frame
+        let (uncompressed_len, prefix_len) = decode_varint_prefix(&item.payload[1..])?
             .ok_or_else(|| ReqRespError::InvalidData("Incomplete response length prefix".into()))?;
 
-        if body_len > max_message_size() {
+        if uncompressed_len > max_message_size() {
             return Err(ReqRespError::InvalidData(format!(
                 "Message size exceeds maximum: {} > {}",
-                body_len,
+                uncompressed_len,
                 max_message_size()
             )));
         }
 
-        let expected_len = 1 + prefix_len + body_len;
+        // Validate the snappy frame that follows
+        let snappy_start = 1 + prefix_len;
+        if item.payload.len() <= snappy_start {
+            return Err(ReqRespError::InvalidData(
+                "Response payload missing snappy frame".into(),
+            ));
+        }
+
+        let snappy_frame_size = calculate_snappy_frame_size(&item.payload[snappy_start..])?
+            .ok_or_else(|| {
+                ReqRespError::InvalidData("Incomplete snappy frame in response".into())
+            })?;
+
+        let expected_len = 1 + prefix_len + snappy_frame_size;
         if item.payload.len() != expected_len {
             return Err(ReqRespError::InvalidData(format!(
                 "Response payload length mismatch (expected {}, got {})",
                 expected_len,
                 item.payload.len()
             )));
-        }
-
-        if expected_len > max_message_size() + MAX_VARINT_BYTES + 1 {
-            return Err(ReqRespError::InvalidData(
-                "Framed response exceeds maximum envelope size".into(),
-            ));
         }
 
         dst.clear();
@@ -130,24 +138,38 @@ impl Decoder for InboundCodec {
             return Ok(None);
         }
 
-        let (body_len, prefix_len) = match decode_varint_prefix(&src[..])? {
+        // Decode the varint prefix which tells us the uncompressed SSZ length
+        let (uncompressed_len, prefix_len) = match decode_varint_prefix(&src[..])? {
             Some(result) => result,
             None => return Ok(None),
         };
 
-        if body_len > max_message_size() {
+        if uncompressed_len > max_message_size() {
             return Err(ReqRespError::InvalidData(format!(
                 "Message size exceeds maximum: {} > {}",
-                body_len,
+                uncompressed_len,
                 max_message_size()
             )));
         }
 
-        let total_len = prefix_len + body_len;
-        if total_len > max_message_size() + MAX_VARINT_BYTES {
-            return Err(ReqRespError::InvalidData(
-                "Framed request exceeds maximum envelope size".into(),
-            ));
+        if src.len() <= prefix_len {
+            return Ok(None);
+        }
+
+        let snappy_frame_size = match calculate_snappy_frame_size(&src[prefix_len..])? {
+            Some(size) => size,
+            None => return Ok(None),
+        };
+
+        let total_len = prefix_len + snappy_frame_size;
+
+        // snappy frame shouldn't be excessively larger than uncompressed
+        let max_snappy_overhead = 64 + (uncompressed_len / 10); // generous overhead allowance
+        if snappy_frame_size > uncompressed_len + max_snappy_overhead {
+            return Err(ReqRespError::InvalidData(format!(
+                "Snappy frame size {} is unexpectedly large for uncompressed size {}",
+                snappy_frame_size, uncompressed_len
+            )));
         }
 
         if src.len() < total_len {
