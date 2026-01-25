@@ -1,7 +1,7 @@
 /// The code originally comes from Ream https://github.com/ReamLabs/ream/blob/5a4b3cb42d5646a0d12ec1825ace03645dbfd59b/crates/networking/p2p/src/req_resp/outbound_protocol.rs
 /// as we still need rust-libp2p until we fully migrate to zig-libp2p. It needs the custom RPC protocol implementation.
 /// we changed the encode/decode logic to delegate the framing to zig side, but we still need to inspect the varint prefix to determine the frame length.
-use super::varint::{decode_varint_prefix, MAX_VARINT_BYTES};
+use super::varint::{calculate_snappy_frame_size, decode_varint_prefix};
 use crate::req_resp::{
     configurations::max_message_size,
     error::ReqRespError,
@@ -66,30 +66,37 @@ impl Encoder<RequestMessage> for OutboundCodec {
             ));
         }
 
-        let (body_len, prefix_len) = decode_varint_prefix(&item.payload)?
+        // Request format: varint (uncompressed len) + snappy frame
+        let (uncompressed_len, prefix_len) = decode_varint_prefix(&item.payload)?
             .ok_or_else(|| ReqRespError::InvalidData("Incomplete request length prefix".into()))?;
 
-        if body_len > max_message_size() {
+        if uncompressed_len > max_message_size() {
             return Err(ReqRespError::InvalidData(format!(
                 "Message size exceeds maximum: {} > {}",
-                body_len,
+                uncompressed_len,
                 max_message_size()
             )));
         }
 
-        let expected_len = prefix_len + body_len;
+        // Validate the snappy frame that follows
+        if item.payload.len() <= prefix_len {
+            return Err(ReqRespError::InvalidData(
+                "Request payload missing snappy frame".into(),
+            ));
+        }
+
+        let snappy_frame_size = calculate_snappy_frame_size(&item.payload[prefix_len..])?
+            .ok_or_else(|| {
+                ReqRespError::InvalidData("Incomplete snappy frame in request".into())
+            })?;
+
+        let expected_len = prefix_len + snappy_frame_size;
         if item.payload.len() != expected_len {
             return Err(ReqRespError::InvalidData(format!(
                 "Request payload length mismatch (expected {}, got {})",
                 expected_len,
                 item.payload.len()
             )));
-        }
-
-        if expected_len > max_message_size() + MAX_VARINT_BYTES {
-            return Err(ReqRespError::InvalidData(
-                "Framed request exceeds maximum envelope size".into(),
-            ));
         }
 
         dst.extend_from_slice(&item.payload);
@@ -106,27 +113,40 @@ impl Decoder for OutboundCodec {
             return Ok(None);
         }
 
-        // Zig is responsible for constructing the response frame, but the codec still needs
-        // to inspect the varint prefix to figure out the total frame length so that we know
-        // when a full message has been received from the stream.
-        let (body_len, prefix_len) = match decode_varint_prefix(&src[1..])? {
+        // Response format: response_code (1 byte) + varint (uncompressed len) + snappy frame
+        let (uncompressed_len, prefix_len) = match decode_varint_prefix(&src[1..])? {
             Some(result) => result,
             None => return Ok(None),
         };
 
-        if body_len > max_message_size() {
+        if uncompressed_len > max_message_size() {
             return Err(ReqRespError::InvalidData(format!(
                 "Message size exceeds maximum: {} > {}",
-                body_len,
+                uncompressed_len,
                 max_message_size()
             )));
         }
 
-        let total_len = 1 + prefix_len + body_len;
-        if total_len > max_message_size() + MAX_VARINT_BYTES + 1 {
-            return Err(ReqRespError::InvalidData(
-                "Framed response exceeds maximum envelope size".into(),
-            ));
+        // Now parse the snappy-framed data that follows to determine the actual frame size
+        let snappy_start = 1 + prefix_len;
+        if src.len() <= snappy_start {
+            return Ok(None);
+        }
+
+        let snappy_frame_size = match calculate_snappy_frame_size(&src[snappy_start..])? {
+            Some(size) => size,
+            None => return Ok(None),
+        };
+
+        let total_len = 1 + prefix_len + snappy_frame_size;
+
+        // snappy frame shouldn't be excessively larger than uncompressed
+        let max_snappy_overhead = 64 + (uncompressed_len / 10);
+        if snappy_frame_size > uncompressed_len + max_snappy_overhead {
+            return Err(ReqRespError::InvalidData(format!(
+                "Snappy frame size {} is unexpectedly large for uncompressed size {}",
+                snappy_frame_size, uncompressed_len
+            )));
         }
 
         if src.len() < total_len {

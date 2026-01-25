@@ -1,4 +1,3 @@
-const ssz = @import("ssz");
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
@@ -51,7 +50,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     logger.debug("extracting state root\n", .{});
     // extract the post state root
     var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
+    try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
     block.state_root = state_root;
 }
 
@@ -117,7 +116,7 @@ pub fn verifySignatures(
 
         // Compute message hash from attestation data
         var message_hash: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
 
         const epoch: u64 = aggregated_attestation.data.slot;
 
@@ -156,7 +155,7 @@ pub fn verifySingleAttestation(
 
     const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
     var message: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
+    try zeam_utils.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
 
     const epoch: u32 = @intCast(attestation_data.slot);
 
@@ -187,7 +186,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
     if (validateResult) {
         // verify the post state root
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
             opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;

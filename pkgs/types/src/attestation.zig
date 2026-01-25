@@ -2,6 +2,7 @@ const std = @import("std");
 const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
+const zeam_utils = @import("@zeam/utils");
 
 const mini_3sf = @import("./mini_3sf.zig");
 const utils = @import("./utils.zig");
@@ -31,7 +32,7 @@ pub const AttestationData = struct {
 
     pub fn sszRoot(self: *const AttestationData, allocator: Allocator) !Root {
         var root: Root = undefined;
-        try ssz.hashTreeRoot(AttestationData, self.*, &root, allocator);
+        try zeam_utils.hashTreeRoot(AttestationData, self.*, &root, allocator);
         return root;
     }
 
