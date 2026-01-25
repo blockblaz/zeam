@@ -28,7 +28,7 @@ export fn main() noreturn {
     // completed.
     const input = zkvm.get_input(allocator);
     defer zkvm.free_input(allocator);
-    logger.debug("serialized input={any} len={d}\n", .{ input[0..], input.len });
+    logger.debug("serialized input len={d}\n", .{input.len});
 
     ssz.deserialize(types.BeamSTFProverInput, input[0..], &prover_input, allocator) catch @panic("could not deserialize input");
     const state_str = prover_input.state.toJsonString(allocator) catch @panic("could not convert state to JSON string");

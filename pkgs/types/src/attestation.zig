@@ -56,6 +56,17 @@ pub const Attestation = struct {
     validator_id: ValidatorIndex,
     data: AttestationData,
 
+    pub fn format(self: Attestation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("Attestation{{ validator={d}, slot={d}, source_slot={d}, target_slot={d} }}", .{
+            self.validator_id,
+            self.data.slot,
+            self.data.source.slot,
+            self.data.target.slot,
+        });
+    }
+
     pub fn toJson(self: *const Attestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
@@ -74,6 +85,17 @@ pub const SignedAttestation = struct {
     validator_id: ValidatorIndex,
     message: AttestationData,
     signature: SIGBYTES,
+
+    pub fn format(self: SignedAttestation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("SignedAttestation{{ validator={d}, slot={d}, source_slot={d}, target_slot={d} }}", .{
+            self.validator_id,
+            self.message.slot,
+            self.message.source.slot,
+            self.message.target.slot,
+        });
+    }
 
     pub fn toJson(self: *const SignedAttestation, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);

@@ -64,6 +64,13 @@ pub const GossipSub = struct {
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
+    pub fn format(self: GossipSub, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = self;
+        _ = fmt;
+        _ = options;
+        try writer.writeAll("GossipSub");
+    }
+
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
     }
@@ -110,6 +117,13 @@ pub const OnGossipCbHandler = struct {
     ptr: *anyopaque,
     onGossipCb: OnGossipCbType,
     // c: xev.Completion = undefined,
+
+    pub fn format(self: OnGossipCbHandler, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = self;
+        _ = fmt;
+        _ = options;
+        try writer.writeAll("OnGossipCbHandler");
+    }
 
     pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8) anyerror!void {
         return self.onGossipCb(self.ptr, data, sender_peer_id);
@@ -208,6 +222,21 @@ pub const GossipMessage = union(GossipTopic) {
         return std.meta.activeTag(self.*);
     }
 
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
+                blk.message.block.slot,
+                blk.message.block.proposer_index,
+            }),
+            .attestation => |att| try writer.print("GossipMessage{{ attestation: validator={d}, slot={d} }}", .{
+                att.validator_id,
+                att.message.slot,
+            }),
+        }
+    }
+
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
         var serialized = std.ArrayList(u8).init(allocator);
         errdefer serialized.deinit();
@@ -300,6 +329,15 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     status: types.Status,
 
     const Self = @This();
+
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
+            .status => try writer.writeAll("ReqRespRequest{ status }"),
+        }
+    }
 
     pub fn toJson(self: *const ReqRespRequest, allocator: Allocator) !json.Value {
         return switch (self.*) {
@@ -583,7 +621,7 @@ pub const ReqRespRequestHandler = struct {
         const peer_id_opt = stream.getPeerId();
         const peer_id = peer_id_opt orelse "unknown";
         const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
-        self.logger.debug("network-{d}:: onReqRespRequest={any}, handlers={d} from peer={s}{}", .{ self.networkId, req, self.handlers.items.len, peer_id, node_name });
+        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -620,6 +658,16 @@ const MessagePublishWrapper = struct {
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
+
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={s}, sender={s} }}", .{
+            self.networkId,
+            self.data.getGossipTopic().encode(),
+            self.sender_peer_id,
+        });
+    }
 
     fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
         const cloned_data = try data.clone(allocator);
@@ -780,7 +828,7 @@ pub const GenericGossipHandler = struct {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any} from peer={s}{}", .{ self.networkId, handlerArr.items, gossip_topic, sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -788,7 +836,7 @@ pub const GenericGossipHandler = struct {
             if (scheduleOnLoop) {
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={s}", .{ self.networkId, publishWrapper, gossip_topic.encode() });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);

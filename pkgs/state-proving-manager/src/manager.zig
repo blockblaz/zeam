@@ -107,7 +107,7 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
     defer serialized.deinit();
     try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
 
-    opts.logger.debug("prove transition ----------- serialized({d})=\n{any}\n", .{ serialized.items.len, serialized.items });
+    opts.logger.debug("prove transition ----------- serialized_len={d}", .{serialized.items.len});
 
     var prover_input_deserialized: types.BeamSTFProverInput = undefined;
     try ssz.deserialize(types.BeamSTFProverInput, serialized.items[0..], &prover_input_deserialized, allocator);
