@@ -291,7 +291,7 @@ fn runCase(
     defer label_map.deinit(allocator);
 
     var anchor_root: types.Root = undefined;
-    ssz.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_root, allocator) catch |err| {
+    zeam_utils.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_root, allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}: anchor block hashing failed ({s})\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -607,7 +607,7 @@ fn processBlockStep(
     defer block.deinit();
 
     var block_root: types.Root = undefined;
-    ssz.hashTreeRoot(types.BeamBlock, block, &block_root, ctx.allocator) catch |err| {
+    zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, ctx.allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{}: hashing block failed ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },

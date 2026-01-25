@@ -242,7 +242,7 @@ pub const ForkChoice = struct {
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
         const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             types.BeamBlockHeader,
             anchor_block_header,
             &anchor_block_root,
@@ -1062,7 +1062,7 @@ pub const ForkChoice = struct {
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+                try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
                 break :computedroot cblock_root;
             };
             const is_timely = self.isBlockTimely(opts.blockDelayMs);

@@ -245,7 +245,7 @@ pub const BeamState = struct {
 
         if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
             var prev_state_root: [32]u8 = undefined;
-            try ssz.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            try zeam_utils.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
             self.latest_block_header.state_root = prev_state_root;
         }
     }
@@ -296,7 +296,7 @@ pub const BeamState = struct {
 
         // 4. verify latest block header is the parent
         var head_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        try zeam_utils.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
             logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
@@ -539,7 +539,7 @@ pub const BeamState = struct {
 
     pub fn genGenesisBlock(self: *const Self, allocator: Allocator, genesis_block: *block.BeamBlock) !void {
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             BeamState,
             self.*,
             &state_root,
@@ -554,7 +554,7 @@ pub const BeamState = struct {
         // check does it need cloning?
         var beam_block_header = self.latest_block_header;
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             BeamState,
             self.*,
             &state_root,
@@ -719,7 +719,7 @@ test "ssz seralize/deserialize signed beam state" {
 
     // successful merklization
     var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(
+    try zeam_utils.hashTreeRoot(
         BeamState,
         state,
         &state_root,
@@ -774,7 +774,7 @@ fn makeBlock(
     attestations: []const attestation.AggregatedAttestation,
 ) !block.BeamBlock {
     var parent_root: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &parent_root, allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &parent_root, allocator);
 
     var attestations_list = try block.AggregatedAttestations.init(allocator);
     errdefer attestations_list.deinit();
@@ -829,7 +829,7 @@ test "justified_slots rebases when finalization advances" {
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2_parent_root: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
 
     var att_0_to_1 = try makeAggregatedAttestation(
         std.testing.allocator,
@@ -848,7 +848,7 @@ test "justified_slots rebases when finalization advances" {
 
     try state.process_slots(std.testing.allocator, 3, logger);
     var block_3_parent_root: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_3_parent_root, std.testing.allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_3_parent_root, std.testing.allocator);
 
     var att_1_to_2 = try makeAggregatedAttestation(
         std.testing.allocator,
@@ -897,7 +897,7 @@ test "pruning keeps pending justifications" {
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2_parent_root: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
 
     var att_0_to_1 = try makeAggregatedAttestation(
         std.testing.allocator,
@@ -1083,7 +1083,7 @@ test "genesis block hash comparison" {
 
     // Compute hash of first genesis block
     var genesis_block_hash1: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
     std.debug.print("genesis_block_hash1 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
 
     // Create a second genesis state with same config but regenerated (should produce same hash)
@@ -1096,7 +1096,7 @@ test "genesis block hash comparison" {
     defer genesis_block1_copy.deinit();
 
     var genesis_block_hash1_copy: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block1_copy, &genesis_block_hash1_copy, allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block1_copy, &genesis_block_hash1_copy, allocator);
 
     // Same genesis spec should produce same hash
     try std.testing.expect(std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash1_copy));
@@ -1125,7 +1125,7 @@ test "genesis block hash comparison" {
     defer genesis_block2.deinit();
 
     var genesis_block_hash2: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
     std.debug.print("genesis_block_hash2 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
 
     // Different validators should produce different genesis block hash
@@ -1155,7 +1155,7 @@ test "genesis block hash comparison" {
     defer genesis_block3.deinit();
 
     var genesis_block_hash3: Root = undefined;
-    try ssz.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
+    try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
     std.debug.print("genesis_block_hash3 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
 
     // Different genesis_time should produce different genesis block hash

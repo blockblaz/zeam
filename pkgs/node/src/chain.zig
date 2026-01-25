@@ -354,7 +354,7 @@ pub const BeamChain = struct {
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
         try self.states.put(block_root, post_state);
         post_state_opt = null;
@@ -491,7 +491,7 @@ pub const BeamChain = struct {
             .block => |signed_block| {
                 const block = signed_block.message.block;
                 var block_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+                try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
@@ -592,7 +592,7 @@ pub const BeamChain = struct {
 
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
-            try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+            try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
             break :computedroot cblock_root;
         };
 
@@ -1339,7 +1339,7 @@ test "process and add mock blocks into a node's chain" {
         // should have matching states in the state
         const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match

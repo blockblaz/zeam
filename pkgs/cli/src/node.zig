@@ -656,7 +656,7 @@ fn verifyCheckpointState(
 
     // Calculate the block root from the properly constructed block header
     var block_root: types.Root = undefined;
-    try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
 
     logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
         state.slot,
@@ -1201,7 +1201,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
 
     // Get state root by hashing the state directly
     var state_root_from_genesis: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
 
     // Generate block header using genStateBlockHeader
     const state_block_header = try genesis_state.genStateBlockHeader(allocator);

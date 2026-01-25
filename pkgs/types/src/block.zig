@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
 const xmss = @import("@zeam/xmss");
+const zeam_utils = @import("@zeam/utils");
 
 const aggregation = @import("./aggregation.zig");
 const attestation = @import("./attestation.zig");
@@ -154,7 +155,7 @@ pub const BeamBlock = struct {
 
     pub fn blockToHeader(self: *const Self, allocator: Allocator) !BeamBlockHeader {
         var body_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             BeamBlockBody,
             self.body,
             &body_root,
@@ -172,7 +173,7 @@ pub const BeamBlock = struct {
 
     pub fn blockToLatestBlockHeader(self: *const Self, allocator: Allocator, header: *BeamBlockHeader) !void {
         var body_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             BeamBlockBody,
             self.body,
             &body_root,
@@ -381,7 +382,7 @@ pub const AggregatedAttestationsResult = struct {
             const data_root = group.data_root;
             const epoch: u64 = group.data.slot;
             var message_hash: [32]u8 = undefined;
-            try ssz.hashTreeRoot(attestation.AttestationData, group.data, &message_hash, allocator);
+            try zeam_utils.hashTreeRoot(attestation.AttestationData, group.data, &message_hash, allocator);
 
             // Phase 1: Collect signatures from signatures_map
             const max_validator = group.validator_bits.capacity();
@@ -744,7 +745,7 @@ test "ssz seralize/deserialize signed beam block" {
     try std.testing.expect(std.mem.eql(u8, &signed_block.message.block.parent_root, &deserialized_signed_block.message.block.parent_root));
 
     var block_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(BeamBlock, signed_block.message.block, &block_root, std.testing.allocator);
+    try zeam_utils.hashTreeRoot(BeamBlock, signed_block.message.block, &block_root, std.testing.allocator);
 }
 
 test "blockToLatestBlockHeader and blockToHeader" {
