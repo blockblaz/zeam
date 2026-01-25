@@ -75,7 +75,7 @@ pub const NodeCommand = struct {
         .override_genesis_time = "Override genesis time in the config.yaml",
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
-        .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/states/finalized)",
+        .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
         .help = "Show help information for the node command",
     };
 };
