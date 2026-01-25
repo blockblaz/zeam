@@ -138,14 +138,14 @@ pub const ApiServer = struct {
 
     const Self = @This();
 
-    pub fn stop(self: *ApiServer) void {
+    pub fn stop(self: *Self) void {
         self.stopped.store(true, .seq_cst);
         self.thread.join();
         self.rate_limiter.deinit();
         self.allocator.destroy(self);
     }
 
-    pub fn setChain(self: *ApiServer, chain: *BeamChain) void {
+    pub fn setChain(self: *Self, chain: *BeamChain) void {
         self.chain.store(chain, .release);
     }
 
@@ -291,7 +291,7 @@ pub const ApiServer = struct {
     }
 
     /// Handle SSE events endpoint
-    fn handleSSEEvents(self: *ApiServer, stream: std.net.Stream) !void {
+    fn handleSSEEvents(self: *Self, stream: std.net.Stream) !void {
         var registered = false;
         errdefer if (!registered) stream.close();
         // Set SSE headers manually by writing HTTP response
@@ -330,7 +330,7 @@ pub const ApiServer = struct {
         }
     }
 
-    fn handleSSEConnection(stream: std.net.Stream, ctx: *ApiServer) void {
+    fn handleSSEConnection(stream: std.net.Stream, ctx: *Self) void {
         ctx.handleSSEEvents(stream) catch |err| {
             ctx.logger.warn("SSE connection failed: {}", .{err});
         };
@@ -338,7 +338,7 @@ pub const ApiServer = struct {
         ctx.releaseSSE();
     }
 
-    fn tryAcquireSSE(self: *ApiServer) bool {
+    fn tryAcquireSSE(self: *Self) bool {
         self.sse_mutex.lock();
         defer self.sse_mutex.unlock();
         // Limit long-lived SSE connections to avoid unbounded threads.
@@ -347,13 +347,13 @@ pub const ApiServer = struct {
         return true;
     }
 
-    fn releaseSSE(self: *ApiServer) void {
+    fn releaseSSE(self: *Self) void {
         self.sse_mutex.lock();
         defer self.sse_mutex.unlock();
         if (self.sse_active > 0) self.sse_active -= 1;
     }
 
-    fn tryAcquireGraph(self: *ApiServer) bool {
+    fn tryAcquireGraph(self: *Self) bool {
         self.graph_mutex.lock();
         defer self.graph_mutex.unlock();
         // Cap concurrent graph JSON generation.
@@ -362,7 +362,7 @@ pub const ApiServer = struct {
         return true;
     }
 
-    fn releaseGraph(self: *ApiServer) void {
+    fn releaseGraph(self: *Self) void {
         self.graph_mutex.lock();
         defer self.graph_mutex.unlock();
         if (self.graph_inflight > 0) self.graph_inflight -= 1;
