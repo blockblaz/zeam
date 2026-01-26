@@ -56,7 +56,8 @@ pub const PublicKeyCache = struct {
         }
 
         // Deserialize and cache
-        const pubkey = try PublicKey.fromBytes(pubkey_bytes);
+        var pubkey = try PublicKey.fromBytes(pubkey_bytes);
+        errdefer pubkey.deinit(); // Free the Rust handle if cache.put fails
         try self.cache.put(validator_index, pubkey);
 
         // Return the handle from the newly cached entry
