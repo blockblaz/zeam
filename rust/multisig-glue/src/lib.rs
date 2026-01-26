@@ -5,6 +5,7 @@ use rec_aggregation::xmss_aggregate::{
 };
 use ssz::{Decode, Encode};
 use std::slice;
+use std::sync::Once;
 
 // Import the same leansig types that hashsig-glue uses
 use leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
@@ -13,6 +14,11 @@ use leansig::signature::SignatureScheme;
 type HashSigScheme = SIGTopLevelTargetSumLifetime32Dim64Base8;
 type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
 type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
+
+// Static Once guards for idempotent initialization
+// Avoids redundant heavy computation on repeated calls
+static PROVER_INIT: Once = Once::new();
+static VERIFIER_INIT: Once = Once::new();
 
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
@@ -36,15 +42,23 @@ pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Devnet2XmssAggregateSignature, ssz
     Devnet2XmssAggregateSignature::from_ssz_bytes(bytes)
 }
 
+/// Initialize the prover (idempotent - only runs once)
+/// This is safe to call multiple times; heavy computation only happens on first call.
 #[no_mangle]
 pub extern "C" fn xmss_setup_prover() {
-    xmss_setup_aggregation_program();
-    whir_p3::precompute_dft_twiddles::<p3_koala_bear::KoalaBear>(1 << 24);
+    PROVER_INIT.call_once(|| {
+        xmss_setup_aggregation_program();
+        whir_p3::precompute_dft_twiddles::<p3_koala_bear::KoalaBear>(1 << 24);
+    });
 }
 
+/// Initialize the verifier (idempotent - only runs once)
+/// This is safe to call multiple times; setup only happens on first call.
 #[no_mangle]
 pub extern "C" fn xmss_setup_verifier() {
-    xmss_setup_aggregation_program();
+    VERIFIER_INIT.call_once(|| {
+        xmss_setup_aggregation_program();
+    });
 }
 
 /// Aggregate signatures from hashsig-glue handles
