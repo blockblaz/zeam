@@ -223,6 +223,13 @@ pub const Node = struct {
         const validator_ids = try options.getValidatorIndices(allocator);
         errdefer allocator.free(validator_ids);
 
+        // Initialize metrics BEFORE beam_node so that metrics set during
+        // initialization (like lean_validators_count) are captured on real
+        // metrics instead of being discarded by noop metrics.
+        if (options.metrics_enable) {
+            try api.init(allocator);
+        }
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -238,7 +245,6 @@ pub const Node = struct {
 
         // Start API server after chain is initialized so we can pass the chain pointer
         if (options.metrics_enable) {
-            try api.init(allocator);
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
