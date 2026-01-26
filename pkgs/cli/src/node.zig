@@ -222,6 +222,13 @@ pub const Node = struct {
         const validator_ids = try options.getValidatorIndices(allocator);
         errdefer allocator.free(validator_ids);
 
+        // Initialize metrics BEFORE beam_node so that metrics set during
+        // initialization (like lean_validators_count) are captured on real
+        // metrics instead of being discarded by noop metrics.
+        if (options.metrics_enable) {
+            try api.init(allocator);
+        }
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
