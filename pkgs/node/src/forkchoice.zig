@@ -18,13 +18,30 @@ const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
 const ProtoBlock = types.ProtoBlock;
-const ProtoMeta = struct {
+pub const ProtoNode = struct {
+    // Fields from ProtoBlock
+    slot: types.Slot,
+    blockRoot: Root,
+    parentRoot: Root,
+    stateRoot: Root,
+    timeliness: bool,
+    confirmed: bool,
+    // Fields from ProtoMeta
     parent: ?usize,
     weight: isize,
     bestChild: ?usize,
     bestDescendant: ?usize,
+
+    pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{s} }}", .{
+            self.slot,
+            self.weight,
+            std.fmt.fmtSliceHexLower(&self.blockRoot),
+        });
+    }
 };
-pub const ProtoNode = zeam_utils.MixIn(ProtoBlock, ProtoMeta);
 
 pub const ProtoArray = struct {
     nodes: std.ArrayList(ProtoNode),
@@ -242,7 +259,7 @@ pub const ForkChoice = struct {
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
         const anchor_block_header = try opts.anchorState.genStateBlockHeader(allocator);
         var anchor_block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(
+        try zeam_utils.hashTreeRoot(
             types.BeamBlockHeader,
             anchor_block_header,
             &anchor_block_root,
@@ -777,11 +794,10 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas={any} justified_node={any} best_descendant_idx={d}", .{
-            //
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
-            deltas,
+            deltas.len,
             justified_node,
             best_descendant_idx,
         });
@@ -1062,7 +1078,7 @@ pub const ForkChoice = struct {
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+                try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
                 break :computedroot cblock_root;
             };
             const is_timely = self.isBlockTimely(opts.blockDelayMs);

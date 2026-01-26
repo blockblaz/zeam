@@ -28,7 +28,6 @@ const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 const FrameDecodeError = error{
     EmptyFrame,
     PayloadTooLarge,
-    LengthMismatch,
     Incomplete,
 } || uvarint.VarintParseError;
 
@@ -48,22 +47,24 @@ fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usiz
     };
 }
 
-fn buildRequestFrame(allocator: Allocator, payload: []const u8) ![]u8 {
-    if (payload.len > MAX_RPC_MESSAGE_SIZE) {
+/// Build a request frame with varint-encoded uncompressed size followed by snappy-framed payload.
+fn buildRequestFrame(allocator: Allocator, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
+    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
     var frame = std.ArrayListUnmanaged(u8).empty;
     errdefer frame.deinit(allocator);
 
-    try encodeVarint(&frame, allocator, payload.len);
-    try frame.appendSlice(allocator, payload);
+    try encodeVarint(&frame, allocator, uncompressed_size);
+    try frame.appendSlice(allocator, snappy_payload);
 
     return frame.toOwnedSlice(allocator);
 }
 
-fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8 {
-    if (payload.len > MAX_RPC_MESSAGE_SIZE) {
+/// Build a response frame with response code, varint-encoded uncompressed size, and snappy-framed payload.
+fn buildResponseFrame(allocator: Allocator, code: u8, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
+    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
@@ -71,32 +72,35 @@ fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8
     errdefer frame.deinit(allocator);
 
     try frame.append(allocator, code);
-    try encodeVarint(&frame, allocator, payload.len);
-    try frame.appendSlice(allocator, payload);
+    try encodeVarint(&frame, allocator, uncompressed_size);
+    try frame.appendSlice(allocator, snappy_payload);
 
     return frame.toOwnedSlice(allocator);
 }
 
-fn parseRequestFrame(bytes: []const u8) FrameDecodeError![]const u8 {
+fn parseRequestFrame(bytes: []const u8) FrameDecodeError!struct {
+    declared_len: usize,
+    payload: []const u8,
+} {
     if (bytes.len == 0) {
         return error.EmptyFrame;
     }
 
     const decoded = try decodeVarint(bytes);
+
     if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
-    const total = decoded.length + decoded.value;
-    if (total != bytes.len) {
-        return error.LengthMismatch;
-    }
-
-    return bytes[decoded.length..total];
+    return .{
+        .declared_len = decoded.value,
+        .payload = bytes[decoded.length..],
+    };
 }
 
 fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
     code: u8,
+    declared_len: usize,
     payload: []const u8,
 } {
     if (bytes.len == 0) {
@@ -107,18 +111,15 @@ fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
     }
 
     const decoded = try decodeVarint(bytes[1..]);
+
     if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
-    const total = 1 + decoded.length + decoded.value;
-    if (total != bytes.len) {
-        return error.LengthMismatch;
-    }
-
     return .{
         .code = bytes[0],
-        .payload = bytes[1 + decoded.length .. total],
+        .declared_len = decoded.value,
+        .payload = bytes[1 + decoded.length ..],
     };
 }
 
@@ -175,7 +176,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     };
     defer allocator.free(framed);
 
-    const frame = try buildResponseFrame(allocator, 0, framed);
+    const frame = try buildResponseFrame(allocator, 0, encoded.len, framed);
     defer allocator.free(frame);
 
     ctx.zigHandler.logger.debug(
@@ -392,7 +393,8 @@ export fn handleRPCRequestFromRustBridge(
     };
 
     const request_frame: []const u8 = request_ptr[0..request_len];
-    const request_payload = parseRequestFrame(request_frame) catch |err| {
+
+    const request_frame_info = parseRequestFrame(request_frame) catch |err| {
         zigHandler.logger.err(
             "network-{d}:: Invalid RPC request frame from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
@@ -400,7 +402,8 @@ export fn handleRPCRequestFromRustBridge(
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request frame");
         return;
     };
-    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_payload) catch |err| {
+
+    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_frame_info.payload) catch |err| {
         zigHandler.logger.err(
             "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
@@ -409,6 +412,21 @@ export fn handleRPCRequestFromRustBridge(
         return;
     };
     defer zigHandler.allocator.free(request_bytes);
+    if (request_bytes.len != request_frame_info.declared_len) {
+        zigHandler.logger.err(
+            "network-{d}:: Invalid RPC request length from peer={s}{} protocol={s}: declared={d} decoded={d}",
+            .{
+                zigHandler.params.networkId,
+                peer_id_slice,
+                node_name,
+                protocol_slice,
+                request_frame_info.declared_len,
+                request_bytes.len,
+            },
+        );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request length");
+        return;
+    }
 
     const method = rpc_protocol;
     var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
@@ -596,6 +614,16 @@ export fn handleRPCResponseFromRustBridge(
         return;
     };
     defer zigHandler.allocator.free(response_bytes);
+    if (response_bytes.len != parsed_frame.declared_len) {
+        zigHandler.notifyRpcErrorFmt(
+            request_id,
+            method,
+            2,
+            "Response length mismatch (protocol={s}): declared {d} decoded {d}",
+            .{ protocol.protocolId(), parsed_frame.declared_len, response_bytes.len },
+        );
+        return;
+    }
 
     const response_union = interface.ReqRespResponse.deserialize(zigHandler.allocator, method, response_bytes) catch |err| {
         zigHandler.notifyRpcErrorFmt(
@@ -983,7 +1011,7 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
-        self.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, compressed_message, data });
+        self.logger.debug("network-{d}:: publishing to rust bridge data={any} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
@@ -1030,7 +1058,8 @@ pub const EthLibp2p = struct {
             return err;
         };
         defer self.allocator.free(framed_payload);
-        const frame = buildRequestFrame(self.allocator, framed_payload) catch |err| {
+
+        const frame = buildRequestFrame(self.allocator, encoded_message.len, framed_payload) catch |err| {
             self.logger.err(
                 "network-{d}:: Failed to build RPC request frame for peer={s}{} protocol_tag={d}: {any}",
                 .{ self.params.networkId, peer_id, node_name, protocol_tag, err },

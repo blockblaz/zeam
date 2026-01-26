@@ -279,6 +279,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total finalization attempts by result." }, .{}),
     };
 
+    // Initialize validators count to 0 by default (spec requires "On scrape" availability)
+    metrics.lean_validators_count.set(0);
+
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     chain_onblock_duration_seconds.context = @ptrCast(&metrics.chain_onblock_duration_seconds);
     block_processing_duration_seconds.context = @ptrCast(&metrics.block_processing_duration_seconds);
