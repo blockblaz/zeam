@@ -121,7 +121,7 @@ pub const BeamNode = struct {
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
-                self.logger.info("received gossip block for slot={any} parent_root={any} proposer={d}{} hasParentBlock={any} from peer={s}{}", .{
+                self.logger.info("received gossip block for slot={d} parent_root=0x{s} proposer={d}{} hasParentBlock={} from peer={s}{}", .{
                     block.slot,
                     std.fmt.fmtSliceHexLower(&parent_root),
                     block.proposer_index,

@@ -80,6 +80,23 @@ pub const NodeCommand = struct {
     };
 };
 
+const BeamCmd = struct {
+    help: bool = false,
+    mockNetwork: bool = false,
+    @"api-port": u16 = constants.DEFAULT_API_PORT,
+    data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
+
+    pub fn format(self: BeamCmd, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, data_dir=\"{s}\" }}", .{
+            self.mockNetwork,
+            self.@"api-port",
+            self.data_dir,
+        });
+    }
+};
+
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     log_filename: []const u8 = "consensus", // Default logger filename
@@ -93,12 +110,7 @@ const ZeamArgs = struct {
         clock: struct {
             help: bool = false,
         },
-        beam: struct {
-            help: bool = false,
-            mockNetwork: bool = false,
-            @"api-port": u16 = constants.DEFAULT_API_PORT,
-            data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
-        },
+        beam: BeamCmd,
         prove: struct {
             dist_dir: []const u8 = "zig-out/bin",
             zkvm: state_proving_manager.ZKVMs = .risc0,
@@ -179,7 +191,7 @@ const ZeamArgs = struct {
         try writer.writeAll(", command=");
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
-            .beam => |cmd| try writer.print("beam(mockNetwork={}, api-port={d}, data_dir=\"{s}\")", .{ cmd.mockNetwork, cmd.@"api-port", cmd.data_dir }),
+            .beam => |cmd| try writer.print("{any}", .{cmd}),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
@@ -229,7 +241,7 @@ fn mainInner() !void {
     const monocolor_file_log = opts.args.monocolor_file_log;
     const console_log_level = opts.args.console_log_level;
 
-    std.debug.print("opts ={any} genesis={d}\n", .{ opts.args, genesis });
+    std.debug.print("opts={any} genesis={d}\n", .{ opts.args, genesis });
 
     switch (opts.args.__commands__) {
         .clock => {
@@ -241,7 +253,7 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "initialize clock");
                 return err;
             };
-            std.debug.print("clock {any}\n", .{clock});
+            std.debug.print("clock={any}\n", .{clock});
 
             clock.run() catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "run clock service");
@@ -320,7 +332,7 @@ fn mainInner() !void {
                 return err;
             };
 
-            std.debug.print("beam opts ={any}\n", .{beamcmd});
+            std.debug.print("beam={any}\n", .{beamcmd});
 
             const mock_network = beamcmd.mockNetwork;
 
@@ -409,7 +421,7 @@ fn mainInner() !void {
                 network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network), shared_registry);
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
-                logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- mock gossip={any}", .{backend1.gossip});
             } else {
                 network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
@@ -454,7 +466,7 @@ fn mainInner() !void {
                     .node_registry = test_registry2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- ethlibp2p gossip={any}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
