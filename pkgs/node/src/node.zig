@@ -10,6 +10,7 @@ const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 const stf = @import("@zeam/state-transition");
+const zeam_metrics = @import("@zeam/metrics");
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -24,6 +25,8 @@ const forkchoice = @import("./forkchoice.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
+
+const ZERO_HASH = types.ZERO_HASH;
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -118,7 +121,7 @@ pub const BeamNode = struct {
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
-                self.logger.info("received gossip block for slot={any} parent_root={any} proposer={d}{} hasParentBlock={any} from peer={s}{}", .{
+                self.logger.info("received gossip block for slot={d} parent_root=0x{s} proposer={d}{} hasParentBlock={} from peer={s}{}", .{
                     block.slot,
                     std.fmt.fmtSliceHexLower(&parent_root),
                     block.proposer_index,
@@ -136,15 +139,15 @@ pub const BeamNode = struct {
                 }
 
                 var block_root: types.Root = undefined;
-                if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                     _ = self.network.removePendingBlockRoot(block_root);
                 } else |err| {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                 }
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.data.slot;
-                const validator_id = signed_attestation.message.validator_id;
+                const slot = signed_attestation.message.slot;
+                const validator_id = signed_attestation.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
@@ -165,7 +168,7 @@ pub const BeamNode = struct {
                 if (data.* == .block) {
                     const signed_block = data.block;
                     var block_root: types.Root = undefined;
-                    if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                    if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                         self.logger.info(
                             "gossip block 0x{s} rejected as pre-finalized; pruning cached descendants",
                             .{std.fmt.fmtSliceHexLower(block_root[0..])},
@@ -214,28 +217,20 @@ pub const BeamNode = struct {
     }
 
     fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
-        // Find all cached blocks that have this parent
-        var descendants_to_process = std.ArrayList(types.Root).init(self.allocator);
-        defer descendants_to_process.deinit();
+        // Get cached children of this parent using O(1) lookup
+        const children = self.network.getChildrenOfBlock(parent_root);
 
-        // TODO: Optimize this to use a more efficient data structure
-        // It is a O(n^2) operation to find all children of a parent and their descendants
-        // We should use a more efficient data structure to store the cached blocks
-        // along with the children roots so it's linear time operation in terms of the number of children
-        var it = self.network.fetched_blocks.iterator();
-        while (it.next()) |entry| {
-            const cached_block = entry.value_ptr.*;
-            if (std.mem.eql(u8, &cached_block.message.block.parent_root, &parent_root)) {
-                descendants_to_process.append(entry.key_ptr.*) catch |err| {
-                    self.logger.warn("Failed to track descendant for processing: {any}", .{err});
-                    continue;
-                };
-            }
-        }
-
-        if (descendants_to_process.items.len == 0) {
+        if (children.len == 0) {
             return;
         }
+
+        // Copy the children roots since we'll be modifying the children map during processing
+        var descendants_to_process = std.ArrayList(types.Root).init(self.allocator);
+        defer descendants_to_process.deinit();
+        descendants_to_process.appendSlice(children) catch |err| {
+            self.logger.warn("Failed to copy children for processing: {any}", .{err});
+            return;
+        };
 
         self.logger.debug(
             "Found {d} cached descendant(s) of block 0x{s}",
@@ -309,25 +304,21 @@ pub const BeamNode = struct {
         var pruned_count: usize = 0;
         while (stack.items.len > 0) {
             const current_root = stack.pop().?;
-            // Collect immediate cached children first (don't mutate the map during iteration).
+
+            // Get cached children using O(1) lookup and copy them since we'll modify the map
+            const children_slice = self.network.getChildrenOfBlock(current_root);
             var children = std.ArrayList(types.Root).init(self.allocator);
             defer children.deinit();
-
-            // TODO: Optimize this to use a more efficient data structure
-            // It is a O(n^2) operation to find all children of a parent and their descendants
-            // We should use a more efficient data structure to store the cached blocks
-            // along with the children roots so it's linear time operation in terms of the number of children
-            var it = self.network.fetched_blocks.iterator();
-            while (it.next()) |entry| {
-                const cached = entry.value_ptr.*;
-                if (std.mem.eql(u8, cached.message.block.parent_root[0..], current_root[0..])) {
-                    children.append(entry.key_ptr.*) catch {};
-                }
-            }
+            children.appendSlice(children_slice) catch |err| {
+                self.logger.warn("Failed to copy children for pruning: {any}", .{err});
+                continue;
+            };
 
             // Enqueue children for recursive pruning.
             for (children.items) |child_root| {
-                stack.append(child_root) catch {};
+                stack.append(child_root) catch |err| {
+                    self.logger.warn("Failed to enqueue child for pruning: {any}", .{err});
+                };
             }
 
             // Remove the current root from caches/tracking.
@@ -347,7 +338,7 @@ pub const BeamNode = struct {
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) !void {
         var block_root: types.Root = undefined;
-        if (ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
@@ -432,6 +423,10 @@ pub const BeamNode = struct {
                 "Successfully processed block 0x{s}, checking for cached descendants",
                 .{std.fmt.fmtSliceHexLower(block_root[0..])},
             );
+
+            // Store aggregated signature proofs from this block so they can be reused
+            // in future block production. This is the same followup done for gossiped blocks.
+            self.chain.onBlockFollowup(true, signed_block);
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -629,16 +624,21 @@ pub const BeamNode = struct {
         }
     }
 
-    pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
+    pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         try self.network.connectPeer(peer_id);
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.info("peer connected: {s}{}, total peers: {d}", .{
+        self.logger.info("peer connected: {s}{}, direction={s}, total peers: {d}", .{
             peer_id,
             node_name,
+            @tagName(direction),
             self.network.getPeerCount(),
         });
+
+        // Record metrics
+        zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
+        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -661,16 +661,35 @@ pub const BeamNode = struct {
         });
     }
 
-    pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
+    pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("peer disconnected: {s}{}, total peers: {d}", .{
+            self.logger.info("peer disconnected: {s}{}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
+                @tagName(direction),
+                @tagName(reason),
                 self.network.getPeerCount(),
             });
+
+            // Record metrics
+            zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
+            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
         }
+    }
+
+    pub fn onPeerConnectionFailed(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, result: networks.ConnectionResult) !void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        self.logger.info("peer connection failed: {s}, direction={s}, result={s}", .{
+            peer_id,
+            @tagName(direction),
+            @tagName(result),
+        });
+
+        // Record metrics for failed connection attempts
+        zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = @tagName(result) }) catch {};
     }
 
     pub fn getPeerEventHandler(self: *Self) networks.OnPeerEventCbHandler {
@@ -678,6 +697,7 @@ pub const BeamNode = struct {
             .ptr = self,
             .onPeerConnectedCb = onPeerConnected,
             .onPeerDisconnectedCb = onPeerDisconnected,
+            .onPeerConnectionFailedCb = onPeerConnectionFailed,
         };
     }
 
@@ -759,7 +779,7 @@ pub const BeamNode = struct {
 
         // 1. Process locally through chain so that produced block first can be confirmed
         var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
         // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
@@ -795,19 +815,19 @@ pub const BeamNode = struct {
         });
 
         // 3. followup with additional housekeeping tasks
-        self.chain.onBlockFollowup(true);
+        self.chain.onBlockFollowup(true, &signed_block);
     }
 
     pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const message = signed_attestation.message;
-        const data = message.data;
+        const data = signed_attestation.message;
+        const validator_id = signed_attestation.validator_id;
 
         // 1. Process locally through chain
         self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
             data.slot,
-            message.validator_id,
+            validator_id,
         });
-        try self.chain.onAttestation(signed_attestation);
+        try self.chain.onGossipAttestation(signed_attestation);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
@@ -815,8 +835,8 @@ pub const BeamNode = struct {
 
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
-            message.validator_id,
-            self.node_registry.getNodeNameFromValidatorIndex(message.validator_id),
+            validator_id,
+            self.node_registry.getNodeNameFromValidatorIndex(validator_id),
         });
     }
 
@@ -921,36 +941,36 @@ test "Node peer tracking on connect/disconnect" {
     const peer2_id = "PEE_POW_2";
     const peer3_id = "PEE_POW_3";
 
-    // Connect peer 1
-    try mock.peerEventHandler.onPeerConnected(peer1_id);
+    // Connect peer 1 (simulate inbound connection)
+    try mock.peerEventHandler.onPeerConnected(peer1_id, .inbound);
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
 
-    // Connect peer 2
-    try mock.peerEventHandler.onPeerConnected(peer2_id);
+    // Connect peer 2 (simulate outbound connection)
+    try mock.peerEventHandler.onPeerConnected(peer2_id, .outbound);
     try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
 
     // Connect peer 3
-    try mock.peerEventHandler.onPeerConnected(peer3_id);
+    try mock.peerEventHandler.onPeerConnected(peer3_id, .inbound);
     try std.testing.expectEqual(@as(usize, 3), node.network.getPeerCount());
 
     // Verify peer 1 exists
     try std.testing.expect(node.network.hasPeer(peer1_id));
 
-    // Disconnect peer 2
-    try mock.peerEventHandler.onPeerDisconnected(peer2_id);
+    // Disconnect peer 2 (remote close)
+    try mock.peerEventHandler.onPeerDisconnected(peer2_id, .outbound, .remote_close);
     try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
     try std.testing.expect(!node.network.hasPeer(peer2_id));
 
-    // Disconnect peer 1
-    try mock.peerEventHandler.onPeerDisconnected(peer1_id);
+    // Disconnect peer 1 (timeout)
+    try mock.peerEventHandler.onPeerDisconnected(peer1_id, .inbound, .timeout);
     try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
     try std.testing.expect(!node.network.hasPeer(peer1_id));
 
     // Verify peer 3 is still connected
     try std.testing.expect(node.network.hasPeer(peer3_id));
 
-    // Disconnect peer 3
-    try mock.peerEventHandler.onPeerDisconnected(peer3_id);
+    // Disconnect peer 3 (local close)
+    try mock.peerEventHandler.onPeerDisconnected(peer3_id, .inbound, .local_close);
     try std.testing.expectEqual(@as(usize, 0), node.network.getPeerCount());
 
     // Process pending async operations (status request timer callbacks and their responses)
@@ -1006,24 +1026,24 @@ test "Node: fetched blocks cache and deduplication" {
         .message = .{
             .block = .{
                 .slot = 1,
-                .parent_root = [_]u8{0} ** 32,
+                .parent_root = ZERO_HASH,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = 1,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
@@ -1033,22 +1053,22 @@ test "Node: fetched blocks cache and deduplication" {
                 .slot = 2,
                 .parent_root = root1,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = 2,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     // Cache blocks
@@ -1168,22 +1188,22 @@ fn makeTestSignedBlockWithParent(
                 .slot = slot,
                 .parent_root = parent_root,
                 .proposer_index = 0,
-                .state_root = [_]u8{0} ** 32,
+                .state_root = types.ZERO_HASH,
                 .body = .{
-                    .attestations = try ssz.utils.List(types.Attestation, params.VALIDATOR_REGISTRY_LIMIT).init(allocator),
+                    .attestations = try types.AggregatedAttestations.init(allocator),
                 },
             },
             .proposer_attestation = .{
                 .validator_id = 0,
                 .data = .{
                     .slot = slot,
-                    .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-                    .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+                    .head = .{ .root = ZERO_HASH, .slot = 0 },
+                    .target = .{ .root = ZERO_HASH, .slot = 0 },
+                    .source = .{ .root = ZERO_HASH, .slot = 0 },
                 },
             },
         },
-        .signature = try types.BlockSignatures.init(allocator),
+        .signature = try types.createBlockSignatures(allocator, 0),
     };
 
     return block_ptr;
@@ -1235,7 +1255,7 @@ test "Node: pruneCachedBlockSubtree prunes root and all cached descendants" {
     const root_c: types.Root = [_]u8{0xCC} ** 32;
     const root_d: types.Root = [_]u8{0xDD} ** 32;
     const root_e: types.Root = [_]u8{0xEE} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
     try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
@@ -1302,12 +1322,19 @@ test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
     const root_b: types.Root = [_]u8{0xBB} ** 32;
     const root_c: types.Root = [_]u8{0xCC} ** 32;
     const root_d: types.Root = [_]u8{0xDD} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
     try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
     try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_b));
     try node.network.cacheFetchedBlock(root_d, try makeTestSignedBlockWithParent(allocator, 4, root_a));
+
+    // Verify initial children map state:
+    // A -> {B, D}, B -> {C}
+    const children_of_a = node.network.getChildrenOfBlock(root_a);
+    try std.testing.expectEqual(@as(usize, 2), children_of_a.len);
+    const children_of_b = node.network.getChildrenOfBlock(root_b);
+    try std.testing.expectEqual(@as(usize, 1), children_of_b.len);
 
     try node.network.trackPendingBlockRoot(root_a, 0);
     try node.network.trackPendingBlockRoot(root_b, 0);
@@ -1322,6 +1349,14 @@ test "Node: pruneCachedBlockSubtree prunes only the selected sub-branch" {
     // Siblings/ancestors remain
     try std.testing.expect(node.network.hasFetchedBlock(root_a));
     try std.testing.expect(node.network.hasFetchedBlock(root_d));
+
+    // ChildrenMap cleanup:
+    // - B's entry should be removed (it had child C)
+    try std.testing.expect(node.network.fetched_block_children.get(root_b) == null);
+    // - A's children list should no longer contain B (only D remains)
+    const children_of_a_after = node.network.getChildrenOfBlock(root_a);
+    try std.testing.expectEqual(@as(usize, 1), children_of_a_after.len);
+    try std.testing.expect(std.mem.eql(u8, children_of_a_after[0][0..], root_d[0..]));
 
     // Pending cleared for B subtree only
     try std.testing.expect(node.network.hasPendingBlockRoot(root_a));
@@ -1367,7 +1402,7 @@ test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is no
     const root_x: types.Root = [_]u8{0x11} ** 32;
     const root_child: types.Root = [_]u8{0x22} ** 32;
     const root_other: types.Root = [_]u8{0x33} ** 32;
-    const zero_root: types.Root = [_]u8{0} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
 
     // Only cache descendants, not the root_x itself
     try node.network.cacheFetchedBlock(root_child, try makeTestSignedBlockWithParent(allocator, 2, root_x));
@@ -1387,4 +1422,67 @@ test "Node: pruneCachedBlockSubtree prunes cached descendants even if root is no
     try std.testing.expect(!node.network.hasPendingBlockRoot(root_x));
     try std.testing.expect(!node.network.hasPendingBlockRoot(root_child));
     try std.testing.expect(node.network.hasPendingBlockRoot(root_other));
+}
+
+test "Node: cacheFetchedBlock deduplicates children entries on repeated caching" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const parent_root: types.Root = [_]u8{0xAA} ** 32;
+    const child_root: types.Root = [_]u8{0xBB} ** 32;
+
+    // Cache the same root multiple times with separate allocations
+    // (simulating receiving the same block from multiple peers)
+    // The first call stores the block, subsequent calls should free the duplicate
+    try node.network.cacheFetchedBlock(child_root, try makeTestSignedBlockWithParent(allocator, 1, parent_root));
+    try node.network.cacheFetchedBlock(child_root, try makeTestSignedBlockWithParent(allocator, 1, parent_root));
+    try node.network.cacheFetchedBlock(child_root, try makeTestSignedBlockWithParent(allocator, 1, parent_root));
+
+    // Verify the block is cached
+    try std.testing.expect(node.network.hasFetchedBlock(child_root));
+
+    // Verify the children list has exactly one entry (no duplicates)
+    const children = node.network.getChildrenOfBlock(parent_root);
+    try std.testing.expectEqual(@as(usize, 1), children.len);
+    try std.testing.expect(std.mem.eql(u8, children[0][0..], child_root[0..]));
+
+    // Remove the block and verify children list is cleaned up
+    try std.testing.expect(node.network.removeFetchedBlock(child_root));
+
+    // After removal, no children should remain for this parent
+    const children_after = node.network.getChildrenOfBlock(parent_root);
+    try std.testing.expectEqual(@as(usize, 0), children_after.len);
+
+    // The parent entry should be fully cleaned up from the children map
+    try std.testing.expect(node.network.fetched_block_children.get(parent_root) == null);
 }

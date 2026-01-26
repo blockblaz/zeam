@@ -35,22 +35,26 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
     switch (prover) {
         .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
@@ -152,6 +156,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
+    zeam_utils.addImport("ssz", ssz);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -168,6 +173,14 @@ pub fn build(b: *Builder) !void {
     });
     zeam_metrics.addImport("metrics", metrics);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_xmss.addImport("ssz", ssz);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -178,6 +191,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
+    zeam_types.addImport("@zeam/xmss", zeam_xmss);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -200,13 +214,6 @@ pub fn build(b: *Builder) !void {
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
 
-    // add zeam-xmss
-    const zeam_xmss = b.addModule("@zeam/xmss", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
-    });
-
     // add zeam-key-manager
     const zeam_key_manager = b.addModule("@zeam/key-manager", .{
         .root_source_file = b.path("pkgs/key-manager/src/lib.zig"),
@@ -215,6 +222,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
     zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("@zeam/utils", zeam_utils);
     zeam_key_manager.addImport("@zeam/metrics", zeam_metrics);
     zeam_key_manager.addImport("ssz", ssz);
 
@@ -297,6 +305,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -429,6 +438,9 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     types_tests.root_module.addImport("ssz", ssz);
+    types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    types_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, types_tests, target, prover);
     const run_types_test = b.addRunArtifact(types_tests);
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
@@ -663,18 +675,19 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "cargo", "+nightly",      "-C", path,          "-Z", "unstable-options",
+            "build", "--release",     "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "-p",    "multisig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
-            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
-            "risc0-glue", "-p",        "hashsig-glue",
+            "cargo",      "+nightly",  "-C",            path, "-Z",            "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue",   "-p",
+            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
-            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
-            "openvm-glue", "-p",        "hashsig-glue",
+            "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
+            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
@@ -717,6 +730,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
+        zeam_utils.addImport("ssz", ssz);
 
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{

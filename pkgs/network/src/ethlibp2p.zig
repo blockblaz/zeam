@@ -1,5 +1,4 @@
 const std = @import("std");
-const json = std.json;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
@@ -10,7 +9,6 @@ const multiformats = @import("multiformats");
 const Multiaddr = multiformats.multiaddr.Multiaddr;
 const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
-const jsonToString = zeam_utils.jsonToString;
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -30,7 +28,6 @@ const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 const FrameDecodeError = error{
     EmptyFrame,
     PayloadTooLarge,
-    LengthMismatch,
     Incomplete,
 } || uvarint.VarintParseError;
 
@@ -50,22 +47,24 @@ fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usiz
     };
 }
 
-fn buildRequestFrame(allocator: Allocator, payload: []const u8) ![]u8 {
-    if (payload.len > MAX_RPC_MESSAGE_SIZE) {
+/// Build a request frame with varint-encoded uncompressed size followed by snappy-framed payload.
+fn buildRequestFrame(allocator: Allocator, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
+    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
     var frame = std.ArrayListUnmanaged(u8).empty;
     errdefer frame.deinit(allocator);
 
-    try encodeVarint(&frame, allocator, payload.len);
-    try frame.appendSlice(allocator, payload);
+    try encodeVarint(&frame, allocator, uncompressed_size);
+    try frame.appendSlice(allocator, snappy_payload);
 
     return frame.toOwnedSlice(allocator);
 }
 
-fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8 {
-    if (payload.len > MAX_RPC_MESSAGE_SIZE) {
+/// Build a response frame with response code, varint-encoded uncompressed size, and snappy-framed payload.
+fn buildResponseFrame(allocator: Allocator, code: u8, uncompressed_size: usize, snappy_payload: []const u8) ![]u8 {
+    if (uncompressed_size > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
@@ -73,32 +72,35 @@ fn buildResponseFrame(allocator: Allocator, code: u8, payload: []const u8) ![]u8
     errdefer frame.deinit(allocator);
 
     try frame.append(allocator, code);
-    try encodeVarint(&frame, allocator, payload.len);
-    try frame.appendSlice(allocator, payload);
+    try encodeVarint(&frame, allocator, uncompressed_size);
+    try frame.appendSlice(allocator, snappy_payload);
 
     return frame.toOwnedSlice(allocator);
 }
 
-fn parseRequestFrame(bytes: []const u8) FrameDecodeError![]const u8 {
+fn parseRequestFrame(bytes: []const u8) FrameDecodeError!struct {
+    declared_len: usize,
+    payload: []const u8,
+} {
     if (bytes.len == 0) {
         return error.EmptyFrame;
     }
 
     const decoded = try decodeVarint(bytes);
+
     if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
-    const total = decoded.length + decoded.value;
-    if (total != bytes.len) {
-        return error.LengthMismatch;
-    }
-
-    return bytes[decoded.length..total];
+    return .{
+        .declared_len = decoded.value,
+        .payload = bytes[decoded.length..],
+    };
 }
 
 fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
     code: u8,
+    declared_len: usize,
     payload: []const u8,
 } {
     if (bytes.len == 0) {
@@ -109,18 +111,15 @@ fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
     }
 
     const decoded = try decodeVarint(bytes[1..]);
+
     if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
         return error.PayloadTooLarge;
     }
 
-    const total = 1 + decoded.length + decoded.value;
-    if (total != bytes.len) {
-        return error.LengthMismatch;
-    }
-
     return .{
         .code = bytes[0],
-        .payload = bytes[1 + decoded.length .. total],
+        .declared_len = decoded.value,
+        .payload = bytes[1 + decoded.length ..],
     };
 }
 
@@ -177,7 +176,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     };
     defer allocator.free(framed);
 
-    const frame = try buildResponseFrame(allocator, 0, framed);
+    const frame = try buildResponseFrame(allocator, 0, encoded.len, framed);
     defer allocator.free(frame);
 
     ctx.zigHandler.logger.debug(
@@ -318,15 +317,53 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     };
 
-    const message_str = message.toJsonString(zigHandler.allocator) catch |e| {
-        zigHandler.logger.err("Failed to convert message to JSON string: {any}", .{e});
-        return;
-    };
-    defer zigHandler.allocator.free(message_str);
-
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
-    zigHandler.logger.debug("\network-{d}:: !!!handleMsgFromRustBridge topic={s}:: message={s} from bytes={any} sender_peer_id={s}{}\n", .{ zigHandler.params.networkId, std.mem.span(topic_str), message_str, message_bytes, sender_peer_id_slice, node_name });
+    switch (message) {
+        .block => |signed_block| {
+            const block = signed_block.message.block;
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    block.slot,
+                    block.proposer_index,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+        .attestation => |signed_attestation| {
+            const slot = signed_attestation.message.slot;
+            const validator_id = signed_attestation.validator_id;
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    slot,
+                    validator_id,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+    }
+
+    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
+    zigHandler.logger.debug(
+        "network-{d}:: gossip payload json topic={s} from peer={s}{}: {}",
+        .{
+            zigHandler.params.networkId,
+            std.mem.span(topic_str),
+            sender_peer_id_slice,
+            node_name,
+            zeam_utils.LazyJson(interface.GossipMessage).init(zigHandler.allocator, &message),
+        },
+    );
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
@@ -356,7 +393,8 @@ export fn handleRPCRequestFromRustBridge(
     };
 
     const request_frame: []const u8 = request_ptr[0..request_len];
-    const request_payload = parseRequestFrame(request_frame) catch |err| {
+
+    const request_frame_info = parseRequestFrame(request_frame) catch |err| {
         zigHandler.logger.err(
             "network-{d}:: Invalid RPC request frame from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
@@ -364,7 +402,8 @@ export fn handleRPCRequestFromRustBridge(
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request frame");
         return;
     };
-    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_payload) catch |err| {
+
+    const request_bytes = snappyframesz.decode(zigHandler.allocator, request_frame_info.payload) catch |err| {
         zigHandler.logger.err(
             "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
@@ -373,6 +412,21 @@ export fn handleRPCRequestFromRustBridge(
         return;
     };
     defer zigHandler.allocator.free(request_bytes);
+    if (request_bytes.len != request_frame_info.declared_len) {
+        zigHandler.logger.err(
+            "network-{d}:: Invalid RPC request length from peer={s}{} protocol={s}: declared={d} decoded={d}",
+            .{
+                zigHandler.params.networkId,
+                peer_id_slice,
+                node_name,
+                protocol_slice,
+                request_frame_info.declared_len,
+                request_bytes.len,
+            },
+        );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request length");
+        return;
+    }
 
     const method = rpc_protocol;
     var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
@@ -391,16 +445,22 @@ export fn handleRPCRequestFromRustBridge(
     };
     defer request.deinit();
 
-    const request_str = request.toJsonString(zigHandler.allocator) catch |e| {
-        zigHandler.logger.err("Failed to convert RPC request to JSON string from peer={s}{}: {any}", .{ peer_id_slice, node_name, e });
-        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to format RPC request");
-        return;
-    };
-    defer zigHandler.allocator.free(request_str);
-
     zigHandler.logger.debug(
-        "network-{d}:: !!!handleRPCRequestFromRustBridge peer={s}{} protocol={s} channel={d}:: request={s}",
-        .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_str },
+        "network-{d}:: received RPC request peer={s}{} protocol={s} channel={d} size={d}",
+        .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_bytes.len },
+    );
+
+    // Debug-only JSON dump (conversion happens only if debug is actually emitted).
+    zigHandler.logger.debug(
+        "network-{d}:: rpc request json peer={s}{} protocol={s} channel={d}: {}",
+        .{
+            zigHandler.params.networkId,
+            peer_id_slice,
+            node_name,
+            rpc_protocol.protocolId(),
+            channel_id,
+            zeam_utils.LazyJson(interface.ReqRespRequest).init(zigHandler.allocator, &request),
+        },
     );
 
     const request_method = std.meta.activeTag(request);
@@ -554,6 +614,16 @@ export fn handleRPCResponseFromRustBridge(
         return;
     };
     defer zigHandler.allocator.free(response_bytes);
+    if (response_bytes.len != parsed_frame.declared_len) {
+        zigHandler.notifyRpcErrorFmt(
+            request_id,
+            method,
+            2,
+            "Response length mismatch (protocol={s}): declared {d} decoded {d}",
+            .{ protocol.protocolId(), parsed_frame.declared_len, response_bytes.len },
+        );
+        return;
+    }
 
     const response_union = interface.ReqRespResponse.deserialize(zigHandler.allocator, method, response_bytes) catch |err| {
         zigHandler.notifyRpcErrorFmt(
@@ -674,23 +744,67 @@ export fn handleRPCErrorFromRustBridge(
     }
 }
 
-export fn handlePeerConnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+export fn handlePeerConnectedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: [*:0]const u8,
+    direction: u32,
+) void {
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    zigHandler.logger.info("network-{d}:: Peer connected: {s}{}", .{ zigHandler.params.networkId, peer_id_slice, node_name });
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    zigHandler.logger.info("network-{d}:: Peer connected: {s}{} direction={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        node_name,
+        @tagName(dir),
+    });
 
-    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice) catch |e| {
+    zigHandler.peerEventHandler.onPeerConnected(peer_id_slice, dir) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer connected event: {any}", .{ zigHandler.params.networkId, e });
     };
 }
 
-export fn handlePeerDisconnectedFromRustBridge(zigHandler: *EthLibp2p, peer_id: [*:0]const u8) void {
+export fn handlePeerDisconnectedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: [*:0]const u8,
+    direction: u32,
+    reason: u32,
+) void {
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
-    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{}", .{ zigHandler.params.networkId, peer_id_slice, node_name });
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    const rsn = @as(interface.DisconnectionReason, @enumFromInt(reason));
+    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{} direction={s} reason={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        node_name,
+        @tagName(dir),
+        @tagName(rsn),
+    });
 
-    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice) catch |e| {
+    zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
+    };
+}
+
+export fn handlePeerConnectionFailedFromRustBridge(
+    zigHandler: *EthLibp2p,
+    peer_id: ?[*:0]const u8,
+    direction: u32,
+    result: u32,
+) void {
+    const peer_id_slice = if (peer_id) |p| std.mem.span(p) else "unknown";
+    const dir = @as(interface.PeerDirection, @enumFromInt(direction));
+    const res = @as(interface.ConnectionResult, @enumFromInt(result));
+    zigHandler.logger.info("network-{d}:: Peer connection failed: {s} direction={s} result={s}", .{
+        zigHandler.params.networkId,
+        peer_id_slice,
+        @tagName(dir),
+        @tagName(res),
+    });
+
+    zigHandler.peerEventHandler.onPeerConnectionFailed(peer_id_slice, dir, res) catch |e| {
+        zigHandler.logger.err("network-{d}:: Error handling peer connection failed event: {any}", .{ zigHandler.params.networkId, e });
     };
 }
 
@@ -897,7 +1011,7 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
-        self.logger.debug("network-{d}:: calling publish_msg_to_rust_bridge with message={any} for data={any}", .{ self.params.networkId, compressed_message, data });
+        self.logger.debug("network-{d}:: publishing to rust bridge data={any} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
@@ -944,7 +1058,8 @@ pub const EthLibp2p = struct {
             return err;
         };
         defer self.allocator.free(framed_payload);
-        const frame = buildRequestFrame(self.allocator, framed_payload) catch |err| {
+
+        const frame = buildRequestFrame(self.allocator, encoded_message.len, framed_payload) catch |err| {
             self.logger.err(
                 "network-{d}:: Failed to build RPC request frame for peer={s}{} protocol_tag={d}: {any}",
                 .{ self.params.networkId, peer_id, node_name, protocol_tag, err },

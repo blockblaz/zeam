@@ -1,8 +1,8 @@
 const std = @import("std");
 const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
+const zeam_utils = @import("@zeam/utils");
 const zeam_metrics = @import("@zeam/metrics");
-const ssz = @import("ssz");
 const Allocator = std.mem.Allocator;
 
 const KeyManagerError = error{
@@ -91,19 +91,8 @@ pub const KeyManager = struct {
         attestation: *const types.Attestation,
         allocator: Allocator,
     ) !types.SIGBYTES {
-        const validator_index: usize = @intCast(attestation.validator_id);
-
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
-
-        const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
-        var message: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
-
-        const epoch: u32 = @intCast(attestation.data.slot);
-
-        var signature = try keypair.sign(&message, epoch);
+        var signature = try self.signAttestationWithHandle(attestation, allocator);
         defer signature.deinit();
-        _ = signing_timer.observe();
 
         var sig_buffer: types.SIGBYTES = undefined;
         const bytes_written = try signature.toBytes(&sig_buffer);
@@ -140,6 +129,36 @@ pub const KeyManager = struct {
         }
 
         return pubkeys;
+    }
+
+    /// Get the raw public key handle for a validator (for aggregation)
+    pub fn getPublicKeyHandle(
+        self: *const Self,
+        validator_index: usize,
+    ) !*const xmss.HashSigPublicKey {
+        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return keypair.public_key;
+    }
+
+    /// Sign an attestation and return the raw signature handle (for aggregation)
+    /// Caller must call deinit on the returned signature when done
+    pub fn signAttestationWithHandle(
+        self: *const Self,
+        attestation: *const types.Attestation,
+        allocator: Allocator,
+    ) !xmss.Signature {
+        const validator_index: usize = @intCast(attestation.validator_id);
+        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+
+        const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
+        var message: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.AttestationData, attestation.data, &message, allocator);
+
+        const epoch: u32 = @intCast(attestation.data.slot);
+        const signature = try keypair.sign(&message, epoch);
+        _ = signing_timer.observe();
+
+        return signature;
     }
 };
 

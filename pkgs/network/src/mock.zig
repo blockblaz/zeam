@@ -10,6 +10,8 @@ const NetworkInterface = interface.NetworkInterface;
 const node_registry = @import("./node_registry.zig");
 const NodeNameRegistry = node_registry.NodeNameRegistry;
 
+const ZERO_HASH = types.ZERO_HASH;
+
 pub const Mock = struct {
     allocator: Allocator,
     logger: zeam_utils.ModuleLogger,
@@ -338,11 +340,12 @@ pub const Mock = struct {
         const peer_a_id = peer_a.peer_id.?;
         const peer_b_id = peer_b.peer_id.?;
 
-        peer_a.event_handler.?.onPeerConnected(peer_b_id) catch |e| {
+        // In mock, peer_a initiates (outbound) to peer_b, peer_b receives (inbound)
+        peer_a.event_handler.?.onPeerConnected(peer_b_id, .outbound) catch |e| {
             self.logger.err("mock:: Failed delivering onPeerConnected to peer {s}: {any}", .{ peer_b_id, e });
         };
 
-        peer_b.event_handler.?.onPeerConnected(peer_a_id) catch |e| {
+        peer_b.event_handler.?.onPeerConnected(peer_a_id, .inbound) catch |e| {
             self.logger.err("mock:: Failed delivering onPeerConnected to peer {s}: {any}", .{ peer_a_id, e });
         };
     }
@@ -655,7 +658,7 @@ test "Mock messaging across two subscribers" {
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
 
     // Create a simple block message
-    var attestations = try types.Attestations.init(allocator);
+    var attestations = try types.AggregatedAttestations.init(allocator);
 
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
@@ -680,7 +683,7 @@ test "Mock messaging across two subscribers" {
                     },
                     .source = .{
                         .slot = 0,
-                        .root = [_]u8{0} ** 32,
+                        .root = ZERO_HASH,
                     },
                     .target = .{
                         .slot = 1,
@@ -741,13 +744,13 @@ test "Mock status RPC between peers" {
             self.connections.deinit(self.allocator);
         }
 
-        fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8) !void {
+        fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const owned = try self.allocator.dupe(u8, peer_id);
             try self.connections.append(self.allocator, owned);
         }
 
-        fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8) !void {
+        fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             var idx: usize = 0;
             while (idx < self.connections.items.len) : (idx += 1) {

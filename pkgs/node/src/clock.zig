@@ -22,6 +22,12 @@ pub const Clock = struct {
 
     const Self = @This();
 
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("Clock{{ genesis_time_ms={d}, current_interval={d} }}", .{ self.genesis_time_ms, self.current_interval });
+    }
+
     pub fn init(
         allocator: Allocator,
         genesis_time: usize,

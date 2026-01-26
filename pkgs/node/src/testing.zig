@@ -9,7 +9,7 @@ const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 const xev = @import("xev");
 const networks = @import("@zeam/network");
-
+const xmss = @import("@zeam/xmss");
 const clockFactory = @import("./clock.zig");
 
 pub const NodeTestOptions = struct {
@@ -152,20 +152,74 @@ pub const NodeTestContext = struct {
         allocator: Allocator,
         block: *types.SignedBlockWithAttestation,
     ) !void {
-        var signatures = try types.BlockSignatures.init(allocator);
-        var signatures_initialized = false;
-        defer if (!signatures_initialized) signatures.deinit();
+        var attestation_signatures = try types.AttestationSignatures.init(allocator);
+        errdefer attestation_signatures.deinit();
 
-        for (block.message.block.body.attestations.constSlice()) |attestation| {
-            const signature = try self.key_manager.signAttestation(&attestation, allocator);
-            try signatures.append(signature);
+        for (block.message.block.body.attestations.constSlice()) |aggregated_attestation| {
+            var signature_proof = try types.AggregatedSignatureProof.init(allocator);
+            errdefer signature_proof.deinit();
+
+            var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+            defer indices.deinit();
+
+            // Collect signature handles for aggregation
+            var signature_handles = std.ArrayList(xmss.Signature).init(allocator);
+            defer {
+                for (signature_handles.items) |*sig| {
+                    sig.deinit();
+                }
+                signature_handles.deinit();
+            }
+
+            // Sign attestation for each validator and set participant bits
+            for (indices.items) |validator_index| {
+                try types.aggregationBitsSet(&signature_proof.participants, validator_index, true);
+
+                // Create attestation for this validator
+                const attestation = types.Attestation{
+                    .validator_id = @intCast(validator_index),
+                    .data = aggregated_attestation.data,
+                };
+
+                // Sign and keep the handle for aggregation
+                const sig = try self.key_manager.signAttestationWithHandle(&attestation, allocator);
+                try signature_handles.append(sig);
+            }
+
+            // Perform actual aggregation if we have signatures
+            if (signature_handles.items.len > 0) {
+                const num_sigs = signature_handles.items.len;
+                const pub_keys = try allocator.alloc(*const xmss.HashSigPublicKey, num_sigs);
+                defer allocator.free(pub_keys);
+                const sig_ptrs = try allocator.alloc(*const xmss.HashSigSignature, num_sigs);
+                defer allocator.free(sig_ptrs);
+
+                for (indices.items, 0..) |val_idx, i| {
+                    pub_keys[i] = try self.key_manager.getPublicKeyHandle(val_idx);
+                    sig_ptrs[i] = signature_handles.items[i].handle;
+                }
+
+                // Compute message hash
+                var message_hash: [32]u8 = undefined;
+                try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+
+                const epoch: u32 = @intCast(aggregated_attestation.data.slot);
+
+                // Perform the actual aggregation
+                try xmss.aggregateSignatures(pub_keys, sig_ptrs, &message_hash, epoch, &signature_proof.proof_data);
+            }
+
+            try attestation_signatures.append(signature_proof);
         }
 
         const proposer_signature = try self.key_manager.signAttestation(&block.message.proposer_attestation, allocator);
-        try signatures.append(proposer_signature);
+
+        const signatures = types.BlockSignatures{
+            .attestation_signatures = attestation_signatures,
+            .proposer_signature = proposer_signature,
+        };
 
         block.signature.deinit();
         block.signature = signatures;
-        signatures_initialized = true;
     }
 };

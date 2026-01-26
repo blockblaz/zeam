@@ -300,6 +300,23 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 );
             }
 
+            /// Put the latest finalized slot metadata to this write batch
+            pub fn putLatestFinalizedSlot(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+            ) void {
+                const key = "latest_finalized_slot";
+                self.putToBatch(
+                    types.Slot,
+                    key,
+                    slot,
+                    cn,
+                    "updated latest finalized slot metadata: slot={d}",
+                    .{slot},
+                );
+            }
+
             /// Put an unfinalized slot index entry to this write batch
             pub fn putUnfinalizedSlotIndex(
                 self: *WriteBatch,
@@ -566,6 +583,49 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 "loaded finalized slot index from database: slot={d}",
                 .{slot},
             );
+        }
+
+        /// Load the latest finalized slot metadata from the database
+        pub fn loadLatestFinalizedSlot(self: *Self, comptime cn: ColumnNamespace) ?types.Slot {
+            const key = "latest_finalized_slot";
+            return self.loadFromDatabase(
+                types.Slot,
+                key,
+                cn,
+                "loaded latest finalized slot metadata",
+                .{},
+            );
+        }
+
+        /// Attempts to load the latest finalized state from the database
+        /// Returns null if no finalized state is found (e.g., first run)
+        pub fn loadLatestFinalizedState(
+            self: *Self,
+            state_ptr: *types.BeamState,
+        ) !void {
+            // Load the latest finalized slot from metadata
+            const finalized_slot = self.loadLatestFinalizedSlot(database.DbDefaultNamespace) orelse {
+                self.logger.info("no finalized state found in database, will use genesis", .{});
+                return error.NoFinalizedStateFound;
+            };
+
+            self.logger.info("found latest finalized slot {d}, loading block root...", .{finalized_slot});
+
+            // Load the block root for this finalized slot
+            const block_root = self.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot) orelse {
+                self.logger.warn("finalized slot {d} found in metadata but not in finalized index", .{finalized_slot});
+                return error.FinalizedSlotNotFoundInIndex;
+            };
+
+            // Load the state from the database
+            if (self.loadState(database.DbStatesNamespace, block_root)) |state| {
+                state_ptr.* = state;
+                self.logger.info("successfully loaded finalized state at slot {d}", .{finalized_slot});
+                return;
+            } else {
+                self.logger.warn("finalized slot {d} found in index but state not in database", .{finalized_slot});
+                return error.FinalizedStateNotFoundInDatabase;
+            }
         }
 
         /// Load an unfinalized slot index from the database
@@ -923,14 +983,18 @@ test "save and load block" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAB);
 
-    // Create test signatures
-    var test_sig1: types.SIGBYTES = undefined;
-    @memset(&test_sig1, 0x12);
-    var test_sig2: types.SIGBYTES = undefined;
-    @memset(&test_sig2, 0x34);
-    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2 };
+    // Create dummy attestation signatures using helper
+    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
+        for (attestation_signatures.slice()) |*sig| {
+            sig.deinit();
+        }
+        attestation_signatures.deinit();
+    };
 
-    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, &test_signatures);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     // Save the block
@@ -951,12 +1015,9 @@ test "save and load block" {
     // Verify attestations list is empty as expected
     try std.testing.expect(loaded.block.body.attestations.len() == 0);
 
-    // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 2);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
+    // Verify attestation signatures count matches
+    const signature_proofs = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(signature_proofs.len() == signed_block.signature.attestation_signatures.len());
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -1028,16 +1089,18 @@ test "batch write and commit" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAA);
 
-    // Create test signatures
-    var test_sig1: types.SIGBYTES = undefined;
-    @memset(&test_sig1, 0xDD);
-    var test_sig2: types.SIGBYTES = undefined;
-    @memset(&test_sig2, 0xEE);
-    var test_sig3: types.SIGBYTES = undefined;
-    @memset(&test_sig3, 0xFF);
-    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2, test_sig3 };
+    // Create dummy attestation signatures using helper
+    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
+        for (attestation_signatures.slice()) |*sig| {
+            sig.deinit();
+        }
+        attestation_signatures.deinit();
+    };
 
-    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, &test_signatures);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     const test_state_root = test_helpers.createDummyRoot(0xEE);
@@ -1073,14 +1136,9 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.parent_root, &signed_block.message.block.parent_root));
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
 
-    // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 3);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    const loaded_sig3 = try loaded_block.?.signature.get(2);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig3, &test_sig3));
+    // Verify attestation signatures count matches
+    const batch_signature_proofs = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(batch_signature_proofs.len() == attestation_signatures.len());
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);
@@ -1092,4 +1150,82 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_justified.root, &test_state.latest_justified.root));
     try std.testing.expect(loaded_state_data.latest_finalized.slot == test_state.latest_finalized.slot);
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_finalized.root, &test_state.latest_finalized.root));
+}
+
+test "loadLatestFinalizedState" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    // Empty DB -> no finalized slot metadata
+    {
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.NoFinalizedStateFound, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Metadata present but slot index missing -> error
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 7;
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        db.commit(&batch);
+
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.FinalizedSlotNotFoundInIndex, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Slot index present but state missing -> error
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 9;
+        const block_root = test_helpers.createDummyRoot(0xAA);
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
+        db.commit(&batch);
+
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.FinalizedStateNotFoundInDatabase, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Happy path: metadata + slot index + state all present
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 11;
+        const block_root = test_helpers.createDummyRoot(0x42);
+
+        var expected_state = try test_helpers.createDummyState(allocator, 123, 4, 93, 1, 0, 0x10, 0x20);
+        defer expected_state.deinit();
+
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
+        batch.putState(database.DbStatesNamespace, block_root, expected_state);
+        db.commit(&batch);
+
+        var loaded_state: types.BeamState = undefined;
+        try db.loadLatestFinalizedState(&loaded_state);
+
+        // Spot-check a few fields to ensure the loaded state matches what we stored.
+        try std.testing.expectEqual(expected_state.slot, loaded_state.slot);
+        try std.testing.expectEqual(expected_state.latest_justified.slot, loaded_state.latest_justified.slot);
+        try std.testing.expect(std.mem.eql(u8, &expected_state.latest_justified.root, &loaded_state.latest_justified.root));
+        try std.testing.expectEqual(expected_state.latest_finalized.slot, loaded_state.latest_finalized.slot);
+        try std.testing.expect(std.mem.eql(u8, &expected_state.latest_finalized.root, &loaded_state.latest_finalized.root));
+    }
 }

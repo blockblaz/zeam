@@ -110,6 +110,7 @@ const LoggerScope = enum {
 };
 
 pub const ModuleTag = enum {
+    api_server,
     cli,
     chain,
     configs,
@@ -445,6 +446,7 @@ fn getLevelColor(comptime level: std.log.Level) []const u8 {
 
 fn getModuleTagName(tag: ModuleTag) []const u8 {
     return switch (tag) {
+        .api_server => "api-server",
         .cli => "cli",
         .chain => "chain",
         .configs => "configs",
