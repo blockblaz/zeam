@@ -58,9 +58,7 @@ fn max_framed_len(expected_uncompressed: usize) -> Result<usize, ReqRespError> {
         total = total
             .checked_add(CHUNK_HEADER_AND_CRC_SIZE)
             .and_then(|value| value.checked_add(max_chunk))
-            .ok_or_else(|| {
-                ReqRespError::InvalidData("Snappy frame length overflow".into())
-            })?;
+            .ok_or_else(|| ReqRespError::InvalidData("Snappy frame length overflow".into()))?;
         remaining -= chunk_len;
     }
 
@@ -107,9 +105,7 @@ pub fn calculate_snappy_frame_size(
             .checked_add(chunk_len)
             .ok_or_else(|| ReqRespError::InvalidData("Snappy frame overflow".into()))?;
         if chunk_len > MAX_CHUNK_LEN {
-            return Err(ReqRespError::InvalidData(
-                "Snappy chunk too large".into(),
-            ));
+            return Err(ReqRespError::InvalidData("Snappy chunk too large".into()));
         }
         if chunk_end > max_frame_len {
             return Err(ReqRespError::InvalidData(
@@ -126,9 +122,7 @@ pub fn calculate_snappy_frame_size(
                 }
                 let chunk = &src[header_end..chunk_end];
                 if chunk_len < 4 {
-                    return Err(ReqRespError::InvalidData(
-                        "Snappy chunk too short".into(),
-                    ));
+                    return Err(ReqRespError::InvalidData("Snappy chunk too short".into()));
                 }
                 if chunk_type == CHUNK_TYPE_COMPRESSED {
                     let compressed = &chunk[4..];
@@ -155,9 +149,8 @@ pub fn calculate_snappy_frame_size(
                             "Snappy chunk exceeds maximum uncompressed length".into(),
                         ));
                     }
-                    total_uncompressed = total_uncompressed
-                        .checked_add(data_len)
-                        .ok_or_else(|| {
+                    total_uncompressed =
+                        total_uncompressed.checked_add(data_len).ok_or_else(|| {
                             ReqRespError::InvalidData("Snappy length overflow".into())
                         })?;
                 }
