@@ -156,6 +156,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
+    zeam_utils.addImport("ssz", ssz);
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -221,6 +222,7 @@ pub fn build(b: *Builder) !void {
     });
     zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
     zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("@zeam/utils", zeam_utils);
     zeam_key_manager.addImport("@zeam/metrics", zeam_metrics);
     zeam_key_manager.addImport("ssz", ssz);
 
@@ -728,6 +730,7 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
+        zeam_utils.addImport("ssz", ssz);
 
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{

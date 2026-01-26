@@ -3,6 +3,7 @@ const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
 const xmss = @import("@zeam/xmss");
+const zeam_utils = @import("@zeam/utils");
 
 const aggregation = @import("./aggregation.zig");
 const attestation = @import("./attestation.zig");
@@ -162,7 +163,7 @@ const TestContext = struct {
 
         // Compute message hash
         var message_hash: [32]u8 = undefined;
-        try ssz.hashTreeRoot(attestation.AttestationData, self.attestation_data, &message_hash, self.allocator);
+        try zeam_utils.hashTreeRoot(attestation.AttestationData, self.attestation_data, &message_hash, self.allocator);
 
         // Aggregate
         var proof = try aggregation.AggregatedSignatureProof.init(self.allocator);
@@ -858,7 +859,7 @@ test "computeAggregatedSignatures: complex 3 groups" {
         }
 
         var message_hash: [32]u8 = undefined;
-        try ssz.hashTreeRoot(attestation.AttestationData, att_data_2, &message_hash, allocator);
+        try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data_2, &message_hash, allocator);
 
         var proof = try aggregation.AggregatedSignatureProof.init(allocator);
         errdefer proof.deinit();
@@ -921,7 +922,7 @@ test "computeAggregatedSignatures: complex 3 groups" {
         }
 
         var message_hash: [32]u8 = undefined;
-        try ssz.hashTreeRoot(attestation.AttestationData, att_data_3, &message_hash, allocator);
+        try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data_3, &message_hash, allocator);
 
         var proof = try aggregation.AggregatedSignatureProof.init(allocator);
         errdefer proof.deinit();

@@ -11,8 +11,8 @@ const node_lib = @import("@zeam/node");
 const BeamChain = node_lib.chainFactory.BeamChain;
 
 /// API server that runs in a background thread
-/// Handles metrics, SSE events, health checks, and checkpoint state endpoints
-/// chain is optional - if null, the finalized state endpoint will return 503
+/// Handles metrics, SSE events, health checks, checkpoint endpoints, and finalized state
+/// chain is optional - if null, endpoints will return 503
 /// (API server starts before chain initialization, so chain may not be available yet)
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !void {
     // Initialize the global event broadcaster for SSE events
@@ -98,13 +98,19 @@ const ApiServer = struct {
         } else if (std.mem.eql(u8, request.head.target, "/metrics")) {
             // Handle metrics request
             self.handleMetrics(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/health")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             // Handle health check
             self.handleHealth(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/lean/states/finalized")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             // Handle finalized checkpoint state endpoint
             self.handleFinalizedCheckpointState(&request) catch |err| {
                 self.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/checkpoints/justified")) {
+            // Handle justified checkpoint endpoint
+            self.handleJustifiedCheckpoint(&request) catch |err| {
+                self.logger.warn("failed to handle justified checkpoint request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
         } else {
@@ -140,7 +146,7 @@ const ApiServer = struct {
     }
 
     /// Handle finalized checkpoint state endpoint
-    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/states/finalized
+    /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/v0/states/finalized
     fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
         // Get the chain (may be null if API server started before chain initialization)
         const chain = self.chain orelse {
@@ -176,6 +182,38 @@ const ApiServer = struct {
             },
         }) catch |err| {
             self.logger.warn("failed to respond with finalized lean state: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Handle justified checkpoint endpoint
+    /// Returns checkpoint info as JSON at /lean/v0/checkpoints/justified
+    /// Useful for monitoring consensus progress and fork choice state
+    fn handleJustifiedCheckpoint(self: *const Self, request: *std.http.Server.Request) !void {
+        // Get the chain (may be null if API server started before chain initialization)
+        const chain = self.chain orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        // Get justified checkpoint from chain (chain handles its own locking internally)
+        const justified_checkpoint = chain.getJustifiedCheckpoint();
+
+        // Convert checkpoint to JSON string
+        const json_string = justified_checkpoint.toJsonString(self.allocator) catch |err| {
+            self.logger.err("failed to serialize justified checkpoint to JSON: {}", .{err});
+            _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer self.allocator.free(json_string);
+
+        // Respond with JSON
+        _ = request.respond(json_string, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with justified checkpoint: {}", .{err});
             return err;
         };
     }

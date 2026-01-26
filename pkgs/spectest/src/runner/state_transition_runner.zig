@@ -41,8 +41,6 @@ pub fn baseRelRoot(comptime spec_fork: Fork) []const u8 {
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const zeam_utils = @import("@zeam/utils");
-const ssz = @import("ssz");
-
 const JsonValue = std.json.Value;
 const Context = expect.Context;
 
@@ -245,7 +243,7 @@ fn runCase(
             var header_for_check = pre_state.latest_block_header;
             if (std.mem.eql(u8, &header_for_check.state_root, &types.ZERO_HASH)) {
                 var pre_state_root: types.Root = undefined;
-                ssz.hashTreeRoot(types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
+                zeam_utils.hashTreeRoot(types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: unable to hash pre-state ({s})\n",
                         .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -256,7 +254,7 @@ fn runCase(
             }
 
             var header_root: types.Root = undefined;
-            ssz.hashTreeRoot(types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
+            zeam_utils.hashTreeRoot(types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
                 std.debug.print(
                     "fixture {s} case {s}: unable to hash latest block header ({s})\n",
                     .{ ctx.fixture_label, ctx.case_name, @errorName(err) },

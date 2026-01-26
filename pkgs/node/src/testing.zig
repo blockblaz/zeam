@@ -10,8 +10,6 @@ const zeam_utils = @import("@zeam/utils");
 const xev = @import("xev");
 const networks = @import("@zeam/network");
 const xmss = @import("@zeam/xmss");
-const ssz = @import("ssz");
-
 const clockFactory = @import("./clock.zig");
 
 pub const NodeTestOptions = struct {
@@ -203,7 +201,7 @@ pub const NodeTestContext = struct {
 
                 // Compute message hash
                 var message_hash: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+                try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
 
                 const epoch: u32 = @intCast(aggregated_attestation.data.slot);
 

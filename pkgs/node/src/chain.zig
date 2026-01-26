@@ -31,6 +31,12 @@ const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
+
+    pub fn format(self: BlockProductionParams, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("BlockProductionParams{{ slot={d}, proposer_index={d} }}", .{ self.slot, self.proposer_index });
+    }
 };
 
 pub const AttestationConstructionParams = struct {
@@ -173,6 +179,9 @@ pub const BeamChain = struct {
         // forkchoice head
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+
+        // Update current slot metric (wall-clock time slot)
+        zeam_metrics.metrics.lean_current_slot.set(slot);
 
         var has_proposal = false;
         if (interval == 0) {
@@ -351,7 +360,7 @@ pub const BeamChain = struct {
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
         try self.states.put(block_root, post_state);
         post_state_opt = null;
@@ -488,12 +497,12 @@ pub const BeamChain = struct {
             .block => |signed_block| {
                 const block = signed_block.message.block;
                 var block_root: [32]u8 = undefined;
-                try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+                try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.debug("chain received gossip block for slot={any} blockroot={any} proposer={d}{} hasBlock={any} from peer={s}{}", .{
+                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{s} proposer={d}{} hasBlock={} from peer={s}{}", .{
                     block.slot,
                     std.fmt.fmtSliceHexLower(&block_root),
                     block.proposer_index,
@@ -511,8 +520,7 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
-                        self.module_logger.err("error processing block for slot={any} root={any}: {any}", .{
-                            //
+                        self.module_logger.err("error processing block for slot={d} root=0x{s}: {any}", .{
                             block.slot,
                             std.fmt.fmtSliceHexLower(&block_root),
                             err,
@@ -532,8 +540,7 @@ pub const BeamChain = struct {
                         .missing_attestation_roots = missing_roots,
                     };
                 } else {
-                    self.module_logger.debug("skipping processing the already present block slot={any} blockroot={any}", .{
-                        //
+                    self.module_logger.debug("skipping processing the already present block slot={d} blockroot=0x{s}", .{
                         block.slot,
                         std.fmt.fmtSliceHexLower(&block_root),
                     });
@@ -589,7 +596,7 @@ pub const BeamChain = struct {
 
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
-            try ssz.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+            try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
             break :computedroot cblock_root;
         };
 
@@ -687,7 +694,7 @@ pub const BeamChain = struct {
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err("error processing block attestation={any} e={any}", .{ attestation, e });
+                        self.module_logger.err("error processing block attestation={any} error={any}", .{ attestation, e });
                         continue;
                     };
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
@@ -709,7 +716,7 @@ pub const BeamChain = struct {
             .signature = proposer_signature,
         };
         self.forkChoice.onGossipAttestation(signed_proposer_attestation, false) catch |e| {
-            self.module_logger.err("error processing proposer attestation={any} e={any}", .{ signed_proposer_attestation, e });
+            self.module_logger.err("error processing proposer attestation={any} error={any}", .{ signed_proposer_attestation, e });
         };
 
         const processing_time = onblock_timer.observe();
@@ -784,6 +791,8 @@ pub const BeamChain = struct {
         // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
         if (latest_finalized.slot > last_emitted_finalized.slot) {
             self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
+                // Record failed finalization attempt
+                zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
                 self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
                     last_emitted_finalized.slot,
                     latest_finalized.slot,
@@ -1008,6 +1017,9 @@ pub const BeamChain = struct {
         //     }
         // }
 
+        // Record successful finalization
+        zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
+
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
@@ -1016,8 +1028,7 @@ pub const BeamChain = struct {
         const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
 
         if (!hasParentBlock) {
-            self.module_logger.warn("gossip block validation failed slot={any} with unknown parent={any}", .{
-                //
+            self.module_logger.warn("gossip block validation failed slot={d} with unknown parent=0x{s}", .{
                 block.slot,
                 std.fmt.fmtSliceHexLower(&block.parent_root),
             });
@@ -1195,6 +1206,12 @@ pub const BeamChain = struct {
         return state_ptr;
     }
 
+    /// Get the latest justified checkpoint
+    /// Returns the checkpoint with slot and root of the most recent justified checkpoint
+    pub fn getJustifiedCheckpoint(self: *Self) types.Checkpoint {
+        return self.forkChoice.fcStore.latest_justified;
+    }
+
     pub const SyncStatus = union(enum) {
         synced,
         no_peers,
@@ -1325,7 +1342,7 @@ test "process and add mock blocks into a node's chain" {
         // should have matching states in the state
         const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match

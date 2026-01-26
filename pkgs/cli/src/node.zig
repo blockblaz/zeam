@@ -28,6 +28,8 @@ const database = @import("@zeam/database");
 const json = std.json;
 const utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const zeam_metrics = @import("@zeam/metrics");
+const build_options = @import("build_options");
 
 // Structure to hold parsed ENR fields from validator-config.yaml
 const EnrFields = struct {
@@ -221,6 +223,13 @@ pub const Node = struct {
         const validator_ids = try options.getValidatorIndices(allocator);
         errdefer allocator.free(validator_ids);
 
+        // Initialize metrics BEFORE beam_node so that metrics set during
+        // initialization (like lean_validators_count) are captured on real
+        // metrics instead of being discarded by noop metrics.
+        if (options.metrics_enable) {
+            try api.init(allocator);
+        }
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -236,7 +245,9 @@ pub const Node = struct {
 
         // Start API server after chain is initialized so we can pass the chain pointer
         if (options.metrics_enable) {
-            try api.init(allocator);
+            // Set node lifecycle metrics
+            zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
             try api_server.startAPIServer(allocator, options.api_port, options.logger_config, self.beam_node.chain);
         }
     }
@@ -651,7 +662,7 @@ fn verifyCheckpointState(
 
     // Calculate the block root from the properly constructed block header
     var block_root: types.Root = undefined;
-    try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
 
     logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
         state.slot,
@@ -1196,7 +1207,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
 
     // Get state root by hashing the state directly
     var state_root_from_genesis: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamState, genesis_state, &state_root_from_genesis, allocator);
 
     // Generate block header using genStateBlockHeader
     const state_block_header = try genesis_state.genStateBlockHeader(allocator);
@@ -1260,11 +1271,11 @@ test "checkpoint-sync-url parameter is optional" {
         .@"node-id" = "test",
         .validator_config = "test",
         .override_genesis_time = null,
-        .@"checkpoint-sync-url" = "http://localhost:5052/lean/states/finalized",
+        .@"checkpoint-sync-url" = "http://localhost:5052/lean/v0/states/finalized",
     };
 
     try std.testing.expect(node_cmd_with_url.@"checkpoint-sync-url" != null);
-    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/states/finalized");
+    try std.testing.expectEqualStrings(node_cmd_with_url.@"checkpoint-sync-url".?, "http://localhost:5052/lean/v0/states/finalized");
 }
 
 test "NodeOptions checkpoint_sync_url field is optional" {
@@ -1309,6 +1320,6 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     try std.testing.expect(node_options.checkpoint_sync_url == null);
 
     // Test with a URL
-    node_options.checkpoint_sync_url = "http://localhost:5052/lean/states/finalized";
+    node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
 }
