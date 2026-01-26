@@ -55,10 +55,13 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
 }
 
 // Verify aggregated signatures using AggregatedSignatureProof
+// If pubkey_cache is provided, public keys are cached to avoid repeated SSZ deserialization.
+// This can significantly reduce CPU overhead when processing many blocks.
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
+    pubkey_cache: ?*xmss.PublicKeyCache,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
     const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
@@ -93,10 +96,15 @@ pub fn verifySignatures(
         defer public_keys.deinit();
 
         // Store the PublicKey wrappers so we can free the Rust handles after verification
+        // Only used when cache is not provided
         var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
         defer {
-            for (pubkey_wrappers.items) |*wrapper| {
-                wrapper.deinit();
+            // Only free wrappers if we're not using a cache
+            // When using cache, the cache owns the handles
+            if (pubkey_cache == null) {
+                for (pubkey_wrappers.items) |*wrapper| {
+                    wrapper.deinit();
+                }
             }
             pubkey_wrappers.deinit();
         }
@@ -107,11 +115,21 @@ pub fn verifySignatures(
             }
             const validator = &validators[validator_index];
             const pubkey_bytes = validator.getPubkey();
-            const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
-                return StateTransitionError.InvalidBlockSignatures;
-            };
-            try public_keys.append(pubkey.handle);
-            try pubkey_wrappers.append(pubkey);
+
+            if (pubkey_cache) |cache| {
+                // Use cached public key (deserialize on first access, reuse on subsequent)
+                const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
+                    return StateTransitionError.InvalidBlockSignatures;
+                };
+                try public_keys.append(pk_handle);
+            } else {
+                // No cache - deserialize each time (legacy behavior)
+                const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+                    return StateTransitionError.InvalidBlockSignatures;
+                };
+                try public_keys.append(pubkey.handle);
+                try pubkey_wrappers.append(pubkey);
+            }
         }
 
         // Compute message hash from attestation data

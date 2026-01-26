@@ -47,7 +47,8 @@ test "apply transition on mocked chain" {
         const signed_block = mock_chain.blocks[i];
 
         // Verify signatures before applying state transition
-        try verifySignatures(allocator, &beam_state, &signed_block);
+        // Pass null for pubkey_cache since tests don't need caching optimization
+        try verifySignatures(allocator, &beam_state, &signed_block, null);
 
         try apply_transition(allocator, &beam_state, signed_block.message.block, .{ .logger = module_logger });
     }
