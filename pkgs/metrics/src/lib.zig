@@ -82,7 +82,7 @@ const Metrics = struct {
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
-    const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.4, 0.6, 0.8, 1, 1.5, 2 });
+    const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.4, 0.6, 0.8, 1, 1.5, 2 });
     const SlotsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const BlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const AttestationsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
