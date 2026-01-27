@@ -390,18 +390,33 @@ pub const BeamState = struct {
         if (justifications_cache) |cache| {
             if (cache.get(parent_root)) |cached_map| {
                 // Cache hit - clone the cached justifications map
+                const cache_hit_timer = zeam_metrics.lean_state_transition_justifications_cache_hit_time_seconds.start();
                 var it = cached_map.iterator();
                 while (it.next()) |entry| {
                     const cloned_value = try allocator.dupe(u8, entry.value_ptr.*);
                     try justifications.put(allocator, entry.key_ptr.*, cloned_value);
                 }
+                _ = cache_hit_timer.observe();
+                if (comptime !zeam_metrics.isZKVM()) {
+                    zeam_metrics.metrics.lean_state_transition_justifications_cache_hits_total.incr();
+                }
             } else {
                 // Cache miss - build from state
+                const cache_miss_timer = zeam_metrics.lean_state_transition_justifications_cache_miss_time_seconds.start();
                 try self.getJustification(allocator, &justifications);
+                _ = cache_miss_timer.observe();
+                if (comptime !zeam_metrics.isZKVM()) {
+                    zeam_metrics.metrics.lean_state_transition_justifications_cache_misses_total.incr();
+                }
             }
         } else {
-            // No cache available - build from state
+            // No cache available - build from state (counts as miss)
+            const cache_miss_timer = zeam_metrics.lean_state_transition_justifications_cache_miss_time_seconds.start();
             try self.getJustification(allocator, &justifications);
+            _ = cache_miss_timer.observe();
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_state_transition_justifications_cache_misses_total.incr();
+            }
         }
         _ = get_just_timer.observe();
 

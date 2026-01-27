@@ -62,6 +62,11 @@ const Metrics = struct {
     lean_state_transition_block_header_hash_time_seconds: BlockHeaderHashHistogram,
     lean_state_transition_get_justification_time_seconds: GetJustificationHistogram,
     lean_state_transition_with_justifications_time_seconds: WithJustificationsHistogram,
+    // Justifications cache metrics
+    lean_state_transition_justifications_cache_hits_total: JustificationsCacheHitsCounter,
+    lean_state_transition_justifications_cache_misses_total: JustificationsCacheMissesCounter,
+    lean_state_transition_justifications_cache_hit_time_seconds: JustificationsCacheHitTimeHistogram,
+    lean_state_transition_justifications_cache_miss_time_seconds: JustificationsCacheMissTimeHistogram,
     // Block processing path counters
     lean_chain_blocks_with_cached_state_total: BlocksWithCachedStateCounter,
     lean_chain_blocks_with_computed_state_total: BlocksWithComputedStateCounter,
@@ -104,6 +109,11 @@ const Metrics = struct {
     const BlockHeaderHashHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const GetJustificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
     const WithJustificationsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
+    // Justifications cache metric types - hit time should be fast (clone), miss time slower (build from state)
+    const JustificationsCacheHitsCounter = metrics_lib.Counter(u64);
+    const JustificationsCacheMissesCounter = metrics_lib.Counter(u64);
+    const JustificationsCacheHitTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
+    const JustificationsCacheMissTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1 });
     const LeanHeadSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestJustifiedSlotGauge = metrics_lib.Gauge(u64);
     const LeanLatestFinalizedSlotGauge = metrics_lib.Gauge(u64);
@@ -310,6 +320,18 @@ fn observeWithJustifications(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeJustificationsCacheHitTime(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.JustificationsCacheHitTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeJustificationsCacheMissTime(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.JustificationsCacheMissTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -410,6 +432,14 @@ pub var lean_state_transition_with_justifications_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeWithJustifications,
 };
+pub var lean_state_transition_justifications_cache_hit_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeJustificationsCacheHitTime,
+};
+pub var lean_state_transition_justifications_cache_miss_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeJustificationsCacheMissTime,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -455,6 +485,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_block_header_hash_time_seconds = Metrics.BlockHeaderHashHistogram.init("lean_state_transition_block_header_hash_time_seconds", .{ .help = "Block header hash in process_block_header." }, .{}),
         .lean_state_transition_get_justification_time_seconds = Metrics.GetJustificationHistogram.init("lean_state_transition_get_justification_time_seconds", .{ .help = "Justifications HashMap creation from state." }, .{}),
         .lean_state_transition_with_justifications_time_seconds = Metrics.WithJustificationsHistogram.init("lean_state_transition_with_justifications_time_seconds", .{ .help = "State update with justifications HashMap." }, .{}),
+        // Justifications cache metrics
+        .lean_state_transition_justifications_cache_hits_total = Metrics.JustificationsCacheHitsCounter.init("lean_state_transition_justifications_cache_hits_total", .{ .help = "Total justifications cache hits (clone from cache)." }, .{}),
+        .lean_state_transition_justifications_cache_misses_total = Metrics.JustificationsCacheMissesCounter.init("lean_state_transition_justifications_cache_misses_total", .{ .help = "Total justifications cache misses (build from state)." }, .{}),
+        .lean_state_transition_justifications_cache_hit_time_seconds = Metrics.JustificationsCacheHitTimeHistogram.init("lean_state_transition_justifications_cache_hit_time_seconds", .{ .help = "Time to clone justifications from cache." }, .{}),
+        .lean_state_transition_justifications_cache_miss_time_seconds = Metrics.JustificationsCacheMissTimeHistogram.init("lean_state_transition_justifications_cache_miss_time_seconds", .{ .help = "Time to build justifications from state (cache miss)." }, .{}),
         .lean_chain_blocks_with_cached_state_total = Metrics.BlocksWithCachedStateCounter.init("lean_chain_blocks_with_cached_state_total", .{ .help = "Blocks processed with precomputed state (skip apply_transition)." }, .{}),
         .lean_chain_blocks_with_computed_state_total = Metrics.BlocksWithComputedStateCounter.init("lean_chain_blocks_with_computed_state_total", .{ .help = "Blocks processed with computed state (call apply_transition with cache)." }, .{}),
         // Network peer metrics
@@ -501,6 +536,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_state_transition_block_header_hash_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_header_hash_time_seconds);
     lean_state_transition_get_justification_time_seconds.context = @ptrCast(&metrics.lean_state_transition_get_justification_time_seconds);
     lean_state_transition_with_justifications_time_seconds.context = @ptrCast(&metrics.lean_state_transition_with_justifications_time_seconds);
+    lean_state_transition_justifications_cache_hit_time_seconds.context = @ptrCast(&metrics.lean_state_transition_justifications_cache_hit_time_seconds);
+    lean_state_transition_justifications_cache_miss_time_seconds.context = @ptrCast(&metrics.lean_state_transition_justifications_cache_miss_time_seconds);
 
     g_initialized = true;
 }
