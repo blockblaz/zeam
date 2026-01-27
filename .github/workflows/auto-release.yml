@@ -22,8 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_tags_labels.outputs.version }}
-      zeam_tag: ${{ steps.get_tags_labels.outputs.zeam_tag }}
-      has_network_tag: ${{ steps.get_tags_labels.outputs.has_network_tag }}
+      devnet_tag: ${{ steps.get_tags_labels.outputs.devnet_tag }}
+      has_devnet_tag: ${{ steps.get_tags_labels.outputs.has_devnet_tag }}
 
     steps:
     - name: Checkout code
@@ -38,14 +38,14 @@ jobs:
         LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
         echo "PR Labels: $LABELS"
 
-        # Look for version label (e.g., "v1.0.0", "version:1.0.0", etc.) - MANDATORY
-        VERSION=$(echo $LABELS | jq -r '.[] | select(test("^(v|version:)?[0-9]+\\.[0-9]+\\.[0-9]+")) | gsub("^(v|version:)"; "")' | head -n 1)
+        # Look for version label (x.y.z format only) - MANDATORY
+        VERSION=$(echo $LABELS | jq -r '.[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' | head -n 1)
 
-        # Look for zeam network tags (devnet0, devnet1, testnet, mainnet)
-        ZEAM_TAG=$(echo $LABELS | jq -r '.[] | select(test("^(devnet[0-9]+|testnet[0-9]*|mainnet)$"))'| head -n 1)
+        # Look for devnet tags (devnet0, devnet1, devnet2, etc.)
+        DEVNET_TAG_LOWER=$(echo $LABELS | jq -r '.[] | select(test("^devnet[0-9]+$"))' | head -n 1)
 
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-          echo "❌ Version label is mandatory! Please add a version label (e.g. v1.0.0, version:1.0.0)"
+          echo "❌ Version label is mandatory! Please add a version label in x.y.z format (e.g. 1.0.0)"
           exit 1
         else
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -53,13 +53,15 @@ jobs:
           echo "✅ Version found: $VERSION"
         fi
 
-        if [ -n "$ZEAM_TAG" ] && [ "$ZEAM_TAG" != "null" ]; then
-          echo "zeam_tag=$ZEAM_TAG" >> $GITHUB_OUTPUT
-          echo "has_network_tag=true" >> $GITHUB_OUTPUT
-          echo "✅ Found network tag: $ZEAM_TAG"
+        if [ -n "$DEVNET_TAG_LOWER" ] && [ "$DEVNET_TAG_LOWER" != "null" ]; then
+          # Convert to capital D (devnet1 -> Devnet1), since branch t obe crated is also devnet
+          DEVNET_TAG="D${DEVNET_TAG_LOWER:1}"
+          echo "devnet_tag=$DEVNET_TAG" >> $GITHUB_OUTPUT
+          echo "has_devnet_tag=true" >> $GITHUB_OUTPUT
+          echo "✅ Found devnet tag: $DEVNET_TAG_LOWER -> $DEVNET_TAG"
         else
-          echo "has_network_tag=false" >> $GITHUB_OUTPUT
-          echo "ℹ️ No network tag found (optional)"
+          echo "has_devnet_tag=false" >> $GITHUB_OUTPUT
+          echo "ℹ️ No devnet tag found (optional)"
         fi
 
     - name: Create and push git tags
@@ -69,7 +71,7 @@ jobs:
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
         CREATE_VERSION_TAG=false
-        CREATE_NETWORK_TAG=false
+        CREATE_DEVNET_TAG=false
 
         # Check if version tag should be created
         if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
@@ -81,15 +83,16 @@ jobs:
           fi
         fi
 
-        # Check if network tag should be created
-        if [ "${{ steps.get_tags_labels.outputs.has_network_tag }}" = "true" ]; then
-          ZEAM_GIT_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
-          if git rev-parse "$ZEAM_GIT_TAG" >/dev/null 2>&1; then
-            echo "❌ Network tag $ZEAM_GIT_TAG already exists. Please use a different network label."
-            exit 1
-          else
-            CREATE_NETWORK_TAG=true
+        # Check if devnet tag should be created
+        if [ "${{ steps.get_tags_labels.outputs.has_devnet_tag }}" = "true" ]; then
+          DEVNET_GIT_TAG="${{ steps.get_tags_labels.outputs.devnet_tag }}"
+          
+          # For devnet tags, allow recreation by deleting existing tag first
+          if git rev-parse "$DEVNET_GIT_TAG" >/dev/null 2>&1; then
+            echo "🗑️ Devnet tag $DEVNET_GIT_TAG already exists, will be recreated"
+            git push --delete origin "$DEVNET_GIT_TAG" || echo "⚠️ Tag deletion failed or tag doesn't exist"
           fi
+          CREATE_DEVNET_TAG=true
         fi
 
         # Create version tag if needed
@@ -99,53 +102,14 @@ jobs:
           echo "✅ Created version tag ${{ steps.get_tags_labels.outputs.git_tag }}"
         fi
 
-        # Create network tag if needed
-        if [ "$CREATE_NETWORK_TAG" = "true" ]; then
-          git tag -a "$ZEAM_GIT_TAG" -m "Zeam network tag for $ZEAM_GIT_TAG"
-          git push origin "$ZEAM_GIT_TAG"
-          echo "✅ Created zeam tag $ZEAM_GIT_TAG"
+        # Create devnet tag if needed
+        if [ "$CREATE_DEVNET_TAG" = "true" ]; then
+          git tag -a "$DEVNET_GIT_TAG" -m "Devnet release for $DEVNET_GIT_TAG"
+          git push origin "$DEVNET_GIT_TAG"
+          echo "✅ Created devnet tag $DEVNET_GIT_TAG"
         fi
         echo "create_version_tag=$CREATE_VERSION_TAG" >> $GITHUB_OUTPUT
-        echo "create_network_tag=$CREATE_NETWORK_TAG" >> $GITHUB_OUTPUT
-
-    - name: Determine primary tag for release
-      id: primary_tag
-      run: |
-        # Determine which tag to use for the release (version takes precedence)
-        if [ -n "${{ steps.get_tags_labels.outputs.version }}" ] && [ "${{ steps.get_tags_labels.outputs.version }}" != "null" ]; then
-          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.git_tag }}"
-          RELEASE_NAME="Release ${{ steps.get_tags_labels.outputs.version }}"
-        else
-          PRIMARY_TAG="${{ steps.get_tags_labels.outputs.zeam_tag }}"
-          RELEASE_NAME="Network Release ${{ steps.get_tags_labels.outputs.zeam_tag }}"
-        fi
-
-        echo "primary_tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
-        echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
-        echo "✅ Primary tag for release: $PRIMARY_TAG"
-
-    - name: Create GitHub Release
-      if: ${{ steps.get_tags_labels.outputs.has_network_tag == 'true' }}
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.get_tags_labels.outputs.zeam_tag }}
-        release_name: "Network Release ${{ steps.get_tags_labels.outputs.zeam_tag }}"
-        body: |
-          ## Zeam Release: ${{ steps.get_tags_labels.outputs.zeam_tag }}
-
-          This release includes:
-          - Version: ${{ steps.get_tags_labels.outputs.version }}
-          - Network: ${{ steps.get_tags_labels.outputs.zeam_tag }}
-          - Docker images available at: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}`
-
-          ### Docker Images
-          - Multi-arch: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}`
-          - AMD64: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}-amd64`
-          - ARM64: `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tags_labels.outputs.zeam_tag }}-arm64`
-        draft: false
-        prerelease: ${{ contains(steps.get_tags_labels.outputs.zeam_tag, 'devnet') }}
+        echo "create_devnet_tag=$CREATE_DEVNET_TAG" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: create-tags
@@ -182,7 +146,7 @@ jobs:
         tags: |
           type=raw,value=latest-${{ matrix.arch }}
           type=raw,value=${{ needs.create-tags.outputs.version }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.version != 'null' }}
-          type=raw,value=${{ needs.create-tags.outputs.zeam_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.has_network_tag == 'true' }}
+          type=raw,value=${{ needs.create-tags.outputs.devnet_tag }}-${{ matrix.arch }},enable=${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -224,9 +188,6 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        build-args: |
-          GIT_COMMIT=${{ github.sha }}
-          GIT_BRANCH=${{ github.ref_name }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         provenance: false
@@ -259,9 +220,196 @@ jobs:
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-amd64 \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}-arm64
 
-    - name: Create and push multi-arch manifest for network tag
-      if: ${{ needs.create-tags.outputs.has_network_tag == 'true' }}
+    - name: Create and push multi-arch manifest for devnet tag
+      if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
       run: |
-        docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }} \
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }}-amd64 \
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.zeam_tag }}-arm64
+        docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }} \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}-amd64 \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}-arm64
+
+  create-github-release:
+    needs: [ create-tags, build-and-push, create-manifest ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.create-tags.outputs.has_devnet_tag == 'true' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Delete existing devnet release if exists
+      run: |
+        DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
+        echo "🔍 Checking for existing $DEVNET_TAG release..."
+
+        # Delete existing GitHub (Devnet) release if it exists
+        RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$DEVNET_TAG --jq '.id' 2>/dev/null || echo "")
+        if [ -n "$RELEASE_ID" ]; then
+          echo "🗑️ Deleting existing GitHub release for $DEVNET_TAG (ID: $RELEASE_ID)"
+          gh api --method DELETE repos/${{ github.repository }}/releases/$RELEASE_ID
+          echo "✅ Deleted existing GitHub release"
+        else
+          echo "ℹ️ No existing GitHub release found for $DEVNET_TAG"
+        fi
+
+        echo "🧹 Release cleanup completed for $DEVNET_TAG"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate changelog from previous release
+      id: changelog
+      run: |
+        DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
+        VERSION="${{ needs.create-tags.outputs.version }}"
+
+        # Find the previous devnet tag
+        PREVIOUS_TAG=$(git tag -l "Devnet*" --sort=-version:refname | head -2 | tail -1)
+
+        if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
+          echo "✅ Found previous tag: $PREVIOUS_TAG"
+          echo "📝 Generating changelog from $PREVIOUS_TAG to current release..."
+          
+          # Generate commit log
+          COMMIT_LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "$PREVIOUS_TAG"..HEAD | head -20)
+          
+          # Generate file changes summary
+          FILES_CHANGED=$(git diff --name-only "$PREVIOUS_TAG"..HEAD | wc -l)
+          INSERTIONS=$(git diff --shortstat "$PREVIOUS_TAG"..HEAD | grep -o '[0-9]\+ insertion' | grep -o '[0-9]\+' || echo "0")
+          DELETIONS=$(git diff --shortstat "$PREVIOUS_TAG"..HEAD | grep -o '[0-9]\+ deletion' | grep -o '[0-9]\+' || echo "0")
+          
+          # Get contributors
+          CONTRIBUTORS=$(git log --pretty=format:"%an" --no-merges "$PREVIOUS_TAG"..HEAD | sort | uniq | tr '\n' ', ' | sed 's/, $//')
+          
+          # Create changelog content in GitHub format
+          CHANGELOG="## 📋 Changes since $PREVIOUS_TAG
+
+          ### 📊 Summary
+          - **Files changed**: $FILES_CHANGED
+          - **Insertions**: +$INSERTIONS
+          - **Deletions**: -$DELETIONS
+          - **Contributors**: $CONTRIBUTORS
+
+          ### 🔄 Recent commits
+          $COMMIT_LOG
+
+          ### 🔗 Compare changes
+          [View full diff](${{ github.server_url }}/${{ github.repository }}/compare/$PREVIOUS_TAG...HEAD)"
+
+        else
+          echo "ℹ️ No previous release found or this is the first release"
+          CHANGELOG="## 📋 Changes
+
+          This is the first devnet release."
+        fi
+
+        # Save changelog to output (escape newlines for GitHub Actions)
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo "previous_tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ needs.create-tags.outputs.devnet_tag }}
+        name: "Zeam ${{ needs.create-tags.outputs.devnet_tag }} Release"
+        body: |
+          # Zeam ${{ needs.create-tags.outputs.devnet_tag }} Release
+
+          ## Release Information
+          - **Version**: ${{ needs.create-tags.outputs.version }}
+          - **Network**: ${{ needs.create-tags.outputs.devnet_tag }}
+          - **Docker Images**: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}`
+
+          ${{ steps.changelog.outputs.changelog }}
+
+          ## 🐋 Docker Images
+          ```bash
+          # Multi-architecture (recommended)
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}
+
+          # Architecture-specific
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}-amd64
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}-arm64
+          ```
+
+          ## 🏷️ All Available Tags
+          ```bash
+          # Latest release
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          # Version-specific
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.version }}
+
+          # Devnet-specific  
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tags.outputs.devnet_tag }}
+          ```
+
+          ---
+          *🤖 This release was automatically created by the GitHub Actions workflow*
+        draft: false
+        prerelease: true
+
+    - name: Push code to corresponding devnet branch
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
+        # Convert Devnet1 to devnet1 for branch name
+        DEVNET_BRANCH=$(echo "$DEVNET_TAG" | tr '[:upper:]' '[:lower:]')
+
+        echo "✅ Detected devnet tag: $DEVNET_TAG, will push to branch: $DEVNET_BRANCH"
+
+        # Check if devnet branch exists remotely
+        if git ls-remote --heads origin "$DEVNET_BRANCH" | grep -q "$DEVNET_BRANCH"; then
+          echo "✅ $DEVNET_BRANCH branch exists, updating it"
+          git fetch origin "$DEVNET_BRANCH"
+          git checkout "$DEVNET_BRANCH"
+          git merge main --no-edit
+        else
+          echo "✅ $DEVNET_BRANCH branch doesn't exist, creating it from main"
+          git checkout -b "$DEVNET_BRANCH"
+        fi
+
+        # Push the devnet branch
+        git push origin "$DEVNET_BRANCH"
+        echo "✅ Successfully pushed code to $DEVNET_BRANCH branch"
+
+    - name: Send Telegram success notification
+      if: ${{ success() }}
+      run: |
+        DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
+        VERSION="${{ needs.create-tags.outputs.version }}"
+
+        # Build notification message
+        MESSAGE="🚀 *Zeam $DEVNET_TAG Release SUCCESS*
+
+        *Release Details:*
+        • Version: \`${VERSION}\`
+        • Network: \`${DEVNET_TAG}\`
+        • Repository: [${{ github.repository }}](${{ github.server_url }}/${{ github.repository }})
+
+        *🐋 Docker Images Available:*
+        • Multi-arch: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${DEVNET_TAG}\`
+        • AMD64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${DEVNET_TAG}-amd64\`
+        • ARM64: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${DEVNET_TAG}-arm64\`
+
+        *🔗 Quick Links:*
+        • [GitHub Release](${{ github.server_url }}/${{ github.repository }}/releases/tag/${DEVNET_TAG})
+
+        *🌿 Deployment:*
+        • Code pushed to \`$(echo "$DEVNET_TAG" | tr '[:upper:]' '[:lower:]')\` branch
+
+        _🤖 Automated release notification_"
+
+        # Send to Telegram
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+            \"text\": \"$MESSAGE\",
+            \"parse_mode\": \"Markdown\",
+            \"disable_web_page_preview\": true
+          }" && echo "📱 Telegram notification sent successfully" || echo "❌ Failed to send Telegram notification"
