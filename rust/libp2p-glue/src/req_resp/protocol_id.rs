@@ -4,7 +4,7 @@ use libp2p::StreamProtocol;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-const LEAN_BLOCKS_BY_ROOT_V1: &str = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
+const LEAN_BLOCKS_BY_ROOT_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
 const LEAN_STATUS_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +16,7 @@ pub enum LeanSupportedProtocol {
 impl LeanSupportedProtocol {
     pub fn message_name(&self) -> &'static str {
         match self {
-            LeanSupportedProtocol::BlocksByRootV1 => "lean_blocks_by_root",
+            LeanSupportedProtocol::BlocksByRootV1 => "blocks_by_root",
             LeanSupportedProtocol::StatusV1 => "status",
         }
     }
