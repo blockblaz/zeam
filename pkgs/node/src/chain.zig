@@ -105,6 +105,9 @@ pub const BeamChain = struct {
     force_block_production: bool,
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
+    // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
+    // Significantly reduces CPU overhead when processing blocks with many attestations.
+    public_key_cache: xmss.PublicKeyCache,
 
     const Self = @This();
 
@@ -142,6 +145,7 @@ pub const BeamChain = struct {
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
+            .public_key_cache = xmss.PublicKeyCache.init(allocator),
         };
     }
 
@@ -161,6 +165,9 @@ pub const BeamChain = struct {
             cached_state.deinit();
             self.allocator.destroy(cached_state);
         }
+
+        // Clean up public key cache
+        self.public_key_cache.deinit();
 
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
@@ -607,7 +614,8 @@ pub const BeamChain = struct {
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
 
             // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
-            try stf.verifySignatures(self.allocator, pre_state, &signedBlock);
+            // Use public key cache to avoid repeated SSZ deserialization of validator public keys
+            try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
