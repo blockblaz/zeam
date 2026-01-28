@@ -10,6 +10,7 @@ pub const BeamChain = chainFactory.BeamChain;
 pub const fcFactory = @import("./forkchoice.zig");
 pub const tree_visualizer = @import("./tree_visualizer.zig");
 pub const constants = @import("./constants.zig");
+pub const utils = @import("./utils.zig");
 
 const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;

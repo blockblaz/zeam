@@ -15,9 +15,18 @@ const clockFactory = @import("./clock.zig");
 pub const NodeTestOptions = struct {
     num_validators: usize = 4,
     key_manager_slots: usize = 10,
+    /// Genesis time in seconds. Use 0 to automatically use current time.
     genesis_time: u64 = 0,
     preset: params.Preset = params.Preset.minimal,
     spec_name: []const u8 = "zeamdev",
+
+    /// Returns the effective genesis time, using current time if genesis_time is 0.
+    pub fn getEffectiveGenesisTime(self: NodeTestOptions) u64 {
+        if (self.genesis_time == 0) {
+            return @intCast(std.time.timestamp());
+        }
+        return self.genesis_time;
+    }
 };
 
 pub const NodeTestContext = struct {
@@ -49,8 +58,9 @@ pub const NodeTestContext = struct {
         const pubkeys = try km.getAllPubkeys(allocator, opts.num_validators);
         errdefer allocator.free(pubkeys);
 
+        const effective_genesis_time = opts.getEffectiveGenesisTime();
         const genesis_config = types.GenesisSpec{
-            .genesis_time = opts.genesis_time,
+            .genesis_time = effective_genesis_time,
             .validator_pubkeys = pubkeys,
         };
 
@@ -137,6 +147,12 @@ pub const NodeTestContext = struct {
 
     pub fn clockPtr(self: *NodeTestContext) *clockFactory.Clock {
         return &self.clock;
+    }
+
+    /// Fix up the db's logger pointer to point to this struct's logger_config.
+    /// Must be called after init() when the struct has a stable address.
+    pub fn fixupDbLogger(self: *NodeTestContext) void {
+        self.db.logger = self.logger_config.logger(.database);
     }
 
     pub fn dbInstance(self: *NodeTestContext) database.Db {

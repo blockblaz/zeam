@@ -41,21 +41,78 @@ type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 // TODO: protect the access by mutex
 #[allow(static_mut_refs)]
 static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-// a hack to start a second network for self testing purposes
+// additional network slots for multi-node testing
 #[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+#[allow(static_mut_refs)]
+static mut SWARM_STATE2: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 // Store Zig handler pointers per network id so free functions can forward logs
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER0: Option<u64> = None;
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER1: Option<u64> = None;
+#[allow(static_mut_refs)]
+static mut ZIG_HANDLER2: Option<u64> = None;
+
+/// Get a mutable reference to the swarm for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+#[allow(static_mut_refs)]
+unsafe fn get_swarm_mut(network_id: u32) -> Option<&'static mut libp2p::swarm::Swarm<Behaviour>> {
+    match network_id {
+        0 => SWARM_STATE.as_mut(),
+        1 => SWARM_STATE1.as_mut(),
+        2 => SWARM_STATE2.as_mut(),
+        _ => None,
+    }
+}
+
+/// Store a swarm in the global slot for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+unsafe fn set_swarm(network_id: u32, swarm: libp2p::swarm::Swarm<Behaviour>) {
+    match network_id {
+        0 => SWARM_STATE = Some(swarm),
+        1 => SWARM_STATE1 = Some(swarm),
+        2 => SWARM_STATE2 = Some(swarm),
+        _ => panic!("unsupported network_id: {}", network_id),
+    }
+}
+
+/// Store the Zig handler pointer for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+unsafe fn set_zig_handler(network_id: u32, handler: u64) {
+    match network_id {
+        0 => ZIG_HANDLER0 = Some(handler),
+        1 => ZIG_HANDLER1 = Some(handler),
+        2 => ZIG_HANDLER2 = Some(handler),
+        _ => {}
+    }
+}
+
+/// Get the Zig handler pointer for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+unsafe fn get_zig_handler(network_id: u32) -> Option<u64> {
+    match network_id {
+        0 => ZIG_HANDLER0,
+        1 => ZIG_HANDLER1,
+        2 => ZIG_HANDLER2,
+        _ => None,
+    }
+}
 
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
-    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
+    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool, bool)> = std::sync::Mutex::new((false, false, false));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
     static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
         Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
@@ -94,6 +151,7 @@ pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
         if match network_id {
             0 => ready.0,
             1 => ready.1,
+            2 => ready.2,
             _ => false,
         } {
             return true;
@@ -165,11 +223,7 @@ pub unsafe fn create_and_run_network(
     ));
 
     // Store zig_handler for this network id for use by free functions
-    if network_id < 1 {
-        ZIG_HANDLER0 = Some(zig_handler);
-    } else {
-        ZIG_HANDLER1 = Some(zig_handler);
-    }
+    set_zig_handler(network_id, zig_handler);
 
     releaseStartNetworkParams(
         zig_handler,
@@ -229,28 +283,14 @@ pub unsafe fn publish_msg_to_rust_bridge(
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
     let topic = gossipsub::IdentTopic::new(topic);
 
-    #[allow(static_mut_refs)]
-    let swarm = if network_id < 1 {
-        match unsafe { SWARM_STATE.as_mut() } {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "publish_msg_to_rust_bridge called before network initialized",
-                );
-                return;
-            }
-        }
-    } else {
-        match unsafe { SWARM_STATE1.as_mut() } {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "publish_msg_to_rust_bridge called before network initialized",
-                );
-                return;
-            }
+    let swarm = match unsafe { get_swarm_mut(network_id) } {
+        Some(s) => s,
+        None => {
+            logger::rustLogger.error(
+                network_id,
+                "publish_msg_to_rust_bridge called before network initialized",
+            );
+            return;
         }
     };
     if let Err(e) = swarm
@@ -302,28 +342,14 @@ pub unsafe fn send_rpc_request(
 
     let protocol_id: ProtocolId = protocol.into();
 
-    #[allow(static_mut_refs)]
-    let swarm = if network_id < 1 {
-        match SWARM_STATE.as_mut() {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_request called before network initialized",
-                );
-                return 0;
-            }
-        }
-    } else {
-        match SWARM_STATE1.as_mut() {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_request called before network initialized",
-                );
-                return 0;
-            }
+    let swarm = match get_swarm_mut(network_id) {
+        Some(s) => s,
+        None => {
+            logger::rustLogger.error(
+                network_id,
+                "send_rpc_request called before network initialized",
+            );
+            return 0;
         }
     };
 
@@ -375,11 +401,15 @@ pub unsafe fn send_rpc_response_chunk(
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_response_chunk called before network initialized",
+                );
+                return;
+            }
         };
 
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
@@ -415,11 +445,15 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_end_of_stream called before network initialized",
+                );
+                return;
+            }
         };
 
         swarm.behaviour_mut().reqresp.finish_response_stream(
@@ -481,11 +515,15 @@ pub unsafe fn send_rpc_error_response(
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_error_response called before network initialized",
+                );
+                return;
+            }
         };
 
         let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
@@ -620,13 +658,7 @@ fn forward_log_with_handler(zig_handler: u64, level: u32, message: &str) {
 }
 
 pub(crate) fn forward_log_by_network(network_id: u32, level: u32, message: &str) {
-    let handler_opt = unsafe {
-        if network_id < 1 {
-            ZIG_HANDLER0
-        } else {
-            ZIG_HANDLER1
-        }
-    };
+    let handler_opt = unsafe { get_zig_handler(network_id) };
     if let Some(handler) = handler_opt {
         forward_log_with_handler(handler, level, message);
     }
@@ -774,14 +806,8 @@ impl Network {
             logger::rustLogger.debug(self.network_id, "no connect addresses");
         }
 
-        if self.network_id < 1 {
-            unsafe {
-                SWARM_STATE = Some(swarm);
-            }
-        } else {
-            unsafe {
-                SWARM_STATE1 = Some(swarm);
-            }
+        unsafe {
+            set_swarm(self.network_id, swarm);
         }
 
         // Signal that this network is now ready
@@ -790,6 +816,7 @@ impl Network {
             match self.network_id {
                 0 => ready.0 = true,
                 1 => ready.1 = true,
+                2 => ready.2 = true,
                 _ => {}
             }
             NETWORK_READY_CONDVAR.notify_all();
@@ -799,12 +826,8 @@ impl Network {
     }
 
     pub async fn run_eventloop(&mut self) {
-        #[allow(static_mut_refs)]
-        let swarm = if self.network_id < 1 {
-            unsafe { SWARM_STATE.as_mut().unwrap() }
-        } else {
-            unsafe { SWARM_STATE1.as_mut().unwrap() }
-        };
+        let swarm = unsafe { get_swarm_mut(self.network_id) }
+            .expect("run_eventloop called before start_network stored the swarm");
 
         loop {
             tokio::select! {
