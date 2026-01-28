@@ -7,6 +7,7 @@ pub const OnGossipCbHandler = interfaceFactory.OnGossipCbHandler;
 pub const GossipEncoding = interfaceFactory.GossipEncoding;
 pub const LeanNetworkTopic = interfaceFactory.LeanNetworkTopic;
 pub const GossipTopic = interfaceFactory.GossipTopic;
+pub const GossipTopicSpec = interfaceFactory.GossipTopicSpec;
 pub const GossipMessage = interfaceFactory.GossipMessage;
 pub const LeanSupportedProtocol = interfaceFactory.LeanSupportedProtocol;
 pub const ReqRespRequest = interfaceFactory.ReqRespRequest;

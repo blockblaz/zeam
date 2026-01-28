@@ -27,6 +27,7 @@ const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
 const ZERO_HASH = types.ZERO_HASH;
+const ATTESTATION_COMMITTEE_COUNT: usize = @intCast(params.ATTESTATION_COMMITTEE_COUNT);
 
 const NodeOpts = struct {
     config: configs.ChainConfig,
@@ -39,6 +40,7 @@ const NodeOpts = struct {
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
+    is_aggregator: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -91,6 +93,7 @@ pub const BeamNode = struct {
             });
             chain.registerValidatorIds(ids);
         }
+        chain.setAggregator(opts.is_aggregator);
 
         self.* = Self{
             .allocator = allocator,
@@ -206,6 +209,15 @@ pub const BeamNode = struct {
                     slot,
                     validator_id,
                     validator_node_name,
+                    sender_peer_id,
+                    sender_node_name,
+                });
+            },
+            .aggregation => |signed_aggregation| {
+                const slot = signed_aggregation.data.slot;
+                const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+                self.logger.info("received gossip aggregated attestation for slot={d} from peer={s}{}", .{
+                    slot,
                     sender_peer_id,
                     sender_node_name,
                 });
@@ -859,6 +871,7 @@ pub const BeamNode = struct {
             return;
         }
         const interval: usize = @intCast(itime_intervals);
+        const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
 
         self.chain.onInterval(interval) catch |e| {
             self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
@@ -891,8 +904,34 @@ pub const BeamNode = struct {
                                 return e;
                             };
                         },
+                        .aggregation => |signed_aggregation| {
+                            self.publishAggregatedAttestation(signed_aggregation) catch |e| {
+                                self.logger.err("error publishing aggregated attestation from validator: err={any}", .{e});
+                                return e;
+                            };
+                        },
                     }
                 }
+            }
+        }
+
+        if (interval_in_slot == 2 and self.chain.is_aggregator) {
+            var aggregated = self.chain.aggregateCommitteeSignatures() catch |e| {
+                self.logger.err("error aggregating committee signatures at interval={d}: {any}", .{ interval, e });
+                return e;
+            };
+            defer {
+                for (aggregated.items) |*msg| {
+                    msg.deinit();
+                }
+                aggregated.deinit();
+            }
+
+            for (aggregated.items) |signed_aggregated| {
+                self.publishAggregatedAttestation(signed_aggregated) catch |e| {
+                    self.logger.err("error publishing aggregated attestation: err={any}", .{e});
+                    return e;
+                };
             }
         }
     }
@@ -930,7 +969,7 @@ pub const BeamNode = struct {
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.network.publish(&gossip_msg);
+        try self.network.publishWithTopic(.{ .topic = .block }, &gossip_msg);
         self.logger.info("published block to network: slot={d} proposer={d}{}", .{
             block.slot,
             block.proposer_index,
@@ -954,13 +993,28 @@ pub const BeamNode = struct {
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
-        try self.network.publish(&gossip_msg);
+        comptime {
+            if (ATTESTATION_COMMITTEE_COUNT == 0) {
+                @compileError("ATTESTATION_COMMITTEE_COUNT must be > 0");
+            }
+        }
+        const subnet_id =
+            @as(usize, @intCast(validator_id)) % ATTESTATION_COMMITTEE_COUNT;
+        const subnet_topic = networks.GossipTopicSpec{ .topic = .attestation, .subnet_id = subnet_id };
+        try self.network.publishWithTopic(subnet_topic, &gossip_msg);
+        try self.network.publishWithTopic(.{ .topic = .attestation }, &gossip_msg);
 
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
             validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(validator_id),
         });
+    }
+
+    pub fn publishAggregatedAttestation(self: *Self, signed_attestation: types.SignedAggregatedAttestation) !void {
+        const gossip_msg = networks.GossipMessage{ .aggregation = signed_attestation };
+        try self.network.publishWithTopic(.{ .topic = .aggregation }, &gossip_msg);
+        self.logger.info("published aggregated attestation to network: slot={d}", .{signed_attestation.data.slot});
     }
 
     pub fn run(self: *Self) !void {
@@ -973,8 +1027,10 @@ pub const BeamNode = struct {
         }
 
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{ .block, .attestation };
-        try self.network.backend.gossip.subscribe(&topics, handler);
+        const validator_ids = if (self.validator) |*validator| validator.ids else null;
+        const topic_specs = try buildGossipTopicSpecs(self.allocator, self.chain.config, validator_ids, self.chain.is_aggregator);
+        defer self.allocator.free(topic_specs);
+        try self.network.backend.gossip.subscribe(topic_specs, handler);
 
         const peer_handler = self.getPeerEventHandler();
         try self.network.backend.peers.subscribe(peer_handler);
@@ -986,6 +1042,41 @@ pub const BeamNode = struct {
         try self.clock.subscribeOnSlot(chainOnSlot);
     }
 };
+
+pub fn buildGossipTopicSpecs(
+    allocator: Allocator,
+    config: configs.ChainConfig,
+    validator_ids: ?[]const usize,
+    is_aggregator: bool,
+) ![]networks.GossipTopicSpec {
+    _ = config;
+    var topics = std.ArrayList(networks.GossipTopicSpec).init(allocator);
+    errdefer topics.deinit();
+
+    try topics.append(.{ .topic = .block });
+    try topics.append(.{ .topic = .attestation });
+    try topics.append(.{ .topic = .aggregation });
+
+    if (is_aggregator) {
+        if (validator_ids) |ids| {
+            if (ATTESTATION_COMMITTEE_COUNT == 0) return topics.toOwnedSlice();
+            const LocalSubnetSet = std.StaticBitSet(ATTESTATION_COMMITTEE_COUNT);
+            var local_subnets = LocalSubnetSet.initEmpty();
+
+            for (ids) |validator_id| {
+                const subnet_id = validator_id % ATTESTATION_COMMITTEE_COUNT;
+                local_subnets.set(subnet_id);
+            }
+
+            var subnet_it = local_subnets.iterator(.{});
+            while (subnet_it.next()) |subnet_id| {
+                try topics.append(.{ .topic = .attestation, .subnet_id = subnet_id });
+            }
+        }
+    }
+
+    return topics.toOwnedSlice();
+}
 
 const xev = @import("xev");
 

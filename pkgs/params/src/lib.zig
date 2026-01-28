@@ -17,6 +17,7 @@ pub const SECONDS_PER_SLOT = activePresetValues.SECONDS_PER_SLOT;
 pub const HISTORICAL_ROOTS_LIMIT = activePresetValues.HISTORICAL_ROOTS_LIMIT;
 pub const VALIDATOR_REGISTRY_LIMIT = activePresetValues.VALIDATOR_REGISTRY_LIMIT;
 pub const MAX_REQUEST_BLOCKS = activePresetValues.MAX_REQUEST_BLOCKS;
+pub const ATTESTATION_COMMITTEE_COUNT = activePresetValues.ATTESTATION_COMMITTEE_COUNT;
 
 test "test preset loading" {
     try std.testing.expect(SECONDS_PER_SLOT == mainnetPreset.preset.SECONDS_PER_SLOT);

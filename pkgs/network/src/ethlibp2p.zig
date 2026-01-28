@@ -315,6 +315,19 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             };
             break :attestationmessage .{ .attestation = message_data };
         },
+        .aggregation => aggregationmessage: {
+            var message_data: types.SignedAggregatedAttestation = undefined;
+            ssz.deserialize(types.SignedAggregatedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+                zigHandler.logger.err("Error in deserializing the signed aggregated attestation message: {any}", .{e});
+                if (writeFailedBytes(uncompressed_message, "aggregation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("Aggregation deserialization failed - debug file created: {s}", .{filename});
+                } else {
+                    zigHandler.logger.err("Aggregation deserialization failed - could not create debug file", .{});
+                }
+                return;
+            };
+            break :aggregationmessage .{ .aggregation = message_data };
+        },
     };
 
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
@@ -344,6 +357,20 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
                     zigHandler.params.networkId,
                     slot,
                     validator_id,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+        .aggregation => |signed_aggregation| {
+            const slot = signed_aggregation.data.slot;
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip aggregated attestation slot={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    slot,
                     message_bytes.len,
                     uncompressed_message.len,
                     sender_peer_id_slice,
@@ -885,6 +912,7 @@ pub const EthLibp2pParams = struct {
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
     node_registry: *const NodeNameRegistry,
+    gossip_topics: []const interface.GossipTopicSpec,
 };
 
 pub const EthLibp2p = struct {
@@ -927,6 +955,7 @@ pub const EthLibp2p = struct {
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
                 .node_registry = params.node_registry,
+                .gossip_topics = params.gossip_topics,
             },
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
@@ -950,6 +979,7 @@ pub const EthLibp2p = struct {
         }
 
         self.allocator.free(self.params.network_name);
+        self.allocator.free(self.params.gossip_topics);
 
         var it = self.rpcCallbacks.iterator();
         while (it.next()) |entry| {
@@ -974,10 +1004,28 @@ pub const EthLibp2p = struct {
             topics_list.deinit(self.allocator);
         }
 
-        for (std.enums.values(interface.GossipTopic)) |gossip_topic| {
-            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+        for (self.params.gossip_topics) |topic_spec| {
+            var topic = try interface.LeanNetworkTopic.init(
+                self.allocator,
+                topic_spec.topic,
+                topic_spec.subnet_id,
+                .ssz_snappy,
+                self.params.network_name,
+            );
             defer topic.deinit();
             const topic_str = try topic.encode();
+
+            var is_duplicate = false;
+            for (topics_list.items) |existing| {
+                if (std.mem.eql(u8, existing, topic_str)) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if (is_duplicate) {
+                self.allocator.free(topic_str);
+                continue;
+            }
             try topics_list.append(self.allocator, topic_str);
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
@@ -997,15 +1045,19 @@ pub const EthLibp2p = struct {
         self.logger.info("network-{d}:: Network initialization complete, ready to send/receive messages", .{self.params.networkId});
     }
 
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn publishWithTopic(ptr: *anyopaque, topic_spec: interface.GossipTopicSpec, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // publish
-        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
+        var topic = try interface.LeanNetworkTopic.init(
+            self.allocator,
+            topic_spec.topic,
+            topic_spec.subnet_id,
+            .ssz_snappy,
+            self.params.network_name,
+        );
         defer topic.deinit();
         const topic_str = try topic.encodeZ();
         defer self.allocator.free(topic_str);
 
-        // TODO: deinit the message later ob once done
         const message = try data.serialize(self.allocator);
         defer self.allocator.free(message);
 
@@ -1015,7 +1067,7 @@ pub const EthLibp2p = struct {
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []const interface.GossipTopicSpec, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.subscribe(topics, handler);
     }
@@ -1172,7 +1224,7 @@ pub const EthLibp2p = struct {
         return .{
             .gossip = .{
                 .ptr = self,
-                .publishFn = publish,
+                .publishWithTopicFn = publishWithTopic,
                 .subscribeFn = subscribe,
                 .onGossipFn = onGossip,
             },

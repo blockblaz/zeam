@@ -3,6 +3,7 @@ pub const Clock = clockFactory.Clock;
 
 const nodeFactory = @import("./node.zig");
 pub const BeamNode = nodeFactory.BeamNode;
+pub const buildGossipTopicSpecs = nodeFactory.buildGossipTopicSpecs;
 
 pub const chainFactory = @import("./chain.zig");
 pub const fcFactory = @import("./forkchoice.zig");

@@ -294,7 +294,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             );
         }
 
-        // Compute aggregated signatures using the shared method
+        // Aggregate gossip signatures into proofs for block production
         var aggregation = try types.AggregatedAttestationsResult.init(allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
@@ -310,11 +310,10 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             }
             aggregation.attestation_signatures.deinit();
         };
-        try aggregation.computeAggregatedSignatures(
+        try aggregation.aggregateGossipSignatures(
             attestations.items,
             &beam_state.validators,
             &signatures_map,
-            null, // no pre-aggregated payloads in mock
         );
 
         const proposer_index = slot % genesis_config.numValidators();

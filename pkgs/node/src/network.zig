@@ -129,8 +129,8 @@ pub const Network = struct {
         self.allocator.destroy(self.connected_peers);
     }
 
-    pub fn publish(self: *Self, data: *const networks.GossipMessage) !void {
-        return self.backend.gossip.publish(data);
+    pub fn publishWithTopic(self: *Self, topic: networks.GossipTopicSpec, data: *const networks.GossipMessage) !void {
+        return self.backend.gossip.publishWithTopic(topic, data);
     }
 
     pub fn sendStatus(

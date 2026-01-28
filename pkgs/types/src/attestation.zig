@@ -5,6 +5,7 @@ const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
 
 const mini_3sf = @import("./mini_3sf.zig");
+const aggregation = @import("./aggregation.zig");
 const utils = @import("./utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -137,6 +138,28 @@ pub const AggregatedAttestation = struct {
     }
 
     pub fn toJsonString(self: *const AggregatedAttestation, allocator: Allocator) ![]const u8 {
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
+pub const SignedAggregatedAttestation = struct {
+    data: AttestationData,
+    proof: aggregation.AggregatedSignatureProof,
+
+    pub fn deinit(self: *SignedAggregatedAttestation) void {
+        self.proof.deinit();
+    }
+
+    pub fn toJson(self: *const SignedAggregatedAttestation, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.init(allocator);
+        try obj.put("data", try self.data.toJson(allocator));
+        try obj.put("proof", try self.proof.toJson(allocator));
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const SignedAggregatedAttestation, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
         defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);

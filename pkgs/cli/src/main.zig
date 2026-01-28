@@ -437,6 +437,9 @@ fn mainInner() !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
+                const gossip_topics1 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                errdefer allocator.free(gossip_topics1);
+
                 network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
                 const priv_key1 = key_pair1.v4.toString();
@@ -455,10 +458,14 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
                     .node_registry = test_registry1,
+                    .gossip_topics = gossip_topics1,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
+                const gossip_topics2 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                errdefer allocator.free(gossip_topics2);
+
                 network2 = try allocator.create(networks.EthLibp2p);
                 const key_pair2 = enr_lib.KeyPair.generate();
                 const priv_key2 = key_pair2.v4.toString();
@@ -478,11 +485,14 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
                     .node_registry = test_registry2,
+                    .gossip_topics = gossip_topics2,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
                 // init network3 for node 3 (delayed sync node)
                 network3 = try allocator.create(networks.EthLibp2p);
+                const gossip_topics3 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                errdefer allocator.free(gossip_topics3);
                 const key_pair3 = enr_lib.KeyPair.generate();
                 const priv_key3 = key_pair3.v4.toString();
                 listen_addresses3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9003")});
@@ -500,6 +510,7 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses3,
                     .connect_peers = connect_peers3,
                     .node_registry = test_registry3,
+                    .gossip_topics = gossip_topics3,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
