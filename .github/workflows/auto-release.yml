@@ -54,7 +54,7 @@ jobs:
         fi
 
         if [ -n "$DEVNET_TAG_LOWER" ] && [ "$DEVNET_TAG_LOWER" != "null" ]; then
-          # Convert to capital D (devnet1 -> Devnet1), since branch t obe crated is also devnet
+          # Convert to capital D (devnet1 -> Devnet1), since branch to be created is also devnetx
           DEVNET_TAG="D${DEVNET_TAG_LOWER:1}"
           echo "devnet_tag=$DEVNET_TAG" >> $GITHUB_OUTPUT
           echo "has_devnet_tag=true" >> $GITHUB_OUTPUT
@@ -243,10 +243,11 @@ jobs:
         DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
         echo "🔍 Checking for existing $DEVNET_TAG release..."
 
-        # Delete existing GitHub (Devnet) release if it exists
+        # Get release ID if release exists
         RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$DEVNET_TAG --jq '.id' 2>/dev/null || echo "")
-        if [ -n "$RELEASE_ID" ]; then
-          echo "🗑️ Deleting existing GitHub release for $DEVNET_TAG (ID: $RELEASE_ID)"
+
+        if [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+          echo "🗑️ Found existing GitHub release for $DEVNET_TAG (ID: $RELEASE_ID), deleting..."
           gh api --method DELETE repos/${{ github.repository }}/releases/$RELEASE_ID
           echo "✅ Deleted existing GitHub release"
         else
@@ -263,15 +264,15 @@ jobs:
         DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
         VERSION="${{ needs.create-tags.outputs.version }}"
 
-        # Find the previous devnet tag
-        PREVIOUS_TAG=$(git tag -l "Devnet*" --sort=-version:refname | head -2 | tail -1)
+        # Find the previous devnet tag (look for both Devnet* and devnet* patterns)
+        PREVIOUS_TAG=$(git tag -l | grep -iE "^[Dd]evnet[0-9]+" | sort -V -r | grep -v "^$DEVNET_TAG$" | head -1)
 
         if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$DEVNET_TAG" ]; then
           echo "✅ Found previous tag: $PREVIOUS_TAG"
           echo "📝 Generating changelog from $PREVIOUS_TAG to current release..."
           
           # Generate commit log
-          COMMIT_LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "$PREVIOUS_TAG"..HEAD | head -20)
+          COMMIT_LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "$PREVIOUS_TAG"..HEAD)
           
           # Generate file changes summary
           FILES_CHANGED=$(git diff --name-only "$PREVIOUS_TAG"..HEAD | wc -l)
