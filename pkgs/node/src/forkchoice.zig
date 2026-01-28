@@ -313,7 +313,7 @@ pub const ForkChoice = struct {
         self.protoArray.indices.deinit();
         self.attestations.deinit();
         self.deltas.deinit();
-        
+
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
         self.gossip_signatures.deinit();
@@ -1354,6 +1354,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit();
@@ -1670,6 +1671,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
 
     return .{
@@ -2616,6 +2618,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
