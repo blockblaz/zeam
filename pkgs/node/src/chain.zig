@@ -320,6 +320,9 @@ pub const BeamChain = struct {
             }
             aggregation.attestation_signatures.deinit();
         };
+        // Lock mutex to protect concurrent access to gossip_signatures and aggregated_payloads
+        self.forkChoice.signatures_mutex.lock();
+        defer self.forkChoice.signatures_mutex.unlock();
         try aggregation.computeAggregatedSignatures(
             attestations,
             &pre_state.validators,
