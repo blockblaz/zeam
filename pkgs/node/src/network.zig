@@ -356,6 +356,70 @@ pub const Network = struct {
         return &[_]types.Root{};
     }
 
+    /// Prune all cached blocks with slots at or before the finalized slot,
+    /// including their entire chain — both descendants (children of pre-finalized
+    /// blocks can never be included) and ancestors (parents must also be pre-finalized).
+    /// Returns the number of blocks pruned.
+    pub fn pruneCachedBlocksBySlot(self: *Self, finalized_slot: types.Slot) usize {
+        // First pass: collect roots of blocks at or before finalized slot
+        var roots_to_prune = std.ArrayList(types.Root).init(self.allocator);
+        defer roots_to_prune.deinit();
+
+        var it = self.fetched_blocks.iterator();
+        while (it.next()) |entry| {
+            const block_slot = entry.value_ptr.*.message.block.slot;
+            if (block_slot <= finalized_slot) {
+                roots_to_prune.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        // Second pass: recursively remove each root and its full chain (parents + descendants)
+        var pruned: usize = 0;
+        for (roots_to_prune.items) |root| {
+            pruned += self.removeFetchedBlockChain(root);
+        }
+        return pruned;
+    }
+
+    /// Remove a block and its entire chain: walk up to ancestors (parents)
+    /// and down to descendants (children), removing all from cache.
+    /// Returns the number of blocks removed.
+    pub fn removeFetchedBlockChain(self: *Self, root: types.Root) usize {
+        var stack = std.ArrayList(types.Root).init(self.allocator);
+        defer stack.deinit();
+
+        stack.append(root) catch return 0;
+
+        // Walk up: traverse parent chain and add all cached ancestors
+        var current = root;
+        while (self.getFetchedBlock(current)) |block_ptr| {
+            const parent_root = block_ptr.message.block.parent_root;
+            if (self.hasFetchedBlock(parent_root)) {
+                stack.append(parent_root) catch break;
+                current = parent_root;
+            } else {
+                break;
+            }
+        }
+
+        // Walk down: process stack, expanding children as we go
+        var pruned: usize = 0;
+        while (stack.items.len > 0) {
+            const current_root = stack.pop().?;
+
+            // Enqueue children before removing (since removal modifies the children map)
+            const children_slice = self.getChildrenOfBlock(current_root);
+            for (children_slice) |child_root| {
+                stack.append(child_root) catch continue;
+            }
+
+            if (self.removeFetchedBlock(current_root)) {
+                pruned += 1;
+            }
+        }
+        return pruned;
+    }
+
     pub fn sendStatusRequest(
         self: *Self,
         peer_id: []const u8,

@@ -103,6 +103,8 @@ pub const BeamNode = struct {
             .node_registry = opts.node_registry,
         };
 
+        chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
+
         network_init_cleanup = false;
     }
 
@@ -140,58 +142,34 @@ pub const BeamNode = struct {
                 _ = self.network.removePendingBlockRoot(block_root);
 
                 if (!hasParentBlock) {
-                    // Check if cache is full to prevent unbounded growth
-                    if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
-                        self.logger.warn(
-                            "Block cache full ({d} blocks), discarding gossip block 0x{s}",
-                            .{ constants.MAX_CACHED_BLOCKS, std.fmt.fmtSliceHexLower(block_root[0..]) },
-                        );
-                        return;
-                    }
-
-                    // Check if already cached (avoid duplicate caching)
-                    if (self.network.hasFetchedBlock(block_root)) {
-                        self.logger.debug(
-                            "Gossip block 0x{s} already cached, skipping",
-                            .{std.fmt.fmtSliceHexLower(block_root[0..])},
-                        );
-                        return;
-                    }
-
                     // Cache this block for later processing when parent arrives
-                    const block_ptr = self.allocator.create(types.SignedBlockWithAttestation) catch |err| {
-                        self.logger.warn("failed to allocate block for caching: {any}", .{err});
-                        return;
-                    };
-
-                    types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, block_ptr) catch |err| {
-                        self.allocator.destroy(block_ptr);
-                        self.logger.warn("failed to clone gossip block for caching: {any}", .{err});
-                        return;
-                    };
-
-                    self.network.cacheFetchedBlock(block_root, block_ptr) catch |err| {
-                        block_ptr.deinit();
-                        self.allocator.destroy(block_ptr);
-                        self.logger.warn("failed to cache gossip block: {any}", .{err});
-                        return;
-                    };
-
-                    self.logger.debug(
-                        "Cached gossip block 0x{s} at slot {d}, fetching parent 0x{s}",
-                        .{
-                            std.fmt.fmtSliceHexLower(block_root[0..]),
-                            block.slot,
-                            std.fmt.fmtSliceHexLower(parent_root[0..]),
-                        },
-                    );
-
-                    // Fetch the parent block
-                    const roots = [_]types.Root{parent_root};
-                    self.fetchBlockByRoots(&roots, 0) catch |err| {
-                        self.logger.warn("failed to fetch parent block by root: {any}", .{err});
-                    };
-
+                    if (self.cacheBlockAndFetchParent(block_root, signed_block, 0)) |_| {
+                        self.logger.debug(
+                            "Cached gossip block 0x{s} at slot {d}, fetching parent 0x{s}",
+                            .{
+                                std.fmt.fmtSliceHexLower(block_root[0..]),
+                                block.slot,
+                                std.fmt.fmtSliceHexLower(parent_root[0..]),
+                            },
+                        );
+                    } else |err| {
+                        if (err == CacheBlockError.PreFinalized) {
+                            // Block is pre-finalized - prune any cached descendants waiting for this parent
+                            self.logger.info(
+                                "gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
+                                .{
+                                    std.fmt.fmtSliceHexLower(block_root[0..]),
+                                    block.slot,
+                                },
+                            );
+                            self.pruneCachedBlockSubtree(block_root);
+                        } else {
+                            self.logger.warn("failed to cache gossip block 0x{s}: {any}", .{
+                                std.fmt.fmtSliceHexLower(block_root[0..]),
+                                err,
+                            });
+                        }
+                    }
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
@@ -311,6 +289,11 @@ pub const BeamNode = struct {
         }
     }
 
+    fn pruneCachedBlocksCallback(ptr: *anyopaque, finalized_slot: types.Slot) usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.network.pruneCachedBlocksBySlot(finalized_slot);
+    }
+
     fn getReqRespResponseHandler(self: *Self) networks.OnReqRespResponseCbHandler {
         return .{
             .ptr = self,
@@ -393,6 +376,79 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Error type for cacheBlockAndFetchParent operation.
+    const CacheBlockError = error{
+        AlreadyCached,
+        PreFinalized,
+        AllocationFailed,
+        CloneFailed,
+        CachingFailed,
+        FetchFailed,
+    };
+
+    /// Cache a block and fetch its parent. Common logic used by both gossip and req-resp handlers.
+    ///
+    /// Arguments:
+    /// - `block_root`: The root hash of the block to cache
+    /// - `signed_block`: The block to cache (will be cloned)
+    /// - `depth`: The depth for parent fetch (0 for gossip, current_depth+1 for req-resp)
+    ///
+    /// Returns the parent root on success so caller can log it.
+    fn cacheBlockAndFetchParent(
+        self: *Self,
+        block_root: types.Root,
+        signed_block: types.SignedBlockWithAttestation,
+        depth: u32,
+    ) CacheBlockError!types.Root {
+        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        const block_slot = signed_block.message.block.slot;
+
+        // Early rejection: don't cache blocks at or before finalized slot
+        // These blocks will definitely be rejected during processing, so save memory
+        if (block_slot <= finalized_slot) {
+            return CacheBlockError.PreFinalized;
+        }
+
+        // Check if already cached (avoid duplicate caching)
+        if (self.network.hasFetchedBlock(block_root)) {
+            return CacheBlockError.AlreadyCached;
+        }
+
+        // If cache is full, reject - proactive pruning on finalization keeps the cache bounded
+        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
+            self.logger.warn("Cache full ({d} blocks), rejecting block 0x{s} at slot {d}", .{
+                self.network.fetched_blocks.count(),
+                std.fmt.fmtSliceHexLower(block_root[0..]),
+                block_slot,
+            });
+            return CacheBlockError.CachingFailed;
+        }
+
+        // Allocate and clone the block
+        const block_ptr = self.allocator.create(types.SignedBlockWithAttestation) catch {
+            return CacheBlockError.AllocationFailed;
+        };
+        errdefer self.allocator.destroy(block_ptr);
+
+        types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, block_ptr) catch {
+            return CacheBlockError.CloneFailed;
+        };
+        errdefer block_ptr.deinit();
+
+        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
+            return CacheBlockError.CachingFailed;
+        };
+
+        // Fetch the parent block
+        const parent_root = signed_block.message.block.parent_root;
+        const roots = [_]types.Root{parent_root};
+        self.fetchBlockByRoots(&roots, depth) catch {
+            return CacheBlockError.FetchFailed;
+        };
+
+        return parent_root;
+    }
+
     /// Remove `root` and all cached descendants from `network.fetched_blocks`, and clear any matching
     /// entries from `network.pending_block_roots`.
     ///
@@ -464,37 +520,34 @@ pub const BeamNode = struct {
                         return;
                     }
 
-                    // Check if cache is full to prevent unbounded growth
-                    if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
-                        self.logger.warn(
-                            "Block cache full ({d} blocks), discarding block 0x{s}",
-                            .{ constants.MAX_CACHED_BLOCKS, std.fmt.fmtSliceHexLower(block_root[0..]) },
+                    // Cache this block and fetch parent
+                    if (self.cacheBlockAndFetchParent(block_root, signed_block.*, current_depth + 1)) |parent_root| {
+                        self.logger.debug(
+                            "Cached block 0x{s} at depth {d}, fetching parent 0x{s}",
+                            .{
+                                std.fmt.fmtSliceHexLower(block_root[0..]),
+                                current_depth,
+                                std.fmt.fmtSliceHexLower(parent_root[0..]),
+                            },
                         );
-                        return;
+                    } else |cache_err| {
+                        if (cache_err == CacheBlockError.PreFinalized) {
+                            // Block is pre-finalized - prune any cached descendants waiting for this parent
+                            self.logger.info(
+                                "block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
+                                .{
+                                    std.fmt.fmtSliceHexLower(block_root[0..]),
+                                    signed_block.message.block.slot,
+                                },
+                            );
+                            self.pruneCachedBlockSubtree(block_root);
+                        } else {
+                            self.logger.warn("failed to cache block 0x{s}: {any}", .{
+                                std.fmt.fmtSliceHexLower(block_root[0..]),
+                                cache_err,
+                            });
+                        }
                     }
-
-                    // Cache this block for later processing
-                    const block_ptr = try self.allocator.create(types.SignedBlockWithAttestation);
-                    errdefer self.allocator.destroy(block_ptr);
-
-                    try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block.*, block_ptr);
-                    errdefer block_ptr.deinit();
-
-                    try self.network.cacheFetchedBlock(block_root, block_ptr);
-
-                    self.logger.debug(
-                        "Cached block 0x{s} at depth {d}, fetching parent 0x{s}",
-                        .{
-                            std.fmt.fmtSliceHexLower(block_root[0..]),
-                            current_depth,
-                            std.fmt.fmtSliceHexLower(signed_block.message.block.parent_root[0..]),
-                        },
-                    );
-
-                    // Fetch the parent block with increased depth
-                    const parent_root = signed_block.message.block.parent_root;
-                    const roots = [_]types.Root{parent_root};
-                    try self.fetchBlockByRoots(&roots, current_depth + 1);
                     return;
                 }
 
@@ -572,25 +625,32 @@ pub const BeamNode = struct {
                                 });
                             }
 
-                            // Proactive initial sync: if peer is ahead of us, request their head block
+                            // Proactive initial sync: if peer's finalized slot is ahead of us, request their head block
                             // This triggers parent syncing which will fetch all blocks back to our current state
-                            const our_head_slot = self.chain.forkChoice.head.slot;
-                            if (status_resp.head_slot > our_head_slot) {
-                                self.logger.info("peer {s}{} is ahead (peer_head_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{s}", .{
-                                    status_ctx.peer_id,
-                                    self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                    status_resp.head_slot,
-                                    our_head_slot,
-                                    std.fmt.fmtSliceHexLower(&status_resp.head_root),
-                                });
-                                const roots = [_]types.Root{status_resp.head_root};
-                                self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                    self.logger.warn("failed to initiate sync by fetching head block from peer {s}{}: {any}", .{
-                                        status_ctx.peer_id,
-                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                        err,
-                                    });
-                                };
+                            // We compare finalized slots (not head slots) because finalized is more reliable for sync decisions
+                            const sync_status = self.chain.getSyncStatus();
+                            switch (sync_status) {
+                                .behind_peers => |info| {
+                                    // Only sync from this peer if their finalized slot is ahead of ours
+                                    if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
+                                        self.logger.info("peer {s}{} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{s}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.finalized_slot,
+                                            info.head_slot,
+                                            std.fmt.fmtSliceHexLower(&status_resp.head_root),
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{}: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
+                                },
+                                .synced, .no_peers => {},
                             }
                         },
                         else => {
