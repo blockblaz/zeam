@@ -243,10 +243,12 @@ jobs:
         DEVNET_TAG="${{ needs.create-tags.outputs.devnet_tag }}"
         echo "🔍 Checking for existing $DEVNET_TAG release..."
 
-        # Check if GitHub release exists and delete if found
-        if gh api repos/${{ github.repository }}/releases/tags/$DEVNET_TAG >/dev/null 2>&1; then
-          echo "🗑️ Found existing GitHub release for $DEVNET_TAG, deleting..."
-          gh api --method DELETE repos/${{ github.repository }}/releases/tags/$DEVNET_TAG
+        # Get release ID if release exists
+        RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$DEVNET_TAG --jq '.id' 2>/dev/null || echo "")
+
+        if [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+          echo "🗑️ Found existing GitHub release for $DEVNET_TAG (ID: $RELEASE_ID), deleting..."
+          gh api --method DELETE repos/${{ github.repository }}/releases/$RELEASE_ID
           echo "✅ Deleted existing GitHub release"
         else
           echo "ℹ️ No existing GitHub release found for $DEVNET_TAG"
