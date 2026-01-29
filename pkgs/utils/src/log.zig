@@ -99,6 +99,7 @@ pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.l
         .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams, moduleTag),
         .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams, moduleTag),
         .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .n4 => return compTimeLog(.n4, activeLevel, level, fmt, args, fileLogParams, moduleTag),
     }
 }
 
@@ -107,6 +108,7 @@ const LoggerScope = enum {
     n1,
     n2,
     n3,
+    n4,
 };
 
 pub const ModuleTag = enum {

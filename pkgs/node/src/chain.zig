@@ -333,6 +333,9 @@ pub const BeamChain = struct {
             }
             aggregation.attestation_signatures.deinit();
         };
+        // Lock mutex to protect concurrent access to gossip_signatures and aggregated_payloads
+        self.forkChoice.signatures_mutex.lock();
+        defer self.forkChoice.signatures_mutex.unlock();
         try aggregation.computeAggregatedSignatures(
             attestations,
             &pre_state.validators,
@@ -533,10 +536,8 @@ pub const BeamChain = struct {
                 });
 
                 if (!hasBlock) {
-                    self.validateBlock(block, true) catch |err| {
-                        self.module_logger.warn("gossip block validation failed: {any}", .{err});
-                        return .{}; // Drop invalid gossip attestations
-                    };
+                    // Validation errors propagate to node.zig for context-aware logging
+                    try self.validateBlock(block, true);
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
@@ -583,9 +584,16 @@ pub const BeamChain = struct {
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.toAttestation(), false) catch |err| {
-                    self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    return .{}; // Drop invalid gossip attestations
+                    // Propagate unknown block errors to node.zig for context-aware logging
+                    // (downgrade to debug when the missing block is already being fetched)
+                    switch (err) {
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        else => {
+                            self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
+                            return .{};
+                        },
+                    }
                 };
 
                 // Process validated attestation
@@ -1077,10 +1085,7 @@ pub const BeamChain = struct {
         const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
 
         if (!hasParentBlock) {
-            self.module_logger.warn("gossip block validation failed slot={d} with unknown parent=0x{s}", .{
-                block.slot,
-                std.fmt.fmtSliceHexLower(&block.parent_root),
-            });
+            // Log decision moved to node.zig where we can check if parent is already being fetched
             return BlockValidationError.UnknownParentBlock;
         }
     }
@@ -1319,7 +1324,7 @@ const AttestationValidationError = error{
     TargetCheckpointSlotMismatch,
     AttestationTooFarInFuture,
 };
-const BlockValidationError = error{
+pub const BlockValidationError = error{
     UnknownParentBlock,
 };
 

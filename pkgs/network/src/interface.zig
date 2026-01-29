@@ -34,7 +34,7 @@ pub const DisconnectionReason = enum(u32) {
 };
 
 const topic_prefix = "leanconsensus";
-const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
+const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
