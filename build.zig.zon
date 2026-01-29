@@ -20,7 +20,7 @@
             .hash = "datetime-0.8.0-cJNXzP_YAQBxQ5hkNNP6ScnG5XsqciJmeP5RVV4xwCBA",
         },
         .metrics = .{
-            .url = "https://github.com/chetanyb/metrics.zig/archive/ea0a0eab0502c08f9438f81db9ffe79a10b68a9b.tar.gz",
+            .url = "https://github.com/blockblaz/metrics.zig/archive/ea0a0eab0502c08f9438f81db9ffe79a10b68a9b.tar.gz",
             .hash = "metrics-0.0.0-W7G4eJW1AQCvJ4jSW0a0XlgBoaT86lvYRU0rjyQk04LE",
         },
         .zig_enr = .{
