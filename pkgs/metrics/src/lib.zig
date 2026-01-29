@@ -109,7 +109,7 @@ const Metrics = struct {
     const BlockHeaderHashHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const GetJustificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
     const WithJustificationsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
-    // Justifications cache metric types - hit time should be fast (clone), miss time slower (build from state)
+    // Justifications cache metric types
     const JustificationsCacheHitsCounter = metrics_lib.Counter(u64);
     const JustificationsCacheMissesCounter = metrics_lib.Counter(u64);
     const JustificationsCacheHitTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.0000005, 0.000001, 0.000002, 0.000005, 0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001 });
