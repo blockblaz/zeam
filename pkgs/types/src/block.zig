@@ -375,6 +375,16 @@ pub const AggregatedAttestationsResult = struct {
         };
     }
 
+    fn ensureAttestationAppendCapacity(self: *Self) !void {
+        const max = params.VALIDATOR_REGISTRY_LIMIT;
+        if (self.attestations.len() >= max or self.attestation_signatures.len() >= max) {
+            return error.Overflow;
+        }
+
+        try self.attestations.inner.ensureTotalCapacity(self.attestations.len() + 1);
+        try self.attestation_signatures.inner.ensureTotalCapacity(self.attestation_signatures.len() + 1);
+    }
+
     fn buildAttestationGroups(
         allocator: Allocator,
         attestations_list: []const Attestation,
@@ -524,8 +534,9 @@ pub const AggregatedAttestationsResult = struct {
             }
         }
 
-        try self.attestations.append(.{ .aggregation_bits = att_bits, .data = group.data });
-        try self.attestation_signatures.append(proof);
+        try self.ensureAttestationAppendCapacity();
+        self.attestations.inner.appendAssumeCapacity(.{ .aggregation_bits = att_bits, .data = group.data });
+        self.attestation_signatures.inner.appendAssumeCapacity(proof);
     }
 
     /// Aggregate individual gossip signatures into proofs (used by committee aggregators).
@@ -590,11 +601,11 @@ pub const AggregatedAttestationsResult = struct {
 
     fn selectBestProofForGroup(
         remaining: *const std.DynamicBitSet,
+        remaining_count: usize,
         candidates: *const AggregatedPayloadsList,
     ) ?*const aggregation.AggregatedSignatureProof {
         var best_proof: ?*const aggregation.AggregatedSignatureProof = null;
         var max_coverage: usize = 0;
-        const remaining_count = remaining.count();
 
         // Choose the proof that covers the most remaining validators.
         for (candidates.items) |*stored| {
@@ -626,6 +637,7 @@ pub const AggregatedAttestationsResult = struct {
         self: *Self,
         group: *const AttestationGroup,
         remaining: *std.DynamicBitSet,
+        remaining_count: *usize,
         proof: *const aggregation.AggregatedSignatureProof,
     ) !void {
         const allocator = self.allocator;
@@ -642,14 +654,16 @@ pub const AggregatedAttestationsResult = struct {
         for (0..cloned_proof.participants.len()) |i| {
             if (cloned_proof.participants.get(i) catch false) {
                 try attestation.aggregationBitsSet(&att_bits, i, true);
-                if (i < remaining.capacity()) {
+                if (i < remaining.capacity() and remaining.isSet(i)) {
                     remaining.unset(i);
+                    remaining_count.* -= 1;
                 }
             }
         }
 
-        try self.attestations.append(.{ .aggregation_bits = att_bits, .data = group.data });
-        try self.attestation_signatures.append(cloned_proof);
+        try self.ensureAttestationAppendCapacity();
+        self.attestations.inner.appendAssumeCapacity(.{ .aggregation_bits = att_bits, .data = group.data });
+        self.attestation_signatures.inner.appendAssumeCapacity(cloned_proof);
     }
 
     /// Select aggregated proofs from stored payloads (used by proposers; no fallback).
@@ -688,9 +702,10 @@ pub const AggregatedAttestationsResult = struct {
             const data_root = group.data_root;
             var remaining = try initRemainingValidators(allocator, group);
             defer remaining.deinit();
+            var remaining_count = remaining.count();
 
             if (aggregated_payloads) |agg_payloads| {
-                while (remaining.count() > 0) {
+                while (remaining_count > 0) {
                     // Pick a deterministic target validator to drive lookup.
                     const target_id = remaining.findFirstSet() orelse break;
                     const vid: ValidatorIndex = @intCast(target_id);
@@ -698,18 +713,20 @@ pub const AggregatedAttestationsResult = struct {
                     // Proofs are indexed by participant id and data root.
                     const candidates = agg_payloads.get(.{ .validator_id = vid, .data_root = data_root }) orelse {
                         remaining.unset(target_id);
+                        remaining_count -= 1;
                         continue;
                     };
 
                     if (candidates.items.len == 0) {
                         remaining.unset(target_id);
+                        remaining_count -= 1;
                         continue;
                     }
 
-                    const best_proof = selectBestProofForGroup(&remaining, &candidates) orelse {
+                    const best_proof = selectBestProofForGroup(&remaining, remaining_count, &candidates) orelse {
                         break;
                     };
-                    try self.appendSelectedProofForGroup(group, &remaining, best_proof);
+                    try self.appendSelectedProofForGroup(group, &remaining, &remaining_count, best_proof);
                 }
             }
         }

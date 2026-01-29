@@ -80,6 +80,7 @@ pub const ValidatorClient = struct {
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
+            4 => return null,
             else => @panic("interval error"),
         }
     }

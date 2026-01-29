@@ -345,78 +345,22 @@ pub const BeamChain = struct {
         const available_attestations = try self.forkChoice.getLatestNewAttestations();
         defer self.allocator.free(available_attestations);
 
-        var selected_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        var selected_attestations = try self.selectAttestationsForBlock(
+            opts,
+            parent_root,
+            pre_state,
+            available_attestations,
+        );
         defer selected_attestations.deinit();
-
-        var selected_keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
-        defer selected_keys.deinit();
-
-        if (available_attestations.len > 0) {
-            while (true) {
-                const candidate_attestations =
-                    try buildAggregatedAttestationsFromAttestations(self.allocator, selected_attestations.items);
-                var candidate_block = types.BeamBlock{
-                    .slot = opts.slot,
-                    .proposer_index = opts.proposer_index,
-                    .parent_root = parent_root,
-                    .state_root = undefined,
-                    .body = types.BeamBlockBody{
-                        .attestations = candidate_attestations,
-                    },
-                };
-                defer candidate_block.deinit();
-
-                var temp_state_ptr = try self.allocator.create(types.BeamState);
-                errdefer {
-                    temp_state_ptr.deinit();
-                    self.allocator.destroy(temp_state_ptr);
-                }
-                try types.sszClone(self.allocator, types.BeamState, pre_state.*, temp_state_ptr);
-                try stf.apply_raw_block(self.allocator, temp_state_ptr, &candidate_block, self.block_building_logger);
-
-                var added_any = false;
-                var no_payloads = false;
-                self.forkChoice.signatures_mutex.lock();
-                defer self.forkChoice.signatures_mutex.unlock();
-                if (self.forkChoice.aggregated_payloads.count() == 0) {
-                    no_payloads = true;
-                } else {
-                    for (available_attestations) |attestation| {
-                        const data = attestation.data;
-                        if (!self.forkChoice.protoArray.indices.contains(data.head.root)) continue;
-                        if (!checkpointEquals(data.source, temp_state_ptr.latest_justified)) continue;
-
-                        const data_root = try data.sszRoot(self.allocator);
-                        const sig_key = types.SignatureKey{
-                            .validator_id = attestation.validator_id,
-                            .data_root = data_root,
-                        };
-
-                        if (selected_keys.contains(sig_key)) continue;
-                        if (self.forkChoice.aggregated_payloads.get(sig_key) == null) continue;
-
-                        try selected_attestations.append(attestation);
-                        try selected_keys.put(sig_key, {});
-                        added_any = true;
-                    }
-                }
-
-                temp_state_ptr.deinit();
-                self.allocator.destroy(temp_state_ptr);
-
-                if (no_payloads or !added_any) break;
-            }
-        }
-        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+        var post_state_opt = try self.clonePostState(pre_state);
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
             self.allocator.destroy(post_state_ptr);
         };
         const post_state = post_state_opt.?;
-        try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
         // Select aggregated proofs from stored payloads (no local aggregation fallback).
-        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        var aggregation = try self.selectAggregatedProofsForBlock(selected_attestations.items);
         var agg_att_opt: ?*types.AggregatedAttestations = &aggregation.attestations;
         var agg_sig_opt: ?*types.AttestationSignatures = &aggregation.attestation_signatures;
         errdefer if (agg_att_opt) |list| {
@@ -431,13 +375,6 @@ pub const BeamChain = struct {
             }
             list.deinit();
         };
-        self.forkChoice.signatures_mutex.lock();
-        defer self.forkChoice.signatures_mutex.unlock();
-        try aggregation.selectAggregatedProofs(
-            selected_attestations.items,
-            &self.forkChoice.aggregated_payloads,
-        );
-
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
@@ -463,25 +400,7 @@ pub const BeamChain = struct {
             attestation_signatures.deinit();
         }
 
-        const block_str = try block.toJsonString(self.allocator);
-        defer self.allocator.free(block_str);
-
-        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
-
-        // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
-
-        const block_str_2 = try block.toJsonString(self.allocator);
-        defer self.allocator.free(block_str_2);
-
-        self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
-
-        // 3. cache state to save recompute while adding the block on publish
-        var block_root: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
-
-        try self.states.put(block_root, post_state);
-        post_state_opt = null;
+        const block_root = try self.applyBlockAndCacheState(opts, &block, post_state, &post_state_opt);
 
         var forkchoice_added = false;
         errdefer if (!forkchoice_added) {
@@ -494,21 +413,161 @@ pub const BeamChain = struct {
         // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
         //   them in the forkchoice
-        _ = try self.forkChoice.onBlock(block, post_state, .{
-            .currentSlot = block.slot,
-            .blockDelayMs = 0,
-            .blockRoot = block_root,
-            // confirmed in publish
-            .confirmed = false,
-        });
+        try self.addBlockToForkchoice(&block, post_state, block_root);
         forkchoice_added = true;
-        _ = try self.forkChoice.updateHead();
 
         return .{
             .block = block,
             .blockRoot = block_root,
             .attestation_signatures = attestation_signatures,
         };
+    }
+
+    fn clonePostState(
+        self: *Self,
+        pre_state: *const types.BeamState,
+    ) !?*types.BeamState {
+        const post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+        const post_state = post_state_opt.?;
+        try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
+        return post_state_opt;
+    }
+
+    fn applyBlockAndCacheState(
+        self: *Self,
+        opts: BlockProductionParams,
+        block: *types.BeamBlock,
+        post_state: *types.BeamState,
+        post_state_opt: *?*types.BeamState,
+    ) !types.Root {
+        const block_str = try block.toJsonString(self.allocator);
+        defer self.allocator.free(block_str);
+        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
+
+        // 2. apply STF to get post state & update post state root & cache it
+        try stf.apply_raw_block(self.allocator, post_state, block, self.block_building_logger);
+
+        const block_str_2 = try block.toJsonString(self.allocator);
+        defer self.allocator.free(block_str_2);
+        self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
+
+        // 3. cache state to save recompute while adding the block on publish
+        var block_root: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block.*, &block_root, self.allocator);
+        try self.states.put(block_root, post_state);
+        post_state_opt.* = null;
+
+        return block_root;
+    }
+
+    fn addBlockToForkchoice(
+        self: *Self,
+        block: *types.BeamBlock,
+        post_state: *types.BeamState,
+        block_root: types.Root,
+    ) !void {
+        // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
+        //   them in the forkchoice
+        _ = try self.forkChoice.onBlock(block.*, post_state, .{
+            .currentSlot = block.slot,
+            .blockDelayMs = 0,
+            .blockRoot = block_root,
+            // confirmed in publish
+            .confirmed = false,
+        });
+        _ = try self.forkChoice.updateHead();
+    }
+
+    fn selectAttestationsForBlock(
+        self: *Self,
+        opts: BlockProductionParams,
+        parent_root: types.Root,
+        pre_state: *const types.BeamState,
+        available_attestations: []const types.Attestation,
+    ) !std.ArrayList(types.Attestation) {
+        var selected_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer selected_attestations.deinit();
+
+        if (available_attestations.len == 0) {
+            return selected_attestations;
+        }
+
+        var selected_keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
+        defer selected_keys.deinit();
+
+        while (true) {
+            const candidate_attestations =
+                try buildAggregatedAttestationsFromAttestations(self.allocator, selected_attestations.items);
+            var candidate_block = types.BeamBlock{
+                .slot = opts.slot,
+                .proposer_index = opts.proposer_index,
+                .parent_root = parent_root,
+                .state_root = undefined,
+                .body = types.BeamBlockBody{
+                    .attestations = candidate_attestations,
+                },
+            };
+            defer candidate_block.deinit();
+
+            var temp_state_ptr_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+            errdefer if (temp_state_ptr_opt) |ptr| self.allocator.destroy(ptr);
+
+            const temp_state_ptr = temp_state_ptr_opt.?;
+            try types.sszClone(self.allocator, types.BeamState, pre_state.*, temp_state_ptr);
+            temp_state_ptr_opt = null;
+            defer {
+                temp_state_ptr.deinit();
+                self.allocator.destroy(temp_state_ptr);
+            }
+            try stf.apply_raw_block(self.allocator, temp_state_ptr, &candidate_block, self.block_building_logger);
+
+            var added_any = false;
+            var no_payloads = false;
+            self.forkChoice.signatures_mutex.lock();
+            defer self.forkChoice.signatures_mutex.unlock();
+            if (self.forkChoice.aggregated_payloads.count() == 0) {
+                no_payloads = true;
+            } else {
+                for (available_attestations) |attestation| {
+                    const data = attestation.data;
+                    if (!self.forkChoice.protoArray.indices.contains(data.head.root)) continue;
+                    if (!checkpointEquals(data.source, temp_state_ptr.latest_justified)) continue;
+
+                    const data_root = try data.sszRoot(self.allocator);
+                    const sig_key = types.SignatureKey{
+                        .validator_id = attestation.validator_id,
+                        .data_root = data_root,
+                    };
+
+                    if (selected_keys.contains(sig_key)) continue;
+                    if (self.forkChoice.aggregated_payloads.get(sig_key) == null) continue;
+
+                    try selected_attestations.append(attestation);
+                    try selected_keys.put(sig_key, {});
+                    added_any = true;
+                }
+            }
+
+            if (no_payloads or !added_any) break;
+        }
+
+        return selected_attestations;
+    }
+
+    fn selectAggregatedProofsForBlock(
+        self: *Self,
+        selected_attestations: []const types.Attestation,
+    ) !types.AggregatedAttestationsResult {
+        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        errdefer aggregation.deinit();
+        self.forkChoice.signatures_mutex.lock();
+        defer self.forkChoice.signatures_mutex.unlock();
+        try aggregation.selectAggregatedProofs(
+            selected_attestations,
+            &self.forkChoice.aggregated_payloads,
+        );
+        return aggregation;
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
@@ -1310,15 +1369,8 @@ pub const BeamChain = struct {
 
         if (attestations.len == 0) return gossip_messages;
 
-        var filtered_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        var filtered_attestations = try self.filterCommitteeAttestations(attestations);
         defer filtered_attestations.deinit();
-        try filtered_attestations.ensureTotalCapacity(attestations.len);
-
-        for (attestations) |attestation| {
-            if (self.forkChoice.shouldStoreCommitteeSignature(attestation.validator_id)) {
-                try filtered_attestations.append(attestation);
-            }
-        }
 
         if (filtered_attestations.items.len == 0) return gossip_messages;
 
@@ -1328,11 +1380,52 @@ pub const BeamChain = struct {
         var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
         defer aggregation.deinit();
 
+        var gossip_snapshot = try self.snapshotGossipSignatures(filtered_attestations.items);
+        defer gossip_snapshot.deinit();
+        try aggregation.aggregateGossipSignatures(
+            filtered_attestations.items,
+            &head_state.validators,
+            &gossip_snapshot,
+        );
+
+        const aggregated_attestations = aggregation.attestations.constSlice();
+        const signature_groups = aggregation.attestation_signatures.constSlice();
+        try self.appendAggregatedCommitteeMessages(
+            aggregated_attestations,
+            signature_groups,
+            current_slot,
+            &gossip_messages,
+        );
+
+        return gossip_messages;
+    }
+
+    fn filterCommitteeAttestations(
+        self: *Self,
+        attestations: []const types.Attestation,
+    ) !std.ArrayList(types.Attestation) {
+        var filtered_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer filtered_attestations.deinit();
+        try filtered_attestations.ensureTotalCapacity(attestations.len);
+
+        for (attestations) |attestation| {
+            if (self.forkChoice.shouldStoreCommitteeSignature(attestation.validator_id)) {
+                try filtered_attestations.append(attestation);
+            }
+        }
+
+        return filtered_attestations;
+    }
+
+    fn snapshotGossipSignatures(
+        self: *Self,
+        attestations: []const types.Attestation,
+    ) !types.SignaturesMap {
         // Build the unique key set outside the lock; we only need a stable snapshot of these entries.
         var signature_keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
         defer signature_keys.deinit();
 
-        for (filtered_attestations.items) |attestation| {
+        for (attestations) |attestation| {
             const data_root = try attestation.data.sszRoot(self.allocator);
             const sig_key = types.SignatureKey{
                 .validator_id = attestation.validator_id,
@@ -1346,7 +1439,7 @@ pub const BeamChain = struct {
         // Snapshot only the needed signatures under lock, then aggregate outside the lock.
         // This keeps the critical section short and avoids blocking writers during XMSS aggregation.
         var gossip_snapshot = types.SignaturesMap.init(self.allocator);
-        defer gossip_snapshot.deinit();
+        errdefer gossip_snapshot.deinit();
 
         var signatures_lock: ?*std.Thread.Mutex = &self.forkChoice.signatures_mutex;
         signatures_lock.?.lock();
@@ -1359,14 +1452,17 @@ pub const BeamChain = struct {
         }
         signatures_lock.?.unlock();
         signatures_lock = null;
-        try aggregation.aggregateGossipSignatures(
-            filtered_attestations.items,
-            &head_state.validators,
-            &gossip_snapshot,
-        );
 
-        const aggregated_attestations = aggregation.attestations.constSlice();
-        const signature_groups = aggregation.attestation_signatures.constSlice();
+        return gossip_snapshot;
+    }
+
+    fn appendAggregatedCommitteeMessages(
+        self: *Self,
+        aggregated_attestations: []const types.AggregatedAttestation,
+        signature_groups: []const types.AggregatedSignatureProof,
+        current_slot: types.Slot,
+        gossip_messages: *std.ArrayList(types.SignedAggregatedAttestation),
+    ) !void {
         if (aggregated_attestations.len != signature_groups.len) {
             return error.AggregationMismatch;
         }
@@ -1397,8 +1493,6 @@ pub const BeamChain = struct {
                 };
             }
         }
-
-        return gossip_messages;
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signed_attestation: types.SignedAggregatedAttestation) !void {

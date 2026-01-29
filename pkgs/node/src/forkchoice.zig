@@ -709,10 +709,11 @@ pub const ForkChoice = struct {
                 }
             },
             1 => {},
-            2 => {
+            2 => {},
+            3 => {
                 _ = try self.updateSafeTarget();
             },
-            3 => {
+            4 => {
                 _ = try self.acceptNewAttestations();
             },
             else => @panic("invalid interval"),
