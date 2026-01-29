@@ -113,7 +113,7 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
-    pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized_slot: types.Slot) usize;
+    pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
 
@@ -835,7 +835,7 @@ pub const BeamChain = struct {
             // Prune cached blocks at or before finalized slot
             if (self.prune_cached_blocks_fn) |prune_fn| {
                 if (self.prune_cached_blocks_ctx) |ctx| {
-                    const pruned = prune_fn(ctx, latest_finalized.slot);
+                    const pruned = prune_fn(ctx, latest_finalized);
                     if (pruned > 0) {
                         self.module_logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
                     }
@@ -1072,12 +1072,14 @@ pub const BeamChain = struct {
     /// 4. Parent existence check: parent_root must be known
     /// 5. Slot ordering check: block.slot must be > parent.slot
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
+        _ = is_from_gossip;
+
         const current_slot = self.forkChoice.fcStore.timeSlots;
         const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // 1. Future slot check - reject blocks too far in the future
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
-        const max_future_tolerance: types.Slot = if (is_from_gossip) 1 else constants.MAX_FUTURE_SLOT_TOLERANCE;
+        const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
             self.module_logger.debug("block validation failed: future slot {d} > max allowed {d}", .{
                 block.slot,
@@ -1098,7 +1100,7 @@ pub const BeamChain = struct {
         // 3. Proposer index bounds check - sanity check against registry limit
         // This is a fast pre-check; actual proposer validity is verified during signature verification
         // We use VALIDATOR_REGISTRY_LIMIT as the upper bound since the validator set can grow beyond genesis
-        if (block.proposer_index > params.VALIDATOR_REGISTRY_LIMIT) {
+        if (block.proposer_index >= params.VALIDATOR_REGISTRY_LIMIT) {
             self.module_logger.debug("block validation failed: proposer_index {d} >= VALIDATOR_REGISTRY_LIMIT {d}", .{
                 block.proposer_index,
                 params.VALIDATOR_REGISTRY_LIMIT,
