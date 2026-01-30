@@ -110,6 +110,38 @@ pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
 }
 
+/// Cache for root to slot mapping to optimize block processing performance.
+/// Thread-safety: NOT thread-safe.
+pub const RootToSlotCache = struct {
+    cache: std.AutoHashMap(Root, Slot),
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .cache = std.AutoHashMap(Root, Slot).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.cache.deinit();
+    }
+
+    pub fn put(self: *Self, root: Root, slot: Slot) !void {
+        try self.cache.put(root, slot);
+    }
+
+    pub fn get(self: *const Self, root: Root) ?Slot {
+        return self.cache.get(root);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.cache.count();
+    }
+};
+
 pub const GenesisSpec = struct {
     genesis_time: u64,
     validator_pubkeys: []const Bytes52,

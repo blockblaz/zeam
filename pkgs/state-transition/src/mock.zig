@@ -330,7 +330,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         agg_att_cleanup = false;
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
-        try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger);
+        try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger, null);
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list

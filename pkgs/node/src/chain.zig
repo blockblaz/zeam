@@ -108,6 +108,8 @@ pub const BeamChain = struct {
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
+    // Cache for root to slot mapping to optimize block processing performance.
+    root_to_slot_cache: types.RootToSlotCache,
 
     const Self = @This();
 
@@ -146,6 +148,7 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            .root_to_slot_cache = types.RootToSlotCache.init(allocator),
         };
     }
 
@@ -168,6 +171,9 @@ pub const BeamChain = struct {
 
         // Clean up public key cache
         self.public_key_cache.deinit();
+
+        // Clean up root to slot cache
+        self.root_to_slot_cache.deinit();
 
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
@@ -361,7 +367,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
+        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -630,6 +636,7 @@ pub const BeamChain = struct {
                 //
                 .logger = self.stf_logger,
                 .validSignatures = true,
+                .rootToSlotCache = &self.root_to_slot_cache,
             });
             break :computedstate cpost_state;
         };
