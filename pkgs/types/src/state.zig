@@ -599,6 +599,21 @@ pub const BeamState = struct {
             }
             // Store in cache for future blocks
             try cache.put(current_block_root, cloned_map);
+
+            // Evict all entries except current and parent (only parent is ever looked up)
+            var evict_it = cache.iterator();
+            while (evict_it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.eql(u8, &key, &current_block_root) or std.mem.eql(u8, &key, &parent_root)) {
+                    continue;
+                }
+                var val_it = entry.value_ptr.iterator();
+                while (val_it.next()) |val_entry| {
+                    allocator.free(val_entry.value_ptr.*);
+                }
+                entry.value_ptr.deinit(allocator);
+                cache.removeByPtr(entry.key_ptr);
+            }
         }
     }
 
