@@ -146,6 +146,8 @@ pub fn build(b: *Builder) !void {
     build_options.addOption([]const u8, "prover", @tagName(prover));
     build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    const use_poseidon = b.option(bool, "use_poseidon", "Use Poseidon SSZ hasher (default: false)") orelse false;
+    build_options.addOption(bool, "use_poseidon", use_poseidon);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -157,6 +159,16 @@ pub fn build(b: *Builder) !void {
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
     zeam_utils.addImport("ssz", ssz);
+    zeam_utils.addImport("build_options", build_options_module);
+    if (use_poseidon) {
+        // add hash-zig dependency only when Poseidon hasher is enabled
+        const hash_zig = b.dependency("hash_zig", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        const hash_zig_module = hash_zig.module("hash-zig");
+        zeam_utils.addImport("hash_zig", hash_zig_module);
+    }
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -368,7 +380,7 @@ pub fn build(b: *Builder) !void {
 
     b.installArtifact(cli_exe);
 
-    try build_zkvm_targets(b, &cli_exe.step, target);
+    try build_zkvm_targets(b, &cli_exe.step, target, build_options_module, use_poseidon);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -698,7 +710,13 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     return cargo_build;
 }
 
-fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
+fn build_zkvm_targets(
+    b: *Builder,
+    main_exe: *Builder.Step,
+    host_target: std.Build.ResolvedTarget,
+    build_options_module: *std.Build.Module,
+    use_poseidon: bool,
+) !void {
     const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
@@ -731,6 +749,16 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
         zeam_utils.addImport("ssz", ssz);
+        zeam_utils.addImport("build_options", build_options_module);
+        if (use_poseidon) {
+            // add hash-zig dependency only when Poseidon hasher is enabled
+            const hash_zig = b.dependency("hash_zig", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            const hash_zig_module = hash_zig.module("hash-zig");
+            zeam_utils.addImport("hash_zig", hash_zig_module);
+        }
 
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{

@@ -4,7 +4,7 @@
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
-            .url = "https://github.com/blockblaz/ssz.zig/archive/0ce92a8f093a321b0d0815eec6c90bd4e745d8e1.tar.gz",
+            .url = "https://github.com/blockblaz/ssz.zig/archive/refs/tags/v0.0.9.tar.gz",
             .hash = "ssz-0.0.9-Lfwd6wvKAgA3JZjtfbeXeQG6zle1K_K2j6HPmQJJF4an",
         },
         .zigcli = .{
@@ -42,6 +42,10 @@
         .snappyframesz = .{
             .url = "https://github.com/blockblaz/snappyframesz/archive/v0.0.2.tar.gz",
             .hash = "snappyframesz-0.0.2-COCLy9AQBAB7Yxi1ourOp6Ki9jCl3M-tLMTVQp2ZOkRo",
+        },
+        .hash_zig = .{
+            .url = "https://github.com/blockblaz/hash-zig/archive/117c0fabe339f05ed130f1100724661b98dd53e2.tar.gz",
+            .hash = "hash_zig-1.1.3-POmurMgaCwDocWpdeWh7Hv-y3Y0oX-aGym-iwWsUfdLN",
         },
     },
     .paths = .{""},
