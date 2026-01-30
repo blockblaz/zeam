@@ -109,6 +109,12 @@ pub const BeamChain = struct {
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
 
+    // Callback for pruning cached blocks after finalization advances
+    prune_cached_blocks_ctx: ?*anyopaque = null,
+    prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
+
+    pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
+
     const Self = @This();
 
     pub fn init(
@@ -147,6 +153,11 @@ pub const BeamChain = struct {
             .force_block_production = opts.force_block_production,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
         };
+    }
+
+    pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
+        self.prune_cached_blocks_ctx = ctx;
+        self.prune_cached_blocks_fn = func;
     }
 
     pub fn deinit(self: *Self) void {
@@ -833,10 +844,20 @@ pub const BeamChain = struct {
                 });
             };
 
-            // Prune gossip_signatures and aggregated_payloads for finalized attestations
+            // Prune signature maps for finalized attestations
             self.forkChoice.pruneSignatureMaps(latest_finalized.slot) catch |err| {
                 self.module_logger.warn("failed to prune signature maps: {any}", .{err});
             };
+
+            // Prune cached blocks at or before finalized slot
+            if (self.prune_cached_blocks_fn) |prune_fn| {
+                if (self.prune_cached_blocks_ctx) |ctx| {
+                    const pruned = prune_fn(ctx, latest_finalized);
+                    if (pruned > 0) {
+                        self.module_logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
+                    }
+                }
+            }
         }
 
         // Store aggregated payloads from the block for future block building
@@ -1056,13 +1077,68 @@ pub const BeamChain = struct {
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
+    /// Validate incoming block before expensive processing.
+    ///
+    /// These checks are cheap and help prevent DoS attacks from malicious peers
+    /// flooding the node with invalid blocks.
+    ///
+    /// Validations performed:
+    /// 1. Future slot check: block.slot must not be too far in the future
+    /// 2. Pre-finalized slot check: block.slot must be >= finalized_slot
+    /// 3. Proposer index bounds check: proposer_index must be < validator_count
+    /// 4. Parent existence check: parent_root must be known
+    /// 5. Slot ordering check: block.slot must be > parent.slot
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
         _ = is_from_gossip;
-        const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
 
-        if (!hasParentBlock) {
+        const current_slot = self.forkChoice.fcStore.timeSlots;
+        const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+
+        // 1. Future slot check - reject blocks too far in the future
+        // Allow a small tolerance for clock skew, but reject clearly invalid future slots
+        const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
+        if (block.slot > current_slot + max_future_tolerance) {
+            self.module_logger.debug("block validation failed: future slot {d} > max allowed {d}", .{
+                block.slot,
+                current_slot + max_future_tolerance,
+            });
+            return BlockValidationError.FutureSlot;
+        }
+
+        // 2. Pre-finalized slot check - reject blocks before finalized slot
+        if (block.slot < finalized_slot) {
+            self.module_logger.debug("block validation failed: pre-finalized slot {d} < finalized {d}", .{
+                block.slot,
+                finalized_slot,
+            });
+            return BlockValidationError.PreFinalizedSlot;
+        }
+
+        // 3. Proposer index bounds check - sanity check against registry limit
+        // This is a fast pre-check; actual proposer validity is verified during signature verification
+        // We use VALIDATOR_REGISTRY_LIMIT as the upper bound since the validator set can grow beyond genesis
+        if (block.proposer_index >= params.VALIDATOR_REGISTRY_LIMIT) {
+            self.module_logger.debug("block validation failed: proposer_index {d} >= VALIDATOR_REGISTRY_LIMIT {d}", .{
+                block.proposer_index,
+                params.VALIDATOR_REGISTRY_LIMIT,
+            });
+            return BlockValidationError.InvalidProposerIndex;
+        }
+
+        // 4. Parent existence check
+        const parent_block = self.forkChoice.getBlock(block.parent_root);
+        if (parent_block == null) {
             // Log decision moved to node.zig where we can check if parent is already being fetched
             return BlockValidationError.UnknownParentBlock;
+        }
+
+        // 5. Slot ordering check - block slot must be greater than parent slot
+        if (block.slot <= parent_block.?.slot) {
+            self.module_logger.debug("block validation failed: slot {d} <= parent slot {d}", .{
+                block.slot,
+                parent_block.?.slot,
+            });
+            return BlockValidationError.SlotNotAfterParent;
         }
     }
 
@@ -1302,6 +1378,14 @@ const AttestationValidationError = error{
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
+    /// Block slot is too far in the future
+    FutureSlot,
+    /// Block slot is before the finalized slot
+    PreFinalizedSlot,
+    /// Block proposer_index exceeds validator count
+    InvalidProposerIndex,
+    /// Block slot is not greater than parent slot
+    SlotNotAfterParent,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added

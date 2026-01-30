@@ -356,6 +356,72 @@ pub const Network = struct {
         return &[_]types.Root{};
     }
 
+    /// Remove a block and its entire chain: walk up to ancestors (parents)
+    /// and down to descendants (children), removing all from cache and
+    /// clearing any matching pending block roots.
+    /// Uses a set for the worklist to handle multiple chains sharing common blocks.
+    /// Returns the number of blocks removed.
+    pub fn pruneCachedBlocks(self: *Self, root: types.Root, finalized_checkpoint: ?types.Checkpoint) usize {
+        if (finalized_checkpoint) |fc| {
+            if (std.mem.eql(u8, &root, &fc.root)) {
+                // Never prune the finalized checkpoint root directly; keep it cached for descendants.
+                return 0;
+            }
+        }
+
+        var to_remove = std.AutoArrayHashMap(types.Root, void).init(self.allocator);
+        defer to_remove.deinit();
+
+        to_remove.put(root, {}) catch return 0;
+
+        // Walk up: traverse parent chain and add all cached ancestors
+        var current = root;
+        while (self.getFetchedBlock(current)) |block_ptr| {
+            const parent_root = block_ptr.message.block.parent_root;
+            if (self.hasFetchedBlock(parent_root)) {
+                to_remove.put(parent_root, {}) catch break;
+                current = parent_root;
+            } else {
+                break;
+            }
+        }
+
+        // Walk down: process entries, expanding children as we go.
+        // We iterate by index since new entries may be appended during iteration.
+        var i: usize = 0;
+        while (i < to_remove.count()) : (i += 1) {
+            const current_root = to_remove.keys()[i];
+
+            // Enqueue children before removing (since removal modifies the children map)
+            const children_slice = self.getChildrenOfBlock(current_root);
+            for (children_slice) |child_root| {
+                // When pruning due to finalization, keep children that are on
+                // the finalized chain (matching root at or after finalized slot).
+                if (finalized_checkpoint) |fc| {
+                    if (self.getFetchedBlock(child_root)) |child_block| {
+                        if (child_block.message.block.slot >= fc.slot and
+                            std.mem.eql(u8, &child_root, &fc.root))
+                        {
+                            // This child is the finalized block — skip it (keep it and its descendants)
+                            continue;
+                        }
+                    }
+                }
+                to_remove.put(child_root, {}) catch continue;
+            }
+        }
+
+        // Remove all collected roots
+        var pruned: usize = 0;
+        for (to_remove.keys()) |entry_root| {
+            if (self.removeFetchedBlock(entry_root)) {
+                pruned += 1;
+            }
+            _ = self.removePendingBlockRoot(entry_root);
+        }
+        return pruned;
+    }
+
     pub fn sendStatusRequest(
         self: *Self,
         peer_id: []const u8,
