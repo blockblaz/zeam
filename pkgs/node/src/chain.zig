@@ -336,12 +336,29 @@ pub const BeamChain = struct {
         // Lock mutex to protect concurrent access to gossip_signatures and aggregated_payloads
         self.forkChoice.signatures_mutex.lock();
         defer self.forkChoice.signatures_mutex.unlock();
+        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
         try aggregation.computeAggregatedSignatures(
             attestations,
             &pre_state.validators,
             &self.forkChoice.gossip_signatures,
             &self.forkChoice.aggregated_payloads,
         );
+        _ = building_timer.observe();
+
+        // Record aggregated signature metrics
+        const num_agg_sigs = aggregation.attestation_signatures.len();
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(num_agg_sigs);
+
+        var total_attestations_in_agg: u64 = 0;
+        for (aggregation.attestations.constSlice()) |agg_att| {
+            const bits_len = agg_att.aggregation_bits.len();
+            for (0..bits_len) |i| {
+                if (agg_att.aggregation_bits.get(i) catch false) {
+                    total_attestations_in_agg += 1;
+                }
+            }
+        }
+        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(total_attestations_in_agg);
 
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
