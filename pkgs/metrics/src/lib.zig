@@ -46,6 +46,13 @@ const Metrics = struct {
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
     lean_pq_signature_attestation_signing_time_seconds: PQSignatureSigningHistogram,
     lean_pq_signature_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
+    // Aggregated attestation signature metrics
+    lean_pq_sig_aggregated_signatures_total: PQSigAggregatedSignaturesTotalCounter,
+    lean_pq_sig_attestations_in_aggregated_signatures_total: PQSigAttestationsInAggregatedTotalCounter,
+    lean_pq_sig_attestation_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
+    lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
+    lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
+    lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
     // Network peer metrics
     lean_connected_peers: LeanConnectedPeersGauge,
     lean_peer_connection_events_total: PeerConnectionEventsCounter,
@@ -79,6 +86,13 @@ const Metrics = struct {
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    // Aggregated attestation signature metric types
+    const PQSigAggregatedSignaturesTotalCounter = metrics_lib.Counter(u64);
+    const PQSigAttestationsInAggregatedTotalCounter = metrics_lib.Counter(u64);
+    const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
+    const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
     // Network peer metric types
     const LeanConnectedPeersGauge = metrics_lib.Gauge(u64);
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
@@ -189,6 +203,18 @@ fn observePQSignatureAttestationVerification(ctx: ?*anyopaque, value: f32) void 
     histogram.observe(value);
 }
 
+fn observePQSigBuildingTime(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.PQSigBuildingTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observePQSigAggregatedVerification(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.PQSigAggregatedVerificationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -232,6 +258,14 @@ pub var lean_pq_signature_attestation_verification_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSignatureAttestationVerification,
 };
+pub var lean_pq_sig_attestation_signatures_building_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observePQSigBuildingTime,
+};
+pub var lean_pq_sig_aggregated_signatures_verification_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observePQSigAggregatedVerification,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -263,6 +297,13 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
         .lean_pq_signature_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_signature_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
         .lean_pq_signature_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_signature_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
+        // Aggregated attestation signature metrics
+        .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures." }, .{}),
+        .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures." }, .{}),
+        .lean_pq_sig_attestation_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_attestation_signatures_building_time_seconds", .{ .help = "Time taken to build aggregated attestation signatures." }, .{}),
+        .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature." }, .{}),
+        .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures." }, .{}),
+        .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures." }, .{}),
         // Network peer metrics
         .lean_connected_peers = Metrics.LeanConnectedPeersGauge.init("lean_connected_peers", .{ .help = "Number of currently connected peers." }, .{}),
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total peer connection events by direction and result." }, .{}),
@@ -293,6 +334,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_attestation_validation_time_seconds.context = @ptrCast(&metrics.lean_attestation_validation_time_seconds);
     lean_pq_signature_attestation_signing_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_signing_time_seconds);
     lean_pq_signature_attestation_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_verification_time_seconds);
+    lean_pq_sig_attestation_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_signatures_building_time_seconds);
+    lean_pq_sig_aggregated_signatures_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds);
 
     g_initialized = true;
 }
