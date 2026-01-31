@@ -57,11 +57,24 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     }
 }
 
+pub const GossipTopicSpec = struct {
+    topic: GossipTopic,
+    subnet_id: ?usize = null,
+
+    pub fn init(topic: GossipTopic) GossipTopicSpec {
+        return .{ .topic = topic };
+    }
+
+    pub fn attestationSubnet(subnet_id: usize) GossipTopicSpec {
+        return .{ .topic = .attestation, .subnet_id = subnet_id };
+    }
+};
+
 pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
-    subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
+    publishWithTopicFn: *const fn (ptr: *anyopaque, topic: GossipTopicSpec, obj: *const GossipMessage) anyerror!void,
+    subscribeFn: *const fn (ptr: *anyopaque, topics: []const GossipTopicSpec, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
     pub fn format(self: GossipSub, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
@@ -71,12 +84,12 @@ pub const GossipSub = struct {
         try writer.writeAll("GossipSub");
     }
 
-    pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(self: GossipSub, topics: []const GossipTopicSpec, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
     }
 
-    pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!void {
-        return self.publishFn(self.ptr, obj);
+    pub fn publishWithTopic(self: GossipSub, topic: GossipTopicSpec, obj: *const GossipMessage) anyerror!void {
+        return self.publishWithTopicFn(self.ptr, topic, obj);
     }
 };
 
@@ -144,24 +157,44 @@ pub const GossipEncoding = enum {
 
 pub const LeanNetworkTopic = struct {
     gossip_topic: GossipTopic,
+    subnet_id: ?usize,
     encoding: GossipEncoding,
     network: []const u8,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, gossip_topic: GossipTopic, encoding: GossipEncoding, network: []const u8) !LeanNetworkTopic {
+    pub fn init(allocator: Allocator, gossip_topic: GossipTopic, subnet_id: ?usize, encoding: GossipEncoding, network: []const u8) !LeanNetworkTopic {
         return LeanNetworkTopic{
             .allocator = allocator,
             .gossip_topic = gossip_topic,
+            .subnet_id = subnet_id,
             .encoding = encoding,
             .network = try allocator.dupe(u8, network),
         };
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
+        if (self.gossip_topic == .attestation) {
+            if (self.subnet_id) |subnet_id| {
+                return try std.fmt.allocPrintZ(
+                    self.allocator,
+                    "/{s}/{s}/attestation_{d}/{s}",
+                    .{ topic_prefix, self.network, subnet_id, self.encoding.encode() },
+                );
+            }
+        }
         return try std.fmt.allocPrintZ(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
+        if (self.gossip_topic == .attestation) {
+            if (self.subnet_id) |subnet_id| {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "/{s}/{s}/attestation_{d}/{s}",
+                    .{ topic_prefix, self.network, subnet_id, self.encoding.encode() },
+                );
+            }
+        }
         return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
     }
 
@@ -178,12 +211,22 @@ pub const LeanNetworkTopic = struct {
         const gossip_topic_slice = iter.next() orelse return error.InvalidTopic;
         const encoding_slice = iter.next() orelse return error.InvalidTopic;
 
-        const gossip_topic = try GossipTopic.decode(gossip_topic_slice);
+        var subnet_id: ?usize = null;
+        var gossip_topic: GossipTopic = undefined;
+        if (std.mem.startsWith(u8, gossip_topic_slice, "attestation_")) {
+            const subnet_slice = gossip_topic_slice["attestation_".len..];
+            if (subnet_slice.len == 0) return error.InvalidTopic;
+            subnet_id = std.fmt.parseInt(usize, subnet_slice, 10) catch return error.InvalidTopic;
+            gossip_topic = .attestation;
+        } else {
+            gossip_topic = try GossipTopic.decode(gossip_topic_slice);
+        }
         const encoding = try GossipEncoding.decode(encoding_slice);
 
         return LeanNetworkTopic{
             .allocator = allocator,
             .gossip_topic = gossip_topic,
+            .subnet_id = subnet_id,
             .encoding = encoding,
             .network = try allocator.dupe(u8, network_slice),
         };
@@ -197,6 +240,7 @@ pub const LeanNetworkTopic = struct {
 pub const GossipTopic = enum {
     block,
     attestation,
+    aggregation,
 
     pub fn encode(self: GossipTopic) []const u8 {
         return std.enums.tagName(GossipTopic, self).?;
@@ -210,12 +254,13 @@ pub const GossipTopic = enum {
 pub const GossipMessage = union(GossipTopic) {
     block: types.SignedBlockWithAttestation,
     attestation: types.SignedAttestation,
+    aggregation: types.SignedAggregatedAttestation,
 
     const Self = @This();
 
     pub fn getLeanNetworkTopic(self: *const Self, allocator: Allocator, network_name: []const u8) !LeanNetworkTopic {
         const gossip_topic = std.meta.activeTag(self.*);
-        return try LeanNetworkTopic.init(allocator, gossip_topic, .ssz_snappy, network_name);
+        return try LeanNetworkTopic.init(allocator, gossip_topic, null, .ssz_snappy, network_name);
     }
 
     pub fn getGossipTopic(self: *const Self) GossipTopic {
@@ -233,6 +278,9 @@ pub const GossipMessage = union(GossipTopic) {
             .attestation => |att| try writer.print("GossipMessage{{ attestation: validator={d}, slot={d} }}", .{
                 att.validator_id,
                 att.message.slot,
+            }),
+            .aggregation => |agg| try writer.print("GossipMessage{{ aggregation: slot={d} }}", .{
+                agg.data.slot,
             }),
         }
     }
@@ -263,6 +311,10 @@ pub const GossipMessage = union(GossipTopic) {
                 cloned_data.* = .{ .attestation = undefined };
                 try types.sszClone(allocator, types.SignedAttestation, self.attestation, &cloned_data.attestation);
             },
+            .aggregation => {
+                cloned_data.* = .{ .aggregation = undefined };
+                try types.sszClone(allocator, types.SignedAggregatedAttestation, self.aggregation, &cloned_data.aggregation);
+            },
         }
 
         return cloned_data;
@@ -276,6 +328,10 @@ pub const GossipMessage = union(GossipTopic) {
             },
             .attestation => |attestation| attestation.toJson(allocator) catch |e| {
                 std.log.err("Failed to convert attestation to JSON: {any}", .{e});
+                return e;
+            },
+            .aggregation => |aggregation| aggregation.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert aggregated attestation to JSON: {any}", .{e});
                 return e;
             },
         };
@@ -876,12 +932,15 @@ pub const GenericGossipHandler = struct {
         // we don't need to run the loop as this is a shared loop and is already being run by the clock
     }
 
-    pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
-        for (topics) |topic| {
+    pub fn subscribe(self: *Self, topics: []const GossipTopicSpec, handler: OnGossipCbHandler) anyerror!void {
+        var seen = std.EnumSet(GossipTopic).initEmpty();
+        for (topics) |spec| {
+            if (seen.contains(spec.topic)) continue;
+            seen.insert(spec.topic);
             // handlerarr should already be there
-            var handlerArr = self.onGossipHandlers.get(topic).?;
+            var handlerArr = self.onGossipHandlers.get(spec.topic).?;
             try handlerArr.append(self.allocator, handler);
-            try self.onGossipHandlers.put(self.allocator, topic, handlerArr);
+            try self.onGossipHandlers.put(self.allocator, spec.topic, handlerArr);
         }
     }
 };
@@ -903,13 +962,17 @@ test GossipTopic {
     try std.testing.expect(std.mem.eql(u8, gossip_topic2.encode(), "attestation"));
     try std.testing.expectEqual(gossip_topic2, try GossipTopic.decode("attestation"));
 
+    const gossip_topic3 = GossipTopic.aggregation;
+    try std.testing.expect(std.mem.eql(u8, gossip_topic3.encode(), "aggregation"));
+    try std.testing.expectEqual(gossip_topic3, try GossipTopic.decode("aggregation"));
+
     try std.testing.expectError(error.InvalidDecoding, GossipTopic.decode("invalid"));
 }
 
 test LeanNetworkTopic {
     const allocator = std.testing.allocator;
 
-    var topic = try LeanNetworkTopic.init(allocator, .block, .ssz_snappy, "devnet0");
+    var topic = try LeanNetworkTopic.init(allocator, .block, null, .ssz_snappy, "devnet0");
     defer topic.deinit();
 
     const topic_str = try topic.encodeZ();
@@ -923,4 +986,17 @@ test LeanNetworkTopic {
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
     try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+
+    var subnet_topic = try LeanNetworkTopic.init(allocator, .attestation, 2, .ssz_snappy, "devnet0");
+    defer subnet_topic.deinit();
+    const subnet_topic_str = try subnet_topic.encodeZ();
+    defer allocator.free(subnet_topic_str);
+
+    try std.testing.expect(std.mem.eql(u8, subnet_topic_str, "/leanconsensus/devnet0/attestation_2/ssz_snappy"));
+
+    var decoded_subnet_topic = try LeanNetworkTopic.decode(allocator, subnet_topic_str.ptr);
+    defer decoded_subnet_topic.deinit();
+
+    try std.testing.expectEqual(subnet_topic.gossip_topic, decoded_subnet_topic.gossip_topic);
+    try std.testing.expectEqual(subnet_topic.subnet_id, decoded_subnet_topic.subnet_id);
 }

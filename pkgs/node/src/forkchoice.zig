@@ -12,6 +12,9 @@ const params = @import("@zeam/params");
 
 const constants = @import("./constants.zig");
 
+const ATTESTATION_COMMITTEE_COUNT: usize = @intCast(params.ATTESTATION_COMMITTEE_COUNT);
+const LocalSubnetSet = std.StaticBitSet(ATTESTATION_COMMITTEE_COUNT);
+
 const AggregatedSignatureProof = types.AggregatedSignatureProof;
 const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
@@ -256,6 +259,9 @@ pub const ForkChoice = struct {
     aggregated_payloads: AggregatedPayloadsMap,
     // Mutex to protect concurrent access to gossip_signatures and aggregated_payloads
     signatures_mutex: std.Thread.Mutex,
+    // Aggregator role and subnet tracking
+    is_aggregator: bool,
+    local_subnets: LocalSubnetSet,
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
@@ -288,6 +294,7 @@ pub const ForkChoice = struct {
         const deltas = std.ArrayList(isize).init(allocator);
         const gossip_signatures = SignaturesMap.init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
+        const local_subnets = LocalSubnetSet.initEmpty();
 
         var fc = Self{
             .allocator = allocator,
@@ -303,6 +310,8 @@ pub const ForkChoice = struct {
             .gossip_signatures = gossip_signatures,
             .aggregated_payloads = aggregated_payloads,
             .signatures_mutex = .{},
+            .is_aggregator = false,
+            .local_subnets = local_subnets,
         };
         _ = try fc.updateHead();
         return fc;
@@ -327,6 +336,53 @@ pub const ForkChoice = struct {
             entry.value_ptr.deinit();
         }
         self.aggregated_payloads.deinit();
+    }
+
+    fn computeSubnetId(validator_id: usize) usize {
+        if (ATTESTATION_COMMITTEE_COUNT == 0) return 0;
+        return validator_id % ATTESTATION_COMMITTEE_COUNT;
+    }
+
+    pub fn setAggregatorInfo(self: *Self, is_aggregator: bool, validator_ids: []usize) !void {
+        self.is_aggregator = is_aggregator;
+
+        // Clear existing subnet assignments
+        self.local_subnets.setRangeValue(.{ .start = 0, .end = ATTESTATION_COMMITTEE_COUNT }, false);
+
+        if (!is_aggregator) return;
+        if (ATTESTATION_COMMITTEE_COUNT == 0) return;
+
+        for (validator_ids) |validator_id| {
+            const subnet_id = computeSubnetId(validator_id);
+            self.local_subnets.set(subnet_id);
+        }
+    }
+
+    pub fn shouldStoreCommitteeSignature(self: *Self, validator_id: types.ValidatorIndex) bool {
+        if (!self.is_aggregator) return false;
+        if (ATTESTATION_COMMITTEE_COUNT == 0) return false;
+        const subnet_id = computeSubnetId(@intCast(validator_id));
+        return self.local_subnets.isSet(subnet_id);
+    }
+
+    pub fn getLatestNewAttestations(self: *Self) ![]types.Attestation {
+        var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer included_attestations.deinit();
+
+        for (0..self.config.genesis.numValidators()) |validator_id| {
+            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
+                .latestNew orelse ProtoAttestation{}).attestation_data;
+
+            if (attestation_data) |att_data| {
+                const attestation = types.Attestation{
+                    .data = att_data,
+                    .validator_id = @intCast(validator_id),
+                };
+                try included_attestations.append(attestation);
+            }
+        }
+
+        return included_attestations.toOwnedSlice();
     }
 
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
@@ -653,10 +709,11 @@ pub const ForkChoice = struct {
                 }
             },
             1 => {},
-            2 => {
+            2 => {},
+            3 => {
                 _ = try self.updateSafeTarget();
             },
-            3 => {
+            4 => {
                 _ = try self.acceptNewAttestations();
             },
             else => @panic("invalid interval"),
@@ -683,48 +740,6 @@ pub const ForkChoice = struct {
         }
 
         return self.updateHead();
-    }
-
-    pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
-        const time_intervals = slot * constants.INTERVALS_PER_SLOT;
-        // this could be called independently by the validator when its a separate process
-        // and FC would need to be protected by mutex to make it thread safe but for now
-        // this is deterministally called after the fc has been ticked ahead
-        // so the following call should be a no-op
-        try self.onInterval(time_intervals, true);
-        // accept any new attestations in case previous ontick was a no-op and either the validator
-        // wasn't registered or there have been new attestations
-        const head = try self.acceptNewAttestations();
-
-        return types.Checkpoint{
-            .root = head.blockRoot,
-            .slot = head.slot,
-        };
-    }
-
-    pub fn getProposalAttestations(self: *Self) ![]types.Attestation {
-        var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        const latest_justified = self.fcStore.latest_justified;
-
-        // TODO naive strategy to include all attestations that are consistent with the latest justified
-        // replace by the other mini 3sf simple strategy to loop and see if justification happens and
-        // till no further attestations can be added
-        for (0..self.config.genesis.numValidators()) |validator_id| {
-            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
-                //
-                .latestKnown orelse ProtoAttestation{}).attestation_data;
-
-            if (attestation_data) |att_data| {
-                if (std.mem.eql(u8, &latest_justified.root, &att_data.source.root)) {
-                    const attestation = types.Attestation{
-                        .data = att_data,
-                        .validator_id = @intCast(validator_id),
-                    };
-                    try included_attestations.append(attestation);
-                }
-            }
-        }
-        return included_attestations.toOwnedSlice();
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
@@ -766,6 +781,15 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
+        // Safe target updates use only attestations with aggregated proofs.
+        // Hold the payloads lock while we check proof availability.
+        var payloads_lock: ?*std.Thread.Mutex = null;
+        if (!from_known) {
+            payloads_lock = &self.signatures_mutex;
+            payloads_lock.?.lock();
+        }
+        defer if (payloads_lock) |lock| lock.unlock();
+
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.appliedIndex) |applied_index| {
@@ -779,6 +803,25 @@ pub const ForkChoice = struct {
             // relevant operation if/when the validator weight changes
             const latest_attestation = if (from_known) attestation_tracker.latestKnown else attestation_tracker.latestNew;
             if (latest_attestation) |delta_attestation| {
+                if (!from_known) {
+                    const data = delta_attestation.attestation_data orelse {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    };
+                    const data_root = try data.sszRoot(self.allocator);
+                    const sig_key = SignatureKey{
+                        .validator_id = @intCast(validator_id),
+                        .data_root = data_root,
+                    };
+                    const proofs = self.aggregated_payloads.get(sig_key) orelse {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    };
+                    if (proofs.items.len == 0) {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    }
+                }
                 self.deltas.items[delta_attestation.index] += validatorWeight;
                 attestation_tracker.appliedIndex = delta_attestation.index;
             }
@@ -900,24 +943,25 @@ pub const ForkChoice = struct {
         const validator_id = signed_attestation.validator_id;
         const attestation_slot = attestation_data.slot;
 
-        // Store the gossip signature for later lookup during block building
-        const data_root = try attestation_data.sszRoot(self.allocator);
-        const sig_key = SignatureKey{
-            .validator_id = validator_id,
-            .data_root = data_root,
-        };
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-        try self.gossip_signatures.put(sig_key, .{
-            .slot = attestation_slot,
-            .signature = signed_attestation.signature,
-        });
+        // Store the gossip signature for committee aggregation if applicable
+        if (self.shouldStoreCommitteeSignature(validator_id)) {
+            const data_root = try attestation_data.sszRoot(self.allocator);
+            const sig_key = SignatureKey{
+                .validator_id = validator_id,
+                .data_root = data_root,
+            };
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+            try self.gossip_signatures.put(sig_key, .{
+                .slot = attestation_slot,
+                .signature = signed_attestation.signature,
+            });
+        }
 
         const attestation = types.Attestation{
             .data = attestation_data,
             .validator_id = validator_id,
         };
-
         try self.onAttestation(attestation, is_from_block);
     }
 
@@ -966,39 +1010,65 @@ pub const ForkChoice = struct {
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
-    /// Store an aggregated signature proof for a validator from a block.
+    /// Store an aggregated signature proof for a validator.
     /// This allows future block builders to reuse this aggregation.
+    ///
+    /// Storage model:
+    /// - Index by (validator_id, data_root) so any participant can retrieve proofs.
+    /// - Keep both attestation_slot and source_slot:
+    ///   * attestation_slot is the slot of the attested data (used for pruning).
+    ///   * source_slot is when the proof was learned (block slot or local time), used for tie-breaks.
+    /// - Maintain each list ordered by source_slot (most recent first) for deterministic selection.
     pub fn storeAggregatedPayload(
         self: *Self,
         validator_id: types.ValidatorIndex,
+        source_slot: types.Slot,
         attestation_data: *const types.AttestationData,
         proof: types.AggregatedSignatureProof,
     ) !void {
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
         const data_root = try attestation_data.sszRoot(self.allocator);
         const sig_key = SignatureKey{
             .validator_id = validator_id,
             .data_root = data_root,
         };
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-        // Get or create the list for this key
+        // Get or create the list for this key.
         const gop = try self.aggregated_payloads.getOrPut(sig_key);
         if (!gop.found_existing) {
             gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
         }
-        try gop.value_ptr.append(.{
-            .slot = attestation_data.slot,
+        const payload = StoredAggregatedPayload{
+            .attestation_slot = attestation_data.slot,
+            .source_slot = source_slot,
             .proof = proof,
-        });
+        };
+
+        // Keep proofs ordered by source slot (most recent first) for deterministic tie-breaking.
+        var insert_idx: usize = gop.value_ptr.items.len;
+        for (gop.value_ptr.items, 0..) |item, idx| {
+            if (item.source_slot <= payload.source_slot) {
+                insert_idx = idx;
+                break;
+            }
+        }
+
+        if (insert_idx == gop.value_ptr.items.len) {
+            try gop.value_ptr.append(payload);
+        } else {
+            try gop.value_ptr.insert(insert_idx, payload);
+        }
     }
 
     /// Prune gossip_signatures and aggregated_payloads for attestations at or before the finalized slot.
     /// This is called after finalization to clean up signature data that is no longer needed.
+    ///
+    /// Note: We prune by attestation_slot (not source_slot). Once the data is finalized,
+    /// any proofs for it are irrelevant even if learned later.
     pub fn pruneSignatureMaps(self: *Self, finalized_slot: types.Slot) !void {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
-
         var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
         defer gossip_keys_to_remove.deinit();
 
@@ -1030,7 +1100,7 @@ pub const ForkChoice = struct {
             var removed_here: usize = 0;
 
             for (list.items) |*stored| {
-                if (stored.slot <= finalized_slot) {
+                if (stored.attestation_slot <= finalized_slot) {
                     stored.proof.deinit();
                     removed_here += 1;
                 } else {
@@ -1244,6 +1314,66 @@ fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte:
     };
 }
 
+test "storeAggregatedPayload orders proofs by most recent" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 1, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+    const module_logger = zeam_logger_config.logger(.forkchoice);
+
+    var fork_choice = try ForkChoice.init(allocator, .{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .logger = module_logger,
+    });
+    defer fork_choice.deinit();
+
+    const att_data = types.AttestationData{
+        .slot = 5,
+        .head = .{ .root = types.ZERO_HASH, .slot = 5 },
+        .target = .{ .root = types.ZERO_HASH, .slot = 5 },
+        .source = .{ .root = types.ZERO_HASH, .slot = 0 },
+    };
+
+    var proof_old = try AggregatedSignatureProof.init(allocator);
+    var proof_old_moved = false;
+    errdefer if (!proof_old_moved) proof_old.deinit();
+    try types.aggregationBitsSet(&proof_old.participants, 0, true);
+    try types.aggregationBitsSet(&proof_old.participants, 1, false);
+
+    var proof_new = try AggregatedSignatureProof.init(allocator);
+    var proof_new_moved = false;
+    errdefer if (!proof_new_moved) proof_new.deinit();
+    try types.aggregationBitsSet(&proof_new.participants, 0, true);
+    try types.aggregationBitsSet(&proof_new.participants, 1, true);
+
+    try fork_choice.storeAggregatedPayload(0, att_data.slot, &att_data, proof_old);
+    proof_old_moved = true;
+    try fork_choice.storeAggregatedPayload(0, att_data.slot, &att_data, proof_new);
+    proof_new_moved = true;
+
+    const data_root = try att_data.sszRoot(allocator);
+    const list_opt = fork_choice.aggregated_payloads.get(.{ .validator_id = 0, .data_root = data_root });
+    try std.testing.expect(list_opt != null);
+    const list = list_opt.?;
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+
+    try std.testing.expect(try list.items[0].proof.participants.get(1));
+    try std.testing.expect(!(try list.items[1].proof.participants.get(1)));
+}
+
 test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     // ============================================================================
     // COMPREHENSIVE TEST TREE
@@ -1354,7 +1484,9 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = .{},
+        .is_aggregator = false,
+        .local_subnets = LocalSubnetSet.initEmpty(),
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit();
@@ -1671,7 +1803,9 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = .{},
+        .is_aggregator = false,
+        .local_subnets = LocalSubnetSet.initEmpty(),
     };
 
     return .{
@@ -2100,10 +2234,10 @@ test "rebase: attestation tracker latestNew index remapping" {
 
     // Setup attestations as gossip (is_from_block = false)
     const att0 = createTestSignedAttestation(0, createTestRoot(0xDD), 5); // D
-    try ctx.fork_choice.onGossipAttestation(att0, false); // gossip
+    try ctx.fork_choice.onAttestation(att0.toAttestation(), false); // aggregated proof
 
     const att1 = createTestSignedAttestation(1, createTestRoot(0xFF), 8); // F
-    try ctx.fork_choice.onGossipAttestation(att1, false); // gossip
+    try ctx.fork_choice.onAttestation(att1.toAttestation(), false); // aggregated proof
 
     // Verify pre-rebase: latestNew is set, latestKnown is null
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestNew.?.index == 3);
@@ -2279,19 +2413,19 @@ test "rebase: mixed latestKnown and latestNew with orphaned votes" {
     const att0_known = createTestSignedAttestation(0, createTestRoot(0xDD), 5); // D
     try ctx.fork_choice.onGossipAttestation(att0_known, true);
     const att0_new = createTestSignedAttestation(0, createTestRoot(0xEE), 6); // E
-    try ctx.fork_choice.onGossipAttestation(att0_new, false);
+    try ctx.fork_choice.onAttestation(att0_new.toAttestation(), false);
 
     // Validator 1: latestKnown on B (slot 1, will be pruned), latestNew on F (slot 8 > 1)
     const att1_known = createTestSignedAttestation(1, createTestRoot(0xBB), 1); // B
     try ctx.fork_choice.onGossipAttestation(att1_known, true);
     const att1_new = createTestSignedAttestation(1, createTestRoot(0xFF), 8); // F
-    try ctx.fork_choice.onGossipAttestation(att1_new, false);
+    try ctx.fork_choice.onAttestation(att1_new.toAttestation(), false);
 
     // Validator 2: latestKnown on G (slot 4, preserved), latestNew on I (slot 7 > 4, preserved)
     const att2_known = createTestSignedAttestation(2, createTestRoot(0x11), 4); // G
     try ctx.fork_choice.onGossipAttestation(att2_known, true);
     const att2_new = createTestSignedAttestation(2, createTestRoot(0x33), 7); // I
-    try ctx.fork_choice.onGossipAttestation(att2_new, false);
+    try ctx.fork_choice.onAttestation(att2_new.toAttestation(), false);
 
     // Verify pre-rebase state
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestKnown.?.index == 3); // D
@@ -2618,7 +2752,9 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = .{},
+        .is_aggregator = false,
+        .local_subnets = LocalSubnetSet.initEmpty(),
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
@@ -2819,4 +2955,66 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 1);
     // I: 8 -> 2
     try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 2);
+}
+
+test "computeDeltas: safe target requires aggregated proofs" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    const signed_att = createTestSignedAttestation(0, createTestRoot(0xFF), 8);
+    const attestation = types.Attestation{
+        .validator_id = signed_att.validator_id,
+        .data = signed_att.message,
+    };
+    try ctx.fork_choice.onAttestation(attestation, false);
+
+    const head_index = ctx.fork_choice.protoArray.indices.get(attestation.data.head.root) orelse unreachable;
+    const deltas_no_proof = try ctx.fork_choice.computeDeltas(false);
+    try std.testing.expectEqual(@as(isize, 0), deltas_no_proof[head_index]);
+
+    var proof = try AggregatedSignatureProof.init(allocator);
+    var proof_moved = false;
+    errdefer if (!proof_moved) proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 0, true);
+
+    try ctx.fork_choice.storeAggregatedPayload(0, attestation.data.slot, &attestation.data, proof);
+    proof_moved = true;
+
+    const deltas_with_proof = try ctx.fork_choice.computeDeltas(false);
+    try std.testing.expectEqual(@as(isize, 1), deltas_with_proof[head_index]);
+}
+
+test "updateSafeTarget: advances only after proofs are stored" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    // Add latestNew attestations for 3 validators pointing to head F (slot 8).
+    for (0..3) |validator_id| {
+        const signed_att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
+        const attestation = types.Attestation{
+            .validator_id = signed_att.validator_id,
+            .data = signed_att.message,
+        };
+        try ctx.fork_choice.onAttestation(attestation, false);
+    }
+
+    // Without proofs, safe target should remain at the justified anchor (A).
+    _ = try ctx.fork_choice.updateSafeTarget();
+    try std.testing.expect(std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &createTestRoot(0xAA)));
+
+    // Store proofs for the same attestation data so safe target can advance.
+    const att_data = createTestSignedAttestation(0, createTestRoot(0xFF), 8).message;
+    for (0..3) |validator_id| {
+        var proof = try AggregatedSignatureProof.init(allocator);
+        var proof_moved = false;
+        errdefer if (!proof_moved) proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, validator_id, true);
+        try ctx.fork_choice.storeAggregatedPayload(@intCast(validator_id), att_data.slot, &att_data, proof);
+        proof_moved = true;
+    }
+
+    _ = try ctx.fork_choice.updateSafeTarget();
+    try std.testing.expect(std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &createTestRoot(0xFF)));
 }

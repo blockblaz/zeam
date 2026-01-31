@@ -86,6 +86,7 @@ pub const NodeOptions = struct {
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
+    is_aggregator: bool = false,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -154,6 +155,12 @@ pub const Node = struct {
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
 
+        const validator_ids = try options.getValidatorIndices(allocator);
+        errdefer allocator.free(validator_ids);
+
+        const gossip_topics = try node_lib.buildGossipTopicSpecs(allocator, chain_config, validator_ids, options.is_aggregator);
+        errdefer allocator.free(gossip_topics);
+
         // TODO we seem to be needing one loop because then the events added to loop are not being fired
         // in the order to which they have been added even with the an appropriate delay added
         // behavior of this further needs to be investigated but for now we will share the same loop
@@ -168,6 +175,7 @@ pub const Node = struct {
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
+            .gossip_topics = gossip_topics,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
@@ -220,16 +228,12 @@ pub const Node = struct {
 
         try self.loadValidatorKeypairs(num_validators);
 
-        const validator_ids = try options.getValidatorIndices(allocator);
-        errdefer allocator.free(validator_ids);
-
         // Initialize metrics BEFORE beam_node so that metrics set during
         // initialization (like lean_validators_count) are captured on real
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
             try api.init(allocator);
         }
-
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -241,6 +245,7 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
+            .is_aggregator = options.is_aggregator,
         });
 
         // Start API server after chain is initialized so we can pass the chain pointer
@@ -511,6 +516,7 @@ pub fn buildStartOptions(
     const local_priv_key = try getPrivateKeyFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
 
     const node_key_index = try nodeKeyIndexFromYaml(opts.node_key, parsed_validator_config);
+    const is_aggregator = try getIsAggregatorFromValidatorConfig(opts.node_key, parsed_validator_config);
 
     const hash_sig_key_dir = try std.mem.concat(allocator, u8, &[_][]const u8{
         node_cmd.custom_genesis,
@@ -528,6 +534,7 @@ pub fn buildStartOptions(
     opts.local_priv_key = local_priv_key;
     opts.genesis_spec = genesis_spec;
     opts.node_key_index = node_key_index;
+    opts.is_aggregator = is_aggregator;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
 }
@@ -873,10 +880,35 @@ fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []con
                     const value_str = try std.fmt.allocPrint(allocator, "0x{x:0>8}", .{@as(u32, @intCast(value.int))});
                     const key_copy = try allocator.dupe(u8, key);
                     try enr_fields.custom_fields.put(key_copy, value_str);
+                } else if (value == .boolean) {
+                    const value_str = if (value.boolean) "0x01" else "0x00";
+                    const key_copy = try allocator.dupe(u8, key);
+                    const value_copy = try allocator.dupe(u8, value_str);
+                    try enr_fields.custom_fields.put(key_copy, value_copy);
                 }
             }
 
             return enr_fields;
+        }
+    }
+    return error.InvalidNodeKey;
+}
+
+fn getIsAggregatorFromValidatorConfig(node_key: []const u8, validator_config: Yaml) !bool {
+    for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
+        const name_value = entry.map.get("name").?;
+        if (name_value == .string and std.mem.eql(u8, name_value.string, node_key)) {
+            const enr_fields_value = entry.map.get("enrFields");
+            if (enr_fields_value == null) {
+                return false;
+            }
+
+            const fields_map = enr_fields_value.?.map;
+            const flag_value = fields_map.get("is_aggregator") orelse return false;
+            if (flag_value == .boolean) {
+                return flag_value.boolean;
+            }
+            return error.InvalidAggregatorFlag;
         }
     }
     return error.InvalidNodeKey;

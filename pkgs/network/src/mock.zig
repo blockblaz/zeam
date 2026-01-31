@@ -608,7 +608,8 @@ pub const Mock = struct {
         self.finalizeServerStream(ctx);
     }
 
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn publishWithTopic(ptr: *anyopaque, topic: interface.GossipTopicSpec, data: *const interface.GossipMessage) anyerror!void {
+        _ = topic;
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
         // Try to find a valid peer_id from connected peers, otherwise use a default
@@ -625,7 +626,7 @@ pub const Mock = struct {
         return self.gossipHandler.onGossip(data, sender_peer_id, true);
     }
 
-    pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
+    pub fn subscribe(ptr: *anyopaque, topics: []const interface.GossipTopicSpec, handler: interface.OnGossipCbHandler) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.gossipHandler.subscribe(topics, handler);
     }
@@ -733,7 +734,7 @@ pub const Mock = struct {
         return .{
             .gossip = .{
                 .ptr = self,
-                .publishFn = publish,
+                .publishWithTopicFn = publishWithTopic,
                 .subscribeFn = subscribe,
                 .onGossipFn = onGossip,
             },
@@ -786,7 +787,7 @@ test "Mock messaging across two subscribers" {
     var subscriber2 = TestSubscriber{};
 
     // Both subscribers subscribe to the same block topic using the complete network interface
-    var topics = [_]interface.GossipTopic{.block};
+    var topics = [_]interface.GossipTopicSpec{.{ .topic = .block }};
     const network = mock.getNetworkInterface();
     try network.gossip.subscribe(&topics, subscriber1.getCallbackHandler());
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());
@@ -830,7 +831,7 @@ test "Mock messaging across two subscribers" {
     } };
 
     // Publish the message using the network interface - both subscribers should receive it
-    try network.gossip.publish(block_message);
+    try network.gossip.publishWithTopic(.{ .topic = .block }, block_message);
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);
