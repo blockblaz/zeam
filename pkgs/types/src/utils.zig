@@ -140,6 +140,23 @@ pub const RootToSlotCache = struct {
     pub fn count(self: *const Self) usize {
         return self.cache.count();
     }
+
+    /// Remove all entries with slot <= finalized_slot.
+    pub fn prune(self: *Self, finalized_slot: Slot) !void {
+        var keys_to_remove = std.ArrayList(Root).init(self.allocator);
+        defer keys_to_remove.deinit();
+
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* <= finalized_slot) {
+                try keys_to_remove.append(entry.key_ptr.*);
+            }
+        }
+
+        for (keys_to_remove.items) |key| {
+            _ = self.cache.remove(key);
+        }
+    }
 };
 
 pub const GenesisSpec = struct {

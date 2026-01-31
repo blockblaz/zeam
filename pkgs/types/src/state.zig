@@ -184,6 +184,10 @@ pub const BeamState = struct {
     }
 
     fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot), cache_opt: ?*utils.RootToSlotCache) !void {
+        if (cache_opt) |cache| {
+            if (cache.count() > 0) return;
+        }
+
         const start_slot: usize = @intCast(finalized_slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
         for (start_slot..historical_len_usize) |i| {
@@ -193,6 +197,7 @@ pub const BeamState = struct {
 
             if (cache_opt) |cache| {
                 try cache.put(root, slot_i);
+                continue;
             }
 
             if (root_to_slot.getPtr(root)) |slot_ptr| {
@@ -319,7 +324,7 @@ pub const BeamState = struct {
         try self.historical_block_hashes.append(staged_block.parent_root);
         if (cache) |c| {
             if (!std.mem.eql(u8, &staged_block.parent_root, &utils.ZERO_HASH)) {
-                try c.put(staged_block.parent_root, staged_block.slot - 1);
+                try c.put(staged_block.parent_root, self.latest_block_header.slot);
             }
         }
 
@@ -537,6 +542,10 @@ pub const BeamState = struct {
                             if (justifications.fetchRemove(root)) |kv| {
                                 allocator.free(kv.value);
                             }
+                        }
+
+                        if (cache) |c| {
+                            try c.prune(finalized_slot);
                         }
                     }
                     const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
