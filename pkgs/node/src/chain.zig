@@ -352,7 +352,7 @@ pub const BeamChain = struct {
             available_attestations,
         );
         defer selected_attestations.deinit();
-        var post_state_opt = try self.clonePostState(pre_state);
+        var post_state_opt: ?*types.BeamState = try self.clonePostState(pre_state);
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
             self.allocator.destroy(post_state_ptr);
@@ -426,11 +426,10 @@ pub const BeamChain = struct {
     fn clonePostState(
         self: *Self,
         pre_state: *const types.BeamState,
-    ) !?*types.BeamState {
-        const post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
-        const post_state = post_state_opt.?;
+    ) !*types.BeamState {
+        const post_state = try self.allocator.create(types.BeamState);
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
-        return post_state_opt;
+        return post_state;
     }
 
     fn applyBlockAndCacheState(

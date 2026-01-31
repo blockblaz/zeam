@@ -1002,7 +1002,6 @@ pub const BeamNode = struct {
             @as(usize, @intCast(validator_id)) % ATTESTATION_COMMITTEE_COUNT;
         const subnet_topic = networks.GossipTopicSpec{ .topic = .attestation, .subnet_id = subnet_id };
         try self.network.publishWithTopic(subnet_topic, &gossip_msg);
-        try self.network.publishWithTopic(.{ .topic = .attestation }, &gossip_msg);
 
         self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
             data.slot,
@@ -1054,7 +1053,6 @@ pub fn buildGossipTopicSpecs(
     errdefer topics.deinit();
 
     try topics.append(.{ .topic = .block });
-    try topics.append(.{ .topic = .attestation });
     try topics.append(.{ .topic = .aggregation });
 
     if (is_aggregator) {

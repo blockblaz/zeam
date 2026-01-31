@@ -781,6 +781,15 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
+        // Safe target updates use only attestations with aggregated proofs.
+        // Hold the payloads lock while we check proof availability.
+        var payloads_lock: ?*std.Thread.Mutex = null;
+        if (!from_known) {
+            payloads_lock = &self.signatures_mutex;
+            payloads_lock.?.lock();
+        }
+        defer if (payloads_lock) |lock| lock.unlock();
+
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.appliedIndex) |applied_index| {
@@ -794,6 +803,25 @@ pub const ForkChoice = struct {
             // relevant operation if/when the validator weight changes
             const latest_attestation = if (from_known) attestation_tracker.latestKnown else attestation_tracker.latestNew;
             if (latest_attestation) |delta_attestation| {
+                if (!from_known) {
+                    const data = delta_attestation.attestation_data orelse {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    };
+                    const data_root = try data.sszRoot(self.allocator);
+                    const sig_key = SignatureKey{
+                        .validator_id = @intCast(validator_id),
+                        .data_root = data_root,
+                    };
+                    const proofs = self.aggregated_payloads.get(sig_key) orelse {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    };
+                    if (proofs.items.len == 0) {
+                        try self.attestations.put(validator_id, attestation_tracker);
+                        continue;
+                    }
+                }
                 self.deltas.items[delta_attestation.index] += validatorWeight;
                 attestation_tracker.appliedIndex = delta_attestation.index;
             }
@@ -934,7 +962,6 @@ pub const ForkChoice = struct {
             .data = attestation_data,
             .validator_id = validator_id,
         };
-
         try self.onAttestation(attestation, is_from_block);
     }
 
@@ -2207,10 +2234,10 @@ test "rebase: attestation tracker latestNew index remapping" {
 
     // Setup attestations as gossip (is_from_block = false)
     const att0 = createTestSignedAttestation(0, createTestRoot(0xDD), 5); // D
-    try ctx.fork_choice.onGossipAttestation(att0, false); // gossip
+    try ctx.fork_choice.onAttestation(att0.toAttestation(), false); // aggregated proof
 
     const att1 = createTestSignedAttestation(1, createTestRoot(0xFF), 8); // F
-    try ctx.fork_choice.onGossipAttestation(att1, false); // gossip
+    try ctx.fork_choice.onAttestation(att1.toAttestation(), false); // aggregated proof
 
     // Verify pre-rebase: latestNew is set, latestKnown is null
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestNew.?.index == 3);
@@ -2386,19 +2413,19 @@ test "rebase: mixed latestKnown and latestNew with orphaned votes" {
     const att0_known = createTestSignedAttestation(0, createTestRoot(0xDD), 5); // D
     try ctx.fork_choice.onGossipAttestation(att0_known, true);
     const att0_new = createTestSignedAttestation(0, createTestRoot(0xEE), 6); // E
-    try ctx.fork_choice.onGossipAttestation(att0_new, false);
+    try ctx.fork_choice.onAttestation(att0_new.toAttestation(), false);
 
     // Validator 1: latestKnown on B (slot 1, will be pruned), latestNew on F (slot 8 > 1)
     const att1_known = createTestSignedAttestation(1, createTestRoot(0xBB), 1); // B
     try ctx.fork_choice.onGossipAttestation(att1_known, true);
     const att1_new = createTestSignedAttestation(1, createTestRoot(0xFF), 8); // F
-    try ctx.fork_choice.onGossipAttestation(att1_new, false);
+    try ctx.fork_choice.onAttestation(att1_new.toAttestation(), false);
 
     // Validator 2: latestKnown on G (slot 4, preserved), latestNew on I (slot 7 > 4, preserved)
     const att2_known = createTestSignedAttestation(2, createTestRoot(0x11), 4); // G
     try ctx.fork_choice.onGossipAttestation(att2_known, true);
     const att2_new = createTestSignedAttestation(2, createTestRoot(0x33), 7); // I
-    try ctx.fork_choice.onGossipAttestation(att2_new, false);
+    try ctx.fork_choice.onAttestation(att2_new.toAttestation(), false);
 
     // Verify pre-rebase state
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestKnown.?.index == 3); // D
@@ -2928,4 +2955,66 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try std.testing.expect(ctx.fork_choice.attestations.get(2).?.latestKnown.?.index == 1);
     // I: 8 -> 2
     try std.testing.expect(ctx.fork_choice.attestations.get(3).?.latestKnown.?.index == 2);
+}
+
+test "computeDeltas: safe target requires aggregated proofs" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    const signed_att = createTestSignedAttestation(0, createTestRoot(0xFF), 8);
+    const attestation = types.Attestation{
+        .validator_id = signed_att.validator_id,
+        .data = signed_att.message,
+    };
+    try ctx.fork_choice.onAttestation(attestation, false);
+
+    const head_index = ctx.fork_choice.protoArray.indices.get(attestation.data.head.root) orelse unreachable;
+    const deltas_no_proof = try ctx.fork_choice.computeDeltas(false);
+    try std.testing.expectEqual(@as(isize, 0), deltas_no_proof[head_index]);
+
+    var proof = try AggregatedSignatureProof.init(allocator);
+    var proof_moved = false;
+    errdefer if (!proof_moved) proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, 0, true);
+
+    try ctx.fork_choice.storeAggregatedPayload(0, attestation.data.slot, &attestation.data, proof);
+    proof_moved = true;
+
+    const deltas_with_proof = try ctx.fork_choice.computeDeltas(false);
+    try std.testing.expectEqual(@as(isize, 1), deltas_with_proof[head_index]);
+}
+
+test "updateSafeTarget: advances only after proofs are stored" {
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    // Add latestNew attestations for 3 validators pointing to head F (slot 8).
+    for (0..3) |validator_id| {
+        const signed_att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
+        const attestation = types.Attestation{
+            .validator_id = signed_att.validator_id,
+            .data = signed_att.message,
+        };
+        try ctx.fork_choice.onAttestation(attestation, false);
+    }
+
+    // Without proofs, safe target should remain at the justified anchor (A).
+    _ = try ctx.fork_choice.updateSafeTarget();
+    try std.testing.expect(std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &createTestRoot(0xAA)));
+
+    // Store proofs for the same attestation data so safe target can advance.
+    const att_data = createTestSignedAttestation(0, createTestRoot(0xFF), 8).message;
+    for (0..3) |validator_id| {
+        var proof = try AggregatedSignatureProof.init(allocator);
+        var proof_moved = false;
+        errdefer if (!proof_moved) proof.deinit();
+        try types.aggregationBitsSet(&proof.participants, validator_id, true);
+        try ctx.fork_choice.storeAggregatedPayload(@intCast(validator_id), att_data.slot, &att_data, proof);
+        proof_moved = true;
+    }
+
+    _ = try ctx.fork_choice.updateSafeTarget();
+    try std.testing.expect(std.mem.eql(u8, &ctx.fork_choice.safeTarget.blockRoot, &createTestRoot(0xFF)));
 }
