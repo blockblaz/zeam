@@ -122,6 +122,7 @@ pub const Node = struct {
     logger: zeam_utils.ModuleLogger,
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
+    api_server_handle: ?*api_server.ApiServer,
     anchor_state: *types.BeamState,
 
     const Self = @This();
@@ -133,9 +134,7 @@ pub const Node = struct {
     ) !void {
         self.allocator = allocator;
         self.options = options;
-
-        // Initialize event broadcaster
-        try event_broadcaster.initGlobalBroadcaster(allocator);
+        self.api_server_handle = null;
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
@@ -245,14 +244,26 @@ pub const Node = struct {
 
         // Start API server after chain is initialized so we can pass the chain pointer
         if (options.metrics_enable) {
+            try api.init(allocator);
+            self.api_server_handle = try api_server.startAPIServer(
+                allocator,
+                options.api_port,
+                options.logger_config,
+                self.beam_node.chain,
+            );
+
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
-            try api_server.startAPIServer(allocator, options.api_port, options.logger_config, self.beam_node.chain);
         }
+
+        self.logger = options.logger_config.logger(.node);
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.api_server_handle) |handle| {
+            handle.stop();
+        }
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
         self.key_manager.deinit();

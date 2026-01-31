@@ -22,6 +22,13 @@ pub const SSEConnection = struct {
         };
     }
 
+    pub fn sendRaw(self: *SSEConnection, data: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.stream.writeAll(data);
+    }
+
     pub fn sendEvent(self: *SSEConnection, event_json: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -87,6 +94,20 @@ pub const EventBroadcaster = struct {
         }
     }
 
+    pub fn removeConnectionByHandle(self: *Self, stream: std.net.Stream) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.connections.items, 0..) |conn, i| {
+            if (conn.stream.handle == stream.handle) {
+                _ = self.connections.swapRemove(i);
+                conn.deinit();
+                self.allocator.destroy(conn);
+                break;
+            }
+        }
+    }
+
     /// Broadcast an event to all connected clients
     pub fn broadcastEvent(self: *Self, event: *events.ChainEvent) !void {
         const event_json = try events.serializeEventToJson(self.allocator, event.*);
@@ -104,11 +125,9 @@ pub const EventBroadcaster = struct {
 
             // Try to send the event
             connection.sendEvent(event_json) catch |err| {
-                // If sending fails, remove the connection
+                // If sending fails, log and keep connection; heartbeat thread will clean it up.
                 std.log.warn("Failed to send event to SSE connection: {}", .{err});
-                connection.deinit();
-                self.allocator.destroy(connection);
-                _ = self.connections.swapRemove(i);
+                i += 1;
                 continue;
             };
 
@@ -158,9 +177,23 @@ pub fn getGlobalBroadcaster() ?*EventBroadcaster {
 }
 
 /// Add a connection to the global broadcaster
-pub fn addGlobalConnection(stream: std.net.Stream) !void {
+pub fn removeGlobalConnection(stream: std.net.Stream) void {
     if (getGlobalBroadcaster()) |broadcaster| {
-        try broadcaster.addConnection(stream);
+        broadcaster.removeConnectionByHandle(stream);
+    }
+}
+
+pub fn addGlobalConnection(stream: std.net.Stream) !*SSEConnection {
+    if (getGlobalBroadcaster()) |broadcaster| {
+        const connection = try broadcaster.allocator.create(SSEConnection);
+        errdefer broadcaster.allocator.destroy(connection);
+        connection.* = SSEConnection.init(stream, broadcaster.allocator);
+
+        broadcaster.mutex.lock();
+        defer broadcaster.mutex.unlock();
+
+        try broadcaster.connections.append(connection);
+        return connection;
     } else {
         return error.BroadcasterNotInitialized;
     }
@@ -217,8 +250,8 @@ test "event broadcaster basic functionality" {
         std.log.debug("Expected broadcast error in test: {}", .{err});
     };
 
-    // Connection should be removed due to send failure
-    try std.testing.expect(broadcaster.getConnectionCount() == 0);
+    // Connection remains until explicitly removed (e.g., by SSE heartbeat cleanup)
+    try std.testing.expect(broadcaster.getConnectionCount() == 1);
 }
 
 test "global broadcaster functionality" {
