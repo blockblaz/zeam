@@ -139,9 +139,14 @@ pub fn verifySignatures(
         const epoch: u64 = aggregated_attestation.data.slot;
 
         // Verify the aggregated signature proof
-        const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
-        try signature_proof.verify(public_keys.items, &message_hash, epoch);
-        _ = verification_timer.observe();
+        const agg_verification_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
+        signature_proof.verify(public_keys.items, &message_hash, epoch) catch |err| {
+            _ = agg_verification_timer.observe();
+            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+            return err;
+        };
+        _ = agg_verification_timer.observe();
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
     }
 
     // Verify proposer signature (still individual)
