@@ -493,7 +493,7 @@ test "SSE events integration test - wait for justification and finalization" {
     // Node3 starts after first finalization and syncs via parent block requests (blocks_by_root).
     // We verify sync by waiting for finalization to advance beyond the first finalized slot,
     // which proves the chain continued progressing after node3 joined.
-    const timeout_ms: u64 = 480000; // 480 seconds timeout (slow CI environments)
+    const timeout_ms: u64 = 240000; // 240 seconds timeout
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
