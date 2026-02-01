@@ -35,7 +35,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
@@ -134,7 +134,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
@@ -208,7 +208,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
@@ -292,7 +292,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
@@ -373,7 +373,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
@@ -432,7 +432,7 @@ jobs:
         fi
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ steps.zig-zon-hash.outputs.hash }}
