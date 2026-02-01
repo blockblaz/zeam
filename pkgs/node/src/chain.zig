@@ -384,7 +384,11 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
+        const old_finalized_slot = post_state.latest_finalized.slot;
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
+        if (post_state.latest_finalized.slot > old_finalized_slot) {
+            try self.root_to_slot_cache.prune(post_state.latest_finalized.slot);
+        }
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -650,13 +654,14 @@ pub const BeamChain = struct {
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
-                //
                 .logger = self.stf_logger,
                 .validSignatures = true,
                 .rootToSlotCache = &self.root_to_slot_cache,
             });
             break :computedstate cpost_state;
         };
+
+        try self.root_to_slot_cache.prune(post_state.latest_finalized.slot);
 
         var missing_roots = std.ArrayList(types.Root).init(self.allocator);
         errdefer missing_roots.deinit();

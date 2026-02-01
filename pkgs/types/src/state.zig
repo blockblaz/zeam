@@ -183,22 +183,13 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
-    fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot), cache_opt: ?*utils.RootToSlotCache) !void {
-        if (cache_opt) |cache| {
-            if (cache.count() > 0) return;
-        }
-
+    fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot)) !void {
         const start_slot: usize = @intCast(finalized_slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
         for (start_slot..historical_len_usize) |i| {
             const root = try self.historical_block_hashes.get(i);
             if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
             const slot_i: Slot = @intCast(i);
-
-            if (cache_opt) |cache| {
-                try cache.put(root, slot_i);
-                continue;
-            }
 
             if (root_to_slot.getPtr(root)) |slot_ptr| {
                 if (slot_i > slot_ptr.*) {
@@ -391,9 +382,22 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
+        // Use the global cache directly if provided, otherwise build a local map.
         var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
         defer root_to_slot.deinit(allocator);
-        try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot, cache);
+        if (cache) |c| {
+            if (c.count() == 0) {
+                const start_slot: usize = @intCast(finalized_slot + 1);
+                const historical_len_usize: usize = self.historical_block_hashes.len();
+                for (start_slot..historical_len_usize) |i| {
+                    const root = try self.historical_block_hashes.get(i);
+                    if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
+                    try c.put(root, @intCast(i));
+                }
+            }
+        } else {
+            try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot);
+        }
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -438,13 +442,6 @@ pub const BeamState = struct {
             const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
             const has_known_root = has_correct_source_root and has_correct_target_root;
-
-            if (has_known_root) {
-                if (cache) |c| {
-                    try c.put(attestation_data.source.root, attestation_data.source.slot);
-                    try c.put(attestation_data.target.root, attestation_data.target.slot);
-                }
-            }
 
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
@@ -542,10 +539,6 @@ pub const BeamState = struct {
                             if (justifications.fetchRemove(root)) |kv| {
                                 allocator.free(kv.value);
                             }
-                        }
-
-                        if (cache) |c| {
-                            try c.prune(finalized_slot);
                         }
                     }
                     const finalized_str_new = try self.latest_finalized.toJsonString(allocator);
@@ -1077,8 +1070,6 @@ test "root_to_slot_cache lifecycle" {
     defer block_5.deinit();
     try state.process_block_header(std.testing.allocator, block_5, logger, &cache);
 
-    const count_before_finalization = cache.count();
-
     // Phase 3: Seed a pending justification at slot 3.
     const slot_3_root = try state.historical_block_hashes.get(3);
 
@@ -1122,18 +1113,11 @@ test "root_to_slot_cache lifecycle" {
 
     try state.process_attestations(std.testing.allocator, attestations_list, logger, &cache);
 
-    // Verify finalization advanced.
+    // Verify finalization advanced and justification cleanup used the cache.
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
 
-    // Verify prune removed entries at slot <= 1 (finalized).
-    try std.testing.expect(cache.count() < count_before_finalization);
-    try std.testing.expectEqual(@as(?Slot, null), cache.get(block_1.parent_root));
-
-    // Verify entries above finalized slot survive.
-    try std.testing.expect(cache.get(slot_3_root) != null);
-
-    // Verify pending justification at slot 3 survived pruning.
+    // Verify pending justification at slot 3 survived cleanup.
     var found = false;
     for (state.justifications_roots.constSlice()) |root| {
         if (std.mem.eql(u8, &root, &slot_3_root)) {
