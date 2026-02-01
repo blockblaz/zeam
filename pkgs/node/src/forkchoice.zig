@@ -1749,7 +1749,11 @@ fn createTestSignedAttestation(validator_id: usize, head_root: types.Root, slot:
 // Tree structure (A-I):
 //   A(0) -> B(1) -> C(2) -> D(3) -> E(4) -> F(5)
 //                    \-> G(6) -> H(7) -> I(8)
-fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct {
+fn buildTestTreeWithMockChain(
+    allocator: Allocator,
+    mock_chain: anytype,
+    module_logger: zeam_utils.ModuleLogger,
+) !struct {
     fork_choice: ForkChoice,
     spec_name: []u8,
 } {
@@ -1787,9 +1791,6 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_finalized = anchorCP,
     };
 
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.forkchoice);
-
     const fork_choice = ForkChoice{
         .allocator = allocator,
         .protoArray = proto_array,
@@ -1820,9 +1821,17 @@ const RebaseTestContext = struct {
     mock_chain: stf.MockChainData,
     fork_choice: ForkChoice,
     spec_name: []u8,
+    logger_config: *zeam_utils.ZeamLoggerConfig,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, num_validators: usize) !RebaseTestContext {
+        const logger_config = try allocator.create(zeam_utils.ZeamLoggerConfig);
+        logger_config.* = zeam_utils.getTestLoggerConfig();
+        errdefer {
+            logger_config.deinit();
+            allocator.destroy(logger_config);
+        }
+
         var mock_chain = try stf.genMockChain(allocator, num_validators, null);
         errdefer mock_chain.deinit(allocator);
         errdefer mock_chain.genesis_state.validators.deinit();
@@ -1831,7 +1840,8 @@ const RebaseTestContext = struct {
         errdefer mock_chain.genesis_state.justifications_roots.deinit();
         errdefer mock_chain.genesis_state.justifications_validators.deinit();
 
-        var test_data = try buildTestTreeWithMockChain(allocator, &mock_chain);
+        const module_logger = logger_config.logger(.forkchoice);
+        var test_data = try buildTestTreeWithMockChain(allocator, &mock_chain, module_logger);
         errdefer allocator.free(test_data.spec_name);
         errdefer test_data.fork_choice.protoArray.nodes.deinit();
         errdefer test_data.fork_choice.protoArray.indices.deinit();
@@ -1844,6 +1854,7 @@ const RebaseTestContext = struct {
             .mock_chain = mock_chain,
             .fork_choice = test_data.fork_choice,
             .spec_name = test_data.spec_name,
+            .logger_config = logger_config,
             .allocator = allocator,
         };
     }
@@ -1865,6 +1876,8 @@ const RebaseTestContext = struct {
         }
         self.fork_choice.aggregated_payloads.deinit();
         self.allocator.free(self.spec_name);
+        self.logger_config.deinit();
+        self.allocator.destroy(self.logger_config);
 
         // Cleanup mock_chain genesis_state components
         self.mock_chain.genesis_state.validators.deinit();
