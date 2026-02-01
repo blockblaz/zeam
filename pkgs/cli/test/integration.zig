@@ -77,7 +77,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         }
 
         // Try to connect to the metrics server
-        const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT) catch {
+        const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
             std.time.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
@@ -159,15 +159,15 @@ const ZeamRequest = struct {
         return self.makeRequest("/metrics");
     }
 
-    /// Make a request to the /health endpoint and return the response
+    /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/health");
+        return self.makeRequest("/lean/v0/health");
     }
 
     /// Internal helper to make HTTP requests to any endpoint
     fn makeRequest(self: ZeamRequest, endpoint: []const u8) ![]u8 {
         // Create connection to the server
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
         var connection = try net.tcpConnectToAddress(address);
         defer connection.close();
 
@@ -176,7 +176,7 @@ const ZeamRequest = struct {
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
             "Connection: close\r\n" ++
-            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT });
+            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
 
         try connection.writeAll(request);
 
@@ -217,7 +217,7 @@ const SSEClient = struct {
     parsed_events_queue: std.ArrayList(ChainEvent),
 
     fn init(allocator: std.mem.Allocator) !SSEClient {
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_METRICS_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
         const connection = try net.tcpConnectToAddress(address);
 
         return SSEClient{
@@ -489,15 +489,21 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
-    // Read events until both justification and finalization are seen, or timeout
-    const timeout_ms: u64 = 180000; // 180 seconds timeout
+    // Read events until justification, finalization, AND node3 parent sync are verified, or timeout.
+    // Node3 starts after first finalization and syncs via parent block requests (blocks_by_root).
+    // We verify sync by waiting for finalization to advance beyond the first finalized slot,
+    // which proves the chain continued progressing after node3 joined.
+    const timeout_ms: u64 = 240000; // 240 seconds timeout
     const start_ns = std.time.nanoTimestamp();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
     var got_finalization = false;
+    var got_node3_sync = false;
+    var first_finalized_slot: u64 = 0;
+    var head_count_at_finalization: usize = 0;
 
-    // FIXED: This loop now works correctly with the improved readEvent() function
-    while (std.time.nanoTimestamp() < deadline_ns and !(got_justification and got_finalization)) {
+    var current_ns = std.time.nanoTimestamp();
+    while (current_ns < deadline_ns and !(got_justification and got_finalization and got_node3_sync)) {
         const event = try sse_client.readEvent();
         if (event) |e| {
             // Check for justification with slot > 0
@@ -510,13 +516,24 @@ test "SSE events integration test - wait for justification and finalization" {
                 }
             }
 
-            // Check for finalization with slot > 0
-            if (!got_finalization and std.mem.eql(u8, e.event_type, "new_finalization")) {
+            // Check for finalization events
+            if (std.mem.eql(u8, e.event_type, "new_finalization")) {
                 if (e.finalized_slot) |slot| {
                     std.debug.print("DEBUG: Found finalization event with slot {}\n", .{slot});
-                    if (slot > 0) {
+                    if (slot > 0 and !got_finalization) {
+                        // First finalization — this triggers node3 to start syncing
                         got_finalization = true;
-                        std.debug.print("INFO: Found finalization with slot {}\n", .{slot});
+                        first_finalized_slot = slot;
+                        head_count_at_finalization = sse_client.getEventCount("new_head");
+                        std.debug.print("INFO: First finalization at slot {} — node 3 will start syncing via parent block requests\n", .{slot});
+                        std.debug.print("INFO: Head events at finalization: {}\n", .{head_count_at_finalization});
+                    } else if (got_finalization and slot > first_finalized_slot and !got_node3_sync) {
+                        // Finalization advanced beyond the first finalized slot.
+                        // This means the chain continued progressing after node3 joined.
+                        got_node3_sync = true;
+                        const head_count_now = sse_client.getEventCount("new_head");
+                        std.debug.print("INFO: Advanced finalization at slot {} (first was {}) — chain progressed after node 3 joined\n", .{ slot, first_finalized_slot });
+                        std.debug.print("INFO: Head events since finalization: {} (total: {})\n", .{ head_count_now - head_count_at_finalization, head_count_now });
                     }
                 } else {
                     std.debug.print("DEBUG: Found finalization event with null slot\n", .{});
@@ -526,6 +543,20 @@ test "SSE events integration test - wait for justification and finalization" {
             // IMPORTANT: Free the event memory after processing
             e.deinit(allocator);
         }
+
+        current_ns = std.time.nanoTimestamp();
+        std.debug.print("CURRENT TIME:{d} DEADLINE={d} START={d} PASSED={d} TIMEOUT={d} (in ms)\n", .{
+            @divTrunc(current_ns, std.time.ns_per_ms),
+            @divTrunc(deadline_ns, std.time.ns_per_ms),
+            @divTrunc(start_ns, std.time.ns_per_ms),
+            @divTrunc(current_ns - start_ns, std.time.ns_per_ms),
+            timeout_ms,
+        });
+        std.debug.print("STATUS: got_justification={any} got_finalization={any} got_node3_sync={any}\n", .{
+            got_justification,
+            got_finalization,
+            got_node3_sync,
+        });
     }
 
     // Check if we received connection event
@@ -538,9 +569,10 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Received events - Head: {}, Justification: {}, Finalization: {}\n", .{ head_events, justification_events, finalization_events });
 
-    // Require both justification and finalization (> 0) to have been observed
+    // Require justification, finalization, and node3 sync verification
     try std.testing.expect(got_justification);
     try std.testing.expect(got_finalization);
+    try std.testing.expect(got_node3_sync);
 
     // Print some sample events for debugging
     for (sse_client.received_events.items, 0..) |event_data, i| {
@@ -549,7 +581,7 @@ test "SSE events integration test - wait for justification and finalization" {
         }
     }
 
-    std.debug.print("SUCCESS: SSE events integration test completed\n", .{});
+    std.debug.print("SUCCESS: SSE events integration test completed — including node 3 parent sync verification\n", .{});
 }
 
 // Test suite for ErrorHandler

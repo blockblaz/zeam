@@ -16,6 +16,18 @@ const zkvm_targets: []const zkvmTarget = &.{
 
 const ProverChoice = enum { dummy, risc0, openvm, all };
 
+fn setTestRunLabel(b: *Builder, run_step: *std.Build.Step.Run, name: []const u8) void {
+    run_step.step.name = b.fmt("test {s}", .{name});
+}
+
+fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compile_step: *std.Build.Step.Compile) void {
+    const source_name = if (compile_step.root_module.root_source_file) |root_source|
+        root_source.getDisplayName()
+    else
+        compile_step.step.name;
+    setTestRunLabel(b, run_step, source_name);
+}
+
 // Add the glue libs to a compile target
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
     // Conditionally include prover libraries based on selection
@@ -23,22 +35,26 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
     switch (prover) {
         .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
@@ -130,6 +146,8 @@ pub fn build(b: *Builder) !void {
     build_options.addOption([]const u8, "prover", @tagName(prover));
     build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    const use_poseidon = b.option(bool, "use_poseidon", "Use Poseidon SSZ hasher (default: false)") orelse false;
+    build_options.addOption(bool, "use_poseidon", use_poseidon);
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -140,6 +158,17 @@ pub fn build(b: *Builder) !void {
     });
     zeam_utils.addImport("datetime", datetime);
     zeam_utils.addImport("yaml", yaml);
+    zeam_utils.addImport("ssz", ssz);
+    zeam_utils.addImport("build_options", build_options_module);
+    if (use_poseidon) {
+        // add hash-zig dependency only when Poseidon hasher is enabled
+        const hash_zig = b.dependency("hash_zig", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        const hash_zig_module = hash_zig.module("hash-zig");
+        zeam_utils.addImport("hash_zig", hash_zig_module);
+    }
 
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
@@ -156,6 +185,14 @@ pub fn build(b: *Builder) !void {
     });
     zeam_metrics.addImport("metrics", metrics);
 
+    // add zeam-xmss
+    const zeam_xmss = b.addModule("@zeam/xmss", .{
+        .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zeam_xmss.addImport("ssz", ssz);
+
     // add zeam-types
     const zeam_types = b.addModule("@zeam/types", .{
         .root_source_file = b.path("pkgs/types/src/lib.zig"),
@@ -166,6 +203,7 @@ pub fn build(b: *Builder) !void {
     zeam_types.addImport("@zeam/params", zeam_params);
     zeam_types.addImport("@zeam/utils", zeam_utils);
     zeam_types.addImport("@zeam/metrics", zeam_metrics);
+    zeam_types.addImport("@zeam/xmss", zeam_xmss);
 
     // add zeam-types
     const zeam_configs = b.addModule("@zeam/configs", .{
@@ -188,13 +226,6 @@ pub fn build(b: *Builder) !void {
     zeam_api.addImport("@zeam/types", zeam_types);
     zeam_api.addImport("@zeam/utils", zeam_utils);
 
-    // add zeam-xmss
-    const zeam_xmss = b.addModule("@zeam/xmss", .{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("pkgs/xmss/src/hashsig.zig"),
-    });
-
     // add zeam-key-manager
     const zeam_key_manager = b.addModule("@zeam/key-manager", .{
         .root_source_file = b.path("pkgs/key-manager/src/lib.zig"),
@@ -203,6 +234,8 @@ pub fn build(b: *Builder) !void {
     });
     zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
     zeam_key_manager.addImport("@zeam/types", zeam_types);
+    zeam_key_manager.addImport("@zeam/utils", zeam_utils);
+    zeam_key_manager.addImport("@zeam/metrics", zeam_metrics);
     zeam_key_manager.addImport("ssz", ssz);
 
     // add zeam-state-transition
@@ -284,6 +317,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/metrics", zeam_metrics);
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
+    zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -346,7 +380,7 @@ pub fn build(b: *Builder) !void {
 
     b.installArtifact(cli_exe);
 
-    try build_zkvm_targets(b, &cli_exe.step, target);
+    try build_zkvm_targets(b, &cli_exe.step, target, build_options_module, use_poseidon);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -416,7 +450,11 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     types_tests.root_module.addImport("ssz", ssz);
+    types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    types_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, types_tests, target, prover);
     const run_types_test = b.addRunArtifact(types_tests);
+    setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
 
     const transition_tests = b.addTest(.{
@@ -431,6 +469,7 @@ pub fn build(b: *Builder) !void {
     transition_tests.root_module.addImport("@zeam/metrics", zeam_metrics);
     transition_tests.root_module.addImport("ssz", ssz);
     const run_transition_test = b.addRunArtifact(transition_tests);
+    setTestRunLabelFromCompile(b, run_transition_test, transition_tests);
     test_step.dependOn(&run_transition_test.step);
 
     const manager_tests = b.addTest(.{
@@ -441,6 +480,7 @@ pub fn build(b: *Builder) !void {
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
     addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
+    setTestRunLabelFromCompile(b, run_manager_test, manager_tests);
     test_step.dependOn(&run_manager_test.step);
 
     const node_tests = b.addTest(.{
@@ -450,6 +490,7 @@ pub fn build(b: *Builder) !void {
     });
     addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
+    setTestRunLabelFromCompile(b, run_node_test, node_tests);
     test_step.dependOn(&run_node_test.step);
 
     const cli_tests = b.addTest(.{
@@ -461,6 +502,7 @@ pub fn build(b: *Builder) !void {
     cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
     const run_cli_test = b.addRunArtifact(cli_tests);
+    setTestRunLabelFromCompile(b, run_cli_test, cli_tests);
     test_step.dependOn(&run_cli_test.step);
 
     const params_tests = b.addTest(.{
@@ -469,6 +511,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_params_tests = b.addRunArtifact(params_tests);
+    setTestRunLabelFromCompile(b, run_params_tests, params_tests);
     test_step.dependOn(&run_params_tests.step);
 
     const network_tests = b.addTest(.{
@@ -481,6 +524,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("ssz", ssz);
     addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
+    setTestRunLabelFromCompile(b, run_network_tests, network_tests);
     test_step.dependOn(&run_network_tests.step);
 
     const configs_tests = b.addTest(.{
@@ -495,6 +539,7 @@ pub fn build(b: *Builder) !void {
     configs_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, configs_tests, target, prover);
     const run_configs_tests = b.addRunArtifact(configs_tests);
+    setTestRunLabelFromCompile(b, run_configs_tests, configs_tests);
     test_step.dependOn(&run_configs_tests.step);
 
     const utils_tests = b.addTest(.{
@@ -503,6 +548,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
+    setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
     test_step.dependOn(&run_utils_tests.step);
 
     const database_tests = b.addTest(.{
@@ -511,6 +557,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
     });
     const run_database_tests = b.addRunArtifact(database_tests);
+    setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
     const xmss_tests = b.addTest(.{
@@ -523,6 +570,7 @@ pub fn build(b: *Builder) !void {
     xmss_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, xmss_tests, target, prover);
     const run_xmss_tests = b.addRunArtifact(xmss_tests);
+    setTestRunLabelFromCompile(b, run_xmss_tests, xmss_tests);
     test_step.dependOn(&run_xmss_tests.step);
 
     const spectests = b.addTest(.{
@@ -552,6 +600,7 @@ pub fn build(b: *Builder) !void {
     });
     tools_cli_tests.root_module.addImport("enr", enr);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
+    setTestRunLabelFromCompile(b, run_tools_cli_test, tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);
 
     test_step.dependOn(tools_test_step);
@@ -559,6 +608,7 @@ pub fn build(b: *Builder) !void {
     // Create simtest step that runs only integration tests
     const simtests = b.step("simtest", "Run integration tests");
     const run_cli_integration_test = b.addRunArtifact(cli_integration_tests);
+    setTestRunLabelFromCompile(b, run_cli_integration_test, cli_integration_tests);
     simtests.dependOn(&run_cli_integration_test.step);
 
     // Create spectest step that runs spec tests
@@ -637,18 +687,19 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "cargo", "+nightly",  "-C", path,          "-Z", "unstable-options",
-            "build", "--release", "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "cargo", "+nightly",      "-C", path,          "-Z", "unstable-options",
+            "build", "--release",     "-p", "libp2p-glue", "-p", "hashsig-glue",
+            "-p",    "multisig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo",      "+nightly",  "-C",            path, "-Z",          "unstable-options",
-            "build",      "--profile", "risc0-release", "-p", "libp2p-glue", "-p",
-            "risc0-glue", "-p",        "hashsig-glue",
+            "cargo",      "+nightly",  "-C",            path, "-Z",            "unstable-options",
+            "build",      "--profile", "risc0-release", "-p", "libp2p-glue",   "-p",
+            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo",       "+nightly",  "-C",             path, "-Z",          "unstable-options",
-            "build",       "--profile", "openvm-release", "-p", "libp2p-glue", "-p",
-            "openvm-glue", "-p",        "hashsig-glue",
+            "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
+            "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
+            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
@@ -659,7 +710,13 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     return cargo_build;
 }
 
-fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Build.ResolvedTarget) !void {
+fn build_zkvm_targets(
+    b: *Builder,
+    main_exe: *Builder.Step,
+    host_target: std.Build.ResolvedTarget,
+    build_options_module: *std.Build.Module,
+    use_poseidon: bool,
+) !void {
     const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
@@ -691,6 +748,17 @@ fn build_zkvm_targets(b: *Builder, main_exe: *Builder.Step, host_target: std.Bui
             .optimize = optimize,
             .root_source_file = b.path("pkgs/utils/src/lib.zig"),
         });
+        zeam_utils.addImport("ssz", ssz);
+        zeam_utils.addImport("build_options", build_options_module);
+        if (use_poseidon) {
+            // add hash-zig dependency only when Poseidon hasher is enabled
+            const hash_zig = b.dependency("hash_zig", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            const hash_zig_module = hash_zig.module("hash-zig");
+            zeam_utils.addImport("hash_zig", hash_zig_module);
+        }
 
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{

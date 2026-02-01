@@ -4,8 +4,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
-            .url = "https://github.com/blockblaz/ssz.zig/archive/refs/tags/v0.0.7.tar.gz",
-            .hash = "ssz-0.0.4-Lfwd65-iAgBkwCIZmHkrOvD3oCjooiBD73Nmp4gCNMG6",
+            .url = "https://github.com/blockblaz/ssz.zig/archive/refs/tags/v0.0.9.tar.gz",
+            .hash = "ssz-0.0.9-Lfwd6wvKAgA3JZjtfbeXeQG6zle1K_K2j6HPmQJJF4an",
         },
         .zigcli = .{
             .url = "git+https://github.com/jiacai2050/zigcli?ref=main#dcbc59d70b4787671c8a4e484ffd2b725aa17af5",
@@ -36,12 +36,16 @@
             .hash = "rocksdb-9.7.4-z_CUTmO5AAD0CQ2ZvShSDZHjC2x9MKrTnpvbNAIU7ah0",
         },
         .zig_snappy = .{
-            .url = "git+https://github.com/blockblaz/zig-snappy#6084220140937f5909090eb75199c6a3430cc277",
-            .hash = "zig_snappy-0.0.1-bDFzXpRWAAB7OvKIiOndOdHZPK8Sg1U5pboBywo-pj2y",
+            .url = "https://github.com/blockblaz/zig-snappy/archive/v0.0.2.tar.gz",
+            .hash = "zig_snappy-0.0.2-bDFzXrNhAAB7ckCAnI7VncBdoBU9CTGFz7V5sM46qL6v",
         },
         .snappyframesz = .{
-            .url = "https://github.com/blockblaz/snappyframesz/archive/78e66c2d42dc44dd1177ad007e28838a82157aa3.tar.gz",
-            .hash = "snappyframesz-0.0.1-COCLy9EQBADDWj8BS-OdrIFOwHfiY9KUUiClsyBHgETn",
+            .url = "https://github.com/blockblaz/snappyframesz/archive/v0.0.2.tar.gz",
+            .hash = "snappyframesz-0.0.2-COCLy9AQBAB7Yxi1ourOp6Ki9jCl3M-tLMTVQp2ZOkRo",
+        },
+        .hash_zig = .{
+            .url = "https://github.com/blockblaz/hash-zig/archive/117c0fabe339f05ed130f1100724661b98dd53e2.tar.gz",
+            .hash = "hash_zig-1.1.3-POmurMgaCwDocWpdeWh7Hv-y3Y0oX-aGym-iwWsUfdLN",
         },
     },
     .paths = .{""},

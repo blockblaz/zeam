@@ -1,3 +1,16 @@
+const aggregation = @import("./aggregation.zig");
+pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
+
+const attestation = @import("./attestation.zig");
+pub const AggregationBits = attestation.AggregationBits;
+pub const AttestationData = attestation.AttestationData;
+pub const Attestation = attestation.Attestation;
+pub const SignedAttestation = attestation.SignedAttestation;
+pub const AggregatedAttestation = attestation.AggregatedAttestation;
+pub const aggregationBitsEnsureLength = attestation.aggregationBitsEnsureLength;
+pub const aggregationBitsSet = attestation.aggregationBitsSet;
+pub const aggregationBitsToValidatorIndices = attestation.aggregationBitsToValidatorIndices;
+
 const block = @import("./block.zig");
 pub const BlockByRootRequest = block.BlockByRootRequest;
 pub const ProtoBlock = block.ProtoBlock;
@@ -7,18 +20,17 @@ pub const BeamBlockHeader = block.BeamBlockHeader;
 pub const BeamBlockBody = block.BeamBlockBody;
 pub const BlockWithAttestation = block.BlockWithAttestation;
 pub const SignedBlockWithAttestation = block.SignedBlockWithAttestation;
-pub const Attestations = block.Attestations;
+pub const AggregatedAttestations = block.AggregatedAttestations;
+pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
+pub const AttestationSignatures = block.AttestationSignatures;
 pub const BlockSignatures = block.BlockSignatures;
 pub const createBlockSignatures = block.createBlockSignatures;
-
-const attestation = @import("./attestation.zig");
-pub const AggregationBits = attestation.AggregationBits;
-pub const AggregatedSignatures = attestation.AggregatedSignatures;
-pub const AttestationData = attestation.AttestationData;
-pub const Attestation = attestation.Attestation;
-pub const SignedAttestation = attestation.SignedAttestation;
-pub const AggregatedAttestation = attestation.AggregatedAttestation;
-pub const SignedAggregatedAttestation = attestation.SignedAggregatedAttestation;
+pub const SignatureKey = block.SignatureKey;
+pub const StoredSignature = block.StoredSignature;
+pub const SignaturesMap = block.SignaturesMap;
+pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
+pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
+pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

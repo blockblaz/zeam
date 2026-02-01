@@ -1,4 +1,3 @@
-const ssz = @import("ssz");
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
@@ -51,50 +50,124 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     logger.debug("extracting state root\n", .{});
     // extract the post state root
     var state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
+    try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
     block.state_root = state_root;
 }
 
-// fill this up when we have signature scheme
+// Verify aggregated signatures using AggregatedSignatureProof
+// If pubkey_cache is provided, public keys are cached to avoid repeated SSZ deserialization.
+// This can significantly reduce CPU overhead when processing many blocks.
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,
     signed_block: *const types.SignedBlockWithAttestation,
+    pubkey_cache: ?*xmss.PublicKeyCache,
 ) !void {
     const attestations = signed_block.message.block.body.attestations.constSlice();
-    const signatures = signed_block.signature.constSlice();
+    const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
 
-    // Must have exactly one signature per attestation plus one for proposer
-    if (attestations.len + 1 != signatures.len) {
+    if (attestations.len != signature_proofs.len) {
         return StateTransitionError.InvalidBlockSignatures;
     }
 
-    // Verify all body attestations
-    for (attestations, 0..) |attestation, i| {
-        try verifySingleAttestation(
-            allocator,
-            state,
-            &attestation,
-            &signatures[i],
-        );
+    const validators = state.validators.constSlice();
+
+    for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
+        // Get validator indices from the attestation's aggregation bits
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
+        defer validator_indices.deinit();
+
+        // Get validator indices from the signature proof's participants
+        var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
+        defer participant_indices.deinit();
+
+        // Verify that the participants EXACTLY match the attestation aggregation bits.
+        if (validator_indices.items.len != participant_indices.items.len) {
+            return StateTransitionError.InvalidBlockSignatures;
+        }
+        for (validator_indices.items, participant_indices.items) |att_idx, proof_idx| {
+            if (att_idx != proof_idx) {
+                return StateTransitionError.InvalidBlockSignatures;
+            }
+        }
+
+        // Convert validator pubkey bytes to HashSigPublicKey handles
+        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
+        defer public_keys.deinit();
+
+        // Store the PublicKey wrappers so we can free the Rust handles after verification
+        // Only used when cache is not provided
+        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        defer {
+            // Only free wrappers if we're not using a cache
+            // When using cache, the cache owns the handles
+            if (pubkey_cache == null) {
+                for (pubkey_wrappers.items) |*wrapper| {
+                    wrapper.deinit();
+                }
+            }
+            pubkey_wrappers.deinit();
+        }
+
+        for (validator_indices.items) |validator_index| {
+            if (validator_index >= validators.len) {
+                return StateTransitionError.InvalidValidatorId;
+            }
+            const validator = &validators[validator_index];
+            const pubkey_bytes = validator.getPubkey();
+
+            if (pubkey_cache) |cache| {
+                // Use cached public key (deserialize on first access, reuse on subsequent)
+                const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
+                    return StateTransitionError.InvalidBlockSignatures;
+                };
+                try public_keys.append(pk_handle);
+            } else {
+                // No cache - deserialize each time (legacy behavior)
+                const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
+                    return StateTransitionError.InvalidBlockSignatures;
+                };
+                try public_keys.append(pubkey.handle);
+                try pubkey_wrappers.append(pubkey);
+            }
+        }
+
+        // Compute message hash from attestation data
+        var message_hash: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.AttestationData, aggregated_attestation.data, &message_hash, allocator);
+
+        const epoch: u64 = aggregated_attestation.data.slot;
+
+        // Verify the aggregated signature proof
+        const agg_verification_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
+        signature_proof.verify(public_keys.items, &message_hash, epoch) catch |err| {
+            _ = agg_verification_timer.observe();
+            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+            return err;
+        };
+        _ = agg_verification_timer.observe();
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
     }
 
-    // Verify proposer attestation (last signature in the list)
+    // Verify proposer signature (still individual)
+    const proposer_attestation = signed_block.message.proposer_attestation;
     try verifySingleAttestation(
         allocator,
         state,
-        &signed_block.message.proposer_attestation,
-        &signatures[signatures.len - 1],
+        @intCast(proposer_attestation.validator_id),
+        &proposer_attestation.data,
+        &signed_block.signature.proposer_signature,
     );
 }
 
 pub fn verifySingleAttestation(
     allocator: Allocator,
     state: *const types.BeamState,
-    attestation: *const types.Attestation,
+    validator_index: usize,
+    attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
 ) !void {
-    const validatorIndex: usize = @intCast(attestation.validator_id);
+    const validatorIndex = validator_index;
     const validators = state.validators.constSlice();
     if (validatorIndex >= validators.len) {
         return StateTransitionError.InvalidValidatorId;
@@ -103,12 +176,14 @@ pub fn verifySingleAttestation(
     const validator = &validators[validatorIndex];
     const pubkey = validator.getPubkey();
 
+    const verification_timer = zeam_metrics.lean_pq_signature_attestation_verification_time_seconds.start();
     var message: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.Attestation, attestation.*, &message, allocator);
+    try zeam_utils.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
 
-    const epoch: u32 = @intCast(attestation.data.slot);
+    const epoch: u32 = @intCast(attestation_data.slot);
 
-    try xmss.verifyBincode(pubkey, &message, epoch, signatureBytes);
+    try xmss.verifySsz(pubkey, &message, epoch, signatureBytes);
+    _ = verification_timer.observe();
 }
 
 // TODO(gballet) check if beam block needs to be a pointer
@@ -134,7 +209,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
     if (validateResult) {
         // verify the post state root
         var state_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
             opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;

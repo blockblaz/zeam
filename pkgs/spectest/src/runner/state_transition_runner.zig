@@ -41,8 +41,6 @@ pub fn baseRelRoot(comptime spec_fork: Fork) []const u8 {
 const types = @import("@zeam/types");
 const state_transition = @import("@zeam/state-transition");
 const zeam_utils = @import("@zeam/utils");
-const ssz = @import("ssz");
-
 const JsonValue = std.json.Value;
 const Context = expect.Context;
 
@@ -245,7 +243,7 @@ fn runCase(
             var header_for_check = pre_state.latest_block_header;
             if (std.mem.eql(u8, &header_for_check.state_root, &types.ZERO_HASH)) {
                 var pre_state_root: types.Root = undefined;
-                ssz.hashTreeRoot(types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
+                zeam_utils.hashTreeRoot(types.BeamState, pre_state, &pre_state_root, allocator) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: unable to hash pre-state ({s})\n",
                         .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -256,7 +254,7 @@ fn runCase(
             }
 
             var header_root: types.Root = undefined;
-            ssz.hashTreeRoot(types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
+            zeam_utils.hashTreeRoot(types.BeamBlockHeader, header_for_check, &header_root, allocator) catch |err| {
                 std.debug.print(
                     "fixture {s} case {s}: unable to hash latest block header ({s})\n",
                     .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
@@ -419,7 +417,16 @@ fn parseValidators(
                 const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
                 const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
 
-                validators.append(.{ .pubkey = pubkey }) catch |err| {
+                const validator_index: u64 = blk: {
+                    if (validator_obj.get("index")) |index_value| {
+                        var index_label_buf: [96]u8 = undefined;
+                        const index_label = std.fmt.bufPrint(&index_label_buf, "{s}.index", .{base_label}) catch "validator.index";
+                        break :blk try expect.expectU64Value(FixtureError, index_value, ctx, index_label);
+                    }
+                    break :blk @as(u64, @intCast(idx));
+                };
+
+                validators.append(.{ .pubkey = pubkey, .index = validator_index }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ ctx.fixture_label, ctx.case_name, idx, @errorName(err) },
@@ -457,7 +464,7 @@ fn buildBlock(
         }
     }
 
-    const attestations = try types.Attestations.init(allocator);
+    const attestations = try types.AggregatedAttestations.init(allocator);
     return types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,

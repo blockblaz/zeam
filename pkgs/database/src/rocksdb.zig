@@ -25,7 +25,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
-            logger.info("Initializing RocksDB", .{});
+            logger.info("initializing RocksDB", .{});
 
             const owned_path = try std.fmt.allocPrintZ(allocator, "{s}/rocksdb", .{path});
             errdefer allocator.free(owned_path);
@@ -41,7 +41,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime {
                 // assert that the first cn is the default column family
                 if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {
-                    @compileError("Default column namespace not found: first column namespace must be 'default'");
+                    @compileError("default column namespace not found: first column namespace must be 'default'");
                 }
             }
 
@@ -133,7 +133,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         pub fn commit(self: *Self, batch: *WriteBatch) void {
             callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner }) catch |err| {
-                self.logger.err("Failed to commit write batch: {any}", .{err});
+                self.logger.err("failed to commit write batch: {any}", .{err});
                 return;
             };
         }
@@ -206,7 +206,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer serialized_value.deinit();
 
                 ssz.serialize(T, value, &serialized_value) catch |err| {
-                    self.logger.err("Failed to serialize value for putToBatch: {any}", .{err});
+                    self.logger.err("failed to serialize value for putToBatch: {any}", .{err});
                     return;
                 };
 
@@ -222,7 +222,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 block: types.SignedBlockWithAttestation,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                    self.logger.err("Failed to format block key for putBlock: {any}", .{err});
+                    self.logger.err("failed to format block key for putBlock: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -232,7 +232,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     block,
                     cn,
-                    "Added block to batch: root=0x{s}",
+                    "added block to batch: root=0x{s}",
                     .{std.fmt.fmtSliceHexLower(&block_root)},
                 );
             }
@@ -245,7 +245,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 state: types.BeamState,
             ) void {
                 const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                    self.logger.err("Failed to format state key for putState: {any}", .{err});
+                    self.logger.err("failed to format state key for putState: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -255,7 +255,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     state,
                     cn,
-                    "Added state to batch: root=0x{s}",
+                    "added state to batch: root=0x{s}",
                     .{std.fmt.fmtSliceHexLower(&state_root)},
                 );
             }
@@ -272,7 +272,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     attestation_key,
                     attestation,
                     cn,
-                    "Added attestation to batch: key={s}",
+                    "added attestation to batch: key={s}",
                     .{attestation_key},
                 );
             }
@@ -285,7 +285,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 blockroot: types.Root,
             ) void {
                 const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                    self.logger.err("failed to format finalized slot key: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -295,8 +295,25 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     blockroot,
                     cn,
-                    "Added finalized slot index to batch: slot={d} root=0x{s}",
+                    "added finalized slot index to batch: slot={d} root=0x{s}",
                     .{ slot, std.fmt.fmtSliceHexLower(&blockroot) },
+                );
+            }
+
+            /// Put the latest finalized slot metadata to this write batch
+            pub fn putLatestFinalizedSlot(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                slot: types.Slot,
+            ) void {
+                const key = "latest_finalized_slot";
+                self.putToBatch(
+                    types.Slot,
+                    key,
+                    slot,
+                    cn,
+                    "updated latest finalized slot metadata: slot={d}",
+                    .{slot},
                 );
             }
 
@@ -308,7 +325,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 blockroots: []const types.Root,
             ) void {
                 const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                    self.logger.err("failed to format unfinalized slot key: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
@@ -318,7 +335,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     blockroots,
                     cn,
-                    "Added unfinalized slot index to batch: slot={d} count={d}",
+                    "added unfinalized slot index to batch: slot={d} count={d}",
                     .{ slot, blockroots.len },
                 );
             }
@@ -330,13 +347,13 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 slot: types.Slot,
             ) void {
                 const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                    self.logger.err("Failed to format unfinalized slot key for deletion: {any}", .{err});
+                    self.logger.err("failed to format unfinalized slot key for deletion: {any}", .{err});
                     return;
                 };
                 defer self.allocator.free(key);
 
                 self.delete(cn, key);
-                self.logger.debug("Deleted unfinalized slot index from batch: slot={d}", .{slot});
+                self.logger.debug("deleted unfinalized slot index from batch: slot={d}", .{slot});
             }
         };
 
@@ -419,12 +436,12 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer serialized_value.deinit();
 
             ssz.serialize(T, value, &serialized_value) catch |err| {
-                self.logger.err("Failed to serialize value for saveToDatabase: {any}", .{err});
+                self.logger.err("failed to serialize value for saveToDatabase: {any}", .{err});
                 return;
             };
 
             self.put(cn, key, serialized_value.items) catch |err| {
-                self.logger.err("Failed to put value to database in saveToDatabase: {any}", .{err});
+                self.logger.err("failed to put value to database in saveToDatabase: {any}", .{err});
                 return;
             };
             self.logger.debug(log_message, log_args);
@@ -440,7 +457,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             log_args: anytype,
         ) ?T {
             const value = self.get(cn, key) catch |err| {
-                self.logger.err("Failed to get value from database in loadFromDatabase: {any}", .{err});
+                self.logger.err("failed to get value from database in loadFromDatabase: {any}", .{err});
                 return null;
             };
             if (value) |encoded_value| {
@@ -448,7 +465,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
                 var decoded_value: T = undefined;
                 ssz.deserialize(T, encoded_value.data, &decoded_value, self.allocator) catch |err| {
-                    self.logger.err("Failed to deserialize value in loadFromDatabase: {any}", .{err});
+                    self.logger.err("failed to deserialize value in loadFromDatabase: {any}", .{err});
                     return null;
                 };
 
@@ -461,7 +478,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Save a block to the database
         pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                self.logger.err("Failed to format block key for saveBlock: {any}", .{err});
+                self.logger.err("failed to format block key for saveBlock: {any}", .{err});
                 return;
             };
             defer self.allocator.free(key);
@@ -471,7 +488,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 block,
                 cn,
-                "Saved block to database: root=0x{s}",
+                "saved block to database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&block_root)},
             );
         }
@@ -479,7 +496,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a block from the database
         pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
             const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
-                self.logger.err("Failed to format block key for loadBlock: {any}", .{err});
+                self.logger.err("failed to format block key for loadBlock: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -488,7 +505,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.SignedBlockWithAttestation,
                 key,
                 cn,
-                "Loaded block from database: root=0x{s}",
+                "loaded block from database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&block_root)},
             );
         }
@@ -496,7 +513,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Save a state to the database
         pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
             const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                self.logger.err("Failed to format state key for saveState: {any}", .{err});
+                self.logger.err("failed to format state key for saveState: {any}", .{err});
                 return;
             };
             defer self.allocator.free(key);
@@ -506,7 +523,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 state,
                 cn,
-                "Saved state to database: root=0x{s}",
+                "saved state to database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&state_root)},
             );
         }
@@ -514,7 +531,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a state from the database
         pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) ?types.BeamState {
             const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
-                self.logger.err("Failed to format state key for loadState: {any}", .{err});
+                self.logger.err("failed to format state key for loadState: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -523,7 +540,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.BeamState,
                 key,
                 cn,
-                "Loaded state from database: root=0x{s}",
+                "loaded state from database: root=0x{s}",
                 .{std.fmt.fmtSliceHexLower(&state_root)},
             );
         }
@@ -535,7 +552,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 attestation_key,
                 attestation,
                 cn,
-                "Saved attestation to database: key={s}",
+                "saved attestation to database: key={s}",
                 .{attestation_key},
             );
         }
@@ -546,7 +563,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.SignedAttestation,
                 attestation_key,
                 cn,
-                "Loaded attestation from database: key={s}",
+                "loaded attestation from database: key={s}",
                 .{attestation_key},
             );
         }
@@ -554,7 +571,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         /// Load a finalized slot index from the database
         pub fn loadFinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?types.Root {
             const key = interface.formatFinalizedSlotKey(self.allocator, slot) catch |err| {
-                self.logger.err("Failed to format finalized slot key: {any}", .{err});
+                self.logger.err("failed to format finalized slot key: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -563,15 +580,58 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.Root,
                 key,
                 cn,
-                "Loaded finalized slot index from database: slot={d}",
+                "loaded finalized slot index from database: slot={d}",
                 .{slot},
             );
+        }
+
+        /// Load the latest finalized slot metadata from the database
+        pub fn loadLatestFinalizedSlot(self: *Self, comptime cn: ColumnNamespace) ?types.Slot {
+            const key = "latest_finalized_slot";
+            return self.loadFromDatabase(
+                types.Slot,
+                key,
+                cn,
+                "loaded latest finalized slot metadata",
+                .{},
+            );
+        }
+
+        /// Attempts to load the latest finalized state from the database
+        /// Returns null if no finalized state is found (e.g., first run)
+        pub fn loadLatestFinalizedState(
+            self: *Self,
+            state_ptr: *types.BeamState,
+        ) !void {
+            // Load the latest finalized slot from metadata
+            const finalized_slot = self.loadLatestFinalizedSlot(database.DbDefaultNamespace) orelse {
+                self.logger.info("no finalized state found in database, will use genesis", .{});
+                return error.NoFinalizedStateFound;
+            };
+
+            self.logger.info("found latest finalized slot {d}, loading block root...", .{finalized_slot});
+
+            // Load the block root for this finalized slot
+            const block_root = self.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot) orelse {
+                self.logger.warn("finalized slot {d} found in metadata but not in finalized index", .{finalized_slot});
+                return error.FinalizedSlotNotFoundInIndex;
+            };
+
+            // Load the state from the database
+            if (self.loadState(database.DbStatesNamespace, block_root)) |state| {
+                state_ptr.* = state;
+                self.logger.info("successfully loaded finalized state at slot {d}", .{finalized_slot});
+                return;
+            } else {
+                self.logger.warn("finalized slot {d} found in index but state not in database", .{finalized_slot});
+                return error.FinalizedStateNotFoundInDatabase;
+            }
         }
 
         /// Load an unfinalized slot index from the database
         pub fn loadUnfinalizedSlotIndex(self: *Self, comptime cn: ColumnNamespace, slot: types.Slot) ?[]types.Root {
             const key = interface.formatUnfinalizedSlotKey(self.allocator, slot) catch |err| {
-                self.logger.err("Failed to format unfinalized slot key: {any}", .{err});
+                self.logger.err("failed to format unfinalized slot key: {any}", .{err});
                 return null;
             };
             defer self.allocator.free(key);
@@ -580,7 +640,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 []types.Root,
                 key,
                 cn,
-                "Loaded unfinalized slot index from database: slot={d}",
+                "loaded unfinalized slot index from database: slot={d}",
                 .{slot},
             );
         }
@@ -603,7 +663,7 @@ fn callRocksDB(logger: zeam_utils.ModuleLogger, func: anytype, args: anytype) in
     var err_str: ?rocksdb.Data = null;
     return @call(.auto, func, args ++ .{&err_str}) catch |e| {
         const func_name = @typeName(@TypeOf(func));
-        logger.err("Failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
+        logger.err("failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
         return e;
     };
 }
@@ -923,14 +983,18 @@ test "save and load block" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAB);
 
-    // Create test signatures
-    var test_sig1: types.SIGBYTES = undefined;
-    @memset(&test_sig1, 0x12);
-    var test_sig2: types.SIGBYTES = undefined;
-    @memset(&test_sig2, 0x34);
-    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2 };
+    // Create dummy attestation signatures using helper
+    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
+        for (attestation_signatures.slice()) |*sig| {
+            sig.deinit();
+        }
+        attestation_signatures.deinit();
+    };
 
-    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, &test_signatures);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 1, 0, 0xCD, 0xEF, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     // Save the block
@@ -951,12 +1015,9 @@ test "save and load block" {
     // Verify attestations list is empty as expected
     try std.testing.expect(loaded.block.body.attestations.len() == 0);
 
-    // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 2);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
+    // Verify attestation signatures count matches
+    const signature_proofs = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(signature_proofs.len() == signed_block.signature.attestation_signatures.len());
 
     // Test loading a non-existent block
     const non_existent_root = test_helpers.createDummyRoot(0xFF);
@@ -1028,16 +1089,18 @@ test "batch write and commit" {
     // Create test data using helper functions
     const test_block_root = test_helpers.createDummyRoot(0xAA);
 
-    // Create test signatures
-    var test_sig1: types.SIGBYTES = undefined;
-    @memset(&test_sig1, 0xDD);
-    var test_sig2: types.SIGBYTES = undefined;
-    @memset(&test_sig2, 0xEE);
-    var test_sig3: types.SIGBYTES = undefined;
-    @memset(&test_sig3, 0xFF);
-    const test_signatures = [_]types.SIGBYTES{ test_sig1, test_sig2, test_sig3 };
+    // Create dummy attestation signatures using helper
+    var attestation_signatures = try test_helpers.createDummyAttestationSignatures(allocator, 3);
+    var attestation_signatures_cleanup = true;
+    errdefer if (attestation_signatures_cleanup) {
+        for (attestation_signatures.slice()) |*sig| {
+            sig.deinit();
+        }
+        attestation_signatures.deinit();
+    };
 
-    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, &test_signatures);
+    var signed_block = try test_helpers.createDummyBlock(allocator, 2, 1, 0xBB, 0xCC, attestation_signatures);
+    attestation_signatures_cleanup = false; // ownership moved into signed_block
     defer signed_block.deinit();
 
     const test_state_root = test_helpers.createDummyRoot(0xEE);
@@ -1073,14 +1136,9 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.parent_root, &signed_block.message.block.parent_root));
     try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
 
-    // Verify signatures match
-    try std.testing.expect(loaded_block.?.signature.len() == 3);
-    const loaded_sig1 = try loaded_block.?.signature.get(0);
-    const loaded_sig2 = try loaded_block.?.signature.get(1);
-    const loaded_sig3 = try loaded_block.?.signature.get(2);
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig1, &test_sig1));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig2, &test_sig2));
-    try std.testing.expect(std.mem.eql(u8, &loaded_sig3, &test_sig3));
+    // Verify attestation signatures count matches
+    const batch_signature_proofs = loaded_block.?.signature.attestation_signatures;
+    try std.testing.expect(batch_signature_proofs.len() == attestation_signatures.len());
 
     // Verify state was saved and can be loaded
     const loaded_state = db.loadState(database.DbStatesNamespace, test_state_root);
@@ -1092,4 +1150,82 @@ test "batch write and commit" {
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_justified.root, &test_state.latest_justified.root));
     try std.testing.expect(loaded_state_data.latest_finalized.slot == test_state.latest_finalized.slot);
     try std.testing.expect(std.mem.eql(u8, &loaded_state_data.latest_finalized.root, &test_state.latest_finalized.root));
+}
+
+test "loadLatestFinalizedState" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    // Empty DB -> no finalized slot metadata
+    {
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.NoFinalizedStateFound, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Metadata present but slot index missing -> error
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 7;
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        db.commit(&batch);
+
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.FinalizedSlotNotFoundInIndex, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Slot index present but state missing -> error
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 9;
+        const block_root = test_helpers.createDummyRoot(0xAA);
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
+        db.commit(&batch);
+
+        var out_state: types.BeamState = undefined;
+        try std.testing.expectError(error.FinalizedStateNotFoundInDatabase, db.loadLatestFinalizedState(&out_state));
+    }
+
+    // Happy path: metadata + slot index + state all present
+    {
+        var batch = db.initWriteBatch();
+        defer batch.deinit();
+
+        const finalized_slot: types.Slot = 11;
+        const block_root = test_helpers.createDummyRoot(0x42);
+
+        var expected_state = try test_helpers.createDummyState(allocator, 123, 4, 93, 1, 0, 0x10, 0x20);
+        defer expected_state.deinit();
+
+        batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
+        batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
+        batch.putState(database.DbStatesNamespace, block_root, expected_state);
+        db.commit(&batch);
+
+        var loaded_state: types.BeamState = undefined;
+        try db.loadLatestFinalizedState(&loaded_state);
+
+        // Spot-check a few fields to ensure the loaded state matches what we stored.
+        try std.testing.expectEqual(expected_state.slot, loaded_state.slot);
+        try std.testing.expectEqual(expected_state.latest_justified.slot, loaded_state.latest_justified.slot);
+        try std.testing.expect(std.mem.eql(u8, &expected_state.latest_justified.root, &loaded_state.latest_justified.root));
+        try std.testing.expectEqual(expected_state.latest_finalized.slot, loaded_state.latest_finalized.slot);
+        try std.testing.expect(std.mem.eql(u8, &expected_state.latest_finalized.root, &loaded_state.latest_finalized.root));
+    }
 }

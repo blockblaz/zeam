@@ -97,9 +97,29 @@ pub const ValidatorClient = struct {
 
     pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
+            // Check if chain is synced before producing a block
+            const sync_status = self.chain.getSyncStatus();
+            switch (sync_status) {
+                .synced => {},
+                .no_peers => {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: no peers connected", .{ slot, slot_proposer_id });
+                    return null;
+                },
+                .behind_peers => |info| {
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                        slot,
+                        slot_proposer_id,
+                        info.head_slot,
+                        info.max_peer_finalized_slot,
+                    });
+                    return null;
+                },
+            }
+
             // 1. construct the block
-            self.logger.info("constructing block message slot={d} proposer={d}", .{ slot, slot_proposer_id });
+            self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+            self.logger.info("produced block for slot={d} proposer={d} with root={s}", .{ slot, slot_proposer_id, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
 
             // 2. construct proposer attestation for the produced block which should already be in forkchoice
             // including its attestations
@@ -108,6 +128,9 @@ pub const ValidatorClient = struct {
                 .validator_id = slot_proposer_id,
                 .data = proposer_attestation_data,
             };
+            const attestation_str = try proposer_attestation_data.toJsonString(self.allocator);
+            defer self.allocator.free(attestation_str);
+            self.logger.info("packing proposer attestation for slot={d} proposer={d}: {s}", .{ slot, slot_proposer_id, attestation_str });
 
             // 3. construct the message to be signed
             const block_with_attestation = types.BlockWithAttestation{
@@ -115,24 +138,20 @@ pub const ValidatorClient = struct {
                 .proposer_attestation = proposer_attestation,
             };
 
-            // 4. Prepare signatures by adding the proposer signature to the already received list of
-            //    attestation signatures
-            var signatures = produced_block.signatures;
-
-            // 5. Sign proposer attestation (last signature)
+            // 4. Sign proposer attestation and build block signatures from the already-aggregated
+            //    attestation signatures returned by block production.
             const proposer_signature = try self.key_manager.signAttestation(&proposer_attestation, self.allocator);
-            try signatures.append(proposer_signature);
+            const signatures = types.BlockSignatures{
+                .attestation_signatures = produced_block.attestation_signatures,
+                .proposer_signature = proposer_signature,
+            };
 
             const signed_block = types.SignedBlockWithAttestation{
                 .message = block_with_attestation,
                 .signature = signatures,
             };
 
-            const signed_block_json = try signed_block.toJson(self.allocator);
-            const block_str = try jsonToString(self.allocator, signed_block_json);
-            defer self.allocator.free(block_str);
-
-            self.logger.info("validator produced block slot={d} block={s}", .{ slot, block_str });
+            self.logger.info("signed produced block with attestation for slot={d} root={s}", .{ slot, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
 
             // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);
@@ -144,6 +163,25 @@ pub const ValidatorClient = struct {
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
         if (self.ids.len == 0) return null;
+
+        // Check if chain is synced before producing attestations
+        const sync_status = self.chain.getSyncStatus();
+        switch (sync_status) {
+            .synced => {},
+            .no_peers => {
+                self.logger.warn("skipping attestation production for slot={d}: no peers connected", .{slot});
+                return null;
+            },
+            .behind_peers => |info| {
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.max_peer_finalized_slot,
+                });
+                return null;
+            },
+        }
+
         const slot_proposer_id = self.getSlotProposer(slot);
 
         self.logger.info("constructing attestation message for slot={d}", .{slot});
@@ -167,7 +205,8 @@ pub const ValidatorClient = struct {
             const signature = try self.key_manager.signAttestation(&attestation, self.allocator);
 
             const signed_attestation: types.SignedAttestation = .{
-                .message = attestation,
+                .validator_id = validator_id,
+                .message = attestation_data,
                 .signature = signature,
             };
 

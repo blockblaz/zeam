@@ -13,6 +13,7 @@ const Colors = struct {
     const timestamp = "\x1b[90m"; // Bright black
     const scope = "\x1b[35m"; // Magenta
     const module = "\x1b[94m"; // Bright blue
+    const peer = "\x1b[38;5;201m"; // Pink;
 };
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
@@ -98,6 +99,7 @@ pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.l
         .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams, moduleTag),
         .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams, moduleTag),
         .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .n4 => return compTimeLog(.n4, activeLevel, level, fmt, args, fileLogParams, moduleTag),
     }
 }
 
@@ -106,9 +108,11 @@ const LoggerScope = enum {
     n1,
     n2,
     n3,
+    n4,
 };
 
 pub const ModuleTag = enum {
+    api_server,
     cli,
     chain,
     configs,
@@ -320,6 +324,33 @@ pub const ModuleLogger = struct {
     }
 };
 
+/// Formatter for optional node names in logs
+/// Usage: logger.info("{}message", .{OptionalNode.init(maybe_node_name)})
+/// Outputs: "message" or "(node1) message"
+pub const OptionalNode = struct {
+    name: ?[]const u8,
+
+    pub fn init(name: ?[]const u8) OptionalNode {
+        return .{ .name = name };
+    }
+
+    pub fn format(
+        self: OptionalNode,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        const peer_color = Colors.peer;
+        const reset_color = Colors.reset;
+
+        _ = fmt;
+        _ = options;
+        if (self.name) |n| {
+            try writer.print("({s}{s}{s})", .{ peer_color, n, reset_color });
+        }
+    }
+};
+
 pub fn getScopedLoggerConfig(comptime scope: LoggerScope, activeLevel: ?std.log.Level, fileBehaviourParams: ?FileBehaviourParams) ZeamLoggerConfig {
     return ZeamLoggerConfig.init(scope, activeLevel orelse std.log.default_level, fileBehaviourParams);
 }
@@ -354,7 +385,16 @@ pub fn getFormattedTimestamp(buf: []u8) []const u8 {
 pub fn getFile(scope: LoggerScope, filePath: []const u8, fileName: []const u8) ?std.fs.File {
     // try to create/open a file
     // do not close here .. will be closed when log file is rotated and new log file is created
-    // directory must exist already - if dir does not exist log will not write
+    // ensure directory exists - try to create it if it doesn't exist
+
+    // Try to create the directory if it doesn't exist
+    std.fs.cwd().makePath(filePath) catch |err| switch (err) {
+        error.PathAlreadyExists => {}, // Directory exists, continue
+        else => {
+            std.debug.print("ERROR: Failed to create directory '{s}': {any}\n", .{ filePath, err });
+            return null;
+        },
+    };
 
     var dir = std.fs.cwd().openDir(filePath, .{}) catch |err| {
         std.debug.print("ERROR: Failed to open directory '{s}': {any}\n", .{ filePath, err });
@@ -408,6 +448,7 @@ fn getLevelColor(comptime level: std.log.Level) []const u8 {
 
 fn getModuleTagName(tag: ModuleTag) []const u8 {
     return switch (tag) {
+        .api_server => "api-server",
         .cli => "cli",
         .chain => "chain",
         .configs => "configs",
@@ -433,4 +474,65 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
         .utils => "utils",
         .validator => "validator",
     };
+}
+
+test "OptionalNode formatter" {
+    const testing = std.testing;
+    var buffer: [256]u8 = undefined;
+
+    // Test with node name present
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{} Peer connected: {s}, total peers: {d}", .{
+            OptionalNode.init("alice"),
+            "peer123",
+            5,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", result);
+    }
+
+    // Test with node name null
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
+            OptionalNode.init(null),
+            "peer456",
+            3,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", result);
+    }
+
+    // Test in different positions
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{} Published block: slot={d} proposer={d}", .{
+            OptionalNode.init("validator-7"),
+            100,
+            7,
+        });
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", result);
+    }
+
+    // Test with empty string (should still format)
+    {
+        var fbs = std.io.fixedBufferStream(&buffer);
+        const writer = fbs.writer();
+
+        try writer.print("{} Message", .{OptionalNode.init("")});
+
+        const result = fbs.getWritten();
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", result);
+    }
 }

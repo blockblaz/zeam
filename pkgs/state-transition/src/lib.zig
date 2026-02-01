@@ -16,6 +16,7 @@ pub const verifySingleAttestation = transition.verifySingleAttestation;
 
 const mockImport = @import("./mock.zig");
 pub const genMockChain = mockImport.genMockChain;
+pub const MockChainData = mockImport.MockChainData;
 
 test "ssz import" {
     const data: u16 = 0x5566;
@@ -46,7 +47,8 @@ test "apply transition on mocked chain" {
         const signed_block = mock_chain.blocks[i];
 
         // Verify signatures before applying state transition
-        try verifySignatures(allocator, &beam_state, &signed_block);
+        // Pass null for pubkey_cache since tests don't need caching optimization
+        try verifySignatures(allocator, &beam_state, &signed_block, null);
 
         try apply_transition(allocator, &beam_state, signed_block.message.block, .{ .logger = module_logger });
     }
@@ -54,7 +56,7 @@ test "apply transition on mocked chain" {
     // check the post state root to be equal to block2's stateroot
     // this is reduant though because apply_transition already checks this for each block's state root
     var post_state_root: [32]u8 = undefined;
-    try ssz.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
     try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.block.state_root));
 }
 
@@ -72,11 +74,11 @@ test "genStateBlockHeader" {
         // get applied block
         const applied_block = mock_chain.blocks[i];
         var applied_block_root: types.Root = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, applied_block.message.block, &applied_block_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, applied_block.message.block, &applied_block_root, allocator);
 
         const state_block_header = try beam_state.genStateBlockHeader(allocator);
         var state_block_header_root: types.Root = undefined;
-        try ssz.hashTreeRoot(types.BeamBlockHeader, state_block_header, &state_block_header_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlockHeader, state_block_header, &state_block_header_root, allocator);
 
         try std.testing.expect(std.mem.eql(u8, &applied_block_root, &state_block_header_root));
 

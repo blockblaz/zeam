@@ -6,10 +6,11 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
+const xmss = @import("@zeam/xmss");
 
 const transition = @import("./transition.zig");
 
-const MockChainData = struct {
+pub const MockChainData = struct {
     genesis_config: types.GenesisSpec,
     genesis_state: types.BeamState,
     blocks: []types.SignedBlockWithAttestation,
@@ -104,17 +105,17 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     const gen_signed_block = types.SignedBlockWithAttestation{
         .message = gen_block_with_attestation,
         .signature = blk: {
-            var sigs = try types.BlockSignatures.init(allocator);
+            var signatures = try types.createBlockSignatures(allocator, gen_block_with_attestation.block.body.attestations.len());
             const proposer_sig = try key_manager.signAttestation(
                 &gen_block_with_attestation.proposer_attestation,
                 allocator,
             );
-            try sigs.append(proposer_sig);
-            break :blk sigs;
+            signatures.proposer_signature = proposer_sig;
+            break :blk signatures;
         },
     };
     var block_root: types.Root = undefined;
-    try ssz.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
+    try zeam_utils.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
 
     try blockList.append(gen_signed_block);
     try blockRootList.append(block_root);
@@ -144,7 +145,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
     for (1..numBlocks) |slot| {
         var parent_root: [32]u8 = undefined;
-        try ssz.hashTreeRoot(types.BeamBlock, prev_block, &parent_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, prev_block, &parent_root, allocator);
 
         const state_root: [32]u8 = types.ZERO_HASH;
         // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
@@ -276,6 +277,46 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
+        // Build gossip signatures map from attestations
+        var signatures_map = types.SignaturesMap.init(allocator);
+        defer signatures_map.deinit();
+
+        for (attestations.items) |attestation| {
+            // Get the serialized signature bytes
+            const sig_buffer = try key_manager.signAttestation(&attestation, allocator);
+
+            // Compute data root for the signature key
+            const data_root = try attestation.data.sszRoot(allocator);
+
+            try signatures_map.put(
+                .{ .validator_id = attestation.validator_id, .data_root = data_root },
+                .{ .slot = attestation.data.slot, .signature = sig_buffer },
+            );
+        }
+
+        // Compute aggregated signatures using the shared method
+        var aggregation = try types.AggregatedAttestationsResult.init(allocator);
+        var agg_att_cleanup = true;
+        var agg_sig_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (aggregation.attestations.slice()) |*att| {
+                att.deinit();
+            }
+            aggregation.attestations.deinit();
+        };
+        errdefer if (agg_sig_cleanup) {
+            for (aggregation.attestation_signatures.slice()) |*sig| {
+                sig.deinit();
+            }
+            aggregation.attestation_signatures.deinit();
+        };
+        try aggregation.computeAggregatedSignatures(
+            attestations.items,
+            &beam_state.validators,
+            &signatures_map,
+            null, // no pre-aggregated payloads in mock
+        );
+
         const proposer_index = slot % genesis_config.numValidators();
         var block = types.BeamBlock{
             .slot = slot,
@@ -283,20 +324,14 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
-                // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = blk: {
-                    var attestations_list = try types.Attestations.init(allocator);
-                    for (attestations.items) |attestation| {
-                        try attestations_list.append(attestation);
-                    }
-                    break :blk attestations_list;
-                },
+                .attestations = aggregation.attestations,
             },
         };
+        agg_att_cleanup = false;
 
         // prepare pre state to process block for that slot, may be rename prepare_pre_state
         try transition.apply_raw_block(allocator, &beam_state, &block, block_building_logger);
-        try ssz.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, allocator);
 
         // generate the signed beam block and add to block list
         const block_with_attestation = types.BlockWithAttestation{
@@ -319,24 +354,20 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             },
         };
 
+        const proposer_sig = try key_manager.signAttestation(
+            &block_with_attestation.proposer_attestation,
+            allocator,
+        );
+
+        const block_signatures = types.BlockSignatures{
+            .attestation_signatures = aggregation.attestation_signatures,
+            .proposer_signature = proposer_sig,
+        };
+        agg_sig_cleanup = false;
+
         const signed_block = types.SignedBlockWithAttestation{
             .message = block_with_attestation,
-            .signature = blk: {
-                var sigs = try types.BlockSignatures.init(allocator);
-
-                for (block.body.attestations.constSlice()) |attestation| {
-                    const sig = try key_manager.signAttestation(&attestation, allocator);
-                    try sigs.append(sig);
-                }
-
-                const proposer_sig = try key_manager.signAttestation(
-                    &block_with_attestation.proposer_attestation,
-                    allocator,
-                );
-                try sigs.append(proposer_sig);
-
-                break :blk sigs;
-            },
+            .signature = block_signatures,
         };
         try blockList.append(signed_block);
         try blockRootList.append(block_root);

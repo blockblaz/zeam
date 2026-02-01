@@ -17,6 +17,7 @@ pub const FileBehaviourParams = logFactory.FileBehaviourParams;
 pub const FileParams = logFactory.FileParams;
 pub const ZeamLoggerConfig = logFactory.ZeamLoggerConfig;
 pub const ModuleLogger = logFactory.ModuleLogger;
+pub const OptionalNode = logFactory.OptionalNode;
 pub const getScopedLoggerConfig = logFactory.getScopedLoggerConfig;
 pub const getLoggerConfig = logFactory.getLoggerConfig;
 pub const getTestLoggerConfig = logFactory.getTestLoggerConfig;
@@ -35,6 +36,13 @@ pub const readFileToEndAlloc = fs_factory.readFileToEndAlloc;
 const json_factory = @import("./json.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const jsonToString = json_factory.jsonToString;
+
+const ssz_factory = @import("./ssz.zig");
+pub const hashTreeRoot = ssz_factory.hashTreeRoot;
+
+const fmt_factory = @import("./fmt.zig");
+// Avoid to use `usingnamespace` to make upgrade easier in the future.
+pub const LazyJson = fmt_factory.LazyJson;
 
 test {
     @import("std").testing.refAllDeclsRecursive(@This());

@@ -9,7 +9,7 @@ use libp2p::core::{
 };
 
 use libp2p::identity::{secp256k1, Keypair};
-use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{
     core, gossipsub, identify, identity, noise, ping, yamux, PeerId, SwarmBuilder, Transport,
 };
@@ -30,6 +30,7 @@ use std::sync::Mutex;
 
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
+    configurations::RESPONSE_CHANNEL_IDLE_TIMEOUT,
     varint::{encode_varint, MAX_VARINT_BYTES},
     LeanSupportedProtocol, ProtocolId, ReqResp, ReqRespMessage, ReqRespMessageError,
     ReqRespMessageReceived, RequestMessage, ResponseMessage,
@@ -40,26 +41,91 @@ type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 // TODO: protect the access by mutex
 #[allow(static_mut_refs)]
 static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-// a hack to start a second network for self testing purposes
+// additional network slots for multi-node testing
 #[allow(static_mut_refs)]
 static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
+#[allow(static_mut_refs)]
+static mut SWARM_STATE2: Option<libp2p::swarm::Swarm<Behaviour>> = None;
 
 // Store Zig handler pointers per network id so free functions can forward logs
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER0: Option<u64> = None;
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER1: Option<u64> = None;
+#[allow(static_mut_refs)]
+static mut ZIG_HANDLER2: Option<u64> = None;
+
+/// Get a mutable reference to the swarm for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+#[allow(static_mut_refs)]
+unsafe fn get_swarm_mut(network_id: u32) -> Option<&'static mut libp2p::swarm::Swarm<Behaviour>> {
+    match network_id {
+        0 => SWARM_STATE.as_mut(),
+        1 => SWARM_STATE1.as_mut(),
+        2 => SWARM_STATE2.as_mut(),
+        _ => None,
+    }
+}
+
+/// Store a swarm in the global slot for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+unsafe fn set_swarm(network_id: u32, swarm: libp2p::swarm::Swarm<Behaviour>) {
+    match network_id {
+        0 => SWARM_STATE = Some(swarm),
+        1 => SWARM_STATE1 = Some(swarm),
+        2 => SWARM_STATE2 = Some(swarm),
+        _ => panic!("unsupported network_id: {}", network_id),
+    }
+}
+
+/// Store the Zig handler pointer for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+unsafe fn set_zig_handler(network_id: u32, handler: u64) {
+    match network_id {
+        0 => ZIG_HANDLER0 = Some(handler),
+        1 => ZIG_HANDLER1 = Some(handler),
+        2 => ZIG_HANDLER2 = Some(handler),
+        _ => {}
+    }
+}
+
+/// Get the Zig handler pointer for the given network id.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+unsafe fn get_zig_handler(network_id: u32) -> Option<u64> {
+    match network_id {
+        0 => ZIG_HANDLER0,
+        1 => ZIG_HANDLER1,
+        2 => ZIG_HANDLER2,
+        _ => None,
+    }
+}
 
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
-    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMap<u64, PendingResponse>> = Mutex::new(HashMap::new());
-    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool)> = std::sync::Mutex::new((false, false));
+    static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
+    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool, bool)> = std::sync::Mutex::new((false, false, false));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
+    static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
+        Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
+    static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
+    // Track connection directions for disconnect events (network_id, peer_id, connection_id) -> direction
+    static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
 }
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+const RECONNECT_DELAYS_SECS: [u64; 5] = [5, 10, 20, 40, 80];
 
 #[derive(Clone)]
 struct PendingResponse {
@@ -85,6 +151,7 @@ pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
         if match network_id {
             0 => ready.0,
             1 => ready.1,
+            2 => ready.2,
             _ => false,
         } {
             return true;
@@ -156,11 +223,7 @@ pub unsafe fn create_and_run_network(
     ));
 
     // Store zig_handler for this network id for use by free functions
-    if network_id < 1 {
-        ZIG_HANDLER0 = Some(zig_handler);
-    } else {
-        ZIG_HANDLER1 = Some(zig_handler);
-    }
+    set_zig_handler(network_id, zig_handler);
 
     releaseStartNetworkParams(
         zig_handler,
@@ -220,28 +283,14 @@ pub unsafe fn publish_msg_to_rust_bridge(
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
     let topic = gossipsub::IdentTopic::new(topic);
 
-    #[allow(static_mut_refs)]
-    let swarm = if network_id < 1 {
-        match unsafe { SWARM_STATE.as_mut() } {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "publish_msg_to_rust_bridge called before network initialized",
-                );
-                return;
-            }
-        }
-    } else {
-        match unsafe { SWARM_STATE1.as_mut() } {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "publish_msg_to_rust_bridge called before network initialized",
-                );
-                return;
-            }
+    let swarm = match unsafe { get_swarm_mut(network_id) } {
+        Some(s) => s,
+        None => {
+            logger::rustLogger.error(
+                network_id,
+                "publish_msg_to_rust_bridge called before network initialized",
+            );
+            return;
         }
     };
     if let Err(e) = swarm
@@ -293,28 +342,14 @@ pub unsafe fn send_rpc_request(
 
     let protocol_id: ProtocolId = protocol.into();
 
-    #[allow(static_mut_refs)]
-    let swarm = if network_id < 1 {
-        match SWARM_STATE.as_mut() {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_request called before network initialized",
-                );
-                return 0;
-            }
-        }
-    } else {
-        match SWARM_STATE1.as_mut() {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_request called before network initialized",
-                );
-                return 0;
-            }
+    let swarm = match get_swarm_mut(network_id) {
+        Some(s) => s,
+        None => {
+            logger::rustLogger.error(
+                network_id,
+                "send_rpc_request called before network initialized",
+            );
+            return 0;
         }
     };
 
@@ -357,16 +392,24 @@ pub unsafe fn send_rpc_response_chunk(
     let response_bytes = response_slice.to_vec();
 
     let channel = {
-        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-        response_map.get(&channel_id).cloned()
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        let channel = response_map.get(&channel_id).cloned();
+        if channel.is_some() {
+            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
+        }
+        channel
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_response_chunk called before network initialized",
+                );
+                return;
+            }
         };
 
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
@@ -402,11 +445,15 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_end_of_stream called before network initialized",
+                );
+                return;
+            }
         };
 
         swarm.behaviour_mut().reqresp.finish_response_stream(
@@ -468,11 +515,15 @@ pub unsafe fn send_rpc_error_response(
     };
 
     if let Some(channel) = channel {
-        #[allow(static_mut_refs)]
-        let swarm = if network_id < 1 {
-            SWARM_STATE.as_mut().unwrap()
-        } else {
-            SWARM_STATE1.as_mut().unwrap()
+        let swarm = match get_swarm_mut(network_id) {
+            Some(s) => s,
+            None => {
+                logger::rustLogger.error(
+                    network_id,
+                    "send_rpc_error_response called before network initialized",
+                );
+                return;
+            }
         };
 
         let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
@@ -516,6 +567,7 @@ extern "C" {
         topic: *const c_char,
         message_ptr: *const u8,
         message_len: usize,
+        sender_peer_id: *const c_char,
     );
 }
 
@@ -532,6 +584,7 @@ extern "C" {
     fn handleRPCResponseFromRustBridge(
         zig_handler: u64,
         request_id: u64,
+        peer_id: *const c_char,
         protocol_id: *const c_char,
         response_ptr: *const u8,
         response_len: usize,
@@ -540,6 +593,7 @@ extern "C" {
     fn handleRPCEndOfStreamFromRustBridge(
         zig_handler: u64,
         request_id: u64,
+        peer_id: *const c_char,
         protocol_id: *const c_char,
     );
 
@@ -553,11 +607,29 @@ extern "C" {
 }
 
 extern "C" {
-    fn handlePeerConnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+    fn handlePeerConnectedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char,
+        direction: u32, // 0=inbound, 1=outbound, 2=unknown
+    );
 }
 
 extern "C" {
-    fn handlePeerDisconnectedFromRustBridge(zig_handler: u64, peer_id: *const c_char);
+    fn handlePeerDisconnectedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char,
+        direction: u32, // 0=inbound, 1=outbound, 2=unknown
+        reason: u32,    // 0=timeout, 1=remote_close, 2=local_close, 3=error
+    );
+}
+
+extern "C" {
+    fn handlePeerConnectionFailedFromRustBridge(
+        zig_handler: u64,
+        peer_id: *const c_char, // may be null for unknown peers
+        direction: u32,         // 0=inbound, 1=outbound
+        result: u32,            // 1=timeout, 2=error
+    );
 }
 
 extern "C" {
@@ -586,13 +658,7 @@ fn forward_log_with_handler(zig_handler: u64, level: u32, message: &str) {
 }
 
 pub(crate) fn forward_log_by_network(network_id: u32, level: u32, message: &str) {
-    let handler_opt = unsafe {
-        if network_id < 1 {
-            ZIG_HANDLER0
-        } else {
-            ZIG_HANDLER1
-        }
-    };
+    let handler_opt = unsafe { get_zig_handler(network_id) };
     if let Some(handler) = handler_opt {
         forward_log_with_handler(handler, level, message);
     }
@@ -603,15 +669,61 @@ pub(crate) fn forward_log_by_network(network_id: u32, level: u32, message: &str)
 pub struct Network {
     network_id: u32,
     zig_handler: u64,
+    peer_addr_map: HashMap<PeerId, Multiaddr>,
 }
+
 impl Network {
     pub fn new(network_id: u32, zig_handler: u64) -> Self {
-        let network: Network = Network {
+        Network {
             network_id,
             zig_handler,
-        };
+            peer_addr_map: HashMap::new(),
+        }
+    }
 
-        network
+    fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+        addr.iter().find_map(|proto| match proto {
+            Protocol::P2p(peer_id) => Some(peer_id),
+            _ => None,
+        })
+    }
+
+    fn schedule_reconnection(&mut self, peer_id: PeerId, addr: Multiaddr, attempt: u32) {
+        if attempt > MAX_RECONNECT_ATTEMPTS {
+            logger::rustLogger.warn(
+                self.network_id,
+                &format!(
+                    "Max reconnection attempts ({}) reached for peer {}, giving up",
+                    MAX_RECONNECT_ATTEMPTS, addr
+                ),
+            );
+            self.peer_addr_map.remove(&peer_id);
+            RECONNECT_ATTEMPTS
+                .lock()
+                .unwrap()
+                .remove(&(self.network_id, peer_id));
+            return;
+        }
+
+        let delay_secs = RECONNECT_DELAYS_SECS
+            .get((attempt - 1) as usize)
+            .copied()
+            .unwrap_or(80);
+
+        logger::rustLogger.info(
+            self.network_id,
+            &format!(
+                "Scheduling reconnection to peer {} (attempt {}/{}) in {}s",
+                addr, attempt, MAX_RECONNECT_ATTEMPTS, delay_secs
+            ),
+        );
+
+        let mut queue = RECONNECT_QUEUE.lock().unwrap();
+        queue.insert_at(
+            (self.network_id, peer_id),
+            (addr, attempt),
+            Duration::from_secs(delay_secs),
+        );
     }
 
     pub async fn start_network(
@@ -678,20 +790,24 @@ impl Network {
             };
 
             for addr in connect_addresses {
+                if let Some(peer_id) = Self::extract_peer_id(&addr) {
+                    self.peer_addr_map
+                        .entry(peer_id)
+                        .or_insert_with(|| addr.clone());
+                } else {
+                    logger::rustLogger.warn(
+                        self.network_id,
+                        &format!("Connect address missing peer id: {}", addr),
+                    );
+                }
                 dial(addr);
             }
         } else {
             logger::rustLogger.debug(self.network_id, "no connect addresses");
         }
 
-        if self.network_id < 1 {
-            unsafe {
-                SWARM_STATE = Some(swarm);
-            }
-        } else {
-            unsafe {
-                SWARM_STATE1 = Some(swarm);
-            }
+        unsafe {
+            set_swarm(self.network_id, swarm);
         }
 
         // Signal that this network is now ready
@@ -700,6 +816,7 @@ impl Network {
             match self.network_id {
                 0 => ready.0 = true,
                 1 => ready.1 = true,
+                2 => ready.2 = true,
                 _ => {}
             }
             NETWORK_READY_CONDVAR.notify_all();
@@ -709,12 +826,8 @@ impl Network {
     }
 
     pub async fn run_eventloop(&mut self) {
-        #[allow(static_mut_refs)]
-        let swarm = if self.network_id < 1 {
-            unsafe { SWARM_STATE.as_mut().unwrap() }
-        } else {
-            unsafe { SWARM_STATE1.as_mut().unwrap() }
-        };
+        let swarm = unsafe { get_swarm_mut(self.network_id) }
+            .expect("run_eventloop called before start_network stored the swarm");
 
         loop {
             tokio::select! {
@@ -756,49 +869,279 @@ impl Network {
                 }
             }
 
+            Some(reconnect_result) = poll_fn(|cx| {
+                let mut queue = RECONNECT_QUEUE.lock().unwrap();
+                std::pin::Pin::new(&mut *queue).poll_next(cx)
+            }) => {
+                    match reconnect_result {
+                        Ok(((network_id, peer_id), (addr, attempt))) => {
+                            if network_id == self.network_id {
+                                if swarm.is_connected(&peer_id) {
+                                    logger::rustLogger.debug(
+                                        self.network_id,
+                                        &format!(
+                                            "Skipping reconnection attempt to peer {} because it is already connected",
+                                            peer_id
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                logger::rustLogger.info(
+                                    self.network_id,
+                                    &format!("Attempting reconnection to {} (attempt {}/{})", addr, attempt, MAX_RECONNECT_ATTEMPTS),
+                                );
+
+                            RECONNECT_ATTEMPTS
+                                .lock()
+                                .unwrap()
+                                .insert((self.network_id, peer_id), (addr.clone(), attempt));
+
+                            let mut dial_addr = addr.clone();
+                            strip_peer_id(&mut dial_addr);
+
+                            match swarm.dial(
+                                DialOpts::peer_id(peer_id)
+                                    .addresses(vec![dial_addr.clone()])
+                                    .build(),
+                            ) {
+                                Ok(()) => {
+                                    logger::rustLogger.info(
+                                        self.network_id,
+                                        &format!("Dialing peer {} at {} for reconnection", peer_id, dial_addr),
+                                    );
+                                }
+                                Err(e) => {
+                                    logger::rustLogger.error(
+                                        self.network_id,
+                                        &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
+                                    );
+                                    RECONNECT_ATTEMPTS
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&(self.network_id, peer_id));
+                                    self.schedule_reconnection(peer_id, addr, attempt + 1);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        logger::rustLogger.error(self.network_id, &format!("Error in reconnect queue: {}", e));
+                    }
+                }
+            }
+
+            Some(response_channel_timeout) = poll_fn(|cx| {
+                let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+                std::pin::Pin::new(&mut *map).poll_next(cx)
+            }) => {
+                match response_channel_timeout {
+                    Ok((channel_id, channel)) => {
+                        logger::rustLogger.warn(
+                            self.network_id,
+                            &format!(
+                                "[reqresp] Response channel {} expired after {:?} (peer: {}, protocol: {})",
+                                channel_id,
+                                RESPONSE_CHANNEL_IDLE_TIMEOUT,
+                                channel.peer_id,
+                                channel.protocol.as_str(),
+                            ),
+                        );
+
+                        // Best-effort: close the response stream so the remote does not hang.
+                        swarm.behaviour_mut().reqresp.finish_response_stream(
+                            channel.peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                        );
+                    }
+                    Err(e) => {
+                        logger::rustLogger.error(
+                            self.network_id,
+                            &format!("[reqresp] Error in response channel delay map: {}", e),
+                        );
+                    }
+                }
+            }
+
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             logger::rustLogger.info(self.network_id, &format!("Listening on {}", address));
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            let peer_id = peer_id.to_string();
-                            let peer_id = peer_id.as_str();
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
+                            let peer_id_str = peer_id.to_string();
+
+                            // Determine direction from endpoint: Dialer=outbound, Listener=inbound
+                            let direction: u32 = if endpoint.is_dialer() { 1 } else { 0 };
+
+                            // If this was an outbound connection, remember the address we successfully dialed.
+                            // This enables reconnection even when the initial connect multiaddr did not include
+                            // a `/p2p/<peer_id>` component (in which case we couldn't pre-populate `peer_addr_map`).
+                            if let core::connection::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                                self.peer_addr_map
+                                    .entry(peer_id)
+                                    .or_insert_with(|| address.clone());
+                            }
+
                             logger::rustLogger.info(
                                 self.network_id,
-                                &format!("Connection established with peer: {}", peer_id),
+                                &format!("Connection established with peer: {} direction={}",
+                                    peer_id_str,
+                                    if direction == 0 { "inbound" } else { "outbound" }),
                             );
-                            let peer_id_cstr = match CString::new(peer_id) {
+
+                            // Store direction for later use on disconnect
+                            CONNECTION_DIRECTIONS.lock().unwrap().insert(
+                                (self.network_id, peer_id, connection_id),
+                                direction,
+                            );
+
+                            RECONNECT_QUEUE.lock().unwrap().remove(&(self.network_id, peer_id));
+                            RECONNECT_ATTEMPTS
+                                .lock()
+                                .unwrap()
+                                .remove(&(self.network_id, peer_id));
+                            let peer_id_cstr = match CString::new(peer_id_str.as_str()) {
                                 Ok(cstr) => cstr,
                                 Err(_) => {
-                                    logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
+                                    logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id_str));
                                     continue;
                                 }
                             };
                             unsafe {
-                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr())
+                                handlePeerConnectedFromRustBridge(self.zig_handler, peer_id_cstr.as_ptr(), direction)
                             };
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            let peer_id = peer_id.to_string();
-                            let peer_id = peer_id.as_str();
-                            logger::rustLogger.info(
-                                self.network_id,
-                                &format!("Connection closed with peer: {}", peer_id),
-                            );
-                            let peer_id_cstr = match CString::new(peer_id) {
-                                Ok(cstr) => cstr,
-                                Err(_) => {
-                                    logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
-                                    continue;
+                            SwarmEvent::ConnectionClosed {
+                                peer_id,
+                                connection_id,
+                                cause,
+                                ..
+                            } => {
+                                let peer_id_string = peer_id.to_string();
+
+                            // Retrieve and remove stored direction
+                            let direction = CONNECTION_DIRECTIONS
+                                .lock()
+                                .unwrap()
+                                .remove(&(self.network_id, peer_id, connection_id))
+                                .unwrap_or(2); // 2 = unknown if not found
+
+                            // Map cause to reason enum: 0=timeout, 1=remote_close, 2=local_close, 3=error
+                            let reason: u32 = match &cause {
+                                None => 1, // remote_close (graceful close, no error)
+                                Some(err) => {
+                                    let err_str = format!("{:?}", err);
+                                    if err_str.contains("Timeout") || err_str.contains("timeout") || err_str.contains("TimedOut") || err_str.contains("KeepAlive") {
+                                        0 // timeout
+                                    } else if err_str.contains("Reset") || err_str.contains("ConnectionReset") {
+                                        1 // remote_close
+                                    } else {
+                                        3 // error (generic)
+                                    }
                                 }
                             };
-                            unsafe {
-                                handlePeerDisconnectedFromRustBridge(
-                                    self.zig_handler,
-                                    peer_id_cstr.as_ptr(),
-                                )
+
+                                let cause_desc = match &cause {
+                                    Some(err) => format!("{err:?}"),
+                                    None => "None".to_string(),
+                                };
+                                logger::rustLogger.info(
+                                    self.network_id,
+                                    &format!(
+                                        "Connection closed: peer={} connection_id={:?} direction={} reason={} cause={}",
+                                        peer_id_string, connection_id, direction, reason, cause_desc
+                                    ),
+                                );
+
+                                // Drop any pending response channels tied to this connection.
+                                // We can't finish streams here (the connection is already gone), but we must
+                                // remove them from the map to avoid leaking entries until idle TTL.
+                                RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
+                                    !(pending.peer_id == peer_id && pending.connection_id == connection_id)
+                                });
+
+                                // `ConnectionClosed` is emitted per connection. If the peer still has other
+                                // established connections, avoid emitting a peer-disconnected event to Zig
+                                // and avoid scheduling reconnection.
+                                if swarm.is_connected(&peer_id) {
+                                    logger::rustLogger.debug(
+                                        self.network_id,
+                                        &format!(
+                                            "Peer {} still has an established connection; skipping disconnect notification/reconnect",
+                                            peer_id_string
+                                        ),
+                                    );
+                                    continue;
+                                }
+
+                                let peer_id_cstr = match CString::new(peer_id_string.as_str()) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", peer_id));
+                                        continue;
+                                    }
+                                };
+                                unsafe {
+                                    handlePeerDisconnectedFromRustBridge(
+                                        self.zig_handler,
+                                        peer_id_cstr.as_ptr(),
+                                        direction,
+                                        reason,
+                                    )
+                                };
+
+                                if let Some(peer_addr) = self.peer_addr_map.get(&peer_id).cloned() {
+                                    self.schedule_reconnection(peer_id, peer_addr, 1);
+                                }
+                            }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            let peer_str = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+                            // Determine if timeout or other error: 1=timeout, 2=error
+                            let result: u32 = {
+                                let err_str = format!("{:?}", error);
+                                if err_str.contains("Timeout") || err_str.contains("timeout") {
+                                    1 // timeout
+                                } else {
+                                    2 // error
+                                }
                             };
+
+                            logger::rustLogger.warn(
+                                self.network_id,
+                                &format!("Outgoing connection failed: peer={} error={:?} result={}", peer_str, error, result),
+                            );
+
+                            // Notify Zig of failed connection attempt and handle reconnection
+                            if let Some(pid) = peer_id {
+                                let peer_id_cstr = match CString::new(pid.to_string()) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        // Invalid peer_id string - can't communicate with Zig, don't retry
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_peer_id_string={}", pid));
+                                        continue;
+                                    }
+                                };
+                                unsafe {
+                                    handlePeerConnectionFailedFromRustBridge(
+                                        self.zig_handler,
+                                        peer_id_cstr.as_ptr(),
+                                        1, // outbound
+                                        result,
+                                    )
+                                };
+
+                                // Schedule reconnection if this was a tracked connection attempt
+                                if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&(self.network_id, pid))
+                                {
+                                    self.schedule_reconnection(pid, addr, attempt + 1);
+                                }
+                            }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                             message,
@@ -817,8 +1160,20 @@ impl Network {
                             let message_ptr = message.data.as_ptr();
                             let message_len = message.data.len();
 
+                            let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
+                            let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                Ok(cstring) => cstring,
+                                Err(_) => {
+                                    logger::rustLogger.error(
+                                        self.network_id,
+                                        &format!("Failed to create C string for peer id {}", sender_peer_id_string),
+                                    );
+                                    continue;
+                                }
+                            };
+
                             unsafe {
-                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len)
+                                handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
                             };
                             logger::rustLogger.debug(self.network_id, "zig callback completed");
                         }
@@ -894,6 +1249,17 @@ impl Network {
                                     self.network_id,
                                     &format!("[reqresp] Received response from {} for request id {} ({} bytes)", peer_id, request_id, response_message.payload.len()),
                                 );
+                                let peer_id_string = peer_id.to_string();
+                                let peer_id_cstring = match CString::new(peer_id_string) {
+                                    Ok(cstring) => cstring,
+                                    Err(err) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            &format!("[reqresp] Failed to create C string for peer id {}: {}", peer_id, err),
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let protocol_cstring = match CString::new(
                                     response_message.protocol.as_str(),
                                 ) {
@@ -911,6 +1277,7 @@ impl Network {
                                     handleRPCResponseFromRustBridge(
                                         self.zig_handler,
                                         request_id,
+                                        peer_id_cstring.as_ptr(),
                                         protocol_cstring.as_ptr(),
                                         response_message.payload.as_ptr(),
                                         response_message.payload.len(),
@@ -925,6 +1292,17 @@ impl Network {
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
+                                    let peer_id_string = peer_id.to_string();
+                                    let peer_id_cstring = match CString::new(peer_id_string) {
+                                        Ok(cstring) => cstring,
+                                        Err(err) => {
+                                            logger::rustLogger.error(
+                                                self.network_id,
+                                                &format!("[reqresp] Failed to create C string for peer id {} on end-of-stream: {}", peer_id, err),
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let protocol_cstring = match CString::new(protocol_id.as_str()) {
                                         Ok(cstring) => cstring,
                                     Err(err) => {
@@ -940,6 +1318,7 @@ impl Network {
                                         handleRPCEndOfStreamFromRustBridge(
                                             self.zig_handler,
                                             request_id,
+                                            peer_id_cstring.as_ptr(),
                                             protocol_cstring.as_ptr(),
                                         );
                                     }
@@ -959,9 +1338,11 @@ impl Network {
                                     .lock()
                                     .unwrap()
                                     .retain(|_, pending| {
-                                        !(pending.peer_id == peer_id
-                                            && pending.connection_id == connection_id
-                                            && pending.stream_id == stream_id)
+                                        !(
+                                            pending.peer_id == peer_id
+                                                && pending.connection_id == connection_id
+                                                && pending.stream_id == stream_id
+                                        )
                                     });
                             }
                             Err(ReqRespMessageError::Outbound { request_id, err }) => {
@@ -1058,12 +1439,14 @@ impl Behaviour {
             .validation_mode(gossipsub::ValidationMode::Anonymous)
             .history_length(6)
             .duplicate_cache_time(Duration::from_secs(3 * 4 * 2))
+            .max_transmit_size(2 * 1024 * 1024) // 2 MiB for blocks/ aggregated payloads
             .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
             .build()
             .unwrap();
         // .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?; // Temporary hack because `build` does not return a proper `std::error::Error`.
 
-        // build a gossipsub network behaviour
+        // build a gossipsub network behaviour with Anonymous mode for multi-client compatibility
+        // Anonymous mode ensures interoperability with other clients (ream, lanten, qlean)
         let gossipsub =
             gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
                 .unwrap();
@@ -1123,7 +1506,7 @@ fn build_transport(
     quic_support: bool,
 ) -> std::io::Result<BoxedTransport> {
     // mplex config
-    let mut mplex_config = libp2p_mplex::MplexConfig::new();
+    let mut mplex_config = libp2p_mplex::Config::new();
     mplex_config.set_max_buffer_size(256);
     mplex_config.set_max_buffer_behaviour(libp2p_mplex::MaxBufferBehaviour::Block);
 

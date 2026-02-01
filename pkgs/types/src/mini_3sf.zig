@@ -1,6 +1,4 @@
 const std = @import("std");
-const ssz = @import("ssz");
-
 const params = @import("@zeam/params");
 
 const utils = @import("./utils.zig");

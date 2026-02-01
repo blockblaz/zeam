@@ -14,9 +14,14 @@ pub const ReqRespResponse = interfaceFactory.ReqRespResponse;
 pub const ReqRespResponseEvent = interfaceFactory.ReqRespResponseEvent;
 pub const ReqRespResponseError = interfaceFactory.ReqRespResponseError;
 pub const ReqRespRequestCallback = interfaceFactory.ReqRespRequestCallback;
-pub const OnPeerEventCbType = interfaceFactory.OnPeerEventCbType;
+pub const OnPeerConnectedCbType = interfaceFactory.OnPeerConnectedCbType;
+pub const OnPeerDisconnectedCbType = interfaceFactory.OnPeerDisconnectedCbType;
+pub const OnPeerConnectionFailedCbType = interfaceFactory.OnPeerConnectionFailedCbType;
 pub const OnPeerEventCbHandler = interfaceFactory.OnPeerEventCbHandler;
 pub const PeerEventHandler = interfaceFactory.PeerEventHandler;
+pub const PeerDirection = interfaceFactory.PeerDirection;
+pub const ConnectionResult = interfaceFactory.ConnectionResult;
+pub const DisconnectionReason = interfaceFactory.DisconnectionReason;
 pub const GenericGossipHandler = interfaceFactory.GenericGossipHandler;
 pub const ReqRespServerStream = interfaceFactory.ReqRespServerStream;
 pub const OnReqRespResponseCbHandler = interfaceFactory.OnReqRespResponseCbHandler;
@@ -28,6 +33,9 @@ pub const Mock = mockFactory.Mock;
 const ethlibp2pFactory = @import("./ethlibp2p.zig");
 pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
 pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
+
+const node_registryFactory = @import("./node_registry.zig");
+pub const NodeNameRegistry = node_registryFactory.NodeNameRegistry;
 
 test "get tests" {
     @import("std").testing.refAllDeclsRecursive(@This());

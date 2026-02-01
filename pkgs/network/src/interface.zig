@@ -8,8 +8,33 @@ const xev = @import("xev");
 const zeam_utils = @import("@zeam/utils");
 const consensus_params = @import("@zeam/params");
 
+const node_registry = @import("./node_registry.zig");
+const NodeNameRegistry = node_registry.NodeNameRegistry;
+
+// Connection direction for peer events
+pub const PeerDirection = enum(u32) {
+    inbound = 0,
+    outbound = 1,
+    unknown = 2,
+};
+
+// Connection result for connection events
+pub const ConnectionResult = enum(u32) {
+    success = 0,
+    timeout = 1,
+    error_ = 2, // 'error' is reserved in Zig
+};
+
+// Disconnection reason for disconnection events
+pub const DisconnectionReason = enum(u32) {
+    timeout = 0,
+    remote_close = 1,
+    local_close = 2,
+    error_ = 3,
+};
+
 const topic_prefix = "leanconsensus";
-const lean_blocks_by_root_protocol = "/leanconsensus/req/lean_blocks_by_root/1/ssz_snappy";
+const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
@@ -37,7 +62,14 @@ pub const GossipSub = struct {
     ptr: *anyopaque,
     publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
-    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage) anyerror!void,
+    onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
+
+    pub fn format(self: GossipSub, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = self;
+        _ = fmt;
+        _ = options;
+        try writer.writeAll("GossipSub");
+    }
 
     pub fn subscribe(self: GossipSub, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         return self.subscribeFn(self.ptr, topics, handler);
@@ -80,14 +112,21 @@ pub const NetworkInterface = struct {
     peers: PeerEvents,
 };
 
-const OnGossipCbType = *const fn (*anyopaque, *const GossipMessage) anyerror!void;
+const OnGossipCbType = *const fn (*anyopaque, *const GossipMessage, sender_peer_id: []const u8) anyerror!void;
 pub const OnGossipCbHandler = struct {
     ptr: *anyopaque,
     onGossipCb: OnGossipCbType,
     // c: xev.Completion = undefined,
 
-    pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage) anyerror!void {
-        return self.onGossipCb(self.ptr, data);
+    pub fn format(self: OnGossipCbHandler, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = self;
+        _ = fmt;
+        _ = options;
+        try writer.writeAll("OnGossipCbHandler");
+    }
+
+    pub fn onGossip(self: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8) anyerror!void {
+        return self.onGossipCb(self.ptr, data, sender_peer_id);
     }
 };
 
@@ -183,6 +222,21 @@ pub const GossipMessage = union(GossipTopic) {
         return std.meta.activeTag(self.*);
     }
 
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
+                blk.message.block.slot,
+                blk.message.block.proposer_index,
+            }),
+            .attestation => |att| try writer.print("GossipMessage{{ attestation: validator={d}, slot={d} }}", .{
+                att.validator_id,
+                att.message.slot,
+            }),
+        }
+    }
+
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
         var serialized = std.ArrayList(u8).init(allocator);
         errdefer serialized.deinit();
@@ -275,6 +329,15 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     status: types.Status,
 
     const Self = @This();
+
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
+            .status => try writer.writeAll("ReqRespRequest{ status }"),
+        }
+    }
 
     pub fn toJson(self: *const ReqRespRequest, allocator: Allocator) !json.Value {
         return switch (self.*) {
@@ -398,6 +461,7 @@ pub const ReqRespServerStream = struct {
     sendErrorFn: *const fn (ptr: *anyopaque, code: u32, message: []const u8) anyerror!void,
     finishFn: *const fn (ptr: *anyopaque) anyerror!void,
     isFinishedFn: *const fn (ptr: *anyopaque) bool,
+    getPeerIdFn: ?*const fn (ptr: *anyopaque) ?[]const u8 = null,
 
     const Self = @This();
 
@@ -417,6 +481,13 @@ pub const ReqRespServerStream = struct {
 
     pub fn isFinished(self: Self) bool {
         return self.isFinishedFn(self.ptr);
+    }
+
+    pub fn getPeerId(self: Self) ?[]const u8 {
+        if (self.getPeerIdFn) |fn_ptr| {
+            return fn_ptr(self.ptr);
+        }
+        return null;
     }
 };
 pub const ReqRespResponseError = struct {
@@ -476,17 +547,20 @@ pub const ReqRespRequestCallback = struct {
     method: LeanSupportedProtocol,
     allocator: Allocator,
     handler: ?OnReqRespResponseCbHandler,
+    peer_id: []const u8,
 
-    pub fn init(method: LeanSupportedProtocol, allocator: Allocator, handler: ?OnReqRespResponseCbHandler) ReqRespRequestCallback {
+    pub fn init(method: LeanSupportedProtocol, allocator: Allocator, handler: ?OnReqRespResponseCbHandler, peer_id: []const u8) ReqRespRequestCallback {
         return ReqRespRequestCallback{
             .method = method,
             .allocator = allocator,
             .handler = handler,
+            .peer_id = peer_id,
         };
     }
 
     pub fn deinit(self: *ReqRespRequestCallback) void {
-        _ = self;
+        // peer_id is owned by the callback, free it
+        self.allocator.free(self.peer_id);
     }
 
     pub fn notify(self: *ReqRespRequestCallback, event: *const ReqRespResponseEvent) anyerror!void {
@@ -521,15 +595,17 @@ pub const ReqRespRequestHandler = struct {
     handlers: std.ArrayListUnmanaged(OnReqRespRequestCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+    node_registry: *const NodeNameRegistry,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger, registry: *const NodeNameRegistry) !Self {
         return Self{
             .allocator = allocator,
             .handlers = .empty,
             .networkId = networkId,
             .logger = logger,
+            .node_registry = registry,
         };
     }
 
@@ -542,7 +618,10 @@ pub const ReqRespRequestHandler = struct {
     }
 
     pub fn onReqRespRequest(self: *Self, req: *const ReqRespRequest, stream: ReqRespServerStream) anyerror!void {
-        self.logger.debug("network-{d}:: onReqRespRequest={any}, handlers={d}", .{ self.networkId, req, self.handlers.items.len });
+        const peer_id_opt = stream.getPeerId();
+        const peer_id = peer_id_opt orelse "unknown";
+        const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
+        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -552,7 +631,7 @@ pub const ReqRespRequestHandler = struct {
 
         for (self.handlers.items) |handler| {
             handler.onReqRespRequest(req, stream) catch |err| {
-                self.logger.err("network-{d}:: onReqRespRequest handler error={any}", .{ self.networkId, err });
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{}", .{ self.networkId, err, peer_id, node_name });
                 last_err = err;
                 continue;
             };
@@ -574,19 +653,32 @@ const MessagePublishWrapper = struct {
     allocator: Allocator,
     handler: OnGossipCbHandler,
     data: *const GossipMessage,
+    sender_peer_id: []const u8,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
 
-    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
+    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={s}, sender={s} }}", .{
+            self.networkId,
+            self.data.getGossipTopic().encode(),
+            self.sender_peer_id,
+        });
+    }
+
+    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
         const cloned_data = try data.clone(allocator);
+        const sender_peer_id_copy = try allocator.dupe(u8, sender_peer_id);
 
         const self = try allocator.create(Self);
         self.* = MessagePublishWrapper{
             .allocator = allocator,
             .handler = handler,
             .data = cloned_data,
+            .sender_peer_id = sender_peer_id_copy,
             .networkId = networkId,
             .logger = logger,
         };
@@ -594,23 +686,34 @@ const MessagePublishWrapper = struct {
     }
 
     fn deinit(self: *Self) void {
+        self.allocator.free(self.sender_peer_id);
         self.allocator.destroy(self.data);
         self.allocator.destroy(self);
     }
 };
 
-pub const OnPeerEventCbType = *const fn (*anyopaque, peer_id: []const u8) anyerror!void;
+pub const OnPeerConnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection) anyerror!void;
+pub const OnPeerDisconnectedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void;
+pub const OnPeerConnectionFailedCbType = *const fn (*anyopaque, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void;
+
 pub const OnPeerEventCbHandler = struct {
     ptr: *anyopaque,
-    onPeerConnectedCb: OnPeerEventCbType,
-    onPeerDisconnectedCb: OnPeerEventCbType,
+    onPeerConnectedCb: OnPeerConnectedCbType,
+    onPeerDisconnectedCb: OnPeerDisconnectedCbType,
+    onPeerConnectionFailedCb: ?OnPeerConnectionFailedCbType = null,
 
-    pub fn onPeerConnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
-        return self.onPeerConnectedCb(self.ptr, peer_id);
+    pub fn onPeerConnected(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection) anyerror!void {
+        return self.onPeerConnectedCb(self.ptr, peer_id, direction);
     }
 
-    pub fn onPeerDisconnected(self: OnPeerEventCbHandler, peer_id: []const u8) anyerror!void {
-        return self.onPeerDisconnectedCb(self.ptr, peer_id);
+    pub fn onPeerDisconnected(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
+        return self.onPeerDisconnectedCb(self.ptr, peer_id, direction, reason);
+    }
+
+    pub fn onPeerConnectionFailed(self: OnPeerEventCbHandler, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
+        if (self.onPeerConnectionFailedCb) |cb| {
+            return cb(self.ptr, peer_id, direction, result);
+        }
     }
 };
 
@@ -619,15 +722,17 @@ pub const PeerEventHandler = struct {
     handlers: std.ArrayListUnmanaged(OnPeerEventCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+    node_registry: *const NodeNameRegistry,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+    pub fn init(allocator: Allocator, networkId: u32, logger: zeam_utils.ModuleLogger, registry: *const NodeNameRegistry) !Self {
         return Self{
             .allocator = allocator,
             .handlers = .empty,
             .networkId = networkId,
             .logger = logger,
+            .node_registry = registry,
         };
     }
 
@@ -639,20 +744,31 @@ pub const PeerEventHandler = struct {
         try self.handlers.append(self.allocator, handler);
     }
 
-    pub fn onPeerConnected(self: *Self, peer_id: []const u8) anyerror!void {
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}, handlers={d}", .{ self.networkId, peer_id, self.handlers.items.len });
+    pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
-            handler.onPeerConnected(peer_id) catch |e| {
+            handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
             };
         }
     }
 
-    pub fn onPeerDisconnected(self: *Self, peer_id: []const u8) anyerror!void {
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}, handlers={d}", .{ self.networkId, peer_id, self.handlers.items.len });
+    pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
-            handler.onPeerDisconnected(peer_id) catch |e| {
+            handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
+            };
+        }
+    }
+
+    pub fn onPeerConnectionFailed(self: *Self, peer_id: []const u8, direction: PeerDirection, result: ConnectionResult) anyerror!void {
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnectionFailed peer_id={s} direction={s} result={s}, handlers={d}", .{ self.networkId, peer_id, @tagName(direction), @tagName(result), self.handlers.items.len });
+        for (self.handlers.items) |handler| {
+            handler.onPeerConnectionFailed(peer_id, direction, result) catch |e| {
+                self.logger.err("network-{d}:: onPeerConnectionFailed handler error={any}", .{ self.networkId, e });
             };
         }
     }
@@ -665,9 +781,10 @@ pub const GenericGossipHandler = struct {
     onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+    node_registry: *const NodeNameRegistry,
 
     const Self = @This();
-    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger) !Self {
+    pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger, registry: *const NodeNameRegistry) !Self {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
@@ -694,6 +811,7 @@ pub const GenericGossipHandler = struct {
             .onGossipHandlers = onGossipHandlers,
             .networkId = networkId,
             .logger = logger,
+            .node_registry = registry,
         };
     }
 
@@ -706,18 +824,19 @@ pub const GenericGossipHandler = struct {
         self.onGossipHandlers.deinit(self.allocator);
     }
 
-    pub fn onGossip(self: *Self, data: *const GossipMessage, scheduleOnLoop: bool) anyerror!void {
+    pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8, scheduleOnLoop: bool) anyerror!void {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
-        self.logger.debug("network-{d}:: ongossip handlerArr {any} for topic {any}", .{ self.networkId, handlerArr.items, gossip_topic });
+        const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
             // remove this option once resolved
             if (scheduleOnLoop) {
-                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, self.networkId, self.logger);
+                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} on loop for topic {any}", .{ self.networkId, gossip_topic, publishWrapper });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={s}", .{ self.networkId, publishWrapper, gossip_topic.encode() });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);
@@ -739,7 +858,7 @@ pub const GenericGossipHandler = struct {
                             _ = r catch unreachable;
                             if (ud) |pwrap| {
                                 pwrap.logger.debug("network-{d}:: ONGOSSIP PUBLISH callback executed", .{pwrap.networkId});
-                                _ = pwrap.handler.onGossip(pwrap.data) catch void;
+                                _ = pwrap.handler.onGossip(pwrap.data, pwrap.sender_peer_id) catch void;
                                 defer pwrap.deinit();
                                 // Clean up the completion object
                                 pwrap.allocator.destroy(c);
@@ -749,7 +868,7 @@ pub const GenericGossipHandler = struct {
                     }).callback,
                 );
             } else {
-                handler.onGossip(data) catch |e| {
+                handler.onGossip(data, sender_peer_id) catch |e| {
                     self.logger.err("network-{d}:: onGossip handler error={any}", .{ self.networkId, e });
                 };
             }

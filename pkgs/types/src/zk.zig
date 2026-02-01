@@ -12,27 +12,10 @@ const validator = @import("./validator.zig");
 const Allocator = std.mem.Allocator;
 
 const bytesToHex = utils.BytesToHex;
+const ZERO_HASH = utils.ZERO_HASH;
 const json = std.json;
 
-fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
-    switch (val.*) {
-        .object => |*o| {
-            var it = o.iterator();
-            while (it.next()) |entry| {
-                freeJsonValue(&entry.value_ptr.*, allocator);
-            }
-            o.deinit();
-        },
-        .array => |*a| {
-            for (a.items) |*item| {
-                freeJsonValue(item, allocator);
-            }
-            a.deinit();
-        },
-        .string => |s| allocator.free(s),
-        else => {},
-    }
-}
+const freeJsonValue = utils.freeJsonValue;
 
 // non ssz types, difference is the variable list doesn't need upper boundaries
 pub const ZkVm = enum {
@@ -136,7 +119,7 @@ test "ssz seralize/deserialize signed stf prover input" {
     };
     defer test_state.deinit();
 
-    var attestations = try block.Attestations.init(std.testing.allocator);
+    const attestations = try block.AggregatedAttestations.init(std.testing.allocator);
 
     var test_block = block.SignedBlockWithAttestation{
         .message = .{
@@ -159,7 +142,7 @@ test "ssz seralize/deserialize signed stf prover input" {
                     },
                     .source = .{
                         .slot = 0,
-                        .root = [_]u8{0} ** 32,
+                        .root = ZERO_HASH,
                     },
                     .target = .{
                         .slot = 9,
