@@ -556,8 +556,10 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
         .target = target,
     });
-    database_tests.step.dependOn(&build_rust_lib_steps.step);
-    addRustGlueLib(b, database_tests, target, prover);
+    if (target.result.os.tag == .macos) {
+        database_tests.step.dependOn(&build_rust_lib_steps.step);
+        addRustGlueLib(b, database_tests, target, prover);
+    }
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
