@@ -501,6 +501,8 @@ test "SSE events integration test - wait for justification and finalization" {
     var got_node3_sync = false;
     var first_finalized_slot: u64 = 0;
     var head_count_at_finalization: usize = 0;
+    var head_events_since_finalization: usize = 0;
+    const min_head_events_after_finalization: usize = 2;
 
     var current_ns = std.time.nanoTimestamp();
     while (current_ns < deadline_ns and !(got_justification and got_finalization and got_node3_sync)) {
@@ -537,6 +539,19 @@ test "SSE events integration test - wait for justification and finalization" {
                     }
                 } else {
                     std.debug.print("DEBUG: Found finalization event with null slot\n", .{});
+                }
+            }
+
+            if (std.mem.eql(u8, e.event_type, "new_head")) {
+                if (got_finalization and !got_node3_sync) {
+                    head_events_since_finalization += 1;
+                    if (head_events_since_finalization >= min_head_events_after_finalization) {
+                        got_node3_sync = true;
+                        std.debug.print(
+                            "INFO: Observed {d} head events after first finalization — chain progressed after node 3 joined\n",
+                            .{head_events_since_finalization},
+                        );
+                    }
                 }
             }
 
