@@ -57,20 +57,49 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
         return StateTransitionError.InvalidJustifiableSlot;
     }
 
-    const delta: f32 = @floatFromInt(candidate - finalized);
+    const delta: u64 = @intCast(candidate - finalized);
     if (delta <= 5) {
         return true;
     }
-    const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
-    if (delta_x2 == 0) {
+
+    // Rule 2: perfect square delta.
+    const delta_u128: u128 = @intCast(delta);
+    const delta_root = sqrtFloorU128(delta_u128);
+    if (delta_root * delta_root == delta_u128) {
         return true;
     }
-    const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
-    if (delta_x2_x == 0.5) {
+
+    // Rule 3: pronic delta: n(n+1) => 4*delta+1 is an odd perfect square.
+    const pronic_disc: u128 = 4 * delta_u128 + 1;
+    const pronic_root = sqrtFloorU128(pronic_disc);
+    if (pronic_root * pronic_root == pronic_disc and (pronic_root & 1) == 1) {
         return true;
     }
 
     return false;
+}
+
+fn sqrtFloorU128(n: u128) u128 {
+    var lo: u128 = 0;
+    var hi: u128 = if (n < @as(u128, std.math.maxInt(u64))) n else @as(u128, std.math.maxInt(u64));
+    var ans: u128 = 0;
+
+    while (lo <= hi) {
+        const mid = (lo + hi) / 2;
+        const sq = mid * mid;
+        if (sq == n) {
+            return mid;
+        }
+        if (sq < n) {
+            ans = mid;
+            lo = mid + 1;
+        } else {
+            if (mid == 0) break;
+            hi = mid - 1;
+        }
+    }
+
+    return ans;
 }
 
 pub fn getJustifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {

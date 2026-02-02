@@ -1526,9 +1526,29 @@ pub const BeamChain = struct {
             .validator_id = @intCast(validator_indices.items[0]),
             .data = data,
         };
-        try self.validateAttestation(representative_attestation, false);
+        self.validateAttestation(representative_attestation, false) catch |err| {
+            self.module_logger.warn(
+                "aggregated attestation validation failed: slot={d} source={d} target={d} head_root=0x{s} target_root=0x{s} source_root=0x{s} err={any}",
+                .{
+                    data.slot,
+                    data.source.slot,
+                    data.target.slot,
+                    std.fmt.fmtSliceHexLower(&data.head.root),
+                    std.fmt.fmtSliceHexLower(&data.target.root),
+                    std.fmt.fmtSliceHexLower(&data.source.root),
+                    err,
+                },
+            );
+            return err;
+        };
 
-        const key_state = self.states.get(data.target.root) orelse return AttestationValidationError.MissingState;
+        const key_state = self.states.get(data.target.root) orelse {
+            self.module_logger.warn(
+                "aggregated attestation missing target state: slot={d} target_root=0x{s}",
+                .{ data.target.slot, std.fmt.fmtSliceHexLower(&data.target.root) },
+            );
+            return AttestationValidationError.MissingState;
+        };
 
         var pubkeys = std.ArrayList(xmss.PublicKey).init(self.allocator);
         defer {

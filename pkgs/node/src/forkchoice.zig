@@ -757,6 +757,33 @@ pub const ForkChoice = struct {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
+        const target_slot = nodes[target_idx].slot;
+        const source_slot = self.fcStore.latest_justified.slot;
+        const finalized_slot = self.fcStore.latest_finalized.slot;
+
+        // Log if the selected target skips over any justifiable slots after the source.
+        if (target_slot > source_slot + 1) {
+            var check_slot: types.Slot = source_slot + 1;
+            var skipped_slot: ?types.Slot = null;
+            while (check_slot < target_slot) : (check_slot += 1) {
+                if (try types.IsJustifiableSlot(finalized_slot, check_slot)) {
+                    skipped_slot = check_slot;
+                    break;
+                }
+            }
+            if (skipped_slot) |slot| {
+                self.logger.debug(
+                    "attestation target skips justifiable slot: source={d} target={d} skipped={d} finalized={d}",
+                    .{ source_slot, target_slot, slot, finalized_slot },
+                );
+            }
+        }
+
+        self.logger.debug(
+            "attestation target selection: head={d} safe_target={d} latest_justified={d} latest_finalized={d} target={d}",
+            .{ self.head.slot, self.safeTarget.slot, source_slot, finalized_slot, target_slot },
+        );
+
         // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
         // This prevents creating invalid attestations where source slot exceeds target slot
         // If the calculated target is older than latest_justified, use latest_justified instead
@@ -780,6 +807,11 @@ pub const ForkChoice = struct {
         }
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
+        var candidate_count: usize = 0;
+        var applied_count: usize = 0;
+        var missing_data_count: usize = 0;
+        var missing_payload_count: usize = 0;
+        var empty_payload_count: usize = 0;
 
         // Safe target updates use only attestations with aggregated proofs.
         // Hold the payloads lock while we check proof availability.
@@ -805,6 +837,7 @@ pub const ForkChoice = struct {
             if (latest_attestation) |delta_attestation| {
                 if (!from_known) {
                     const data = delta_attestation.attestation_data orelse {
+                        missing_data_count += 1;
                         try self.attestations.put(validator_id, attestation_tracker);
                         continue;
                     };
@@ -814,18 +847,36 @@ pub const ForkChoice = struct {
                         .data_root = data_root,
                     };
                     const proofs = self.aggregated_payloads.get(sig_key) orelse {
+                        missing_payload_count += 1;
                         try self.attestations.put(validator_id, attestation_tracker);
                         continue;
                     };
                     if (proofs.items.len == 0) {
+                        empty_payload_count += 1;
                         try self.attestations.put(validator_id, attestation_tracker);
                         continue;
                     }
                 }
+                candidate_count += 1;
                 self.deltas.items[delta_attestation.index] += validatorWeight;
                 attestation_tracker.appliedIndex = delta_attestation.index;
+                applied_count += 1;
             }
             try self.attestations.put(validator_id, attestation_tracker);
+        }
+
+        if (!from_known and (missing_data_count > 0 or missing_payload_count > 0 or empty_payload_count > 0)) {
+            self.logger.debug(
+                "safe target deltas: candidates={d} applied={d} missing_data={d} missing_payloads={d} empty_payloads={d} payload_map_size={d}",
+                .{
+                    candidate_count,
+                    applied_count,
+                    missing_data_count,
+                    missing_payload_count,
+                    empty_payload_count,
+                    self.aggregated_payloads.count(),
+                },
+            );
         }
 
         return self.deltas.items;
@@ -928,7 +979,14 @@ pub const ForkChoice = struct {
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
+        const prev_safe = self.safeTarget;
         self.safeTarget = try self.computeFCHead(false, cutoff_weight);
+        if (!std.mem.eql(u8, &prev_safe.blockRoot, &self.safeTarget.blockRoot)) {
+            self.logger.debug(
+                "safe target updated: prev={d} new={d} head={d} latest_justified={d} latest_finalized={d}",
+                .{ prev_safe.slot, self.safeTarget.slot, self.head.slot, self.fcStore.latest_justified.slot, self.fcStore.latest_finalized.slot },
+            );
+        }
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
