@@ -74,6 +74,10 @@ pub const ValidatorClient = struct {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
+        if (interval == 0) {
+            self.logger.debug("validator interval tick: slot={d} interval={d} (proposal check)", .{ slot, interval });
+        }
+
         // if a new slot interval may be do a proposal
         switch (interval) {
             0 => return self.maybeDoProposal(slot),
@@ -159,6 +163,7 @@ pub const ValidatorClient = struct {
             try result.addBlock(signed_block);
             return result;
         }
+        self.logger.debug("skipping block production for slot={d}: not proposer (validator_ids={any})", .{ slot, self.ids });
         return null;
     }
 
