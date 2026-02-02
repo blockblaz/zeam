@@ -872,8 +872,6 @@ pub const BeamNode = struct {
         }
         const interval: usize = @intCast(itime_intervals);
         const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
-        const slot: usize = @intCast(@divFloor(itime_intervals, constants.INTERVALS_PER_SLOT));
-        self.logger.debug("node interval tick: interval={d} slot={d} interval_in_slot={d}", .{ interval, slot, interval_in_slot });
 
         self.chain.onInterval(interval) catch |e| {
             self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });

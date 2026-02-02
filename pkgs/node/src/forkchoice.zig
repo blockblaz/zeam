@@ -778,33 +778,6 @@ pub const ForkChoice = struct {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
-        const target_slot = nodes[target_idx].slot;
-        const source_slot = self.fcStore.latest_justified.slot;
-        const finalized_slot = self.fcStore.latest_finalized.slot;
-
-        // Log if the selected target skips over any justifiable slots after the source.
-        if (target_slot > source_slot + 1) {
-            var check_slot: types.Slot = source_slot + 1;
-            var skipped_slot: ?types.Slot = null;
-            while (check_slot < target_slot) : (check_slot += 1) {
-                if (try types.IsJustifiableSlot(finalized_slot, check_slot)) {
-                    skipped_slot = check_slot;
-                    break;
-                }
-            }
-            if (skipped_slot) |slot| {
-                self.logger.debug(
-                    "attestation target skips justifiable slot: source={d} target={d} skipped={d} finalized={d}",
-                    .{ source_slot, target_slot, slot, finalized_slot },
-                );
-            }
-        }
-
-        self.logger.debug(
-            "attestation target selection: head={d} safe_target={d} latest_justified={d} latest_finalized={d} target={d}",
-            .{ self.head.slot, self.safeTarget.slot, source_slot, finalized_slot, target_slot },
-        );
-
         // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
         // This prevents creating invalid attestations where source slot exceeds target slot
         // If the calculated target is older than latest_justified, use latest_justified instead

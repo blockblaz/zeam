@@ -484,24 +484,16 @@ pub const BeamState = struct {
 
                 // source is finalized if target is the next valid justifiable hash
                 var can_target_finalize = true;
-                var blocking_slot: ?Slot = null;
                 const start_slot_usize: usize = @intCast(source_slot + 1);
                 const end_slot_usize: usize = @intCast(target_slot);
                 for (start_slot_usize..end_slot_usize) |slot_usize| {
                     const slot: Slot = @intCast(slot_usize);
                     if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
                         can_target_finalize = false;
-                        blocking_slot = slot;
                         break;
                     }
                 }
                 logger.debug("----------------can_target_finalize ({d})={any}----------\n\n", .{ source_slot, can_target_finalize });
-                if (!can_target_finalize) {
-                    logger.debug(
-                        "finalization blocked: source_slot={d} target_slot={d} latest_finalized_slot={d} blocking_slot={d}",
-                        .{ source_slot, target_slot, self.latest_finalized.slot, blocking_slot orelse 0 },
-                    );
-                }
                 if (can_target_finalize == true) {
                     const old_finalized_slot = finalized_slot;
                     self.latest_finalized = attestation_data.source;
