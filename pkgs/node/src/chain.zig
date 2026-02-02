@@ -1389,6 +1389,11 @@ pub const BeamChain = struct {
 
         if (filtered_attestations.items.len == 0) return gossip_messages;
 
+        // Skip attestations that are already proven (or finalized) to avoid
+        // repeatedly aggregating and gossiping stale proofs.
+        try self.filterAlreadyProvenAttestations(&filtered_attestations);
+        if (filtered_attestations.items.len == 0) return gossip_messages;
+
         const head_state = self.states.get(self.forkChoice.head.blockRoot) orelse return AttestationValidationError.MissingState;
         const current_slot = self.forkChoice.fcStore.timeSlots;
 
@@ -1430,6 +1435,41 @@ pub const BeamChain = struct {
         }
 
         return filtered_attestations;
+    }
+
+    fn filterAlreadyProvenAttestations(
+        self: *Self,
+        attestations: *std.ArrayList(types.Attestation),
+    ) !void {
+        const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+
+        var write_index: usize = 0;
+        for (attestations.items) |attestation| {
+            if (attestation.data.slot <= finalized_slot) {
+                continue;
+            }
+
+            const data_root = try attestation.data.sszRoot(self.allocator);
+            const sig_key = types.SignatureKey{
+                .validator_id = attestation.validator_id,
+                .data_root = data_root,
+            };
+
+            self.forkChoice.signatures_mutex.lock();
+            const payloads = self.forkChoice.aggregated_payloads.get(sig_key);
+            self.forkChoice.signatures_mutex.unlock();
+
+            if (payloads) |list| {
+                if (list.items.len > 0) {
+                    continue;
+                }
+            }
+
+            attestations.items[write_index] = attestation;
+            write_index += 1;
+        }
+
+        attestations.items = attestations.items[0..write_index];
     }
 
     fn snapshotGossipSignatures(
