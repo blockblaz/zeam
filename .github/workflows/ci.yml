@@ -253,7 +253,7 @@ jobs:
           ${{ runner.os }}-leanspec-
 
     - name: Generate LeanSpec fixtures
-      if: steps.cache-leanspec.outputs.cache-hit != 'true'
+      if: steps['cache-leanspec'].outputs.cache-hit != 'true'
       working-directory: leanSpec
       run: uv run fill --clean --fork=devnet
     
