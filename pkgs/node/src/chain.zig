@@ -342,7 +342,7 @@ pub const BeamChain = struct {
         const parent_root = chainHead.blockRoot;
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
 
-        const available_attestations = try self.forkChoice.getLatestNewAttestations();
+        const available_attestations = try self.forkChoice.getLatestKnownAttestations();
         defer self.allocator.free(available_attestations);
 
         var selected_attestations = try self.selectAttestationsForBlock(

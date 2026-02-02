@@ -385,6 +385,26 @@ pub const ForkChoice = struct {
         return included_attestations.toOwnedSlice();
     }
 
+    pub fn getLatestKnownAttestations(self: *Self) ![]types.Attestation {
+        var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer included_attestations.deinit();
+
+        for (0..self.config.genesis.numValidators()) |validator_id| {
+            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
+                .latestKnown orelse ProtoAttestation{}).attestation_data;
+
+            if (attestation_data) |att_data| {
+                const attestation = types.Attestation{
+                    .data = att_data,
+                    .validator_id = @intCast(validator_id),
+                };
+                try included_attestations.append(attestation);
+            }
+        }
+
+        return included_attestations.toOwnedSlice();
+    }
+
     fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
         _ = self;
         _ = blockDelayMs;
@@ -734,6 +754,7 @@ pub const ForkChoice = struct {
                 // we can directly assign because we always make sure that new attestation is fresher
                 // than an onchain attestation by purging those which are earlier than those seen on chain
                 attestation_tracker.latestKnown = new_attestation;
+                attestation_tracker.latestNew = null;
             }
 
             try self.attestations.put(validator_id, attestation_tracker);
