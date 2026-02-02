@@ -243,7 +243,17 @@ jobs:
         curl -LsSf https://astral.sh/uv/install.sh | sh
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+    - name: Cache LeanSpec fixtures
+      id: cache-leanspec
+      uses: actions/cache@v4
+      with:
+        path: leanSpec/fixtures
+        key: ${{ runner.os }}-leanspec-${{ hashFiles('leanSpec/**/*.py', 'leanSpec/**/*.yml', 'leanSpec/**/*.yaml', 'leanSpec/**/*.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-leanspec-
+
     - name: Generate LeanSpec fixtures
+      if: steps.cache-leanspec.outputs.cache-hit != 'true'
       working-directory: leanSpec
       run: uv run fill --clean --fork=devnet
     
