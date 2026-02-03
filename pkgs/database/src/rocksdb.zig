@@ -27,7 +27,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing RocksDB", .{});
 
-            const owned_path = try std.fmt.allocPrintZ(allocator, "{s}/rocksdb", .{path});
+            const owned_path = try std.fmt.allocPrintSentinel(allocator, "{s}/rocksdb", .{path}, 0);
             errdefer allocator.free(owned_path);
 
             try std.fs.cwd().makePath(owned_path);
@@ -62,6 +62,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 owned_path,
                 options,
                 column_family_descriptions,
+                false, // for_read_only
             });
 
             // allocate handle slice
@@ -84,8 +85,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         pub fn count(self: *Self, comptime cn: ColumnNamespace) Allocator.Error!u64 {
-            const live_files = try self.db.liveFiles(self.allocator);
-            defer live_files.deinit();
+            var live_files = try self.db.liveFiles(self.allocator);
+            defer live_files.deinit(self.allocator);
             defer for (live_files.items) |file| file.deinit();
 
             var sum: u64 = 0;
@@ -202,10 +203,10 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime log_message: []const u8,
                 log_args: anytype,
             ) void {
-                var serialized_value = std.ArrayList(u8).init(self.allocator);
-                defer serialized_value.deinit();
+                var serialized_value = std.ArrayList(u8){};
+                defer serialized_value.deinit(self.allocator);
 
-                ssz.serialize(T, value, &serialized_value) catch |err| {
+                ssz.serialize(T, value, &serialized_value, self.allocator) catch |err| {
                     self.logger.err("failed to serialize value for putToBatch: {any}", .{err});
                     return;
                 };
@@ -233,7 +234,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     block,
                     cn,
                     "added block to batch: root=0x{s}",
-                    .{std.fmt.fmtSliceHexLower(&block_root)},
+                    .{&block_root},
                 );
             }
 
@@ -256,7 +257,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     state,
                     cn,
                     "added state to batch: root=0x{s}",
-                    .{std.fmt.fmtSliceHexLower(&state_root)},
+                    .{&state_root},
                 );
             }
 
@@ -296,7 +297,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     blockroot,
                     cn,
                     "added finalized slot index to batch: slot={d} root=0x{s}",
-                    .{ slot, std.fmt.fmtSliceHexLower(&blockroot) },
+                    .{ slot, &blockroot },
                 );
             }
 
@@ -432,10 +433,10 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime log_message: []const u8,
             log_args: anytype,
         ) void {
-            var serialized_value = std.ArrayList(u8).init(self.allocator);
-            defer serialized_value.deinit();
+            var serialized_value = std.ArrayList(u8){};
+            defer serialized_value.deinit(self.allocator);
 
-            ssz.serialize(T, value, &serialized_value) catch |err| {
+            ssz.serialize(T, value, &serialized_value, self.allocator) catch |err| {
                 self.logger.err("failed to serialize value for saveToDatabase: {any}", .{err});
                 return;
             };
@@ -489,7 +490,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 block,
                 cn,
                 "saved block to database: root=0x{s}",
-                .{std.fmt.fmtSliceHexLower(&block_root)},
+                .{&block_root},
             );
         }
 
@@ -506,7 +507,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 cn,
                 "loaded block from database: root=0x{s}",
-                .{std.fmt.fmtSliceHexLower(&block_root)},
+                .{&block_root},
             );
         }
 
@@ -524,7 +525,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 state,
                 cn,
                 "saved state to database: root=0x{s}",
-                .{std.fmt.fmtSliceHexLower(&state_root)},
+                .{&state_root},
             );
         }
 
@@ -541,7 +542,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 cn,
                 "loaded state from database: root=0x{s}",
-                .{std.fmt.fmtSliceHexLower(&state_root)},
+                .{&state_root},
             );
         }
 
@@ -663,7 +664,11 @@ fn callRocksDB(logger: zeam_utils.ModuleLogger, func: anytype, args: anytype) in
     var err_str: ?rocksdb.Data = null;
     return @call(.auto, func, args ++ .{&err_str}) catch |e| {
         const func_name = @typeName(@TypeOf(func));
-        logger.err("failed to call RocksDB function: '{s}', error: {} - {s}", .{ func_name, e, err_str.? });
+        if (err_str) |err_data| {
+            logger.err("failed to call RocksDB function: '{s}', error: {any} - {s}", .{ func_name, e, err_data.data });
+        } else {
+            logger.err("failed to call RocksDB function: '{s}', error: {any}", .{ func_name, e });
+        }
         return e;
     };
 }

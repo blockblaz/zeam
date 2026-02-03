@@ -16,7 +16,8 @@ pub const Clock = struct {
     current_interval: isize,
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
-    on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
+    on_interval_cbs: std.array_list.AlignedManaged(*OnIntervalCbWrapper, null),
+    allocator: Allocator,
 
     timer: xev.Timer,
 
@@ -46,7 +47,8 @@ pub const Clock = struct {
             .current_interval = current_interval,
             .events = events,
             .timer = timer,
-            .on_interval_cbs = std.ArrayList(*OnIntervalCbWrapper).init(allocator),
+            .on_interval_cbs = std.array_list.AlignedManaged(*OnIntervalCbWrapper, null).init(allocator),
+            .allocator = allocator,
         };
     }
 

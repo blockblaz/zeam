@@ -505,13 +505,13 @@ pub const BeamChain = struct {
             \\+---------------------------------------------------------------+
             \\  Connected Peers:    {d}
             \\+---------------------------------------------------------------+
-            \\  Head Block Root:    0x{any}
-            \\  Parent Block Root:  0x{any}
-            \\  State Root:         0x{any}
+            \\  Head Block Root:    0x{x}
+            \\  Parent Block Root:  0x{x}
+            \\  State Root:         0x{x}
             \\  Timely:             {s}
             \\+---------------------------------------------------------------+
-            \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
-            \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
+            \\  Latest Justified:   Slot {d:>6} | Root: 0x{x}
+            \\  Latest Finalized:   Slot {d:>6} | Root: 0x{x}
             \\+===============================================================+
             \\
         , .{
@@ -519,14 +519,14 @@ pub const BeamChain = struct {
             fc_head.slot,
             blocks_behind,
             peer_count,
-            std.fmt.fmtSliceHexLower(&fc_head.blockRoot),
-            std.fmt.fmtSliceHexLower(&fc_head.parentRoot),
-            std.fmt.fmtSliceHexLower(&fc_head.stateRoot),
+            fc_head.blockRoot,
+            fc_head.parentRoot,
+            fc_head.stateRoot,
             if (is_timely) "YES" else "NO",
             justified.slot,
-            std.fmt.fmtSliceHexLower(&justified.root),
+            justified.root,
             finalized.slot,
-            std.fmt.fmtSliceHexLower(&finalized.root),
+            finalized.root,
         });
     }
 
@@ -540,9 +540,9 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{s} proposer={d}{} hasBlock={} from peer={s}{}", .{
+                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{any} hasBlock={} from peer={s}{any}", .{
                     block.slot,
-                    std.fmt.fmtSliceHexLower(&block_root),
+                    block_root,
                     block.proposer_index,
                     self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
                     hasBlock,
@@ -556,9 +556,9 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
-                        self.module_logger.err("error processing block for slot={d} root=0x{s}: {any}", .{
+                        self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
-                            std.fmt.fmtSliceHexLower(&block_root),
+                            block_root,
                             err,
                         });
                         return err;
@@ -576,9 +576,9 @@ pub const BeamChain = struct {
                         .missing_attestation_roots = missing_roots,
                     };
                 } else {
-                    self.module_logger.debug("skipping processing the already present block slot={d} blockroot=0x{s}", .{
+                    self.module_logger.debug("skipping processing the already present block slot={d} blockroot=0x{x}", .{
                         block.slot,
-                        std.fmt.fmtSliceHexLower(&block_root),
+                        block_root,
                     });
                 }
                 return .{};
@@ -589,7 +589,7 @@ pub const BeamChain = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.module_logger.debug("chain received gossip attestation for slot={d} validator={d}{} from peer={s}{}", .{
+                self.module_logger.debug("chain received gossip attestation for slot={d} validator={d}{any} from peer={s}{any}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -617,7 +617,7 @@ pub const BeamChain = struct {
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
-                self.module_logger.info("processed gossip attestation for slot={d} validator={d}{}", .{
+                self.module_logger.info("processed gossip attestation for slot={d} validator={d}{any}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -662,8 +662,8 @@ pub const BeamChain = struct {
             break :computedstate cpost_state;
         };
 
-        var missing_roots = std.ArrayList(types.Root).init(self.allocator);
-        errdefer missing_roots.deinit();
+        var missing_roots = std.ArrayList(types.Root){};
+        errdefer missing_roots.deinit(self.allocator);
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
@@ -676,8 +676,8 @@ pub const BeamChain = struct {
             });
 
             // 4. fc onattestations
-            self.module_logger.debug("processing attestations of block with root=0x{s} slot={d}", .{
-                std.fmt.fmtSliceHexLower(&freshFcBlock.blockRoot),
+            self.module_logger.debug("processing attestations of block with root=0x{x} slot={d}", .{
+                freshFcBlock.blockRoot,
                 block.slot,
             });
 
@@ -686,8 +686,8 @@ pub const BeamChain = struct {
 
             if (aggregated_attestations.len != signature_groups.len) {
                 self.module_logger.err(
-                    "signature group count mismatch for block root=0x{s}: attestations={d} signature_groups={d}",
-                    .{ std.fmt.fmtSliceHexLower(&freshFcBlock.blockRoot), aggregated_attestations.len, signature_groups.len },
+                    "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
+                    .{ freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
                 );
             }
 
@@ -704,7 +704,7 @@ pub const BeamChain = struct {
                 var participant_indices = if (signature_proof) |proof|
                     try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
                 else
-                    std.ArrayList(usize).init(self.allocator);
+                    std.array_list.AlignedManaged(usize, null).init(self.allocator);
                 defer participant_indices.deinit();
 
                 if (validator_indices.items.len != participant_indices.items.len) {
@@ -726,7 +726,7 @@ pub const BeamChain = struct {
                     self.validateAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                         if (e == AttestationValidationError.UnknownHeadBlock) {
-                            try missing_roots.append(attestation.data.head.root);
+                            try missing_roots.append(self.allocator, attestation.data.head.root);
                         }
 
                         self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
@@ -767,21 +767,21 @@ pub const BeamChain = struct {
 
         // 7. Save block and state to database and confirm the block in forkchoice
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
-            self.module_logger.err("failed to update block database for block root=0x{s}: {any}", .{
-                std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
+            self.module_logger.err("failed to update block database for block root=0x{x}: {any}", .{
+                fcBlock.blockRoot,
                 err,
             });
         };
         try self.forkChoice.confirmBlock(block_root);
 
-        self.module_logger.info("processed block with root=0x{s} slot={d} processing time={d} (computed root={} computed state={})", .{
-            std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
+        self.module_logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={} computed state={})", .{
+            fcBlock.blockRoot,
             block.slot,
             processing_time,
             blockInfo.blockRoot == null,
             blockInfo.postState == null,
         });
-        return missing_roots.toOwnedSlice();
+        return missing_roots.toOwnedSlice(self.allocator);
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlockWithAttestation) void {
@@ -959,8 +959,8 @@ pub const BeamChain = struct {
                 const state_ptr = entry.value;
                 state_ptr.deinit();
                 self.allocator.destroy(state_ptr);
-                self.module_logger.debug("pruned state for root 0x{s}", .{
-                    std.fmt.fmtSliceHexLower(&root),
+                self.module_logger.debug("pruned state for root 0x{x}", .{
+                    root,
                 });
             }
         }
@@ -1013,8 +1013,8 @@ pub const BeamChain = struct {
             const idx = self.forkChoice.protoArray.indices.get(root) orelse return error.FinalizedBlockNotInForkChoice;
             const node = self.forkChoice.protoArray.nodes.items[idx];
             batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, node.slot, root);
-            self.module_logger.debug("added block 0x{s} at slot {d} to finalized index", .{
-                std.fmt.fmtSliceHexLower(&root),
+            self.module_logger.debug("added block 0x{x} at slot {d} to finalized index", .{
+                root,
                 node.slot,
             });
         }
@@ -1156,24 +1156,24 @@ pub const BeamChain = struct {
 
         // 1. Validate that source, target, and head blocks exist in proto array
         const source_idx = self.forkChoice.protoArray.indices.get(data.source.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown source block root=0x{s}", .{
-                std.fmt.fmtSliceHexLower(&data.source.root),
+            self.module_logger.debug("attestation validation failed: unknown source block root=0x{x}", .{
+                data.source.root,
             });
             return AttestationValidationError.UnknownSourceBlock;
         };
 
         const target_idx = self.forkChoice.protoArray.indices.get(data.target.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
                 data.target.slot,
-                std.fmt.fmtSliceHexLower(&data.target.root),
+                data.target.root,
             });
             return AttestationValidationError.UnknownTargetBlock;
         };
 
         const head_idx = self.forkChoice.protoArray.indices.get(data.head.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{s}", .{
+            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{x}", .{
                 data.head.slot,
-                std.fmt.fmtSliceHexLower(&data.head.root),
+                data.head.root,
             });
             return AttestationValidationError.UnknownHeadBlock;
         };

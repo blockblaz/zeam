@@ -39,7 +39,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     } else {
         std.debug.lockStdErr();
         defer std.debug.unlockStdErr();
-        const stderr = std.io.getStdErr().writer();
+        const stderr = std.fs.File.stderr();
 
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
@@ -81,7 +81,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             }
 
             nosuspend fileLogParams.?.file.writeAll(print_str) catch |err| {
-                stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err }) catch {};
+                std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
             };
         }
     }
@@ -485,8 +485,9 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{} Peer connected: {s}, total peers: {d}", .{
-            OptionalNode.init("alice"),
+        const node = OptionalNode.init("alice");
+        try node.format("", .{}, writer);
+        try writer.print(" Peer connected: {s}, total peers: {d}", .{
             "peer123",
             5,
         });
@@ -500,8 +501,9 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
-            OptionalNode.init(null),
+        const node = OptionalNode.init(null);
+        try node.format("", .{}, writer);
+        try writer.print("Peer connected: {s}, total peers: {d}", .{
             "peer456",
             3,
         });
@@ -515,8 +517,9 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{} Published block: slot={d} proposer={d}", .{
-            OptionalNode.init("validator-7"),
+        const node = OptionalNode.init("validator-7");
+        try node.format("", .{}, writer);
+        try writer.print(" Published block: slot={d} proposer={d}", .{
             100,
             7,
         });
@@ -530,7 +533,9 @@ test "OptionalNode formatter" {
         var fbs = std.io.fixedBufferStream(&buffer);
         const writer = fbs.writer();
 
-        try writer.print("{} Message", .{OptionalNode.init("")});
+        const node = OptionalNode.init("");
+        try node.format("", .{}, writer);
+        try writer.writeAll(" Message");
 
         const result = fbs.getWritten();
         try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", result);

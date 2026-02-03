@@ -11,7 +11,7 @@ const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -227,9 +227,8 @@ fn mainInner() !void {
     const app_version = build_options.version;
 
     const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)}) catch {};
-        stderr.print("Run 'zeam --help' for usage information.\n", .{}) catch {};
+        std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
+        std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };

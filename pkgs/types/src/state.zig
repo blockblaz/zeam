@@ -463,7 +463,7 @@ pub const BeamState = struct {
                     target_justifications_count += 1;
                 }
             }
-            logger.debug("target jcount={d} target_root=0x{s} justifications_len={d}\n", .{ target_justifications_count, std.fmt.fmtSliceHexLower(&attestation_data.target.root), target_justifications.len });
+            logger.debug("target jcount={d} target_root=0x{x} justifications_len={d}\n", .{ target_justifications_count, &attestation_data.target.root, target_justifications.len });
 
             // as soon as we hit the threshold do justifications
             // note that this simplification works if weight of each validator is 1
@@ -478,8 +478,8 @@ pub const BeamState = struct {
                     allocator.free(kv.value);
                 }
                 logger.debug(
-                    "\n\n\n-----------------HURRAY JUSTIFICATION ------------\nroot=0x{s} slot={d}\n--------------\n---------------\n-------------------------\n\n\n",
-                    .{ std.fmt.fmtSliceHexLower(&self.latest_justified.root), self.latest_justified.slot },
+                    "\n\n\n-----------------HURRAY JUSTIFICATION ------------\nroot=0x{x} slot={d}\n--------------\n---------------\n-------------------------\n\n\n",
+                    .{ &self.latest_justified.root, self.latest_justified.slot },
                 );
 
                 // source is finalized if target is the next valid justifiable hash
@@ -503,7 +503,7 @@ pub const BeamState = struct {
                     if (delta > 0) {
                         try self.shiftJustifiedSlots(delta, allocator);
 
-                        var roots_to_remove = std.ArrayList(Root).init(allocator);
+                        var roots_to_remove = std.array_list.AlignedManaged(Root, null).init(allocator);
                         defer roots_to_remove.deinit();
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
@@ -703,9 +703,9 @@ test "ssz seralize/deserialize signed beam state" {
     };
     defer state.deinit();
 
-    var serialized_state = std.ArrayList(u8).init(std.testing.allocator);
-    defer serialized_state.deinit();
-    try ssz.serialize(BeamState, state, &serialized_state);
+    var serialized_state = std.ArrayList(u8){};
+    defer serialized_state.deinit(std.testing.allocator);
+    try ssz.serialize(BeamState, state, &serialized_state, std.testing.allocator);
     std.debug.print("serialized_state ({d})\n", .{serialized_state.items.len});
 
     // we need to use arena allocator because deserialization allocs without providing for
@@ -1015,13 +1015,13 @@ test "encode decode state roundtrip" {
     defer state.deinit();
 
     // Encode
-    var encoded = std.ArrayList(u8).init(std.testing.allocator);
-    defer encoded.deinit();
-    try ssz.serialize(BeamState, state, &encoded);
+    var encoded = std.ArrayList(u8){};
+    defer encoded.deinit(std.testing.allocator);
+    try ssz.serialize(BeamState, state, &encoded, std.testing.allocator);
 
     // Convert to hex and compare with expected value
     const expected_value = "e8030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e4000000e4000000e5000000e5000000e50000000101";
-    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{x}", .{encoded.items});
     defer std.testing.allocator.free(encoded_hex);
     try std.testing.expectEqualStrings(expected_value, encoded_hex);
 
@@ -1084,7 +1084,7 @@ test "genesis block hash comparison" {
     // Compute hash of first genesis block
     var genesis_block_hash1: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
-    std.debug.print("genesis_block_hash1 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
+    std.debug.print("genesis_block_hash1 =0x{x}\n", .{genesis_block_hash1});
 
     // Create a second genesis state with same config but regenerated (should produce same hash)
     var genesis_state1_copy: BeamState = undefined;
@@ -1126,7 +1126,7 @@ test "genesis block hash comparison" {
 
     var genesis_block_hash2: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
-    std.debug.print("genesis_block_hash2 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
+    std.debug.print("genesis_block_hash2 =0x{x}\n", .{genesis_block_hash2});
 
     // Different validators should produce different genesis block hash
     try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash2));
@@ -1156,21 +1156,21 @@ test "genesis block hash comparison" {
 
     var genesis_block_hash3: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
-    std.debug.print("genesis_block_hash3 =0x{s}\n", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
+    std.debug.print("genesis_block_hash3 =0x{x}\n", .{genesis_block_hash3});
 
     // Different genesis_time should produce different genesis block hash
     try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash3));
 
     // // Compare genesis block hashes with expected hex values
-    const hash1_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash1)});
+    const hash1_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash1});
     defer allocator.free(hash1_hex);
     try std.testing.expectEqualStrings(hash1_hex, "0xcc03f11dd80dd79a4add86265fad0a141d0a553812d43b8f2c03aa43e4b002e3");
 
-    const hash2_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash2)});
+    const hash2_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash2});
     defer allocator.free(hash2_hex);
     try std.testing.expectEqualStrings(hash2_hex, "0x6bd5347aa1397c63ed8558079fdd3042112a5f4258066e3a659a659ff75ba14f");
 
-    const hash3_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&genesis_block_hash3)});
+    const hash3_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash3});
     defer allocator.free(hash3_hex);
     try std.testing.expectEqualStrings(hash3_hex, "0xce48a709189aa2b23b6858800996176dc13eb49c0c95d717c39e60042de1ac91");
 }

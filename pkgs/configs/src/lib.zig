@@ -77,10 +77,9 @@ pub fn genesisConfigFromYAML(
 
     const genesis_time_node = root.get("GENESIS_TIME") orelse return GenesisConfigError.MissingGenesisTime;
     var genesis_time: u64 = switch (genesis_time_node) {
-        .int => |value| blk: {
-            if (value < 0) return GenesisConfigError.InvalidGenesisTime;
-            const casted: u64 = @intCast(value);
-            break :blk casted;
+        .scalar => |value| blk: {
+            const parsed = std.fmt.parseInt(u64, value, 10) catch return GenesisConfigError.InvalidGenesisTime;
+            break :blk parsed;
         },
         else => return GenesisConfigError.InvalidGenesisTime,
     };
@@ -107,9 +106,9 @@ fn parsePubkeysFromYaml(
 
     for (list, 0..) |item, idx| {
         // The Zig YAML library has a bug where it parses quoted "0x..." as float
-        // If any item is not a string, return an error as the YAML is malformed
-        if (item != .string) return GenesisConfigError.InvalidValidatorPubkeys;
-        pubkeys[idx] = try hexToBytes52(item.string);
+        // If any item is not a scalar, return an error as the YAML is malformed
+        if (item != .scalar) return GenesisConfigError.InvalidValidatorPubkeys;
+        pubkeys[idx] = try hexToBytes52(item.scalar);
     }
 
     return pubkeys;

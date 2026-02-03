@@ -341,7 +341,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
 }
 
 /// Writes metrics to a writer (for Prometheus endpoint).
-pub fn writeMetrics(writer: anytype) !void {
+pub fn writeMetrics(writer: *std.Io.Writer) !void {
     if (!g_initialized) return error.NotInitialized;
 
     // For ZKVM targets, write no metrics

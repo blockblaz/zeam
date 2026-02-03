@@ -49,7 +49,7 @@ pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
 pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlockWithAttestation);
 // key: parent root, value: list of child roots (for O(1) child lookup)
-pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayList(types.Root));
+pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayListUnmanaged(types.Root));
 
 pub const BlocksByRootRequestResult = struct {
     peer_id: []const u8,
@@ -116,7 +116,7 @@ pub const Network = struct {
 
         var children_it = self.fetched_block_children.iterator();
         while (children_it.next()) |entry| {
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fetched_block_children.deinit();
 
@@ -232,8 +232,8 @@ pub const Network = struct {
 
             // Finalize all pending RPC requests for this peer
             var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove = std.ArrayList(u64).init(self.allocator);
-            defer request_ids_to_remove.deinit();
+            var request_ids_to_remove = std.ArrayList(u64){};
+            defer request_ids_to_remove.deinit(self.allocator);
 
             while (rpc_it.next()) |rpc_entry| {
                 const pending_peer_id = switch (rpc_entry.value_ptr.*) {
@@ -242,7 +242,7 @@ pub const Network = struct {
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
                     // If we can't allocate, skip this request (should be rare)
-                    request_ids_to_remove.append(rpc_entry.key_ptr.*) catch continue;
+                    request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
                 }
             }
 
@@ -310,13 +310,13 @@ pub const Network = struct {
 
         const created_new_entry = !gop.found_existing;
         if (created_new_entry) {
-            gop.value_ptr.* = std.ArrayList(types.Root).init(self.allocator);
+            gop.value_ptr.* = std.ArrayListUnmanaged(types.Root){};
         }
         errdefer if (created_new_entry) {
-            gop.value_ptr.deinit();
+            gop.value_ptr.deinit(self.allocator);
             _ = self.fetched_block_children.remove(parent_root);
         };
-        try gop.value_ptr.append(root);
+        try gop.value_ptr.append(self.allocator, root);
     }
 
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
@@ -335,7 +335,7 @@ pub const Network = struct {
                 }
                 // Clean up the parent entry if no children remain
                 if (children_list.items.len == 0) {
-                    children_list.deinit();
+                    children_list.deinit(self.allocator);
                     _ = self.fetched_block_children.remove(parent_root);
                 }
             }

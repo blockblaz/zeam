@@ -9,7 +9,7 @@ Beam Chain is a futuristic ZK based Ethereum Consensus Protocol first [unveiled 
 and is meant to upgrade the current Beacon Chain when ready. Zeam is its production grade implementation (wip).
 
 The heart of Beam Chain is to massively scale and decentralize ethereum consensus with provable and verifiable
-protocol via ZK-VMs but also bundles some of the other disruptive ideas and learnings on ethereum consensus which 
+protocol via ZK-VMs but also bundles some of the other disruptive ideas and learnings on ethereum consensus which
 could be a bit harder to incrementally implement on the current Beacon Chain.
 
 ## Beam Chain
@@ -27,11 +27,11 @@ for consideration and deployment to ethereum blockchain.
 
 We are currently doing various POCs/libs development:
 
- - [POC of zig run time](https://github.com/blockblaz/zeam-runtime) with various ZK-VMs.
- - [Snappy](https://github.com/blockblaz/zig-snappy) & [Snappy frames](https://github.com/blockblaz/snappyframesz)
- - [Zig <> rust libp2p interops](https://github.com/blockblaz/zig-libp2p-pocs)
- - [Zig SSZ!](https://github.com/blockblaz/ssz.zig)
- - [Hash Signatures](https://github.com/blockblaz/hash-sigz)
+- [POC of zig run time](https://github.com/blockblaz/zeam-runtime) with various ZK-VMs.
+- [Snappy](https://github.com/blockblaz/zig-snappy) & [Snappy frames](https://github.com/blockblaz/snappyframesz)
+- [Zig <> rust libp2p interops](https://github.com/blockblaz/zig-libp2p-pocs)
+- [Zig SSZ!](https://github.com/blockblaz/ssz.zig)
+- [Hash Signatures](https://github.com/blockblaz/hash-sigz)
 
 And all of these efforts culminating in a [ZEAM POC](./resources/zeam.md) with which we hope to aid in Beam Spec
 research especially with state transition proving.
@@ -67,6 +67,7 @@ out for this space for annoucements on the same or reach out to us via our [comm
 Docker images are built in CI using `Dockerfile.prebuilt`, which packages pre-built binaries. This avoids intermittent build failures caused by a [Zig HTTP connection pool bug](https://github.com/ziglang/zig/issues/21316) when building inside Docker.
 
 To build a Docker image locally:
+
 ```bash
 # Build zeam natively first
 zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
@@ -76,6 +77,7 @@ docker build -f Dockerfile.prebuilt -t zeam:local .
 ```
 
 For publishing to a public registry, add OCI labels for better traceability:
+
 ```bash
 docker build -f Dockerfile.prebuilt \
   --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
@@ -85,11 +87,11 @@ docker build -f Dockerfile.prebuilt \
 
 #### Prerequisites
 
- - Zeam requires zig version 0.14.1 to build.
- - Zeam requires Rust 1.85+ to be able to build the rust connections to various zkvms
- - Both [risc0](https://github.com/risc0/risc0) (v3.0.3) and OpenVM provers are supported:
-   - risc0 requires the toolchain to be [installed](https://dev.risczero.com/api/zkvm/install): `rzup install r0vm 3.0.3`
-   - OpenVM is self-contained (no external toolchain needed)
+- Zeam requires zig version 0.15.2 to build.
+- Zeam requires Rust 1.85+ to be able to build the rust connections to various zkvms
+- Both [risc0](https://github.com/risc0/risc0) (v3.0.3) and OpenVM provers are supported:
+  - risc0 requires the toolchain to be [installed](https://dev.risczero.com/api/zkvm/install): `rzup install r0vm 3.0.3`
+  - OpenVM is self-contained (no external toolchain needed)
 
 #### Build
 
@@ -124,4 +126,4 @@ Zeam supports checkpoint sync for faster initial synchronization. You can start 
 
 ### Reporting Issues
 
-Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH). 
+Open an [issue or a bug](https://github.com/blockblaz/zeam/issues/new) or else talk to us via our [community telegram group](https://t.me/zeamETH).

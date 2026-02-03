@@ -121,16 +121,26 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
     }
 
     if (cmd.out) |output_path| {
+        // Use a fixed buffer stream which provides a standard writer with writeAll
+        var buffer: [4096]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try genENR(cmd.sk, cmd.ip, cmd.quic, fbs.writer());
+
+        // Write the result to the file
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
-
-        const writer = file.writer();
-        try genENR(cmd.sk, cmd.ip, cmd.quic, writer);
+        try file.writeAll(fbs.getWritten());
 
         std.debug.print("ENR written to: {s}\n", .{output_path});
     } else {
-        const stdout = std.io.getStdOut().writer();
-        try genENR(cmd.sk, cmd.ip, cmd.quic, stdout);
+        // Use a fixed buffer stream which provides a standard writer with writeAll
+        var buffer: [4096]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buffer);
+        try genENR(cmd.sk, cmd.ip, cmd.quic, fbs.writer());
+
+        // Write the result to stdout
+        const stdout = std.fs.File.stdout();
+        try stdout.writeAll(fbs.getWritten());
     }
 }
 

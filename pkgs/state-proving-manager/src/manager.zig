@@ -103,9 +103,9 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
         .block = block,
     };
 
-    var serialized = std.ArrayList(u8).init(allocator);
-    defer serialized.deinit();
-    try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
+    var serialized: std.ArrayListUnmanaged(u8) = .{};
+    defer serialized.deinit(allocator);
+    try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized, allocator);
 
     opts.logger.debug("prove transition ----------- serialized_len={d}", .{serialized.items.len});
 

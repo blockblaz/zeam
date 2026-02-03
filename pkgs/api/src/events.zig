@@ -24,9 +24,9 @@ pub const NewHeadEvent = struct {
     timely: bool,
 
     pub fn fromProtoBlock(allocator: Allocator, proto_block: types.ProtoBlock) !NewHeadEvent {
-        const block_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.blockRoot)});
-        const parent_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.parentRoot)});
-        const state_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.stateRoot)});
+        const block_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{proto_block.blockRoot});
+        const parent_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{proto_block.parentRoot});
+        const state_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{proto_block.stateRoot});
 
         return NewHeadEvent{
             .slot = proto_block.slot,
@@ -67,7 +67,7 @@ pub const NewJustificationEvent = struct {
     justified_slot: u64,
 
     pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewJustificationEvent {
-        const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
+        const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{checkpoint.root});
 
         return NewJustificationEvent{
             .slot = current_slot,
@@ -102,7 +102,7 @@ pub const NewFinalizationEvent = struct {
     finalized_slot: u64,
 
     pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewFinalizationEvent {
-        const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
+        const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{checkpoint.root});
 
         return NewFinalizationEvent{
             .slot = current_slot,

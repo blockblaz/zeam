@@ -22,21 +22,20 @@ pub fn main() !void {
 
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
-        const writer = file.writer();
 
         // magic +  binary format
-        _ = try writer.write(magic);
-        try writer.writeInt(u32, BinaryFormatVersion, .little);
+        try file.writeAll(magic);
+        try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(BinaryFormatVersion))));
 
         // write program header + len as u32
         const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
-        try writer.writeInt(u32, @truncate(header.len), .little);
+        try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(header.len))));
         // program header
-        _ = try writer.write(header);
+        try file.writeAll(header);
 
         // user data length + data
-        try writer.writeInt(u32, @truncate(bindata.len), .little);
-        _ = try writer.write(bindata);
+        try file.writeAll(&std.mem.toBytes(@as(u32, @truncate(bindata.len))));
+        try file.writeAll(bindata);
 
         // DO NOT write the kernel length, it's inferred
         const kernel = try std.fs.cwd().openFile("build/v1compat.elf", .{});
@@ -45,7 +44,7 @@ pub fn main() !void {
         const kernelsize = kernelstat.size;
         const kerneldata = try kernel.readToEndAlloc(allocator, kernelsize);
         defer allocator.free(kerneldata);
-        _ = try writer.write(kerneldata);
+        try file.writeAll(kerneldata);
     } else {
         @panic("no binary file given");
     }

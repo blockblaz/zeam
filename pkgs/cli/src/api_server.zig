@@ -82,8 +82,11 @@ const ApiServer = struct {
     fn handleConnection(self: *const Self, connection: std.net.Server.Connection) void {
         defer connection.stream.close();
 
-        var buffer: [4096]u8 = undefined;
-        var http_server = std.http.Server.init(connection, &buffer);
+        var read_buffer: [4096]u8 = undefined;
+        var write_buffer: [4096]u8 = undefined;
+        var stream_reader = connection.stream.reader(&read_buffer);
+        var stream_writer = connection.stream.writer(&write_buffer);
+        var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
         var request = http_server.receiveHead() catch |err| {
             self.logger.warn("failed to receive HTTP head: {}", .{err});
             return;
@@ -119,16 +122,16 @@ const ApiServer = struct {
     }
 
     /// Handle metrics endpoint
-    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
-        var metrics_output = std.ArrayList(u8).init(self.allocator);
-        defer metrics_output.deinit();
+    fn handleMetrics(_: *const Self, request: *std.http.Server.Request) void {
+        var buffer: [65536]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
 
-        api.writeMetrics(metrics_output.writer()) catch {
+        api.writeMetrics(&writer) catch {
             _ = request.respond("Internal Server Error\n", .{}) catch {};
             return;
         };
 
-        _ = request.respond(metrics_output.items, .{
+        _ = request.respond(buffer[0..writer.end], .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },
@@ -161,10 +164,10 @@ const ApiServer = struct {
         };
 
         // Serialize lean state (BeamState) to SSZ
-        var ssz_output = std.ArrayList(u8).init(self.allocator);
-        defer ssz_output.deinit();
+        var ssz_output: std.ArrayListUnmanaged(u8) = .{};
+        defer ssz_output.deinit(self.allocator);
 
-        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
+        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output, self.allocator) catch |err| {
             self.logger.err("failed to serialize finalized lean state to SSZ: {}", .{err});
             _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
             return;
@@ -250,7 +253,7 @@ const ApiServer = struct {
             };
 
             // Wait between SSE heartbeats
-            std.time.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
+            std.Thread.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
         }
     }
 };

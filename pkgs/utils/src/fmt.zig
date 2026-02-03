@@ -50,9 +50,13 @@ test "LazyJson formats JSON and frees allocation" {
     };
 
     const value: OkJson = .{};
-    const out = try std.fmt.allocPrint(allocator, "{}", .{LazyJson(OkJson).init(allocator, &value)});
-    defer allocator.free(out);
+    const lazy_json = LazyJson(OkJson).init(allocator, &value);
 
+    var buffer: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buffer);
+    try lazy_json.format("", .{}, fbs.writer());
+
+    const out = fbs.getWritten();
     try std.testing.expectEqualStrings("{\"ok\":true}", out);
 }
 
@@ -68,8 +72,12 @@ test "LazyJson formats error on toJsonString failure" {
     };
 
     const value: FailJson = .{};
-    const out = try std.fmt.allocPrint(allocator, "{}", .{LazyJson(FailJson).init(allocator, &value)});
-    defer allocator.free(out);
+    const lazy_json = LazyJson(FailJson).init(allocator, &value);
 
+    var buffer: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buffer);
+    try lazy_json.format("", .{}, fbs.writer());
+
+    const out = fbs.getWritten();
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "<json error:"));
 }

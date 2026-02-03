@@ -36,7 +36,7 @@ pub const SSEConnection = struct {
 
 /// Thread-safe event broadcaster for SSE connections
 pub const EventBroadcaster = struct {
-    connections: std.ArrayList(*SSEConnection),
+    connections: std.ArrayListUnmanaged(*SSEConnection),
     mutex: Mutex,
     allocator: std.mem.Allocator,
 
@@ -44,7 +44,7 @@ pub const EventBroadcaster = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .connections = std.ArrayList(*SSEConnection).init(allocator),
+            .connections = .{},
             .mutex = Mutex{},
             .allocator = allocator,
         };
@@ -58,7 +58,7 @@ pub const EventBroadcaster = struct {
             connection.deinit();
             self.allocator.destroy(connection);
         }
-        self.connections.deinit();
+        self.connections.deinit(self.allocator);
     }
 
     /// Add a new SSE connection
@@ -69,7 +69,7 @@ pub const EventBroadcaster = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.connections.append(connection);
+        try self.connections.append(self.allocator, connection);
     }
 
     /// Remove a connection (typically when it's closed)

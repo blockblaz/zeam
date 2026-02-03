@@ -93,7 +93,7 @@ pub fn verifySignatures(
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
-        defer public_keys.deinit();
+        defer public_keys.deinit(allocator);
 
         // Store the PublicKey wrappers so we can free the Rust handles after verification
         // Only used when cache is not provided
@@ -106,7 +106,7 @@ pub fn verifySignatures(
                     wrapper.deinit();
                 }
             }
-            pubkey_wrappers.deinit();
+            pubkey_wrappers.deinit(allocator);
         }
 
         for (validator_indices.items) |validator_index| {
@@ -121,14 +121,14 @@ pub fn verifySignatures(
                 const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
-                try public_keys.append(pk_handle);
+                try public_keys.append(allocator, pk_handle);
             } else {
                 // No cache - deserialize each time (legacy behavior)
                 const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
-                try public_keys.append(pubkey.handle);
-                try pubkey_wrappers.append(pubkey);
+                try public_keys.append(allocator, pubkey.handle);
+                try pubkey_wrappers.append(allocator, pubkey);
             }
         }
 

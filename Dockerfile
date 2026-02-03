@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig 0.14.1 based on architecture
+# Install Zig 0.15.2 based on architecture
 ARG TARGETARCH
-RUN ZIG_VERSION="0.14.1" && \
+RUN ZIG_VERSION="0.15.2" && \
     case "$TARGETARCH" in \
         amd64) ZIG_ARCH="x86_64" ;; \
         arm64) ZIG_ARCH="aarch64" ;; \
