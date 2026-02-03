@@ -92,12 +92,14 @@ pub fn verifySignatures(
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
-        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
+        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .{};
+        try public_keys.ensureTotalCapacity(allocator, validator_indices.items.len);
         defer public_keys.deinit(allocator);
 
         // Store the PublicKey wrappers so we can free the Rust handles after verification
         // Only used when cache is not provided
-        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .{};
+        try pubkey_wrappers.ensureTotalCapacity(allocator, validator_indices.items.len);
         defer {
             // Only free wrappers if we're not using a cache
             // When using cache, the cache owns the handles
@@ -211,7 +213,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
+            opts.logger.debug("state root={x} block root={x}\n", .{ state_root, block.state_root });
             return StateTransitionError.InvalidPostState;
         }
     }

@@ -298,7 +298,7 @@ pub const BeamState = struct {
         var head_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
-            logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
+            logger.err("state root={x} block root={x}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
         }
 
