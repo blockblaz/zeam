@@ -187,6 +187,44 @@ const StepContext = struct {
     base_context: Context,
 };
 
+fn aggregateGossipSignatures(ctx: *StepContext) !void {
+    const attestations = try ctx.fork_choice.getAttestationsFromGossipSignatures();
+    defer ctx.allocator.free(attestations);
+
+    if (attestations.len == 0) return;
+
+    const source_slot = ctx.fork_choice.fcStore.timeSlots;
+    for (attestations) |attestation| {
+        var proof = try types.AggregatedSignatureProof.init(ctx.allocator);
+        errdefer proof.deinit();
+
+        try types.aggregationBitsSet(&proof.participants, @intCast(attestation.validator_id), true);
+
+        try ctx.fork_choice.storeAggregatedPayload(
+            attestation.validator_id,
+            source_slot,
+            &attestation.data,
+            proof,
+            .new,
+        );
+    }
+}
+
+fn advanceIntervals(
+    ctx: *StepContext,
+    time_intervals: usize,
+    has_proposal: bool,
+) !void {
+    while (ctx.fork_choice.fcStore.time < time_intervals) {
+        const should_signal_proposal = has_proposal and (ctx.fork_choice.fcStore.time + 1) == time_intervals;
+        try ctx.fork_choice.tickInterval(should_signal_proposal);
+
+        if (ctx.fork_choice.fcStore.time % node_constants.INTERVALS_PER_SLOT == 2) {
+            try aggregateGossipSignatures(ctx);
+        }
+    }
+}
+
 const StateMap = std.AutoHashMapUnmanaged(types.Root, *types.BeamState);
 const StateList = std.ArrayListUnmanaged(*types.BeamState);
 const LabelMap = std.StringHashMapUnmanaged(types.Root);
@@ -270,6 +308,26 @@ fn runCase(
     }) catch |err| {
         std.debug.print(
             "fixture {s} case {s}: fork choice init failed ({s})\n",
+            .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+
+    const validator_count = anchor_state.validatorCount();
+    var validator_ids = allocator.alloc(usize, validator_count) catch {
+        std.debug.print(
+            "fixture {s} case {s}: failed to allocate validator list\n",
+            .{ ctx.fixture_label, ctx.case_name },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    defer allocator.free(validator_ids);
+    for (0..validator_count) |validator_id| {
+        validator_ids[validator_id] = validator_id;
+    }
+    fork_choice.setAggregatorInfo(true, validator_ids) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}: failed to set aggregator info ({s})\n",
             .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -624,7 +682,7 @@ fn processBlockStep(
     };
 
     const target_intervals = slotToIntervals(block.slot);
-    try ctx.fork_choice.onInterval(target_intervals, true);
+    try advanceIntervals(ctx, target_intervals, true);
 
     const new_state_ptr = try ctx.allocator.create(types.BeamState);
     errdefer {
@@ -777,7 +835,7 @@ fn processTickStep(
     }
 
     const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-    try ctx.fork_choice.onInterval(target_intervals, false);
+    try advanceIntervals(ctx, target_intervals, false);
 }
 
 fn applyChecks(
