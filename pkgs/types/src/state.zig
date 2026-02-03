@@ -489,6 +489,10 @@ pub const BeamState = struct {
                 for (start_slot_usize..end_slot_usize) |slot_usize| {
                     const slot: Slot = @intCast(slot_usize);
                     if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
+                        logger.debug(
+                            "can_target_finalize blocked by justifiable slot={d} (source={d}, target={d}, finalized={d})\n",
+                            .{ slot, source_slot, target_slot, self.latest_finalized.slot },
+                        );
                         can_target_finalize = false;
                         break;
                     }

@@ -654,6 +654,44 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
+    // Store aggregated attestation proofs from block body for forkchoice (spec-aligned).
+    const aggregated_attestations = block.body.attestations.constSlice();
+    for (aggregated_attestations) |aggregated_attestation| {
+        var proof_template = try types.AggregatedSignatureProof.init(ctx.allocator);
+        errdefer proof_template.deinit();
+
+        for (0..aggregated_attestation.aggregation_bits.len()) |i| {
+            if (aggregated_attestation.aggregation_bits.get(i) catch false) {
+                try types.aggregationBitsSet(&proof_template.participants, i, true);
+            }
+        }
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator);
+        defer validator_indices.deinit();
+
+        for (validator_indices.items) |validator_index| {
+            var stored_proof: types.AggregatedSignatureProof = undefined;
+            types.sszClone(ctx.allocator, types.AggregatedSignatureProof, proof_template, &stored_proof) catch |err| {
+                std.debug.print(
+                    "fixture {s} case {s}{}: failed to clone aggregated proof ({s})\n",
+                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                );
+                return FixtureError.InvalidFixture;
+            };
+
+            ctx.fork_choice.storeAggregatedPayload(@intCast(validator_index), block.slot, &aggregated_attestation.data, stored_proof, .known) catch |err| {
+                stored_proof.deinit();
+                std.debug.print(
+                    "fixture {s} case {s}{}: failed to store aggregated payload ({s})\n",
+                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                );
+                return FixtureError.FixtureMismatch;
+            };
+        }
+
+        proof_template.deinit();
+    }
+
     _ = try ctx.fork_choice.updateHead();
 
     ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
@@ -690,11 +728,12 @@ fn processBlockStep(
         }
     }
 
-    const attestation = types.Attestation{
+    const signed_attestation = types.SignedAttestation{
         .validator_id = proposer_attestation.validator_id,
-        .data = proposer_attestation.data,
+        .message = proposer_attestation.data,
+        .signature = types.ZERO_SIGBYTES,
     };
-    try ctx.fork_choice.onAttestation(attestation, false);
+    try ctx.fork_choice.onGossipAttestation(signed_attestation);
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {

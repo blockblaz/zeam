@@ -851,12 +851,15 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
-        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.time) {
-            self.logger.warn("skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
-                self.chain.forkChoice.fcStore.time,
-                itime_intervals,
-            });
-            return;
+        if (itime_intervals > 0) {
+            const target_intervals: types.Interval = @intCast(itime_intervals);
+            if (target_intervals <= self.chain.forkChoice.fcStore.time) {
+                self.logger.warn("skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
+                    self.chain.forkChoice.fcStore.time,
+                    itime_intervals,
+                });
+                return;
+            }
         }
 
         // till its time to attest atleast for first time don't run onInterval,
@@ -870,69 +873,67 @@ pub const BeamNode = struct {
             }
             return;
         }
-        const interval: usize = @intCast(itime_intervals);
-        const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
 
-        self.chain.onInterval(interval) catch |e| {
-            self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-            // no point going further if chain is not ticked properly
-            return e;
-        };
-        if (self.validator) |*validator| {
-            // we also tick validator per interval in case it would
-            // need to sync its future duties when its an independent validator
-            var validator_output = validator.onInterval(interval) catch |e| {
-                self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+        const target_interval: usize = @intCast(itime_intervals);
+        var interval: usize = @intCast(self.chain.forkChoice.fcStore.time + 1);
+        while (interval <= target_interval) : (interval += 1) {
+            const interval_output = self.chain.onInterval(interval) catch |e| {
+                self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+                // no point going further if chain is not ticked properly
                 return e;
             };
+            if (interval_output) |*aggregated| {
+                defer {
+                    for (aggregated.items) |*msg| {
+                        msg.deinit();
+                    }
+                    aggregated.deinit();
+                }
 
-            if (validator_output) |*output| {
-                defer output.deinit();
-                for (output.gossip_messages.items) |gossip_msg| {
+                for (aggregated.items) |signed_aggregated| {
+                    self.publishAggregatedAttestation(signed_aggregated) catch |e| {
+                        self.logger.err("error publishing aggregated attestation: err={any}", .{e});
+                        return e;
+                    };
+                }
+            }
+            if (self.validator) |*validator| {
+                // we also tick validator per interval in case it would
+                // need to sync its future duties when its an independent validator
+                var validator_output = validator.onInterval(interval) catch |e| {
+                    self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                    return e;
+                };
 
-                    // Process based on message type
-                    switch (gossip_msg) {
-                        .block => |signed_block| {
-                            self.publishBlock(signed_block) catch |e| {
-                                self.logger.err("error publishing block from validator: err={any}", .{e});
-                                return e;
-                            };
-                        },
-                        .attestation => |signed_attestation| {
-                            self.publishAttestation(signed_attestation) catch |e| {
-                                self.logger.err("error publishing attestation from validator: err={any}", .{e});
-                                return e;
-                            };
-                        },
-                        .aggregation => |signed_aggregation| {
-                            self.publishAggregatedAttestation(signed_aggregation) catch |e| {
-                                self.logger.err("error publishing aggregated attestation from validator: err={any}", .{e});
-                                return e;
-                            };
-                        },
+                if (validator_output) |*output| {
+                    defer output.deinit();
+                    for (output.gossip_messages.items) |gossip_msg| {
+
+                        // Process based on message type
+                        switch (gossip_msg) {
+                            .block => |signed_block| {
+                                self.publishBlock(signed_block) catch |e| {
+                                    self.logger.err("error publishing block from validator: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                            .attestation => |signed_attestation| {
+                                self.publishAttestation(signed_attestation) catch |e| {
+                                    self.logger.err("error publishing attestation from validator: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                            .aggregation => |signed_aggregation| {
+                                self.publishAggregatedAttestation(signed_aggregation) catch |e| {
+                                    self.logger.err("error publishing aggregated attestation: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                        }
                     }
                 }
             }
-        }
 
-        if (interval_in_slot == 2 and self.chain.is_aggregator) {
-            var aggregated = self.chain.aggregateCommitteeSignatures() catch |e| {
-                self.logger.err("error aggregating committee signatures at interval={d}: {any}", .{ interval, e });
-                return e;
-            };
-            defer {
-                for (aggregated.items) |*msg| {
-                    msg.deinit();
-                }
-                aggregated.deinit();
-            }
-
-            for (aggregated.items) |signed_aggregated| {
-                self.publishAggregatedAttestation(signed_aggregated) catch |e| {
-                    self.logger.err("error publishing aggregated attestation: err={any}", .{e});
-                    return e;
-                };
-            }
         }
     }
 

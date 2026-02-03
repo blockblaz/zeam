@@ -4,6 +4,8 @@ const params = @import("@zeam/params");
 // a constant fixed only relevant to node operation and hence not in the config or preset
 pub const INTERVALS_PER_SLOT = 5;
 pub const SECONDS_PER_INTERVAL_MS: isize = @divFloor(params.SECONDS_PER_SLOT * std.time.ms_per_s, INTERVALS_PER_SLOT);
+// Number of slots to walk back from head toward safe target when selecting attestation target.
+pub const JUSTIFICATION_LOOKBACK_SLOTS: usize = 3;
 
 // Maximum number of slots in the future that an attestation is allowed to reference
 // This prevents accepting attestations that are too far ahead of the current slot

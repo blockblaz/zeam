@@ -429,6 +429,11 @@ fn mainInner() !void {
             try shared_registry.addPeerMapping("zeam_n2", "zeam_n2");
             try shared_registry.addPeerMapping("zeam_n3", "zeam_n3");
 
+            // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
+            var validator_ids_1 = [_]usize{0};
+            var validator_ids_2 = [_]usize{1};
+            var validator_ids_3 = [_]usize{2}; // Node 3 gets validator 2, starts delayed
+
             if (mock_network) {
                 var network: *networks.Mock = try allocator.create(networks.Mock);
                 network.* = try networks.Mock.init(allocator, loop, logger1_config.logger(.network), shared_registry);
@@ -437,7 +442,7 @@ fn mainInner() !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
-                const gossip_topics1 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                const gossip_topics1 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_1, true);
                 errdefer allocator.free(gossip_topics1);
 
                 network1 = try allocator.create(networks.EthLibp2p);
@@ -463,7 +468,7 @@ fn mainInner() !void {
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
-                const gossip_topics2 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                const gossip_topics2 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_2, true);
                 errdefer allocator.free(gossip_topics2);
 
                 network2 = try allocator.create(networks.EthLibp2p);
@@ -489,9 +494,9 @@ fn mainInner() !void {
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
-                // init network3 for node 3 (delayed sync node)
+                // init network3 for node 3
                 network3 = try allocator.create(networks.EthLibp2p);
-                const gossip_topics3 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, null, false);
+                const gossip_topics3 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_3, true);
                 errdefer allocator.free(gossip_topics3);
                 const key_pair3 = enr_lib.KeyPair.generate();
                 const priv_key3 = key_pair3.v4.toString();
@@ -518,11 +523,6 @@ fn mainInner() !void {
 
             var clock = try allocator.create(Clock);
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
-
-            // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
-            var validator_ids_1 = [_]usize{0};
-            var validator_ids_2 = [_]usize{1};
-            var validator_ids_3 = [_]usize{2}; // Node 3 gets validator 2, starts delayed
 
             const data_dir_1 = try std.fmt.allocPrint(allocator, "{s}/node1", .{beamcmd.data_dir});
             defer allocator.free(data_dir_1);
@@ -602,7 +602,6 @@ fn mainInner() !void {
                 reference_node: *BeamNode,
                 network: ?*networks.EthLibp2p = null,
                 started: bool = false,
-
                 pub fn onInterval(ptr: *anyopaque, interval: isize) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.started) return;

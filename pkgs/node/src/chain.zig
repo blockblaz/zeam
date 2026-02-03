@@ -80,42 +80,6 @@ pub const ProducedBlock = struct {
     }
 };
 
-fn checkpointEquals(a: types.Checkpoint, b: types.Checkpoint) bool {
-    return a.slot == b.slot and std.mem.eql(u8, &a.root, &b.root);
-}
-
-fn buildAggregatedAttestationsFromAttestations(
-    allocator: Allocator,
-    attestations: []const types.Attestation,
-) !types.AggregatedAttestations {
-    var aggregated = try types.AggregatedAttestations.init(allocator);
-    errdefer {
-        for (aggregated.slice()) |*att| {
-            att.deinit();
-        }
-        aggregated.deinit();
-    }
-
-    var root_indices = std.AutoHashMap(types.Root, usize).init(allocator);
-    defer root_indices.deinit();
-
-    for (attestations) |att| {
-        const data_root = try att.data.sszRoot(allocator);
-        if (root_indices.get(data_root)) |idx| {
-            var slice = aggregated.slice();
-            try types.aggregationBitsSet(&slice[idx].aggregation_bits, @intCast(att.validator_id), true);
-        } else {
-            var bits = try types.AggregationBits.init(allocator);
-            errdefer bits.deinit();
-            try types.aggregationBitsSet(&bits, @intCast(att.validator_id), true);
-            try aggregated.append(.{ .aggregation_bits = bits, .data = att.data });
-            try root_indices.put(data_root, aggregated.len() - 1);
-        }
-    }
-
-    return aggregated;
-}
-
 pub const BeamChain = struct {
     config: configs.ChainConfig,
     anchor_state: *types.BeamState,
@@ -187,7 +151,7 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Clean up forkchoice resources (gossip_signatures, aggregated_payloads)
+        // Clean up forkchoice resources (gossip_signatures, aggregated payloads)
         self.forkChoice.deinit();
 
         var it = self.states.iterator();
@@ -232,11 +196,18 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize) !void {
+    pub fn onInterval(self: *Self, time_intervals: usize) !?std.ArrayList(types.SignedAggregatedAttestation) {
         // see if the node has a proposal this slot to properly tick
         // forkchoice head
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
+        var aggregated_opt: ?std.ArrayList(types.SignedAggregatedAttestation) = null;
+        errdefer if (aggregated_opt) |*messages| {
+            for (messages.items) |*msg| {
+                msg.deinit();
+            }
+            messages.deinit();
+        };
 
         // Update current slot metric (wall-clock time slot)
         zeam_metrics.metrics.lean_current_slot.set(slot);
@@ -259,6 +230,10 @@ pub const BeamChain = struct {
         });
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
+
+        if (interval == 2 and self.is_aggregator) {
+            aggregated_opt = try self.aggregateCommitteeSignatures();
+        }
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
@@ -319,6 +294,7 @@ pub const BeamChain = struct {
         self.zeam_logger_config.maybeRotate() catch |err| {
             self.module_logger.err("error rotating log file: {any}", .{err});
         };
+        return aggregated_opt;
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
@@ -334,24 +310,16 @@ pub const BeamChain = struct {
         //     self.module_logger.warn("validator id={d} vote is={s}", .{ entry.key_ptr.*, latest_new });
         // }
 
-        // right now with integrated validator into node produceBlock is always gurranteed to be
+        // right now with integrated validator into node produceBlock is always guaranteed to be
         // called post ticking the chain to the correct time, but once validator is separated
         // one must make the forkchoice tick to the right time if there is a race condition
         // however in that scenario forkchoice also needs to be protected by mutex/kept thread safe
         const chainHead = try self.forkChoice.updateHead();
-        const parent_root = chainHead.blockRoot;
-        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
-
-        const available_attestations = try self.forkChoice.getLatestKnownAttestations();
+        const available_attestations = try self.forkChoice.getProposalAttestations();
         defer self.allocator.free(available_attestations);
 
-        var selected_attestations = try self.selectAttestationsForBlock(
-            opts,
-            parent_root,
-            pre_state,
-            available_attestations,
-        );
-        defer selected_attestations.deinit();
+        const parent_root = chainHead.blockRoot;
+        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
         var post_state_opt: ?*types.BeamState = try self.clonePostState(pre_state);
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
@@ -359,38 +327,30 @@ pub const BeamChain = struct {
         };
         const post_state = post_state_opt.?;
 
-        // Select aggregated proofs from stored payloads (no local aggregation fallback).
-        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
-        var aggregation = try self.selectAggregatedProofsForBlock(selected_attestations.items);
-        _ = building_timer.observe();
-        var agg_att_opt: ?*types.AggregatedAttestations = &aggregation.attestations;
-        var agg_sig_opt: ?*types.AttestationSignatures = &aggregation.attestation_signatures;
-        errdefer if (agg_att_opt) |list| {
-            for (list.slice()) |*att| {
+        var selected_attestations = try self.selectProofBackedAttestations(
+            opts,
+            pre_state,
+            parent_root,
+            available_attestations,
+        );
+        defer selected_attestations.deinit();
+
+        // Proof-only aggregation: use stored proofs learned from blocks only.
+        var aggregation = try self.buildProofAggregation(selected_attestations.items);
+        var agg_att_cleanup = true;
+        var agg_sig_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (aggregation.attestations.slice()) |*att| {
                 att.deinit();
             }
-            list.deinit();
+            aggregation.attestations.deinit();
         };
-        errdefer if (agg_sig_opt) |list| {
-            for (list.slice()) |*sig| {
+        errdefer if (agg_sig_cleanup) {
+            for (aggregation.attestation_signatures.slice()) |*sig| {
                 sig.deinit();
             }
-            list.deinit();
+            aggregation.attestation_signatures.deinit();
         };
-        // Record aggregated signature metrics
-        const num_agg_sigs = aggregation.attestation_signatures.len();
-        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(num_agg_sigs);
-
-        var total_attestations_in_agg: u64 = 0;
-        for (aggregation.attestations.constSlice()) |agg_att| {
-            const bits_len = agg_att.aggregation_bits.len();
-            for (0..bits_len) |i| {
-                if (agg_att.aggregation_bits.get(i) catch false) {
-                    total_attestations_in_agg += 1;
-                }
-            }
-        }
-        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(total_attestations_in_agg);
         // keeping for later when execution will be integrated into lean
         // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
 
@@ -404,11 +364,11 @@ pub const BeamChain = struct {
                 .attestations = aggregation.attestations,
             },
         };
-        agg_att_opt = null; // Ownership moved to block.body.attestations
+        agg_att_cleanup = false; // Ownership moved to block.body.attestations
         errdefer block.deinit();
 
         var attestation_signatures = aggregation.attestation_signatures;
-        agg_sig_opt = null; // Ownership moved to attestation_signatures
+        agg_sig_cleanup = false; // Ownership moved to attestation_signatures
         errdefer {
             for (attestation_signatures.slice()) |*sig_group| {
                 sig_group.deinit();
@@ -437,6 +397,132 @@ pub const BeamChain = struct {
             .blockRoot = block_root,
             .attestation_signatures = attestation_signatures,
         };
+    }
+
+    fn selectProofBackedAttestations(
+        self: *Self,
+        opts: BlockProductionParams,
+        pre_state: *const types.BeamState,
+        parent_root: types.Root,
+        available_attestations: []const types.Attestation,
+    ) !std.ArrayList(types.Attestation) {
+        // Proof-only block production with fixed-point attestation selection.
+        // Only include attestations that already have aggregated proofs from blocks.
+        var selected_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer selected_attestations.deinit();
+
+        var selected_keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
+        defer selected_keys.deinit();
+
+        // Fixed-point: iteratively add attestations that become valid after justification updates.
+        while (true) {
+            var candidate_aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+            defer candidate_aggregation.deinit();
+
+            self.forkChoice.signatures_mutex.lock();
+            defer self.forkChoice.signatures_mutex.unlock();
+            try candidate_aggregation.selectAggregatedProofs(
+                selected_attestations.items,
+                &self.forkChoice.aggregated_payloads,
+            );
+
+            const candidate_block = types.BeamBlock{
+                .slot = opts.slot,
+                .proposer_index = opts.proposer_index,
+                .parent_root = parent_root,
+                .state_root = types.ZERO_HASH,
+                .body = types.BeamBlockBody{ .attestations = candidate_aggregation.attestations },
+            };
+
+            var candidate_state = try self.clonePostState(pre_state);
+            defer {
+                candidate_state.deinit();
+                self.allocator.destroy(candidate_state);
+            }
+
+            try stf.apply_transition(self.allocator, candidate_state, candidate_block, .{
+                .logger = self.stf_logger,
+                .validSignatures = true,
+                .validateResult = false,
+            });
+
+            const latest_justified = candidate_state.latest_justified;
+            var newly_added: usize = 0;
+
+            for (available_attestations) |attestation| {
+                if (self.forkChoice.getBlock(attestation.data.head.root) == null) continue;
+                if (attestation.data.source.slot != latest_justified.slot) continue;
+                if (!std.mem.eql(u8, &attestation.data.source.root, &latest_justified.root)) continue;
+
+                const data_root = try attestation.data.sszRoot(self.allocator);
+                const sig_key = types.SignatureKey{
+                    .validator_id = attestation.validator_id,
+                    .data_root = data_root,
+                };
+
+                if (selected_keys.contains(sig_key)) continue;
+                try selected_attestations.append(attestation);
+                try selected_keys.put(sig_key, {});
+                newly_added += 1;
+            }
+
+            if (newly_added == 0) break;
+        }
+
+        return selected_attestations;
+    }
+
+    fn buildProofAggregation(
+        self: *Self,
+        selected_attestations: []const types.Attestation,
+    ) !types.AggregatedAttestationsResult {
+        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        errdefer aggregation.deinit();
+
+        self.forkChoice.signatures_mutex.lock();
+        defer self.forkChoice.signatures_mutex.unlock();
+
+        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
+        try aggregation.selectAggregatedProofs(selected_attestations, &self.forkChoice.aggregated_payloads);
+        _ = building_timer.observe();
+
+        var missing_target_count: usize = 0;
+        var missing_target_sample: ?types.Root = null;
+        for (aggregation.attestations.constSlice()) |agg_att| {
+            if (self.states.get(agg_att.data.target.root) == null) {
+                missing_target_count += 1;
+                if (missing_target_sample == null) {
+                    missing_target_sample = agg_att.data.target.root;
+                }
+            }
+        }
+        if (missing_target_count > 0) {
+            self.module_logger.warn(
+                "block production attestations missing target state: count={d} total={d} sample_target_root=0x{s}",
+                .{
+                    missing_target_count,
+                    aggregation.attestations.len(),
+                    std.fmt.fmtSliceHexLower(&missing_target_sample.?),
+                },
+            );
+        }
+
+        // Record aggregated signature metrics
+        const num_agg_sigs = aggregation.attestation_signatures.len();
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(num_agg_sigs);
+
+        var total_attestations_in_agg: u64 = 0;
+        for (aggregation.attestations.constSlice()) |agg_att| {
+            const bits_len = agg_att.aggregation_bits.len();
+            for (0..bits_len) |i| {
+                if (agg_att.aggregation_bits.get(i) catch false) {
+                    total_attestations_in_agg += 1;
+                }
+            }
+        }
+        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(total_attestations_in_agg);
+
+        return aggregation;
     }
 
     fn clonePostState(
@@ -492,97 +578,6 @@ pub const BeamChain = struct {
             .confirmed = false,
         });
         _ = try self.forkChoice.updateHead();
-    }
-
-    fn selectAttestationsForBlock(
-        self: *Self,
-        opts: BlockProductionParams,
-        parent_root: types.Root,
-        pre_state: *const types.BeamState,
-        available_attestations: []const types.Attestation,
-    ) !std.ArrayList(types.Attestation) {
-        var selected_attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        errdefer selected_attestations.deinit();
-
-        if (available_attestations.len == 0) {
-            return selected_attestations;
-        }
-
-        var selected_keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
-        defer selected_keys.deinit();
-
-        while (true) {
-            const candidate_attestations =
-                try buildAggregatedAttestationsFromAttestations(self.allocator, selected_attestations.items);
-            var candidate_block = types.BeamBlock{
-                .slot = opts.slot,
-                .proposer_index = opts.proposer_index,
-                .parent_root = parent_root,
-                .state_root = undefined,
-                .body = types.BeamBlockBody{
-                    .attestations = candidate_attestations,
-                },
-            };
-            defer candidate_block.deinit();
-
-            var temp_state_ptr_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
-            errdefer if (temp_state_ptr_opt) |ptr| self.allocator.destroy(ptr);
-
-            const temp_state_ptr = temp_state_ptr_opt.?;
-            try types.sszClone(self.allocator, types.BeamState, pre_state.*, temp_state_ptr);
-            temp_state_ptr_opt = null;
-            defer {
-                temp_state_ptr.deinit();
-                self.allocator.destroy(temp_state_ptr);
-            }
-            try stf.apply_raw_block(self.allocator, temp_state_ptr, &candidate_block, self.block_building_logger);
-
-            var added_any = false;
-            var no_payloads = false;
-            self.forkChoice.signatures_mutex.lock();
-            defer self.forkChoice.signatures_mutex.unlock();
-            if (self.forkChoice.aggregated_payloads.count() == 0) {
-                no_payloads = true;
-            } else {
-                for (available_attestations) |attestation| {
-                    const data = attestation.data;
-                    if (!self.forkChoice.protoArray.indices.contains(data.head.root)) continue;
-                    if (!checkpointEquals(data.source, temp_state_ptr.latest_justified)) continue;
-
-                    const data_root = try data.sszRoot(self.allocator);
-                    const sig_key = types.SignatureKey{
-                        .validator_id = attestation.validator_id,
-                        .data_root = data_root,
-                    };
-
-                    if (selected_keys.contains(sig_key)) continue;
-                    if (self.forkChoice.aggregated_payloads.get(sig_key) == null) continue;
-
-                    try selected_attestations.append(attestation);
-                    try selected_keys.put(sig_key, {});
-                    added_any = true;
-                }
-            }
-
-            if (no_payloads or !added_any) break;
-        }
-
-        return selected_attestations;
-    }
-
-    fn selectAggregatedProofsForBlock(
-        self: *Self,
-        selected_attestations: []const types.Attestation,
-    ) !types.AggregatedAttestationsResult {
-        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
-        errdefer aggregation.deinit();
-        self.forkChoice.signatures_mutex.lock();
-        defer self.forkChoice.signatures_mutex.unlock();
-        try aggregation.selectAggregatedProofs(
-            selected_attestations,
-            &self.forkChoice.aggregated_payloads,
-        );
-        return aggregation;
     }
 
     pub fn constructAttestationData(self: *Self, opts: AttestationConstructionParams) !types.AttestationData {
@@ -906,9 +901,18 @@ pub const BeamChain = struct {
                         continue;
                     };
 
-                    self.forkChoice.onAttestation(attestation, true) catch |e| {
+                    const proof_ptr = signature_proof orelse {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err("error processing block attestation={any} error={any}", .{ attestation, e });
+                        self.module_logger.err("missing signature proof for block attestation index={d}", .{index});
+                        continue;
+                    };
+
+                    var stored_proof: types.AggregatedSignatureProof = undefined;
+                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof_ptr.*, &stored_proof);
+                    self.forkChoice.storeAggregatedPayload(validator_id, block.slot, &aggregated_attestation.data, stored_proof, .known) catch |e| {
+                        stored_proof.deinit();
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        self.module_logger.err("error storing block attestation proof={any} error={any}", .{ attestation, e });
                         continue;
                     };
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
@@ -929,7 +933,7 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
-        self.forkChoice.onGossipAttestation(signed_proposer_attestation, false) catch |e| {
+        self.forkChoice.onGossipAttestation(signed_proposer_attestation) catch |e| {
             self.module_logger.err("error processing proposer attestation={any} error={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -955,6 +959,7 @@ pub const BeamChain = struct {
     }
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlockWithAttestation) void {
+        _ = signedBlock;
         // 8. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
         const new_head = self.forkChoice.head;
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
@@ -1020,13 +1025,6 @@ pub const BeamChain = struct {
             };
         }
 
-        // Store aggregated payloads from the block for future block building
-        if (signedBlock) |block| {
-            self.storeAggregatedPayloads(block) catch |err| {
-                self.module_logger.warn("failed to store aggregated payloads: {any}", .{err});
-            };
-        }
-
         const states_count_after_block = self.states.count();
         const fc_nodes_count_after_block = self.forkChoice.protoArray.nodes.items.len;
         self.module_logger.info("completed on block followup with states_count={d} fc_nodes_count={d}", .{
@@ -1036,39 +1034,6 @@ pub const BeamChain = struct {
 
         zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
-    }
-
-    /// Store aggregated signature payloads from a block for future block building
-    fn storeAggregatedPayloads(self: *Self, signedBlock: *const types.SignedBlockWithAttestation) !void {
-        const block = signedBlock.message.block;
-        const aggregated_attestations = block.body.attestations.constSlice();
-        const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
-
-        for (aggregated_attestations, 0..) |aggregated_attestation, index| {
-            const signature_proof = if (index < signature_groups.len)
-                &signature_groups[index]
-            else
-                continue;
-
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
-            defer validator_indices.deinit();
-
-            for (validator_indices.items) |validator_index| {
-                const validator_id: types.ValidatorIndex = @intCast(validator_index);
-
-                // Clone the proof since we need to store it and the block data may be freed
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                types.sszClone(self.allocator, types.AggregatedSignatureProof, signature_proof.*, &cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to clone aggregated proof for validator={d}: {any}", .{ validator_index, e });
-                    continue;
-                };
-
-                self.forkChoice.storeAggregatedPayload(validator_id, block.slot, &aggregated_attestation.data, cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to store aggregated payload for validator={d}: {any}", .{ validator_index, e });
-                    cloned_proof.deinit();
-                };
-            }
-        }
     }
 
     /// Update block database with block, state, and slot indices
@@ -1252,8 +1217,7 @@ pub const BeamChain = struct {
     /// is_from_block: true if attestation came from a block, false if from network gossip
     ///
     /// Per leanSpec:
-    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
-    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
+    /// - Attestation slots are allowed up to current_slot + 1 (small clock skew tolerance)
     pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
@@ -1326,14 +1290,8 @@ pub const BeamChain = struct {
 
         // 4. Validate attestation is not too far in the future
         //
-        //    Gossip attestations must be for current or past slots only. Validators attest
-        //    in interval 1 of the current slot, so they cannot attest for future slots.
-        //    Block attestations can be more lenient since the block itself was validated.
         const current_slot = self.forkChoice.fcStore.timeSlots;
-        const max_allowed_slot = if (is_from_block)
-            current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
-        else
-            current_slot; // Gossip attestations: no future slots allowed
+        const max_allowed_slot = current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE;
 
         if (data.slot > max_allowed_slot) {
             self.module_logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
@@ -1357,7 +1315,19 @@ pub const BeamChain = struct {
         const attestation = signedAttestation.toAttestation();
         try self.validateAttestation(attestation, false);
 
-        const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        const state = self.states.get(attestation.data.target.root) orelse {
+            self.module_logger.warn(
+                "attestation missing target state: validator={d} slot={d} source={d} target={d} target_root=0x{s}",
+                .{
+                    attestation.validator_id,
+                    attestation.data.slot,
+                    attestation.data.source.slot,
+                    attestation.data.target.slot,
+                    std.fmt.fmtSliceHexLower(&attestation.data.target.root),
+                },
+            );
+            return AttestationValidationError.MissingState;
+        };
 
         try stf.verifySingleAttestation(
             self.allocator,
@@ -1367,7 +1337,7 @@ pub const BeamChain = struct {
             &signedAttestation.signature,
         );
 
-        return self.forkChoice.onGossipAttestation(signedAttestation, false);
+        return self.forkChoice.onGossipAttestation(signedAttestation);
     }
 
     pub fn aggregateCommitteeSignatures(self: *Self) !std.ArrayList(types.SignedAggregatedAttestation) {
@@ -1379,7 +1349,7 @@ pub const BeamChain = struct {
             gossip_messages.deinit();
         }
 
-        const attestations = try self.forkChoice.getLatestNewAttestations();
+        const attestations = try self.forkChoice.getAttestationsFromGossipSignatures();
         defer self.allocator.free(attestations);
 
         if (attestations.len == 0) return gossip_messages;
@@ -1420,23 +1390,6 @@ pub const BeamChain = struct {
         return gossip_messages;
     }
 
-    fn filterCommitteeAttestations(
-        self: *Self,
-        attestations: []const types.Attestation,
-    ) !std.ArrayList(types.Attestation) {
-        var filtered_attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        errdefer filtered_attestations.deinit();
-        try filtered_attestations.ensureTotalCapacity(attestations.len);
-
-        for (attestations) |attestation| {
-            if (self.forkChoice.shouldStoreCommitteeSignature(attestation.validator_id)) {
-                try filtered_attestations.append(attestation);
-            }
-        }
-
-        return filtered_attestations;
-    }
-
     fn filterAlreadyProvenAttestations(
         self: *Self,
         attestations: *std.ArrayList(types.Attestation),
@@ -1470,6 +1423,23 @@ pub const BeamChain = struct {
         }
 
         attestations.items = attestations.items[0..write_index];
+    }
+
+    fn filterCommitteeAttestations(
+        self: *Self,
+        attestations: []const types.Attestation,
+    ) !std.ArrayList(types.Attestation) {
+        var filtered_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        errdefer filtered_attestations.deinit();
+        try filtered_attestations.ensureTotalCapacity(attestations.len);
+
+        for (attestations) |attestation| {
+            if (self.forkChoice.shouldStoreCommitteeSignature(attestation.validator_id)) {
+                try filtered_attestations.append(attestation);
+            }
+        }
+
+        return filtered_attestations;
     }
 
     fn snapshotGossipSignatures(
@@ -1542,7 +1512,7 @@ pub const BeamChain = struct {
             for (validator_indices.items) |validator_index| {
                 var stored_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &stored_proof);
-                self.forkChoice.storeAggregatedPayload(@intCast(validator_index), current_slot, &aggregated_attestation.data, stored_proof) catch |e| {
+                self.forkChoice.storeAggregatedPayload(@intCast(validator_index), current_slot, &aggregated_attestation.data, stored_proof, .new) catch |e| {
                     stored_proof.deinit();
                     self.module_logger.warn("failed to store aggregated payload from committee aggregation: {any}", .{e});
                 };
@@ -1561,26 +1531,6 @@ pub const BeamChain = struct {
         if (validator_indices.items.len == 0) {
             return error.EmptyAggregation;
         }
-
-        const representative_attestation = types.Attestation{
-            .validator_id = @intCast(validator_indices.items[0]),
-            .data = data,
-        };
-        self.validateAttestation(representative_attestation, false) catch |err| {
-            self.module_logger.warn(
-                "aggregated attestation validation failed: slot={d} source={d} target={d} head_root=0x{s} target_root=0x{s} source_root=0x{s} err={any}",
-                .{
-                    data.slot,
-                    data.source.slot,
-                    data.target.slot,
-                    std.fmt.fmtSliceHexLower(&data.head.root),
-                    std.fmt.fmtSliceHexLower(&data.target.root),
-                    std.fmt.fmtSliceHexLower(&data.source.root),
-                    err,
-                },
-            );
-            return err;
-        };
 
         const key_state = self.states.get(data.target.root) orelse {
             self.module_logger.warn(
@@ -1614,17 +1564,9 @@ pub const BeamChain = struct {
         for (validator_indices.items) |validator_id| {
             var stored_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof.*, &stored_proof);
-            self.forkChoice.storeAggregatedPayload(@intCast(validator_id), current_slot, &data, stored_proof) catch |e| {
+            self.forkChoice.storeAggregatedPayload(@intCast(validator_id), current_slot, &data, stored_proof, .new) catch |e| {
                 stored_proof.deinit();
                 self.module_logger.warn("failed to store aggregated payload from aggregation gossip: {any}", .{e});
-            };
-
-            const attestation = types.Attestation{
-                .validator_id = @intCast(validator_id),
-                .data = data,
-            };
-            self.forkChoice.onAttestation(attestation, false) catch |e| {
-                self.module_logger.err("error processing aggregated gossip attestation={any} e={any}", .{ attestation, e });
             };
         }
     }
@@ -2153,12 +2095,12 @@ test "attestation validation - comprehensive" {
         try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
     }
 
-    // Test 9: Attestation too far in future (for gossip)
+    // Test 9: Attestation too far in future (beyond current + 1 tolerance)
     {
         const future_attestation: types.SignedAttestation = .{
             .validator_id = 0,
             .message = .{
-                .slot = 3, // Future slot (current is 2)
+                .slot = 4, // Future slot (current is 2, max allowed is 3)
                 .head = types.Checkpoint{
                     .root = mock_chain.blockRoots[2],
                     .slot = 2,
@@ -2180,10 +2122,8 @@ test "attestation validation - comprehensive" {
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
-test "attestation validation - gossip vs block future slot handling" {
-    // Test that gossip and block attestations have different future slot tolerances
-    // Gossip: must be <= current_slot
-    // Block: can be <= current_slot + 1
+test "attestation validation - future slot tolerance" {
+    // Test that attestations allow a +1 slot tolerance (for clock skew), regardless of source.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -2248,12 +2188,8 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
 
-    // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false));
-
-    // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    // Attestations should PASS for next slot (current + 1), regardless of source.
+    try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false);
     try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), true);
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
@@ -2361,7 +2297,16 @@ test "attestation processing - valid block attestation" {
     // Process attestation through chain (this validates and then processes)
     try beam_chain.onGossipAttestation(valid_attestation);
 
-    // Verify the attestation was recorded in attestations
+    // Gossip attestations are stored for later aggregation (not immediately counted).
+    const data_root = try message.data.sszRoot(allocator);
+    try std.testing.expect(beam_chain.forkChoice.attestation_data_by_root.contains(data_root));
+
+    // Store an aggregated proof to mark the attestation as "new".
+    var proof = try types.AggregatedSignatureProof.init(allocator);
+    errdefer proof.deinit();
+    try types.aggregationBitsSet(&proof.participants, @intCast(message.validator_id), true);
+    try beam_chain.forkChoice.storeAggregatedPayload(message.validator_id, message.data.slot, &message.data, proof, .new);
+
     const attestations_tracker = beam_chain.forkChoice.attestations.get(1);
     try std.testing.expect(attestations_tracker != null);
     try std.testing.expect(attestations_tracker.?.latestNew != null);
