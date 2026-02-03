@@ -384,11 +384,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        const old_finalized_slot = post_state.latest_finalized.slot;
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
-        if (post_state.latest_finalized.slot > old_finalized_slot) {
-            try self.root_to_slot_cache.prune(post_state.latest_finalized.slot);
-        }
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -660,8 +656,6 @@ pub const BeamChain = struct {
             });
             break :computedstate cpost_state;
         };
-
-        try self.root_to_slot_cache.prune(post_state.latest_finalized.slot);
 
         var missing_roots = std.ArrayList(types.Root).init(self.allocator);
         errdefer missing_roots.deinit();
@@ -1061,6 +1055,9 @@ pub const BeamChain = struct {
         //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
         //     }
         // }
+
+        // Prune root-to-slot cache up to finalized slot
+        try self.root_to_slot_cache.prune(latestFinalized.slot);
 
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
