@@ -1004,8 +1004,37 @@ pub const ForkChoice = struct {
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.validator_count, 3);
+        var latest_new_votes: u64 = 0;
+        for (0..self.validator_count) |validator_id| {
+            const attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
+            if (attestation_tracker.latestNew) |latest_new| {
+                latest_new_votes += 1;
+                self.logger.info(
+                    "safe target latestNew: validator={d} slot={d}",
+                    .{ validator_id, latest_new.slot },
+                );
+            } else {
+                self.logger.info(
+                    "safe target latestNew: validator={d} slot=null",
+                    .{validator_id},
+                );
+            }
+        }
         const prev_safe = self.safeTarget;
         self.safeTarget = try self.computeFCHead(false, cutoff_weight);
+        self.logger.info(
+            "safe target update: cutoff_weight={d} latest_new_votes={d} prev={d} new={d} head={d} latest_justified={d} latest_finalized={d} new_root=0x{s}",
+            .{
+                cutoff_weight,
+                latest_new_votes,
+                prev_safe.slot,
+                self.safeTarget.slot,
+                self.head.slot,
+                self.fcStore.latest_justified.slot,
+                self.fcStore.latest_finalized.slot,
+                std.fmt.fmtSliceHexLower(self.safeTarget.blockRoot[0..]),
+            },
+        );
         if (!std.mem.eql(u8, &prev_safe.blockRoot, &self.safeTarget.blockRoot)) {
             self.logger.debug(
                 "safe target updated: prev={d} new={d} head={d} latest_justified={d} latest_finalized={d}",
