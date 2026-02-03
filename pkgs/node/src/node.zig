@@ -933,7 +933,6 @@ pub const BeamNode = struct {
                     }
                 }
             }
-
         }
     }
 
