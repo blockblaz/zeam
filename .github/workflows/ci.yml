@@ -213,7 +213,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: cargo-test
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -286,7 +286,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: cargo-test
 
     - name: Fetch Zig dependencies with retry
       run: |
