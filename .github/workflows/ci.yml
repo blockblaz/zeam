@@ -202,12 +202,23 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
+      id: cache-zig-packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
+
+    - name: Cache Zig build artifacts
+      uses: actions/cache@v3
+      with:
+        path: |
+          .zig-cache
+          zig-out
+        key: ${{ runner.os }}-zig-build-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-build-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -216,6 +227,7 @@ jobs:
         shared-key: cargo-test
 
     - name: Fetch Zig dependencies with retry
+      if: steps.cache-zig-packages.outputs.cache-hit != 'true'
       run: |
         max_attempts=5
         attempt=1
@@ -274,12 +286,23 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
+      id: cache-zig-packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
+
+    - name: Cache Zig build artifacts
+      uses: actions/cache@v3
+      with:
+        path: |
+          .zig-cache
+          zig-out
+        key: ${{ runner.os }}-zig-build-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-build-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -288,6 +311,7 @@ jobs:
         shared-key: cargo-test
 
     - name: Fetch Zig dependencies with retry
+      if: steps.cache-zig-packages.outputs.cache-hit != 'true'
       run: |
         max_attempts=5
         attempt=1
