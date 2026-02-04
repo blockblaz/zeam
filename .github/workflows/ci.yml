@@ -256,7 +256,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     needs: test
     strategy:
-      max-parallel: 1
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
