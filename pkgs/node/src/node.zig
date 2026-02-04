@@ -1027,7 +1027,7 @@ pub const BeamNode = struct {
 
         const handler = try self.getOnGossipCbHandler();
         const validator_ids = if (self.validator) |*validator| validator.ids else null;
-        const topic_specs = try buildGossipTopicSpecs(self.allocator, self.chain.config, validator_ids, self.chain.is_aggregator);
+        const topic_specs = try buildGossipTopicSpecs(self.allocator, validator_ids, self.chain.is_aggregator);
         defer self.allocator.free(topic_specs);
         try self.network.backend.gossip.subscribe(topic_specs, handler);
 
@@ -1044,11 +1044,9 @@ pub const BeamNode = struct {
 
 pub fn buildGossipTopicSpecs(
     allocator: Allocator,
-    config: configs.ChainConfig,
     validator_ids: ?[]const usize,
     is_aggregator: bool,
 ) ![]networks.GossipTopicSpec {
-    _ = config;
     var topics = std.ArrayList(networks.GossipTopicSpec).init(allocator);
     errdefer topics.deinit();
 

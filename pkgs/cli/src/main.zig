@@ -442,7 +442,7 @@ fn mainInner() !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
             } else {
-                const gossip_topics1 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_1, true);
+                const gossip_topics1 = try node_lib.buildGossipTopicSpecs(allocator, &validator_ids_1, true);
                 errdefer allocator.free(gossip_topics1);
 
                 network1 = try allocator.create(networks.EthLibp2p);
@@ -468,7 +468,7 @@ fn mainInner() !void {
                 backend1 = network1.getNetworkInterface();
 
                 // init a new lib2p network here to connect with network1
-                const gossip_topics2 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_2, true);
+                const gossip_topics2 = try node_lib.buildGossipTopicSpecs(allocator, &validator_ids_2, true);
                 errdefer allocator.free(gossip_topics2);
 
                 network2 = try allocator.create(networks.EthLibp2p);
@@ -496,7 +496,7 @@ fn mainInner() !void {
 
                 // init network3 for node 3
                 network3 = try allocator.create(networks.EthLibp2p);
-                const gossip_topics3 = try node_lib.buildGossipTopicSpecs(allocator, chain_config, &validator_ids_3, true);
+                const gossip_topics3 = try node_lib.buildGossipTopicSpecs(allocator, &validator_ids_3, true);
                 errdefer allocator.free(gossip_topics3);
                 const key_pair3 = enr_lib.KeyPair.generate();
                 const priv_key3 = key_pair3.v4.toString();

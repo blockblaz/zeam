@@ -186,7 +186,7 @@ pub const BeamChain = struct {
     }
 
     fn updateAggregatorInfo(self: *Self) !void {
-        try self.forkChoice.setAggregatorInfo(self.is_aggregator, self.registered_validator_ids);
+        try self.forkChoice.setAggregatorInfo(self.is_aggregator);
     }
 
     pub fn setAggregator(self: *Self, is_aggregator: bool) void {
@@ -216,8 +216,7 @@ pub const BeamChain = struct {
         if (interval == 0) {
             const num_validators: usize = @intCast(self.config.genesis.numValidators());
             const slot_proposer_id = slot % num_validators;
-            if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id)) |index| {
-                _ = index;
+            if (std.mem.indexOfScalar(usize, self.registered_validator_ids, slot_proposer_id) != null) {
                 has_proposal = true;
             }
         }
@@ -419,12 +418,14 @@ pub const BeamChain = struct {
             var candidate_aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
             defer candidate_aggregation.deinit();
 
-            self.forkChoice.signatures_mutex.lock();
-            defer self.forkChoice.signatures_mutex.unlock();
-            try candidate_aggregation.selectAggregatedProofs(
-                selected_attestations.items,
-                &self.forkChoice.aggregated_payloads,
-            );
+            {
+                self.forkChoice.signatures_mutex.lock();
+                defer self.forkChoice.signatures_mutex.unlock();
+                try candidate_aggregation.selectAggregatedProofs(
+                    selected_attestations.items,
+                    &self.forkChoice.aggregated_payloads,
+                );
+            }
 
             const candidate_block = types.BeamBlock{
                 .slot = opts.slot,
@@ -448,6 +449,8 @@ pub const BeamChain = struct {
 
             const latest_justified = candidate_state.latest_justified;
             var newly_added: usize = 0;
+            var payload_keys = try self.snapshotAggregatedPayloadKeys();
+            defer payload_keys.deinit();
 
             for (available_attestations) |attestation| {
                 if (self.forkChoice.getBlock(attestation.data.head.root) == null) continue;
@@ -459,6 +462,7 @@ pub const BeamChain = struct {
                     .validator_id = attestation.validator_id,
                     .data_root = data_root,
                 };
+                if (!payload_keys.contains(sig_key)) continue;
 
                 if (selected_keys.contains(sig_key)) continue;
                 try selected_attestations.append(attestation);
@@ -701,7 +705,7 @@ pub const BeamChain = struct {
 
                 if (!hasBlock) {
                     // Validation errors propagate to node.zig for context-aware logging
-                    try self.validateBlock(block, true);
+                    try self.validateBlock(block);
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
@@ -940,7 +944,7 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 7. Save block and state to database and confirm the block in forkchoice
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
+        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*) catch |err| {
             self.module_logger.err("failed to update block database for block root=0x{s}: {any}", .{
                 std.fmt.fmtSliceHexLower(&fcBlock.blockRoot),
                 err,
@@ -1037,7 +1041,7 @@ pub const BeamChain = struct {
     }
 
     /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
+    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlockWithAttestation, blockRoot: types.Root, postState: types.BeamState) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
@@ -1046,7 +1050,6 @@ pub const BeamChain = struct {
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
-        _ = slot;
         // primarily this is served by the forkchoice
         // update unfinalized slot index
         // if (slot > finalizedSlot) {
@@ -1202,8 +1205,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
-    pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
-        _ = is_from_gossip;
+    pub fn validateBlock(self: *Self, block: types.BeamBlock) !void {
         const hasParentBlock = self.forkChoice.hasBlock(block.parent_root);
 
         if (!hasParentBlock) {
@@ -1350,11 +1352,12 @@ pub const BeamChain = struct {
         }
 
         const attestations = try self.forkChoice.getAttestationsFromGossipSignatures();
-        defer self.allocator.free(attestations);
+        if (attestations.len == 0) {
+            self.allocator.free(attestations);
+            return gossip_messages;
+        }
 
-        if (attestations.len == 0) return gossip_messages;
-
-        var filtered_attestations = try self.filterCommitteeAttestations(attestations);
+        var filtered_attestations = std.ArrayList(types.Attestation).fromOwnedSlice(self.allocator, attestations);
         defer filtered_attestations.deinit();
 
         if (filtered_attestations.items.len == 0) return gossip_messages;
@@ -1395,6 +1398,8 @@ pub const BeamChain = struct {
         attestations: *std.ArrayList(types.Attestation),
     ) !void {
         const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        var payload_keys = try self.snapshotAggregatedPayloadKeys();
+        defer payload_keys.deinit();
 
         var write_index: usize = 0;
         for (attestations.items) |attestation| {
@@ -1408,15 +1413,7 @@ pub const BeamChain = struct {
                 .data_root = data_root,
             };
 
-            self.forkChoice.signatures_mutex.lock();
-            const payloads = self.forkChoice.aggregated_payloads.get(sig_key);
-            self.forkChoice.signatures_mutex.unlock();
-
-            if (payloads) |list| {
-                if (list.items.len > 0) {
-                    continue;
-                }
-            }
+            if (payload_keys.contains(sig_key)) continue;
 
             attestations.items[write_index] = attestation;
             write_index += 1;
@@ -1425,21 +1422,21 @@ pub const BeamChain = struct {
         attestations.items = attestations.items[0..write_index];
     }
 
-    fn filterCommitteeAttestations(
-        self: *Self,
-        attestations: []const types.Attestation,
-    ) !std.ArrayList(types.Attestation) {
-        var filtered_attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        errdefer filtered_attestations.deinit();
-        try filtered_attestations.ensureTotalCapacity(attestations.len);
+    fn snapshotAggregatedPayloadKeys(self: *Self) !std.AutoHashMap(types.SignatureKey, void) {
+        var keys = std.AutoHashMap(types.SignatureKey, void).init(self.allocator);
+        errdefer keys.deinit();
 
-        for (attestations) |attestation| {
-            if (self.forkChoice.shouldStoreCommitteeSignature(attestation.validator_id)) {
-                try filtered_attestations.append(attestation);
-            }
+        self.forkChoice.signatures_mutex.lock();
+        defer self.forkChoice.signatures_mutex.unlock();
+        try keys.ensureTotalCapacity(self.forkChoice.aggregated_payloads.count());
+
+        var it = self.forkChoice.aggregated_payloads.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.items.len == 0) continue;
+            try keys.put(entry.key_ptr.*, {});
         }
 
-        return filtered_attestations;
+        return keys;
     }
 
     fn snapshotGossipSignatures(

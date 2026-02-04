@@ -158,7 +158,7 @@ pub const Node = struct {
         const validator_ids = try options.getValidatorIndices(allocator);
         errdefer allocator.free(validator_ids);
 
-        const gossip_topics = try node_lib.buildGossipTopicSpecs(allocator, chain_config, validator_ids, options.is_aggregator);
+        const gossip_topics = try node_lib.buildGossipTopicSpecs(allocator, validator_ids, options.is_aggregator);
         errdefer allocator.free(gossip_topics);
 
         // TODO we seem to be needing one loop because then the events added to loop are not being fired

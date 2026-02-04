@@ -940,8 +940,8 @@ pub const AggregatedAttestationsResult = struct {
         //    b) Fetch candidate proofs indexed by (validator_id, data_root).
         //    c) Choose the proof that covers the most remaining validators.
         //       If coverage ties, keep the first proof in the list.
-        //       The list is pre-ordered by source_slot (most recent first),
-        //       so this tie-break is deterministic and prefers newer proofs.
+        //       The list is in insertion order (older first, newer last),
+        //       so this tie-break is deterministic and preserves that order.
         //    d) If the best proof has zero overlap, stop to avoid inconsistent results.
         //    e) Add the proof and remove its participants from remaining.
         // Note: We do not aggregate fresh gossip signatures here. Only stored proofs are used.

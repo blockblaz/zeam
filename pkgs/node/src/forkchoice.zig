@@ -13,7 +13,6 @@ const params = @import("@zeam/params");
 const constants = @import("./constants.zig");
 
 const ATTESTATION_COMMITTEE_COUNT: usize = @intCast(params.ATTESTATION_COMMITTEE_COUNT);
-const LocalSubnetSet = std.StaticBitSet(ATTESTATION_COMMITTEE_COUNT);
 
 const AggregatedSignatureProof = types.AggregatedSignatureProof;
 const Root = types.Root;
@@ -70,8 +69,7 @@ pub const ProtoArray = struct {
         // currentSlot might be needed in future for finding the viable head
         _ = currentSlot;
         const node_or_null = self.indices.get(block.blockRoot);
-        if (node_or_null) |node| {
-            _ = node;
+        if (node_or_null != null) {
             return;
         }
 
@@ -266,9 +264,10 @@ pub const ForkChoice = struct {
     // Mutex to protect concurrent access to gossip_signatures, attestation_data_by_root,
     // and aggregated payload maps.
     signatures_mutex: std.Thread.Mutex,
-    // Aggregator role and subnet tracking
+    // Aggregator role (subnet filtering is handled by gossip topic selection)
     is_aggregator: bool,
-    local_subnets: LocalSubnetSet,
+    // Missing attestation heads awaiting block import (used to trigger tracker rebuilds).
+    missing_head_roots: std.AutoHashMap(types.Root, void),
 
     const Self = @This();
     pub fn init(allocator: Allocator, opts: ForkChoiceParams) !Self {
@@ -303,7 +302,7 @@ pub const ForkChoice = struct {
         const attestation_data_by_root = std.AutoHashMap(types.Root, types.AttestationData).init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
         const new_aggregated_payloads = AggregatedPayloadsMap.init(allocator);
-        const local_subnets = LocalSubnetSet.initEmpty();
+        const missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator);
 
         var fc = Self{
             .allocator = allocator,
@@ -323,7 +322,7 @@ pub const ForkChoice = struct {
             .new_aggregated_payloads = new_aggregated_payloads,
             .signatures_mutex = .{},
             .is_aggregator = false,
-            .local_subnets = local_subnets,
+            .missing_head_roots = missing_head_roots,
         };
         _ = try fc.updateHead();
         return fc;
@@ -339,6 +338,7 @@ pub const ForkChoice = struct {
         defer self.signatures_mutex.unlock();
         self.gossip_signatures.deinit();
         self.attestation_data_by_root.deinit();
+        self.missing_head_roots.deinit();
 
         // Deinit each list in the aggregated payload maps
         var it = self.aggregated_payloads.iterator();
@@ -360,31 +360,8 @@ pub const ForkChoice = struct {
         self.new_aggregated_payloads.deinit();
     }
 
-    fn computeSubnetId(validator_id: usize) usize {
-        if (ATTESTATION_COMMITTEE_COUNT == 0) return 0;
-        return validator_id % ATTESTATION_COMMITTEE_COUNT;
-    }
-
-    pub fn setAggregatorInfo(self: *Self, is_aggregator: bool, validator_ids: []usize) !void {
+    pub fn setAggregatorInfo(self: *Self, is_aggregator: bool) !void {
         self.is_aggregator = is_aggregator;
-
-        // Clear existing subnet assignments
-        self.local_subnets.setRangeValue(.{ .start = 0, .end = ATTESTATION_COMMITTEE_COUNT }, false);
-
-        if (!is_aggregator) return;
-        if (ATTESTATION_COMMITTEE_COUNT == 0) return;
-
-        for (validator_ids) |validator_id| {
-            const subnet_id = computeSubnetId(validator_id);
-            self.local_subnets.set(subnet_id);
-        }
-    }
-
-    pub fn shouldStoreCommitteeSignature(self: *Self, validator_id: types.ValidatorIndex) bool {
-        if (!self.is_aggregator) return false;
-        if (ATTESTATION_COMMITTEE_COUNT == 0) return false;
-        const subnet_id = computeSubnetId(@intCast(validator_id));
-        return self.local_subnets.isSet(subnet_id);
     }
 
     pub fn getLatestNewAttestations(self: *Self) ![]types.Attestation {
@@ -472,9 +449,7 @@ pub const ForkChoice = struct {
         return included_attestations.toOwnedSlice();
     }
 
-    fn isBlockTimely(self: *Self, blockDelayMs: usize) bool {
-        _ = self;
-        _ = blockDelayMs;
+    fn isBlockTimely() bool {
         return true;
     }
 
@@ -1059,17 +1034,15 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        // Store the gossip signature for committee aggregation if applicable
-        if (self.shouldStoreCommitteeSignature(validator_id)) {
-            const sig_key = SignatureKey{
-                .validator_id = validator_id,
-                .data_root = data_root,
-            };
-            try self.gossip_signatures.put(sig_key, .{
-                .slot = attestation_slot,
-                .signature = signed_attestation.signature,
-            });
-        }
+        // Store the gossip signature for committee aggregation.
+        const sig_key = SignatureKey{
+            .validator_id = validator_id,
+            .data_root = data_root,
+        };
+        try self.gossip_signatures.put(sig_key, .{
+            .slot = attestation_slot,
+            .signature = signed_attestation.signature,
+        });
 
         // Store attestation data by root for later reconstruction from proofs.
         try self.attestation_data_by_root.put(data_root, attestation_data);
@@ -1122,6 +1095,7 @@ pub const ForkChoice = struct {
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
+    // Caller must hold signatures_mutex.
     fn updateTrackerFromAttestationData(
         self: *Self,
         validator_id: types.ValidatorIndex,
@@ -1129,6 +1103,7 @@ pub const ForkChoice = struct {
         payload_kind: AggregatedPayloadKind,
     ) !void {
         const new_head_index = self.protoArray.indices.get(attestation_data.head.root) orelse {
+            try self.missing_head_roots.put(attestation_data.head.root, {});
             self.logger.debug(
                 "updateTracker skipped: head not in protoarray validator={d} slot={d} head_root=0x{s} source={d} target={d} kind={any}",
                 .{
@@ -1142,6 +1117,7 @@ pub const ForkChoice = struct {
             );
             return;
         };
+        _ = self.missing_head_roots.remove(attestation_data.head.root);
         var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
 
         switch (payload_kind) {
@@ -1185,20 +1161,8 @@ pub const ForkChoice = struct {
             gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
         }
 
-        // Keep proofs ordered by source slot (most recent first) for deterministic tie-breaking.
-        var insert_idx: usize = gop.value_ptr.items.len;
-        for (gop.value_ptr.items, 0..) |item, idx| {
-            if (item.source_slot <= payload.source_slot) {
-                insert_idx = idx;
-                break;
-            }
-        }
-
-        if (insert_idx == gop.value_ptr.items.len) {
-            try gop.value_ptr.append(payload);
-        } else {
-            try gop.value_ptr.insert(insert_idx, payload);
-        }
+        // Preserve insertion order (older first, newer last) to match spec behavior.
+        try gop.value_ptr.append(payload);
     }
 
     fn rebuildAttestationTrackersFromPayloadsLocked(self: *Self) !void {
@@ -1210,6 +1174,7 @@ pub const ForkChoice = struct {
 
         @memset(latest_known, null);
         @memset(latest_new, null);
+        self.missing_head_roots.clearRetainingCapacity();
 
         var known_it = self.aggregated_payloads.iterator();
         while (known_it.next()) |entry| {
@@ -1217,7 +1182,10 @@ pub const ForkChoice = struct {
             const validator_index: usize = @intCast(sig_key.validator_id);
             if (validator_index >= num_validators) continue;
             if (self.attestation_data_by_root.get(sig_key.data_root)) |data| {
-                const new_head_index = self.protoArray.indices.get(data.head.root) orelse continue;
+                const new_head_index = self.protoArray.indices.get(data.head.root) orelse {
+                    try self.missing_head_roots.put(data.head.root, {});
+                    continue;
+                };
                 const candidate = ProtoAttestation{
                     .index = new_head_index,
                     .slot = data.slot,
@@ -1235,7 +1203,10 @@ pub const ForkChoice = struct {
             const validator_index: usize = @intCast(sig_key.validator_id);
             if (validator_index >= num_validators) continue;
             if (self.attestation_data_by_root.get(sig_key.data_root)) |data| {
-                const new_head_index = self.protoArray.indices.get(data.head.root) orelse continue;
+                const new_head_index = self.protoArray.indices.get(data.head.root) orelse {
+                    try self.missing_head_roots.put(data.head.root, {});
+                    continue;
+                };
                 const candidate = ProtoAttestation{
                     .index = new_head_index,
                     .slot = data.slot,
@@ -1262,8 +1233,8 @@ pub const ForkChoice = struct {
     /// - Index by (validator_id, data_root) so any participant can retrieve proofs.
     /// - Keep both attestation_slot and source_slot:
     ///   * attestation_slot is the slot of the attested data (used for pruning).
-    ///   * source_slot is when the proof was learned (block slot or local time), used for tie-breaks.
-    /// - Maintain each list ordered by source_slot (most recent first) for deterministic selection.
+    ///   * source_slot is when the proof was learned (block slot or local time).
+    /// - Preserve insertion order (older proofs first, newer proofs last) to match spec behavior.
     pub fn storeAggregatedPayload(
         self: *Self,
         validator_id: types.ValidatorIndex,
@@ -1429,10 +1400,8 @@ pub const ForkChoice = struct {
         const parent_root = block.parent_root;
         const slot = block.slot;
 
-        const parent_block_or_null = self.getBlock(parent_root);
-        if (parent_block_or_null) |parent_block| {
+        if (self.getBlock(parent_root) != null) {
             // we will use parent block later as per the finalization gadget
-            _ = parent_block;
 
             // Keep validator count in sync with latest known state (spec uses head state validators length).
             self.validator_count = state.validatorCount();
@@ -1457,7 +1426,7 @@ pub const ForkChoice = struct {
                 try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
                 break :computedroot cblock_root;
             };
-            const is_timely = self.isBlockTimely(opts.blockDelayMs);
+            const is_timely = isBlockTimely();
 
             const proto_block = ProtoBlock{
                 .slot = slot,
@@ -1469,6 +1438,12 @@ pub const ForkChoice = struct {
             };
 
             try self.protoArray.onBlock(proto_block, opts.currentSlot);
+
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+            if (self.missing_head_roots.contains(block_root)) {
+                try self.rebuildAttestationTrackersFromPayloadsLocked();
+            }
             return proto_block;
         } else {
             return ForkChoiceError.UnknownParent;
@@ -1607,7 +1582,7 @@ fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte:
     };
 }
 
-test "storeAggregatedPayload orders proofs by most recent" {
+test "storeAggregatedPayload preserves insertion order" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -1663,8 +1638,8 @@ test "storeAggregatedPayload orders proofs by most recent" {
     const list = list_opt.?;
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
 
-    try std.testing.expect(try list.items[0].proof.participants.get(1));
-    try std.testing.expect(!(try list.items[1].proof.participants.get(1)));
+    try std.testing.expect(!(try list.items[0].proof.participants.get(1)));
+    try std.testing.expect(try list.items[1].proof.participants.get(1));
 }
 
 test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
@@ -1780,7 +1755,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
-        .local_subnets = LocalSubnetSet.initEmpty(),
+        .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
     };
     defer fork_choice.deinit();
 
@@ -2117,7 +2092,7 @@ fn buildTestTreeWithMockChain(
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
-        .local_subnets = LocalSubnetSet.initEmpty(),
+        .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
     };
 
     return .{
@@ -3090,7 +3065,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
-        .local_subnets = LocalSubnetSet.initEmpty(),
+        .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
     };
     // proto_array ownership moves into fork_choice, so use fork_choice.deinit().
     defer fork_choice.deinit();
