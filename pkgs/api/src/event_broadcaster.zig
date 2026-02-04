@@ -26,7 +26,10 @@ pub const SSEConnection = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.stream.writeAll(event_json);
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.stream.writer(&write_buf);
+        try writer.interface.writeAll(event_json);
+        try writer.interface.flush();
     }
 
     pub fn deinit(self: *SSEConnection) void {
@@ -36,7 +39,7 @@ pub const SSEConnection = struct {
 
 /// Thread-safe event broadcaster for SSE connections
 pub const EventBroadcaster = struct {
-    connections: std.ArrayListUnmanaged(*SSEConnection),
+    connections: std.ArrayList(*SSEConnection),
     mutex: Mutex,
     allocator: std.mem.Allocator,
 
@@ -44,7 +47,7 @@ pub const EventBroadcaster = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .connections = .{},
+            .connections = .empty,
             .mutex = Mutex{},
             .allocator = allocator,
         };

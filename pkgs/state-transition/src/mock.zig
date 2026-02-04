@@ -70,16 +70,16 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     var genesis_state: types.BeamState = undefined;
     try genesis_state.genGenesisState(allocator, genesis_config);
     errdefer genesis_state.deinit();
-    var blockList: std.ArrayListUnmanaged(types.SignedBlockWithAttestation) = .{};
-    var blockRootList: std.ArrayListUnmanaged(types.Root) = .{};
+    var blockList: std.ArrayList(types.SignedBlockWithAttestation) = .empty;
+    var blockRootList: std.ArrayList(types.Root) = .empty;
 
-    var justificationCPList: std.ArrayListUnmanaged(types.Checkpoint) = .{};
-    var justificationList: std.ArrayListUnmanaged(bool) = .{};
+    var justificationCPList: std.ArrayList(types.Checkpoint) = .empty;
+    var justificationList: std.ArrayList(bool) = .empty;
 
-    var finalizationCPList: std.ArrayListUnmanaged(types.Checkpoint) = .{};
-    var finalizationList: std.ArrayListUnmanaged(bool) = .{};
+    var finalizationCPList: std.ArrayList(types.Checkpoint) = .empty;
+    var finalizationList: std.ArrayList(bool) = .empty;
 
-    var headList: std.ArrayListUnmanaged(types.Checkpoint) = .{};
+    var headList: std.ArrayList(types.Checkpoint) = .empty;
 
     // figure out a way to clone genesis_state
     var beam_state: types.BeamState = undefined;
@@ -149,7 +149,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         const state_root: [32]u8 = types.ZERO_HASH;
         // const timestamp = genesis_config.genesis_time + slot * params.SECONDS_PER_SLOT;
-        var attestations: std.ArrayListUnmanaged(types.Attestation) = .{};
+        var attestations: std.ArrayList(types.Attestation) = .empty;
         defer attestations.deinit(allocator);
         // 4 slot moving scenario can be applied over and over with finalization in 0
         switch (slot % 4) {

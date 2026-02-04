@@ -383,7 +383,7 @@ pub const BeamState = struct {
         const num_validators: usize = @intCast(self.validatorCount());
         for (attestations.constSlice()) |aggregated_attestation| {
             var validator_indices = try attestation.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-            defer validator_indices.deinit();
+            defer validator_indices.deinit(allocator);
 
             if (validator_indices.items.len == 0) {
                 continue;
@@ -503,13 +503,13 @@ pub const BeamState = struct {
                     if (delta > 0) {
                         try self.shiftJustifiedSlots(delta, allocator);
 
-                        var roots_to_remove = std.array_list.AlignedManaged(Root, null).init(allocator);
-                        defer roots_to_remove.deinit();
+                        var roots_to_remove: std.ArrayList(Root) = .empty;
+                        defer roots_to_remove.deinit(allocator);
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
                             const slot_value = root_to_slot.get(entry.key_ptr.*) orelse return StateTransitionError.InvalidJustificationRoot;
                             if (slot_value <= finalized_slot) {
-                                try roots_to_remove.append(entry.key_ptr.*);
+                                try roots_to_remove.append(allocator, entry.key_ptr.*);
                             }
                         }
                         for (roots_to_remove.items) |root| {
@@ -703,7 +703,7 @@ test "ssz seralize/deserialize signed beam state" {
     };
     defer state.deinit();
 
-    var serialized_state = std.ArrayList(u8){};
+    var serialized_state: std.ArrayList(u8) = .empty;
     defer serialized_state.deinit(std.testing.allocator);
     try ssz.serialize(BeamState, state, &serialized_state, std.testing.allocator);
     std.debug.print("serialized_state ({d})\n", .{serialized_state.items.len});
@@ -1015,7 +1015,7 @@ test "encode decode state roundtrip" {
     defer state.deinit();
 
     // Encode
-    var encoded = std.ArrayList(u8){};
+    var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(std.testing.allocator);
     try ssz.serialize(BeamState, state, &encoded, std.testing.allocator);
 

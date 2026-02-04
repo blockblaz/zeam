@@ -148,7 +148,7 @@ pub const ChainSpec = struct {
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
 // pass a pointer where you want to clone the data
 pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
-    var bytes: std.ArrayListUnmanaged(u8) = .{};
+    var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(allocator);
 
     try ssz.serialize(T, data, &bytes, allocator);
@@ -168,7 +168,7 @@ test "isSlotJustified treats finalized boundary as implicit" {
 test "ssz import" {
     const data: u16 = 0x5566;
     const serialized_data = [_]u8{ 0x66, 0x55 };
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(std.testing.allocator);
 
     try ssz.serialize(u16, data, &list, std.testing.allocator);

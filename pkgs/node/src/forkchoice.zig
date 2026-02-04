@@ -44,14 +44,14 @@ pub const ProtoNode = struct {
 };
 
 pub const ProtoArray = struct {
-    nodes: std.ArrayListUnmanaged(ProtoNode),
+    nodes: std.ArrayList(ProtoNode),
     indices: std.AutoHashMap(types.Root, usize),
     allocator: Allocator,
 
     const Self = @This();
     pub fn init(allocator: Allocator, anchorBlock: ProtoBlock) !Self {
         var proto_array = Self{
-            .nodes = .{},
+            .nodes = .empty,
             .indices = std.AutoHashMap(types.Root, usize).init(allocator),
             .allocator = allocator,
         };
@@ -246,7 +246,7 @@ pub const ForkChoice = struct {
     safeTarget: ProtoBlock,
     // data structure to hold validator deltas, could be grown over time as more validators
     // get added
-    deltas: std.ArrayListUnmanaged(isize),
+    deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
     // Per-validator XMSS signatures learned from gossip, keyed by (validator_id, attestation_data_root)
     gossip_signatures: SignaturesMap,
@@ -284,7 +284,7 @@ pub const ForkChoice = struct {
             .latest_finalized = anchorCP,
         };
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
-        const deltas = std.ArrayListUnmanaged(isize){};
+        const deltas: std.ArrayList(isize) = .empty;
         const gossip_signatures = SignaturesMap.init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
 
@@ -427,9 +427,9 @@ pub const ForkChoice = struct {
     ///
     /// If canonicalViewOrNull is provided, it reuses an existing canonical view for efficiency.
     pub fn getCanonicalityAnalysis(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
-        var canonical_roots = std.ArrayList(types.Root){};
-        var potential_canonical_roots = std.ArrayList(types.Root){};
-        var non_canonical_roots = std.ArrayList(types.Root){};
+        var canonical_roots: std.ArrayList(types.Root) = .empty;
+        var potential_canonical_roots: std.ArrayList(types.Root) = .empty;
+        var non_canonical_roots: std.ArrayList(types.Root) = .empty;
 
         // get some info about previous and target anchors
         const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
@@ -702,7 +702,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn getProposalAttestations(self: *Self) ![]types.Attestation {
-        var included_attestations = std.ArrayList(types.Attestation){};
+        var included_attestations: std.ArrayList(types.Attestation) = .empty;
         const latest_justified = self.fcStore.latest_justified;
 
         // TODO naive strategy to include all attestations that are consistent with the latest justified
@@ -984,7 +984,7 @@ pub const ForkChoice = struct {
         // Get or create the list for this key
         const gop = try self.aggregated_payloads.getOrPut(sig_key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = AggregatedPayloadsList{};
+            gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.append(self.allocator, .{
             .slot = attestation_data.slot,
@@ -998,10 +998,10 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        var gossip_keys_to_remove = std.ArrayList(SignatureKey){};
+        var gossip_keys_to_remove: std.ArrayList(SignatureKey) = .empty;
         defer gossip_keys_to_remove.deinit(self.allocator);
 
-        var payload_keys_to_remove = std.ArrayList(SignatureKey){};
+        var payload_keys_to_remove: std.ArrayList(SignatureKey) = .empty;
         defer payload_keys_to_remove.deinit(self.allocator);
 
         var gossip_removed: usize = 0;
@@ -1350,7 +1350,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = .{},
+        .deltas = .empty,
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
@@ -2614,7 +2614,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(3, 0xDD, 0xCC),
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
-        .deltas = .{},
+        .deltas = .empty,
         .logger = module_logger,
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),

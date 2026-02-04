@@ -203,7 +203,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 comptime log_message: []const u8,
                 log_args: anytype,
             ) void {
-                var serialized_value = std.ArrayList(u8){};
+                var serialized_value: std.ArrayList(u8) = .empty;
                 defer serialized_value.deinit(self.allocator);
 
                 ssz.serialize(T, value, &serialized_value, self.allocator) catch |err| {
@@ -433,7 +433,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             comptime log_message: []const u8,
             log_args: anytype,
         ) void {
-            var serialized_value = std.ArrayList(u8){};
+            var serialized_value: std.ArrayList(u8) = .empty;
             defer serialized_value.deinit(self.allocator);
 
             ssz.serialize(T, value, &serialized_value, self.allocator) catch |err| {

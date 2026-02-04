@@ -238,7 +238,7 @@ pub const GossipMessage = union(GossipTopic) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized: std.ArrayListUnmanaged(u8) = .{};
+        var serialized: std.ArrayList(u8) = .empty;
         errdefer serialized.deinit(allocator);
 
         switch (self.*) {
@@ -353,7 +353,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized: std.ArrayListUnmanaged(u8) = .{};
+        var serialized: std.ArrayList(u8) = .empty;
         errdefer serialized.deinit(allocator);
 
         switch (self.*) {
@@ -423,7 +423,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const ReqRespResponse, allocator: Allocator) ![]u8 {
-        var serialized: std.ArrayListUnmanaged(u8) = .{};
+        var serialized: std.ArrayList(u8) = .empty;
         errdefer serialized.deinit(allocator);
 
         switch (self.*) {
@@ -592,7 +592,7 @@ pub const OnReqRespRequestCbHandler = struct {
 };
 pub const ReqRespRequestHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnReqRespRequestCbHandler),
+    handlers: std.ArrayList(OnReqRespRequestCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -719,7 +719,7 @@ pub const OnPeerEventCbHandler = struct {
 
 pub const PeerEventHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnPeerEventCbHandler),
+    handlers: std.ArrayList(OnPeerEventCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -778,7 +778,7 @@ pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
     allocator: Allocator,
-    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
+    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -788,7 +788,7 @@ pub const GenericGossipHandler = struct {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
-        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
+        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)) = .empty;
         errdefer {
             var it = onGossipHandlers.iterator();
             while (it.next()) |entry| {
@@ -799,7 +799,7 @@ pub const GenericGossipHandler = struct {
         try onGossipHandlers.ensureTotalCapacity(allocator, @intCast(std.enums.values(GossipTopic).len));
 
         for (std.enums.values(GossipTopic)) |topic| {
-            var arr: std.ArrayListUnmanaged(OnGossipCbHandler) = .empty;
+            var arr: std.ArrayList(OnGossipCbHandler) = .empty;
             errdefer arr.deinit(allocator);
             try onGossipHandlers.put(allocator, topic, arr);
         }

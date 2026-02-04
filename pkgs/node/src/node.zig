@@ -293,7 +293,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // Collect roots of blocks at or before finalized slot
-        var roots_to_prune = std.ArrayListUnmanaged(types.Root){};
+        var roots_to_prune: std.ArrayList(types.Root) = .empty;
         defer roots_to_prune.deinit(self.allocator);
 
         var it = self.network.fetched_blocks.iterator();
@@ -329,7 +329,7 @@ pub const BeamNode = struct {
         }
 
         // Copy the children roots since we'll be modifying the children map during processing
-        var descendants_to_process = std.ArrayList(types.Root){};
+        var descendants_to_process: std.ArrayList(types.Root) = .empty;
         defer descendants_to_process.deinit(self.allocator);
         descendants_to_process.appendSlice(self.allocator, children) catch |err| {
             self.logger.warn("Failed to copy children for processing: {any}", .{err});
@@ -746,7 +746,7 @@ pub const BeamNode = struct {
         if (roots.len == 0) return;
 
         // Check if any of the requested blocks are missing
-        var missing_roots = std.ArrayList(types.Root){};
+        var missing_roots: std.ArrayList(types.Root) = .empty;
         defer missing_roots.deinit(self.allocator);
 
         for (roots) |root| {

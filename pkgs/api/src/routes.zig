@@ -3,10 +3,10 @@ const metrics = @import("./lib.zig");
 
 /// Metrics route handler for /metrics endpoint
 pub fn metricsHandler(allocator: std.mem.Allocator, request: *std.http.Server.Request) !void {
-    var metrics_output = std.ArrayList(u8).init(allocator);
-    defer metrics_output.deinit();
+    var metrics_output: std.ArrayList(u8) = .empty;
+    defer metrics_output.deinit(allocator);
 
-    metrics.writeMetrics(metrics_output.writer()) catch {
+    metrics.writeMetrics(metrics_output.writer(allocator)) catch {
         _ = request.respond("Internal Server Error\n", .{}) catch {};
         return;
     };

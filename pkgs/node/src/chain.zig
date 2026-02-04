@@ -662,7 +662,7 @@ pub const BeamChain = struct {
             break :computedstate cpost_state;
         };
 
-        var missing_roots = std.ArrayList(types.Root){};
+        var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
 
         // 3. fc onblock if the block was not pre added by the block production
@@ -693,7 +693,7 @@ pub const BeamChain = struct {
 
             for (aggregated_attestations, 0..) |aggregated_attestation, index| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
-                defer validator_indices.deinit();
+                defer validator_indices.deinit(self.allocator);
 
                 // Get participant indices from the signature proof
                 const signature_proof = if (index < signature_groups.len)
@@ -701,11 +701,11 @@ pub const BeamChain = struct {
                 else
                     null;
 
-                var participant_indices = if (signature_proof) |proof|
+                var participant_indices: std.ArrayList(usize) = if (signature_proof) |proof|
                     try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
                 else
-                    std.array_list.AlignedManaged(usize, null).init(self.allocator);
-                defer participant_indices.deinit();
+                    .empty;
+                defer participant_indices.deinit(self.allocator);
 
                 if (validator_indices.items.len != participant_indices.items.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
@@ -891,7 +891,7 @@ pub const BeamChain = struct {
                 continue;
 
             var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
-            defer validator_indices.deinit();
+            defer validator_indices.deinit(self.allocator);
 
             for (validator_indices.items) |validator_index| {
                 const validator_id: types.ValidatorIndex = @intCast(validator_index);

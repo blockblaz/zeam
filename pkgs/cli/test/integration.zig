@@ -9,7 +9,7 @@ const ErrorHandler = error_handler.ErrorHandler;
 /// Verify that the Zeam executable exists and return its path
 /// Includes detailed debugging output if the executable is not found
 fn getZeamExecutable() ![]const u8 {
-    // Handle both absolute and relative paths (Zig 0.15.2 may provide relative paths)
+    // Handle both absolute and relative paths
     const exe_file = if (std.fs.path.isAbsolute(build_options.cli_exe_path))
         std.fs.openFileAbsolute(build_options.cli_exe_path, .{})
     else
@@ -116,7 +116,9 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         // Try to read any output from the process
         if (cli_process.stdout) |stdout| {
             var stdout_buffer: [4096]u8 = undefined;
-            const stdout_bytes = stdout.readAll(&stdout_buffer) catch 0;
+            var read_buf: [4096]u8 = undefined;
+            var stdout_reader = stdout.reader(&read_buf);
+            const stdout_bytes = stdout_reader.interface.readSliceShort(&stdout_buffer) catch 0;
             if (stdout_bytes > 0) {
                 std.debug.print("STDOUT: {s}\n", .{stdout_buffer[0..stdout_bytes]});
             }
@@ -124,7 +126,9 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
         if (cli_process.stderr) |stderr| {
             var stderr_buffer: [4096]u8 = undefined;
-            const stderr_bytes = stderr.readAll(&stderr_buffer) catch 0;
+            var read_buf: [4096]u8 = undefined;
+            var stderr_reader = stderr.reader(&read_buf);
+            const stderr_bytes = stderr_reader.interface.readSliceShort(&stderr_buffer) catch 0;
             if (stderr_bytes > 0) {
                 std.debug.print("STDERR: {s}\n", .{stderr_buffer[0..stderr_bytes]});
             }
@@ -189,7 +193,10 @@ const ZeamRequest = struct {
             "Connection: close\r\n" ++
             "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
 
-        try connection.writeAll(request);
+        var conn_write_buf: [4096]u8 = undefined;
+        var conn_writer = connection.writer(&conn_write_buf);
+        try conn_writer.interface.writeAll(request);
+        try conn_writer.interface.flush();
 
         // Read response until connection closes
         var response_buffer: [8192]u8 = undefined;
@@ -243,9 +250,9 @@ const SSEClient = struct {
         return SSEClient{
             .allocator = allocator,
             .connection = connection,
-            .received_events = std.ArrayList([]u8){},
-            .read_buffer = std.ArrayList(u8){},
-            .parsed_events_queue = std.ArrayList(ChainEvent){},
+            .received_events = .empty,
+            .read_buffer = .empty,
+            .parsed_events_queue = .empty,
         };
     }
 
@@ -273,7 +280,10 @@ const SSEClient = struct {
             "Connection: keep-alive\r\n" ++
             "\r\n";
 
-        try self.connection.writeAll(request);
+        var conn_write_buf: [4096]u8 = undefined;
+        var conn_writer = self.connection.writer(&conn_write_buf);
+        try conn_writer.interface.writeAll(request);
+        try conn_writer.interface.flush();
     }
 
     /// NEW: Parse all complete events from the current buffer

@@ -23,19 +23,22 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
 
-        // magic +  binary format
-        try file.writeAll(magic);
-        try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(BinaryFormatVersion))));
+        var write_buf: [4096]u8 = undefined;
+        var writer = file.writer(&write_buf);
+
+        // magic + binary format
+        try writer.interface.writeAll(magic);
+        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @intCast(BinaryFormatVersion))));
 
         // write program header + len as u32
         const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
-        try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(header.len))));
+        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @intCast(header.len))));
         // program header
-        try file.writeAll(header);
+        try writer.interface.writeAll(header);
 
         // user data length + data
-        try file.writeAll(&std.mem.toBytes(@as(u32, @truncate(bindata.len))));
-        try file.writeAll(bindata);
+        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @truncate(bindata.len))));
+        try writer.interface.writeAll(bindata);
 
         // DO NOT write the kernel length, it's inferred
         const kernel = try std.fs.cwd().openFile("build/v1compat.elf", .{});
@@ -44,7 +47,8 @@ pub fn main() !void {
         const kernelsize = kernelstat.size;
         const kerneldata = try kernel.readToEndAlloc(allocator, kernelsize);
         defer allocator.free(kerneldata);
-        try file.writeAll(kerneldata);
+        try writer.interface.writeAll(kerneldata);
+        try writer.interface.flush();
     } else {
         @panic("no binary file given");
     }

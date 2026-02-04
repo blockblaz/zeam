@@ -16,7 +16,7 @@ pub const Clock = struct {
     current_interval: isize,
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
-    on_interval_cbs: std.array_list.AlignedManaged(*OnIntervalCbWrapper, null),
+    on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
     allocator: Allocator,
 
     timer: xev.Timer,
@@ -47,7 +47,7 @@ pub const Clock = struct {
             .current_interval = current_interval,
             .events = events,
             .timer = timer,
-            .on_interval_cbs = std.array_list.AlignedManaged(*OnIntervalCbWrapper, null).init(allocator),
+            .on_interval_cbs = .empty,
             .allocator = allocator,
         };
     }
@@ -57,7 +57,7 @@ pub const Clock = struct {
         for (self.on_interval_cbs.items) |cbWrapper| {
             allocator.destroy(cbWrapper);
         }
-        self.on_interval_cbs.deinit();
+        self.on_interval_cbs.deinit(allocator);
     }
 
     pub fn tickInterval(self: *Self) void {
@@ -106,6 +106,6 @@ pub const Clock = struct {
     }
 
     pub fn subscribeOnSlot(self: *Self, cb: *OnIntervalCbWrapper) !void {
-        try self.on_interval_cbs.append(cb);
+        try self.on_interval_cbs.append(self.allocator, cb);
     }
 };

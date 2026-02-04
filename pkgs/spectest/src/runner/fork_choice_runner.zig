@@ -188,7 +188,7 @@ const StepContext = struct {
 };
 
 const StateMap = std.AutoHashMapUnmanaged(types.Root, *types.BeamState);
-const StateList = std.ArrayListUnmanaged(*types.BeamState);
+const StateList = std.ArrayList(*types.BeamState);
 const LabelMap = std.StringHashMapUnmanaged(types.Root);
 
 fn runCase(

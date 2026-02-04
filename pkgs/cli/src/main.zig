@@ -651,8 +651,14 @@ fn mainInner() !void {
                     return err;
                 };
                 defer config_file.close();
-                config_file.writeAll(generated_config) catch |err| {
+                var write_buf: [4096]u8 = undefined;
+                var writer = config_file.writer(&write_buf);
+                writer.interface.writeAll(generated_config) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
+                    return err;
+                };
+                writer.interface.flush() catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "flush Prometheus config", .{ .filename = genconfig.filename });
                     return err;
                 };
                 std.log.info("Successfully generated Prometheus config: {s}", .{genconfig.filename});

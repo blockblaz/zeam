@@ -356,7 +356,7 @@ pub const Node = struct {
             for (listen_addresses) |addr| addr.deinit();
             self.allocator.free(listen_addresses);
         }
-        var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
+        var connect_peer_list: std.ArrayList(Multiaddr) = .empty;
         defer connect_peer_list.deinit(self.allocator);
 
         for (self.options.bootnodes, 0..) |n, i| {
@@ -575,7 +575,7 @@ fn downloadCheckpointState(
     }
 
     // Read response body
-    var ssz_data = std.ArrayList(u8){};
+    var ssz_data: std.ArrayList(u8) = .empty;
     errdefer ssz_data.deinit(allocator);
 
     var transfer_buffer: [8192]u8 = undefined;
@@ -719,7 +719,7 @@ fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []co
 /// where `node_key` (e.g., "zeam_0") is the key for the node's validator assignments.
 /// Returns a slice of ValidatorAssignment. The caller is responsible for freeing the returned slice.
 fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const u8, validators: Yaml) ![]ValidatorAssignment {
-    var assignments: std.ArrayListUnmanaged(ValidatorAssignment) = .empty;
+    var assignments: std.ArrayList(ValidatorAssignment) = .empty;
     defer assignments.deinit(allocator);
     errdefer {
         for (assignments.items) |*a| {
@@ -983,12 +983,11 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     }
 
     // Convert SignableENR to ENR
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    try enr_lib.writeSignableENR(writer, &signable_enr);
-    const enr_text = fbs.getWritten();
+    try enr_lib.writeSignableENR(buffer.writer(allocator), &signable_enr);
+    const enr_text = buffer.items;
 
     var enr: ENR = undefined;
     try ENR.decodeTxtInto(&enr, enr_text);

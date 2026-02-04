@@ -154,13 +154,13 @@ pub fn aggregationBitsSet(bits: *AggregationBits, index: usize, value: bool) !vo
     try bits.set(index, value);
 }
 
-pub fn aggregationBitsToValidatorIndices(bits: *const AggregationBits, allocator: Allocator) !std.array_list.AlignedManaged(usize, null) {
-    var indices = std.array_list.AlignedManaged(usize, null).init(allocator);
-    errdefer indices.deinit();
+pub fn aggregationBitsToValidatorIndices(bits: *const AggregationBits, allocator: Allocator) !std.ArrayList(usize) {
+    var indices: std.ArrayList(usize) = .empty;
+    errdefer indices.deinit(allocator);
 
     for (0..bits.len()) |validator_index| {
         if (try bits.get(validator_index)) {
-            try indices.append(validator_index);
+            try indices.append(allocator, validator_index);
         }
     }
 
@@ -179,7 +179,7 @@ test "encode decode signed attestation roundtrip" {
         .signature = ZERO_SIGBYTES,
     };
 
-    var encoded: std.ArrayListUnmanaged(u8) = .{};
+    var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(std.testing.allocator);
     try ssz.serialize(SignedAttestation, signed_attestation, &encoded, std.testing.allocator);
     try std.testing.expect(encoded.items.len > 0);

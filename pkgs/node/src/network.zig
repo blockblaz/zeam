@@ -49,7 +49,7 @@ pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
 pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlockWithAttestation);
 // key: parent root, value: list of child roots (for O(1) child lookup)
-pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayListUnmanaged(types.Root));
+pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayList(types.Root));
 
 pub const BlocksByRootRequestResult = struct {
     peer_id: []const u8,
@@ -232,7 +232,7 @@ pub const Network = struct {
 
             // Finalize all pending RPC requests for this peer
             var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove = std.ArrayList(u64){};
+            var request_ids_to_remove: std.ArrayList(u64) = .empty;
             defer request_ids_to_remove.deinit(self.allocator);
 
             while (rpc_it.next()) |rpc_entry| {
@@ -310,7 +310,7 @@ pub const Network = struct {
 
         const created_new_entry = !gop.found_existing;
         if (created_new_entry) {
-            gop.value_ptr.* = std.ArrayListUnmanaged(types.Root){};
+            gop.value_ptr.* = .empty;
         }
         errdefer if (created_new_entry) {
             gop.value_ptr.deinit(self.allocator);

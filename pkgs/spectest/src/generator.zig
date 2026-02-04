@@ -36,19 +36,19 @@ const GroupedEntry = struct {
 
 const HandlerGroup = struct {
     handler_name: []u8,
-    entries: std.ArrayListUnmanaged(GroupedEntry),
+    entries: std.ArrayList(GroupedEntry),
 };
 
 const SuiteGroup = struct {
     suite_name: []u8,
-    handlers: std.ArrayListUnmanaged(HandlerGroup),
+    handlers: std.ArrayList(HandlerGroup),
 };
 
 const ForkGroup = struct {
     kind: FixtureKind,
     fork_name: []u8,
     fork_symbol: []u8,
-    suites: std.ArrayListUnmanaged(SuiteGroup),
+    suites: std.ArrayList(SuiteGroup),
 };
 
 const WriteSummary = struct {
@@ -138,7 +138,7 @@ fn ensureVectorsRoot(options: *CliOptions) !void {
 }
 
 fn collectFixtures(allocator: Allocator, root_path: []const u8) ![][]const u8 {
-    var list = std.ArrayListUnmanaged([]const u8).empty;
+    var list = std.ArrayList([]const u8).empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
         list.deinit(allocator);
@@ -170,7 +170,7 @@ fn walkDir(
     allocator: Allocator,
     rel_dir: []const u8,
     dir: *std.fs.Dir,
-    list: *std.ArrayListUnmanaged([]const u8),
+    list: *std.ArrayList([]const u8),
 ) !void {
     var it = dir.iterate();
     while (true) {
@@ -244,7 +244,7 @@ fn parseFixtureRoute(rel_path: []const u8) !FixtureRoute {
 
 fn makeRunnerPrefix(allocator: Allocator, levels_up: usize) ![]u8 {
     if (levels_up == 0) return allocator.alloc(u8, 0);
-    var list = std.ArrayListUnmanaged(u8).empty;
+    var list = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
     try list.ensureTotalCapacityPrecise(allocator, levels_up * 3);
     for (0..levels_up) |_| try list.appendSlice(allocator, "../");
@@ -268,7 +268,7 @@ fn computeLevelsUp(from_dir: []const u8, target_dir: []const u8) usize {
 }
 
 fn makeHeaderWithPrefix(allocator: Allocator, prefix: []const u8, kind: FixtureKind) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
+    var list = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
     var writer = list.writer(allocator);
 
@@ -337,7 +337,7 @@ fn makeHeaderWithPrefix(allocator: Allocator, prefix: []const u8, kind: FixtureK
 }
 
 fn makeLiteral(allocator: Allocator, text: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
+    var list = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
     var writer = list.writer(allocator);
     try writer.writeByte('"');
@@ -402,7 +402,7 @@ fn writeTests(
 fn collectIntoGroups(
     allocator: Allocator,
     fixtures: [][]const u8,
-    groups: *std.ArrayListUnmanaged(ForkGroup),
+    groups: *std.ArrayList(ForkGroup),
     emitted_count: *usize,
 ) !void {
     for (fixtures) |rel_path| {
@@ -425,7 +425,7 @@ fn collectIntoGroups(
                 .kind = route.kind,
                 .fork_name = try allocator.dupe(u8, route.fork_name),
                 .fork_symbol = try allocator.dupe(u8, route.fork_symbol),
-                .suites = std.ArrayListUnmanaged(SuiteGroup).empty,
+                .suites = std.ArrayList(SuiteGroup).empty,
             });
             break :blk &groups.items[groups.items.len - 1];
         };
@@ -437,7 +437,7 @@ fn collectIntoGroups(
 
             try group.suites.append(allocator, SuiteGroup{
                 .suite_name = try allocator.dupe(u8, route.suite),
-                .handlers = std.ArrayListUnmanaged(HandlerGroup).empty,
+                .handlers = std.ArrayList(HandlerGroup).empty,
             });
             break :blk &group.suites.items[group.suites.items.len - 1];
         };
@@ -449,7 +449,7 @@ fn collectIntoGroups(
 
             try suite.handlers.append(allocator, HandlerGroup{
                 .handler_name = try allocator.dupe(u8, route.handler),
-                .entries = std.ArrayListUnmanaged(GroupedEntry).empty,
+                .entries = std.ArrayList(GroupedEntry).empty,
             });
             break :blk &suite.handlers.items[suite.handlers.items.len - 1];
         };
@@ -494,7 +494,7 @@ fn sortGroups(groups: []ForkGroup) void {
     }
 }
 
-fn deinitGroups(allocator: Allocator, groups: *std.ArrayListUnmanaged(ForkGroup)) void {
+fn deinitGroups(allocator: Allocator, groups: *std.ArrayList(ForkGroup)) void {
     for (groups.items) |*group| {
         for (group.suites.items) |*suite| {
             for (suite.handlers.items) |*handler| {
@@ -526,7 +526,7 @@ fn writeGroupedTests(
     }
     try std.fs.cwd().makePath(output_dir);
 
-    var groups = std.ArrayListUnmanaged(ForkGroup).empty;
+    var groups = std.ArrayList(ForkGroup).empty;
     errdefer deinitGroups(allocator, &groups);
 
     var emitted_count: usize = 0;
@@ -586,8 +586,7 @@ fn writeHandlerFile(
     const file_path = try std.fmt.allocPrint(allocator, "{s}/tests.zig", .{handler_dir});
     defer allocator.free(file_path);
 
-    // Use ArrayList as buffer since File.writer() API changed in Zig 0.15.2
-    var buffer = std.ArrayList(u8){};
+    var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
     const writer = buffer.writer(allocator);
 
@@ -622,7 +621,10 @@ fn writeHandlerFile(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
     defer file.close();
-    try file.writeAll(buffer.items);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&write_buf);
+    try file_writer.interface.writeAll(buffer.items);
+    try file_writer.interface.flush();
 }
 
 fn writeIndexFile(
@@ -634,7 +636,7 @@ fn writeIndexFile(
     defer allocator.free(index_path);
 
     // Use ArrayList as buffer since File.writer() API changed in Zig 0.15.2
-    var buffer = std.ArrayList(u8){};
+    var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
     const writer = buffer.writer(allocator);
 
@@ -695,7 +697,10 @@ fn writeIndexFile(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
     defer file.close();
-    try file.writeAll(buffer.items);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&write_buf);
+    try file_writer.interface.writeAll(buffer.items);
+    try file_writer.interface.flush();
 }
 
 fn writeEmptyIndex(
@@ -706,7 +711,7 @@ fn writeEmptyIndex(
     defer allocator.free(index_path);
 
     // Use ArrayList as buffer since File.writer() API changed in Zig 0.15.2
-    var buffer = std.ArrayList(u8){};
+    var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
     const writer = buffer.writer(allocator);
     try writer.writeAll("// This file is generated by pkgs/spectest/src/generator.zig.\n");
@@ -722,7 +727,10 @@ fn writeEmptyIndex(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
     defer file.close();
-    try file.writeAll(buffer.items);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&write_buf);
+    try file_writer.interface.writeAll(buffer.items);
+    try file_writer.interface.flush();
 }
 
 pub fn main() !void {

@@ -344,7 +344,7 @@ pub const AggregatedAttestationsResult = struct {
             validator_bits: std.DynamicBitSet,
         };
 
-        var groups: std.ArrayListUnmanaged(AttestationGroup) = .{};
+        var groups: std.ArrayList(AttestationGroup) = .empty;
         defer {
             for (groups.items) |*group| {
                 group.validator_bits.deinit();
@@ -387,7 +387,7 @@ pub const AggregatedAttestationsResult = struct {
             // Phase 1: Collect signatures from signatures_map
             const max_validator = group.validator_bits.capacity();
 
-            var sigmap_sigs: std.ArrayListUnmanaged(xmss.Signature) = .{};
+            var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
             defer {
                 for (sigmap_sigs.items) |*sig| {
                     sig.deinit();
@@ -395,7 +395,7 @@ pub const AggregatedAttestationsResult = struct {
                 sigmap_sigs.deinit(allocator);
             }
 
-            var sigmap_pks: std.ArrayListUnmanaged(xmss.PublicKey) = .{};
+            var sigmap_pks: std.ArrayList(xmss.PublicKey) = .empty;
             defer {
                 for (sigmap_pks.items) |*pk| {
                     pk.deinit();
@@ -731,7 +731,7 @@ test "ssz seralize/deserialize signed beam block" {
     };
     defer signed_block.deinit();
 
-    var serialized_signed_block: std.ArrayListUnmanaged(u8) = .{};
+    var serialized_signed_block: std.ArrayList(u8) = .empty;
     defer serialized_signed_block.deinit(std.testing.allocator);
 
     try ssz.serialize(SignedBlockWithAttestation, signed_block, &serialized_signed_block, std.testing.allocator);
@@ -800,7 +800,7 @@ test "encode decode signed block with attestation roundtrip" {
     };
     defer signed_block_with_attestation.deinit();
 
-    var encoded: std.ArrayListUnmanaged(u8) = .{};
+    var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(std.testing.allocator);
     try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded, std.testing.allocator);
 
@@ -860,7 +860,7 @@ test "encode decode signed block with non-empty attestation signatures" {
     };
     defer signed_block_with_attestation.deinit();
 
-    var encoded: std.ArrayListUnmanaged(u8) = .{};
+    var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(std.testing.allocator);
     try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded, std.testing.allocator);
 

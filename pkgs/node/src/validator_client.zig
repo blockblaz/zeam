@@ -21,7 +21,7 @@ pub const ValidatorClientOutput = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
-            .gossip_messages = std.ArrayList(networks.GossipMessage){},
+            .gossip_messages = .empty,
             .allocator = allocator,
         };
     }

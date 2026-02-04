@@ -164,7 +164,7 @@ test "ssz seralize/deserialize signed stf prover input" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
 
-    var serialized = std.ArrayList(u8){};
+    var serialized: std.ArrayList(u8) = .empty;
     defer serialized.deinit(arena_allocator.allocator());
     try ssz.serialize(BeamSTFProverInput, prover_input, &serialized, arena_allocator.allocator());
 

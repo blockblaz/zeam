@@ -34,7 +34,7 @@ const FrameDecodeError = error{
 
 const LeanSupportedProtocol = interface.LeanSupportedProtocol;
 
-fn encodeVarint(buffer: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: usize) !void {
+fn encodeVarint(buffer: *std.ArrayList(u8), allocator: Allocator, value: usize) !void {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, value, &scratch);
     try buffer.appendSlice(allocator, encoded);
@@ -54,7 +54,7 @@ fn buildRequestFrame(allocator: Allocator, uncompressed_size: usize, snappy_payl
         return error.PayloadTooLarge;
     }
 
-    var frame = std.ArrayListUnmanaged(u8).empty;
+    var frame = std.ArrayList(u8).empty;
     errdefer frame.deinit(allocator);
 
     try encodeVarint(&frame, allocator, uncompressed_size);
@@ -69,7 +69,7 @@ fn buildResponseFrame(allocator: Allocator, code: u8, uncompressed_size: usize, 
         return error.PayloadTooLarge;
     }
 
-    var frame = std.ArrayListUnmanaged(u8).empty;
+    var frame = std.ArrayList(u8).empty;
     errdefer frame.deinit(allocator);
 
     try frame.append(allocator, code);
@@ -261,8 +261,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     };
     defer file.close();
 
-    file.writeAll(message_bytes) catch |e| {
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(&write_buf);
+    writer.interface.writeAll(message_bytes) catch |e| {
         logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
+        return null;
+    };
+    writer.interface.flush() catch |e| {
+        logger.err("Failed to flush file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
         return null;
     };
 
@@ -967,7 +973,7 @@ pub const EthLibp2p = struct {
             try self.allocator.dupeZ(u8, "");
         const local_private_key = try self.allocator.dupeZ(u8, self.params.local_private_key);
 
-        var topics_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var topics_list: std.ArrayList([]const u8) = .empty;
         defer {
             for (topics_list.items) |topic_str| {
                 self.allocator.free(topic_str);
@@ -1195,7 +1201,7 @@ pub const EthLibp2p = struct {
             return try allocator.dupeZ(u8, "");
         }
 
-        var addr_strings = std.ArrayListUnmanaged([]const u8).empty;
+        var addr_strings = std.ArrayList([]const u8).empty;
         defer {
             for (addr_strings.items) |addr_str| {
                 allocator.free(addr_str);

@@ -75,11 +75,11 @@ pub fn verifySignatures(
     for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
         // Get validator indices from the attestation's aggregation bits
         var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-        defer validator_indices.deinit();
+        defer validator_indices.deinit(allocator);
 
         // Get validator indices from the signature proof's participants
         var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
-        defer participant_indices.deinit();
+        defer participant_indices.deinit(allocator);
 
         // Verify that the participants EXACTLY match the attestation aggregation bits.
         if (validator_indices.items.len != participant_indices.items.len) {
@@ -92,13 +92,13 @@ pub fn verifySignatures(
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
-        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .{};
+        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .empty;
         try public_keys.ensureTotalCapacity(allocator, validator_indices.items.len);
         defer public_keys.deinit(allocator);
 
         // Store the PublicKey wrappers so we can free the Rust handles after verification
         // Only used when cache is not provided
-        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .{};
+        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
         try pubkey_wrappers.ensureTotalCapacity(allocator, validator_indices.items.len);
         defer {
             // Only free wrappers if we're not using a cache

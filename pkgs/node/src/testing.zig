@@ -176,10 +176,10 @@ pub const NodeTestContext = struct {
             errdefer signature_proof.deinit();
 
             var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-            defer indices.deinit();
+            defer indices.deinit(allocator);
 
             // Collect signature handles for aggregation
-            var signature_handles = std.ArrayList(xmss.Signature){};
+            var signature_handles: std.ArrayList(xmss.Signature) = .empty;
             defer {
                 for (signature_handles.items) |*sig| {
                     sig.deinit();

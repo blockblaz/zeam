@@ -149,7 +149,7 @@ pub const ChainEvent = union(ChainEventType) {
 pub fn serializeEventToJson(allocator: Allocator, event: ChainEvent) ![]u8 {
     const event_name = @tagName(std.meta.activeTag(event));
 
-    var json_str = std.ArrayListUnmanaged(u8){};
+    var json_str: std.ArrayList(u8) = .empty;
     defer json_str.deinit(allocator);
 
     // Format as SSE event

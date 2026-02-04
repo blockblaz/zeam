@@ -123,6 +123,7 @@ const ApiServer = struct {
 
     /// Handle metrics endpoint
     fn handleMetrics(_: *const Self, request: *std.http.Server.Request) void {
+        // 64KiB buffer for metrics output: ipv4 max limit
         var buffer: [65536]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
 
@@ -164,7 +165,7 @@ const ApiServer = struct {
         };
 
         // Serialize lean state (BeamState) to SSZ
-        var ssz_output: std.ArrayListUnmanaged(u8) = .{};
+        var ssz_output: std.ArrayList(u8) = .empty;
         defer ssz_output.deinit(self.allocator);
 
         ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output, self.allocator) catch |err| {
@@ -232,12 +233,17 @@ const ApiServer = struct {
             "Access-Control-Allow-Headers: Cache-Control\r\n" ++
             "\r\n";
 
+        var write_buf: [4096]u8 = undefined;
+        var stream_writer = stream.writer(&write_buf);
+
         // Send initial response with SSE headers
-        try stream.writeAll(sse_headers);
+        try stream_writer.interface.writeAll(sse_headers);
+        try stream_writer.interface.flush();
 
         // Send initial connection event
         const connection_event = "event: connection\ndata: {\"status\":\"connected\"}\n\n";
-        try stream.writeAll(connection_event);
+        try stream_writer.interface.writeAll(connection_event);
+        try stream_writer.interface.flush();
 
         // Register this connection with the global event broadcaster
         try event_broadcaster.addGlobalConnection(stream);
@@ -247,7 +253,11 @@ const ApiServer = struct {
         while (true) {
             // Send periodic heartbeat to keep connection alive
             const heartbeat = ": heartbeat\n\n";
-            stream.writeAll(heartbeat) catch |err| {
+            stream_writer.interface.writeAll(heartbeat) catch |err| {
+                self.logger.warn("SSE connection closed: {}", .{err});
+                break;
+            };
+            stream_writer.interface.flush() catch |err| {
                 self.logger.warn("SSE connection closed: {}", .{err});
                 break;
             };
