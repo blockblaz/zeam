@@ -20,3 +20,9 @@ pub const MAX_CACHED_BLOCKS = 1024;
 // Periodic state pruning interval: prune non-canonical states every N slots
 // Set to 7200 slots (approximately 8 hours in Lean, assuming 4 seconds per slot)
 pub const FORKCHOICE_PRUNING_INTERVAL_SLOTS: u64 = 7200;
+
+// Timeout for pending RPC requests in seconds.
+// If a peer does not respond within this duration, the request is finalized and retried
+// with a different peer. 2 slots at 4s/slot is generous for latency while ensuring
+// stuck sync chains recover quickly.
+pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
