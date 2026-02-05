@@ -202,23 +202,12 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      id: cache-zig-packages
       uses: actions/cache@v3
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
-
-    - name: Cache Zig build artifacts
-      uses: actions/cache@v3
-      with:
-        path: |
-          .zig-cache
-          zig-out
-        key: ${{ runner.os }}-zig-build-${{ hashFiles('build.zig.zon') }}
-        restore-keys: |
-          ${{ runner.os }}-zig-build-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -227,7 +216,6 @@ jobs:
         shared-key: cargo-test
 
     - name: Fetch Zig dependencies with retry
-      if: steps.cache-zig-packages.outputs.cache-hit != 'true'
       run: |
         max_attempts=5
         attempt=1
@@ -246,9 +234,6 @@ jobs:
     - name: Run all unit tests
       run: zig build test --summary all
 
-    - name: Run all sim tests
-      run: zig build simtest --summary all
-
     # NOTE: Spectests are temporarily disabled while syncing spec changes.
     # - name: Install uv
     #   shell: bash
@@ -265,6 +250,61 @@ jobs:
     #
     # - name: Run all spec tests
     #   run: zig build spectest:run --summary all
+
+  simtest:
+    name: simtest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.14.1
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-packages-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        shared-key: cargo-test
+
+    - name: Fetch Zig dependencies with retry
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+          attempt=$((attempt + 1))
+        done
+        echo "Failed to fetch dependencies after $max_attempts attempts"
+        exit 1
+
+    - name: Run all sim tests
+      run: zig build simtest --summary all
 
   dummy-prove:
     name: Dummy prove
