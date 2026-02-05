@@ -292,6 +292,8 @@ pub const ForkChoice = struct {
     // Aggregated signature proofs learned from blocks, keyed by (validator_id, attestation_data_root)
     // Values are lists since we may receive multiple proofs for the same key from different blocks
     aggregated_payloads: AggregatedPayloadsMap,
+    // Mutex to protect concurrent access to gossip_signatures and aggregated_payloads
+    signatures_mutex: std.Thread.Mutex,
 
     const Self = @This();
 
@@ -351,6 +353,7 @@ pub const ForkChoice = struct {
             .mutex = Thread.RwLock{},
             .gossip_signatures = gossip_signatures,
             .aggregated_payloads = aggregated_payloads,
+            .signatures_mutex = .{},
         };
         // No lock needed during init - struct not yet accessible to other threads
         _ = try fc.updateHeadUnlocked();
@@ -425,6 +428,9 @@ pub const ForkChoice = struct {
         self.protoArray.indices.deinit();
         self.attestations.deinit();
         self.deltas.deinit();
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
         self.gossip_signatures.deinit();
 
         // Deinit each list in the aggregated_payloads map
@@ -1044,6 +1050,8 @@ pub const ForkChoice = struct {
             .validator_id = validator_id,
             .data_root = data_root,
         };
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
         try self.gossip_signatures.put(sig_key, .{
             .slot = attestation_slot,
             .signature = signed_attestation.signature,
@@ -1116,6 +1124,8 @@ pub const ForkChoice = struct {
             .data_root = data_root,
         };
 
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
         // Get or create the list for this key
         const gop = try self.aggregated_payloads.getOrPut(sig_key);
         if (!gop.found_existing) {
@@ -1130,6 +1140,9 @@ pub const ForkChoice = struct {
     /// Prune gossip_signatures and aggregated_payloads for attestations at or before the finalized slot.
     /// This is called after finalization to clean up signature data that is no longer needed.
     pub fn pruneSignatureMaps(self: *Self, finalized_slot: types.Slot) !void {
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
         var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
         defer gossip_keys_to_remove.deinit();
 
@@ -1666,6 +1679,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit();
@@ -1983,6 +1997,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
 
     return .{
@@ -2930,6 +2945,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .signatures_mutex = std.Thread.Mutex{},
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
