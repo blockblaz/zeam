@@ -13,6 +13,9 @@ concurrency:
 
 name: CI
 
+env:
+  ZIG_LOCAL_CACHE_DIR: .zig-cache
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -27,7 +30,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -96,7 +99,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -127,9 +130,12 @@ jobs:
       run: zig build all
 
   build-all-provers:
-    name: build-all-provers
-    runs-on: ubuntu-latest
+    name: build-all-provers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: build  # Only run if the build job succeeds
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
 
@@ -147,7 +153,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -202,20 +208,10 @@ jobs:
       id: cache-zig-packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
-
-    - name: Cache Zig build artifacts
-      uses: actions/cache@v3
-      with:
-        path: |
-          .zig-cache
-          zig-out
-        key: ${{ runner.os }}-zig-build-${{ hashFiles('build.zig.zon') }}
-        restore-keys: |
-          ${{ runner.os }}-zig-build-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -285,7 +281,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -324,7 +320,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig
+        path: ~/.cache/zig/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
