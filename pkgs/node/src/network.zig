@@ -73,6 +73,7 @@ pub const Network = struct {
     pending_block_roots: PendingBlockRootMap,
     fetched_blocks: FetchedBlockMap,
     fetched_block_children: ChildrenMap,
+    timed_out_requests: std.ArrayList(u64),
 
     const Self = @This();
 
@@ -103,10 +104,13 @@ pub const Network = struct {
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
             .fetched_block_children = fetched_block_children,
+            .timed_out_requests = std.ArrayList(u64).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.timed_out_requests.deinit();
+
         var rpc_it = self.pending_rpc_requests.iterator();
         while (rpc_it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -550,16 +554,15 @@ pub const Network = struct {
         return self.pending_rpc_requests.getPtr(request_id);
     }
 
-    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) !std.ArrayList(u64) {
-        var timed_out = std.ArrayList(u64).init(self.allocator);
-        errdefer timed_out.deinit();
+    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
+        self.timed_out_requests.clearRetainingCapacity();
         var it = self.pending_rpc_requests.iterator();
         while (it.next()) |entry| {
             if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
-                try timed_out.append(entry.key_ptr.*);
+                try self.timed_out_requests.append(entry.key_ptr.*);
             }
         }
-        return timed_out;
+        return self.timed_out_requests.items;
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {

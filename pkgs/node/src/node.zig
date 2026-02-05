@@ -943,13 +943,12 @@ pub const BeamNode = struct {
 
     fn sweepTimedOutRequests(self: *Self) void {
         const current_time = std.time.timestamp();
-        var timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
+        const timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
             self.logger.warn("failed to check for timed-out RPC requests: {any}", .{err});
             return;
         };
-        defer timed_out.deinit();
 
-        for (timed_out.items) |request_id| {
+        for (timed_out) |request_id| {
             const entry_ptr = self.network.getPendingRequestPtr(request_id) orelse continue;
 
             switch (entry_ptr.request) {
