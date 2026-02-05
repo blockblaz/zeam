@@ -15,6 +15,7 @@ name: CI
 
 env:
   ZIG_LOCAL_CACHE_DIR: .zig-cache
+  ZIG_GLOBAL_CACHE_DIR: .zig-cache-global
 
 jobs:
   lint:
@@ -30,7 +31,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -99,7 +100,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -153,7 +154,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -207,7 +208,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -279,7 +280,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -331,7 +332,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -370,7 +371,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: ~/.cache/zig/p
+        path: .zig-cache-global/p
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
