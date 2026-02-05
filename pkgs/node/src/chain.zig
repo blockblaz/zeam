@@ -1323,6 +1323,7 @@ pub const BeamChain = struct {
         no_peers,
         behind_peers: struct {
             head_slot: types.Slot,
+            finalized_slot: types.Slot,
             max_peer_finalized_slot: types.Slot,
         },
     };
@@ -1351,10 +1352,20 @@ pub const BeamChain = struct {
             }
         }
 
-        // We must also be synced with peers (at or past max peer finalized slot)
+        // Check 1: our head is behind peer finalization — we don't even have finalized blocks
         if (our_head_slot < max_peer_finalized_slot) {
             return .{ .behind_peers = .{
                 .head_slot = our_head_slot,
+                .finalized_slot = our_finalized_slot,
+                .max_peer_finalized_slot = max_peer_finalized_slot,
+            } };
+        }
+
+        // Check 2: our finalization is behind peer finalization — we may be on a divergent fork
+        if (our_finalized_slot < max_peer_finalized_slot) {
+            return .{ .behind_peers = .{
+                .head_slot = our_head_slot,
+                .finalized_slot = our_finalized_slot,
                 .max_peer_finalized_slot = max_peer_finalized_slot,
             } };
         }
