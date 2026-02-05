@@ -165,7 +165,9 @@ pub const ProtoArray = struct {
 
                 if (updateBest) {
                     self.nodes.items[parent_idx].bestChild = node_idx;
-                    self.nodes.items[parent_idx].bestDescendant = nodeBestDescendant;
+                    // Invariant: bestDescendant must be non-null when bestChild is set (required by rebase).
+                    // If this node has no descendant >= cutoff, the best descendant in this branch is the node itself.
+                    self.nodes.items[parent_idx].bestDescendant = nodeBestDescendant orelse node_idx;
                 }
             }
         }
@@ -2709,6 +2711,90 @@ test "rebase: deltas array is properly shrunk" {
     // Deltas array uses swapRemove, so length should also be reduced
     // The deltas array should have 7 elements now
     try std.testing.expect(ctx.fork_choice.deltas.items.len == 7);
+}
+
+test "rebase: bestChild/bestDescendant invariant maintained with cutoff_weight" {
+    // ========================================
+    // Test: applyDeltas with cutoff_weight preserves the invariant that
+    //       bestChild != null => bestDescendant != null
+    // ========================================
+    //
+    // This is a regression test for issue #545:
+    //   https://github.com/blockblaz/zeam/issues/545
+    //
+    // Scenario that previously caused a panic:
+    //   1. A fork branch (G -> H -> I) has zero attestation weight
+    //   2. applyDeltas is called with cutoff_weight > 0
+    //   3. For nodes on the zero-weight branch, nodeBestDescendant was computed as null
+    //      (because weight < cutoff and no descendant above cutoff)
+    //   4. BUT the parent (C) still set bestChild = G (because G was the only child on
+    //      that side, and updateBest was true when parent had no bestChild)
+    //   5. This created a state: bestChild = G, bestDescendant = null
+    //   6. A subsequent rebase() hit the assertion:
+    //      "invalid forkchoice with null best descendant for a non null best child"
+    //
+    // Tree (same as standard test tree):
+    //   A(0) -> B(1) -> C(2) -> D(3) -> E(4) -> F(5)
+    //                    \-> G(6) -> H(7) -> I(8)
+    //
+    // Setup:
+    //   - No attestations on fork branch (weight = 0 for G, H, I)
+    //   - All 4 validators vote for F (canonical chain gets all weight)
+    //   - cutoff_weight = 1 (above zero-weight nodes)
+    //
+    // After applyDeltas with cutoff_weight=1:
+    //   - Canonical chain: weight propagates from F -> E -> D -> C -> B -> A
+    //   - Fork branch: G(0), H(0), I(0) — all below cutoff
+    //   - C's bestChild should be D (higher weight), bestDescendant should be F
+    //   - G's bestChild may be set to H, but bestDescendant must NOT be null
+    //
+    // Then rebase to C — this previously panicked, now it should succeed.
+
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    // Only vote on the canonical chain — fork branch gets zero weight
+    for (0..4) |validator_id| {
+        const att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
+        try ctx.fork_choice.onGossipAttestation(att, true);
+    }
+
+    // Apply deltas WITH a non-zero cutoff weight.
+    // This is the key: cutoff_weight > 0 means nodes below cutoff get
+    // nodeBestDescendant = null in the old code, violating the invariant.
+    const deltas = try ctx.fork_choice.computeDeltas(true);
+    try ctx.fork_choice.protoArray.applyDeltas(deltas, 1);
+
+    // Verify the invariant: for ALL nodes, bestChild != null => bestDescendant != null
+    for (ctx.fork_choice.protoArray.nodes.items) |node| {
+        if (node.bestChild != null) {
+            try std.testing.expect(node.bestDescendant != null);
+        }
+    }
+
+    // Canonical chain should still have correct best pointers
+    // C(2): bestChild=3(D), bestDescendant=5(F) — canonical branch wins
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[2].bestChild.? == 3);
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[2].bestDescendant.? == 5);
+
+    // Now rebase to C — this is where the panic occurred in issue #545
+    try ctx.fork_choice.rebase(createTestRoot(0xCC), null);
+
+    // Verify 7 nodes remain (C, D, E, F, G, H, I)
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 7);
+
+    // Verify the invariant still holds after rebase
+    for (ctx.fork_choice.protoArray.nodes.items) |node| {
+        if (node.bestChild != null) {
+            try std.testing.expect(node.bestDescendant != null);
+        }
+    }
+
+    // Verify canonical chain is correct after rebase
+    // C(0): bestChild=1(D), bestDescendant=3(F)
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[0].bestChild.? == 1);
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[0].bestDescendant.? == 3);
 }
 
 test "rebase: to fork branch node (G) removes previous canonical chain" {
