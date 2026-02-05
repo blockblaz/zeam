@@ -799,6 +799,10 @@ pub const BeamChain = struct {
                 });
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
+                    if (err == AttestationValidationError.MissingState) {
+                        // Missing target state is expected under network reordering; drop to avoid error spam.
+                        return .{};
+                    }
                     self.module_logger.err("aggregated attestation processing error: {any}", .{err});
                     return err;
                 };
