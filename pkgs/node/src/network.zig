@@ -104,12 +104,12 @@ pub const Network = struct {
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
             .fetched_block_children = fetched_block_children,
-            .timed_out_requests = std.ArrayList(u64).init(allocator),
+            .timed_out_requests = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.timed_out_requests.deinit();
+        self.timed_out_requests.deinit(self.allocator);
 
         var rpc_it = self.pending_rpc_requests.iterator();
         while (rpc_it.next()) |entry| {
@@ -555,11 +555,11 @@ pub const Network = struct {
     }
 
     pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
-        self.timed_out_requests.clearRetainingCapacity();
+        self.timed_out_requests.clearAndFree(self.allocator);
         var it = self.pending_rpc_requests.iterator();
         while (it.next()) |entry| {
             if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
-                try self.timed_out_requests.append(entry.key_ptr.*);
+                try self.timed_out_requests.append(self.allocator, entry.key_ptr.*);
             }
         }
         return self.timed_out_requests.items;

@@ -954,15 +954,15 @@ pub const BeamNode = struct {
             switch (entry_ptr.request) {
                 .blocks_by_root => |block_ctx| {
                     // Copy roots + depths BEFORE finalize frees them
-                    var roots_to_retry = std.ArrayList(struct { root: types.Root, depth: u32 }).init(self.allocator);
-                    defer roots_to_retry.deinit();
+                    var roots_to_retry = std.ArrayList(struct { root: types.Root, depth: u32 }).empty;
+                    defer roots_to_retry.deinit(self.allocator);
 
                     for (block_ctx.requested_roots) |root| {
                         const depth = self.network.getPendingBlockRootDepth(root) orelse 0;
-                        roots_to_retry.append(.{ .root = root, .depth = depth }) catch continue;
+                        roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch continue;
                     }
 
-                    self.logger.warn("RPC request_id={d} to peer {s}{} timed out after {d}s, retrying {d} roots", .{
+                    self.logger.warn("RPC request_id={d} to peer {s}{any} timed out after {d}s, retrying {d} roots", .{
                         request_id,
                         block_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -982,7 +982,7 @@ pub const BeamNode = struct {
                     }
                 },
                 .status => |status_ctx| {
-                    self.logger.warn("status RPC request_id={d} to peer {s}{} timed out, finalizing", .{
+                    self.logger.warn("status RPC request_id={d} to peer {s}{any} timed out, finalizing", .{
                         request_id,
                         status_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),

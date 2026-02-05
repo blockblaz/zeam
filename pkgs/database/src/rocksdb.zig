@@ -233,7 +233,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     block,
                     cn,
-                    "added block to batch: root=0x{s}",
+                    "added block to batch: root=0x{x}",
                     .{&block_root},
                 );
             }
@@ -256,7 +256,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     state,
                     cn,
-                    "added state to batch: root=0x{s}",
+                    "added state to batch: root=0x{x}",
                     .{&state_root},
                 );
             }
@@ -296,7 +296,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                     key,
                     blockroot,
                     cn,
-                    "added finalized slot index to batch: slot={d} root=0x{s}",
+                    "added finalized slot index to batch: slot={d} root=0x{x}",
                     .{ slot, &blockroot },
                 );
             }
@@ -489,7 +489,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 block,
                 cn,
-                "saved block to database: root=0x{s}",
+                "saved block to database: root=0x{x}",
                 .{&block_root},
             );
         }
@@ -506,7 +506,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.SignedBlockWithAttestation,
                 key,
                 cn,
-                "loaded block from database: root=0x{s}",
+                "loaded block from database: root=0x{x}",
                 .{&block_root},
             );
         }
@@ -524,7 +524,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 key,
                 state,
                 cn,
-                "saved state to database: root=0x{s}",
+                "saved state to database: root=0x{x}",
                 .{&state_root},
             );
         }
@@ -541,7 +541,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 types.BeamState,
                 key,
                 cn,
-                "loaded state from database: root=0x{s}",
+                "loaded state from database: root=0x{x}",
                 .{&state_root},
             );
         }

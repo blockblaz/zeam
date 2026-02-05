@@ -351,7 +351,7 @@ pub const BeamState = struct {
             zeam_metrics.metrics.lean_state_transition_attestations_processed_total.incrBy(attestation_count);
         }
 
-        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots ={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
+        logger.debug("process attestations slot={d} \n prestate:historical hashes={d} justified slots={d} attestations={d}, ", .{ self.slot, self.historical_block_hashes.len(), self.justified_slots.len(), attestations.constSlice().len });
         const justified_str = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str);
         const finalized_str = try self.latest_finalized.toJsonString(allocator);
@@ -528,7 +528,7 @@ pub const BeamState = struct {
 
         try self.withJustifications(allocator, &justifications);
 
-        logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
+        logger.debug("poststate:historical hashes={d} justified slots={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
         const justified_str_final = try self.latest_justified.toJsonString(allocator);
         defer allocator.free(justified_str_final);
         const finalized_str_final = try self.latest_finalized.toJsonString(allocator);
