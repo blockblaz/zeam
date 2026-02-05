@@ -32,6 +32,17 @@ pub const ProtoNode = struct {
     weight: isize,
     bestChild: ?usize,
     bestDescendant: ?usize,
+    depth: usize, // depth from the anchor/forkchoice root
+
+    // idx of next sibling, for easy traversal of children 0 means no there is no next sibling as 0 is anchor root and isn't anyone's sibling
+    nextSibling: usize,
+    // idx of the first and latest added children for easy children traversal through siblings
+    firstChild: usize,
+    latestChild: usize,
+    numChildren: usize,
+
+    // info populated lazily for tree visualization in snapshot for efficiency purposes
+    numBranches: ?usize = null,
 
     pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
@@ -72,8 +83,25 @@ pub const ProtoArray = struct {
             _ = node;
             return;
         }
-
+        // index at which node will be inserted
+        const node_index = self.nodes.items.len;
         const parent = self.indices.get(block.parentRoot);
+
+        // some tree book keeping
+        var depth: usize = 0;
+        if (parent) |parent_id| {
+            depth = self.nodes.items[parent_id].depth + 1;
+
+            // update next sibling of the current parent's latest
+            const prevLatestChild = self.nodes.items[parent_id].latestChild;
+            if (prevLatestChild == 0) {
+                self.nodes.items[parent_id].firstChild = node_index;
+            } else {
+                self.nodes.items[prevLatestChild].nextSibling = node_index;
+            }
+            self.nodes.items[parent_id].latestChild = node_index;
+            self.nodes.items[parent_id].numChildren += 1;
+        }
 
         // TODO extend is not working so copy data for now
         // const node = utils.Extend(ProtoNode, block, .{
@@ -92,8 +120,14 @@ pub const ProtoArray = struct {
             .weight = 0,
             .bestChild = null,
             .bestDescendant = null,
+
+            // tree book keeping
+            .depth = depth,
+            .nextSibling = 0,
+            .firstChild = 0,
+            .latestChild = 0,
+            .numChildren = 0,
         };
-        const node_index = self.nodes.items.len;
         try self.nodes.append(node);
         try self.indices.put(node.blockRoot, node_index);
     }
@@ -333,6 +367,22 @@ pub const ForkChoice = struct {
         const nodes_copy = try allocator.alloc(ProtoNode, self.protoArray.nodes.items.len);
         @memcpy(nodes_copy, self.protoArray.nodes.items);
 
+        // populate numBranches
+        var node_natural_idx = nodes_copy.len;
+        while (node_natural_idx > 0) {
+            if (nodes_copy[node_natural_idx - 1].numBranches == null) {
+                // leaf of the forkchoice tree is always a branch by itself
+                nodes_copy[node_natural_idx - 1].numBranches = 1;
+            }
+
+            const numBranches = nodes_copy[node_natural_idx - 1].numBranches orelse @panic("invalid null num branches for node");
+            if (nodes_copy[node_natural_idx - 1].parent) |parent_idx| {
+                nodes_copy[parent_idx].numBranches = (nodes_copy[parent_idx].numBranches orelse 0) + numBranches;
+            }
+
+            node_natural_idx -= 1;
+        }
+
         // Get the full ProtoNode for head from protoArray
         const head_idx = self.protoArray.indices.get(self.head.blockRoot) orelse {
             // Fallback: create a ProtoNode from ProtoBlock if not found
@@ -347,6 +397,12 @@ pub const ForkChoice = struct {
                 .weight = 0,
                 .bestChild = null,
                 .bestDescendant = null,
+                .depth = 0,
+                .nextSibling = 0,
+                .firstChild = 0,
+                .latestChild = 0,
+                .numChildren = 0,
+                .numBranches = 1,
             };
             return Snapshot{
                 .head = head_node,
@@ -556,6 +612,7 @@ pub const ForkChoice = struct {
     fn rebaseUnlocked(self: *Self, targetAnchorRoot: types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) !void {
         const target_anchor_idx = self.protoArray.indices.get(targetAnchorRoot) orelse return ForkChoiceError.InvalidTargetAnchor;
         const target_anchor_slot = self.protoArray.nodes.items[target_anchor_idx].slot;
+        const target_anchor_depth = self.protoArray.nodes.items[target_anchor_idx].depth;
 
         var canonical_view = canonicalViewOrNull orelse blk: {
             var local_view = std.AutoHashMap(types.Root, void).init(self.allocator);
@@ -593,16 +650,30 @@ pub const ForkChoice = struct {
         // correct parent, bestChild and bestDescendant indices using the created old to new map
         current_idx = 0;
         while (current_idx < self.protoArray.nodes.items.len) {
-            // fix parent
             var current_node = self.protoArray.nodes.items[current_idx];
+            // correct depth
+            current_node.depth -= target_anchor_depth;
+
+            // fix parent, anchor i.e. 0rth entry of forkchoice has no parent and no sibling
             if (current_idx == 0) {
                 current_node.parent = null;
+                current_node.nextSibling = 0;
             } else {
                 // all other nodes should have parents, otherwise its an irrecoverable error as we have already
                 // modified forkchoice and can't be restored
                 const old_parent_idx = current_node.parent orelse @panic("invalid parent of the rebased unfinalized");
                 const new_parent_idx = old_indices_to_new.get(old_parent_idx);
                 current_node.parent = new_parent_idx;
+
+                if (current_node.nextSibling != 0) {
+                    current_node.nextSibling = old_indices_to_new.get(current_node.nextSibling) orelse @panic("invalid sibling of rebased unfinalized");
+                }
+            }
+
+            // fix firstChild and latestChild
+            if (current_node.latestChild != 0) {
+                current_node.firstChild = old_indices_to_new.get(current_node.firstChild) orelse @panic("invalid first child of rebased tree");
+                current_node.latestChild = old_indices_to_new.get(current_node.latestChild) orelse @panic("invalid latest child of rebaed tree");
             }
 
             // fix bestChild and descendant

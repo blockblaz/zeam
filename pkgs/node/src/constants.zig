@@ -20,3 +20,7 @@ pub const MAX_CACHED_BLOCKS = 1024;
 // Periodic state pruning interval: prune non-canonical states every N slots
 // Set to 7200 slots (approximately 8 hours in Lean, assuming 4 seconds per slot)
 pub const FORKCHOICE_PRUNING_INTERVAL_SLOTS: u64 = 7200;
+
+pub const MAX_FC_DISPLAY_DEPTH = 100;
+pub const MAX_FC_DISPLAY_BRANCH = 10;
+pub const MAX_FC_CHAIN_PRINT_DEPTH = 5;

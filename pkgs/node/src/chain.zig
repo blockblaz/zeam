@@ -213,7 +213,7 @@ pub const BeamChain = struct {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
-            self.printSlot(islot, null, self.connected_peers.count());
+            self.printSlot(islot, constants.MAX_FC_CHAIN_PRINT_DEPTH, self.connected_peers.count());
 
             // Periodic pruning: prune old non-canonical states every N slots
             // This ensures we prune even when finalization doesn't advance
@@ -463,17 +463,6 @@ pub const BeamChain = struct {
         const blocks_behind = if (slot > fc_head.slot) slot - fc_head.slot else 0;
         const is_timely = fc_head.timeliness;
 
-        // Build tree visualization (thread-safe snapshot)
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const tree_visual = blk: {
-            const snapshot = self.forkChoice.snapshot(arena.allocator()) catch {
-                break :blk "Failed to get fork choice snapshot";
-            };
-            defer snapshot.deinit(arena.allocator());
-            break :blk tree_visualizer.buildTreeVisualization(arena.allocator(), snapshot.nodes, tree_depth) catch "Tree visualization failed";
-        };
-
         const states_count = self.states.count();
         const fc_nodes_count = self.forkChoice.getNodeCount();
 
@@ -493,10 +482,6 @@ pub const BeamChain = struct {
             \\  Latest Justified:   Slot {d:>6} | Root: 0x{any}
             \\  Latest Finalized:   Slot {d:>6} | Root: 0x{any}
             \\+---------------------------------------------------------------+
-            \\  ForkChoice Tree:
-            \\{s}
-            \\+===============================================================+
-            \\
         , .{
             islot,
             fc_head.slot,
@@ -510,6 +495,24 @@ pub const BeamChain = struct {
             std.fmt.fmtSliceHexLower(&justified.root),
             finalized.slot,
             std.fmt.fmtSliceHexLower(&finalized.root),
+        });
+
+        // Build tree visualization (thread-safe snapshot)
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const tree_visual = blk: {
+            const snapshot = self.forkChoice.snapshot(arena.allocator()) catch {
+                break :blk "Failed to get fork choice snapshot";
+            };
+            defer snapshot.deinit(arena.allocator());
+            break :blk tree_visualizer.buildTreeVisualization(arena.allocator(), snapshot.nodes, tree_depth, null) catch "Tree visualization failed";
+        };
+        // Print forkchoice tree separate because when it gets big the logger skips the entire log
+        self.module_logger.info(
+            \\  ForkChoice Tree:
+            \\{s}
+            \\
+        , .{
             tree_visual,
         });
     }
