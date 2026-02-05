@@ -13,10 +13,6 @@ concurrency:
 
 name: CI
 
-env:
-  ZIG_LOCAL_CACHE_DIR: .zig-cache
-  ZIG_GLOBAL_CACHE_DIR: .zig-cache-global
-
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -31,7 +27,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -58,15 +54,15 @@ jobs:
         toolchain: stable
         components: clippy, rustfmt
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
     - name: Verify installation
       run: |
         rustc --version
         cargo --version
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Check Rust formatting
       run: |
@@ -100,7 +96,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -131,8 +127,8 @@ jobs:
       run: zig build all
 
   build-all-provers:
-    name: build-all-provers (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: build-all-provers
+    runs-on: ubuntu-latest
     needs: build  # Only run if the build job succeeds
     strategy:
       matrix:
@@ -154,7 +150,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -185,8 +181,8 @@ jobs:
       run: zig build -Dprover=all
 
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: test
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -208,7 +204,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -217,7 +213,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        shared-key: cargo-test
+        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -238,77 +234,24 @@ jobs:
     - name: Run all unit tests
       run: zig build test --summary all
 
-    # NOTE: Spectests are temporarily disabled while syncing spec changes.
-    # - name: Install uv
-    #   shell: bash
-    #   run: |
-    #     curl -LsSf https://astral.sh/uv/install.sh | sh
-    #     echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-    #
-    # - name: Generate LeanSpec fixtures
-    #   working-directory: leanSpec
-    #   run: uv run fill --clean --fork=devnet
-    # 
-    # - name: Generate spec fixtures
-    #   run: zig build spectest:generate --summary all
-    #
-    # - name: Run all spec tests
-    #   run: zig build spectest:run --summary all
-
-  simtest:
-    name: simtest (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    needs: test
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Set up Zig
-      uses: mlugg/setup-zig@v2.0.5
-      with:
-        version: 0.14.1
-
-    - name: Set up Rust/Cargo
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: nightly
-
-    - name: Cache Zig packages
-      uses: actions/cache@v3
-      with:
-        path: .zig-cache-global/p
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
-        restore-keys: |
-          ${{ runner.os }}-zig-packages-
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: "rust -> target"
-        shared-key: cargo-test
-
-    - name: Fetch Zig dependencies with retry
-      run: |
-        max_attempts=5
-        attempt=1
-        while [ $attempt -le $max_attempts ]; do
-          if zig build --fetch; then
-            echo "Successfully fetched dependencies on attempt $attempt"
-            exit 0
-          fi
-          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
-          sleep 5
-          attempt=$((attempt + 1))
-        done
-        echo "Failed to fetch dependencies after $max_attempts attempts"
-        exit 1
-
     - name: Run all sim tests
       run: zig build simtest --summary all
+
+    - name: Install uv
+      shell: bash
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Generate LeanSpec fixtures
+      working-directory: leanSpec
+      run: uv run fill --clean --fork=devnet
+    
+    - name: Generate spec fixtures
+      run: zig build spectest:generate --summary all
+
+    - name: Run all spec tests
+      run: zig build spectest:run --summary all
 
   dummy-prove:
     name: Dummy prove
@@ -332,7 +275,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
@@ -371,7 +314,7 @@ jobs:
     - name: Cache Zig packages
       uses: actions/cache@v3
       with:
-        path: .zig-cache-global/p
+        path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
         restore-keys: |
           ${{ runner.os }}-zig-packages-
