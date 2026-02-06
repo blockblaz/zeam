@@ -65,9 +65,6 @@ pub const GossipTopicSpec = struct {
         return .{ .topic = topic };
     }
 
-    pub fn attestationSubnet(subnet_id: usize) GossipTopicSpec {
-        return .{ .topic = .attestation, .subnet_id = subnet_id };
-    }
 };
 
 pub const GossipSub = struct {

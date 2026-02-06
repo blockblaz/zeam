@@ -374,26 +374,6 @@ pub const ForkChoice = struct {
         self.is_aggregator = is_aggregator;
     }
 
-    pub fn getLatestNewAttestations(self: *Self) ![]types.Attestation {
-        var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        errdefer included_attestations.deinit();
-
-        for (0..self.validator_count) |validator_id| {
-            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
-                .latestNew orelse ProtoAttestation{}).attestation_data;
-
-            if (attestation_data) |att_data| {
-                const attestation = types.Attestation{
-                    .data = att_data,
-                    .validator_id = @intCast(validator_id),
-                };
-                try included_attestations.append(attestation);
-            }
-        }
-
-        return included_attestations.toOwnedSlice();
-    }
-
     pub fn getAttestationsFromGossipSignatures(self: *Self) ![]types.Attestation {
         var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
         errdefer included_attestations.deinit();
@@ -413,10 +393,6 @@ pub const ForkChoice = struct {
         }
 
         return included_attestations.toOwnedSlice();
-    }
-
-    pub fn getLatestKnownAttestations(self: *Self) ![]types.Attestation {
-        return self.getProposalAttestations();
     }
 
     pub fn getProposalAttestations(self: *Self) ![]types.Attestation {
