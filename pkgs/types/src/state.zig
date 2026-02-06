@@ -244,8 +244,10 @@ pub const BeamState = struct {
         // this completes latest block header for parentRoot checks of new block
 
         if (std.mem.eql(u8, &self.latest_block_header.state_root, &utils.ZERO_HASH)) {
+            const slot_timer = zeam_metrics.lean_state_transition_state_root_in_slot_time_seconds.start();
             var prev_state_root: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(*BeamState, self, &prev_state_root, allocator);
+            _ = slot_timer.observe();
             self.latest_block_header.state_root = prev_state_root;
         }
     }
@@ -295,8 +297,10 @@ pub const BeamState = struct {
         }
 
         // 4. verify latest block header is the parent
+        const header_timer = zeam_metrics.lean_state_transition_block_header_hash_time_seconds.start();
         var head_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
+        _ = header_timer.observe();
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
             logger.err("state root={x:02} block root={x:02}\n", .{ head_root, staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
@@ -325,26 +329,35 @@ pub const BeamState = struct {
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
 
-    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, opts: anytype) !void {
         const block_timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
         defer _ = block_timer.observe();
+
+        const logger = if (@hasField(@TypeOf(opts), "logger")) opts.logger else opts;
 
         // start block processing
         try self.process_block_header(allocator, staged_block, logger);
 
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
-        try self.process_operations(allocator, staged_block, logger);
+        try self.process_operations(allocator, staged_block, opts);
     }
 
-    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, opts: anytype) !void {
+        // Compute current block root for cache population
+        var current_block_root: Root = undefined;
+        try zeam_utils.hashTreeRoot(BeamBlock, staged_block, &current_block_root, allocator);
+
         // 1. process attestations
-        try self.process_attestations(allocator, staged_block.body.attestations, logger);
+        try self.process_attestations(allocator, staged_block.body.attestations, staged_block.parent_root, current_block_root, opts);
     }
 
-    fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, logger: zeam_utils.ModuleLogger) !void {
+    fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, parent_root: Root, current_block_root: Root, opts: anytype) !void {
         const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
         defer _ = attestations_timer.observe();
+
+        const logger = if (@hasField(@TypeOf(opts), "logger")) opts.logger else opts;
+        const justifications_cache = if (@hasField(@TypeOf(opts), "justifications_cache")) opts.justifications_cache else null;
 
         if (comptime !zeam_metrics.isZKVM()) {
             const attestation_count: u64 = @intCast(attestations.constSlice().len);
@@ -371,7 +384,41 @@ pub const BeamState = struct {
             justifications.deinit(allocator);
         }
         errdefer justifications.deinit(allocator);
-        try self.getJustification(allocator, &justifications);
+
+        // Try to use cached justifications if available
+        const get_just_timer = zeam_metrics.lean_state_transition_get_justification_time_seconds.start();
+        if (justifications_cache) |cache| {
+            if (cache.get(parent_root)) |cached_map| {
+                // Cache hit - clone the cached justifications map
+                const cache_hit_timer = zeam_metrics.lean_state_transition_justifications_cache_hit_time_seconds.start();
+                var it = cached_map.iterator();
+                while (it.next()) |entry| {
+                    const cloned_value = try allocator.dupe(u8, entry.value_ptr.*);
+                    try justifications.put(allocator, entry.key_ptr.*, cloned_value);
+                }
+                _ = cache_hit_timer.observe();
+                if (comptime !zeam_metrics.isZKVM()) {
+                    zeam_metrics.metrics.lean_state_transition_justifications_cache_hits_total.incr();
+                }
+            } else {
+                // Cache miss - build from state
+                const cache_miss_timer = zeam_metrics.lean_state_transition_justifications_cache_miss_time_seconds.start();
+                try self.getJustification(allocator, &justifications);
+                _ = cache_miss_timer.observe();
+                if (comptime !zeam_metrics.isZKVM()) {
+                    zeam_metrics.metrics.lean_state_transition_justifications_cache_misses_total.incr();
+                }
+            }
+        } else {
+            // No cache available - build from state (counts as miss)
+            const cache_miss_timer = zeam_metrics.lean_state_transition_justifications_cache_miss_time_seconds.start();
+            try self.getJustification(allocator, &justifications);
+            _ = cache_miss_timer.observe();
+            if (comptime !zeam_metrics.isZKVM()) {
+                zeam_metrics.metrics.lean_state_transition_justifications_cache_misses_total.incr();
+            }
+        }
+        _ = get_just_timer.observe();
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
@@ -396,7 +443,10 @@ pub const BeamState = struct {
             const attestation_str = try attestation_data.toJsonString(allocator);
             defer allocator.free(attestation_str);
 
-            logger.debug("processing attestation={s} validators_count={d}\n", .{ attestation_str, validator_indices.items.len });
+            logger.debug(
+                "processing attestation={s} validators_count={d}\n",
+                .{ attestation_str, validator_indices.items.len },
+            );
 
             const historical_len: Slot = @intCast(self.historical_block_hashes.len());
             if (source_slot >= historical_len) {
@@ -526,7 +576,9 @@ pub const BeamState = struct {
             }
         }
 
+        const with_just_timer = zeam_metrics.lean_state_transition_with_justifications_time_seconds.start();
         try self.withJustifications(allocator, &justifications);
+        _ = with_just_timer.observe();
 
         logger.debug("poststate:historical hashes={d} justified slots ={d}\n justifications_roots:{d}\n justifications_validators={d}\n", .{ self.historical_block_hashes.len(), self.justified_slots.len(), self.justifications_roots.len(), self.justifications_validators.len() });
         const justified_str_final = try self.latest_justified.toJsonString(allocator);
@@ -535,6 +587,34 @@ pub const BeamState = struct {
         defer allocator.free(finalized_str_final);
 
         logger.debug("poststate: justified={s} finalized={s}", .{ justified_str_final, finalized_str_final });
+
+        // Populate cache with processed justifications for next block to reuse
+        if (justifications_cache) |cache| {
+            // Clone the justifications map before it gets freed
+            var cloned_map: std.AutoHashMapUnmanaged(Root, []u8) = .empty;
+            var it = justifications.iterator();
+            while (it.next()) |entry| {
+                const cloned_value = try allocator.dupe(u8, entry.value_ptr.*);
+                try cloned_map.put(allocator, entry.key_ptr.*, cloned_value);
+            }
+            // Store in cache for future blocks
+            try cache.put(current_block_root, cloned_map);
+
+            // Evict all entries except current and parent (only parent is ever looked up)
+            var evict_it = cache.iterator();
+            while (evict_it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.eql(u8, &key, &current_block_root) or std.mem.eql(u8, &key, &parent_root)) {
+                    continue;
+                }
+                var val_it = entry.value_ptr.iterator();
+                while (val_it.next()) |val_entry| {
+                    allocator.free(val_entry.value_ptr.*);
+                }
+                entry.value_ptr.deinit(allocator);
+                cache.removeByPtr(entry.key_ptr);
+            }
+        }
     }
 
     pub fn genGenesisBlock(self: *const Self, allocator: Allocator, genesis_block: *block.BeamBlock) !void {
@@ -974,7 +1054,7 @@ test "pruning keeps pending justifications" {
     try attestations_list.append(att_1_to_2);
     att_1_to_2_transferred = true;
 
-    try state.process_attestations(std.testing.allocator, attestations_list, logger);
+    try state.process_attestations(std.testing.allocator, attestations_list, utils.ZERO_HASH, utils.ZERO_HASH, logger);
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
