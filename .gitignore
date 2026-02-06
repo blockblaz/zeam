@@ -30,3 +30,6 @@ data/
 
 # VSCode files
 .vscode/
+
+# Tool versions
+.tool-versions
