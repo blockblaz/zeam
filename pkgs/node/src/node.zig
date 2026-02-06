@@ -894,7 +894,7 @@ pub const BeamNode = struct {
             const interval = @mod(itime_intervals, constants.INTERVALS_PER_SLOT);
 
             if (interval == 1) {
-                self.chain.printSlot(islot, self.network.getPeerCount());
+                self.chain.printSlot(islot, constants.MAX_FC_CHAIN_PRINT_DEPTH, self.network.getPeerCount());
             }
             return;
         }
@@ -1091,7 +1091,6 @@ test "Node peer tracking on connect/disconnect" {
     const allocator = arena_allocator.allocator();
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     // Create empty node registry for test - shared between Mock and node
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -1154,7 +1153,7 @@ test "Node peer tracking on connect/disconnect" {
         .validator_ids = null,
         .nodeId = 0,
         .db = db,
-        .logger_config = &ctx.logger_config,
+        .logger_config = ctx.logger_config,
         .node_registry = test_registry,
     });
     defer node.deinit();
@@ -1216,7 +1215,6 @@ test "Node: fetched blocks cache and deduplication" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1329,7 +1327,6 @@ test "Node: processCachedDescendants basic flow" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1446,7 +1443,6 @@ test "Node: pruneCachedBlocks removes root and all cached descendants" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1522,7 +1518,6 @@ test "Node: pruneCachedBlocks removes entire chain including ancestors" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1601,7 +1596,6 @@ test "Node: pruneCachedBlocks removes cached descendants even if root is not cac
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1661,7 +1655,6 @@ test "Node: pruneCachedBlocks with finalized checkpoint keeps finalized descenda
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1730,7 +1723,6 @@ test "Node: pruneCachedBlocks skips pruning finalized root" {
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger();
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();
@@ -1778,7 +1770,6 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
 
     var ctx = try testing.NodeTestContext.init(allocator, .{});
     defer ctx.deinit();
-    ctx.fixupDbLogger(); // Fix dangling logger pointer after struct has stable address
 
     var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
     defer mock.deinit();

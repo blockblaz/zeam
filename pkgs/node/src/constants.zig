@@ -21,6 +21,11 @@ pub const MAX_CACHED_BLOCKS = 1024;
 // Set to 7200 slots (approximately 8 hours in Lean, assuming 4 seconds per slot)
 pub const FORKCHOICE_PRUNING_INTERVAL_SLOTS: u64 = 7200;
 
+// Forkchoice visualization constants
+pub const MAX_FC_DISPLAY_DEPTH = 100;
+pub const MAX_FC_DISPLAY_BRANCH = 10;
+pub const MAX_FC_CHAIN_PRINT_DEPTH = 5;
+
 // Timeout for pending RPC requests in seconds.
 // If a peer does not respond within this duration, the request is finalized and retried
 // with a different peer. 2 slots at 4s/slot is generous for latency while ensuring
