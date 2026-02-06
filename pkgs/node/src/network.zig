@@ -43,7 +43,16 @@ pub const PendingRPC = union(enum) {
     }
 };
 
-pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPC);
+pub const PendingRPCEntry = struct {
+    request: PendingRPC,
+    created_at: i64,
+
+    pub fn deinit(self: *PendingRPCEntry, allocator: Allocator) void {
+        self.request.deinit(allocator);
+    }
+};
+
+pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPCEntry);
 // key: block root, value: depth
 pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
@@ -64,6 +73,7 @@ pub const Network = struct {
     pending_block_roots: PendingBlockRootMap,
     fetched_blocks: FetchedBlockMap,
     fetched_block_children: ChildrenMap,
+    timed_out_requests: std.ArrayList(u64),
 
     const Self = @This();
 
@@ -94,10 +104,13 @@ pub const Network = struct {
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
             .fetched_block_children = fetched_block_children,
+            .timed_out_requests = std.ArrayList(u64).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.timed_out_requests.deinit();
+
         var rpc_it = self.pending_rpc_requests.iterator();
         while (rpc_it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -236,7 +249,7 @@ pub const Network = struct {
             defer request_ids_to_remove.deinit();
 
             while (rpc_it.next()) |rpc_entry| {
-                const pending_peer_id = switch (rpc_entry.value_ptr.*) {
+                const pending_peer_id = switch (rpc_entry.value_ptr.request) {
                     .status => |*ctx| ctx.peer_id,
                     .blocks_by_root => |*ctx| ctx.peer_id,
                 };
@@ -441,7 +454,10 @@ pub const Network = struct {
 
         const request_id = try self.sendStatus(peer_id, status, handler);
 
-        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+            .request = pending,
+            .created_at = std.time.timestamp(),
+        }) catch |err| {
             pending.deinit(self.allocator);
             return err;
         };
@@ -493,7 +509,10 @@ pub const Network = struct {
             return err;
         };
 
-        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+            .request = pending,
+            .created_at = std.time.timestamp(),
+        }) catch |err| {
             pending.deinit(self.allocator);
             return err;
         };
@@ -531,14 +550,25 @@ pub const Network = struct {
         };
     }
 
-    pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPC {
+    pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPCEntry {
         return self.pending_rpc_requests.getPtr(request_id);
+    }
+
+    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
+        self.timed_out_requests.clearRetainingCapacity();
+        var it = self.pending_rpc_requests.iterator();
+        while (it.next()) |entry| {
+            if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
+                try self.timed_out_requests.append(entry.key_ptr.*);
+            }
+        }
+        return self.timed_out_requests.items;
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {
         if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
-            var ctx = entry.value;
-            switch (ctx) {
+            var rpc_entry = entry.value;
+            switch (rpc_entry.request) {
                 .blocks_by_root => |block_ctx| {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.removePendingBlockRoot(root);
@@ -546,7 +576,7 @@ pub const Network = struct {
                 },
                 .status => {},
             }
-            ctx.deinit(self.allocator);
+            rpc_entry.deinit(self.allocator);
         }
     }
 };
