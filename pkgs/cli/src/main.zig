@@ -547,6 +547,7 @@ fn mainInner() !void {
                 .db = db_1,
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
+                .is_aggregator = true, // This node is the designated aggregator
             });
 
             var beam_node_2: BeamNode = undefined;
@@ -562,6 +563,7 @@ fn mainInner() !void {
                 .db = db_2,
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
+                // Not an aggregator - will receive aggregated attestations from node 1
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -579,6 +581,7 @@ fn mainInner() !void {
                 .db = db_3,
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
+                // Not an aggregator - will receive aggregated attestations from node 1
             });
 
             // Delayed runner - starts both network3 and node3 together

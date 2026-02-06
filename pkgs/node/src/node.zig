@@ -64,8 +64,9 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         errdefer allocator.destroy(chain);
 
-        const has_validators = if (opts.validator_ids) |ids| ids.len > 0 else false;
-        const is_aggregator = has_validators and opts.is_aggregator;
+        // is_aggregator controls whether the node performs attestation aggregation
+        // Default is false - nodes will attest but not aggregate unless explicitly enabled
+        const is_aggregator = opts.is_aggregator;
         chain.* = try chainFactory.BeamChain.init(
             allocator,
             chainFactory.ChainOpts{
