@@ -558,6 +558,8 @@ pub fn build(b: *Builder) !void {
     const api_tests = b.addTest(.{
         .root_module = zeam_api,
     });
+    api_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, api_tests, target, prover);
     const run_api_tests = b.addRunArtifact(api_tests);
     setTestRunLabelFromCompile(b, run_api_tests, api_tests);
     test_step.dependOn(&run_api_tests.step);
