@@ -50,7 +50,7 @@ pub const SignaturesMap = std.AutoHashMap(SignatureKey, StoredSignature);
 
 /// Stored aggregated payload entry
 pub const StoredAggregatedPayload = struct {
-    /// Slot of the attested data (used for pruning).
+    /// Slot of the attested data (metadata; pruning is based on attestation target).
     attestation_slot: Slot,
     /// Slot when the proof was learned (used for tie-break ordering).
     source_slot: Slot,

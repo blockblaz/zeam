@@ -1272,11 +1272,21 @@ pub const ForkChoice = struct {
     /// Prune gossip_signatures, aggregated payload maps, and attestation data for finalized slots.
     /// This is called after finalization to clean up signature data that is no longer needed.
     ///
-    /// Note: We prune by attestation_slot (not source_slot). Once the data is finalized,
-    /// any proofs for it are irrelevant even if learned later.
+    /// Spec-aligned: prune entries whose attestation *target* slot is at or before finalized.
     pub fn pruneSignatureMaps(self: *Self, finalized_slot: types.Slot) !void {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
+        var stale_roots = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer stale_roots.deinit();
+
+        var data_it = self.attestation_data_by_root.iterator();
+        while (data_it.next()) |entry| {
+            if (entry.value_ptr.target.slot <= finalized_slot) {
+                try stale_roots.put(entry.key_ptr.*, {});
+            }
+        }
+        if (stale_roots.count() == 0) return;
+
         var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
         defer gossip_keys_to_remove.deinit();
 
@@ -1284,17 +1294,16 @@ pub const ForkChoice = struct {
         defer payload_keys_to_remove.deinit();
         var new_payload_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
         defer new_payload_keys_to_remove.deinit();
-        var data_roots_to_remove = std.ArrayList(types.Root).init(self.allocator);
-        defer data_roots_to_remove.deinit();
 
         var gossip_removed: usize = 0;
         var payloads_removed: usize = 0;
         var new_payloads_removed: usize = 0;
+        var data_removed: usize = 0;
 
-        // Identify gossip signatures that are at or before the finalized slot
+        // Identify gossip signatures that reference stale attestation data
         var gossip_it = self.gossip_signatures.iterator();
         while (gossip_it.next()) |entry| {
-            if (entry.value_ptr.slot <= finalized_slot) {
+            if (stale_roots.contains(entry.key_ptr.*.data_root)) {
                 try gossip_keys_to_remove.append(entry.key_ptr.*);
             }
         }
@@ -1305,91 +1314,59 @@ pub const ForkChoice = struct {
             }
         }
 
-        // Prune aggregated payload proofs by slot as well (known payloads)
+        // Prune aggregated payload proofs by stale data roots (known payloads)
         var payload_it = self.aggregated_payloads.iterator();
         while (payload_it.next()) |entry| {
-            var list = entry.value_ptr;
-            var write_index: usize = 0;
-            var removed_here: usize = 0;
-
-            for (list.items) |*stored| {
-                if (stored.attestation_slot <= finalized_slot) {
-                    stored.proof.deinit();
-                    removed_here += 1;
-                } else {
-                    list.items[write_index] = stored.*;
-                    write_index += 1;
-                }
-            }
-
-            if (removed_here > 0) {
-                payloads_removed += removed_here;
-                list.items = list.items[0..write_index];
-            }
-
-            if (list.items.len == 0) {
+            if (stale_roots.contains(entry.key_ptr.*.data_root)) {
                 try payload_keys_to_remove.append(entry.key_ptr.*);
             }
         }
 
-        // Prune aggregated payload proofs by slot as well (new payloads)
+        // Prune aggregated payload proofs by stale data roots (new payloads)
         var new_payload_it = self.new_aggregated_payloads.iterator();
         while (new_payload_it.next()) |entry| {
-            var list = entry.value_ptr;
-            var write_index: usize = 0;
-            var removed_here: usize = 0;
-
-            for (list.items) |*stored| {
-                if (stored.attestation_slot <= finalized_slot) {
-                    stored.proof.deinit();
-                    removed_here += 1;
-                } else {
-                    list.items[write_index] = stored.*;
-                    write_index += 1;
-                }
-            }
-
-            if (removed_here > 0) {
-                new_payloads_removed += removed_here;
-                list.items = list.items[0..write_index];
-            }
-
-            if (list.items.len == 0) {
+            if (stale_roots.contains(entry.key_ptr.*.data_root)) {
                 try new_payload_keys_to_remove.append(entry.key_ptr.*);
             }
         }
 
         for (payload_keys_to_remove.items) |sig_key| {
             if (self.aggregated_payloads.fetchRemove(sig_key)) |kv| {
+                for (kv.value.items) |*item| {
+                    item.proof.deinit();
+                }
+                payloads_removed += kv.value.items.len;
                 kv.value.deinit();
             }
         }
 
         for (new_payload_keys_to_remove.items) |sig_key| {
             if (self.new_aggregated_payloads.fetchRemove(sig_key)) |kv| {
+                for (kv.value.items) |*item| {
+                    item.proof.deinit();
+                }
+                new_payloads_removed += kv.value.items.len;
                 kv.value.deinit();
             }
         }
 
-        // Prune attestation data by root for finalized slots
-        var data_it = self.attestation_data_by_root.iterator();
-        while (data_it.next()) |entry| {
-            if (entry.value_ptr.slot <= finalized_slot) {
-                try data_roots_to_remove.append(entry.key_ptr.*);
+        // Prune attestation data by root for finalized slots (target.slot <= finalized_slot)
+        var stale_it = stale_roots.keyIterator();
+        while (stale_it.next()) |data_root_ptr| {
+            if (self.attestation_data_by_root.remove(data_root_ptr.*)) {
+                data_removed += 1;
             }
-        }
-        for (data_roots_to_remove.items) |data_root| {
-            _ = self.attestation_data_by_root.remove(data_root);
         }
 
         // Rebuild per-validator attestation trackers after pruning.
         try self.rebuildAttestationTrackersFromPayloadsLocked();
 
-        if (gossip_removed > 0 or payloads_removed > 0 or new_payloads_removed > 0) {
-            self.logger.debug("pruned signature maps: gossip_signatures={d} aggregated_payload_proofs={d} new_payload_proofs={d} for finalized_slot={d}", .{
+        if (gossip_removed > 0 or payloads_removed > 0 or new_payloads_removed > 0 or data_removed > 0) {
+            self.logger.debug("pruned signature maps: gossip_signatures={d} aggregated_payload_proofs={d} new_payload_proofs={d} attestation_data={d} for finalized_slot={d}", .{
                 gossip_removed,
                 payloads_removed,
                 new_payloads_removed,
+                data_removed,
                 finalized_slot,
             });
         }
