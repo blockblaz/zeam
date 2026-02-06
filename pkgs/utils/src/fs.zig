@@ -59,7 +59,7 @@ test "readFileToEndAlloc with relative path" {
     const test_content = "Hello from relative path!";
 
     const file = try std.fs.cwd().createFile(test_file, .{});
-    var write_buf: [256]u8 = undefined;
+    var write_buf: [test_content.len]u8 = undefined;
     var writer = file.writer(&write_buf);
     try writer.interface.writeAll(test_content);
     try writer.interface.flush();
@@ -77,7 +77,7 @@ test "readFileToEndAlloc with absolute path" {
     const test_content = "Hello from absolute path!";
 
     const file = try std.fs.cwd().createFile(test_file, .{});
-    var write_buf: [256]u8 = undefined;
+    var write_buf: [test_content.len]u8 = undefined;
     var writer = file.writer(&write_buf);
     try writer.interface.writeAll(test_content);
     try writer.interface.flush();

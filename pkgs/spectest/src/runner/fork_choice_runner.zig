@@ -618,7 +618,7 @@ fn processBlockStep(
     const parent_state_ptr = ctx.state_map.get(block.parent_root) orelse {
         std.debug.print(
             "fixture {s} case {s}{any}: parent root 0x{x} unknown\n",
-            .{ fixture_path, case_name, formatStep(step_index), block.parent_root },
+            .{ fixture_path, case_name, formatStep(step_index), &block.parent_root },
         );
         return FixtureError.FixtureMismatch;
     };

@@ -213,7 +213,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            opts.logger.debug("state root={x} block root={x}\n", .{ state_root, block.state_root });
+            opts.logger.debug("state root={x} block root={x}\n", .{ &state_root, &block.state_root });
             return StateTransitionError.InvalidPostState;
         }
     }

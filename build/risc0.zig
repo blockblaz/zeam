@@ -26,18 +26,18 @@ pub fn main() !void {
         var write_buf: [4096]u8 = undefined;
         var writer = file.writer(&write_buf);
 
-        // magic + binary format
+        // magic + binary format (risc0 format is little-endian)
         try writer.interface.writeAll(magic);
-        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @intCast(BinaryFormatVersion))));
+        try writer.interface.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, BinaryFormatVersion)));
 
         // write program header + len as u32
         const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
-        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @intCast(header.len))));
+        try writer.interface.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(header.len))));
         // program header
         try writer.interface.writeAll(header);
 
         // user data length + data
-        try writer.interface.writeAll(&std.mem.toBytes(@as(u32, @truncate(bindata.len))));
+        try writer.interface.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, @truncate(bindata.len))));
         try writer.interface.writeAll(bindata);
 
         // DO NOT write the kernel length, it's inferred

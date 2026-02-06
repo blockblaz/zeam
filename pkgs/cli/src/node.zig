@@ -666,8 +666,8 @@ fn verifyCheckpointState(
         state.slot,
         state.config.genesis_time,
         actual_validators,
-        state_block_header.state_root,
-        block_root,
+        &state_block_header.state_root,
+        &block_root,
     });
 }
 
@@ -1213,7 +1213,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
 
     // Verify the state root matches the expected value
-    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{state_root_from_genesis});
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&state_root_from_genesis});
     defer allocator.free(state_root_from_genesis_hex);
     try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
 }

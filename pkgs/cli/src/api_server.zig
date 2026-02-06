@@ -82,10 +82,20 @@ const ApiServer = struct {
     fn handleConnection(self: *const Self, connection: std.net.Server.Connection) void {
         defer connection.stream.close();
 
-        var read_buffer: [4096]u8 = undefined;
-        var write_buffer: [4096]u8 = undefined;
-        var stream_reader = connection.stream.reader(&read_buffer);
-        var stream_writer = connection.stream.writer(&write_buffer);
+        const read_buffer = self.allocator.alloc(u8, 4096) catch {
+            self.logger.err("failed to allocate read buffer", .{});
+            return;
+        };
+        defer self.allocator.free(read_buffer);
+        const write_buffer = self.allocator.alloc(u8, 4096) catch {
+            self.logger.err("failed to allocate write buffer", .{});
+            return;
+        };
+        defer self.allocator.free(write_buffer);
+
+        var stream_reader = connection.stream.reader(read_buffer);
+        var stream_writer = connection.stream.writer(write_buffer);
+
         var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
         var request = http_server.receiveHead() catch |err| {
             self.logger.warn("failed to receive HTTP head: {}", .{err});
@@ -122,17 +132,19 @@ const ApiServer = struct {
     }
 
     /// Handle metrics endpoint
-    fn handleMetrics(_: *const Self, request: *std.http.Server.Request) void {
-        // 64KiB buffer for metrics output: ipv4 max limit
-        var buffer: [65536]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
+    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
+        var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer allocating_writer.deinit();
 
-        api.writeMetrics(&writer) catch {
+        api.writeMetrics(&allocating_writer.writer) catch {
             _ = request.respond("Internal Server Error\n", .{}) catch {};
             return;
         };
 
-        _ = request.respond(buffer[0..writer.end], .{
+        // Get the written data from the allocating writer
+        const written_data = allocating_writer.writer.buffer[0..allocating_writer.writer.end];
+
+        _ = request.respond(written_data, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },

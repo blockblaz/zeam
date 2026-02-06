@@ -38,7 +38,7 @@ pub const ProtoNode = struct {
         try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{x} }}", .{
             self.slot,
             self.weight,
-            self.blockRoot,
+            &self.blockRoot,
         });
     }
 };
@@ -451,7 +451,7 @@ pub const ForkChoice = struct {
             if (canonical_blocks.contains(current_node.blockRoot)) {
                 if (current_node.slot <= target_anchor_slot) {
                     self.logger.debug("adding confirmed canonical root={x} slot={d} index={d} parent={any}", .{
-                        current_node.blockRoot,
+                        &current_node.blockRoot,
                         current_node.slot,
                         current_idx,
                         current_node.parent,
@@ -474,10 +474,10 @@ pub const ForkChoice = struct {
             for (canonical_roots.items, 0..) |root, index| {
                 self.logger.err("canonical root at index={d} {x}", .{
                     index,
-                    root,
+                    &root,
                 });
             }
-            self.logger.err("targetAnchorRoot is {x}", .{targetAnchorRoot});
+            self.logger.err("targetAnchorRoot is {x}", .{&targetAnchorRoot});
             return ForkChoiceError.InvalidCanonicalTraversal;
         }
 

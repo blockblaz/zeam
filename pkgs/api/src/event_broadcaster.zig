@@ -8,6 +8,10 @@ const Checkpoint = types.Checkpoint;
 const Mutex = Thread.Mutex;
 const Thread = std.Thread;
 
+/// Maximum size of the SSE send buffer in event_broadcaster.zig. Serialized events
+/// must not exceed this to avoid buffer overflow when sending.
+pub const sse_send_buffer_size = 512;
+
 /// SSE connection wrapper
 pub const SSEConnection = struct {
     stream: std.net.Stream,
@@ -26,7 +30,7 @@ pub const SSEConnection = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var write_buf: [4096]u8 = undefined;
+        var write_buf: [sse_send_buffer_size]u8 = undefined;
         var writer = self.stream.writer(&write_buf);
         try writer.interface.writeAll(event_json);
         try writer.interface.flush();
@@ -187,41 +191,36 @@ test "event broadcaster basic functionality" {
     // Test initial state
     try std.testing.expect(broadcaster.getConnectionCount() == 0);
 
-    // Create a mock stream (we'll use a pipe for testing)
-    const pipe = try std.os.pipe();
-    defer {
-        std.os.close(pipe[0]);
-        std.os.close(pipe[1]);
+    // Use a socket pair so the stream is a real socket (std.net.Stream's writer uses sendmsg, which requires a socket, not a pipe fd).
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
     }
+    defer std.posix.close(fds[0]); // read end; write end fds[1] is owned by the connection and closed in broadcaster.deinit()
 
-    const stream = std.net.Stream{ .handle = pipe[1] };
+    const stream = std.net.Stream{ .handle = fds[1] };
 
     // Add connection
     try broadcaster.addConnection(stream);
     try std.testing.expect(broadcaster.getConnectionCount() == 1);
 
-    // Test broadcasting an event
+    // Test broadcasting an event (writes to the socket; read end fds[0] is left open so the write succeeds)
     const proto_block = types.ProtoBlock{
         .slot = 123,
         .blockRoot = [_]u8{1} ** 32,
         .parentRoot = [_]u8{2} ** 32,
         .stateRoot = [_]u8{3} ** 32,
         .timeliness = true,
+        .confirmed = true,
     };
 
     const head_event = try events.NewHeadEvent.fromProtoBlock(allocator, proto_block);
-    defer head_event.deinit(allocator);
 
     var chain_event = events.ChainEvent{ .new_head = head_event };
 
-    // This should not error even if the pipe is closed
-    broadcaster.broadcastEvent(&chain_event) catch |err| {
-        // Expected to fail since we're using a pipe, but should handle gracefully
-        std.log.debug("Expected broadcast error in test: {}", .{err});
-    };
+    try broadcaster.broadcastEvent(&chain_event);
 
-    // Connection should be removed due to send failure
-    try std.testing.expect(broadcaster.getConnectionCount() == 0);
+    try std.testing.expect(broadcaster.getConnectionCount() == 1);
 }
 
 test "global broadcaster functionality" {
@@ -240,7 +239,6 @@ test "global broadcaster functionality" {
     };
 
     const just_event = try events.NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123);
-    defer just_event.deinit(allocator);
 
     var chain_event = events.ChainEvent{ .new_justification = just_event };
 

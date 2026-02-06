@@ -555,6 +555,13 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
+    const api_tests = b.addTest(.{
+        .root_module = zeam_api,
+    });
+    const run_api_tests = b.addRunArtifact(api_tests);
+    setTestRunLabelFromCompile(b, run_api_tests, api_tests);
+    test_step.dependOn(&run_api_tests.step);
+
     const xmss_tests = b.addTest(.{
         .root_module = zeam_xmss,
     });

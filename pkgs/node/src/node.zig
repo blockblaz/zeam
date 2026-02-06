@@ -125,7 +125,7 @@ pub const BeamNode = struct {
 
                 self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{any} hasParentBlock={} from peer={s}{any}", .{
                     block.slot,
-                    parent_root,
+                    &parent_root,
                     block.proposer_index,
                     self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
                     hasParentBlock,
@@ -147,9 +147,9 @@ pub const BeamNode = struct {
                         self.logger.debug(
                             "Cached gossip block 0x{x} at slot {d}, fetching parent 0x{x}",
                             .{
-                                block_root,
+                                &block_root,
                                 block.slot,
-                                parent_root,
+                                &parent_root,
                             },
                         );
                     } else |err| {
@@ -158,14 +158,14 @@ pub const BeamNode = struct {
                             self.logger.info(
                                 "gossip block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
                                 .{
-                                    block_root,
+                                    &block_root,
                                     block.slot,
                                 },
                             );
                             _ = self.network.pruneCachedBlocks(block_root, null);
                         } else {
                             self.logger.warn("failed to cache gossip block 0x{x}: {any}", .{
-                                block_root,
+                                &block_root,
                                 err,
                             });
                         }
@@ -201,7 +201,7 @@ pub const BeamNode = struct {
                         if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
                             self.logger.info(
                                 "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                                .{block_root},
+                                .{&block_root},
                             );
                             _ = self.network.pruneCachedBlocks(block_root, null);
                         } else |_| {}
@@ -217,12 +217,12 @@ pub const BeamNode = struct {
                         if (self.network.hasPendingBlockRoot(parent_root)) {
                             self.logger.debug("gossip block validation deferred slot={d} parent=0x{x} (parent fetch in progress)", .{
                                 block.slot,
-                                parent_root,
+                                &parent_root,
                             });
                         } else {
                             self.logger.warn("gossip block validation failed slot={d} with unknown parent=0x{x}", .{
                                 block.slot,
-                                parent_root,
+                                &parent_root,
                             });
                         }
                     }
@@ -268,7 +268,7 @@ pub const BeamNode = struct {
         if (result.processed_block_root) |processed_root| {
             self.logger.debug(
                 "gossip block 0x{x} successfully processed, checking for cached descendants",
-                .{processed_root},
+                .{&processed_root},
             );
             self.processCachedDescendants(processed_root);
         }
@@ -338,7 +338,7 @@ pub const BeamNode = struct {
 
         self.logger.debug(
             "Found {d} cached descendant(s) of block 0x{x}",
-            .{ descendants_to_process.items.len, parent_root },
+            .{ descendants_to_process.items.len, &parent_root },
         );
 
         // Try to process each descendant
@@ -346,7 +346,7 @@ pub const BeamNode = struct {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
-                    .{descendant_root},
+                    .{&descendant_root},
                 );
 
                 const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
@@ -354,20 +354,20 @@ pub const BeamNode = struct {
                         // Parent still missing, keep it cached
                         self.logger.debug(
                             "Cached block 0x{x} still missing parent, keeping in cache",
-                            .{descendant_root},
+                            .{&descendant_root},
                         );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
                         // Prune this block and all its cached descendants; they are no longer useful.
                         self.logger.info(
                             "cached block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                            .{descendant_root},
+                            .{&descendant_root},
                         );
                         _ = self.network.pruneCachedBlocks(descendant_root, null);
                     } else {
                         self.logger.warn(
                             "Failed to process cached block 0x{x}: {any}",
-                            .{ descendant_root, err },
+                            .{ &descendant_root, err },
                         );
                         // Remove from cache on other errors
                         _ = self.network.removeFetchedBlock(descendant_root);
@@ -378,7 +378,7 @@ pub const BeamNode = struct {
 
                 self.logger.info(
                     "Successfully processed cached block 0x{x}",
-                    .{descendant_root},
+                    .{&descendant_root},
                 );
 
                 // Remove from cache now that it's been processed
@@ -437,7 +437,7 @@ pub const BeamNode = struct {
         if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
             self.logger.warn("Cache full ({d} blocks), rejecting block 0x{x} at slot {d}", .{
                 self.network.fetched_blocks.count(),
-                block_root,
+                &block_root,
                 block_slot,
             });
             return CacheBlockError.CachingFailed;
@@ -480,7 +480,7 @@ pub const BeamNode = struct {
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
                 self.logger.warn("received unexpected block root 0x{x} from peer {s}{any}", .{
-                    block_root,
+                    &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
@@ -494,7 +494,7 @@ pub const BeamNode = struct {
                     if (current_depth >= constants.MAX_BLOCK_FETCH_DEPTH) {
                         self.logger.warn(
                             "Reached max block fetch depth ({d}) for block 0x{x}, discarding",
-                            .{ constants.MAX_BLOCK_FETCH_DEPTH, block_root },
+                            .{ constants.MAX_BLOCK_FETCH_DEPTH, &block_root },
                         );
                         return;
                     }
@@ -504,9 +504,9 @@ pub const BeamNode = struct {
                         self.logger.debug(
                             "Cached block 0x{x} at depth {d}, fetching parent 0x{x}",
                             .{
-                                block_root,
+                                &block_root,
                                 current_depth,
-                                parent_root,
+                                &parent_root,
                             },
                         );
                     } else |cache_err| {
@@ -515,14 +515,14 @@ pub const BeamNode = struct {
                             self.logger.info(
                                 "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
                                 .{
-                                    block_root,
+                                    &block_root,
                                     signed_block.message.block.slot,
                                 },
                             );
                             _ = self.network.pruneCachedBlocks(block_root, null);
                         } else {
                             self.logger.warn("failed to cache block 0x{x}: {any}", .{
-                                block_root,
+                                &block_root,
                                 cache_err,
                             });
                         }
@@ -534,7 +534,7 @@ pub const BeamNode = struct {
                     self.logger.info(
                         "discarding pre-finalized block 0x{x} from peer {s}{any}, pruning cached descendants",
                         .{
-                            block_root,
+                            &block_root,
                             block_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                         },
@@ -544,7 +544,7 @@ pub const BeamNode = struct {
                 }
 
                 self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{any}: {any}", .{
-                    block_root,
+                    &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                     err,
@@ -555,7 +555,7 @@ pub const BeamNode = struct {
 
             self.logger.debug(
                 "Successfully processed block 0x{x}, checking for cached descendants",
-                .{block_root},
+                .{&block_root},
             );
 
             // Store aggregated signature proofs from this block so they can be reused
@@ -618,7 +618,7 @@ pub const BeamNode = struct {
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                             status_resp.finalized_slot,
                                             info.head_slot,
-                                            status_resp.head_root,
+                                            &status_resp.head_root,
                                         });
                                         const roots = [_]types.Root{status_resp.head_root};
                                         self.fetchBlockByRoots(&roots, 0) catch |err| {
@@ -718,7 +718,7 @@ pub const BeamNode = struct {
                     } else {
                         self.logger.warn(
                             "node-{d}:: Requested block root=0x{x} not found",
-                            .{ self.nodeId, root },
+                            .{ self.nodeId, &root },
                         );
                     }
                 }

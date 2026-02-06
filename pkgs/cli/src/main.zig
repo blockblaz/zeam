@@ -645,6 +645,8 @@ fn mainInner() !void {
                     ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
                     return err;
                 };
+                defer allocator.free(generated_config);
+
                 const cwd = std.fs.cwd();
                 const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });

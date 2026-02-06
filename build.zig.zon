@@ -24,8 +24,8 @@
             .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
         },
         .zig_enr = .{
-            .url = "git+https://github.com/blockblaz/enr#25a01845829e13eade22e44307d5e3d166514083",
-            .hash = "zig_enr-0.0.0-cO2P21i9AQDl8MF-WXmW9s6iPSkGGpJOxyuJ7SP1Jk3Q",
+            .url = "git+https://github.com/blockblaz/enr#16b719df8b7c691f8fdc8961fa41a2c2604cb668",
+            .hash = "zig_enr-0.0.0-cO2P21y9AQD5kcT3ei1hdKiQETldBmzYdATkS-9JNTJa",
         },
         .zig_yaml = .{
             .url = "https://github.com/kubkon/zig-yaml/archive/refs/tags/0.2.0.tar.gz",

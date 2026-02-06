@@ -621,8 +621,9 @@ fn writeHandlerFile(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
     defer file.close();
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = file.writer(&write_buf);
+    var allocating_write_buf = std.Io.Writer.Allocating.init(allocator);
+    defer allocating_write_buf.deinit();
+    var file_writer = file.writer(allocating_write_buf.writer.buffer);
     try file_writer.interface.writeAll(buffer.items);
     try file_writer.interface.flush();
 }
@@ -697,8 +698,9 @@ fn writeIndexFile(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
     defer file.close();
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = file.writer(&write_buf);
+    var allocating_write_buf = std.Io.Writer.Allocating.init(allocator);
+    defer allocating_write_buf.deinit();
+    var file_writer = file.writer(allocating_write_buf.writer.buffer);
     try file_writer.interface.writeAll(buffer.items);
     try file_writer.interface.flush();
 }
@@ -727,8 +729,9 @@ fn writeEmptyIndex(
     // Write buffer to file
     var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
     defer file.close();
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = file.writer(&write_buf);
+    var allocating_write_buf = std.Io.Writer.Allocating.init(allocator);
+    defer allocating_write_buf.deinit();
+    var file_writer = file.writer(allocating_write_buf.writer.buffer);
     try file_writer.interface.writeAll(buffer.items);
     try file_writer.interface.flush();
 }

@@ -3,6 +3,8 @@ const enr = @import("enr");
 const build_options = @import("build_options");
 const simargs = @import("simargs");
 
+pub const max_enr_txt_size = enr.max_enr_txt_size;
+
 const ToolsArgs = struct {
     help: bool = false,
     version: bool = false,
@@ -131,7 +133,7 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
         // Write the result to the file
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
-        var write_buf: [4096]u8 = undefined;
+        var write_buf: [max_enr_txt_size]u8 = undefined;
         var file_writer = file.writer(&write_buf);
         try file_writer.interface.writeAll(buffer.items);
         try file_writer.interface.flush();
@@ -140,7 +142,7 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
     } else {
         // Write the result to stdout
         const stdout = std.fs.File.stdout();
-        var stdout_write_buf: [4096]u8 = undefined;
+        var stdout_write_buf: [max_enr_txt_size]u8 = undefined;
         var stdout_writer = stdout.writer(&stdout_write_buf);
         try stdout_writer.interface.writeAll(buffer.items);
         try stdout_writer.interface.flush();

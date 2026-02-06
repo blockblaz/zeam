@@ -222,7 +222,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 block_root: types.Root,
                 block: types.SignedBlockWithAttestation,
             ) void {
-                const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+                const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                     self.logger.err("failed to format block key for putBlock: {any}", .{err});
                     return;
                 };
@@ -245,7 +245,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 state_root: types.Root,
                 state: types.BeamState,
             ) void {
-                const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+                const key = interface.formatStateKey(self.allocator, &state_root) catch |err| {
                     self.logger.err("failed to format state key for putState: {any}", .{err});
                     return;
                 };
@@ -478,7 +478,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         /// Save a block to the database
         pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
-            const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+            const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                 self.logger.err("failed to format block key for saveBlock: {any}", .{err});
                 return;
             };
@@ -496,7 +496,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         /// Load a block from the database
         pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
-            const key = interface.formatBlockKey(self.allocator, block_root) catch |err| {
+            const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                 self.logger.err("failed to format block key for loadBlock: {any}", .{err});
                 return null;
             };
@@ -513,7 +513,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         /// Save a state to the database
         pub fn saveState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root, state: types.BeamState) void {
-            const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+            const key = interface.formatStateKey(self.allocator, &state_root) catch |err| {
                 self.logger.err("failed to format state key for saveState: {any}", .{err});
                 return;
             };
@@ -531,7 +531,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         /// Load a state from the database
         pub fn loadState(self: *Self, comptime cn: ColumnNamespace, state_root: types.Root) ?types.BeamState {
-            const key = interface.formatStateKey(self.allocator, state_root) catch |err| {
+            const key = interface.formatStateKey(self.allocator, &state_root) catch |err| {
                 self.logger.err("failed to format state key for loadState: {any}", .{err});
                 return null;
             };

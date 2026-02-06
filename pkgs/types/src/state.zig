@@ -298,7 +298,7 @@ pub const BeamState = struct {
         var head_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(block.BeamBlockHeader, self.latest_block_header, &head_root, allocator);
         if (!std.mem.eql(u8, &head_root, &staged_block.parent_root)) {
-            logger.err("state root={x} block root={x}\n", .{ head_root, staged_block.parent_root });
+            logger.err("state root={x} block root={x}\n", .{ &head_root, &staged_block.parent_root });
             return StateTransitionError.InvalidParentRoot;
         }
 
@@ -1084,7 +1084,7 @@ test "genesis block hash comparison" {
     // Compute hash of first genesis block
     var genesis_block_hash1: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block1, &genesis_block_hash1, allocator);
-    std.debug.print("genesis_block_hash1 =0x{x}\n", .{genesis_block_hash1});
+    std.debug.print("genesis_block_hash1 =0x{x}\n", .{&genesis_block_hash1});
 
     // Create a second genesis state with same config but regenerated (should produce same hash)
     var genesis_state1_copy: BeamState = undefined;
@@ -1126,7 +1126,7 @@ test "genesis block hash comparison" {
 
     var genesis_block_hash2: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block2, &genesis_block_hash2, allocator);
-    std.debug.print("genesis_block_hash2 =0x{x}\n", .{genesis_block_hash2});
+    std.debug.print("genesis_block_hash2 =0x{x}\n", .{&genesis_block_hash2});
 
     // Different validators should produce different genesis block hash
     try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash2));
@@ -1156,21 +1156,21 @@ test "genesis block hash comparison" {
 
     var genesis_block_hash3: Root = undefined;
     try zeam_utils.hashTreeRoot(block.BeamBlock, genesis_block3, &genesis_block_hash3, allocator);
-    std.debug.print("genesis_block_hash3 =0x{x}\n", .{genesis_block_hash3});
+    std.debug.print("genesis_block_hash3 =0x{x}\n", .{&genesis_block_hash3});
 
     // Different genesis_time should produce different genesis block hash
     try std.testing.expect(!std.mem.eql(u8, &genesis_block_hash1, &genesis_block_hash3));
 
     // // Compare genesis block hashes with expected hex values
-    const hash1_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash1});
+    const hash1_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash1});
     defer allocator.free(hash1_hex);
     try std.testing.expectEqualStrings(hash1_hex, "0xcc03f11dd80dd79a4add86265fad0a141d0a553812d43b8f2c03aa43e4b002e3");
 
-    const hash2_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash2});
+    const hash2_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash2});
     defer allocator.free(hash2_hex);
     try std.testing.expectEqualStrings(hash2_hex, "0x6bd5347aa1397c63ed8558079fdd3042112a5f4258066e3a659a659ff75ba14f");
 
-    const hash3_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{genesis_block_hash3});
+    const hash3_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash3});
     defer allocator.free(hash3_hex);
     try std.testing.expectEqualStrings(hash3_hex, "0xce48a709189aa2b23b6858800996176dc13eb49c0c95d717c39e60042de1ac91");
 }

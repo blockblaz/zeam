@@ -122,7 +122,7 @@ pub const ValidatorClient = struct {
             // 1. construct the block
             self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
-            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, produced_block.blockRoot });
+            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
 
             // 2. construct proposer attestation for the produced block which should already be in forkchoice
             // including its attestations
@@ -154,7 +154,7 @@ pub const ValidatorClient = struct {
                 .signature = signatures,
             };
 
-            self.logger.info("signed produced block with attestation for slot={d} root={x}", .{ slot, produced_block.blockRoot });
+            self.logger.info("signed produced block with attestation for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
 
             // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);

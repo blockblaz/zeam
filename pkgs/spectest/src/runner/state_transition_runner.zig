@@ -267,8 +267,8 @@ fn runCase(
                     .{
                         ctx.fixture_label,
                         ctx.case_name,
-                        header_root,
-                        block.parent_root,
+                        &header_root,
+                        &block.parent_root,
                     },
                 );
                 return FixtureError.UnsupportedFixture;
