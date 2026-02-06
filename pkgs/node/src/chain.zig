@@ -1055,7 +1055,7 @@ pub const BeamChain = struct {
 
         // 5 Rebase forkchouce
         if (pruneForkchoice)
-            try self.forkChoice.rebase(latestFinalized.root, null);
+            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
 
         // TODO:
         // 6. Remove orphaned blocks from database and cleanup unfinalized indices of there are any
