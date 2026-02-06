@@ -39,6 +39,7 @@ const NodeOpts = struct {
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
+    is_aggregator: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -63,6 +64,8 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         errdefer allocator.destroy(chain);
 
+        const has_validators = if (opts.validator_ids) |ids| ids.len > 0 else false;
+        const is_aggregator = has_validators and opts.is_aggregator;
         chain.* = try chainFactory.BeamChain.init(
             allocator,
             chainFactory.ChainOpts{
@@ -72,6 +75,7 @@ pub const BeamNode = struct {
                 .db = opts.db,
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
+                .is_aggregator = is_aggregator,
             },
             network.connected_peers,
         );
@@ -1064,7 +1068,7 @@ pub const BeamNode = struct {
         // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
-            try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
+            try self.chain.forkChoice.onInterval(@intCast(current_interval), false, self.chain.is_aggregator);
             self.logger.info("fork choice time caught up to interval {d}", .{current_interval});
         }
 

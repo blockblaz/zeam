@@ -86,6 +86,7 @@ pub const NodeOptions = struct {
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
+    is_aggregator: bool = false,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -241,6 +242,7 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
+            .is_aggregator = options.is_aggregator,
         });
 
         // Start API server after chain is initialized so we can pass the chain pointer

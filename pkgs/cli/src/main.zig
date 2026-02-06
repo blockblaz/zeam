@@ -58,6 +58,7 @@ pub const NodeCommand = struct {
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
     @"checkpoint-sync-url": ?[]const u8 = null,
+    is_aggregator: bool = false,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -76,6 +77,7 @@ pub const NodeCommand = struct {
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
+        .is_aggregator = "Enable attestation aggregation (store gossip signatures and run aggregation at interval 2 when this node has validators)",
         .help = "Show help information for the node command",
     };
 };
@@ -686,6 +688,7 @@ fn mainInner() !void {
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = undefined,
                 .node_registry = node_registry,
+                .is_aggregator = leancmd.is_aggregator,
             };
 
             defer start_options.deinit(allocator);
