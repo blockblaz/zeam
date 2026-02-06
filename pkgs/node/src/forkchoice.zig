@@ -261,6 +261,10 @@ pub const ForkChoice = struct {
     aggregated_payloads: AggregatedPayloadsMap,
     // Aggregated signature proofs that are newly received (not yet accepted).
     new_aggregated_payloads: AggregatedPayloadsMap,
+    // Insertion order for aggregated payload keys (spec uses dict insertion order).
+    aggregated_payload_keys: std.ArrayList(SignatureKey),
+    // Insertion order for new aggregated payload keys.
+    new_aggregated_payload_keys: std.ArrayList(SignatureKey),
     // Mutex to protect concurrent access to gossip_signatures, attestation_data_by_root,
     // and aggregated payload maps.
     signatures_mutex: std.Thread.Mutex,
@@ -302,6 +306,8 @@ pub const ForkChoice = struct {
         const attestation_data_by_root = std.AutoHashMap(types.Root, types.AttestationData).init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
         const new_aggregated_payloads = AggregatedPayloadsMap.init(allocator);
+        const aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator);
+        const new_aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator);
         const missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator);
 
         var fc = Self{
@@ -320,6 +326,8 @@ pub const ForkChoice = struct {
             .attestation_data_by_root = attestation_data_by_root,
             .aggregated_payloads = aggregated_payloads,
             .new_aggregated_payloads = new_aggregated_payloads,
+            .aggregated_payload_keys = aggregated_payload_keys,
+            .new_aggregated_payload_keys = new_aggregated_payload_keys,
             .signatures_mutex = .{},
             .is_aggregator = false,
             .missing_head_roots = missing_head_roots,
@@ -358,6 +366,8 @@ pub const ForkChoice = struct {
             entry.value_ptr.deinit();
         }
         self.new_aggregated_payloads.deinit();
+        self.aggregated_payload_keys.deinit();
+        self.new_aggregated_payload_keys.deinit();
     }
 
     pub fn setAggregatorInfo(self: *Self, is_aggregator: bool) !void {
@@ -423,11 +433,11 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        var it = self.aggregated_payloads.iterator();
-        while (it.next()) |entry| {
-            const sig_key = entry.key_ptr.*;
+        // Preserve insertion order to match spec dict semantics.
+        for (self.aggregated_payload_keys.items) |sig_key| {
             if (sig_key.validator_id >= validator_count) continue;
-            if (entry.value_ptr.items.len == 0) continue;
+            const entry = self.aggregated_payloads.get(sig_key) orelse continue;
+            if (entry.items.len == 0) continue;
 
             if (self.attestation_data_by_root.get(sig_key.data_root)) |data| {
                 const idx: usize = @intCast(sig_key.validator_id);
@@ -794,12 +804,10 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        var new_it = self.new_aggregated_payloads.iterator();
-        while (new_it.next()) |entry| {
-            const sig_key = entry.key_ptr.*;
-            var list = entry.value_ptr.*;
+        for (self.new_aggregated_payload_keys.items) |sig_key| {
+            const list_ptr = self.new_aggregated_payloads.getPtr(sig_key) orelse continue;
 
-            for (list.items) |*stored| {
+            for (list_ptr.items) |*stored| {
                 const payload = stored.*;
                 stored.* = undefined;
                 try self.insertAggregatedPayload(&self.aggregated_payloads, sig_key, payload);
@@ -808,10 +816,14 @@ pub const ForkChoice = struct {
                     try self.updateTrackerFromAttestationData(sig_key.validator_id, data, .known);
                 }
             }
-            list.deinit();
+            // Remove key after draining.
+            if (self.new_aggregated_payloads.fetchRemove(sig_key)) |kv| {
+                kv.value.deinit();
+            }
         }
         self.new_aggregated_payloads.deinit();
         self.new_aggregated_payloads = AggregatedPayloadsMap.init(self.allocator);
+        self.new_aggregated_payload_keys.clearRetainingCapacity();
 
         // Promote latestNew attestations to latestKnown for proposal selection.
         for (0..self.config.genesis.numValidators()) |validator_id| {
@@ -1159,6 +1171,11 @@ pub const ForkChoice = struct {
         const gop = try payload_map.getOrPut(sig_key);
         if (!gop.found_existing) {
             gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+            if (payload_map == &self.aggregated_payloads) {
+                try self.aggregated_payload_keys.append(sig_key);
+            } else {
+                try self.new_aggregated_payload_keys.append(sig_key);
+            }
         }
 
         // Preserve insertion order (older first, newer last) to match spec behavior.
@@ -1349,6 +1366,25 @@ pub const ForkChoice = struct {
                 kv.value.deinit();
             }
         }
+
+        // Compact insertion-order lists after removals.
+        var write_known: usize = 0;
+        for (self.aggregated_payload_keys.items) |sig_key| {
+            if (self.aggregated_payloads.contains(sig_key)) {
+                self.aggregated_payload_keys.items[write_known] = sig_key;
+                write_known += 1;
+            }
+        }
+        self.aggregated_payload_keys.items = self.aggregated_payload_keys.items[0..write_known];
+
+        var write_new: usize = 0;
+        for (self.new_aggregated_payload_keys.items) |sig_key| {
+            if (self.new_aggregated_payloads.contains(sig_key)) {
+                self.new_aggregated_payload_keys.items[write_new] = sig_key;
+                write_new += 1;
+            }
+        }
+        self.new_aggregated_payload_keys.items = self.new_aggregated_payload_keys.items[0..write_new];
 
         // Prune attestation data by root for finalized slots (target.slot <= finalized_slot)
         var stale_it = stale_roots.keyIterator();
@@ -1730,6 +1766,8 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .attestation_data_by_root = std.AutoHashMap(types.Root, types.AttestationData).init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
+        .new_aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
         .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
@@ -2067,6 +2105,8 @@ fn buildTestTreeWithMockChain(
         .attestation_data_by_root = std.AutoHashMap(types.Root, types.AttestationData).init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
+        .new_aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
         .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
@@ -2114,6 +2154,8 @@ const RebaseTestContext = struct {
         errdefer test_data.fork_choice.attestation_data_by_root.deinit();
         errdefer test_data.fork_choice.aggregated_payloads.deinit();
         errdefer test_data.fork_choice.new_aggregated_payloads.deinit();
+        errdefer test_data.fork_choice.aggregated_payload_keys.deinit();
+        errdefer test_data.fork_choice.new_aggregated_payload_keys.deinit();
 
         return .{
             .mock_chain = mock_chain,
@@ -2149,6 +2191,8 @@ const RebaseTestContext = struct {
             entry.value_ptr.deinit();
         }
         self.fork_choice.new_aggregated_payloads.deinit();
+        self.fork_choice.aggregated_payload_keys.deinit();
+        self.fork_choice.new_aggregated_payload_keys.deinit();
         self.allocator.free(self.spec_name);
         self.logger_config.deinit();
         self.allocator.destroy(self.logger_config);
@@ -3040,6 +3084,8 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .attestation_data_by_root = std.AutoHashMap(types.Root, types.AttestationData).init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
+        .aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
+        .new_aggregated_payload_keys = std.ArrayList(SignatureKey).init(allocator),
         .signatures_mutex = .{},
         .is_aggregator = false,
         .missing_head_roots = std.AutoHashMap(types.Root, void).init(allocator),
