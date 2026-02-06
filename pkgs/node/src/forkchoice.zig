@@ -2638,7 +2638,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         const target = if (validator_id % 2 == 0) createTestRoot(0xCC) else createTestRoot(0xDD);
         const slot: types.Slot = if (validator_id % 2 == 0) 2 else 3;
         const att = createTestSignedAttestation(validator_id, target, slot);
-        try fork_choice.onGossipAttestation(att, true);
+        try fork_choice.onGossipAttestation(att, true, false);
     }
 
     // Verify all 32 attestations are set
