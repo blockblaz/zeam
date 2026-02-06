@@ -106,10 +106,11 @@ pub const ValidatorClient = struct {
                     return null;
                 },
                 .behind_peers => |info| {
-                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                    self.logger.warn("skipping block production for slot={d} proposer={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
                         slot,
                         slot_proposer_id,
                         info.head_slot,
+                        info.finalized_slot,
                         info.max_peer_finalized_slot,
                     });
                     return null;
@@ -173,9 +174,10 @@ pub const ValidatorClient = struct {
                 return null;
             },
             .behind_peers => |info| {
-                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                self.logger.warn("skipping attestation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
                     slot,
                     info.head_slot,
+                    info.finalized_slot,
                     info.max_peer_finalized_slot,
                 });
                 return null;
