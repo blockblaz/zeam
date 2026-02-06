@@ -64,7 +64,6 @@ pub const GossipTopicSpec = struct {
     pub fn init(topic: GossipTopic) GossipTopicSpec {
         return .{ .topic = topic };
     }
-
 };
 
 pub const GossipSub = struct {
