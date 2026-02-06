@@ -2737,7 +2737,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
     // Only vote on canonical chain — fork branch has zero weight
     for (0..4) |validator_id| {
         const att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
-        try ctx.fork_choice.onGossipAttestation(att, true);
+        try ctx.fork_choice.onGossipAttestation(att, true, false);
     }
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null
