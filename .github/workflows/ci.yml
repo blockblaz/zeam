@@ -25,7 +25,7 @@ jobs:
         version: 0.14.1
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
@@ -94,7 +94,7 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
@@ -148,7 +148,7 @@ jobs:
         components: clippy, rustfmt
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
@@ -202,7 +202,7 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
@@ -273,7 +273,7 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
@@ -312,7 +312,7 @@ jobs:
         toolchain: nightly
 
     - name: Cache Zig packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
