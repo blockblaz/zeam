@@ -576,10 +576,11 @@ pub const BeamNode = struct {
 
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
         const request_id = event.request_id;
-        const ctx_ptr = self.network.getPendingRequestPtr(request_id) orelse {
+        const entry_ptr = self.network.getPendingRequestPtr(request_id) orelse {
             self.logger.warn("received RPC response for unknown request_id={d}", .{request_id});
             return;
         };
+        const ctx_ptr = &entry_ptr.request;
         const peer_id = switch (ctx_ptr.*) {
             .status => |*ctx| ctx.peer_id,
             .blocks_by_root => |*ctx| ctx.peer_id,
@@ -904,6 +905,10 @@ pub const BeamNode = struct {
             // no point going further if chain is not ticked properly
             return e;
         };
+
+        // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers
+        self.sweepTimedOutRequests();
+
         if (self.validator) |*validator| {
             // we also tick validator per interval in case it would
             // need to sync its future duties when its an independent validator
@@ -932,6 +937,58 @@ pub const BeamNode = struct {
                         },
                     }
                 }
+            }
+        }
+    }
+
+    fn sweepTimedOutRequests(self: *Self) void {
+        const current_time = std.time.timestamp();
+        const timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
+            self.logger.warn("failed to check for timed-out RPC requests: {any}", .{err});
+            return;
+        };
+
+        for (timed_out) |request_id| {
+            const entry_ptr = self.network.getPendingRequestPtr(request_id) orelse continue;
+
+            switch (entry_ptr.request) {
+                .blocks_by_root => |block_ctx| {
+                    // Copy roots + depths BEFORE finalize frees them
+                    var roots_to_retry = std.ArrayList(struct { root: types.Root, depth: u32 }).init(self.allocator);
+                    defer roots_to_retry.deinit();
+
+                    for (block_ctx.requested_roots) |root| {
+                        const depth = self.network.getPendingBlockRootDepth(root) orelse 0;
+                        roots_to_retry.append(.{ .root = root, .depth = depth }) catch continue;
+                    }
+
+                    self.logger.warn("RPC request_id={d} to peer {s}{} timed out after {d}s, retrying {d} roots", .{
+                        request_id,
+                        block_ctx.peer_id,
+                        self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                        constants.RPC_REQUEST_TIMEOUT_SECONDS,
+                        roots_to_retry.items.len,
+                    });
+
+                    // Finalize clears pending state + frees memory
+                    self.network.finalizePendingRequest(request_id);
+
+                    // Retry each root — fetchBlockByRoots picks a new random peer
+                    for (roots_to_retry.items) |item| {
+                        const roots = [_]types.Root{item.root};
+                        self.fetchBlockByRoots(&roots, item.depth) catch |err| {
+                            self.logger.warn("failed to retry block fetch after timeout: {any}", .{err});
+                        };
+                    }
+                },
+                .status => |status_ctx| {
+                    self.logger.warn("status RPC request_id={d} to peer {s}{} timed out, finalizing", .{
+                        request_id,
+                        status_ctx.peer_id,
+                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                    });
+                    self.network.finalizePendingRequest(request_id);
+                },
             }
         }
     }
