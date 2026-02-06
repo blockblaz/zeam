@@ -555,11 +555,13 @@ pub const ForkChoice = struct {
                 const new_best_child_idx = old_indices_to_new.get(old_best_child_idx) orelse @panic("invalid old index lookup for rebased best child");
                 current_node.bestChild = new_best_child_idx;
 
-                // best descendant should always be there when there is a best child
-                const old_best_descendant_idx = current_node.bestDescendant orelse @panic("invalid forkchoice with null best descendant for a non null best child");
-                // we should be able to lookup new index otherwise its an irrecoverable error
-                const new_best_descendant_idx = old_indices_to_new.get(old_best_descendant_idx) orelse @panic("invalid old index lookup for rebase best descendant");
-                current_node.bestDescendant = new_best_descendant_idx;
+                // If bestDescendant is null, keep it null (can happen when applyDeltas uses cutoff_weight
+                // and the best branch has no node >= cutoff). See issue #545.
+                if (current_node.bestDescendant) |old_best_descendant_idx| {
+                    const new_best_descendant_idx = old_indices_to_new.get(old_best_descendant_idx) orelse @panic("invalid old index lookup for rebase best descendant");
+                    current_node.bestDescendant = new_best_descendant_idx;
+                }
+                // else: bestDescendant remains null
             } else {
                 // confirm best descendant is also null
                 if (current_node.bestDescendant != null) {
@@ -2714,6 +2716,43 @@ test "rebase: deltas array is properly shrunk" {
     // Deltas array uses swapRemove, so length should also be reduced
     // The deltas array should have 7 elements now
     try std.testing.expect(ctx.fork_choice.deltas.items.len == 7);
+}
+
+test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
+    // ========================================
+    // Test: rebase does not panic when a node has bestChild set but bestDescendant null
+    // ========================================
+    //
+    // Regression test for issue #545:
+    //   https://github.com/blockblaz/zeam/issues/545
+    //
+    // When applyDeltas is called with cutoff_weight > 0, nodes below cutoff can have
+    // bestDescendant = null while their parent still sets bestChild to them. Rebase
+    // now treats null bestDescendant as bestChild for index remapping instead of panicking.
+
+    const allocator = std.testing.allocator;
+    var ctx = try RebaseTestContext.init(allocator, 4);
+    defer ctx.deinit();
+
+    // Only vote on canonical chain — fork branch has zero weight
+    for (0..4) |validator_id| {
+        const att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
+        try ctx.fork_choice.onGossipAttestation(att, true);
+    }
+
+    // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null
+    const deltas = try ctx.fork_choice.computeDeltas(true);
+    try ctx.fork_choice.protoArray.applyDeltas(deltas, 1);
+
+    // Rebase to C — must not panic (previously hit "null best descendant for a non null best child")
+    try ctx.fork_choice.rebase(createTestRoot(0xCC), null);
+
+    // After rebase: if bestDescendant was null (due to cutoff), it remains null.
+    // This is the correct behavior - rebase preserves the null state rather than remapping.
+    try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 7);
+    // The invariant "bestChild != null implies bestDescendant != null" does NOT hold
+    // when cutoff_weight is used, as nodes below cutoff can have bestDescendant = null.
+    // Rebase correctly preserves this state.
 }
 
 test "rebase: to fork branch node (G) removes previous canonical chain" {
