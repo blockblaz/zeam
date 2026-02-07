@@ -812,7 +812,7 @@ pub const ForkChoice = struct {
             1 => {},
             2 => {
                 if (is_aggregator) {
-                    _ = try self.aggregateCommitteeSignatures(null);
+                    _ = try self.aggregateCommitteeSignaturesUnlocked(null);
                 }
             },
             3 => {
@@ -839,6 +839,10 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
         if (self.latest_new_aggregated_payloads.count() > 0) {
+            // Keep payload migration synchronized with other signature/payload map writers.
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+
             var it = self.latest_new_aggregated_payloads.iterator();
             while (it.next()) |entry| {
                 const sig_key = entry.key_ptr.*;
@@ -1300,7 +1304,7 @@ pub const ForkChoice = struct {
         return self.onGossipAggregatedAttestationUnlocked(signed_aggregation);
     }
 
-    pub fn aggregateCommitteeSignatures(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+    fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return &[_]types.SignedAggregatedAttestation{};
 
         var attestations = std.ArrayList(types.Attestation).init(self.allocator);
@@ -1402,6 +1406,12 @@ pub const ForkChoice = struct {
         aggregation.attestation_signatures.deinit();
 
         return results.toOwnedSlice();
+    }
+
+    pub fn aggregateCommitteeSignatures(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.aggregateCommitteeSignaturesUnlocked(state_opt);
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -2342,6 +2352,10 @@ fn stageAggregatedAttestation(
     try fork_choice.onGossipAggregatedAttestation(signed_aggregation);
 }
 
+// Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.
+// Keep logger config at file scope so ModuleLogger pointers remain valid.
+var rebase_test_logger_config = zeam_utils.getTestLoggerConfig();
+
 fn deinitAggregatedPayloadsMap(map: *AggregatedPayloadsMap) void {
     var it = map.iterator();
     while (it.next()) |entry| {
@@ -2398,8 +2412,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_finalized = anchorCP,
     };
 
-    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
-    const module_logger = zeam_logger_config.logger(.forkchoice);
+    const module_logger = rebase_test_logger_config.logger(.forkchoice);
 
     const fork_choice = ForkChoice{
         .allocator = allocator,
