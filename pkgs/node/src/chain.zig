@@ -989,7 +989,7 @@ pub const BeamChain = struct {
                             self.module_logger.warn("dropping pending attestation: {any}", .{err});
                         },
                     }
-                    return;
+                    continue;
                 };
             }
             self.pending_gossip_attestations.deinit();

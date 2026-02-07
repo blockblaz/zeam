@@ -177,7 +177,7 @@ pub const ValidatorClient = struct {
     }
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
-        if (!self.is_aggregator_enabled or self.ids.len == 0) return null;
+        if (self.ids.len == 0) return null;
 
         // Check if chain is synced before producing attestations
         const sync_status = self.chain.getSyncStatus();

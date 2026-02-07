@@ -856,7 +856,6 @@ pub const ForkChoice = struct {
             }
             self.latest_new_aggregated_payloads.clearAndFree();
         }
-
         return self.updateHeadUnlocked();
     }
 
@@ -1265,7 +1264,7 @@ pub const ForkChoice = struct {
         });
     }
 
-    pub fn onGossipAggregatedAttestation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+    fn onGossipAggregatedAttestationUnlocked(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         const data_root = try signed_aggregation.data.sszRoot(self.allocator);
 
         self.signatures_mutex.lock();
@@ -1293,6 +1292,12 @@ pub const ForkChoice = struct {
                 .proof = cloned_proof,
             });
         }
+    }
+
+    pub fn onGossipAggregatedAttestation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.onGossipAggregatedAttestationUnlocked(signed_aggregation);
     }
 
     pub fn aggregateCommitteeSignatures(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
