@@ -1,9 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
-const Mutex = Thread.Mutex;
-const Condition = Thread.Condition;
-const AtomicBool = std.atomic.Value(bool);
 
 const types = @import("@zeam/types");
 const xev = @import("xev");
@@ -33,22 +29,8 @@ pub const Mock = struct {
     timer: xev.Timer,
     nextPeerIndex: usize,
     nextRequestId: u64,
-    gossip_thread: ?Thread,
-    gossip_queue: std.ArrayListUnmanaged(GossipQueueItem),
-    gossip_queue_high: std.ArrayListUnmanaged(GossipQueueItem),
-    gossip_inflight: usize,
-    gossip_mutex: Mutex,
-    gossip_cv: Condition,
-    gossip_stop: AtomicBool,
-    seen_blocks: std.AutoHashMapUnmanaged(types.Root, void),
-    seen_blocks_order: std.ArrayListUnmanaged(types.Root),
-    seen_attestations: std.AutoHashMapUnmanaged(types.SignatureKey, void),
-    seen_attestations_order: std.ArrayListUnmanaged(types.SignatureKey),
-    seen_aggregations: std.AutoHashMapUnmanaged(AggregationKey, void),
-    seen_aggregations_order: std.ArrayListUnmanaged(AggregationKey),
 
     const Self = @This();
-    const MAX_SEEN_GOSSIP = 4096;
 
     const PairKey = struct {
         a: usize,
@@ -71,22 +53,6 @@ pub const Mock = struct {
     };
 
     const StreamError = error{StreamAlreadyFinished};
-
-    const GossipQueueItem = struct {
-        msg: *interface.GossipMessage,
-        sender_peer_id: []u8,
-    };
-
-    const AggregationKey = struct {
-        data_root: types.Root,
-        participants_hash: u64,
-    };
-
-    const GossipKey = union(enum) {
-        block: types.Root,
-        attestation: types.SignatureKey,
-        aggregation: AggregationKey,
-    };
 
     const MockServerStream = struct {
         mock: *Mock,
@@ -290,34 +256,10 @@ pub const Mock = struct {
             .timer = timer,
             .nextPeerIndex = 0,
             .nextRequestId = 1,
-            .gossip_thread = null,
-            .gossip_queue = .empty,
-            .gossip_queue_high = .empty,
-            .gossip_inflight = 0,
-            .gossip_mutex = Mutex{},
-            .gossip_cv = Condition{},
-            .gossip_stop = AtomicBool.init(false),
-            .seen_blocks = .empty,
-            .seen_blocks_order = .empty,
-            .seen_attestations = .empty,
-            .seen_attestations_order = .empty,
-            .seen_aggregations = .empty,
-            .seen_aggregations_order = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.stopGossipThread();
-        self.clearGossipQueue();
-        self.gossip_queue_high.deinit(self.allocator);
-        self.gossip_queue.deinit(self.allocator);
-        self.seen_blocks.deinit(self.allocator);
-        self.seen_blocks_order.deinit(self.allocator);
-        self.seen_attestations.deinit(self.allocator);
-        self.seen_attestations_order.deinit(self.allocator);
-        self.seen_aggregations.deinit(self.allocator);
-        self.seen_aggregations_order.deinit(self.allocator);
-
         var rpc_it = self.rpcCallbacks.iterator();
         while (rpc_it.next()) |entry| {
             var callback = entry.value_ptr.*;
@@ -349,199 +291,6 @@ pub const Mock = struct {
         if (self.owns_registry) {
             self.registry.deinit();
             self.allocator.destroy(self.registry);
-        }
-    }
-
-    fn ensureGossipThread(self: *Self) !void {
-        self.gossip_mutex.lock();
-        defer self.gossip_mutex.unlock();
-
-        if (self.gossip_thread != null) return;
-        self.gossip_stop.store(false, .release);
-        self.gossip_thread = try Thread.spawn(.{}, gossipThreadMain, .{self});
-    }
-
-    fn stopGossipThread(self: *Self) void {
-        self.gossip_mutex.lock();
-        self.gossip_stop.store(true, .release);
-        self.gossip_cv.signal();
-        self.gossip_mutex.unlock();
-
-        if (self.gossip_thread) |thread| {
-            thread.join();
-            self.gossip_thread = null;
-        }
-    }
-
-    fn clearGossipQueue(self: *Self) void {
-        self.gossip_mutex.lock();
-        defer self.gossip_mutex.unlock();
-
-        while (self.gossip_queue_high.pop()) |item| {
-            deinitGossipMessage(self.allocator, item.msg);
-            self.allocator.free(item.sender_peer_id);
-        }
-        while (self.gossip_queue.pop()) |item| {
-            deinitGossipMessage(self.allocator, item.msg);
-            self.allocator.free(item.sender_peer_id);
-        }
-    }
-
-    pub fn flushGossip(self: *Self) !void {
-        try self.ensureGossipThread();
-
-        self.gossip_mutex.lock();
-        defer self.gossip_mutex.unlock();
-
-        while (self.gossip_queue_high.items.len != 0 or self.gossip_queue.items.len != 0 or self.gossip_inflight != 0) {
-            self.gossip_cv.wait(&self.gossip_mutex);
-        }
-    }
-
-    fn deinitGossipMessage(allocator: Allocator, msg: *interface.GossipMessage) void {
-        switch (msg.*) {
-            .block => |*blk| blk.deinit(),
-            .attestation => {},
-            .aggregation => |*agg| agg.deinit(),
-        }
-        allocator.destroy(msg);
-    }
-
-    fn hashParticipants(bits: *const types.AggregationBits) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(bits.inner.items);
-        hasher.update(std.mem.asBytes(&bits.length));
-        return hasher.final();
-    }
-
-    fn computeGossipKey(self: *Self, data: *const interface.GossipMessage) !GossipKey {
-        return switch (data.*) {
-            .block => blk: {
-                var block_root: types.Root = undefined;
-                try zeam_utils.hashTreeRoot(types.BeamBlock, data.block.message.block, &block_root, self.allocator);
-                break :blk .{ .block = block_root };
-            },
-            .attestation => att: {
-                const data_root = try data.attestation.message.message.sszRoot(self.allocator);
-                break :att .{
-                    .attestation = .{
-                        .validator_id = data.attestation.message.validator_id,
-                        .data_root = data_root,
-                    },
-                };
-            },
-            .aggregation => agg: {
-                const data_root = try data.aggregation.data.sszRoot(self.allocator);
-                const participants_hash = hashParticipants(&data.aggregation.proof.participants);
-                break :agg .{ .aggregation = .{
-                    .data_root = data_root,
-                    .participants_hash = participants_hash,
-                } };
-            },
-        };
-    }
-
-    fn isDuplicateGossipLocked(self: *Self, key: GossipKey) !bool {
-        switch (key) {
-            .block => |root| {
-                if (self.seen_blocks.contains(root)) return true;
-                try self.seen_blocks.put(self.allocator, root, {});
-                try self.seen_blocks_order.append(self.allocator, root);
-                if (self.seen_blocks_order.items.len > MAX_SEEN_GOSSIP) {
-                    const old = self.seen_blocks_order.orderedRemove(0);
-                    _ = self.seen_blocks.remove(old);
-                }
-                return false;
-            },
-            .attestation => |sig_key| {
-                if (self.seen_attestations.contains(sig_key)) return true;
-                try self.seen_attestations.put(self.allocator, sig_key, {});
-                try self.seen_attestations_order.append(self.allocator, sig_key);
-                if (self.seen_attestations_order.items.len > MAX_SEEN_GOSSIP) {
-                    const old = self.seen_attestations_order.orderedRemove(0);
-                    _ = self.seen_attestations.remove(old);
-                }
-                return false;
-            },
-            .aggregation => |agg_key| {
-                if (self.seen_aggregations.contains(agg_key)) return true;
-                try self.seen_aggregations.put(self.allocator, agg_key, {});
-                try self.seen_aggregations_order.append(self.allocator, agg_key);
-                if (self.seen_aggregations_order.items.len > MAX_SEEN_GOSSIP) {
-                    const old = self.seen_aggregations_order.orderedRemove(0);
-                    _ = self.seen_aggregations.remove(old);
-                }
-                return false;
-            },
-        }
-    }
-
-    fn enqueueGossip(self: *Self, data: *const interface.GossipMessage, sender_peer_id: []const u8) !void {
-        try self.ensureGossipThread();
-
-        const key = try self.computeGossipKey(data);
-
-        const cloned_msg = try data.clone(self.allocator);
-        errdefer deinitGossipMessage(self.allocator, cloned_msg);
-
-        const sender_copy = try self.allocator.dupe(u8, sender_peer_id);
-        errdefer self.allocator.free(sender_copy);
-
-        self.gossip_mutex.lock();
-        defer self.gossip_mutex.unlock();
-
-        if (try self.isDuplicateGossipLocked(key)) {
-            deinitGossipMessage(self.allocator, cloned_msg);
-            self.allocator.free(sender_copy);
-            return;
-        }
-
-        const is_block = switch (data.*) {
-            .block => true,
-            else => false,
-        };
-
-        const target_queue = if (is_block) &self.gossip_queue_high else &self.gossip_queue;
-
-        try target_queue.append(self.allocator, .{
-            .msg = cloned_msg,
-            .sender_peer_id = sender_copy,
-        });
-        self.gossip_cv.signal();
-    }
-
-    fn gossipThreadMain(self: *Self) void {
-        while (true) {
-            self.gossip_mutex.lock();
-            while (self.gossip_queue_high.items.len == 0 and self.gossip_queue.items.len == 0 and !self.gossip_stop.load(.acquire)) {
-                self.gossip_cv.wait(&self.gossip_mutex);
-            }
-
-            if (self.gossip_stop.load(.acquire) and self.gossip_queue_high.items.len == 0 and self.gossip_queue.items.len == 0) {
-                self.gossip_mutex.unlock();
-                break;
-            }
-
-            const item_opt = if (self.gossip_queue_high.pop()) |item| item else self.gossip_queue.pop();
-            if (item_opt != null) {
-                self.gossip_inflight += 1;
-            }
-            self.gossip_mutex.unlock();
-
-            if (item_opt) |item| {
-                self.gossipHandler.onGossip(item.msg, item.sender_peer_id, false) catch |err| {
-                    const node_name = self.registry.getNodeNameFromPeerId(item.sender_peer_id);
-                    self.logger.err("mock:: gossip worker failed: {any} from peer={s}{}", .{ err, item.sender_peer_id, node_name });
-                };
-
-                deinitGossipMessage(self.allocator, item.msg);
-                self.allocator.free(item.sender_peer_id);
-
-                self.gossip_mutex.lock();
-                self.gossip_inflight -= 1;
-                self.gossip_cv.signal();
-                self.gossip_mutex.unlock();
-            }
         }
     }
 
@@ -873,7 +622,7 @@ pub const Mock = struct {
             // Fallback to default if no peers found
             break :blk "mock_publisher";
         };
-        return self.enqueueGossip(data, sender_peer_id);
+        return self.gossipHandler.onGossip(data, sender_peer_id, true);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -883,7 +632,7 @@ pub const Mock = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.enqueueGossip(data, sender_peer_id);
+        return self.gossipHandler.onGossip(data, sender_peer_id, true);
     }
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
@@ -1082,9 +831,6 @@ test "Mock messaging across two subscribers" {
 
     // Publish the message using the network interface - both subscribers should receive it
     try network.gossip.publish(block_message);
-
-    // Wait for mock gossip worker to drain
-    try mock.flushGossip();
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);
