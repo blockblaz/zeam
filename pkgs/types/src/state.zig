@@ -201,6 +201,24 @@ pub const BeamState = struct {
         }
     }
 
+    pub fn initRootToSlotCache(self: *const Self, cache: *utils.RootToSlotCache) !void {
+        const start_slot: usize = @intCast(self.latest_finalized.slot + 1);
+        const historical_len_usize: usize = self.historical_block_hashes.len();
+        if (start_slot >= historical_len_usize) return;
+        for (start_slot..historical_len_usize) |i| {
+            const root = try self.historical_block_hashes.get(i);
+            if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
+            const slot_i: Slot = @intCast(i);
+            if (cache.get(root)) |existing| {
+                if (slot_i > existing) {
+                    try cache.put(root, slot_i);
+                }
+            } else {
+                try cache.put(root, slot_i);
+            }
+        }
+    }
+
     fn extendJustifiedSlots(self: *Self, finalized_slot: Slot, target_slot: Slot) !void {
         if (target_slot < finalized_slot) {
             return StateTransitionError.InvalidJustificationTargetSlot;
@@ -383,17 +401,7 @@ pub const BeamState = struct {
         // Use the global cache directly if provided, otherwise build a local map.
         var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
         defer root_to_slot.deinit(allocator);
-        if (cache) |c| {
-            if (c.count() == 0) {
-                const start_slot: usize = @intCast(finalized_slot + 1);
-                const historical_len_usize: usize = self.historical_block_hashes.len();
-                for (start_slot..historical_len_usize) |i| {
-                    const root = try self.historical_block_hashes.get(i);
-                    if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
-                    try c.put(root, @intCast(i));
-                }
-            }
-        } else {
+        if (cache == null) {
             try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot);
         }
 

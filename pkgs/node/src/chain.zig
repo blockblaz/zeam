@@ -137,7 +137,7 @@ pub const BeamChain = struct {
         try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
         try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
 
-        return Self{
+        var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
             .forkChoice = fork_choice,
@@ -157,6 +157,8 @@ pub const BeamChain = struct {
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
         };
+        try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
+        return chain;
     }
 
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
