@@ -801,7 +801,7 @@ pub const ForkChoice = struct {
         self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool, is_aggregator: bool) !void {
+    fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool, is_aggregator: bool) !void {
         _ = is_aggregator; // reserved for aggregation at interval 2 (leanSpec PR 368)
         while (self.fcStore.time < time_intervals) {
             try self.tickIntervalUnlocked(has_proposal and (self.fcStore.time + 1) == time_intervals);
@@ -1320,28 +1320,16 @@ pub const ForkChoice = struct {
         return self.onBlockUnlocked(block, state, opts);
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
+    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool, is_aggregator: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.onIntervalUnlocked(time_intervals, has_proposal);
+        return self.onIntervalUnlocked(time_intervals, has_proposal, is_aggregator);
     }
 
     pub fn onAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.onAttestationUnlocked(attestation, is_from_block);
-    }
-
-    pub fn onGossipAttestation(self: *Self, signed_attestation: types.SignedAttestation, is_from_block: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.onGossipAttestationUnlocked(signed_attestation, is_from_block);
-    }
-
-    pub fn updateSafeTarget(self: *Self) !ProtoBlock {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.updateSafeTargetUnlocked();
     }
 
     //  READ-ONLY API - SHARED LOCK
