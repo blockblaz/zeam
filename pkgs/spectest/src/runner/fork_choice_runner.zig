@@ -624,7 +624,7 @@ fn processBlockStep(
     };
 
     const target_intervals = slotToIntervals(block.slot);
-    try ctx.fork_choice.onInterval(target_intervals, true);
+    try ctx.fork_choice.onInterval(target_intervals, true, false);
 
     const new_state_ptr = try ctx.allocator.create(types.BeamState);
     errdefer {
@@ -738,7 +738,7 @@ fn processTickStep(
     }
 
     const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-    try ctx.fork_choice.onInterval(target_intervals, false);
+    try ctx.fork_choice.onInterval(target_intervals, false, false);
 }
 
 fn applyChecks(

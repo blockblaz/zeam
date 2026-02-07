@@ -39,6 +39,7 @@ const NodeOpts = struct {
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
+    is_aggregator: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -63,6 +64,9 @@ pub const BeamNode = struct {
         const chain = try allocator.create(chainFactory.BeamChain);
         errdefer allocator.destroy(chain);
 
+        // is_aggregator controls whether the node performs attestation aggregation
+        // Default is false - nodes will attest but not aggregate unless explicitly enabled
+        const is_aggregator = opts.is_aggregator;
         chain.* = try chainFactory.BeamChain.init(
             allocator,
             chainFactory.ChainOpts{
@@ -72,6 +76,7 @@ pub const BeamNode = struct {
                 .db = opts.db,
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
+                .is_aggregator = is_aggregator,
             },
             network.connected_peers,
         );
@@ -1064,7 +1069,7 @@ pub const BeamNode = struct {
         // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
-            try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
+            try self.chain.forkChoice.onInterval(@intCast(current_interval), false, self.chain.is_aggregator);
             self.logger.info("fork choice time caught up to interval {d}", .{current_interval});
         }
 
@@ -1382,7 +1387,7 @@ test "Node: processCachedDescendants basic flow" {
     try std.testing.expect(!node.chain.forkChoice.hasBlock(block2_root));
 
     // Advance forkchoice time to block1 slot and add block1 to the chain
-    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
+    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false, false);
     const missing_roots1 = try node.chain.onBlock(block1, .{});
     defer allocator.free(missing_roots1);
 
@@ -1391,7 +1396,7 @@ test "Node: processCachedDescendants basic flow" {
 
     // Now call processCachedDescendants with block1_root. This should discover
     // cached block2 as a descendant and process it automatically.
-    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false);
+    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false, false);
     node.processCachedDescendants(block1_root);
 
     // Verify block2 was removed from cache because it was successfully processed

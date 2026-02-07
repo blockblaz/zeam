@@ -58,6 +58,7 @@ pub const NodeCommand = struct {
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
     @"checkpoint-sync-url": ?[]const u8 = null,
+    is_aggregator: bool = false,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -76,6 +77,7 @@ pub const NodeCommand = struct {
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
+        .is_aggregator = "Enable attestation aggregation (store gossip signatures and run aggregation at interval 2 when this node has validators)",
         .help = "Show help information for the node command",
     };
 };
@@ -547,6 +549,7 @@ fn mainInner() !void {
                 .db = db_1,
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
+                .is_aggregator = true, // This node is the designated aggregator
             });
 
             if (api_server_handle) |handle| {
@@ -566,6 +569,7 @@ fn mainInner() !void {
                 .db = db_2,
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
+                // Not an aggregator - will receive aggregated attestations from node 1
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -583,6 +587,7 @@ fn mainInner() !void {
                 .db = db_3,
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
+                // Not an aggregator - will receive aggregated attestations from node 1
             });
 
             // Delayed runner - starts both network3 and node3 together
@@ -692,6 +697,7 @@ fn mainInner() !void {
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = undefined,
                 .node_registry = node_registry,
+                .is_aggregator = leancmd.is_aggregator,
             };
 
             defer start_options.deinit(allocator);
