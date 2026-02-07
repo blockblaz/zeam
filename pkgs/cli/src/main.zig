@@ -70,8 +70,8 @@ pub const NodeCommand = struct {
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
         .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
-        .@"api-port" = "Port for the API server (metrics, health, events, checkpoint state)",
-        .metrics_enable = "Enable metrics endpoint",
+        .@"api-port" = "Port for the API server (metrics, health, events, forkchoice graph, checkpoint state)",
+        .metrics_enable = "Enable API server (metrics, health, events, forkchoice graph, checkpoint state)",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
@@ -320,6 +320,9 @@ fn mainInner() !void {
                 return err;
             };
 
+            var api_server_handle: ?*api_server.ApiServer = null;
+            defer if (api_server_handle) |handle| handle.stop();
+
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
@@ -327,9 +330,8 @@ fn mainInner() !void {
             // Create logger config for API server
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
-            // Start metrics HTTP server
-            // Pass null for chain - in .beam command mode, chains are created later and the checkpoint sync endpoint won't be available
-            api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
+            // Start API server early. Pass null for chain - in .beam command mode, chains are created later
+            api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
                 return err;
             };
@@ -549,6 +551,10 @@ fn mainInner() !void {
                 .node_registry = registry_1,
                 .is_aggregator = true, // This node is the designated aggregator
             });
+
+            if (api_server_handle) |handle| {
+                handle.setChain(beam_node_1.chain);
+            }
 
             var beam_node_2: BeamNode = undefined;
             try beam_node_2.init(allocator, .{
