@@ -314,9 +314,7 @@ pub const BeamState = struct {
         // extend historical block hashes structure using SSZ Lists directly
         try self.historical_block_hashes.append(staged_block.parent_root);
         if (cache) |c| {
-            if (!std.mem.eql(u8, &staged_block.parent_root, &utils.ZERO_HASH)) {
-                try c.put(staged_block.parent_root, self.latest_block_header.slot);
-            }
+            try c.put(staged_block.parent_root, self.latest_block_header.slot);
         }
 
         const block_slot: usize = @intCast(staged_block.slot);

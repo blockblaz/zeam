@@ -3064,7 +3064,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 1);
+    try ctx.fork_choice.applyDeltas(deltas, 1);
 
     // Rebase to C — must not panic (previously hit "null best descendant for a non null best child")
     try ctx.fork_choice.rebase(createTestRoot(0xCC), null);
