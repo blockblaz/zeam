@@ -1039,7 +1039,7 @@ pub const ForkChoice = struct {
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHead(false, cutoff_weight);
+        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
@@ -3064,7 +3064,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null
     const deltas = try ctx.fork_choice.computeDeltas(true);
-    try ctx.fork_choice.protoArray.applyDeltas(deltas, 1);
+    try ctx.fork_choice.protoArray.applyDeltasUnlocked(deltas, 1);
 
     // Rebase to C — must not panic (previously hit "null best descendant for a non null best child")
     try ctx.fork_choice.rebase(createTestRoot(0xCC), null);
