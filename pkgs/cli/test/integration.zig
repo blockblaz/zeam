@@ -41,7 +41,7 @@ fn getZeamExecutable() ![]const u8 {
 /// Returns the process handle for cleanup, or error if startup fails
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true" };
+    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
     cli_process.* = process.Child.init(&args, allocator);
 

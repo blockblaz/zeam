@@ -88,6 +88,7 @@ pub const NodeTestContext = struct {
             .spec = .{
                 .preset = opts.preset,
                 .name = spec_name,
+                .attestation_committee_count = 1,
             },
         };
 

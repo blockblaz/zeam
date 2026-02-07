@@ -24,7 +24,11 @@ pub const ChainConfig = struct {
     pub fn init(chainId: Chain, chainOptsOrNull: ?ChainOptions) !Self {
         switch (chainId) {
             .custom => {
-                if (chainOptsOrNull) |*chainOpts| {
+                if (chainOptsOrNull) |chain_opts_in| {
+                    var chainOpts = chain_opts_in;
+                    if (chainOpts.attestation_committee_count == null) {
+                        chainOpts.attestation_committee_count = 1;
+                    }
                     const genesis = utils.Cast(types.GenesisSpec, chainOpts);
                     // transfer ownership of any allocated memory in chainOpts to spec
                     const spec = utils.Cast(types.ChainSpec, chainOpts);

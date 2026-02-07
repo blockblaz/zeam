@@ -31,6 +31,11 @@ pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, Inva
 
 const json = std.json;
 
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) u64 {
+    if (committee_count == 0) return 0;
+    return validator_id % committee_count;
+}
+
 pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
         .object => |*o| {
@@ -57,20 +62,34 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
         return StateTransitionError.InvalidJustifiableSlot;
     }
 
-    const delta: f32 = @floatFromInt(candidate - finalized);
+    const delta: u64 = candidate - finalized;
     if (delta <= 5) {
         return true;
     }
-    const delta_x2: f32 = @mod(std.math.pow(f32, delta, 0.5), 1);
-    if (delta_x2 == 0) {
+
+    const sqrt_delta = isqrt(delta);
+    if (sqrt_delta * sqrt_delta == delta) {
         return true;
     }
-    const delta_x2_x: f32 = @mod(std.math.pow(f32, delta + 0.25, 0.5), 1);
-    if (delta_x2_x == 0.5) {
+
+    if (sqrt_delta * (sqrt_delta + 1) == delta) {
         return true;
     }
 
     return false;
+}
+
+fn isqrt(n: u64) u64 {
+    if (n == 0) return 0;
+
+    var x = @as(u64, @intFromFloat(@floor(@sqrt(@as(f64, @floatFromInt(n))))));
+    while ((x + 1) <= n / (x + 1)) {
+        x += 1;
+    }
+    while (x > n / x) {
+        x -= 1;
+    }
+    return x;
 }
 
 pub fn getJustifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
@@ -125,6 +144,7 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
+    attestation_committee_count: u64,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -134,6 +154,7 @@ pub const ChainSpec = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
+        try obj.put("attestation_committee_count", json.Value{ .integer = @as(i64, @intCast(self.attestation_committee_count)) });
         return json.Value{ .object = obj };
     }
 

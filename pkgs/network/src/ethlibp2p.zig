@@ -287,7 +287,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
-    const message: interface.GossipMessage = switch (topic.gossip_topic) {
+    const message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => blockmessage: {
             var message_data: types.SignedBlockWithAttestation = undefined;
             ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
@@ -303,6 +303,10 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             break :blockmessage .{ .block = message_data };
         },
         .attestation => attestationmessage: {
+            const subnet_id = topic.gossip_topic.subnet_id orelse {
+                zigHandler.logger.err("attestation topic missing subnet id: {s}", .{std.mem.span(topic_str)});
+                return;
+            };
             var message_data: types.SignedAttestation = undefined;
             ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
@@ -313,7 +317,20 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
                 }
                 return;
             };
-            break :attestationmessage .{ .attestation = message_data };
+            break :attestationmessage .{ .attestation = .{ .subnet_id = subnet_id, .message = message_data } };
+        },
+        .aggregation => aggregationmessage: {
+            var message_data: types.SignedAggregatedAttestation = undefined;
+            ssz.deserialize(types.SignedAggregatedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+                zigHandler.logger.err("Error in deserializing the signed aggregated attestation message: {any}", .{e});
+                if (writeFailedBytes(uncompressed_message, "aggregation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("Aggregation deserialization failed - debug file created: {s}", .{filename});
+                } else {
+                    zigHandler.logger.err("Aggregation deserialization failed - could not create debug file", .{});
+                }
+                return;
+            };
+            break :aggregationmessage .{ .aggregation = message_data };
         },
     };
 
@@ -336,14 +353,28 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             );
         },
         .attestation => |signed_attestation| {
-            const slot = signed_attestation.message.slot;
-            const validator_id = signed_attestation.validator_id;
+            const slot = signed_attestation.message.message.slot;
+            const validator_id = signed_attestation.message.validator_id;
             zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                "network-{d}:: received gossip attestation subnet={d} slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{}",
                 .{
                     zigHandler.params.networkId,
+                    signed_attestation.subnet_id,
                     slot,
                     validator_id,
+                    message_bytes.len,
+                    uncompressed_message.len,
+                    sender_peer_id_slice,
+                    node_name,
+                },
+            );
+        },
+        .aggregation => |signed_aggregation| {
+            zigHandler.logger.debug(
+                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                .{
+                    zigHandler.params.networkId,
+                    signed_aggregation.data.slot,
                     message_bytes.len,
                     uncompressed_message.len,
                     sender_peer_id_slice,
@@ -885,6 +916,7 @@ pub const EthLibp2pParams = struct {
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
     node_registry: *const NodeNameRegistry,
+    attestation_committee_count: u64,
 };
 
 pub const EthLibp2p = struct {
@@ -927,6 +959,7 @@ pub const EthLibp2p = struct {
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
                 .node_registry = params.node_registry,
+                .attestation_committee_count = params.attestation_committee_count,
             },
             .gossipHandler = gossip_handler,
             .peerEventHandler = peer_event_handler,
@@ -974,11 +1007,26 @@ pub const EthLibp2p = struct {
             topics_list.deinit(self.allocator);
         }
 
-        for (std.enums.values(interface.GossipTopic)) |gossip_topic| {
-            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
-            defer topic.deinit();
-            const topic_str = try topic.encode();
-            try topics_list.append(self.allocator, topic_str);
+        for (std.enums.values(interface.GossipTopicKind)) |kind| {
+            switch (kind) {
+                .attestation => {
+                    const count = self.params.attestation_committee_count;
+                    for (0..count) |subnet_id| {
+                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = @intCast(subnet_id) };
+                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                        defer topic.deinit();
+                        const topic_str = try topic.encode();
+                        try topics_list.append(self.allocator, topic_str);
+                    }
+                },
+                else => {
+                    const gossip_topic = interface.GossipTopic{ .kind = kind };
+                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                    defer topic.deinit();
+                    const topic_str = try topic.encode();
+                    try topics_list.append(self.allocator, topic_str);
+                },
+            }
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 

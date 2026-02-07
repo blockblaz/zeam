@@ -33,8 +33,13 @@ pub const ValidatorClientOutput = struct {
         try self.gossip_messages.append(gossip_msg);
     }
 
-    pub fn addAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
+    pub fn addAttestation(self: *Self, subnet_id: u32, signed_attestation: types.SignedAttestation) !void {
+        const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = signed_attestation } };
+        try self.gossip_messages.append(gossip_msg);
+    }
+
+    pub fn addAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+        const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
         try self.gossip_messages.append(gossip_msg);
     }
 };
@@ -46,6 +51,7 @@ pub const ValidatorClientParams = struct {
     network: networkFactory.Network,
     logger: zeam_utils.ModuleLogger,
     key_manager: *const key_manager_lib.KeyManager,
+    is_aggregator: bool = false,
 };
 
 pub const ValidatorClient = struct {
@@ -56,6 +62,7 @@ pub const ValidatorClient = struct {
     ids: []usize,
     logger: zeam_utils.ModuleLogger,
     key_manager: *const key_manager_lib.KeyManager,
+    is_aggregator_enabled: bool,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorClientParams) Self {
@@ -67,6 +74,7 @@ pub const ValidatorClient = struct {
             .ids = opts.ids,
             .logger = opts.logger,
             .key_manager = opts.key_manager,
+            .is_aggregator_enabled = opts.is_aggregator,
         };
     }
 
@@ -78,8 +86,14 @@ pub const ValidatorClient = struct {
         switch (interval) {
             0 => return self.maybeDoProposal(slot),
             1 => return self.mayBeDoAttestation(slot),
-            2 => return null,
+            2 => {
+                if (self.is_aggregator_enabled) {
+                    return self.maybeDoAggregation(slot);
+                }
+                return null;
+            },
             3 => return null,
+            4 => return null,
             else => @panic("interval error"),
         }
     }
@@ -163,7 +177,7 @@ pub const ValidatorClient = struct {
     }
 
     pub fn mayBeDoAttestation(self: *Self, slot: usize) !?ValidatorClientOutput {
-        if (self.ids.len == 0) return null;
+        if (!self.is_aggregator_enabled or self.ids.len == 0) return null;
 
         // Check if chain is synced before producing attestations
         const sync_status = self.chain.getSyncStatus();
@@ -212,9 +226,48 @@ pub const ValidatorClient = struct {
                 .signature = signature,
             };
 
-            try result.addAttestation(signed_attestation);
+            const subnet_id = types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
+            try result.addAttestation(@intCast(subnet_id), signed_attestation);
             self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
+        return result;
+    }
+
+    pub fn maybeDoAggregation(self: *Self, slot: usize) !?ValidatorClientOutput {
+        if (!self.is_aggregator_enabled or self.ids.len == 0) return null;
+
+        // Check if chain is synced before producing aggregations
+        const sync_status = self.chain.getSyncStatus();
+        switch (sync_status) {
+            .synced => {},
+            .no_peers => {
+                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
+                return null;
+            },
+            .behind_peers => |info| {
+                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.max_peer_finalized_slot,
+                });
+                return null;
+            },
+        }
+
+        const aggregations = self.chain.aggregateCommitteeSignatures() catch |err| {
+            self.logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
+            return null;
+        };
+        defer self.allocator.free(aggregations);
+
+        if (aggregations.len == 0) return null;
+
+        var result = ValidatorClientOutput.init(self.allocator);
+        for (aggregations) |aggregation| {
+            try result.addAggregation(aggregation);
+        }
+
+        self.logger.info("constructed {d} aggregations for slot={d}", .{ aggregations.len, slot });
         return result;
     }
 };
