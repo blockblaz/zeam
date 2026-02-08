@@ -61,8 +61,21 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
 }
 
 fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, ctx: *ApiServer) void {
-    var buffer: [4096]u8 = undefined;
-    var http_server = std.http.Server.init(connection, &buffer);
+    const read_buffer = allocator.alloc(u8, 4096) catch {
+        ctx.logger.err("failed to allocate read buffer", .{});
+        return;
+    };
+    defer allocator.free(read_buffer);
+    const write_buffer = allocator.alloc(u8, 4096) catch {
+        ctx.logger.err("failed to allocate write buffer", .{});
+        return;
+    };
+    defer allocator.free(write_buffer);
+
+    var stream_reader = connection.stream.reader(read_buffer);
+    var stream_writer = connection.stream.writer(write_buffer);
+
+    var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
     var request = http_server.receiveHead() catch |err| {
         ctx.logger.warn("failed to receive HTTP head: {}", .{err});
         connection.stream.close();
@@ -87,7 +100,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         const request_allocator = arena.allocator();
 
         if (std.mem.eql(u8, request.head.target, "/metrics")) {
-            ctx.handleMetrics(&request, request_allocator);
+            ctx.handleMetrics(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             ctx.handleHealth(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
@@ -170,7 +183,7 @@ pub const ApiServer = struct {
             if (self.stopped.load(.acquire)) break;
             const connection = server.accept() catch |err| {
                 if (err == error.WouldBlock) {
-                    std.time.sleep(ACCEPT_POLL_NS);
+                    std.Thread.sleep(ACCEPT_POLL_NS);
                     continue;
                 }
                 self.logger.warn("failed to accept connection: {}", .{err});
@@ -186,7 +199,7 @@ pub const ApiServer = struct {
             defer self.sse_mutex.unlock();
             break :blk self.sse_active != 0;
         }) {
-            std.time.sleep(ACCEPT_POLL_NS);
+            std.Thread.sleep(ACCEPT_POLL_NS);
         }
     }
 
@@ -394,10 +407,10 @@ fn handleForkChoiceGraph(
 
     if (max_slots > MAX_ALLOWED_SLOTS) max_slots = MAX_ALLOWED_SLOTS;
 
-    var graph_json = std.ArrayList(u8).init(allocator);
-    defer graph_json.deinit();
+    var graph_json: std.ArrayList(u8) = .empty;
+    defer graph_json.deinit(allocator);
 
-    try node_lib.tree_visualizer.buildForkChoiceGraphJSON(&chain.forkChoice, graph_json.writer(), max_slots, allocator);
+    try node_lib.tree_visualizer.buildForkChoiceGraphJSON(&chain.forkChoice, &graph_json, max_slots, allocator);
 
     _ = request.respond(graph_json.items, .{
         .extra_headers = &.{
@@ -470,13 +483,13 @@ const RateLimiter = struct {
     }
 
     fn evictStale(self: *RateLimiter, now: u64) void {
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.last_refill_ns > RATE_LIMIT_STALE_NS) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

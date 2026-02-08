@@ -199,7 +199,7 @@ pub fn addGlobalConnection(stream: std.net.Stream) !*SSEConnection {
         broadcaster.mutex.lock();
         defer broadcaster.mutex.unlock();
 
-        try broadcaster.connections.append(connection);
+        try broadcaster.connections.append(broadcaster.allocator, connection);
         return connection;
     } else {
         return error.BroadcasterNotInitialized;
