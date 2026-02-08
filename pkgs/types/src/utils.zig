@@ -31,9 +31,14 @@ pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, Inva
 
 const json = std.json;
 
-pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) u64 {
-    if (committee_count == 0) return 0;
-    return validator_id % committee_count;
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) u32 {
+    if (committee_count == 0) {
+        @panic("attestation_committee_count must be greater than 0");
+    }
+    if (committee_count > std.math.maxInt(u32)) {
+        @panic("attestation_committee_count must fit in u32");
+    }
+    return @intCast(validator_id % committee_count);
 }
 
 pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
@@ -68,11 +73,11 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
     }
 
     const sqrt_delta = isqrt(delta);
-    if (sqrt_delta * sqrt_delta == delta) {
+    if ((delta % sqrt_delta == 0) and (delta / sqrt_delta == sqrt_delta)) {
         return true;
     }
 
-    if (sqrt_delta * (sqrt_delta + 1) == delta) {
+    if ((delta % sqrt_delta == 0) and (delta / sqrt_delta == (sqrt_delta + 1))) {
         return true;
     }
 

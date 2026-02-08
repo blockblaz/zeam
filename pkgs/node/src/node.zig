@@ -1013,7 +1013,7 @@ pub const BeamNode = struct {
 
         var start_interval: isize = self.last_interval + 1;
         if (start_interval < 1) start_interval = 1;
-        if (start_interval > itime_intervals) start_interval = itime_intervals;
+        if (start_interval > itime_intervals) return;
 
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {

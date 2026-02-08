@@ -812,7 +812,8 @@ pub const ForkChoice = struct {
             1 => {},
             2 => {
                 if (is_aggregator) {
-                    _ = try self.aggregateCommitteeSignaturesUnlocked(null);
+                    const aggregations = try self.aggregateCommitteeSignaturesUnlocked(null);
+                    defer self.allocator.free(aggregations);
                 }
             },
             3 => {
@@ -846,17 +847,22 @@ pub const ForkChoice = struct {
             var it = self.latest_new_aggregated_payloads.iterator();
             while (it.next()) |entry| {
                 const sig_key = entry.key_ptr.*;
-                var list = entry.value_ptr.*;
+                const source_list = entry.value_ptr;
 
                 const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
                 }
 
-                for (list.items) |stored| {
-                    try gop.value_ptr.append(stored);
+                // Ensure all required capacity up-front so the move is non-failing.
+                try gop.value_ptr.ensureUnusedCapacity(source_list.items.len);
+                for (source_list.items) |stored| {
+                    gop.value_ptr.appendAssumeCapacity(stored);
                 }
-                list.deinit();
+
+                // Source list buffer no longer needed after ownership transfer.
+                source_list.deinit();
+                source_list.* = AggregatedPayloadsList.init(self.allocator);
             }
             self.latest_new_aggregated_payloads.clearAndFree();
         }
@@ -1284,13 +1290,15 @@ pub const ForkChoice = struct {
                 .validator_id = @intCast(validator_index),
                 .data_root = data_root,
             };
-            var cloned_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
-
             const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
             if (!gop.found_existing) {
                 gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
             }
+
+            var cloned_proof: types.AggregatedSignatureProof = undefined;
+            try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
+            errdefer cloned_proof.deinit();
+
             try gop.value_ptr.append(.{
                 .slot = signed_aggregation.data.slot,
                 .proof = cloned_proof,
@@ -1305,7 +1313,7 @@ pub const ForkChoice = struct {
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
-        const state = state_opt orelse return &[_]types.SignedAggregatedAttestation{};
+        const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
         var attestations = std.ArrayList(types.Attestation).init(self.allocator);
         defer attestations.deinit();
@@ -1375,8 +1383,10 @@ pub const ForkChoice = struct {
                 if (!gop.found_existing) {
                     gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
                 }
+
                 var cloned_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+                errdefer cloned_proof.deinit();
                 try gop.value_ptr.append(.{
                     .slot = agg_att.data.slot,
                     .proof = cloned_proof,
@@ -1388,6 +1398,7 @@ pub const ForkChoice = struct {
 
             var output_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
+            errdefer output_proof.deinit();
             try results.append(.{
                 .data = agg_att.data,
                 .proof = output_proof,

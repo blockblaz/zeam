@@ -1010,7 +1010,11 @@ pub const EthLibp2p = struct {
         for (std.enums.values(interface.GossipTopicKind)) |kind| {
             switch (kind) {
                 .attestation => {
-                    const count = self.params.attestation_committee_count;
+                    const count_u64 = self.params.attestation_committee_count;
+                    if (count_u64 == 0 or count_u64 > std.math.maxInt(u32)) {
+                        return error.InvalidAttestationCommitteeCount;
+                    }
+                    const count = std.math.cast(usize, count_u64) orelse return error.InvalidAttestationCommitteeCount;
                     for (0..count) |subnet_id| {
                         const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = @intCast(subnet_id) };
                         var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
