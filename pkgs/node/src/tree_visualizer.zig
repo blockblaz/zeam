@@ -321,3 +321,370 @@ pub fn buildForkChoiceGraphJSON(
         \\{{"nodes":[{s}],"edges":[{s}]}}
     , .{ nodes_list.items, edges_list.items });
 }
+
+// ============================================================================
+// TESTS FOR buildTreeVisualization
+// ============================================================================
+
+const types = @import("@zeam/types");
+const Root = types.Root;
+
+/// Helper function to create a deterministic test root filled with a specific byte
+fn createTestRoot(fill_byte: u8) Root {
+    var root: Root = undefined;
+    @memset(&root, fill_byte);
+    return root;
+}
+
+/// Helper function to create a ProtoNode for testing
+fn createTestProtoNode(
+    slot: types.Slot,
+    block_root_byte: u8,
+    parent_root_byte: u8,
+    parent: ?usize,
+    depth: usize,
+    first_child: usize,
+    latest_child: usize,
+    next_sibling: usize,
+    num_children: usize,
+    best_descendant: ?usize,
+) fcFactory.ProtoNode {
+    return fcFactory.ProtoNode{
+        .slot = slot,
+        .blockRoot = createTestRoot(block_root_byte),
+        .parentRoot = createTestRoot(parent_root_byte),
+        .stateRoot = createTestRoot(0x00),
+        .timeliness = true,
+        .confirmed = true,
+        .parent = parent,
+        .weight = 0,
+        .bestChild = null,
+        .bestDescendant = best_descendant,
+        .depth = depth,
+        .nextSibling = next_sibling,
+        .firstChild = first_child,
+        .latestChild = latest_child,
+        .numChildren = num_children,
+        .numBranches = null,
+    };
+}
+
+test "buildTreeVisualization: empty nodes array" {
+    const allocator = std.testing.allocator;
+    const nodes: []const fcFactory.ProtoNode = &.{};
+
+    const result = try buildTreeVisualization(allocator, nodes, null, null);
+    defer allocator.free(result);
+
+    // Empty array should produce empty output
+    try std.testing.expectEqualStrings("", result);
+
+    std.debug.print("\n=== TEST: empty nodes array ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+}
+
+test "buildTreeVisualization: single root node with no children" {
+    const allocator = std.testing.allocator;
+
+    // Single node: slot 0, root 0xAA, no parent, no children
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 0, 0, 0, 0, null),
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    // Should output "aaaa(0)" - first 2 bytes of blockRoot in hex + (slot)
+    try std.testing.expectEqualStrings("aaaa(0)", result);
+
+    std.debug.print("\n=== TEST: single root node ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+}
+
+test "buildTreeVisualization: linear chain (no forks)" {
+    const allocator = std.testing.allocator;
+
+    // Linear chain: A(0) -> B(1) -> C(2)
+    // Node 0: slot 0, root 0xAA, parent null, firstChild=1
+    // Node 1: slot 1, root 0xBB, parent 0, firstChild=2
+    // Node 2: slot 2, root 0xCC, parent 1, no children
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 1, 0, 1, 2), // A: root, child is B, bestDescendant is C
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 2, 2, 0, 1, 2), // B: parent A, child is C
+        createTestProtoNode(2, 0xCC, 0xBB, 1, 2, 0, 0, 0, 0, null), // C: parent B, no children
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    // Linear chain should show: aaaa(0)─ bbbb(1)─ cccc(2)
+    try std.testing.expectEqualStrings("aaaa(0)─ bbbb(1)─ cccc(2)", result);
+
+    std.debug.print("\n=== TEST: linear chain ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+}
+
+test "buildTreeVisualization: simple fork with two branches" {
+    const allocator = std.testing.allocator;
+
+    // Fork: A(0) has two children B(1) and C(1)
+    //       A(0)
+    //      /    \
+    //   B(1)    C(1)
+    //
+    // Node 0: slot 0, root 0xAA, firstChild=1, latestChild=2, numChildren=2
+    // Node 1: slot 1, root 0xBB, parent 0, nextSibling=2
+    // Node 2: slot 1, root 0xCC, parent 0, nextSibling=0
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 2, 0, 2, null), // A: root with 2 children
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 0, 0, 2, 0, null), // B: child of A, sibling C
+        createTestProtoNode(1, 0xCC, 0xAA, 0, 1, 0, 0, 0, 0, null), // C: child of A, no sibling
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    // Should show fork structure with branches
+    // Expected format when multiple children: "aaaa(0) - 2 branches\n├── bbbb(1)\n└── cccc(1)"
+    // Note: children are sorted by recency (bestDescendant or slot), both have slot=1 so order may vary
+    std.debug.print("\n=== TEST: simple fork ===\n", .{});
+    std.debug.print("Output:\n{s}\n", .{result});
+
+    // Verify it contains the expected elements
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- 2 branches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cccc(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "├──") != null or std.mem.indexOf(u8, result, "└──") != null);
+}
+
+test "buildTreeVisualization: missing slots indicator (single slot)" {
+    const allocator = std.testing.allocator;
+
+    // Chain with missing slot: A(0) -> B(2) (slot 1 is missing)
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 1, 0, 1, 1), // A: slot 0
+        createTestProtoNode(2, 0xBB, 0xAA, 0, 1, 0, 0, 0, 0, null), // B: slot 2 (missing slot 1)
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    // Should show "[ ]" for single missing slot
+    std.debug.print("\n=== TEST: missing slot (single) ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "[ ]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(2)") != null);
+}
+
+test "buildTreeVisualization: missing slots indicator (multiple slots)" {
+    const allocator = std.testing.allocator;
+
+    // Chain with multiple missing slots: A(0) -> B(4) (slots 1,2,3 are missing)
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 1, 0, 1, 1), // A: slot 0
+        createTestProtoNode(4, 0xBB, 0xAA, 0, 1, 0, 0, 0, 0, null), // B: slot 4 (missing slots 1,2,3)
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    // Should show "[3]" for 3 missing slots
+    std.debug.print("\n=== TEST: missing slots (multiple) ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "[3]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(4)") != null);
+}
+
+test "buildTreeVisualization: max depth truncation" {
+    const allocator = std.testing.allocator;
+
+    // Deep chain: A(0) -> B(1) -> C(2) -> D(3) -> E(4)
+    // With max_depth=2, should truncate middle nodes and show root + near-leaf nodes
+    // Print logic: root (depth<1) always printed. B,C skipped (leaf_distance > max_depth-1
+    // and single child, not fork). D printed (leaf_distance=1 <= max_depth-1=1). E printed (leaf_distance=0).
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 1, 0, 1, 4), // A
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 2, 2, 0, 1, 4), // B
+        createTestProtoNode(2, 0xCC, 0xBB, 1, 2, 3, 3, 0, 1, 4), // C
+        createTestProtoNode(3, 0xDD, 0xCC, 2, 3, 4, 4, 0, 1, 4), // D
+        createTestProtoNode(4, 0xEE, 0xDD, 3, 4, 0, 0, 0, 0, null), // E: leaf
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, 2, null);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: max depth truncation ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+
+    // Root should always be shown
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    // Should contain truncation indicator "... " (appended when leaf_distance > max_depth on a single-child node)
+    try std.testing.expect(std.mem.indexOf(u8, result, "... ") != null);
+    // Near-leaf nodes D and E should be rendered (within max_depth of leaf)
+    try std.testing.expect(std.mem.indexOf(u8, result, "dddd(3)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "eeee(4)") != null);
+    // Middle nodes B and C should be skipped (too far from leaf, not a fork point)
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(1)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cccc(2)") == null);
+}
+
+test "buildTreeVisualization: max branch truncation" {
+    const allocator = std.testing.allocator;
+
+    // Wide fork: A(0) has 4 children B, C, D, E
+    // With max_branch=2, should truncate after 2 branches
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 4, 0, 4, null), // A: root with 4 children
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 0, 0, 2, 0, null), // B
+        createTestProtoNode(1, 0xCC, 0xAA, 0, 1, 0, 0, 3, 0, null), // C
+        createTestProtoNode(1, 0xDD, 0xAA, 0, 1, 0, 0, 4, 0, null), // D
+        createTestProtoNode(1, 0xEE, 0xAA, 0, 1, 0, 0, 0, 0, null), // E
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, 2);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: max branch truncation ===\n", .{});
+    std.debug.print("Output:\n{s}\n", .{result});
+
+    // Should contain branch truncation indicator
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "truncated at branch 2") != null);
+}
+
+test "buildTreeVisualization: complex tree with forks at multiple levels" {
+    const allocator = std.testing.allocator;
+
+    // Complex tree:
+    //         A(0)
+    //        /    \
+    //      B(1)   C(1)
+    //      /
+    //    D(2)
+    //
+    // Node indices: A=0, B=1, C=2, D=3
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 2, 0, 2, 3), // A: root, children B,C
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 3, 3, 2, 1, 3), // B: child of A, has child D
+        createTestProtoNode(1, 0xCC, 0xAA, 0, 1, 0, 0, 0, 0, null), // C: child of A, no children
+        createTestProtoNode(2, 0xDD, 0xBB, 1, 2, 0, 0, 0, 0, null), // D: child of B
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: complex tree with multi-level forks ===\n", .{});
+    std.debug.print("Output:\n{s}\n", .{result});
+
+    // Verify all nodes are present
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cccc(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "dddd(2)") != null);
+    // Should indicate A has 2 branches
+    try std.testing.expect(std.mem.indexOf(u8, result, "- 2 branches") != null);
+}
+
+test "buildTreeVisualization: multiple root nodes (disconnected trees)" {
+    const allocator = std.testing.allocator;
+
+    // Two disconnected trees:
+    // Tree 1: A(0) -> B(1)
+    // Tree 2: C(0) -> D(1)
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 1, 0, 1, 1), // A: root of tree 1
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 0, 0, 0, 0, null), // B: child of A
+        createTestProtoNode(0, 0xCC, 0x00, null, 0, 3, 3, 0, 1, 3), // C: root of tree 2
+        createTestProtoNode(1, 0xDD, 0xCC, 2, 1, 0, 0, 0, 0, null), // D: child of C
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: multiple root nodes ===\n", .{});
+    std.debug.print("Output: '{s}'\n", .{result});
+
+    // Both trees should be visualized
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cccc(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "dddd(1)") != null);
+}
+
+test "buildTreeVisualization: children sorted by recency (highest bestDescendant first)" {
+    const allocator = std.testing.allocator;
+
+    // Fork: A(0) has two children B(1) and C(1)
+    // B has bestDescendant=5 (recency=5), C has bestDescendant=4 (recency=4)
+    // B should appear before C in output since higher recency is sorted first
+    //
+    //       A(0)
+    //      /    \
+    //   B(1)    C(1)
+    //    |        |
+    //   D(2)    E(2)
+    //    |
+    //   F(3)
+    //
+    // Node indices: A=0, B=1, C=2, D=3, E=4, F=5
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 2, 0, 2, 5), // A: root, 2 children
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 3, 3, 2, 1, 5), // B: child of A, bestDescendant=5 (recency=5)
+        createTestProtoNode(1, 0xCC, 0xAA, 0, 1, 4, 4, 0, 1, 4), // C: child of A, bestDescendant=4 (recency=4)
+        createTestProtoNode(2, 0xDD, 0xBB, 1, 2, 5, 5, 0, 1, 5), // D: child of B
+        createTestProtoNode(2, 0xEE, 0xCC, 2, 2, 0, 0, 0, 0, null), // E: child of C (leaf)
+        createTestProtoNode(3, 0xFF, 0xDD, 3, 3, 0, 0, 0, 0, null), // F: child of D (leaf)
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: children sorted by recency ===\n", .{});
+    std.debug.print("Output:\n{s}\n", .{result});
+
+    // Both branches should be present
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bbbb(1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cccc(1)") != null);
+
+    // B (recency=5) should appear before C (recency=4) in the output
+    const b_pos = std.mem.indexOf(u8, result, "bbbb(1)").?;
+    const c_pos = std.mem.indexOf(u8, result, "cccc(1)").?;
+    try std.testing.expect(b_pos < c_pos);
+}
+
+test "buildTreeVisualization: fork choice tree with fork (printSlot style)" {
+    // This test creates a realistic fork-choice scenario similar to printSlot:
+    // Genesis(0) -> Block1(1) which forks into Block2a(2) and Block2b(2)
+    // This goes beyond a simple linear chain to validate fork rendering.
+    const allocator = std.testing.allocator;
+
+    var nodes = [_]fcFactory.ProtoNode{
+        createTestProtoNode(0, 0x00, 0x00, null, 0, 1, 1, 0, 1, 2), // Genesis at slot 0
+        createTestProtoNode(1, 0x11, 0x00, 0, 1, 2, 3, 0, 2, 2), // Block1 forks into 2 children
+        createTestProtoNode(2, 0x22, 0x11, 1, 2, 0, 0, 3, 0, null), // Block2a
+        createTestProtoNode(2, 0x33, 0x11, 1, 2, 0, 0, 0, 0, null), // Block2b
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, null, null);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: fork choice tree with fork (printSlot style) ===\n", .{});
+    std.debug.print("ForkChoice Tree:\n{s}\n", .{result});
+
+    // Verify the chain structure
+    try std.testing.expect(std.mem.indexOf(u8, result, "0000(0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "1111(1)") != null);
+    // Both fork branches should be present
+    try std.testing.expect(std.mem.indexOf(u8, result, "2222(2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "3333(2)") != null);
+    // Block1 has 2 children so should indicate branches
+    try std.testing.expect(std.mem.indexOf(u8, result, "- 2 branches") != null);
+    // Should use tree branch characters
+    try std.testing.expect(std.mem.indexOf(u8, result, "├──") != null or std.mem.indexOf(u8, result, "└──") != null);
+}
