@@ -43,6 +43,6 @@ pub const OnIntervalCbWrapper = struct {
     }
 };
 
-pub fn computeSubnetId(validator_id: u64, committee_count: u64) u32 {
+pub fn computeSubnetId(validator_id: u64, committee_count: u64) error{InvalidCommitteeCount}!u32 {
     return types.computeSubnetId(validator_id, committee_count);
 }

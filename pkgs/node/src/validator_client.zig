@@ -226,7 +226,7 @@ pub const ValidatorClient = struct {
                 .signature = signature,
             };
 
-            const subnet_id = types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
+            const subnet_id = try types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
             try result.addAttestation(@intCast(subnet_id), signed_attestation);
             self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
@@ -263,8 +263,26 @@ pub const ValidatorClient = struct {
         if (aggregations.len == 0) return null;
 
         var result = ValidatorClientOutput.init(self.allocator);
-        for (aggregations) |aggregation| {
-            try result.addAggregation(aggregation);
+        errdefer {
+            for (result.gossip_messages.items) |*gossip_msg| {
+                switch (gossip_msg.*) {
+                    .aggregation => |*signed_aggregation| signed_aggregation.deinit(),
+                    else => {},
+                }
+            }
+            result.deinit();
+        }
+
+        var i: usize = 0;
+        while (i < aggregations.len) : (i += 1) {
+            result.addAggregation(aggregations[i]) catch |err| {
+                // On transfer failure, deinit the unmoved tail to avoid leaking proofs.
+                var j: usize = i;
+                while (j < aggregations.len) : (j += 1) {
+                    aggregations[j].deinit();
+                }
+                return err;
+            };
         }
 
         self.logger.info("constructed {d} aggregations for slot={d}", .{ aggregations.len, slot });

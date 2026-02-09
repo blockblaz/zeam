@@ -1224,7 +1224,7 @@ pub const BeamNode = struct {
                 var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
                 defer seen_subnets.deinit();
                 for (validator.ids) |validator_id| {
-                    const subnet_id = types.computeSubnetId(@intCast(validator_id), committee_count);
+                    const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                     if (seen_subnets.contains(@intCast(subnet_id))) continue;
                     try seen_subnets.put(@intCast(subnet_id), {});
                     try topics_list.append(.{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });

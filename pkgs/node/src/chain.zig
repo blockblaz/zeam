@@ -825,12 +825,12 @@ pub const BeamChain = struct {
         var store_signature = false;
         if (self.is_aggregator_enabled and self.registered_validator_ids.len > 0) {
             const committee_count = self.config.spec.attestation_committee_count;
-            const proposer_subnet_id = types.computeSubnetId(
+            const proposer_subnet_id = try types.computeSubnetId(
                 @intCast(signed_proposer_attestation.validator_id),
                 committee_count,
             );
             for (self.registered_validator_ids) |validator_id| {
-                const local_subnet_id = types.computeSubnetId(@intCast(validator_id), committee_count);
+                const local_subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                 if (local_subnet_id == proposer_subnet_id) {
                     store_signature = true;
                     break;
@@ -1400,7 +1400,7 @@ pub const BeamChain = struct {
         if (self.is_aggregator_enabled and self.registered_validator_ids.len > 0) {
             const committee_count = self.config.spec.attestation_committee_count;
             for (self.registered_validator_ids) |validator_id| {
-                const subnet_id = types.computeSubnetId(@intCast(validator_id), committee_count);
+                const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                 if (subnet_id == signedAttestation.subnet_id) {
                     store_signature = true;
                     break;
@@ -1765,6 +1765,7 @@ test "buildTreeVisualization integration test" {
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .attestation_committee_count = 1,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -1794,7 +1795,7 @@ test "buildTreeVisualization integration test" {
         const block = signed_block.message.block;
         const current_slot = block.slot;
 
-        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{});
         allocator.free(missing_roots);
     }
@@ -2289,7 +2290,7 @@ test "attestation processing - valid block attestation" {
         .signature = signature,
     };
 
-    const subnet_id = types.computeSubnetId(
+    const subnet_id = try types.computeSubnetId(
         @intCast(valid_attestation.validator_id),
         beam_chain.config.spec.attestation_committee_count,
     );

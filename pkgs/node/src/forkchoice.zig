@@ -811,10 +811,8 @@ pub const ForkChoice = struct {
             },
             1 => {},
             2 => {
-                if (is_aggregator) {
-                    const aggregations = try self.aggregateCommitteeSignaturesUnlocked(null);
-                    defer self.allocator.free(aggregations);
-                }
+                // Aggregation execution is driven by validator flow with an explicit state.
+                _ = is_aggregator;
             },
             3 => {
                 _ = try self.updateSafeTargetUnlocked();

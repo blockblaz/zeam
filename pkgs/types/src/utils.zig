@@ -31,12 +31,11 @@ pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, Inva
 
 const json = std.json;
 
-pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) u32 {
-    if (committee_count == 0) {
-        @panic("attestation_committee_count must be greater than 0");
-    }
-    if (committee_count > std.math.maxInt(u32)) {
-        @panic("attestation_committee_count must fit in u32");
+pub const SubnetIdError = error{InvalidCommitteeCount};
+
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) SubnetIdError!u32 {
+    if (committee_count == 0 or committee_count > std.math.maxInt(u32)) {
+        return error.InvalidCommitteeCount;
     }
     return @intCast(validator_id % committee_count);
 }
