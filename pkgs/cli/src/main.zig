@@ -684,13 +684,13 @@ fn mainInner() !void {
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
                 .api_port = leancmd.@"api-port",
-                .bootnodes = undefined,
+                .bootnodes = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .genesis_spec = undefined,
-                .validator_assignments = undefined,
-                .local_priv_key = undefined,
+                .validator_assignments = &.{}, // Initialize to empty slice to avoid segfault in deinit
+                .local_priv_key = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
-                .hash_sig_key_dir = undefined,
+                .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
             };
 
