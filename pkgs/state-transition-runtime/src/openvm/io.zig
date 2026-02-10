@@ -1,30 +1,30 @@
 const std = @import("std");
 
 pub fn print_str(str: []const u8) void {
-    // OpenVM debug print instruction
-    // Uses custom RISC-V instruction encoding for debug output
-    for (str) |byte| {
-        print_char(byte);
-    }
-}
-
-pub fn print_char(c: u8) void {
-    asm volatile (".insn r 0x0b, 1, 0, x0, %[char], x0"
+    asm volatile (".insn i 0x0b, 3, x0, %[ptr], 1"
         :
-        : [char] "r" (@as(usize, c)),
+        : [ptr] "r" (str.ptr),
+          [len] "{x11}" (str.len),
     );
 }
 
-pub fn read_input(buffer: []u8) usize {
-    var bytes_read: usize = 0;
-    const buffer_ptr = @intFromPtr(buffer.ptr);
-    const buffer_end = buffer_ptr + buffer.len;
+pub fn hint_input() void {
+    asm volatile (".insn i 0x0b, 3, x0, x0, 0");
+}
 
-    asm volatile (".insn r 0x0b, 2, 0, %[bytes_read], %[buffer_start], %[buffer_end]"
-        : [bytes_read] "=r" (bytes_read),
-        : [buffer_start] "r" (buffer_ptr),
-          [buffer_end] "r" (buffer_end),
+pub fn hint_store_u32(ptr: *u32) void {
+    asm volatile (".insn i 0x0b, 1, %[ptr], x0, 0"
+        :
+        : [ptr] "r" (ptr),
+        : "memory"
     );
+}
 
-    return bytes_read;
+pub fn hint_buffer_u32(ptr: [*]u8, word_count: u32) void {
+    asm volatile (".insn i 0x0b, 1, %[ptr], %[wc], 1"
+        :
+        : [ptr] "r" (ptr),
+          [wc] "r" (word_count),
+        : "memory"
+    );
 }
