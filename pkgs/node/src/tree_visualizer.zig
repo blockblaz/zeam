@@ -128,6 +128,14 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged
 
         // Recursively process child
         try visualizeTreeBranch(allocator, tree_lines, nodes, child_idx, depth + 1, branch + child_i, "", max_depth, max_branch);
+
+        // In multi-branch mode, separate sibling branches with newlines
+        // Only add newline if the last character isn't already a newline (avoid double newlines from sub-forks)
+        if (children.items.len > 1) {
+            if (tree_lines.items.len == 0 or tree_lines.items[tree_lines.items.len - 1] != '\n') {
+                try tree_lines.append(allocator, '\n');
+            }
+        }
     }
 }
 
@@ -687,4 +695,97 @@ test "buildTreeVisualization: fork choice tree with fork (printSlot style)" {
     try std.testing.expect(std.mem.indexOf(u8, result, "- 2 branches") != null);
     // Should use tree branch characters
     try std.testing.expect(std.mem.indexOf(u8, result, "├──") != null or std.mem.indexOf(u8, result, "└──") != null);
+}
+
+test "buildTreeVisualization: big tree with many branches and depth (max_depth=10, max_branches=10)" {
+    // Big tree test to visualize BOTH branch and depth truncation with realistic limits
+    // Structure:
+    //   Root(0) - 12 branches (exceeds max_branches=10, triggers branch truncation)
+    //     ├── Branch1: 12 blocks deep (slots 1->12, exceeds max_depth=10, triggers depth truncation)
+    //     ├── Branch2: 6 blocks deep with sub-fork at slot 3
+    //     ├── Branch3-12: leaf nodes (slots 1)
+    //
+    // This tests:
+    // 1. Branch truncation (12 > 10) - "truncated at branch 10"
+    // 2. Depth truncation (12 > 10) - "... " marker in Branch1
+    // 3. Sub-forks within branches - "- 2 branches" for D2's fork
+    // 4. Visual output showing both limits working together
+    const allocator = std.testing.allocator;
+
+    // Node indices:
+    // 0: Root
+    // 1-12: 12 children of root (Branch1-12)
+    // 13-23: Chain for Branch1 (11 more nodes, slots 2-12) - total depth 12
+    // 24-28: Chain for Branch2 with fork (slots 2-5, with fork at 25)
+    var nodes = [_]fcFactory.ProtoNode{
+        // Root: slot 0, 12 children (indices 1-12)
+        createTestProtoNode(0, 0xAA, 0x00, null, 0, 1, 12, 0, 12, 23), // bestDescendant=23 (end of Branch1)
+
+        // Branch1: deep chain of 12 blocks (indices 1, 13-23)
+        createTestProtoNode(1, 0xB1, 0xAA, 0, 1, 13, 13, 2, 1, 23), // B1 slot 1, depth 1
+        // Branch2: chain with fork (indices 2, 24-28)
+        createTestProtoNode(1, 0xB2, 0xAA, 0, 1, 24, 24, 3, 1, 28), // B2 slot 1
+        // Branches 3-12: leaf nodes
+        createTestProtoNode(1, 0xB3, 0xAA, 0, 1, 0, 0, 4, 0, null), // B3
+        createTestProtoNode(1, 0xB4, 0xAA, 0, 1, 0, 0, 5, 0, null), // B4
+        createTestProtoNode(1, 0xB5, 0xAA, 0, 1, 0, 0, 6, 0, null), // B5
+        createTestProtoNode(1, 0xB6, 0xAA, 0, 1, 0, 0, 7, 0, null), // B6
+        createTestProtoNode(1, 0xB7, 0xAA, 0, 1, 0, 0, 8, 0, null), // B7
+        createTestProtoNode(1, 0xB8, 0xAA, 0, 1, 0, 0, 9, 0, null), // B8
+        createTestProtoNode(1, 0xB9, 0xAA, 0, 1, 0, 0, 10, 0, null), // B9
+        createTestProtoNode(1, 0xBA, 0xAA, 0, 1, 0, 0, 11, 0, null), // B10
+        createTestProtoNode(1, 0xBB, 0xAA, 0, 1, 0, 0, 12, 0, null), // B11
+        createTestProtoNode(1, 0xBC, 0xAA, 0, 1, 0, 0, 0, 0, null), // B12 (last, no sibling)
+
+        // Branch1 chain continuation (indices 13-23, slots 2-12) - 12 total depth
+        createTestProtoNode(2, 0xC1, 0xB1, 1, 2, 14, 14, 0, 1, 23), // slot 2, depth 2
+        createTestProtoNode(3, 0xD1, 0xC1, 13, 3, 15, 15, 0, 1, 23), // slot 3, depth 3
+        createTestProtoNode(4, 0xE1, 0xD1, 14, 4, 16, 16, 0, 1, 23), // slot 4, depth 4
+        createTestProtoNode(5, 0xF1, 0xE1, 15, 5, 17, 17, 0, 1, 23), // slot 5, depth 5
+        createTestProtoNode(6, 0x11, 0xF1, 16, 6, 18, 18, 0, 1, 23), // slot 6, depth 6
+        createTestProtoNode(7, 0x12, 0x11, 17, 7, 19, 19, 0, 1, 23), // slot 7, depth 7
+        createTestProtoNode(8, 0x13, 0x12, 18, 8, 20, 20, 0, 1, 23), // slot 8, depth 8
+        createTestProtoNode(9, 0x14, 0x13, 19, 9, 21, 21, 0, 1, 23), // slot 9, depth 9
+        createTestProtoNode(10, 0x15, 0x14, 20, 10, 22, 22, 0, 1, 23), // slot 10, depth 10
+        createTestProtoNode(11, 0x16, 0x15, 21, 11, 23, 23, 0, 1, 23), // slot 11, depth 11
+        createTestProtoNode(12, 0x17, 0x16, 22, 12, 0, 0, 0, 0, null), // slot 12, depth 12 (leaf)
+
+        // Branch2 chain with fork (indices 24-28)
+        createTestProtoNode(2, 0xC2, 0xB2, 2, 2, 25, 25, 0, 1, 28), // C2 slot 2
+        createTestProtoNode(3, 0xD2, 0xC2, 24, 3, 26, 27, 0, 2, 28), // D2 slot 3 - FORK: 2 children
+        createTestProtoNode(4, 0xE2, 0xD2, 25, 4, 28, 28, 27, 1, 28), // E2a slot 4 (fork branch a)
+        createTestProtoNode(4, 0xE3, 0xD2, 25, 4, 0, 0, 0, 0, null), // E2b slot 4 (fork branch b, leaf)
+        createTestProtoNode(5, 0xF2, 0xE2, 26, 5, 0, 0, 0, 0, null), // F2 slot 5 (leaf of branch a)
+    };
+
+    const result = try buildTreeVisualization(allocator, &nodes, 10, 10);
+    defer allocator.free(result);
+
+    std.debug.print("\n=== TEST: big tree with many branches (max_depth=10, max_branches=10) ===\n", .{});
+    std.debug.print("ForkChoice Tree:\n{s}\n", .{result});
+
+    // Verify root is present
+    try std.testing.expect(std.mem.indexOf(u8, result, "aaaa(0)") != null);
+
+    // Verify it shows 12 branches
+    try std.testing.expect(std.mem.indexOf(u8, result, "- 12 branches") != null);
+
+    // Verify branch truncation occurs (should see "truncated at branch 10")
+    try std.testing.expect(std.mem.indexOf(u8, result, "truncated at branch 10") != null);
+
+    // Verify depth truncation occurs in Branch1 (should see "... " marker)
+    try std.testing.expect(std.mem.indexOf(u8, result, "... ") != null);
+
+    // Verify Branch1's start is visible
+    try std.testing.expect(std.mem.indexOf(u8, result, "b1b1(1)") != null);
+
+    // Verify Branch1's leaf (slot 12) is visible (near-leaf nodes shown despite depth truncation)
+    try std.testing.expect(std.mem.indexOf(u8, result, "1717(12)") != null);
+
+    // Verify Branch2's sub-fork is present and shows as a fork
+    try std.testing.expect(std.mem.indexOf(u8, result, "d2d2(3)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- 2 branches") != null); // D2's fork indicator
+
+    // Verify tree structure characters are used
+    try std.testing.expect(std.mem.indexOf(u8, result, "├──") != null);
 }
