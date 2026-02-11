@@ -14,17 +14,25 @@ const networks = @import("@zeam/network");
 const constants = @import("./constants.zig");
 
 pub const ValidatorClientOutput = struct {
+    allocator: Allocator,
     gossip_messages: std.ArrayList(networks.GossipMessage),
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
         return Self{
+            .allocator = allocator,
             .gossip_messages = std.ArrayList(networks.GossipMessage).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.gossip_messages.items) |*gossip_msg| {
+            switch (gossip_msg.*) {
+                .aggregation => |*signed_aggregation| signed_aggregation.deinit(),
+                else => {},
+            }
+        }
         self.gossip_messages.deinit();
     }
 
@@ -39,7 +47,11 @@ pub const ValidatorClientOutput = struct {
     }
 
     pub fn addAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
-        const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
+        var cloned_aggregation: types.SignedAggregatedAttestation = undefined;
+        try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned_aggregation);
+        errdefer cloned_aggregation.deinit();
+
+        const gossip_msg = networks.GossipMessage{ .aggregation = cloned_aggregation };
         try self.gossip_messages.append(gossip_msg);
     }
 };
@@ -263,15 +275,7 @@ pub const ValidatorClient = struct {
         if (aggregations.len == 0) return null;
 
         var result = ValidatorClientOutput.init(self.allocator);
-        errdefer {
-            for (result.gossip_messages.items) |*gossip_msg| {
-                switch (gossip_msg.*) {
-                    .aggregation => |*signed_aggregation| signed_aggregation.deinit(),
-                    else => {},
-                }
-            }
-            result.deinit();
-        }
+        errdefer result.deinit();
 
         var i: usize = 0;
         while (i < aggregations.len) : (i += 1) {
@@ -283,6 +287,7 @@ pub const ValidatorClient = struct {
                 }
                 return err;
             };
+            aggregations[i].deinit();
         }
 
         self.logger.info("constructed {d} aggregations for slot={d}", .{ aggregations.len, slot });

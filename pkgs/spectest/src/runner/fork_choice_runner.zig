@@ -754,7 +754,7 @@ fn processBlockStep(
             );
             return FixtureError.InvalidFixture;
         };
-        errdefer proof_template.deinit();
+        defer proof_template.deinit();
 
         const bits_len = aggregated_attestation.aggregation_bits.len();
         for (0..bits_len) |i| {
@@ -789,7 +789,6 @@ fn processBlockStep(
             };
         }
 
-        proof_template.deinit();
     }
 
     _ = try ctx.fork_choice.updateHead();
@@ -1148,19 +1147,8 @@ fn verifyBlockAttestations(
             if (actual.target_slot != expected_target_slot) continue;
             if (actual.participants.len != expected_participants.len) continue;
 
-            const sorted_actual_participants = ctx.allocator.alloc(u64, actual.participants.len) catch |err| {
-                std.debug.print(
-                    "fixture {s} case {s}{}: failed to allocate actual participants ({s})\n",
-                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                );
-                return FixtureError.InvalidFixture;
-            };
-            defer ctx.allocator.free(sorted_actual_participants);
-            @memcpy(sorted_actual_participants, actual.participants);
-            std.sort.heap(u64, sorted_actual_participants, {}, std.sort.asc(u64));
-
             var equal = true;
-            for (sorted_actual_participants, 0..) |p, p_idx| {
+            for (actual.participants, 0..) |p, p_idx| {
                 if (p != expected_participants[p_idx]) {
                     equal = false;
                     break;

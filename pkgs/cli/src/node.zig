@@ -366,7 +366,6 @@ pub const Node = struct {
 
         // Overriding the IP to 0.0.0.0 to listen on all interfaces
         try self.enr.kvs.put("ip", "\x00\x00\x00\x00");
-        try self.enr.kvs.put("is_aggregator", if (self.options.is_aggregator) "\x01" else "\x00");
 
         var node_multiaddrs = try self.enr.multiaddrP2PQUIC(self.allocator);
         defer node_multiaddrs.deinit(self.allocator);
