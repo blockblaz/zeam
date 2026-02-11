@@ -788,7 +788,6 @@ fn processBlockStep(
                 return FixtureError.FixtureMismatch;
             };
         }
-
     }
 
     _ = try ctx.fork_choice.updateHead();
