@@ -11,6 +11,7 @@ const zkvmTarget = struct {
 
 const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "risc0", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "sp1", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
