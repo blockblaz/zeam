@@ -13,6 +13,7 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "risc0", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
     .{ .name = "openvm", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "ziren", .triplet = "mipsel-freestanding-none", .cpu_features = "mips32r2" },
 };
 
 const ProverChoice = enum { dummy, risc0, openvm, all };
@@ -128,10 +129,10 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
-    // add rocksdb — always use ReleaseFast to minimize disk usage (debug info is huge)
+    // add rocksdb
     const rocksdb = b.dependency("rocksdb", .{
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     }).module("bindings");
 
     // add snappyz
