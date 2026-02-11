@@ -837,32 +837,34 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
-        if (self.latest_new_aggregated_payloads.count() > 0) {
+        {
             // Keep payload migration synchronized with other signature/payload map writers.
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
 
-            var it = self.latest_new_aggregated_payloads.iterator();
-            while (it.next()) |entry| {
-                const sig_key = entry.key_ptr.*;
-                const source_list = entry.value_ptr;
+            if (self.latest_new_aggregated_payloads.count() > 0) {
+                var it = self.latest_new_aggregated_payloads.iterator();
+                while (it.next()) |entry| {
+                    const sig_key = entry.key_ptr.*;
+                    const source_list = entry.value_ptr;
 
-                const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+                    const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+                    }
+
+                    // Ensure all required capacity up-front so the move is non-failing.
+                    try gop.value_ptr.ensureUnusedCapacity(source_list.items.len);
+                    for (source_list.items) |stored| {
+                        gop.value_ptr.appendAssumeCapacity(stored);
+                    }
+
+                    // Source list buffer no longer needed after ownership transfer.
+                    source_list.deinit();
+                    source_list.* = AggregatedPayloadsList.init(self.allocator);
                 }
-
-                // Ensure all required capacity up-front so the move is non-failing.
-                try gop.value_ptr.ensureUnusedCapacity(source_list.items.len);
-                for (source_list.items) |stored| {
-                    gop.value_ptr.appendAssumeCapacity(stored);
-                }
-
-                // Source list buffer no longer needed after ownership transfer.
-                source_list.deinit();
-                source_list.* = AggregatedPayloadsList.init(self.allocator);
+                self.latest_new_aggregated_payloads.clearAndFree();
             }
-            self.latest_new_aggregated_payloads.clearAndFree();
         }
         return self.updateHeadUnlocked();
     }
@@ -945,10 +947,9 @@ pub const ForkChoice = struct {
             const attestation_data = self.attestation_data_by_root.get(data_root) orelse continue;
 
             for (entry.value_ptr.items) |*stored| {
-                var validator_indices = try types.aggregationBitsToValidatorIndices(&stored.proof.participants, self.allocator);
-                defer validator_indices.deinit();
-
-                for (validator_indices.items) |validator_index| {
+                const participants_len = stored.proof.participants.len();
+                for (0..participants_len) |validator_index| {
+                    if (!(try stored.proof.participants.get(validator_index))) continue;
                     const validator_id: types.ValidatorIndex = @intCast(validator_index);
                     if (attestations.get(validator_id)) |existing| {
                         if (existing.slot >= attestation_data.slot) {
