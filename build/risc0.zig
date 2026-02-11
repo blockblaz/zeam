@@ -23,7 +23,7 @@ pub fn main() !void {
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
 
-        var write_buf: [4096]u8 = undefined;
+        var write_buf: [131072]u8 = undefined;
         var writer = file.writer(&write_buf);
 
         // magic + binary format (risc0 format is little-endian)
