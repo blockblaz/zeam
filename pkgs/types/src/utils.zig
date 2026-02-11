@@ -14,6 +14,7 @@ pub const Bytes32 = [32]u8;
 pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
+pub const SubnetId = u32;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
@@ -33,11 +34,12 @@ const json = std.json;
 
 pub const SubnetIdError = error{InvalidCommitteeCount};
 
-pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: u64) SubnetIdError!u32 {
-    if (committee_count == 0 or committee_count > std.math.maxInt(u32)) {
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: SubnetId) SubnetIdError!SubnetId {
+    if (committee_count == 0) {
         return error.InvalidCommitteeCount;
     }
-    return @intCast(validator_id % committee_count);
+    const committee_count_index: ValidatorIndex = committee_count;
+    return @intCast(validator_id % committee_count_index);
 }
 
 pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
@@ -85,15 +87,14 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
 
 fn isqrt(n: u64) u64 {
     if (n == 0) return 0;
+    const bit_length: u7 = @intCast((@bitSizeOf(u64) - @clz(n)));
+    var x: u64 = @as(u64, 1) << @intCast((bit_length + 1) / 2);
 
-    var x = @as(u64, @intFromFloat(@floor(@sqrt(@as(f64, @floatFromInt(n))))));
-    while ((x + 1) <= n / (x + 1)) {
-        x += 1;
+    while (true) {
+        const y = (x + (n / x)) >> 1;
+        if (y >= x) return x;
+        x = y;
     }
-    while (x > n / x) {
-        x -= 1;
-    }
-    return x;
 }
 
 pub fn getJustifiedSlotsIndex(finalized_slot: types.Slot, slot: types.Slot) ?usize {
@@ -148,7 +149,7 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
-    attestation_committee_count: u64,
+    attestation_committee_count: SubnetId,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -158,7 +159,7 @@ pub const ChainSpec = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
-        try obj.put("attestation_committee_count", json.Value{ .integer = @as(i64, @intCast(self.attestation_committee_count)) });
+        try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
         return json.Value{ .object = obj };
     }
 

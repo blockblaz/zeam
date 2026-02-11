@@ -33,7 +33,7 @@ pub const ValidatorClientOutput = struct {
         try self.gossip_messages.append(gossip_msg);
     }
 
-    pub fn addAttestation(self: *Self, subnet_id: u32, signed_attestation: types.SignedAttestation) !void {
+    pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
         const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = signed_attestation } };
         try self.gossip_messages.append(gossip_msg);
     }
@@ -227,7 +227,7 @@ pub const ValidatorClient = struct {
             };
 
             const subnet_id = try types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
-            try result.addAttestation(@intCast(subnet_id), signed_attestation);
+            try result.addAttestation(subnet_id, signed_attestation);
             self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
         return result;

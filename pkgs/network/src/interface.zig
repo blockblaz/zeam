@@ -206,41 +206,36 @@ pub const GossipTopicKind = enum {
 
 pub const GossipTopic = struct {
     kind: GossipTopicKind,
-    subnet_id: ?u32 = null,
+    subnet_id: ?types.SubnetId = null,
 
     pub fn encode(self: GossipTopic, allocator: Allocator) ![]u8 {
-        return switch (self.kind) {
-            .block => allocator.dupe(u8, "block"),
-            .aggregation => allocator.dupe(u8, "aggregation"),
-            .attestation => blk: {
-                const subnet_id = self.subnet_id orelse return error.MissingSubnetId;
-                break :blk std.fmt.allocPrint(allocator, "attestation_{d}", .{subnet_id});
-            },
-        };
+        if (self.kind == .attestation) {
+            const subnet_id = self.subnet_id orelse return error.MissingSubnetId;
+            return std.fmt.allocPrint(allocator, "attestation_{d}", .{subnet_id});
+        }
+        return allocator.dupe(u8, @tagName(self.kind));
     }
 
     pub fn decode(encoded: []const u8) !GossipTopic {
         if (std.mem.startsWith(u8, encoded, "attestation_")) {
             const subnet_slice = encoded["attestation_".len..];
-            const subnet_id = std.fmt.parseInt(u32, subnet_slice, 10) catch return error.InvalidDecoding;
+            const subnet_id = std.fmt.parseInt(types.SubnetId, subnet_slice, 10) catch return error.InvalidDecoding;
             return GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
         }
-        if (std.mem.eql(u8, encoded, "block")) return GossipTopic{ .kind = .block };
-        if (std.mem.eql(u8, encoded, "aggregation")) return GossipTopic{ .kind = .aggregation };
-        return error.InvalidDecoding;
+        const kind = std.meta.stringToEnum(GossipTopicKind, encoded) orelse return error.InvalidDecoding;
+        return GossipTopic{ .kind = kind };
     }
 
     pub fn format(self: GossipTopic, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
         _ = options;
         switch (self.kind) {
-            .block => try writer.writeAll("block"),
-            .aggregation => try writer.writeAll("aggregation"),
+            .block, .aggregation => try writer.writeAll(@tagName(self.kind)),
             .attestation => {
                 if (self.subnet_id) |subnet_id| {
                     try writer.print("attestation_{d}", .{subnet_id});
                 } else {
-                    try writer.writeAll("attestation");
+                    try writer.writeAll(@tagName(self.kind));
                 }
             },
         }
@@ -248,7 +243,7 @@ pub const GossipTopic = struct {
 };
 
 pub const AttestationGossip = struct {
-    subnet_id: u32,
+    subnet_id: types.SubnetId,
     message: types.SignedAttestation,
 };
 

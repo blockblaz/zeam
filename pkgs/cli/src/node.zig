@@ -814,6 +814,30 @@ fn getPrivateKeyFromValidatorConfig(allocator: std.mem.Allocator, node_key: []co
     return error.InvalidNodeKey;
 }
 
+fn getIsAggregatorFromValidatorConfig(node_key: []const u8, validator_config: Yaml) !bool {
+    for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
+        const name_value = entry.map.get("name").?;
+        if (name_value == .string and std.mem.eql(u8, name_value.string, node_key)) {
+            const value = entry.map.get("is_aggregator") orelse return false;
+            return switch (value) {
+                .boolean => |b| b,
+                .int => |i| switch (i) {
+                    0 => false,
+                    1 => true,
+                    else => error.InvalidAggregatorFlag,
+                },
+                .string => |s| blk: {
+                    if (std.ascii.eqlIgnoreCase(s, "true")) break :blk true;
+                    if (std.ascii.eqlIgnoreCase(s, "false")) break :blk false;
+                    break :blk error.InvalidAggregatorFlag;
+                },
+                else => error.InvalidAggregatorFlag,
+            };
+        }
+    }
+    return error.InvalidNodeKey;
+}
+
 fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []const u8, validator_config: Yaml) !EnrFields {
     for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
         const name_value = entry.map.get("name").?;
@@ -1078,9 +1102,10 @@ pub fn populateNodeNameRegistry(
                 if (privkey_value == .string) {
                     const enr_fields_value = entry.map.get("enrFields");
                     if (enr_fields_value != null) {
+                        const is_aggregator = getIsAggregatorFromValidatorConfig(node_name, parsed_validator_config) catch break :blk null;
                         var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
                         defer enr_fields.deinit(allocator);
-                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields, false) catch break :blk null;
+                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields, is_aggregator) catch break :blk null;
                         defer enr.deinit();
                         const pid = enr.peerId(allocator) catch break :blk null;
                         const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;

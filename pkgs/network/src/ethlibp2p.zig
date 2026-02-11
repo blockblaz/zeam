@@ -916,7 +916,7 @@ pub const EthLibp2pParams = struct {
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
     node_registry: *const NodeNameRegistry,
-    attestation_committee_count: u64,
+    attestation_committee_count: types.SubnetId,
 };
 
 pub const EthLibp2p = struct {
@@ -931,6 +931,11 @@ pub const EthLibp2p = struct {
     node_registry: *const NodeNameRegistry,
 
     const Self = @This();
+
+    fn getAttestationSubnetCount(committee_count: types.SubnetId) !usize {
+        if (committee_count == 0) return error.InvalidAttestationCommitteeCount;
+        return @intCast(committee_count);
+    }
 
     pub fn init(
         allocator: Allocator,
@@ -1010,11 +1015,7 @@ pub const EthLibp2p = struct {
         for (std.enums.values(interface.GossipTopicKind)) |kind| {
             switch (kind) {
                 .attestation => {
-                    const count_u64 = self.params.attestation_committee_count;
-                    if (count_u64 == 0 or count_u64 > std.math.maxInt(u32)) {
-                        return error.InvalidAttestationCommitteeCount;
-                    }
-                    const count = std.math.cast(usize, count_u64) orelse return error.InvalidAttestationCommitteeCount;
+                    const count = try getAttestationSubnetCount(self.params.attestation_committee_count);
                     for (0..count) |subnet_id| {
                         const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = @intCast(subnet_id) };
                         var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);

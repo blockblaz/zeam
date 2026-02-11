@@ -55,6 +55,7 @@ pub const Bytes32 = utils.Bytes32;
 pub const Slot = utils.Slot;
 pub const Interval = utils.Interval;
 pub const ValidatorIndex = utils.ValidatorIndex;
+pub const SubnetId = utils.SubnetId;
 pub const Bytes48 = utils.Bytes48;
 pub const SIGSIZE = utils.SIGSIZE;
 pub const SIGBYTES = utils.SIGBYTES;
