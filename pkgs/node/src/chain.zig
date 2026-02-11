@@ -1568,6 +1568,87 @@ test "printSlot output demonstration" {
     try std.testing.expect(beam_chain.registered_validator_ids.len == 3);
 }
 
+test "buildTreeVisualization integration test" {
+    // Integration test for buildTreeVisualization through the real chain pipeline
+    // This tests the visualization with real block roots from processed blocks
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    // Create a mock chain with some blocks
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    const nodeId = 42;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    // Initialize the beam chain
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, &std.StringHashMap(PeerInfo).init(allocator));
+
+    // Process blocks to build the forkchoice tree
+    for (1..mock_chain.blocks.len) |i| {
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        const current_slot = block.slot;
+
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
+    }
+
+    // Get forkchoice snapshot and build tree visualization
+    // Uses .snapshot() — same method as printSlot (see line ~535)
+    const snapshot = try beam_chain.forkChoice.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const tree_output = try tree_visualizer.buildTreeVisualization(allocator, snapshot.nodes, 10, null);
+    defer allocator.free(tree_output);
+
+    std.debug.print("\n=== INTEGRATION TEST: buildTreeVisualization ===\n", .{});
+    std.debug.print("ForkChoice Tree:\n{s}\n", .{tree_output});
+
+    // Verify the output format:
+    // 1. Output should not be empty (we have 3 blocks)
+    try std.testing.expect(tree_output.len > 0);
+
+    // 2. Should contain slot numbers in parentheses for each block
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "(0)") != null); // genesis
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "(1)") != null); // slot 1
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "(2)") != null); // slot 2
+
+    // 3. Should contain the chain connector for linear chain
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "─") != null);
+
+    // 4. Should NOT contain fork indicators (we have a linear chain)
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "├──") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tree_output, "└──") == null);
+
+    // 5. Verify node count matches blocks processed
+    try std.testing.expect(snapshot.nodes.len == mock_chain.blocks.len);
+}
+
 // Attestation Validation Tests
 // These tests align with leanSpec's test_attestation_processing.py
 
