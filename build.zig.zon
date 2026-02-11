@@ -48,8 +48,8 @@
             .hash = "hash_zig-1.1.3-POmurGUxCwBhWN4rP3ECGi0yS73KDyZ8Y29Q0wGKZWcE",
         },
         .multiaddr = .{
-            .url = "git+https://github.com/zen-eth/multiaddr-zig#c5e16a3a506cca8d37b732ea343818033782e874",
-            .hash = "multiaddr-0.1.0-Cjayds-5AAArNw0ghMgquaRygVf7-kEWQJlQGjVpZzZ0",
+            .url = "git+https://github.com/zen-eth/multiaddr-zig#ba57f18bb375acb3313a3017aaf9fa517f598f37",
+            .hash = "multiaddr-0.1.0-CjaydtK5AABS9kkN9a3c7UBKSsweNV66ZIV86oO1yf3V",
         },
     },
     .paths = .{""},
