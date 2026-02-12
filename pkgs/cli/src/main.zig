@@ -5,24 +5,13 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
-// Custom log function to suppress YAML tokenizer/parser debug noise
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
 pub const std_options: std.Options = .{
-    .logFn = zeamLogFn,
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .tokenizer, .level = .err },
+        .{ .scope = .parser, .level = .err },
+    },
 };
-
-fn zeamLogFn(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    // Filter out YAML tokenizer and parser debug messages
-    if (level == .debug and (scope == .tokenizer or scope == .parser)) {
-        return;
-    }
-    // Otherwise use default logging
-    std.log.defaultLog(level, scope, format, args);
-}
 
 const types = @import("@zeam/types");
 const node_lib = @import("@zeam/node");
