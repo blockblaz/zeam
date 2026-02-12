@@ -342,7 +342,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     pub fn toJson(self: *const ReqRespRequest, allocator: Allocator) !json.Value {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
-            .blocks_by_root => |request| request.toJson(allocator),
+            .blocks_by_root => |request| types.blockByRootRequestToJson(&request, allocator),
         };
     }
 
@@ -369,16 +369,14 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
         const PayloadType = std.meta.TagPayload(Self, tag);
         return switch (tag) {
-            .blocks_by_root => PayloadType{
-                .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
-            },
+            .blocks_by_root => try PayloadType.init(allocator),
             inline else => @as(PayloadType, undefined),
         };
     }
 
     fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
         switch (tag) {
-            .blocks_by_root => payload.roots.deinit(),
+            .blocks_by_root => payload.deinit(),
             inline else => {},
         }
     }

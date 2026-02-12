@@ -698,7 +698,7 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                const roots = request.roots.constSlice();
+                const roots = request.constSlice();
 
                 self.logger.debug(
                     "node-{d}:: Handling blocks_by_root request for {d} roots",
