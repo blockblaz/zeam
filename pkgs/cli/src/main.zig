@@ -5,6 +5,14 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
+pub const std_options: std.Options = .{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .tokenizer, .level = .err },
+        .{ .scope = .parser, .level = .err },
+    },
+};
+
 const types = @import("@zeam/types");
 const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
