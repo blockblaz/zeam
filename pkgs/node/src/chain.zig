@@ -336,16 +336,19 @@ pub const BeamChain = struct {
         // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onGossipAttestation
         // acquires mutex then signatures_mutex. Holding signatures_mutex across onBlock/updateHead
         // would allow: (this thread: signatures_mutex -> mutex) vs (gossip: mutex -> signatures_mutex).
-        self.forkChoice.signatures_mutex.lock();
-        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
-        try aggregation.computeAggregatedSignatures(
-            attestations,
-            &pre_state.validators,
-            &self.forkChoice.gossip_signatures,
-            &self.forkChoice.aggregated_payloads,
-        );
-        _ = building_timer.observe();
-        self.forkChoice.signatures_mutex.unlock();
+        {
+            self.forkChoice.signatures_mutex.lock();
+            defer self.forkChoice.signatures_mutex.unlock();
+
+            const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
+            try aggregation.computeAggregatedSignatures(
+                attestations,
+                &pre_state.validators,
+                &self.forkChoice.gossip_signatures,
+                &self.forkChoice.aggregated_payloads,
+            );
+            _ = building_timer.observe();
+        }
 
         // Record aggregated signature metrics
         const num_agg_sigs = aggregation.attestation_signatures.len();
