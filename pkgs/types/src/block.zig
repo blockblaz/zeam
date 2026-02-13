@@ -635,26 +635,30 @@ pub const AggregatedAttestationsResult = struct {
     }
 };
 
-pub const BlockByRootRequest = struct {
-    roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
+/// BlockByRootRequest is encoded as a raw SSZ list of roots (no container offset header).
+/// This matches devnet-2 spec where BlocksByRootRequest is SSZList[Bytes32].
+/// See: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md
+/// "For objects containing a single field, only the field is SSZ-encoded not a container with a single field."
+pub const BlockByRootRequest = ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS);
 
-    pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        var roots_array = json.Array.init(allocator);
-        errdefer roots_array.deinit();
-        for (self.roots.constSlice()) |root| {
-            try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
-        }
-        try obj.put("roots", json.Value{ .array = roots_array });
-        return json.Value{ .object = obj };
+/// Convert a BlockByRootRequest to JSON representation.
+pub fn blockByRootRequestToJson(request: *const BlockByRootRequest, allocator: Allocator) !json.Value {
+    var obj = json.ObjectMap.init(allocator);
+    var roots_array = json.Array.init(allocator);
+    errdefer roots_array.deinit();
+    for (request.constSlice()) |root| {
+        try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
     }
+    try obj.put("roots", json.Value{ .array = roots_array });
+    return json.Value{ .object = obj };
+}
 
-    pub fn toJsonString(self: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
-        var json_value = try self.toJson(allocator);
-        defer freeJsonValue(&json_value, allocator);
-        return utils.jsonToString(allocator, json_value);
-    }
-};
+/// Convert a BlockByRootRequest to JSON string.
+pub fn blockByRootRequestToJsonString(request: *const BlockByRootRequest, allocator: Allocator) ![]const u8 {
+    var json_value = try blockByRootRequestToJson(request, allocator);
+    defer freeJsonValue(&json_value, allocator);
+    return utils.jsonToString(allocator, json_value);
+}
 
 /// Canonical lightweight forkchoice proto block used across modules
 pub const ProtoBlock = struct {

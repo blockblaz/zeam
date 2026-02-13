@@ -332,9 +332,11 @@ pub const BeamChain = struct {
             }
             aggregation.attestation_signatures.deinit();
         };
-        // Lock mutex to protect concurrent access to gossip_signatures and aggregated_payloads
+        // Lock mutex only for the duration of computeAggregatedSignatures to avoid deadlock:
+        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onGossipAttestation
+        // acquires mutex then signatures_mutex. Holding signatures_mutex across onBlock/updateHead
+        // would allow: (this thread: signatures_mutex -> mutex) vs (gossip: mutex -> signatures_mutex).
         self.forkChoice.signatures_mutex.lock();
-        defer self.forkChoice.signatures_mutex.unlock();
         const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
         try aggregation.computeAggregatedSignatures(
             attestations,
@@ -343,6 +345,7 @@ pub const BeamChain = struct {
             &self.forkChoice.aggregated_payloads,
         );
         _ = building_timer.observe();
+        self.forkChoice.signatures_mutex.unlock();
 
         // Record aggregated signature metrics
         const num_agg_sigs = aggregation.attestation_signatures.len();
