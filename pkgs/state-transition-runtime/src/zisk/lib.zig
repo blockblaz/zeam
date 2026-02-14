@@ -39,7 +39,7 @@ pub fn get_allocator() std.mem.Allocator {
     // two pointers.
     const mem_size: usize = @intFromPtr(mem_end) - @intFromPtr(mem_start);
     const mem_area: []u8 = mem_start[0..mem_size];
-    asm volatile ("" ::: "memory");
+    asm volatile ("" ::: .{ .memory = true });
     var fixed_allocator = std.heap.FixedBufferAllocator.init(mem_area);
     return fixed_allocator.allocator();
 }

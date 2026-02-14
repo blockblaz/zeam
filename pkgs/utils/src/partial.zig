@@ -14,7 +14,7 @@ pub fn Partial(comptime T: type) type {
                     else => ?field.type,
                 };
                 const default_value: optional_type = null;
-                const aligned_ptr: *align(field.alignment) const anyopaque = @alignCast(@ptrCast(&default_value));
+                const aligned_ptr: *align(field.alignment) const anyopaque = @ptrCast(@alignCast(&default_value));
                 const optional_field: [1]std.builtin.Type.StructField = [_]std.builtin.Type.StructField{.{
                     .alignment = field.alignment,
                     .default_value_ptr = aligned_ptr,

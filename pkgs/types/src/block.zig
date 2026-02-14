@@ -344,12 +344,12 @@ pub const AggregatedAttestationsResult = struct {
             validator_bits: std.DynamicBitSet,
         };
 
-        var groups = std.ArrayList(AttestationGroup).init(allocator);
+        var groups: std.ArrayList(AttestationGroup) = .empty;
         defer {
             for (groups.items) |*group| {
                 group.validator_bits.deinit();
             }
-            groups.deinit();
+            groups.deinit(allocator);
         }
 
         var root_indices = std.AutoHashMap(Root, usize).init(allocator);
@@ -368,7 +368,7 @@ pub const AggregatedAttestationsResult = struct {
             } else {
                 var new_bits = try std.DynamicBitSet.initEmpty(allocator, vid + 1);
                 new_bits.set(vid);
-                try groups.append(.{
+                try groups.append(allocator, .{
                     .data = att.data,
                     .data_root = data_root,
                     .validator_bits = new_bits,
@@ -387,20 +387,20 @@ pub const AggregatedAttestationsResult = struct {
             // Phase 1: Collect signatures from signatures_map
             const max_validator = group.validator_bits.capacity();
 
-            var sigmap_sigs = std.ArrayList(xmss.Signature).init(allocator);
+            var sigmap_sigs: std.ArrayList(xmss.Signature) = .empty;
             defer {
                 for (sigmap_sigs.items) |*sig| {
                     sig.deinit();
                 }
-                sigmap_sigs.deinit();
+                sigmap_sigs.deinit(allocator);
             }
 
-            var sigmap_pks = std.ArrayList(xmss.PublicKey).init(allocator);
+            var sigmap_pks: std.ArrayList(xmss.PublicKey) = .empty;
             defer {
                 for (sigmap_pks.items) |*pk| {
                     pk.deinit();
                 }
-                sigmap_pks.deinit();
+                sigmap_pks.deinit(allocator);
             }
 
             // Map from validator_id to index in signatures_map arrays
@@ -453,8 +453,8 @@ pub const AggregatedAttestationsResult = struct {
                         };
 
                         vid_to_sigmap_idx[validator_id] = sigmap_sigs.items.len;
-                        try sigmap_sigs.append(sig);
-                        try sigmap_pks.append(pk);
+                        try sigmap_sigs.append(allocator, sig);
+                        try sigmap_pks.append(allocator, pk);
                         sigmap_available.set(validator_id);
                     } else {
                         remaining.set(validator_id);
@@ -731,10 +731,10 @@ test "ssz seralize/deserialize signed beam block" {
     };
     defer signed_block.deinit();
 
-    var serialized_signed_block = std.ArrayList(u8).init(std.testing.allocator);
-    defer serialized_signed_block.deinit();
+    var serialized_signed_block: std.ArrayList(u8) = .empty;
+    defer serialized_signed_block.deinit(std.testing.allocator);
 
-    try ssz.serialize(SignedBlockWithAttestation, signed_block, &serialized_signed_block);
+    try ssz.serialize(SignedBlockWithAttestation, signed_block, &serialized_signed_block, std.testing.allocator);
     try std.testing.expect(serialized_signed_block.items.len > 0);
 
     var deserialized_signed_block: SignedBlockWithAttestation = undefined;
@@ -800,9 +800,9 @@ test "encode decode signed block with attestation roundtrip" {
     };
     defer signed_block_with_attestation.deinit();
 
-    var encoded = std.ArrayList(u8).init(std.testing.allocator);
-    defer encoded.deinit();
-    try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded);
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded, std.testing.allocator);
 
     var decoded: SignedBlockWithAttestation = undefined;
     try ssz.deserialize(SignedBlockWithAttestation, encoded.items[0..], &decoded, std.testing.allocator);
@@ -860,9 +860,9 @@ test "encode decode signed block with non-empty attestation signatures" {
     };
     defer signed_block_with_attestation.deinit();
 
-    var encoded = std.ArrayList(u8).init(std.testing.allocator);
-    defer encoded.deinit();
-    try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded);
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try ssz.serialize(SignedBlockWithAttestation, signed_block_with_attestation, &encoded, std.testing.allocator);
 
     var decoded: SignedBlockWithAttestation = undefined;
     try ssz.deserialize(SignedBlockWithAttestation, encoded.items[0..], &decoded, std.testing.allocator);

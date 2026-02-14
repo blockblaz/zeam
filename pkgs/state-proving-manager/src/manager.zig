@@ -12,8 +12,8 @@ const Allocator = std.mem.Allocator;
 // extern fn powdr_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32;
 
 // Conditionally declare extern functions - these will only be linked if the library is included
-extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) callconv(.C) u32;
-extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.C) bool;
+extern fn risc0_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) callconv(.c) u32;
+extern fn risc0_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.c) bool;
 
 fn risc0_prove_stub(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32 {
     _ = serialized;
@@ -37,8 +37,8 @@ const risc0_prove_fn = if (build_options.has_risc0) risc0_prove else risc0_prove
 const risc0_verify_fn = if (build_options.has_risc0) risc0_verify else risc0_verify_stub;
 
 // Conditionally declare extern functions - these will only be linked if the library is included
-extern fn openvm_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) callconv(.C) u32;
-extern fn openvm_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.C) bool;
+extern fn openvm_prove(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) callconv(.c) u32;
+extern fn openvm_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.c) bool;
 
 fn openvm_prove_stub(serialized: [*]const u8, len: usize, output: [*]u8, output_len: usize, binary_path: [*]const u8, binary_path_length: usize, result_path: [*]const u8, result_path_len: usize) u32 {
     _ = serialized;
@@ -103,9 +103,9 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
         .block = block,
     };
 
-    var serialized = std.ArrayList(u8).init(allocator);
-    defer serialized.deinit();
-    try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized);
+    var serialized: std.ArrayList(u8) = .empty;
+    defer serialized.deinit(allocator);
+    try ssz.serialize(types.BeamSTFProverInput, prover_input, &serialized, allocator);
 
     opts.logger.debug("prove transition ----------- serialized_len={d}", .{serialized.items.len});
 
