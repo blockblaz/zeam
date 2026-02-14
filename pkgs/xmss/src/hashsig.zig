@@ -3,6 +3,21 @@ const Allocator = std.mem.Allocator;
 
 pub const aggregate = @import("aggregation.zig");
 
+pub const HashSigScheme = enum(u8) {
+    @"test" = 0,
+    prod = 1,
+};
+
+pub const PROD_SIGNATURE_SSZ_LEN: usize = 3112;
+pub const TEST_SIGNATURE_SSZ_LEN: usize = 424;
+
+pub fn signatureSszLenForScheme(scheme: HashSigScheme) usize {
+    return switch (scheme) {
+        .@"test" => TEST_SIGNATURE_SSZ_LEN,
+        .prod => PROD_SIGNATURE_SSZ_LEN,
+    };
+}
+
 /// Opaque pointer to the Rust KeyPair struct
 pub const HashSigKeyPair = opaque {};
 
@@ -104,7 +119,17 @@ extern fn hashsig_verify_ssz(
     epoch: u32,
     signature_bytes: [*]const u8,
     signature_len: usize,
+    scheme: HashSigScheme,
 ) i32;
+
+/// Convert signature JSON (proposerSignature object) into SSZ bytes.
+/// Returns number of bytes written, or 0 on error.
+extern fn hashsig_signature_ssz_from_json(
+    signature_json_ptr: [*]const u8,
+    signature_json_len: usize,
+    out_ptr: [*]u8,
+    out_len: usize,
+) usize;
 
 pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 
@@ -114,6 +139,7 @@ pub fn verifySsz(
     message: []const u8,
     epoch: u32,
     signature_bytes: []const u8,
+    scheme: HashSigScheme,
 ) HashSigError!void {
     if (message.len != 32) {
         return HashSigError.InvalidMessageLength;
@@ -126,6 +152,7 @@ pub fn verifySsz(
         epoch,
         signature_bytes.ptr,
         signature_bytes.len,
+        scheme,
     );
 
     switch (result) {
@@ -134,6 +161,21 @@ pub fn verifySsz(
         -1 => return HashSigError.InvalidSignature,
         else => return HashSigError.VerificationFailed,
     }
+}
+
+/// Fill `out` with SSZ signature bytes parsed from a signature JSON object.
+pub fn signatureSszFromJson(signature_json: []const u8, out: []u8) HashSigError!usize {
+    const written = hashsig_signature_ssz_from_json(
+        signature_json.ptr,
+        signature_json.len,
+        out.ptr,
+        out.len,
+    );
+
+    if (written == 0) {
+        return HashSigError.DeserializationFailed;
+    }
+    return written;
 }
 
 /// Wrapper for the hash signature key pair
@@ -508,6 +550,7 @@ test "HashSig: SSZ serialize and verify" {
         &message,
         epoch,
         sig_buffer[0..sig_size],
+        .prod,
     );
 
     std.debug.print("Verification succeeded!\n", .{});
@@ -542,6 +585,7 @@ test "HashSig: verify fails with zero signature" {
         &message,
         epoch,
         &zero_sig_buffer,
+        .prod,
     );
 
     try std.testing.expectError(HashSigError.InvalidSignature, invalid_signature_result);
@@ -553,6 +597,7 @@ test "HashSig: verify fails with zero signature" {
         &invalid_message,
         epoch,
         signature_buffer[0..signature_size],
+        .prod,
     );
 
     try std.testing.expectError(HashSigError.VerificationFailed, verification_failed_result);
