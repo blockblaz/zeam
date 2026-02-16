@@ -457,7 +457,7 @@ pub const ForkChoice = struct {
             for (entry.value_ptr.items) |*stored| {
                 stored.proof.deinit();
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.latest_new_aggregated_payloads.deinit();
     }
@@ -849,18 +849,18 @@ pub const ForkChoice = struct {
 
                     const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
                     if (!gop.found_existing) {
-                        gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+                        gop.value_ptr.* = .empty;
                     }
 
                     // Ensure all required capacity up-front so the move is non-failing.
-                    try gop.value_ptr.ensureUnusedCapacity(source_list.items.len);
+                    try gop.value_ptr.ensureUnusedCapacity(self.allocator, source_list.items.len);
                     for (source_list.items) |stored| {
                         gop.value_ptr.appendAssumeCapacity(stored);
                     }
 
                     // Source list buffer no longer needed after ownership transfer.
-                    source_list.deinit();
-                    source_list.* = AggregatedPayloadsList.init(self.allocator);
+                    source_list.deinit(self.allocator);
+                    source_list.* = .empty;
                 }
                 self.latest_new_aggregated_payloads.clearAndFree();
             }
@@ -889,7 +889,7 @@ pub const ForkChoice = struct {
     fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
         var included_attestations: std.ArrayList(types.Attestation) = .empty;
         if (self.latest_known_aggregated_payloads.count() == 0) {
-            return included_attestations.toOwnedSlice();
+            return included_attestations.toOwnedSlice(self.allocator);
         }
 
         var attestation_map = try self.extractAttestationsFromAggregatedPayloads(&self.latest_known_aggregated_payloads);
@@ -903,7 +903,7 @@ pub const ForkChoice = struct {
                 .data = att_data,
                 .validator_id = validator_id,
             };
-            try included_attestations.append(attestation);
+            try included_attestations.append(self.allocator, attestation);
         }
         return included_attestations.toOwnedSlice(self.allocator);
     }
@@ -1076,7 +1076,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={any} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,
@@ -1281,7 +1281,7 @@ pub const ForkChoice = struct {
         try self.attestation_data_by_root.put(data_root, signed_aggregation.data);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signed_aggregation.proof.participants, self.allocator);
-        defer validator_indices.deinit();
+        defer validator_indices.deinit(self.allocator);
 
         for (validator_indices.items) |validator_index| {
             const sig_key = SignatureKey{
@@ -1290,14 +1290,14 @@ pub const ForkChoice = struct {
             };
             const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
             if (!gop.found_existing) {
-                gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+                gop.value_ptr.* = .empty;
             }
 
             var cloned_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
             errdefer cloned_proof.deinit();
 
-            try gop.value_ptr.append(.{
+            try gop.value_ptr.append(self.allocator, .{
                 .slot = signed_aggregation.data.slot,
                 .proof = cloned_proof,
             });
@@ -1313,8 +1313,8 @@ pub const ForkChoice = struct {
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
-        var attestations = std.ArrayList(types.Attestation).init(self.allocator);
-        defer attestations.deinit();
+        var attestations: std.ArrayList(types.Attestation) = .{};
+        defer attestations.deinit(self.allocator);
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
@@ -1323,7 +1323,7 @@ pub const ForkChoice = struct {
         while (sig_it.next()) |entry| {
             const sig_key = entry.key_ptr.*;
             const attestation_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
-            try attestations.append(.{
+            try attestations.append(self.allocator, .{
                 .validator_id = sig_key.validator_id,
                 .data = attestation_data,
             });
@@ -1352,12 +1352,12 @@ pub const ForkChoice = struct {
             null,
         );
 
-        var results = std.ArrayList(types.SignedAggregatedAttestation).init(self.allocator);
+        var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
         errdefer {
             for (results.items) |*signed| {
                 signed.deinit();
             }
-            results.deinit();
+            results.deinit(self.allocator);
         }
 
         const agg_attestations = aggregation.attestations.constSlice();
@@ -1370,7 +1370,7 @@ pub const ForkChoice = struct {
             try self.attestation_data_by_root.put(data_root, agg_att.data);
 
             var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-            defer validator_indices.deinit();
+            defer validator_indices.deinit(self.allocator);
 
             for (validator_indices.items) |validator_index| {
                 const sig_key = SignatureKey{
@@ -1379,13 +1379,13 @@ pub const ForkChoice = struct {
                 };
                 const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
                 if (!gop.found_existing) {
-                    gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+                    gop.value_ptr.* = .empty;
                 }
 
                 var cloned_proof: types.AggregatedSignatureProof = undefined;
                 try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
                 errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(.{
+                try gop.value_ptr.append(self.allocator, .{
                     .slot = agg_att.data.slot,
                     .proof = cloned_proof,
                 });
@@ -1397,7 +1397,7 @@ pub const ForkChoice = struct {
             var output_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
             errdefer output_proof.deinit();
-            try results.append(.{
+            try results.append(self.allocator, .{
                 .data = agg_att.data,
                 .proof = output_proof,
             });
@@ -1414,7 +1414,7 @@ pub const ForkChoice = struct {
         }
         aggregation.attestation_signatures.deinit();
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     pub fn aggregateCommitteeSignatures(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
@@ -1457,13 +1457,13 @@ pub const ForkChoice = struct {
         }
 
         // Remove gossip signatures tied to stale data roots.
-        var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
-        defer gossip_keys_to_remove.deinit();
+        var gossip_keys_to_remove: std.ArrayList(SignatureKey) = .empty;
+        defer gossip_keys_to_remove.deinit(self.allocator);
 
         var gossip_it = self.gossip_signatures.iterator();
         while (gossip_it.next()) |entry| {
             if (stale_roots.contains(entry.key_ptr.data_root)) {
-                try gossip_keys_to_remove.append(entry.key_ptr.*);
+                try gossip_keys_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
         for (gossip_keys_to_remove.items) |sig_key| {
@@ -1495,8 +1495,8 @@ pub const ForkChoice = struct {
         payloads: *AggregatedPayloadsMap,
         stale_roots: *const std.AutoHashMap(types.Root, void),
     ) !usize {
-        var keys_to_remove = std.ArrayList(SignatureKey).init(allocator);
-        defer keys_to_remove.deinit();
+        var keys_to_remove: std.ArrayList(SignatureKey) = .{};
+        defer keys_to_remove.deinit(allocator);
 
         var removed_total: usize = 0;
         var it = payloads.iterator();
@@ -1507,12 +1507,13 @@ pub const ForkChoice = struct {
                 stored.proof.deinit();
             }
             removed_total += entry.value_ptr.items.len;
-            try keys_to_remove.append(entry.key_ptr.*);
+            try keys_to_remove.append(allocator, entry.key_ptr.*);
         }
 
         for (keys_to_remove.items) |sig_key| {
             if (payloads.fetchRemove(sig_key)) |kv| {
-                kv.value.deinit();
+                var mutable_val = kv.value;
+                mutable_val.deinit(allocator);
             }
         }
         return removed_total;
@@ -2087,8 +2088,8 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     defer fork_choice.deltas.deinit(fork_choice.allocator);
     defer fork_choice.gossip_signatures.deinit();
     defer fork_choice.attestation_data_by_root.deinit();
-    defer deinitAggregatedPayloadsMap(&fork_choice.latest_known_aggregated_payloads);
-    defer deinitAggregatedPayloadsMap(&fork_choice.latest_new_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
 
     // ========================================
     // TEST getCanonicalAncestorAtDepth
@@ -2365,13 +2366,13 @@ fn stageAggregatedAttestation(
 // Keep logger config at file scope so ModuleLogger pointers remain valid.
 var rebase_test_logger_config = zeam_utils.getTestLoggerConfig();
 
-fn deinitAggregatedPayloadsMap(map: *AggregatedPayloadsMap) void {
+fn deinitAggregatedPayloadsMap(allocator: Allocator, map: *AggregatedPayloadsMap) void {
     var it = map.iterator();
     while (it.next()) |entry| {
         for (entry.value_ptr.items) |*stored| {
             stored.proof.deinit();
         }
-        entry.value_ptr.deinit();
+        entry.value_ptr.deinit(allocator);
     }
     map.deinit();
 }
@@ -2507,7 +2508,7 @@ const RebaseTestContext = struct {
             for (entry.value_ptr.items) |*stored| {
                 stored.proof.deinit();
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fork_choice.latest_new_aggregated_payloads.deinit();
         self.allocator.free(self.spec_name);
@@ -3424,8 +3425,8 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     defer fork_choice.deltas.deinit(fork_choice.allocator);
     defer fork_choice.gossip_signatures.deinit();
     defer fork_choice.attestation_data_by_root.deinit();
-    defer deinitAggregatedPayloadsMap(&fork_choice.latest_known_aggregated_payloads);
-    defer deinitAggregatedPayloadsMap(&fork_choice.latest_new_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_known_aggregated_payloads);
+    defer deinitAggregatedPayloadsMap(allocator, &fork_choice.latest_new_aggregated_payloads);
 
     // Setup attestations for all validators
     // Distribute across C and D

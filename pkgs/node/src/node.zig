@@ -128,7 +128,7 @@ pub const BeamNode = struct {
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
-                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{any} hasParentBlock={} from peer={s}{any}", .{
+                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{any} hasParentBlock={any} from peer={s}{any}", .{
                     block.slot,
                     &parent_root,
                     block.proposer_index,
@@ -185,7 +185,7 @@ pub const BeamNode = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip attestation for slot={d} validator={d}{} from peer={s}{}", .{
+                self.logger.info("received gossip attestation for slot={d} validator={d}{any} from peer={s}{any}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -195,7 +195,7 @@ pub const BeamNode = struct {
             },
             .aggregation => |signed_aggregation| {
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip aggregation for slot={d} from peer={s}{}", .{
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{any}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
@@ -250,18 +250,18 @@ pub const BeamNode = struct {
                             if (self.cacheFutureBlock(block_root, signed_block)) |_| {
                                 self.logger.debug(
                                     "cached future gossip block 0x{s} at slot {d}",
-                                    .{ std.fmt.fmtSliceHexLower(block_root[0..]), signed_block.message.block.slot },
+                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
                                 );
                             } else |cache_err| {
                                 if (cache_err == CacheBlockError.PreFinalized) {
                                     self.logger.info(
                                         "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                        .{ std.fmt.fmtSliceHexLower(block_root[0..]), signed_block.message.block.slot },
+                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
                                     );
                                     _ = self.network.pruneCachedBlocks(block_root, null);
                                 } else {
                                     self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                        std.fmt.fmtSliceHexLower(block_root[0..]),
+                                        std.fmt.bytesToHex(block_root, .lower)[0..],
                                         cache_err,
                                     });
                                 }
@@ -402,7 +402,7 @@ pub const BeamNode = struct {
                         // Block is still in the future, keep it cached
                         self.logger.debug(
                             "Cached block 0x{s} still in future slot, keeping in cache",
-                            .{std.fmt.fmtSliceHexLower(descendant_root[0..])},
+                            .{std.fmt.bytesToHex(descendant_root, .lower)[0..]},
                         );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
@@ -561,7 +561,7 @@ pub const BeamNode = struct {
         if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
             self.logger.warn("Cache full ({d} blocks), rejecting future block 0x{s} at slot {d}", .{
                 self.network.fetched_blocks.count(),
-                std.fmt.fmtSliceHexLower(block_root[0..]),
+                std.fmt.bytesToHex(block_root, .lower)[0..],
                 block_slot,
             });
             return CacheBlockError.CachingFailed;
@@ -1166,7 +1166,7 @@ pub const BeamNode = struct {
     pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {
         const data = signed_attestation.message.message;
         const validator_id = signed_attestation.message.validator_id;
-        const subnet_id = signed_attestation.subnet_id;
+        _ = signed_attestation.subnet_id;
 
         // 1. Process locally through chain
         self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
@@ -1179,7 +1179,7 @@ pub const BeamNode = struct {
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        self.logger.info("published attestation to network: slot={d} validator={d}{}", .{
+        self.logger.info("published attestation to network: slot={d} validator={d}{any}", .{
             data.slot,
             validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(validator_id),
@@ -1210,11 +1210,11 @@ pub const BeamNode = struct {
 
         const handler = try self.getOnGossipCbHandler();
 
-        var topics_list = std.ArrayList(networks.GossipTopic).init(self.allocator);
-        defer topics_list.deinit();
+        var topics_list: std.ArrayList(networks.GossipTopic) = .empty;
+        defer topics_list.deinit(self.allocator);
 
-        try topics_list.append(.{ .kind = .block });
-        try topics_list.append(.{ .kind = .aggregation });
+        try topics_list.append(self.allocator, .{ .kind = .block });
+        try topics_list.append(self.allocator, .{ .kind = .aggregation });
 
         const committee_count = self.chain.config.spec.attestation_committee_count;
         if (committee_count > 0) {
@@ -1225,15 +1225,15 @@ pub const BeamNode = struct {
                     const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                     if (seen_subnets.contains(@intCast(subnet_id))) continue;
                     try seen_subnets.put(@intCast(subnet_id), {});
-                    try topics_list.append(.{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
+                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
                 }
             } else {
                 // Keep parity with leanSpec: passive nodes subscribe to subnet 0.
-                try topics_list.append(.{ .kind = .attestation, .subnet_id = 0 });
+                try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
 
-        const topics_slice = try topics_list.toOwnedSlice();
+        const topics_slice = try topics_list.toOwnedSlice(self.allocator);
         defer self.allocator.free(topics_slice);
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 

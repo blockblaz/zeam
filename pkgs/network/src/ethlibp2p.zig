@@ -363,7 +363,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             const slot = signed_attestation.message.message.slot;
             const validator_id = signed_attestation.message.validator_id;
             zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
+                "network-{d}:: received gossip attestation subnet={d} slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
                 .{
                     zigHandler.params.networkId,
                     signed_attestation.subnet_id,
@@ -378,7 +378,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
         .aggregation => |signed_aggregation| {
             zigHandler.logger.debug(
-                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{}",
+                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
                 .{
                     zigHandler.params.networkId,
                     signed_aggregation.data.slot,

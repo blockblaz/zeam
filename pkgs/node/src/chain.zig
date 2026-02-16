@@ -158,8 +158,8 @@ pub const BeamChain = struct {
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = opts.is_aggregator,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
-            .pending_gossip_attestations = std.ArrayList(networks.AttestationGossip).init(allocator),
-            .pending_gossip_aggregations = std.ArrayList(types.SignedAggregatedAttestation).init(allocator),
+            .pending_gossip_attestations = .{},
+            .pending_gossip_aggregations = .{},
         };
     }
 
@@ -192,8 +192,8 @@ pub const BeamChain = struct {
         for (self.pending_gossip_aggregations.items) |*agg| {
             agg.deinit();
         }
-        self.pending_gossip_attestations.deinit();
-        self.pending_gossip_aggregations.deinit();
+        self.pending_gossip_attestations.deinit(self.allocator);
+        self.pending_gossip_aggregations.deinit(self.allocator);
 
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
@@ -227,7 +227,7 @@ pub const BeamChain = struct {
         }
 
         const is_aggregator = self.is_aggregator_enabled and self.registered_validator_ids.len > 0;
-        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={} is_aggregator={}", .{
+        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={any} is_aggregator={any}", .{
             time_intervals,
             slot,
             interval,
@@ -583,7 +583,7 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{any} hasBlock={} from peer={s}{any}", .{
+                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{any} hasBlock={any} from peer={s}{any}", .{
                     block.slot,
                     &block_root,
                     block.proposer_index,
@@ -674,7 +674,7 @@ pub const BeamChain = struct {
                 return .{};
             },
             .aggregation => |signed_aggregation| {
-                self.module_logger.debug("chain received gossip aggregation for slot={d} from peer={s}{}", .{
+                self.module_logger.debug("chain received gossip aggregation for slot={d} from peer={s}{any}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
@@ -855,7 +855,7 @@ pub const BeamChain = struct {
         };
         try self.forkChoice.confirmBlock(block_root);
 
-        self.module_logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={} computed state={})", .{
+        self.module_logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={any} computed state={any})", .{
             &fcBlock.blockRoot,
             block.slot,
             processing_time,
@@ -956,7 +956,7 @@ pub const BeamChain = struct {
     }
 
     fn cachePendingAttestation(self: *Self, signed_attestation: networks.AttestationGossip) void {
-        self.pending_gossip_attestations.append(signed_attestation) catch |err| {
+        self.pending_gossip_attestations.append(self.allocator, signed_attestation) catch |err| {
             self.module_logger.warn("failed to cache pending attestation: {any}", .{err});
         };
     }
@@ -967,7 +967,7 @@ pub const BeamChain = struct {
             self.module_logger.warn("failed to clone pending aggregation: {any}", .{err});
             return;
         };
-        self.pending_gossip_aggregations.append(.{
+        self.pending_gossip_aggregations.append(self.allocator, .{
             .data = signed_aggregation.data,
             .proof = cloned_proof,
         }) catch |err| {
@@ -978,12 +978,12 @@ pub const BeamChain = struct {
 
     fn retryPendingGossip(self: *Self) void {
         if (self.pending_gossip_attestations.items.len > 0) {
-            var remaining = std.ArrayList(networks.AttestationGossip).init(self.allocator);
+            var remaining: std.ArrayList(networks.AttestationGossip) = .empty;
             for (self.pending_gossip_attestations.items) |att| {
                 self.onGossipAttestation(att) catch |err| {
                     switch (err) {
                         AttestationValidationError.MissingState, AttestationValidationError.UnknownHeadBlock, AttestationValidationError.UnknownSourceBlock, AttestationValidationError.UnknownTargetBlock => {
-                            remaining.append(att) catch |append_err| {
+                            remaining.append(self.allocator, att) catch |append_err| {
                                 self.module_logger.warn("failed to keep pending attestation: {any}", .{append_err});
                             };
                         },
@@ -994,16 +994,16 @@ pub const BeamChain = struct {
                     continue;
                 };
             }
-            self.pending_gossip_attestations.deinit();
+            self.pending_gossip_attestations.deinit(self.allocator);
             self.pending_gossip_attestations = remaining;
         }
 
         if (self.pending_gossip_aggregations.items.len > 0) {
-            var remaining = std.ArrayList(types.SignedAggregatedAttestation).init(self.allocator);
+            var remaining: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
             for (self.pending_gossip_aggregations.items) |*agg| {
                 self.onGossipAggregatedAttestation(agg.*) catch |err| {
                     if (err == error.MissingState) {
-                        remaining.append(agg.*) catch |append_err| {
+                        remaining.append(self.allocator, agg.*) catch |append_err| {
                             self.module_logger.warn("failed to keep pending aggregation: {any}", .{append_err});
                             agg.deinit();
                         };
@@ -1015,7 +1015,7 @@ pub const BeamChain = struct {
                 };
                 agg.deinit();
             }
-            self.pending_gossip_aggregations.deinit();
+            self.pending_gossip_aggregations.deinit(self.allocator);
             self.pending_gossip_aggregations = remaining;
         }
     }
@@ -1423,13 +1423,13 @@ pub const BeamChain = struct {
         const proof = signedAggregation.proof;
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-        defer validator_indices.deinit();
+        defer validator_indices.deinit(self.allocator);
 
         const key_state = self.states.get(data.target.root) orelse return error.MissingState;
         const validators = key_state.validators.constSlice();
 
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.items.len);
-        defer public_keys.deinit();
+        defer public_keys.deinit(self.allocator);
 
         for (validator_indices.items) |validator_index| {
             if (validator_index >= validators.len) {
@@ -1439,7 +1439,7 @@ pub const BeamChain = struct {
             const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
                 return error.InvalidBlockSignatures;
             };
-            try public_keys.append(pk_handle);
+            try public_keys.append(self.allocator, pk_handle);
         }
 
         var message_hash: [32]u8 = undefined;
@@ -1487,13 +1487,13 @@ pub const BeamChain = struct {
 
         // Fallback: try to load from database
         const state_ptr = self.allocator.create(types.BeamState) catch |err| {
-            self.module_logger.warn("failed to allocate memory for finalized state: {}", .{err});
+            self.module_logger.warn("failed to allocate memory for finalized state: {any}", .{err});
             return null;
         };
 
         self.db.loadLatestFinalizedState(state_ptr) catch |err| {
             self.allocator.destroy(state_ptr);
-            self.module_logger.warn("finalized state not available in database: {}", .{err});
+            self.module_logger.warn("finalized state not available in database: {any}", .{err});
             return null;
         };
 

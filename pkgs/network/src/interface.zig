@@ -158,7 +158,9 @@ pub const LeanNetworkTopic = struct {
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
-        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() }, 0);
+        const gossip_part = try self.gossip_topic.encode(self.allocator);
+        defer self.allocator.free(gossip_part);
+        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, gossip_part, self.encoding.encode() }, 0);
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
@@ -297,8 +299,8 @@ pub const GossipMessage = union(GossipTopicKind) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
                 switch (tag) {
-                    .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized),
-                    else => try ssz.serialize(PayloadType, payload, &serialized),
+                    .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized, allocator),
+                    else => try ssz.serialize(PayloadType, payload, &serialized, allocator),
                 }
             },
         }
@@ -885,11 +887,13 @@ pub const GenericGossipHandler = struct {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic) orelse {
             const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-            self.logger.debug("network-{d}:: ongossip no handlers for topic={} from peer={s}{}", .{ self.networkId, gossip_topic, sender_peer_id, node_name });
+            self.logger.debug("network-{d}:: ongossip no handlers for topic={any} from peer={s}{any}", .{ self.networkId, gossip_topic, sender_peer_id, node_name });
             return;
         };
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{any}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
+        const topic_str = try gossip_topic.encode(self.allocator);
+        defer self.allocator.free(topic_str);
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{any}", .{ self.networkId, handlerArr.items.len, topic_str, sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -897,7 +901,7 @@ pub const GenericGossipHandler = struct {
             if (scheduleOnLoop) {
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={}", .{ self.networkId, publishWrapper, gossip_topic });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={any}", .{ self.networkId, publishWrapper, gossip_topic });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);

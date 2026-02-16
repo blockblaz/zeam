@@ -632,7 +632,7 @@ fn processBlockStep(
     const aggregated_attestations = block.body.attestations.constSlice();
     ctx.block_attestations.ensureTotalCapacity(ctx.allocator, aggregated_attestations.len) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{}: failed to allocate block attestations ({s})\n",
+            "fixture {s} case {s}{any}: failed to allocate block attestations ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -640,15 +640,15 @@ fn processBlockStep(
     for (aggregated_attestations) |aggregated_attestation| {
         var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to parse aggregation bits ({s})\n",
+                "fixture {s} case {s}{any}: failed to parse aggregation bits ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
         };
-        defer indices.deinit();
+        defer indices.deinit(ctx.allocator);
         const participants = ctx.allocator.alloc(u64, indices.items.len) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to allocate participants ({s})\n",
+                "fixture {s} case {s}{any}: failed to allocate participants ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
@@ -665,7 +665,7 @@ fn processBlockStep(
             .target_slot = aggregated_attestation.data.target.slot,
         }) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to record block attestation ({s})\n",
+                "fixture {s} case {s}{any}: failed to record block attestation ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
@@ -740,16 +740,16 @@ fn processBlockStep(
     for (aggregated_attestations) |aggregated_attestation| {
         var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to parse aggregation bits ({s})\n",
+                "fixture {s} case {s}{any}: failed to parse aggregation bits ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
         };
-        defer indices.deinit();
+        defer indices.deinit(ctx.allocator);
 
         var proof_template = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to init proof template ({s})\n",
+                "fixture {s} case {s}{any}: failed to init proof template ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
@@ -761,7 +761,7 @@ fn processBlockStep(
             if (aggregated_attestation.aggregation_bits.get(i) catch false) {
                 types.aggregationBitsSet(&proof_template.participants, i, true) catch |err| {
                     std.debug.print(
-                        "fixture {s} case {s}{}: failed to set aggregation bit ({s})\n",
+                        "fixture {s} case {s}{any}: failed to set aggregation bit ({s})\n",
                         .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
                     );
                     return FixtureError.InvalidFixture;
@@ -773,7 +773,7 @@ fn processBlockStep(
             var proof_clone: types.AggregatedSignatureProof = undefined;
             types.sszClone(ctx.allocator, types.AggregatedSignatureProof, proof_template, &proof_clone) catch |err| {
                 std.debug.print(
-                    "fixture {s} case {s}{}: failed to clone proof ({s})\n",
+                    "fixture {s} case {s}{any}: failed to clone proof ({s})\n",
                     .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
                 );
                 return FixtureError.InvalidFixture;
@@ -782,7 +782,7 @@ fn processBlockStep(
 
             ctx.fork_choice.storeAggregatedPayload(@intCast(validator_index), &aggregated_attestation.data, proof_clone) catch |err| {
                 std.debug.print(
-                    "fixture {s} case {s}{}: failed to store aggregated payload ({s})\n",
+                    "fixture {s} case {s}{any}: failed to store aggregated payload ({s})\n",
                     .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
                 );
                 return FixtureError.FixtureMismatch;
@@ -824,7 +824,7 @@ fn processBlockStep(
 
     var proposer_proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{}: failed to init proposer proof ({s})\n",
+            "fixture {s} case {s}{any}: failed to init proposer proof ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -833,7 +833,7 @@ fn processBlockStep(
 
     types.aggregationBitsSet(&proposer_proof.participants, proposer_attestation.validator_id, true) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{}: failed to set proposer participant bit ({s})\n",
+            "fixture {s} case {s}{any}: failed to set proposer participant bit ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -845,9 +845,9 @@ fn processBlockStep(
     };
     const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(sig_key);
     if (!gop.found_existing) {
-        gop.value_ptr.* = types.AggregatedPayloadsList.init(ctx.allocator);
+        gop.value_ptr.* = .empty;
     }
-    try gop.value_ptr.append(.{
+    try gop.value_ptr.append(ctx.allocator, .{
         .slot = proposer_attestation.data.slot,
         .proof = proposer_proof,
     });
@@ -1032,7 +1032,7 @@ fn applyChecks(
             const actual: u64 = @intCast(ctx.block_attestations.items.len);
             if (actual != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{}: block attestation count mismatch got {d} expected {d}\n",
+                    "fixture {s} case {s}{any}: block attestation count mismatch got {d} expected {d}\n",
                     .{ fixture_path, case_name, formatStep(step_index), actual, expected },
                 );
                 return FixtureError.FixtureMismatch;
@@ -1069,7 +1069,7 @@ fn verifyBlockAttestations(
         .array => |entries| entries,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: blockAttestations must be array\n",
+                "fixture {s} case {s}{any}: blockAttestations must be array\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -1078,7 +1078,7 @@ fn verifyBlockAttestations(
 
     if (ctx.block_attestations.items.len != arr.items.len) {
         std.debug.print(
-            "fixture {s} case {s}{}: block attestation count mismatch got {d} expected {d}\n",
+            "fixture {s} case {s}{any}: block attestation count mismatch got {d} expected {d}\n",
             .{ fixture_path, case_name, formatStep(step_index), ctx.block_attestations.items.len, arr.items.len },
         );
         return FixtureError.FixtureMismatch;
@@ -1086,7 +1086,7 @@ fn verifyBlockAttestations(
 
     const matched = ctx.allocator.alloc(bool, ctx.block_attestations.items.len) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{}: failed to allocate match buffer ({s})\n",
+            "fixture {s} case {s}{any}: failed to allocate match buffer ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -1099,7 +1099,7 @@ fn verifyBlockAttestations(
             .object => |map| map,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{}: blockAttestations entry must be object\n",
+                    "fixture {s} case {s}{any}: blockAttestations entry must be object\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.InvalidFixture;
@@ -1108,7 +1108,7 @@ fn verifyBlockAttestations(
 
         const participants_value = obj.get("participants") orelse {
             std.debug.print(
-                "fixture {s} case {s}{}: blockAttestations missing participants\n",
+                "fixture {s} case {s}{any}: blockAttestations missing participants\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -1117,7 +1117,7 @@ fn verifyBlockAttestations(
             .array => |entries| entries,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{}: blockAttestations participants must be array\n",
+                    "fixture {s} case {s}{any}: blockAttestations participants must be array\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.InvalidFixture;
@@ -1125,7 +1125,7 @@ fn verifyBlockAttestations(
         };
         const expected_participants = ctx.allocator.alloc(u64, participants_arr.items.len) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: failed to allocate expected participants ({s})\n",
+                "fixture {s} case {s}{any}: failed to allocate expected participants ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
             );
             return FixtureError.InvalidFixture;
@@ -1162,7 +1162,7 @@ fn verifyBlockAttestations(
 
         if (!found) {
             std.debug.print(
-                "fixture {s} case {s}{}: blockAttestations entry mismatch\n",
+                "fixture {s} case {s}{any}: blockAttestations entry mismatch\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.FixtureMismatch;

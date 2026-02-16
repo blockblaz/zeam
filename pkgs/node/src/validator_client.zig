@@ -43,7 +43,7 @@ pub const ValidatorClientOutput = struct {
 
     pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
         const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = signed_attestation } };
-        try self.gossip_messages.append(gossip_msg);
+        try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 
     pub fn addAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
@@ -52,7 +52,7 @@ pub const ValidatorClientOutput = struct {
         errdefer cloned_aggregation.deinit();
 
         const gossip_msg = networks.GossipMessage{ .aggregation = cloned_aggregation };
-        try self.gossip_messages.append(gossip_msg);
+        try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 };
 
