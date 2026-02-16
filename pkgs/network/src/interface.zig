@@ -383,7 +383,27 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         }
     }
 
+    fn validateBytes(method: LeanSupportedProtocol, bytes: []const u8) !void {
+        switch (method) {
+            .blocks_by_root => {
+                // BlockByRootRequest is a struct with a single variable-size field (roots: List[Root, N]).
+                // SSZ struct encoding: 4 bytes offset (must be 4) + N * 32 bytes of roots.
+                if (bytes.len < 4) return error.InvalidEncoding;
+                const offset = std.mem.readInt(u32, bytes[0..4], .little);
+                if (offset != 4) return error.InvalidEncoding;
+                const list_data_len = bytes.len - 4;
+                if (list_data_len % 32 != 0) return error.InvalidEncoding;
+                if (list_data_len / 32 > consensus_params.MAX_REQUEST_BLOCKS) return error.InvalidEncoding;
+            },
+            .status => {
+                // Status is a fixed-size struct: 2 Roots (32 bytes each) + 2 Slots (8 bytes each) = 80 bytes
+                if (bytes.len != 80) return error.InvalidEncoding;
+            },
+        }
+    }
+
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
+        try validateBytes(method, bytes);
         return switch (method) {
             inline else => |tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
@@ -923,4 +943,77 @@ test LeanNetworkTopic {
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
     try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+}
+
+test "blocks_by_root deserialize rejects empty bytes" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &.{}));
+}
+
+test "blocks_by_root deserialize rejects raw root hash" {
+    // Simulates the actual failure: a peer sends a raw 32-byte root hash
+    // instead of a properly SSZ-encoded BlockByRootRequest
+    const allocator = std.testing.allocator;
+    const raw_root = [_]u8{0xab} ** 32;
+    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &raw_root));
+}
+
+test "blocks_by_root deserialize rejects invalid offset" {
+    const allocator = std.testing.allocator;
+    // 36 bytes with wrong offset (8 instead of 4)
+    var bad_offset: [36]u8 = undefined;
+    std.mem.writeInt(u32, bad_offset[0..4], 8, .little);
+    @memset(bad_offset[4..], 0xaa);
+    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &bad_offset));
+}
+
+test "blocks_by_root deserialize rejects misaligned data" {
+    const allocator = std.testing.allocator;
+    // 4 bytes offset + 33 bytes (not a multiple of 32)
+    var misaligned: [37]u8 = undefined;
+    std.mem.writeInt(u32, misaligned[0..4], 4, .little);
+    @memset(misaligned[4..], 0xaa);
+    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &misaligned));
+}
+
+test "blocks_by_root deserialize valid single root" {
+    const allocator = std.testing.allocator;
+    var valid: [36]u8 = undefined;
+    std.mem.writeInt(u32, valid[0..4], 4, .little);
+    @memset(valid[4..], 0xab);
+    var request = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &valid);
+    defer request.deinit();
+    try std.testing.expectEqual(@as(usize, 1), request.blocks_by_root.roots.len());
+    const root = try request.blocks_by_root.roots.get(0);
+    try std.testing.expect(std.mem.eql(u8, &root, &([_]u8{0xab} ** 32)));
+}
+
+test "blocks_by_root deserialize valid empty request" {
+    const allocator = std.testing.allocator;
+    var empty_req: [4]u8 = undefined;
+    std.mem.writeInt(u32, empty_req[0..4], 4, .little);
+    var request = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &empty_req);
+    defer request.deinit();
+    try std.testing.expectEqual(@as(usize, 0), request.blocks_by_root.roots.len());
+}
+
+test "blocks_by_root roundtrip serialize/deserialize" {
+    const allocator = std.testing.allocator;
+    var roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator);
+    try roots.append([_]u8{0x01} ** 32);
+    try roots.append([_]u8{0x02} ** 32);
+    var original = ReqRespRequest{ .blocks_by_root = .{ .roots = roots } };
+    defer original.deinit();
+
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    var deserialized = try ReqRespRequest.deserialize(allocator, .blocks_by_root, serialized);
+    defer deserialized.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), deserialized.blocks_by_root.roots.len());
+    const root0 = try deserialized.blocks_by_root.roots.get(0);
+    const root1 = try deserialized.blocks_by_root.roots.get(1);
+    try std.testing.expect(std.mem.eql(u8, &root0, &([_]u8{0x01} ** 32)));
+    try std.testing.expect(std.mem.eql(u8, &root1, &([_]u8{0x02} ** 32)));
 }
