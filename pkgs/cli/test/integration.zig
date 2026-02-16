@@ -9,20 +9,31 @@ const ErrorHandler = error_handler.ErrorHandler;
 /// Verify that the Zeam executable exists and return its path
 /// Includes detailed debugging output if the executable is not found
 fn getZeamExecutable() ![]const u8 {
-    const exe_file = std.fs.openFileAbsolute(build_options.cli_exe_path, .{}) catch |err| {
+    // Handle both absolute and relative paths
+    const exe_file = if (std.fs.path.isAbsolute(build_options.cli_exe_path))
+        std.fs.openFileAbsolute(build_options.cli_exe_path, .{})
+    else
+        std.fs.cwd().openFile(build_options.cli_exe_path, .{});
+
+    const file = exe_file catch |err| {
         std.debug.print("ERROR: Cannot find executable at {s}: {}\n", .{ build_options.cli_exe_path, err });
 
         // Try to list the directory to see what's actually there
         std.debug.print("INFO: Attempting to list {s} directory...\n", .{build_options.cli_exe_path});
         const dir_path = std.fs.path.dirname(build_options.cli_exe_path);
         if (dir_path) |path| {
-            var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |dir_err| {
+            const dir = if (std.fs.path.isAbsolute(path))
+                std.fs.openDirAbsolute(path, .{ .iterate = true })
+            else
+                std.fs.cwd().openDir(path, .{ .iterate = true });
+
+            var d = dir catch |dir_err| {
                 std.debug.print("ERROR: Cannot open directory {s}: {}\n", .{ path, dir_err });
                 return err;
             };
-            defer dir.close();
+            defer d.close();
 
-            var iterator = dir.iterate();
+            var iterator = d.iterate();
             std.debug.print("INFO: Contents of {s}:\n", .{path});
             while (try iterator.next()) |entry| {
                 std.debug.print("  - {s} (type: {})\n", .{ entry.name, entry.kind });
@@ -31,7 +42,7 @@ fn getZeamExecutable() ![]const u8 {
 
         return err;
     };
-    exe_file.close();
+    file.close();
     std.debug.print("INFO: Found executable at {s}\n", .{build_options.cli_exe_path});
     return build_options.cli_exe_path;
 }
@@ -78,7 +89,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
         // Try to connect to the metrics server
         const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
-            std.time.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
+            std.Thread.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
@@ -87,7 +98,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
             if (retry_count % 20 == 0) {
                 std.debug.print("DEBUG: Connection attempt {} failed: {}\n", .{ retry_count, err });
             }
-            std.time.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
+            std.Thread.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
@@ -105,7 +116,9 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         // Try to read any output from the process
         if (cli_process.stdout) |stdout| {
             var stdout_buffer: [4096]u8 = undefined;
-            const stdout_bytes = stdout.readAll(&stdout_buffer) catch 0;
+            var read_buf: [4096]u8 = undefined;
+            var stdout_reader = stdout.reader(&read_buf);
+            const stdout_bytes = stdout_reader.interface.readSliceShort(&stdout_buffer) catch 0;
             if (stdout_bytes > 0) {
                 std.debug.print("STDOUT: {s}\n", .{stdout_buffer[0..stdout_bytes]});
             }
@@ -113,7 +126,9 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 
         if (cli_process.stderr) |stderr| {
             var stderr_buffer: [4096]u8 = undefined;
-            const stderr_bytes = stderr.readAll(&stderr_buffer) catch 0;
+            var read_buf: [4096]u8 = undefined;
+            var stderr_reader = stderr.reader(&read_buf);
+            const stderr_bytes = stderr_reader.interface.readSliceShort(&stderr_buffer) catch 0;
             if (stderr_bytes > 0) {
                 std.debug.print("STDERR: {s}\n", .{stderr_buffer[0..stderr_bytes]});
             }
@@ -143,7 +158,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 /// TODO: Over time, this can be abstracted to listen for some event
 /// that the node can output when being active, rather than using a fixed sleep
 fn waitForNodeStart() void {
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }
 
 /// Helper struct for making HTTP requests to Zeam endpoints
@@ -178,11 +193,23 @@ const ZeamRequest = struct {
             "Connection: close\r\n" ++
             "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
 
-        try connection.writeAll(request);
+        var conn_write_buf: [4096]u8 = undefined;
+        var conn_writer = connection.writer(&conn_write_buf);
+        try conn_writer.interface.writeAll(request);
+        try conn_writer.interface.flush();
 
-        // Read response
+        // Read response until connection closes
         var response_buffer: [8192]u8 = undefined;
-        const bytes_read = try connection.readAll(&response_buffer);
+        var total_bytes: usize = 0;
+        while (total_bytes < response_buffer.len) {
+            const bytes_read = connection.read(response_buffer[total_bytes..]) catch |err| switch (err) {
+                error.ConnectionResetByPeer => break,
+                else => return err,
+            };
+            if (bytes_read == 0) break; // Connection closed
+            total_bytes += bytes_read;
+        }
+        const bytes_read = total_bytes;
 
         // Allocate and return a copy of the response
         const response = try self.allocator.dupe(u8, response_buffer[0..bytes_read]);
@@ -223,9 +250,9 @@ const SSEClient = struct {
         return SSEClient{
             .allocator = allocator,
             .connection = connection,
-            .received_events = std.ArrayList([]u8).init(allocator),
-            .read_buffer = std.ArrayList(u8).init(allocator),
-            .parsed_events_queue = std.ArrayList(ChainEvent).init(allocator),
+            .received_events = .empty,
+            .read_buffer = .empty,
+            .parsed_events_queue = .empty,
         };
     }
 
@@ -234,14 +261,14 @@ const SSEClient = struct {
         for (self.received_events.items) |event| {
             self.allocator.free(event);
         }
-        self.received_events.deinit();
-        self.read_buffer.deinit();
+        self.received_events.deinit(self.allocator);
+        self.read_buffer.deinit(self.allocator);
 
         // Clean up parsed events queue
         for (self.parsed_events_queue.items) |event| {
             self.allocator.free(event.event_type);
         }
-        self.parsed_events_queue.deinit();
+        self.parsed_events_queue.deinit(self.allocator);
     }
 
     fn connect(self: *SSEClient) !void {
@@ -253,7 +280,10 @@ const SSEClient = struct {
             "Connection: keep-alive\r\n" ++
             "\r\n";
 
-        try self.connection.writeAll(request);
+        var conn_write_buf: [4096]u8 = undefined;
+        var conn_writer = self.connection.writer(&conn_write_buf);
+        try conn_writer.interface.writeAll(request);
+        try conn_writer.interface.flush();
     }
 
     /// NEW: Parse all complete events from the current buffer
@@ -297,11 +327,11 @@ const SSEClient = struct {
 
             // Parse this event and add to queue if valid
             if (self.parseEventBlock(event_block)) |parsed_event| {
-                try self.parsed_events_queue.append(parsed_event);
+                try self.parsed_events_queue.append(self.allocator, parsed_event);
 
                 // Store raw event for debugging
                 const raw_event = try self.allocator.dupe(u8, event_block);
-                try self.received_events.append(raw_event);
+                try self.received_events.append(self.allocator, raw_event);
             }
 
             // Move past this event
@@ -312,9 +342,9 @@ const SSEClient = struct {
         if (buffer_pos > 0) {
             if (buffer_pos < self.read_buffer.items.len) {
                 std.mem.copyForwards(u8, self.read_buffer.items[0..], self.read_buffer.items[buffer_pos..]);
-                try self.read_buffer.resize(self.read_buffer.items.len - buffer_pos);
+                try self.read_buffer.resize(self.allocator, self.read_buffer.items.len - buffer_pos);
             } else {
-                self.read_buffer.clearAndFree();
+                self.read_buffer.clearAndFree(self.allocator);
             }
         }
     }
@@ -384,19 +414,19 @@ const SSEClient = struct {
         var temp_buffer: [4096]u8 = undefined;
         const bytes_read = self.connection.read(&temp_buffer) catch |err| switch (err) {
             error.WouldBlock => {
-                std.time.sleep(50 * std.time.ns_per_ms);
+                std.Thread.sleep(50 * std.time.ns_per_ms);
                 return null; // No data available
             },
             else => return err,
         };
 
         if (bytes_read == 0) {
-            std.time.sleep(50 * std.time.ns_per_ms);
+            std.Thread.sleep(50 * std.time.ns_per_ms);
             return null; // No data available
         }
 
         // Append new data to our persistent buffer
-        try self.read_buffer.appendSlice(temp_buffer[0..bytes_read]);
+        try self.read_buffer.appendSlice(self.allocator, temp_buffer[0..bytes_read]);
 
         // Parse all complete events from the buffer
         try self.parseAllEventsFromBuffer();

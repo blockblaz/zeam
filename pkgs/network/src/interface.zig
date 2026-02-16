@@ -158,9 +158,7 @@ pub const LeanNetworkTopic = struct {
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
-        const topic_name = try self.gossip_topic.encode(self.allocator);
-        defer self.allocator.free(topic_name);
-        return try std.fmt.allocPrintZ(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, topic_name, self.encoding.encode() });
+        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() }, 0);
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
@@ -292,8 +290,8 @@ pub const GossipMessage = union(GossipTopicKind) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
@@ -305,7 +303,7 @@ pub const GossipMessage = union(GossipTopicKind) {
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     pub fn clone(self: *const Self, allocator: Allocator) !*Self {
@@ -419,17 +417,17 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized);
+                try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
@@ -489,17 +487,17 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const ReqRespResponse, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized);
+                try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
@@ -658,7 +656,7 @@ pub const OnReqRespRequestCbHandler = struct {
 };
 pub const ReqRespRequestHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnReqRespRequestCbHandler),
+    handlers: std.ArrayList(OnReqRespRequestCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -687,7 +685,7 @@ pub const ReqRespRequestHandler = struct {
         const peer_id_opt = stream.getPeerId();
         const peer_id = peer_id_opt orelse "unknown";
         const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
-        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
+        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{any}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -697,7 +695,7 @@ pub const ReqRespRequestHandler = struct {
 
         for (self.handlers.items) |handler| {
             handler.onReqRespRequest(req, stream) catch |err| {
-                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{}", .{ self.networkId, err, peer_id, node_name });
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{any}", .{ self.networkId, err, peer_id, node_name });
                 last_err = err;
                 continue;
             };
@@ -785,7 +783,7 @@ pub const OnPeerEventCbHandler = struct {
 
 pub const PeerEventHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnPeerEventCbHandler),
+    handlers: std.ArrayList(OnPeerEventCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -812,7 +810,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{any} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
@@ -822,7 +820,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{any} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
@@ -844,7 +842,7 @@ pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
     allocator: Allocator,
-    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
+    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -854,7 +852,7 @@ pub const GenericGossipHandler = struct {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
-        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
+        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)) = .empty;
         errdefer {
             var it = onGossipHandlers.iterator();
             while (it.next()) |entry| {
@@ -891,7 +889,7 @@ pub const GenericGossipHandler = struct {
             return;
         };
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={} from peer={s}{}", .{ self.networkId, handlerArr.items.len, gossip_topic, sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{any}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance

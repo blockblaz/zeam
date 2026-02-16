@@ -22,21 +22,23 @@ pub fn main() !void {
 
         const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
         defer file.close();
-        const writer = file.writer();
 
-        // magic +  binary format
-        _ = try writer.write(magic);
-        try writer.writeInt(u32, BinaryFormatVersion, .little);
+        var write_buf = std.Io.Writer.Allocating.init(allocator);
+        defer write_buf.deinit();
+
+        // magic + binary format (risc0 format is little-endian)
+        try write_buf.writer.writeAll(magic);
+        try write_buf.writer.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, BinaryFormatVersion)));
 
         // write program header + len as u32
         const header = &[_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 49, 46, 48, 46, 48 };
-        try writer.writeInt(u32, @truncate(header.len), .little);
+        try write_buf.writer.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(header.len))));
         // program header
-        _ = try writer.write(header);
+        try write_buf.writer.writeAll(header);
 
         // user data length + data
-        try writer.writeInt(u32, @truncate(bindata.len), .little);
-        _ = try writer.write(bindata);
+        try write_buf.writer.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, @truncate(bindata.len))));
+        try write_buf.writer.writeAll(bindata);
 
         // DO NOT write the kernel length, it's inferred
         const kernel = try std.fs.cwd().openFile("build/v1compat.elf", .{});
@@ -45,7 +47,17 @@ pub fn main() !void {
         const kernelsize = kernelstat.size;
         const kerneldata = try kernel.readToEndAlloc(allocator, kernelsize);
         defer allocator.free(kerneldata);
-        _ = try writer.write(kerneldata);
+        try write_buf.writer.writeAll(kerneldata);
+        try write_buf.writer.flush();
+
+        std.debug.print("write_buf.written(): {}\n", .{write_buf.written().len});
+
+        // write accumulated data to file
+        var file_buf = std.Io.Writer.Allocating.init(allocator);
+        defer file_buf.deinit();
+        var file_writer = file.writer(file_buf.writer.buffer);
+        try file_writer.interface.writeAll(write_buf.written());
+        try file_writer.interface.flush();
     } else {
         @panic("no binary file given");
     }

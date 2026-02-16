@@ -21,8 +21,8 @@ pub const ValidatorClientOutput = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
+            .gossip_messages = .empty,
             .allocator = allocator,
-            .gossip_messages = std.ArrayList(networks.GossipMessage).init(allocator),
         };
     }
 
@@ -33,12 +33,12 @@ pub const ValidatorClientOutput = struct {
                 else => {},
             }
         }
-        self.gossip_messages.deinit();
+        self.gossip_messages.deinit(self.allocator);
     }
 
     pub fn addBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.gossip_messages.append(gossip_msg);
+        try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 
     pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
@@ -146,7 +146,7 @@ pub const ValidatorClient = struct {
             // 1. construct the block
             self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
-            self.logger.info("produced block for slot={d} proposer={d} with root={s}", .{ slot, slot_proposer_id, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
+            self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
 
             // 2. construct proposer attestation for the produced block which should already be in forkchoice
             // including its attestations
@@ -178,7 +178,7 @@ pub const ValidatorClient = struct {
                 .signature = signatures,
             };
 
-            self.logger.info("signed produced block with attestation for slot={d} root={s}", .{ slot, std.fmt.fmtSliceHexLower(&produced_block.blockRoot) });
+            self.logger.info("signed produced block with attestation for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
 
             // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);

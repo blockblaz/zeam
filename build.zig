@@ -117,6 +117,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("multiformats-zig");
 
+    const multiaddr_mod = enr_dep.builder.dependency("multiaddr", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("multiaddr");
+
     const yaml = b.dependency("zig_yaml", .{
         .target = target,
         .optimize = optimize,
@@ -265,11 +270,15 @@ pub fn build(b: *Builder) !void {
     zeam_state_proving_manager.addImport("ssz", ssz);
     zeam_state_proving_manager.addImport("build_options", build_options_module);
 
-    const st_lib = b.addStaticLibrary(.{
-        .name = "zeam-state-transition",
+    const st_module = b.createModule(.{
         .root_source_file = b.path("pkgs/state-transition/src/lib.zig"),
-        .optimize = optimize,
         .target = target,
+        .optimize = optimize,
+    });
+    const st_lib = b.addLibrary(.{
+        .name = "zeam-state-transition",
+        .root_module = st_module,
+        .linkage = .static,
     });
     b.installArtifact(st_lib);
 
@@ -296,6 +305,7 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
+    zeam_network.addImport("multiaddr", multiaddr_mod);
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
 
@@ -337,9 +347,11 @@ pub fn build(b: *Builder) !void {
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
         .name = "zeam",
-        .root_source_file = b.path("pkgs/cli/src/main.zig"),
-        .optimize = optimize,
-        .target = target,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/cli/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     // Enable LTO if requested and on Linux (disabled by default for faster builds)
@@ -368,6 +380,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
+    cli_exe.root_module.addImport("multiaddr", multiaddr_mod);
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
     cli_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
@@ -417,9 +430,11 @@ pub fn build(b: *Builder) !void {
 
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
-        .root_source_file = b.path("pkgs/cli/test/integration.zig"),
-        .optimize = optimize,
-        .target = target,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/cli/test/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const integration_build_options = b.addOptions();
@@ -446,8 +461,6 @@ pub fn build(b: *Builder) !void {
 
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
-        .optimize = optimize,
-        .target = target,
     });
     types_tests.root_module.addImport("ssz", ssz);
     types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
@@ -459,8 +472,6 @@ pub fn build(b: *Builder) !void {
 
     const transition_tests = b.addTest(.{
         .root_module = zeam_state_transition,
-        .optimize = optimize,
-        .target = target,
     });
     // TODO(gballet) typing modules each time is quite tedious, hopefully
     // this will no longer be necessary in later versions of zig.
@@ -474,8 +485,6 @@ pub fn build(b: *Builder) !void {
 
     const manager_tests = b.addTest(.{
         .root_module = zeam_state_proving_manager,
-        .optimize = optimize,
-        .target = target,
     });
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
     addRustGlueLib(b, manager_tests, target, prover);
@@ -485,8 +494,6 @@ pub fn build(b: *Builder) !void {
 
     const node_tests = b.addTest(.{
         .root_module = zeam_beam_node,
-        .optimize = optimize,
-        .target = target,
     });
     addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
@@ -495,8 +502,6 @@ pub fn build(b: *Builder) !void {
 
     const cli_tests = b.addTest(.{
         .root_module = cli_exe.root_module,
-        .optimize = optimize,
-        .target = target,
     });
     cli_tests.step.dependOn(&cli_exe.step);
     cli_tests.step.dependOn(&build_rust_lib_steps.step);
@@ -507,8 +512,6 @@ pub fn build(b: *Builder) !void {
 
     const params_tests = b.addTest(.{
         .root_module = zeam_params,
-        .optimize = optimize,
-        .target = target,
     });
     const run_params_tests = b.addRunArtifact(params_tests);
     setTestRunLabelFromCompile(b, run_params_tests, params_tests);
@@ -516,8 +519,6 @@ pub fn build(b: *Builder) !void {
 
     const network_tests = b.addTest(.{
         .root_module = zeam_network,
-        .optimize = optimize,
-        .target = target,
     });
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
@@ -529,8 +530,6 @@ pub fn build(b: *Builder) !void {
 
     const configs_tests = b.addTest(.{
         .root_module = zeam_configs,
-        .optimize = optimize,
-        .target = target,
     });
     configs_tests.root_module.addImport("@zeam/utils", zeam_utils);
     configs_tests.root_module.addImport("@zeam/types", zeam_types);
@@ -544,8 +543,6 @@ pub fn build(b: *Builder) !void {
 
     const utils_tests = b.addTest(.{
         .root_module = zeam_utils,
-        .optimize = optimize,
-        .target = target,
     });
     const run_utils_tests = b.addRunArtifact(utils_tests);
     setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
@@ -553,17 +550,22 @@ pub fn build(b: *Builder) !void {
 
     const database_tests = b.addTest(.{
         .root_module = zeam_database,
-        .optimize = optimize,
-        .target = target,
     });
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
+    const api_tests = b.addTest(.{
+        .root_module = zeam_api,
+    });
+    api_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, api_tests, target, prover);
+    const run_api_tests = b.addRunArtifact(api_tests);
+    setTestRunLabelFromCompile(b, run_api_tests, api_tests);
+    test_step.dependOn(&run_api_tests.step);
+
     const xmss_tests = b.addTest(.{
         .root_module = zeam_xmss,
-        .optimize = optimize,
-        .target = target,
     });
 
     // xmss_tests.step.dependOn(&networking_build.step);
@@ -575,8 +577,6 @@ pub fn build(b: *Builder) !void {
 
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
-        .optimize = optimize,
-        .target = target,
     });
     spectests.root_module.addImport("@zeam/utils", zeam_utils);
     spectests.root_module.addImport("@zeam/types", zeam_types);
@@ -595,8 +595,6 @@ pub fn build(b: *Builder) !void {
     const tools_test_step = b.step("test-tools", "Run zeam tools tests");
     const tools_cli_tests = b.addTest(.{
         .root_module = tools_cli_exe.root_module,
-        .optimize = optimize,
-        .target = target,
     });
     tools_cli_tests.root_module.addImport("enr", enr);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
@@ -614,9 +612,11 @@ pub fn build(b: *Builder) !void {
     // Create spectest step that runs spec tests
     const spectest_generate_exe = b.addExecutable(.{
         .name = "spectest-generate",
-        .root_source_file = b.path("pkgs/spectest/src/generator.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/spectest/src/generator.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     const run_spectest_generate = b.addRunArtifact(spectest_generate_exe);
     const spectest_generate_step = b.step("spectest:generate", "Regenerate spectest fixtures");
@@ -642,8 +642,8 @@ fn setSpectestArgsAndEnv(
     run_spectests_after_generate: *std.Build.Step.Run,
 ) !void {
     if (b.args) |args| {
-        var generator_args_builder = std.ArrayList([]const u8).init(b.allocator);
-        defer generator_args_builder.deinit();
+        var generator_args_builder: std.ArrayList([]const u8) = .{};
+        defer generator_args_builder.deinit(b.allocator);
 
         var skip_expected_errors = false;
 
@@ -667,11 +667,11 @@ fn setSpectestArgsAndEnv(
                 // match the supported forms.
             }
 
-            try generator_args_builder.append(arg);
+            try generator_args_builder.append(b.allocator, arg);
         }
 
         if (generator_args_builder.items.len != 0) {
-            const generator_args = try generator_args_builder.toOwnedSlice();
+            const generator_args = try generator_args_builder.toOwnedSlice(b.allocator);
             run_spectest_generate.addArgs(generator_args);
         }
 
@@ -804,9 +804,11 @@ fn build_zkvm_targets(
         var exec_name: [256]u8 = undefined;
         var exe = b.addExecutable(.{
             .name = try std.fmt.bufPrint(&exec_name, "zeam-stf-{s}", .{zkvm_target.name}),
-            .root_source_file = b.path("pkgs/state-transition-runtime/src/main.zig"),
-            .optimize = optimize,
-            .target = target,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("pkgs/state-transition-runtime/src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
         });
         // addimport to root module is even required afer declaring it in mod
         exe.root_module.addImport("ssz", ssz);
@@ -828,9 +830,11 @@ fn build_zkvm_targets(
         if (std.mem.eql(u8, zkvm_target.name, "risc0")) {
             const risc0_postbuild_gen = b.addExecutable(.{
                 .name = "risc0ospkg",
-                .root_source_file = b.path("build/risc0.zig"),
-                .target = host_target,
-                .optimize = .ReleaseSafe,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("build/risc0.zig"),
+                    .target = host_target,
+                    .optimize = .ReleaseSafe,
+                }),
             });
             const run_risc0_postbuild_gen_step = b.addRunArtifact(risc0_postbuild_gen);
             run_risc0_postbuild_gen_step.addFileArg(exe.getEmittedBin());

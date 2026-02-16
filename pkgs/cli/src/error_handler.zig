@@ -50,12 +50,11 @@ pub const ErrorHandler = struct {
         // Suppress output during tests to avoid test framework complaints
         if (@import("builtin").is_test) return;
 
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Error: {s}\n", .{formatError(err)}) catch {};
+        std.debug.print("Error: {s}\n", .{formatError(err)});
         if (context.len > 0) {
-            stderr.print("Context: {s}\n", .{context}) catch {};
+            std.debug.print("Context: {s}\n", .{context});
         }
-        stderr.print("Error code: {s}\n\n", .{@errorName(err)}) catch {};
+        std.debug.print("Error code: {s}\n\n", .{@errorName(err)});
     }
 
     /// Handle application-level errors with user-friendly output
@@ -63,15 +62,14 @@ pub const ErrorHandler = struct {
         // Suppress output during tests to avoid test framework complaints
         if (@import("builtin").is_test) return;
 
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("\n❌ Zeam exited with error\n\n", .{}) catch {};
+        std.debug.print("\nZeam exited with error\n\n", .{});
 
         const context = getErrorContext(err);
         printError(err, context);
 
         // Print usage hint for common argument errors
         if (err == error.InvalidArgument) {
-            stderr.print("Hint: Run 'zeam --help' or 'zeam node --help' for usage information.\n\n", .{}) catch {};
+            std.debug.print("Hint: Run 'zeam --help' or 'zeam node --help' for usage information.\n\n", .{});
         }
     }
 
