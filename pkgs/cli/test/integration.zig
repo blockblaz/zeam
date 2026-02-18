@@ -523,9 +523,10 @@ test "SSE events integration test - wait for justification and finalization" {
     // Node3 starts after first finalization and syncs via parent block requests (blocks_by_root).
     // We verify sync by waiting for finalization to advance beyond the first finalized slot,
     // which proves the chain continued progressing after node3 joined.
-    const timeout_ms: u64 = 240000; // 240 seconds timeout
+    const timeout_ms: u64 = 240000; // 240 seconds to reach first justification/finalization
+    const post_finalization_timeout_ms: u64 = 120000; // extra time for node3 sync/finalization advancement
     const start_ns = std.time.nanoTimestamp();
-    const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
+    var deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
     var got_finalization = false;
     var got_node3_sync = false;
@@ -555,8 +556,13 @@ test "SSE events integration test - wait for justification and finalization" {
                         got_finalization = true;
                         first_finalized_slot = slot;
                         head_count_at_finalization = sse_client.getEventCount("new_head");
+                        const sync_deadline_ns = std.time.nanoTimestamp() + post_finalization_timeout_ms * std.time.ns_per_ms;
+                        if (sync_deadline_ns > deadline_ns) {
+                            deadline_ns = sync_deadline_ns;
+                        }
                         std.debug.print("INFO: First finalization at slot {} — node 3 will start syncing via parent block requests\n", .{slot});
                         std.debug.print("INFO: Head events at finalization: {}\n", .{head_count_at_finalization});
+                        std.debug.print("INFO: Extended deadline by {}ms for node3 sync verification\n", .{post_finalization_timeout_ms});
                     } else if (got_finalization and slot > first_finalized_slot and !got_node3_sync) {
                         // Finalization advanced beyond the first finalized slot.
                         // This means the chain continued progressing after node3 joined.

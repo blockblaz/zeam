@@ -26,6 +26,24 @@ const ServerStreamError = error{
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
+// SSZ size constants derived directly from type definitions for payload validation.
+const CHECKPOINT_SSZ_SIZE = zeam_utils.fixedSszSize(types.Checkpoint);
+const ATTESTATION_DATA_SSZ_SIZE = zeam_utils.fixedSszSize(types.AttestationData);
+const SIGNED_ATTESTATION_SSZ_SIZE = zeam_utils.fixedSszSize(types.SignedAttestation);
+
+comptime {
+    if (ATTESTATION_DATA_SSZ_SIZE != 8 + 3 * CHECKPOINT_SSZ_SIZE) {
+        @compileError("AttestationData SSZ layout changed; revisit payload size assumptions");
+    }
+    if (SIGNED_ATTESTATION_SSZ_SIZE != 8 + ATTESTATION_DATA_SSZ_SIZE + types.SIGSIZE) {
+        @compileError("SignedAttestation SSZ layout changed; revisit payload size assumptions");
+    }
+}
+
+// SignedBlockWithAttestation is variable-size with 2 variable fields (message, signature).
+// SSZ struct encoding: at least 2 offsets (4 bytes each) = 8 bytes minimum.
+const MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE = 8;
+
 const FrameDecodeError = error{
     EmptyFrame,
     PayloadTooLarge,
@@ -45,6 +63,53 @@ fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usiz
     return .{
         .value = result.value,
         .length = bytes.len - result.remaining.len,
+    };
+}
+
+fn validateGossipSnappyHeader(message_bytes: []const u8) (uvarint.VarintParseError || error{PayloadTooLarge})!struct { value: usize, length: usize } {
+    const decoded = try decodeVarint(message_bytes);
+    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
+        return error.PayloadTooLarge;
+    }
+    return .{
+        .value = decoded.value,
+        .length = decoded.length,
+    };
+}
+
+fn validateSignedBlockWithAttestation(bytes: []const u8) !void {
+    if (bytes.len < MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE) {
+        return error.InvalidEncoding;
+    }
+
+    const message_offset: usize = @intCast(std.mem.readInt(u32, bytes[0..4], .little));
+    const signature_offset: usize = @intCast(std.mem.readInt(u32, bytes[4..8], .little));
+
+    if (message_offset != MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE) {
+        return error.InvalidEncoding;
+    }
+    if (signature_offset < message_offset) {
+        return error.InvalidEncoding;
+    }
+    if (signature_offset > bytes.len) {
+        return error.InvalidEncoding;
+    }
+}
+
+fn initSignedBlockWithAttestation(allocator: Allocator) !types.SignedBlockWithAttestation {
+    var block: types.BeamBlock = undefined;
+    try block.setToDefault(allocator);
+    errdefer block.deinit();
+
+    var signatures = try types.createBlockSignatures(allocator, 0);
+    errdefer signatures.deinit();
+
+    return .{
+        .message = .{
+            .block = block,
+            .proposer_attestation = undefined,
+        },
+        .signature = signatures,
     };
 }
 
@@ -87,11 +152,7 @@ fn parseRequestFrame(bytes: []const u8) FrameDecodeError!struct {
         return error.EmptyFrame;
     }
 
-    const decoded = try decodeVarint(bytes);
-
-    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
+    const decoded = try validateGossipSnappyHeader(bytes);
 
     return .{
         .declared_len = decoded.value,
@@ -111,11 +172,7 @@ fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
         return error.Incomplete;
     }
 
-    const decoded = try decodeVarint(bytes[1..]);
-
-    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
+    const decoded = try validateGossipSnappyHeader(bytes[1..]);
 
     return .{
         .code = bytes[0],
@@ -283,7 +340,6 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
-
     const uncompressed_message = snappyz.decode(zigHandler.allocator, message_bytes) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
         if (writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) |filename| {
@@ -294,9 +350,32 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
+
+    if (uncompressed_message.len > MAX_RPC_MESSAGE_SIZE) {
+        zigHandler.logger.err(
+            "Gossip message decompressed size {d} exceeds limit {d} for topic={s}",
+            .{ uncompressed_message.len, MAX_RPC_MESSAGE_SIZE, std.mem.span(topic_str) },
+        );
+        return;
+    }
+
     const message: interface.GossipMessage = switch (topic.gossip_topic) {
         .block => blockmessage: {
-            var message_data: types.SignedBlockWithAttestation = undefined;
+            validateSignedBlockWithAttestation(uncompressed_message) catch {
+                const message_offset = if (uncompressed_message.len >= 4) std.mem.readInt(u32, uncompressed_message[0..4], .little) else 0;
+                const signature_offset = if (uncompressed_message.len >= 8) std.mem.readInt(u32, uncompressed_message[4..8], .little) else 0;
+                zigHandler.logger.err(
+                    "Invalid gossip block top-level SSZ offsets: len={d} message_offset={d} signature_offset={d}",
+                    .{ uncompressed_message.len, message_offset, signature_offset },
+                );
+                return;
+            };
+            var message_data = initSignedBlockWithAttestation(zigHandler.allocator) catch |e| {
+                zigHandler.logger.err("Error initializing signed block payload before deserialization: {any}", .{e});
+                return;
+            };
+            var decode_succeeded = false;
+            defer if (!decode_succeeded) message_data.deinit();
             ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
                 if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
@@ -306,10 +385,18 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
                 }
                 return;
             };
+            decode_succeeded = true;
 
             break :blockmessage .{ .block = message_data };
         },
         .attestation => attestationmessage: {
+            if (uncompressed_message.len != SIGNED_ATTESTATION_SSZ_SIZE) {
+                zigHandler.logger.err(
+                    "Gossip attestation message size mismatch: got {d} bytes, expected {d}",
+                    .{ uncompressed_message.len, SIGNED_ATTESTATION_SSZ_SIZE },
+                );
+                return;
+            }
             var message_data: types.SignedAttestation = undefined;
             ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
@@ -1222,3 +1309,38 @@ pub const EthLibp2p = struct {
         return result;
     }
 };
+
+test "SIGNED_ATTESTATION_SSZ_SIZE matches actual serialized size" {
+    const attestation = types.SignedAttestation{
+        .validator_id = 0,
+        .message = .{
+            .slot = 0,
+            .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+            .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
+        },
+        .signature = [_]u8{0} ** types.SIGSIZE,
+    };
+    var serialized: std.ArrayList(u8) = .empty;
+    defer serialized.deinit(std.testing.allocator);
+    try ssz.serialize(types.SignedAttestation, attestation, &serialized, std.testing.allocator);
+    try std.testing.expectEqual(SIGNED_ATTESTATION_SSZ_SIZE, serialized.items.len);
+}
+
+test "validateGossipSnappyHeader rejects oversized declared size" {
+    var scratch: [MAX_VARINT_BYTES]u8 = undefined;
+    const encoded = uvarint.encode(usize, MAX_RPC_MESSAGE_SIZE + 1, &scratch);
+    try std.testing.expectError(error.PayloadTooLarge, validateGossipSnappyHeader(encoded));
+}
+
+test "validateSignedBlockWithAttestationTopLevelOffsets rejects invalid offsets" {
+    var bad_first: [8]u8 = undefined;
+    std.mem.writeInt(u32, bad_first[0..4], 4, .little);
+    std.mem.writeInt(u32, bad_first[4..8], 8, .little);
+    try std.testing.expectError(error.InvalidEncoding, validateSignedBlockWithAttestation(&bad_first));
+
+    var bad_second: [8]u8 = undefined;
+    std.mem.writeInt(u32, bad_second[0..4], 8, .little);
+    std.mem.writeInt(u32, bad_second[4..8], 4, .little);
+    try std.testing.expectError(error.InvalidEncoding, validateSignedBlockWithAttestation(&bad_second));
+}

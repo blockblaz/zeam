@@ -26,3 +26,8 @@ pub fn hashTreeRoot(
 ) !void {
     try ssz.hashTreeRoot(Hasher, T, value, out, allocator);
 }
+
+pub fn fixedSszSize(comptime T: type) usize {
+    return ssz.serializedFixedSize(T) catch
+        @compileError(std.fmt.comptimePrint("SSZ type {s} must remain fixed-size", .{@typeName(T)}));
+}
