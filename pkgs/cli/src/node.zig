@@ -193,6 +193,15 @@ pub const Node = struct {
                 // Verify state against genesis config
                 if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
                     self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
+                    self.logger.info(
+                        "checkpoint sync state: finalized_slot={d} finalized_root={x} justified_slot={d} justified_root={x}",
+                        .{
+                            self.anchor_state.latest_finalized.slot,
+                            self.anchor_state.latest_finalized.root,
+                            self.anchor_state.latest_justified.slot,
+                            self.anchor_state.latest_justified.root,
+                        },
+                    );
                     checkpoint_sync_succeeded = true;
                 } else |verify_err| {
                     self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
@@ -209,6 +218,7 @@ pub const Node = struct {
             db.loadLatestFinalizedState(self.anchor_state) catch |err| {
                 self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
                 try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+                self.logger.info("initialized from genesis: finalized_slot=0 justified_slot=0", .{});
             };
         }
         errdefer self.anchor_state.deinit();

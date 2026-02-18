@@ -326,13 +326,28 @@ pub const ForkChoice = struct {
             .confirmed = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
-        const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
+        const is_genesis = opts.anchorState.slot == 0;
         const fc_store = ForkChoiceStore{
             .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
             .timeSlots = opts.anchorState.slot,
-            .latest_justified = anchorCP,
-            .latest_finalized = anchorCP,
+            .latest_justified = opts.anchorState.latest_justified,
+            .latest_finalized = opts.anchorState.latest_finalized,
         };
+
+        if (is_genesis) {
+            opts.logger.info("forkchoice initialized from genesis", .{});
+        } else {
+            opts.logger.info(
+                "forkchoice initialized from checkpoint: anchor_slot={d} finalized_slot={d} finalized_root={x} justified_slot={d} justified_root={x}",
+                .{
+                    opts.anchorState.slot,
+                    fc_store.latest_finalized.slot,
+                    fc_store.latest_finalized.root,
+                    fc_store.latest_justified.slot,
+                    fc_store.latest_justified.root,
+                },
+            );
+        }
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
         const deltas: std.ArrayList(isize) = .empty;
         const gossip_signatures = SignaturesMap.init(allocator);
