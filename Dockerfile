@@ -28,7 +28,8 @@ RUN ZIG_VERSION="0.15.2" && \
     esac && \
     curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ && \
     mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /opt/zig && \
-    ln -s /opt/zig/zig /usr/local/bin/zig
+    ln -s /opt/zig/zig /usr/local/bin/zig && \
+    sed -i 's/const j: MinInt = @intCast(r\.intRangeLessThan(Index, i, max));/const j: MinInt = i + @as(MinInt, @intCast(r.int(Index) % @as(Index, @intCast(max - i))));/' /opt/zig/lib/std/Random.zig
 
 # Install Rust nightly (required by build.zig which uses +nightly)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
