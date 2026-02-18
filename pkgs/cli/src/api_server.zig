@@ -25,9 +25,10 @@ const RATE_LIMIT_STALE_NS: u64 = 10 * std.time.ns_per_min; // Evict entries idle
 const RATE_LIMIT_CLEANUP_COOLDOWN_NS: u64 = 60 * std.time.ns_per_s;
 
 /// API server that runs in a background thread
-/// Handles metrics, SSE events, health checks, forkchoice graph, and checkpoint state endpoints
+/// Handles SSE events, health checks, forkchoice graph, and checkpoint state endpoints
 /// chain is optional - if null, chain-dependent endpoints will return 503
 /// (API server starts before chain initialization, so chain may not be available yet)
+/// Note: Metrics are served by the separate metrics_server on a different port
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !*ApiServer {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
@@ -99,9 +100,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         defer arena.deinit();
         const request_allocator = arena.allocator();
 
-        if (std.mem.eql(u8, request.head.target, "/metrics")) {
-            ctx.handleMetrics(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
+        if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             ctx.handleHealth(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             ctx.handleFinalizedCheckpointState(&request) catch |err| {
@@ -177,7 +176,7 @@ pub const ApiServer = struct {
         };
         defer server.deinit();
 
-        self.logger.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+        self.logger.info("API server listening on http://0.0.0.0:{d}", .{self.port});
 
         while (true) {
             if (self.stopped.load(.acquire)) break;
@@ -201,26 +200,6 @@ pub const ApiServer = struct {
         }) {
             std.Thread.sleep(ACCEPT_POLL_NS);
         }
-    }
-
-    /// Handle metrics endpoint
-    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
-        var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer allocating_writer.deinit();
-
-        api.writeMetrics(&allocating_writer.writer) catch {
-            _ = request.respond("Internal Server Error\n", .{}) catch {};
-            return;
-        };
-
-        // Get the written data from the allocating writer
-        const written_data = allocating_writer.writer.buffer[0..allocating_writer.writer.end];
-
-        _ = request.respond(written_data, .{
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
-            },
-        }) catch {};
     }
 
     /// Handle health check endpoint
