@@ -936,6 +936,7 @@ pub const ForkChoice = struct {
         payloads: *const AggregatedPayloadsMap,
     ) !std.AutoHashMap(types.ValidatorIndex, types.AttestationData) {
         var attestations = std.AutoHashMap(types.ValidatorIndex, types.AttestationData).init(self.allocator);
+        errdefer attestations.deinit();
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();

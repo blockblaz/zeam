@@ -330,6 +330,14 @@ pub const GossipMessage = union(GossipTopicKind) {
         return cloned_data;
     }
 
+    pub fn deinit(self: *Self) void {
+        switch (self.*) {
+            .block => |*block| block.deinit(),
+            .attestation => {},
+            .aggregation => |*aggregation| aggregation.deinit(),
+        }
+    }
+
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
         return switch (self.*) {
             .block => |block| block.toJson(allocator) catch |e| {
@@ -718,7 +726,7 @@ pub const ReqRespRequestHandler = struct {
 const MessagePublishWrapper = struct {
     allocator: Allocator,
     handler: OnGossipCbHandler,
-    data: *const GossipMessage,
+    data: *GossipMessage,
     sender_peer_id: []const u8,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
@@ -753,6 +761,7 @@ const MessagePublishWrapper = struct {
 
     fn deinit(self: *Self) void {
         self.allocator.free(self.sender_peer_id);
+        self.data.deinit();
         self.allocator.destroy(self.data);
         self.allocator.destroy(self);
     }

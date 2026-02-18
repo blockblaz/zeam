@@ -294,7 +294,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
-    const message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
+    var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => blockmessage: {
             var message_data: types.SignedBlockWithAttestation = undefined;
             ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
@@ -340,6 +340,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             break :aggregationmessage .{ .aggregation = message_data };
         },
     };
+    defer message.deinit();
 
     const sender_peer_id_slice = std.mem.span(sender_peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
