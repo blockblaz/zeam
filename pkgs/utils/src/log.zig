@@ -39,7 +39,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     } else {
         std.debug.lockStdErr();
         defer std.debug.unlockStdErr();
-        const stderr = std.io.getStdErr().writer();
+        const stderr = std.fs.File.stderr();
 
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
@@ -67,7 +67,10 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
 
         // Print to stderr
         if (@intFromEnum(activeLevel) >= @intFromEnum(level)) {
-            nosuspend stderr.writeAll(print_str) catch return;
+            var stderr_write_buf: [4096]u8 = undefined;
+            var stderr_writer = stderr.writer(&stderr_write_buf);
+            nosuspend stderr_writer.interface.writeAll(print_str) catch return;
+            nosuspend stderr_writer.interface.flush() catch return;
         }
 
         //write to file
@@ -80,8 +83,14 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
                 ) catch return;
             }
 
-            nosuspend fileLogParams.?.file.writeAll(print_str) catch |err| {
-                stderr.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err }) catch {};
+            var file_write_buf: [4096]u8 = undefined;
+            var file_writer = fileLogParams.?.file.writer(&file_write_buf);
+            nosuspend file_writer.interface.writeAll(print_str) catch |err| {
+                std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
+                return;
+            };
+            nosuspend file_writer.interface.flush() catch |err| {
+                std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to flush log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
             };
         }
     }
@@ -478,61 +487,66 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
 
 test "OptionalNode formatter" {
     const testing = std.testing;
-    var buffer: [256]u8 = undefined;
+    const allocator = testing.allocator;
 
     // Test with node name present
     {
-        var fbs = std.io.fixedBufferStream(&buffer);
-        const writer = fbs.writer();
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
 
-        try writer.print("{} Peer connected: {s}, total peers: {d}", .{
-            OptionalNode.init("alice"),
+        const node = OptionalNode.init("alice");
+        try node.format("", .{}, writer);
+        try writer.print(" Peer connected: {s}, total peers: {d}", .{
             "peer123",
             5,
         });
 
-        const result = fbs.getWritten();
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "alice" ++ Colors.reset ++ ") Peer connected: peer123, total peers: 5", buffer.items);
     }
 
     // Test with node name null
     {
-        var fbs = std.io.fixedBufferStream(&buffer);
-        const writer = fbs.writer();
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
 
-        try writer.print("{}Peer connected: {s}, total peers: {d}", .{
-            OptionalNode.init(null),
+        const node = OptionalNode.init(null);
+        try node.format("", .{}, writer);
+        try writer.print("Peer connected: {s}, total peers: {d}", .{
             "peer456",
             3,
         });
 
-        const result = fbs.getWritten();
-        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", result);
+        try testing.expectEqualStrings("Peer connected: peer456, total peers: 3", buffer.items);
     }
 
     // Test in different positions
     {
-        var fbs = std.io.fixedBufferStream(&buffer);
-        const writer = fbs.writer();
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
 
-        try writer.print("{} Published block: slot={d} proposer={d}", .{
-            OptionalNode.init("validator-7"),
+        const node = OptionalNode.init("validator-7");
+        try node.format("", .{}, writer);
+        try writer.print(" Published block: slot={d} proposer={d}", .{
             100,
             7,
         });
 
-        const result = fbs.getWritten();
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ "validator-7" ++ Colors.reset ++ ") Published block: slot=100 proposer=7", buffer.items);
     }
 
     // Test with empty string (should still format)
     {
-        var fbs = std.io.fixedBufferStream(&buffer);
-        const writer = fbs.writer();
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
 
-        try writer.print("{} Message", .{OptionalNode.init("")});
+        const node = OptionalNode.init("");
+        try node.format("", .{}, writer);
+        try writer.writeAll(" Message");
 
-        const result = fbs.getWritten();
-        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", result);
+        try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", buffer.items);
     }
 }

@@ -21,10 +21,10 @@ pub const MockChainData = mockImport.MockChainData;
 test "ssz import" {
     const data: u16 = 0x5566;
     const serialized_data = [_]u8{ 0x66, 0x55 };
-    var list = std.ArrayList(u8).init(std.testing.allocator);
-    defer list.deinit();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
 
-    try ssz.serialize(u16, data, &list);
+    try ssz.serialize(u16, data, &list, std.testing.allocator);
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }
 

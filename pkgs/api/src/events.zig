@@ -2,11 +2,15 @@ const std = @import("std");
 const types = @import("@zeam/types");
 const utils = @import("@zeam/utils");
 
+const event_broadcaster = @import("./event_broadcaster.zig");
+
 const Allocator = std.mem.Allocator;
 const Checkpoint = types.Checkpoint;
 
 const json = std.json;
 const jsonToString = utils.jsonToString;
+
+const sse_send_buffer_size = event_broadcaster.sse_send_buffer_size;
 
 /// SSE Event types for chain state changes
 pub const ChainEventType = enum {
@@ -24,9 +28,9 @@ pub const NewHeadEvent = struct {
     timely: bool,
 
     pub fn fromProtoBlock(allocator: Allocator, proto_block: types.ProtoBlock) !NewHeadEvent {
-        const block_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.blockRoot)});
-        const parent_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.parentRoot)});
-        const state_root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&proto_block.stateRoot)});
+        const block_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&proto_block.blockRoot});
+        const parent_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&proto_block.parentRoot});
+        const state_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&proto_block.stateRoot});
 
         return NewHeadEvent{
             .slot = proto_block.slot,
@@ -67,7 +71,7 @@ pub const NewJustificationEvent = struct {
     justified_slot: u64,
 
     pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewJustificationEvent {
-        const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
+        const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&checkpoint.root});
 
         return NewJustificationEvent{
             .slot = current_slot,
@@ -102,7 +106,7 @@ pub const NewFinalizationEvent = struct {
     finalized_slot: u64,
 
     pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewFinalizationEvent {
-        const root_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&checkpoint.root)});
+        const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&checkpoint.root});
 
         return NewFinalizationEvent{
             .slot = current_slot,
@@ -149,7 +153,7 @@ pub const ChainEvent = union(ChainEventType) {
 pub fn serializeEventToJson(allocator: Allocator, event: ChainEvent) ![]u8 {
     const event_name = @tagName(std.meta.activeTag(event));
 
-    var json_str = std.ArrayListUnmanaged(u8){};
+    var json_str: std.ArrayList(u8) = .empty;
     defer json_str.deinit(allocator);
 
     // Format as SSE event
@@ -190,9 +194,10 @@ test "serialize new head event" {
         .parentRoot = [_]u8{2} ** 32,
         .stateRoot = [_]u8{3} ** 32,
         .timeliness = true,
+        .confirmed = true,
     };
 
-    const head_event = try NewHeadEvent.fromProtoBlock(allocator, proto_block);
+    var head_event = try NewHeadEvent.fromProtoBlock(allocator, proto_block);
     defer head_event.deinit(allocator);
 
     const chain_event = ChainEvent{ .new_head = head_event };
@@ -212,7 +217,7 @@ test "serialize new justification event" {
         .root = [_]u8{5} ** 32,
     };
 
-    const just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123);
+    var just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123);
     defer just_event.deinit(allocator);
 
     const chain_event = ChainEvent{ .new_justification = just_event };
@@ -232,7 +237,7 @@ test "serialize new finalization event" {
         .root = [_]u8{4} ** 32,
     };
 
-    const final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 123);
+    var final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 123);
     defer final_event.deinit(allocator);
 
     const chain_event = ChainEvent{ .new_finalization = final_event };
@@ -242,4 +247,56 @@ test "serialize new finalization event" {
     try std.testing.expect(std.mem.indexOf(u8, json_str, "event: new_finalization") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"slot\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"finalized_slot\":100") != null);
+}
+
+/// Builds a sample ChainEvent for the given tag. Used so the buffer test covers every
+/// ChainEventType; when a new variant is added, the compiler requires it here.
+fn makeSampleChainEvent(allocator: Allocator, tag: ChainEventType) !ChainEvent {
+    return switch (tag) {
+        .new_head => blk: {
+            const proto_block = types.ProtoBlock{
+                .slot = 999_999,
+                .blockRoot = [_]u8{0xab} ** 32,
+                .parentRoot = [_]u8{0xcd} ** 32,
+                .stateRoot = [_]u8{0xef} ** 32,
+                .timeliness = true,
+                .confirmed = true,
+            };
+            const head_event = try NewHeadEvent.fromProtoBlock(allocator, proto_block);
+            break :blk ChainEvent{ .new_head = head_event };
+        },
+        .new_justification => blk: {
+            const checkpoint = Checkpoint{
+                .slot = 999_999,
+                .root = [_]u8{0x12} ** 32,
+            };
+            const just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 999_999);
+            break :blk ChainEvent{ .new_justification = just_event };
+        },
+        .new_finalization => blk: {
+            const checkpoint = Checkpoint{
+                .slot = 999_999,
+                .root = [_]u8{0x34} ** 32,
+            };
+            const final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 999_999);
+            break :blk ChainEvent{ .new_finalization = final_event };
+        },
+    };
+}
+
+test "every ChainEventType serializes below send buffer size" {
+    const allocator = std.testing.allocator;
+
+    inline for (std.meta.fields(ChainEventType)) |field| {
+        const tag = @field(ChainEventType, field.name);
+        var event = try makeSampleChainEvent(allocator, tag);
+        defer event.deinit(allocator);
+
+        const json_str = try serializeEventToJson(allocator, event);
+        defer allocator.free(json_str);
+
+        try std.testing.expect(
+            json_str.len <= sse_send_buffer_size,
+        );
+    }
 }

@@ -107,7 +107,7 @@ pub fn setSlotJustified(finalized_slot: types.Slot, justified_slots: *types.Just
 
 // Helper function to convert bytes to hex string
 pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
+    return try std.fmt.allocPrint(allocator, "0x{x}", .{bytes});
 }
 
 pub const GenesisSpec = struct {
@@ -148,10 +148,10 @@ pub const ChainSpec = struct {
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
 // pass a pointer where you want to clone the data
 pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
-    var bytes = std.ArrayList(u8).init(allocator);
-    defer bytes.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
 
-    try ssz.serialize(T, data, &bytes);
+    try ssz.serialize(T, data, &bytes, allocator);
     try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
@@ -168,9 +168,9 @@ test "isSlotJustified treats finalized boundary as implicit" {
 test "ssz import" {
     const data: u16 = 0x5566;
     const serialized_data = [_]u8{ 0x66, 0x55 };
-    var list = std.ArrayList(u8).init(std.testing.allocator);
-    defer list.deinit();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
 
-    try ssz.serialize(u16, data, &list);
+    try ssz.serialize(u16, data, &list, std.testing.allocator);
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }

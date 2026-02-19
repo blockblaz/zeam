@@ -9,12 +9,12 @@ pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.Pro
     defer tree_lines.deinit(allocator);
 
     // Find root nodes (nodes with no parent)
-    var root_indices = std.ArrayList(usize).init(allocator);
-    defer root_indices.deinit();
+    var root_indices: std.ArrayList(usize) = .empty;
+    defer root_indices.deinit(allocator);
 
     for (nodes, 0..) |node, i| {
         if (node.parent == null) {
-            try root_indices.append(i);
+            try root_indices.append(allocator, i);
         }
     }
 
@@ -35,7 +35,7 @@ fn sortDescByRecency(context: void, a: RecentChildren, b: RecentChildren) bool {
 /// Recursively builds a tree branch visualization
 fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged(u8), nodes: []const fcFactory.ProtoNode, node_idx: usize, depth: usize, branch: usize, prefix: []const u8, maxDepth: ?usize, maxBranch: ?usize) !void {
     const node = nodes[node_idx];
-    const hex_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(node.blockRoot[0..2])});
+    const hex_root = try std.fmt.allocPrint(allocator, "{x}", .{node.blockRoot[0..2]});
     defer allocator.free(hex_root);
 
     const max_depth = maxDepth orelse constants.MAX_FC_DISPLAY_DEPTH;
@@ -46,13 +46,13 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged
     const leaf_distance = leaf_node.depth - node.depth;
 
     // get children and order them
-    var children = std.ArrayList(RecentChildren).init(allocator);
-    defer children.deinit();
+    var children: std.ArrayList(RecentChildren) = .empty;
+    defer children.deinit(allocator);
 
     var c_idx = node.firstChild;
     while (c_idx > 0) {
         const child_node = nodes[c_idx];
-        try children.append(.{ .id = c_idx, .recency = child_node.bestDescendant orelse child_node.slot });
+        try children.append(allocator, .{ .id = c_idx, .recency = child_node.bestDescendant orelse child_node.slot });
 
         c_idx = child_node.nextSibling;
     }
@@ -141,25 +141,25 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged
 
 /// Helper function to create proper tree indentation
 fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]const u8 {
-    var indent = std.ArrayList(u8).init(allocator);
-    defer indent.deinit();
+    var indent: std.ArrayList(u8) = .empty;
+    defer indent.deinit(allocator);
 
     // Add indentation for each depth level
     for (0..depth) |_| {
-        try indent.appendSlice("    ");
+        try indent.appendSlice(allocator, "    ");
     }
 
     // Add tree characters based on position
     const tree_char = if (is_last_child) "└── " else "├── ";
-    try indent.appendSlice(tree_char);
+    try indent.appendSlice(allocator, tree_char);
 
-    return indent.toOwnedSlice();
+    return indent.toOwnedSlice(allocator);
 }
 
 /// Build fork choice graph in Grafana node-graph JSON format
 pub fn buildForkChoiceGraphJSON(
     forkchoice: *fcFactory.ForkChoice,
-    writer: anytype,
+    output: *std.ArrayList(u8),
     max_slots: usize,
     allocator: Allocator,
 ) !void {
@@ -173,10 +173,10 @@ pub fn buildForkChoiceGraphJSON(
     const min_slot = if (current_slot > max_slots) current_slot - max_slots else 0;
 
     // Build nodes and edges
-    var nodes_list = std.ArrayList(u8).init(allocator);
-    defer nodes_list.deinit();
-    var edges_list = std.ArrayList(u8).init(allocator);
-    defer edges_list.deinit();
+    var nodes_list: std.ArrayList(u8) = .empty;
+    defer nodes_list.deinit(allocator);
+    var edges_list: std.ArrayList(u8) = .empty;
+    defer edges_list.deinit(allocator);
 
     var node_count: usize = 0;
     var edge_count: usize = 0;
@@ -270,16 +270,16 @@ pub fn buildForkChoiceGraphJSON(
         const arc_orphaned: f64 = if (is_orphaned) arc_weight else 0.0;
 
         // Block root as hex
-        const hex_prefix = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(pnode.blockRoot[0..4])});
+        const hex_prefix = try std.fmt.allocPrint(allocator, "{x}", .{pnode.blockRoot[0..4]});
         defer allocator.free(hex_prefix);
-        const full_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&pnode.blockRoot)});
+        const full_root = try std.fmt.allocPrint(allocator, "{x}", .{&pnode.blockRoot});
         defer allocator.free(full_root);
 
         if (node_count > 0) {
-            try nodes_list.appendSlice(",");
+            try nodes_list.appendSlice(allocator, ",");
         }
 
-        try std.fmt.format(nodes_list.writer(),
+        const node_json = try std.fmt.allocPrint(allocator,
             \\{{"id":"{s}","title":"Slot {d}","mainStat":"{d}","secondaryStat":"{d}","arc__timely":{d:.4},"arc__head":{d:.4},"arc__justified":{d:.4},"arc__finalized":{d:.4},"arc__orphaned":{d:.4},"detail__role":"{s}","detail__hex_prefix":"{s}"}}
         , .{
             full_root,
@@ -294,6 +294,8 @@ pub fn buildForkChoiceGraphJSON(
             role,
             hex_prefix,
         });
+        defer allocator.free(node_json);
+        try nodes_list.appendSlice(allocator, node_json);
 
         node_count += 1;
 
@@ -301,16 +303,16 @@ pub fn buildForkChoiceGraphJSON(
         if (pnode.parent) |parent_idx| {
             const parent_node = proto_nodes[parent_idx];
             if (parent_node.slot >= min_slot) {
-                const parent_root = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&parent_node.blockRoot)});
+                const parent_root = try std.fmt.allocPrint(allocator, "{x}", .{&parent_node.blockRoot});
                 defer allocator.free(parent_root);
 
                 const is_best_child = if (parent_node.bestChild) |bc| bc == idx else false;
 
                 if (edge_count > 0) {
-                    try edges_list.appendSlice(",");
+                    try edges_list.appendSlice(allocator, ",");
                 }
 
-                try std.fmt.format(edges_list.writer(),
+                const edge_json = try std.fmt.allocPrint(allocator,
                     \\{{"id":"edge_{d}","source":"{s}","target":"{s}","mainStat":"","detail__is_best_child":{}}}
                 , .{
                     edge_count,
@@ -318,6 +320,8 @@ pub fn buildForkChoiceGraphJSON(
                     full_root,
                     is_best_child,
                 });
+                defer allocator.free(edge_json);
+                try edges_list.appendSlice(allocator, edge_json);
 
                 edge_count += 1;
             }
@@ -325,9 +329,11 @@ pub fn buildForkChoiceGraphJSON(
     }
 
     // Write final JSON
-    try std.fmt.format(writer,
+    const final_json = try std.fmt.allocPrint(allocator,
         \\{{"nodes":[{s}],"edges":[{s}]}}
     , .{ nodes_list.items, edges_list.items });
+    defer allocator.free(final_json);
+    try output.appendSlice(allocator, final_json);
 }
 
 // ============================================================================

@@ -13,7 +13,7 @@ const ChainOptions = configs.ChainOptions;
 const sft = @import("@zeam/state-transition");
 const xev = @import("xev");
 const networks = @import("@zeam/network");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const xmss = @import("@zeam/xmss");
@@ -367,7 +367,7 @@ pub const Node = struct {
             for (listen_addresses) |addr| addr.deinit();
             self.allocator.free(listen_addresses);
         }
-        var connect_peer_list: std.ArrayListUnmanaged(Multiaddr) = .empty;
+        var connect_peer_list: std.ArrayList(Multiaddr) = .empty;
         defer connect_peer_list.deinit(self.allocator);
 
         for (self.options.bootnodes, 0..) |n, i| {
@@ -559,48 +559,46 @@ fn downloadCheckpointState(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // Buffer for server response headers
-    var server_header_buffer: [16 * 1024]u8 = undefined;
-
-    // Open HTTP request
-    var req = client.open(.GET, uri, .{
-        .server_header_buffer = &server_header_buffer,
-    }) catch |err| {
-        logger.err("failed to open HTTP connection: {}", .{err});
+    // Create HTTP request
+    var req = client.request(.GET, uri, .{}) catch |err| {
+        logger.err("failed to create HTTP request: {any}", .{err});
         return error.ConnectionFailed;
     };
     defer req.deinit();
 
-    // Send the request
-    req.send() catch |err| {
-        logger.err("failed to send HTTP request: {}", .{err});
+    // Send the request (GET has no body)
+    req.sendBodiless() catch |err| {
+        logger.err("failed to send HTTP request: {any}", .{err});
         return error.RequestFailed;
     };
 
-    // Wait for response
-    req.wait() catch |err| {
-        logger.err("failed to receive HTTP response: {}", .{err});
+    // Receive response headers
+    var redirect_buffer: [1024]u8 = undefined;
+    var response = req.receiveHead(&redirect_buffer) catch |err| {
+        logger.err("failed to receive HTTP response: {any}", .{err});
         return error.ResponseFailed;
     };
 
     // Check HTTP status
-    if (req.response.status != .ok) {
-        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(req.response.status)});
+    if (response.head.status != .ok) {
+        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(response.head.status)});
         return error.HttpError;
     }
 
     // Read response body
-    var ssz_data = std.ArrayList(u8).init(allocator);
-    errdefer ssz_data.deinit();
+    var ssz_data: std.ArrayList(u8) = .empty;
+    errdefer ssz_data.deinit(allocator);
 
+    var transfer_buffer: [8192]u8 = undefined;
+    const body_reader = response.reader(&transfer_buffer);
     var buffer: [8192]u8 = undefined;
     while (true) {
-        const bytes_read = req.reader().read(&buffer) catch |err| {
-            logger.err("failed to read response body: {}", .{err});
+        const bytes_read = body_reader.readSliceShort(&buffer) catch |err| {
+            logger.err("failed to read response body: {any}", .{err});
             return error.ReadFailed;
         };
         if (bytes_read == 0) break;
-        try ssz_data.appendSlice(buffer[0..bytes_read]);
+        try ssz_data.appendSlice(allocator, buffer[0..bytes_read]);
     }
 
     logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
@@ -675,12 +673,12 @@ fn verifyCheckpointState(
     var block_root: types.Root = undefined;
     try zeam_utils.hashTreeRoot(types.BeamBlockHeader, state_block_header, &block_root, allocator);
 
-    logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{s}, block_root=0x{s}", .{
+    logger.info("checkpoint state verified: slot={d}, genesis_time={d}, validators={d}, state_root=0x{x}, block_root=0x{x}", .{
         state.slot,
         state.config.genesis_time,
         actual_validators,
-        std.fmt.fmtSliceHexLower(&state_block_header.state_root),
-        std.fmt.fmtSliceHexLower(&block_root),
+        &state_block_header.state_root,
+        &block_root,
     });
 }
 
@@ -692,17 +690,20 @@ fn verifyCheckpointState(
 /// ```
 /// Returns a set of ENR strings. The caller is responsible for freeing the returned slice.
 fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []const u8 {
-    const temp_nodes = try nodes_config.parse(allocator, [][]const u8);
-    defer allocator.free(temp_nodes);
+    // Directly access yaml structure to avoid yaml library's parse() double allocation bug
+    if (nodes_config.docs.items.len == 0) return error.InvalidYamlShape;
+    const root = nodes_config.docs.items[0];
+    if (root != .list) return error.InvalidYamlShape;
 
-    var nodes = try allocator.alloc([]const u8, temp_nodes.len);
+    var nodes = try allocator.alloc([]const u8, root.list.len);
     errdefer {
         for (nodes) |node| allocator.free(node);
         allocator.free(nodes);
     }
 
-    for (temp_nodes, 0..) |temp_node, i| {
-        nodes[i] = try allocator.dupe(u8, temp_node);
+    for (root.list, 0..) |item, i| {
+        if (item != .scalar) return error.InvalidYamlShape;
+        nodes[i] = try allocator.dupe(u8, item.scalar);
     }
 
     return nodes;
@@ -729,7 +730,7 @@ fn nodesFromYAML(allocator: std.mem.Allocator, nodes_config: Yaml) ![]const []co
 /// where `node_key` (e.g., "zeam_0") is the key for the node's validator assignments.
 /// Returns a slice of ValidatorAssignment. The caller is responsible for freeing the returned slice.
 fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const u8, validators: Yaml) ![]ValidatorAssignment {
-    var assignments: std.ArrayListUnmanaged(ValidatorAssignment) = .empty;
+    var assignments: std.ArrayList(ValidatorAssignment) = .empty;
     defer assignments.deinit(allocator);
     errdefer {
         for (assignments.items) |*a| {
@@ -744,18 +745,18 @@ fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const 
         if (item != .map) return error.InvalidValidatorConfig;
 
         const index_value = item.map.get("index") orelse return error.InvalidValidatorConfig;
-        if (index_value != .int) return error.InvalidValidatorConfig;
+        if (index_value != .scalar) return error.InvalidValidatorConfig;
 
         const pubkey_value = item.map.get("pubkey_hex") orelse return error.InvalidValidatorConfig;
-        if (pubkey_value != .string) return error.InvalidValidatorConfig;
+        if (pubkey_value != .scalar) return error.InvalidValidatorConfig;
 
         const privkey_value = item.map.get("privkey_file") orelse return error.InvalidValidatorConfig;
-        if (privkey_value != .string) return error.InvalidValidatorConfig;
+        if (privkey_value != .scalar) return error.InvalidValidatorConfig;
 
         const assignment = ValidatorAssignment{
-            .index = @intCast(index_value.int),
-            .pubkey_hex = try allocator.dupe(u8, pubkey_value.string),
-            .privkey_file = try allocator.dupe(u8, privkey_value.string),
+            .index = @intCast(std.fmt.parseInt(usize, index_value.scalar, 10) catch return error.InvalidValidatorConfig),
+            .pubkey_hex = try allocator.dupe(u8, pubkey_value.scalar),
+            .privkey_file = try allocator.dupe(u8, privkey_value.scalar),
         };
         try assignments.append(allocator, assignment);
     }
@@ -781,7 +782,7 @@ fn nodeKeyIndexFromYaml(node_key: []const u8, validator_config: Yaml) !usize {
     var index: usize = 0;
     for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
         const name_value = entry.map.get("name").?;
-        if (name_value == .string and std.mem.eql(u8, name_value.string, node_key)) {
+        if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
             return index;
         }
         index += 1;
@@ -792,10 +793,10 @@ fn nodeKeyIndexFromYaml(node_key: []const u8, validator_config: Yaml) !usize {
 fn getPrivateKeyFromValidatorConfig(allocator: std.mem.Allocator, node_key: []const u8, validator_config: Yaml) ![]const u8 {
     for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
         const name_value = entry.map.get("name").?;
-        if (name_value == .string and std.mem.eql(u8, name_value.string, node_key)) {
+        if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
             const privkey_value = entry.map.get("privkey").?;
-            if (privkey_value == .string) {
-                return try allocator.dupe(u8, privkey_value.string);
+            if (privkey_value == .scalar) {
+                return try allocator.dupe(u8, privkey_value.scalar);
             } else {
                 return error.InvalidPrivateKeyFormat;
             }
@@ -807,7 +808,7 @@ fn getPrivateKeyFromValidatorConfig(allocator: std.mem.Allocator, node_key: []co
 fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []const u8, validator_config: Yaml) !EnrFields {
     for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
         const name_value = entry.map.get("name").?;
-        if (name_value == .string and std.mem.eql(u8, name_value.string, node_key)) {
+        if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
             const enr_fields_value = entry.map.get("enrFields");
             if (enr_fields_value == null) {
                 return error.MissingEnrFields;
@@ -822,38 +823,38 @@ fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []con
 
             // Parse known fields
             if (fields_map.get("ip")) |ip_value| {
-                if (ip_value == .string) {
-                    enr_fields.ip = try allocator.dupe(u8, ip_value.string);
+                if (ip_value == .scalar) {
+                    enr_fields.ip = try allocator.dupe(u8, ip_value.scalar);
                 }
             }
 
             if (fields_map.get("ip6")) |ip6_value| {
-                if (ip6_value == .string) {
-                    enr_fields.ip6 = try allocator.dupe(u8, ip6_value.string);
+                if (ip6_value == .scalar) {
+                    enr_fields.ip6 = try allocator.dupe(u8, ip6_value.scalar);
                 }
             }
 
             if (fields_map.get("tcp")) |tcp_value| {
-                if (tcp_value == .int) {
-                    enr_fields.tcp = @intCast(tcp_value.int);
+                if (tcp_value == .scalar) {
+                    enr_fields.tcp = std.fmt.parseInt(u16, tcp_value.scalar, 10) catch 0;
                 }
             }
 
             if (fields_map.get("udp")) |udp_value| {
-                if (udp_value == .int) {
-                    enr_fields.udp = @intCast(udp_value.int);
+                if (udp_value == .scalar) {
+                    enr_fields.udp = std.fmt.parseInt(u16, udp_value.scalar, 10) catch 0;
                 }
             }
 
             if (fields_map.get("quic")) |quic_value| {
-                if (quic_value == .int) {
-                    enr_fields.quic = @intCast(quic_value.int);
+                if (quic_value == .scalar) {
+                    enr_fields.quic = std.fmt.parseInt(u16, quic_value.scalar, 10) catch 0;
                 }
             }
 
             if (fields_map.get("seq")) |seq_value| {
-                if (seq_value == .int) {
-                    enr_fields.seq = @intCast(seq_value.int);
+                if (seq_value == .scalar) {
+                    enr_fields.seq = std.fmt.parseInt(u64, seq_value.scalar, 10) catch 0;
                 }
             }
 
@@ -875,15 +876,10 @@ fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []con
                 }
 
                 // Handle custom field based on type
-                if (value == .string) {
+                if (value == .scalar) {
                     const key_copy = try allocator.dupe(u8, key);
-                    const value_copy = try allocator.dupe(u8, value.string);
+                    const value_copy = try allocator.dupe(u8, value.scalar);
                     try enr_fields.custom_fields.put(key_copy, value_copy);
-                } else if (value == .int) {
-                    // Convert integer to string for custom fields with proper padding
-                    const value_str = try std.fmt.allocPrint(allocator, "0x{x:0>8}", .{@as(u32, @intCast(value.int))});
-                    const key_copy = try allocator.dupe(u8, key);
-                    try enr_fields.custom_fields.put(key_copy, value_str);
                 }
             }
 
@@ -998,12 +994,11 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
     }
 
     // Convert SignableENR to ENR
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    try enr_lib.writeSignableENR(writer, &signable_enr);
-    const enr_text = fbs.getWritten();
+    try enr_lib.writeSignableENR(buffer.writer(allocator), &signable_enr);
+    const enr_text = buffer.items;
 
     var enr: ENR = undefined;
     try ENR.decodeTxtInto(&enr, enr_text);
@@ -1033,17 +1028,17 @@ pub fn populateNodeNameRegistry(
 
     for (validators_list.?.list) |entry| {
         const name_value = entry.map.get("name");
-        if (name_value == null or name_value.? != .string) continue;
-        const node_name = name_value.?.string;
+        if (name_value == null or name_value.? != .scalar) continue;
+        const node_name = name_value.?.scalar;
 
         // Get peer ID from ENR or private key
         const peer_id_str = blk: {
             var peer_id_buf: [256]u8 = undefined;
             // Try to get ENR first
             if (entry.map.get("enr")) |enr_value| {
-                if (enr_value == .string) {
+                if (enr_value == .scalar) {
                     var enr: ENR = undefined;
-                    ENR.decodeTxtInto(&enr, enr_value.string) catch break :blk null;
+                    ENR.decodeTxtInto(&enr, enr_value.scalar) catch break :blk null;
                     const pid = enr.peerId(allocator) catch break :blk null;
                     const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
                     const pid_str = allocator.dupe(u8, pid_str_slice) catch break :blk null;
@@ -1053,12 +1048,12 @@ pub fn populateNodeNameRegistry(
 
             // Try to construct ENR from privkey and enrFields
             if (entry.map.get("privkey")) |privkey_value| {
-                if (privkey_value == .string) {
+                if (privkey_value == .scalar) {
                     const enr_fields_value = entry.map.get("enrFields");
                     if (enr_fields_value != null) {
                         var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
                         defer enr_fields.deinit(allocator);
-                        var enr = constructENRFromFields(allocator, privkey_value.string, enr_fields) catch break :blk null;
+                        var enr = constructENRFromFields(allocator, privkey_value.scalar, enr_fields) catch break :blk null;
                         defer enr.deinit();
                         const pid = enr.peerId(allocator) catch break :blk null;
                         const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
@@ -1083,8 +1078,8 @@ pub fn populateNodeNameRegistry(
         if (node_validators) |validators| {
             if (validators == .list) {
                 for (validators.list) |item| {
-                    if (item == .int) {
-                        const validator_index: usize = @intCast(item.int);
+                    if (item == .scalar) {
+                        const validator_index: usize = std.fmt.parseInt(usize, item.scalar, 10) catch continue;
                         registry.addValidatorMapping(validator_index, node_name) catch |err| {
                             std.log.warn("Failed to add validator mapping for node {s} index {d}: {any}", .{ node_name, validator_index, err });
                         };
@@ -1229,7 +1224,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     try std.testing.expect(std.mem.eql(u8, &state_root_from_genesis, &state_root_from_block_header));
 
     // Verify the state root matches the expected value
-    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(&state_root_from_genesis)});
+    const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&state_root_from_genesis});
     defer allocator.free(state_root_from_genesis_hex);
     try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
 }
