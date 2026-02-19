@@ -287,7 +287,7 @@ jobs:
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run the dummy prover
-      run: zig build run -Dprover=dummy -- prove --zkvm dummy
+      run: zig build run -Doptimize=ReleaseSafe -Dprover=dummy -- prove --zkvm dummy
 
   docker-build:
     name: docker-build
