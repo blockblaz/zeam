@@ -2016,7 +2016,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = .{},
+        .deltas = .empty,
         .logger = module_logger,
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
