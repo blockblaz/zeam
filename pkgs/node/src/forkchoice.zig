@@ -326,21 +326,12 @@ pub const ForkChoice = struct {
             .confirmed = true,
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
-        // Use the anchor state's finalized/justified slots so checkpoint sync
-        // correctly propagates finalization status. The roots must point to the
-        // anchor block since it is the only entry in the proto array at init.
         const is_genesis = opts.anchorState.slot == 0;
         const fc_store = ForkChoiceStore{
             .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
             .timeSlots = opts.anchorState.slot,
-            .latest_justified = .{
-                .slot = opts.anchorState.latest_justified.slot,
-                .root = anchor_block_root,
-            },
-            .latest_finalized = .{
-                .slot = opts.anchorState.latest_finalized.slot,
-                .root = anchor_block_root,
-            },
+            .latest_justified = opts.anchorState.latest_justified,
+            .latest_finalized = opts.anchorState.latest_finalized,
         };
 
         if (is_genesis) {
