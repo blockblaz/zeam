@@ -1046,12 +1046,10 @@ pub const ForkChoice = struct {
                     }
                 }
             } else {
-                if (from_known) {
-                    attestation_tracker.latestKnown = null;
-                } else {
-                    attestation_tracker.latestNew = null;
-                }
-                latest_attestation = null;
+                latest_attestation = if (from_known)
+                    attestation_tracker.latestKnown
+                else
+                    attestation_tracker.latestNew;
             }
 
             if (latest_attestation) |delta_attestation| {
@@ -1183,21 +1181,29 @@ pub const ForkChoice = struct {
 
         // Store attestation data by root for later aggregation
         const data_root = try attestation_data.sszRoot(self.allocator);
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-        try self.attestation_data_by_root.put(data_root, attestation_data);
+        {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+            try self.attestation_data_by_root.put(data_root, attestation_data);
 
-        if (store_signature) {
-            // Store the gossip signature for later aggregation
-            const sig_key = SignatureKey{
-                .validator_id = validator_id,
-                .data_root = data_root,
-            };
-            try self.gossip_signatures.put(sig_key, .{
-                .slot = attestation_slot,
-                .signature = signed_attestation.signature,
-            });
+            if (store_signature) {
+                // Store the gossip signature for later aggregation
+                const sig_key = SignatureKey{
+                    .validator_id = validator_id,
+                    .data_root = data_root,
+                };
+                try self.gossip_signatures.put(sig_key, .{
+                    .slot = attestation_slot,
+                    .signature = signed_attestation.signature,
+                });
+            }
         }
+
+        const attestation = types.Attestation{
+            .validator_id = validator_id,
+            .data = attestation_data,
+        };
+        try self.onAttestationUnlocked(attestation, false);
     }
 
     pub fn onAttestationUnlocked(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
@@ -1254,14 +1260,16 @@ pub const ForkChoice = struct {
         proof: types.AggregatedSignatureProof,
     ) !void {
         const data_root = try attestation_data.sszRoot(self.allocator);
+
+        self.signatures_mutex.lock();
+        defer self.signatures_mutex.unlock();
+
         try self.attestation_data_by_root.put(data_root, attestation_data.*);
         const sig_key = SignatureKey{
             .validator_id = validator_id,
             .data_root = data_root,
         };
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
         // Get or create the list for this key
         const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
         if (!gop.found_existing) {
@@ -1484,11 +1492,6 @@ pub const ForkChoice = struct {
                 finalized_slot,
             },
         );
-    }
-
-    /// Backward-compatible wrapper.
-    pub fn pruneSignatureMaps(self: *Self, finalized_slot: types.Slot) !void {
-        try self.pruneStaleAttestationData(finalized_slot);
     }
 
     fn prunePayloadMapByRoots(

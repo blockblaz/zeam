@@ -6,12 +6,12 @@ const zeam_utils = @import("@zeam/utils");
 
 /// Helper function to format block keys consistently
 pub fn formatBlockKey(allocator: Allocator, block_root: *const types.Root) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "block:{x}", .{block_root});
+    return std.fmt.allocPrint(allocator, "block:{x}", .{block_root.*});
 }
 
 /// Helper function to format state keys consistently
 pub fn formatStateKey(allocator: Allocator, state_root: *const types.Root) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "state:{x}", .{state_root});
+    return std.fmt.allocPrint(allocator, "state:{x}", .{state_root.*});
 }
 
 /// Helper function to format finalized slot index keys

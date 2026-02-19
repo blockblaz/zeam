@@ -42,7 +42,9 @@ pub const ValidatorClientOutput = struct {
     }
 
     pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
-        const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = signed_attestation } };
+        var cloned_attestation: types.SignedAttestation = undefined;
+        try types.sszClone(self.allocator, types.SignedAttestation, signed_attestation, &cloned_attestation);
+        const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = cloned_attestation } };
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 

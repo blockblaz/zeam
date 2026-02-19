@@ -1023,9 +1023,10 @@ pub const EthLibp2p = struct {
         for (std.enums.values(interface.GossipTopicKind)) |kind| {
             switch (kind) {
                 .attestation => {
-                    const count = try getAttestationSubnetCount(self.params.attestation_committee_count);
-                    for (0..count) |subnet_id| {
-                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = @intCast(subnet_id) };
+                    const subnet_count = try getAttestationSubnetCount(self.params.attestation_committee_count);
+                    for (0..subnet_count) |i| {
+                        const subnet_id: types.SubnetId = @intCast(i);
+                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
                         var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
                         defer topic.deinit();
                         const topic_str = try topic.encode();
