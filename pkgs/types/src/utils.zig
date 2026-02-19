@@ -87,11 +87,12 @@ pub fn IsJustifiableSlot(finalized: types.Slot, candidate: types.Slot) !bool {
 
 fn isqrt(n: u64) u64 {
     if (n == 0) return 0;
-    const bit_length: u7 = @intCast((@bitSizeOf(u64) - @clz(n)));
+
+    const bit_length: u7 = @intCast(@as(u7, @bitSizeOf(u64)) - @as(u7, @clz(n)));
     var x: u64 = @as(u64, 1) << @intCast((bit_length + 1) / 2);
 
     while (true) {
-        const y = (x + (n / x)) >> 1;
+        const y: u64 = (x + (n / x)) >> 1;
         if (y >= x) return x;
         x = y;
     }
@@ -199,4 +200,29 @@ test "ssz import" {
 
     try ssz.serialize(u16, data, &list, std.testing.allocator);
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
+}
+
+test "isqrt" {
+    try std.testing.expectEqual(0, isqrt(0));
+    try std.testing.expectEqual(1, isqrt(1));
+    try std.testing.expectEqual(1, isqrt(2));
+    try std.testing.expectEqual(1, isqrt(3));
+    try std.testing.expectEqual(2, isqrt(4));
+    try std.testing.expectEqual(2, isqrt(5));
+    try std.testing.expectEqual(2, isqrt(6));
+    try std.testing.expectEqual(2, isqrt(7));
+    try std.testing.expectEqual(2, isqrt(8));
+    try std.testing.expectEqual(3, isqrt(9));
+    try std.testing.expectEqual(3, isqrt(10));
+    try std.testing.expectEqual(3, isqrt(11));
+    try std.testing.expectEqual(3, isqrt(12));
+    try std.testing.expectEqual(3, isqrt(13));
+    try std.testing.expectEqual(3, isqrt(14));
+    try std.testing.expectEqual(3, isqrt(15));
+    try std.testing.expectEqual(4, isqrt(16));
+    try std.testing.expectEqual(4, isqrt(17));
+    // boundary cases
+    try std.testing.expectEqual(1 << 31, isqrt(1 << 62));
+    try std.testing.expectEqual((1 << 32) - 1, isqrt(std.math.maxInt(u64) - 1));
+    try std.testing.expectEqual((1 << 32) - 1, isqrt(std.math.maxInt(u64)));
 }

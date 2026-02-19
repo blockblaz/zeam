@@ -158,8 +158,8 @@ pub const BeamChain = struct {
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = opts.is_aggregator,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
-            .pending_gossip_attestations = .{},
-            .pending_gossip_aggregations = .{},
+            .pending_gossip_attestations = .empty,
+            .pending_gossip_aggregations = .empty,
         };
     }
 
@@ -169,7 +169,7 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Clean up forkchoice resources (gossip_signatures, aggregated payloads)
+        // Clean up forkchoice resources (gossip_signatures, aggregated_payloads)
         self.forkChoice.deinit();
 
         var it = self.states.iterator();
