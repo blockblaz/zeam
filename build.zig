@@ -127,11 +127,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
-    // add rocksdb — always build with ReleaseSafe to avoid LLD UnableToWriteArchive
-    // on Debug builds (the Debug archive exceeds LLD's size limits on CI runners)
+    // add rocksdb — always build with ReleaseSmall to minimize archive size and avoid
+    // LLD UnableToWriteArchive on Linux CI runners (the archive exceeds LLD's size limits)
     const rocksdb = b.dependency("rocksdb", .{
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .ReleaseSmall,
     }).module("bindings");
 
     // add snappyz
