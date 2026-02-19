@@ -125,7 +125,6 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
-    cache_justifications: ?bool = null,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -135,7 +134,6 @@ pub const ChainSpec = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
-        try obj.put("cache_justifications", json.Value{ .bool = self.cache_justifications orelse false });
         return json.Value{ .object = obj };
     }
 

@@ -138,7 +138,7 @@ pub const Node = struct {
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
-            \\{"preset": "mainnet", "name": "devnet0", "cache_justifications": true}
+            \\{"preset": "mainnet", "name": "devnet0"}
         ;
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,

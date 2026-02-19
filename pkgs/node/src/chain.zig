@@ -697,9 +697,11 @@ pub const BeamChain = struct {
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
+            errdefer self.allocator.destroy(cpost_state);
             const clone_timer = zeam_metrics.lean_chain_state_clone_time_seconds.start();
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
             _ = clone_timer.observe();
+            errdefer cpost_state.deinit();
 
             // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
             // Use public key cache to avoid repeated SSZ deserialization of validator public keys
@@ -707,13 +709,50 @@ pub const BeamChain = struct {
             try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
             _ = sig_verify_timer.observe();
 
-            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
+            // 3. prepare justifications (from cache or state)
+            var justifications: std.AutoHashMapUnmanaged(types.Root, []u8) = .empty;
+            var owns_justifications = true;
+
+            const get_just_timer = zeam_metrics.lean_state_transition_get_justification_time_seconds.start();
+            if (self.justifications_cache.fetchRemove(block.parent_root)) |kv| {
+                justifications = kv.value;
+                zeam_metrics.metrics.lean_state_transition_justifications_cache_hits_total.incr();
+            } else {
+                try pre_state.getJustification(self.allocator, &justifications);
+                zeam_metrics.metrics.lean_state_transition_justifications_cache_misses_total.incr();
+            }
+            _ = get_just_timer.observe();
+
+            defer if (owns_justifications) {
+                var it = justifications.iterator();
+                while (it.next()) |entry| {
+                    self.allocator.free(entry.value_ptr.*);
+                }
+                justifications.deinit(self.allocator);
+            };
+
+            // 4. apply state transition
             try stf.apply_transition(self.allocator, cpost_state, block, .{
-                //
                 .logger = self.stf_logger,
                 .validSignatures = true,
-                .justifications_cache = if (self.config.spec.cache_justifications orelse false) &self.justifications_cache else null,
+                .justifications = &justifications,
             });
+
+            // 5. store justifications to cache (clear old entries first)
+            var clear_it = self.justifications_cache.iterator();
+            while (clear_it.next()) |entry| {
+                var map = entry.value_ptr.*;
+                var map_it = map.iterator();
+                while (map_it.next()) |e| {
+                    self.allocator.free(e.value_ptr.*);
+                }
+                map.deinit(self.allocator);
+            }
+            self.justifications_cache.clearRetainingCapacity();
+
+            try self.justifications_cache.put(block_root, justifications);
+            owns_justifications = false;
+
             break :computedstate cpost_state;
         };
 

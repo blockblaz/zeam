@@ -20,8 +20,8 @@ pub const StateTransitionOpts = struct {
     validSignatures: bool = true,
     validateResult: bool = true,
     logger: zeam_utils.ModuleLogger,
-    // Optional cache for justifications (block_root -> justifications_map)
-    justifications_cache: ?*std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)) = null,
+    // Optional pre-populated justifications map; if null, built from state internally
+    justifications: ?*std.AutoHashMapUnmanaged(types.Root, []u8) = null,
 };
 
 // pub fn process_epoch(state: types.BeamState) void {
@@ -47,7 +47,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     try state.process_slots(allocator, block.slot, logger);
 
     // process block and modify the pre state to post state
-    try state.process_block(allocator, block.*, .{ .logger = logger, .justifications_cache = null });
+    try state.process_block(allocator, block.*, .{ .logger = logger, .justifications = null });
 
     logger.debug("extracting state root\n", .{});
     // extract the post state root
