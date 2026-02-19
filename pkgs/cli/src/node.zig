@@ -193,15 +193,11 @@ pub const Node = struct {
                 // Verify state against genesis config
                 if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
                     self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
-                    self.logger.info(
-                        "checkpoint sync state: finalized_slot={d} finalized_root={x} justified_slot={d} justified_root={x}",
-                        .{
-                            self.anchor_state.latest_finalized.slot,
-                            self.anchor_state.latest_finalized.root,
-                            self.anchor_state.latest_justified.slot,
-                            self.anchor_state.latest_justified.root,
-                        },
-                    );
+                    const finalized_json = try self.anchor_state.latest_finalized.toJsonString(allocator);
+                    defer allocator.free(finalized_json);
+                    const justified_json = try self.anchor_state.latest_justified.toJsonString(allocator);
+                    defer allocator.free(justified_json);
+                    self.logger.info("checkpoint sync state: finalized={s} justified={s}", .{ finalized_json, justified_json });
                     checkpoint_sync_succeeded = true;
                 } else |verify_err| {
                     self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
