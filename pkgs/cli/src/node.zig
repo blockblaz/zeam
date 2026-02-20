@@ -245,10 +245,17 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
         });
+        errdefer self.beam_node.deinit();
 
         // Start API and metrics servers
         // Note: api.init() was already called above before beam_node.init()
         if (options.metrics_enable) {
+            // Validate that API and metrics ports are different
+            if (options.api_port == options.metrics_port) {
+                std.log.err("API port and metrics port cannot be the same (both set to {d})", .{options.api_port});
+                return error.PortConflict;
+            }
+
             // Start metrics server (doesn't need chain reference)
             self.metrics_server_handle = try metrics_server.startMetricsServer(
                 allocator,

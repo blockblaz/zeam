@@ -342,6 +342,12 @@ fn mainInner() !void {
             // Create logger config for API and metrics servers
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
+            // Validate that API and metrics ports are different
+            if (beamcmd.@"api-port" == beamcmd.@"metrics-port") {
+                std.log.err("API port and metrics port cannot be the same (both set to {d})", .{beamcmd.@"api-port"});
+                return error.PortConflict;
+            }
+
             // Start metrics server (doesn't need chain reference)
             metrics_server_handle = metrics_server.startMetricsServer(allocator, beamcmd.@"metrics-port", &api_logger_config) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start metrics server", .{ .port = beamcmd.@"metrics-port" });

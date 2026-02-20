@@ -5,6 +5,7 @@ const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const ModuleLogger = utils_lib.ModuleLogger;
 
 const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
+const STARTUP_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 
 /// Simple metrics server that only serves Prometheus metrics at /metrics endpoint.
 /// This is a lightweight server separate from the main API server.
@@ -17,20 +18,42 @@ pub fn startMetricsServer(
     const logger = logger_config.logger(.metrics_server);
 
     const ctx = try allocator.create(MetricsServer);
-    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .port = port,
         .logger = logger,
         .stopped = std.atomic.Value(bool).init(false),
+        .startup_status = std.atomic.Value(StartupStatus).init(.pending),
         .thread = undefined,
     };
 
-    ctx.thread = try std.Thread.spawn(.{}, MetricsServer.run, .{ctx});
+    ctx.thread = std.Thread.spawn(.{}, MetricsServer.run, .{ctx}) catch |err| {
+        allocator.destroy(ctx);
+        return err;
+    };
+
+    // Wait for thread to report startup result (success or failure)
+    while (ctx.startup_status.load(.acquire) == .pending) {
+        std.Thread.sleep(STARTUP_POLL_NS);
+    }
+
+    // Check if startup failed
+    if (ctx.startup_status.load(.acquire) == .failed) {
+        ctx.thread.join();
+        allocator.destroy(ctx);
+        return error.ServerStartupFailed;
+    }
 
     logger.info("Metrics server started on port {d}", .{port});
     return ctx;
 }
+
+/// Startup status for synchronizing server thread initialization
+const StartupStatus = enum(u8) {
+    pending,
+    success,
+    failed,
+};
 
 /// Metrics server context
 pub const MetricsServer = struct {
@@ -38,12 +61,15 @@ pub const MetricsServer = struct {
     port: u16,
     logger: ModuleLogger,
     stopped: std.atomic.Value(bool),
+    startup_status: std.atomic.Value(StartupStatus),
     thread: std.Thread,
 
     const Self = @This();
 
     pub fn stop(self: *Self) void {
-        self.stopped.store(true, .seq_cst);
+        // Use swap to atomically set stopped=true and check if already stopped
+        // This prevents double-stop causing undefined behavior (double join/destroy)
+        if (self.stopped.swap(true, .seq_cst)) return;
         self.thread.join();
         self.allocator.destroy(self);
     }
@@ -51,14 +77,18 @@ pub const MetricsServer = struct {
     fn run(self: *Self) void {
         const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
+            self.startup_status.store(.failed, .release);
             return;
         };
         var server = address.listen(.{ .reuse_address = true, .force_nonblocking = true }) catch |err| {
             self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
+            self.startup_status.store(.failed, .release);
             return;
         };
         defer server.deinit();
 
+        // Signal successful startup to the spawning thread
+        self.startup_status.store(.success, .release);
         self.logger.info("Metrics server listening on http://0.0.0.0:{d}", .{self.port});
 
         while (true) {
