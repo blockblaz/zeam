@@ -47,10 +47,10 @@ pub const ProtoNode = struct {
     pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
         _ = options;
-        try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{s} }}", .{
+        try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{x} }}", .{
             self.slot,
             self.weight,
-            std.fmt.fmtSliceHexLower(&self.blockRoot),
+            &self.blockRoot,
         });
     }
 };
@@ -58,15 +58,14 @@ pub const ProtoNode = struct {
 pub const ProtoArray = struct {
     nodes: std.ArrayList(ProtoNode),
     indices: std.AutoHashMap(types.Root, usize),
+    allocator: Allocator,
 
     const Self = @This();
     pub fn init(allocator: Allocator, anchorBlock: ProtoBlock) !Self {
-        const nodes = std.ArrayList(ProtoNode).init(allocator);
-        const indices = std.AutoHashMap(types.Root, usize).init(allocator);
-
         var proto_array = Self{
-            .nodes = nodes,
-            .indices = indices,
+            .nodes = .empty,
+            .indices = std.AutoHashMap(types.Root, usize).init(allocator),
+            .allocator = allocator,
         };
         try proto_array.onBlock(anchorBlock, anchorBlock.slot);
         return proto_array;
@@ -128,7 +127,7 @@ pub const ProtoArray = struct {
             .latestChild = 0,
             .numChildren = 0,
         };
-        try self.nodes.append(node);
+        try self.nodes.append(self.allocator, node);
         try self.indices.put(node.blockRoot, node_index);
     }
 
@@ -335,7 +334,7 @@ pub const ForkChoice = struct {
             .latest_finalized = anchorCP,
         };
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
-        const deltas = std.ArrayList(isize).init(allocator);
+        const deltas: std.ArrayList(isize) = .empty;
         const gossip_signatures = SignaturesMap.init(allocator);
         const aggregated_payloads = AggregatedPayloadsMap.init(allocator);
 
@@ -424,10 +423,10 @@ pub const ForkChoice = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.protoArray.nodes.deinit();
+        self.protoArray.nodes.deinit(self.protoArray.allocator);
         self.protoArray.indices.deinit();
         self.attestations.deinit();
-        self.deltas.deinit();
+        self.deltas.deinit(self.allocator);
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
@@ -439,7 +438,7 @@ pub const ForkChoice = struct {
             for (entry.value_ptr.items) |*stored| {
                 stored.proof.deinit();
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.aggregated_payloads.deinit();
     }
@@ -545,9 +544,9 @@ pub const ForkChoice = struct {
     /// If canonicalViewOrNull is provided, it reuses an existing canonical view for efficiency.
     // Internal unlocked version - assumes caller holds lock
     fn getCanonicalityAnalysisUnlocked(self: *Self, targetAnchorRoot: types.Root, prevAnchorRootOrNull: ?types.Root, canonicalViewOrNull: ?*std.AutoHashMap(types.Root, void)) ![3][]types.Root {
-        var canonical_roots = std.ArrayList(types.Root).init(self.allocator);
-        var potential_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
-        var non_canonical_roots = std.ArrayList(types.Root).init(self.allocator);
+        var canonical_roots: std.ArrayList(types.Root) = .empty;
+        var potential_canonical_roots: std.ArrayList(types.Root) = .empty;
+        var non_canonical_roots: std.ArrayList(types.Root) = .empty;
 
         // get some info about previous and target anchors
         const prev_anchor_idx = if (prevAnchorRootOrNull) |prevAnchorRoot| (self.protoArray.indices.get(prevAnchorRoot) orelse return ForkChoiceError.InvalidAnchor) else 0;
@@ -568,18 +567,18 @@ pub const ForkChoice = struct {
             const current_node = self.protoArray.nodes.items[current_idx];
             if (canonical_blocks.contains(current_node.blockRoot)) {
                 if (current_node.slot <= target_anchor_slot) {
-                    self.logger.debug("adding confirmed canonical root={s} slot={d} index={d} parent={any}", .{
-                        std.fmt.fmtSliceHexLower(&current_node.blockRoot),
+                    self.logger.debug("adding confirmed canonical root={x} slot={d} index={d} parent={any}", .{
+                        &current_node.blockRoot,
                         current_node.slot,
                         current_idx,
                         current_node.parent,
                     });
-                    _ = try canonical_roots.append(current_node.blockRoot);
+                    try canonical_roots.append(self.allocator, current_node.blockRoot);
                 } else if (current_node.slot > target_anchor_slot) {
-                    _ = try potential_canonical_roots.append(current_node.blockRoot);
+                    try potential_canonical_roots.append(self.allocator, current_node.blockRoot);
                 }
             } else {
-                _ = try non_canonical_roots.append(current_node.blockRoot);
+                try non_canonical_roots.append(self.allocator, current_node.blockRoot);
             }
             if (current_idx == 0) {
                 break;
@@ -590,20 +589,20 @@ pub const ForkChoice = struct {
         // confirm first root in canonical_roots is the new anchor because it should have been pushed first
         if (!std.mem.eql(u8, &canonical_roots.items[0], &targetAnchorRoot)) {
             for (canonical_roots.items, 0..) |root, index| {
-                self.logger.err("canonical root at index={d} {s}", .{
+                self.logger.err("canonical root at index={d} {x}", .{
                     index,
-                    std.fmt.fmtSliceHexLower(&root),
+                    &root,
                 });
             }
-            self.logger.err("targetAnchorRoot is {s}", .{std.fmt.fmtSliceHexLower(&targetAnchorRoot)});
+            self.logger.err("targetAnchorRoot is {x}", .{&targetAnchorRoot});
             return ForkChoiceError.InvalidCanonicalTraversal;
         }
 
         const result = [_]([]types.Root){
-            try canonical_roots.toOwnedSlice(),
+            try canonical_roots.toOwnedSlice(self.allocator),
             //
-            try potential_canonical_roots.toOwnedSlice(),
-            try non_canonical_roots.toOwnedSlice(),
+            try potential_canonical_roots.toOwnedSlice(self.allocator),
+            try non_canonical_roots.toOwnedSlice(self.allocator),
         };
 
         // only way to conditionally deinit locally allocated map created in a orelse block scope
@@ -843,7 +842,7 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
-        var included_attestations = std.ArrayList(types.Attestation).init(self.allocator);
+        var included_attestations: std.ArrayList(types.Attestation) = .empty;
 
         const latest_justified = self.fcStore.latest_justified;
 
@@ -861,11 +860,11 @@ pub const ForkChoice = struct {
                         .data = att_data,
                         .validator_id = @intCast(validator_id),
                     };
-                    try included_attestations.append(attestation);
+                    try included_attestations.append(self.allocator, attestation);
                 }
             }
         }
-        return included_attestations.toOwnedSlice();
+        return included_attestations.toOwnedSlice(self.allocator);
     }
 
     // Internal unlocked version - assumes caller holds lock
@@ -901,7 +900,7 @@ pub const ForkChoice = struct {
     fn computeDeltasUnlocked(self: *Self, from_known: bool) ![]isize {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
-            try self.deltas.append(0);
+            try self.deltas.append(self.allocator, 0);
         }
         for (0..self.deltas.items.len) |i| {
             self.deltas.items[i] = 0;
@@ -1131,9 +1130,9 @@ pub const ForkChoice = struct {
         // Get or create the list for this key
         const gop = try self.aggregated_payloads.getOrPut(sig_key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
+            gop.value_ptr.* = .empty;
         }
-        try gop.value_ptr.append(.{
+        try gop.value_ptr.append(self.allocator, .{
             .slot = attestation_data.slot,
             .proof = proof,
         });
@@ -1145,11 +1144,11 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        var gossip_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
-        defer gossip_keys_to_remove.deinit();
+        var gossip_keys_to_remove: std.ArrayList(SignatureKey) = .empty;
+        defer gossip_keys_to_remove.deinit(self.allocator);
 
-        var payload_keys_to_remove = std.ArrayList(SignatureKey).init(self.allocator);
-        defer payload_keys_to_remove.deinit();
+        var payload_keys_to_remove: std.ArrayList(SignatureKey) = .empty;
+        defer payload_keys_to_remove.deinit(self.allocator);
 
         var gossip_removed: usize = 0;
         var payloads_removed: usize = 0;
@@ -1158,7 +1157,7 @@ pub const ForkChoice = struct {
         var gossip_it = self.gossip_signatures.iterator();
         while (gossip_it.next()) |entry| {
             if (entry.value_ptr.slot <= finalized_slot) {
-                try gossip_keys_to_remove.append(entry.key_ptr.*);
+                try gossip_keys_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
 
@@ -1191,13 +1190,14 @@ pub const ForkChoice = struct {
             }
 
             if (list.items.len == 0) {
-                try payload_keys_to_remove.append(entry.key_ptr.*);
+                try payload_keys_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
 
         for (payload_keys_to_remove.items) |sig_key| {
             if (self.aggregated_payloads.fetchRemove(sig_key)) |kv| {
-                kv.value.deinit();
+                var value = kv.value;
+                value.deinit(self.allocator);
             }
         }
 
@@ -1634,7 +1634,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     // Genesis block A at slot 0
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
     var proto_array = try ProtoArray.init(allocator, anchor_block);
-    defer proto_array.nodes.deinit();
+    defer proto_array.nodes.deinit(proto_array.allocator);
     defer proto_array.indices.deinit();
 
     // Canonical chain with missed slots
@@ -1676,7 +1676,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = std.ArrayList(isize).init(allocator),
+        .deltas = .empty,
         .logger = module_logger,
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
@@ -1684,7 +1684,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .signatures_mutex = std.Thread.Mutex{},
     };
     defer fork_choice.attestations.deinit();
-    defer fork_choice.deltas.deinit();
+    defer fork_choice.deltas.deinit(fork_choice.allocator);
     defer fork_choice.gossip_signatures.deinit();
     defer fork_choice.aggregated_payloads.deinit();
 
@@ -1994,7 +1994,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = std.ArrayList(isize).init(allocator),
+        .deltas = .{},
         .logger = module_logger,
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
@@ -2027,10 +2027,10 @@ const RebaseTestContext = struct {
 
         var test_data = try buildTestTreeWithMockChain(allocator, &mock_chain);
         errdefer allocator.free(test_data.spec_name);
-        errdefer test_data.fork_choice.protoArray.nodes.deinit();
+        errdefer test_data.fork_choice.protoArray.nodes.deinit(test_data.fork_choice.allocator);
         errdefer test_data.fork_choice.protoArray.indices.deinit();
         errdefer test_data.fork_choice.attestations.deinit();
-        errdefer test_data.fork_choice.deltas.deinit();
+        errdefer test_data.fork_choice.deltas.deinit(test_data.fork_choice.allocator);
         errdefer test_data.fork_choice.gossip_signatures.deinit();
         errdefer test_data.fork_choice.aggregated_payloads.deinit();
 
@@ -2044,10 +2044,10 @@ const RebaseTestContext = struct {
 
     pub fn deinit(self: *RebaseTestContext) void {
         // Cleanup fork_choice components
-        self.fork_choice.protoArray.nodes.deinit();
+        self.fork_choice.protoArray.nodes.deinit(self.allocator);
         self.fork_choice.protoArray.indices.deinit();
         self.fork_choice.attestations.deinit();
-        self.fork_choice.deltas.deinit();
+        self.fork_choice.deltas.deinit(self.allocator);
         self.fork_choice.gossip_signatures.deinit();
         // Deinit each list in aggregated_payloads
         var it = self.fork_choice.aggregated_payloads.iterator();
@@ -2055,7 +2055,7 @@ const RebaseTestContext = struct {
             for (entry.value_ptr.items) |*proof| {
                 proof.proof.deinit();
             }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fork_choice.aggregated_payloads.deinit();
         self.allocator.free(self.spec_name);
@@ -2915,7 +2915,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     // Build smaller tree: A -> B -> C -> D
     const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
     var proto_array = try ProtoArray.init(allocator, anchor_block);
-    defer proto_array.nodes.deinit();
+    defer proto_array.nodes.deinit(proto_array.allocator);
     defer proto_array.indices.deinit();
 
     try proto_array.onBlock(createTestProtoBlock(1, 0xBB, 0xAA), 1);
@@ -2942,7 +2942,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(3, 0xDD, 0xCC),
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
-        .deltas = std.ArrayList(isize).init(allocator),
+        .deltas = .empty,
         .logger = module_logger,
         .mutex = Thread.RwLock{},
         .gossip_signatures = SignaturesMap.init(allocator),
@@ -2952,7 +2952,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
     defer fork_choice.attestations.deinit();
-    defer fork_choice.deltas.deinit();
+    defer fork_choice.deltas.deinit(fork_choice.allocator);
     defer fork_choice.gossip_signatures.deinit();
     defer fork_choice.aggregated_payloads.deinit();
 

@@ -5,13 +5,21 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
+pub const std_options: std.Options = .{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .tokenizer, .level = .err },
+        .{ .scope = .parser, .level = .err },
+    },
+};
+
 const types = @import("@zeam/types");
 const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -227,9 +235,8 @@ fn mainInner() !void {
     const app_version = build_options.version;
 
     const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)}) catch {};
-        stderr.print("Run 'zeam --help' for usage information.\n", .{}) catch {};
+        std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
+        std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
@@ -652,14 +659,22 @@ fn mainInner() !void {
                     ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
                     return err;
                 };
+                defer allocator.free(generated_config);
+
                 const cwd = std.fs.cwd();
                 const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
                     return err;
                 };
                 defer config_file.close();
-                config_file.writeAll(generated_config) catch |err| {
+                var write_buf: [4096]u8 = undefined;
+                var writer = config_file.writer(&write_buf);
+                writer.interface.writeAll(generated_config) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
+                    return err;
+                };
+                writer.interface.flush() catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "flush Prometheus config", .{ .filename = genconfig.filename });
                     return err;
                 };
                 std.log.info("Successfully generated Prometheus config: {s}", .{genconfig.filename});
@@ -684,13 +699,13 @@ fn mainInner() !void {
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
                 .api_port = leancmd.@"api-port",
-                .bootnodes = undefined,
+                .bootnodes = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .genesis_spec = undefined,
-                .validator_assignments = undefined,
-                .local_priv_key = undefined,
+                .validator_assignments = &.{}, // Initialize to empty slice to avoid segfault in deinit
+                .local_priv_key = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
-                .hash_sig_key_dir = undefined,
+                .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
             };
 

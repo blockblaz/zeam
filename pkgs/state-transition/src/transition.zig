@@ -75,11 +75,11 @@ pub fn verifySignatures(
     for (attestations, signature_proofs) |aggregated_attestation, signature_proof| {
         // Get validator indices from the attestation's aggregation bits
         var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-        defer validator_indices.deinit();
+        defer validator_indices.deinit(allocator);
 
         // Get validator indices from the signature proof's participants
         var participant_indices = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, allocator);
-        defer participant_indices.deinit();
+        defer participant_indices.deinit(allocator);
 
         // Verify that the participants EXACTLY match the attestation aggregation bits.
         if (validator_indices.items.len != participant_indices.items.len) {
@@ -92,12 +92,14 @@ pub fn verifySignatures(
         }
 
         // Convert validator pubkey bytes to HashSigPublicKey handles
-        var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(allocator, validator_indices.items.len);
-        defer public_keys.deinit();
+        var public_keys: std.ArrayList(*const xmss.HashSigPublicKey) = .empty;
+        try public_keys.ensureTotalCapacity(allocator, validator_indices.items.len);
+        defer public_keys.deinit(allocator);
 
         // Store the PublicKey wrappers so we can free the Rust handles after verification
         // Only used when cache is not provided
-        var pubkey_wrappers = try std.ArrayList(xmss.PublicKey).initCapacity(allocator, validator_indices.items.len);
+        var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+        try pubkey_wrappers.ensureTotalCapacity(allocator, validator_indices.items.len);
         defer {
             // Only free wrappers if we're not using a cache
             // When using cache, the cache owns the handles
@@ -106,7 +108,7 @@ pub fn verifySignatures(
                     wrapper.deinit();
                 }
             }
-            pubkey_wrappers.deinit();
+            pubkey_wrappers.deinit(allocator);
         }
 
         for (validator_indices.items) |validator_index| {
@@ -121,14 +123,14 @@ pub fn verifySignatures(
                 const pk_handle = cache.getOrPut(validator_index, pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
-                try public_keys.append(pk_handle);
+                try public_keys.append(allocator, pk_handle);
             } else {
                 // No cache - deserialize each time (legacy behavior)
                 const pubkey = xmss.PublicKey.fromBytes(pubkey_bytes) catch {
                     return StateTransitionError.InvalidBlockSignatures;
                 };
-                try public_keys.append(pubkey.handle);
-                try pubkey_wrappers.append(pubkey);
+                try public_keys.append(allocator, pubkey.handle);
+                try pubkey_wrappers.append(allocator, pubkey);
             }
         }
 
@@ -211,7 +213,7 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
         if (!std.mem.eql(u8, &state_root, &block.state_root)) {
-            opts.logger.debug("state root={x:02} block root={x:02}\n", .{ state_root, block.state_root });
+            opts.logger.debug("state root={x} block root={x}\n", .{ &state_root, &block.state_root });
             return StateTransitionError.InvalidPostState;
         }
     }

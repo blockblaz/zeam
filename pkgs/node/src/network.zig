@@ -104,12 +104,12 @@ pub const Network = struct {
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
             .fetched_block_children = fetched_block_children,
-            .timed_out_requests = std.ArrayList(u64).init(allocator),
+            .timed_out_requests = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.timed_out_requests.deinit();
+        self.timed_out_requests.deinit(self.allocator);
 
         var rpc_it = self.pending_rpc_requests.iterator();
         while (rpc_it.next()) |entry| {
@@ -129,7 +129,7 @@ pub const Network = struct {
 
         var children_it = self.fetched_block_children.iterator();
         while (children_it.next()) |entry| {
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fetched_block_children.deinit();
 
@@ -245,8 +245,8 @@ pub const Network = struct {
 
             // Finalize all pending RPC requests for this peer
             var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove = std.ArrayList(u64).init(self.allocator);
-            defer request_ids_to_remove.deinit();
+            var request_ids_to_remove: std.ArrayList(u64) = .empty;
+            defer request_ids_to_remove.deinit(self.allocator);
 
             while (rpc_it.next()) |rpc_entry| {
                 const pending_peer_id = switch (rpc_entry.value_ptr.request) {
@@ -255,7 +255,7 @@ pub const Network = struct {
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
                     // If we can't allocate, skip this request (should be rare)
-                    request_ids_to_remove.append(rpc_entry.key_ptr.*) catch continue;
+                    request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
                 }
             }
 
@@ -323,13 +323,13 @@ pub const Network = struct {
 
         const created_new_entry = !gop.found_existing;
         if (created_new_entry) {
-            gop.value_ptr.* = std.ArrayList(types.Root).init(self.allocator);
+            gop.value_ptr.* = .empty;
         }
         errdefer if (created_new_entry) {
-            gop.value_ptr.deinit();
+            gop.value_ptr.deinit(self.allocator);
             _ = self.fetched_block_children.remove(parent_root);
         };
-        try gop.value_ptr.append(root);
+        try gop.value_ptr.append(self.allocator, root);
     }
 
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
@@ -348,7 +348,7 @@ pub const Network = struct {
                 }
                 // Clean up the parent entry if no children remain
                 if (children_list.items.len == 0) {
-                    children_list.deinit();
+                    children_list.deinit(self.allocator);
                     _ = self.fetched_block_children.remove(parent_root);
                 }
             }
@@ -555,11 +555,11 @@ pub const Network = struct {
     }
 
     pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
-        self.timed_out_requests.clearRetainingCapacity();
+        self.timed_out_requests.clearAndFree(self.allocator);
         var it = self.pending_rpc_requests.iterator();
         while (it.next()) |entry| {
             if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
-                try self.timed_out_requests.append(entry.key_ptr.*);
+                try self.timed_out_requests.append(self.allocator, entry.key_ptr.*);
             }
         }
         return self.timed_out_requests.items;

@@ -174,15 +174,15 @@ pub const NodeTestContext = struct {
             errdefer signature_proof.deinit();
 
             var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-            defer indices.deinit();
+            defer indices.deinit(allocator);
 
             // Collect signature handles for aggregation
-            var signature_handles = std.ArrayList(xmss.Signature).init(allocator);
+            var signature_handles: std.ArrayList(xmss.Signature) = .empty;
             defer {
                 for (signature_handles.items) |*sig| {
                     sig.deinit();
                 }
-                signature_handles.deinit();
+                signature_handles.deinit(allocator);
             }
 
             // Sign attestation for each validator and set participant bits
@@ -197,7 +197,7 @@ pub const NodeTestContext = struct {
 
                 // Sign and keep the handle for aggregation
                 const sig = try self.key_manager.signAttestationWithHandle(&attestation, allocator);
-                try signature_handles.append(sig);
+                try signature_handles.append(allocator, sig);
             }
 
             // Perform actual aggregation if we have signatures

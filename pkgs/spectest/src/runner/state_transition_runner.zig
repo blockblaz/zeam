@@ -263,12 +263,12 @@ fn runCase(
             };
             if (!std.mem.eql(u8, &header_root, &block.parent_root)) {
                 std.debug.print(
-                    "fixture {s} case {s}: parent root mismatch (expected=0x{s} got=0x{s})\n",
+                    "fixture {s} case {s}: parent root mismatch (expected=0x{x} got=0x{x})\n",
                     .{
                         ctx.fixture_label,
                         ctx.case_name,
-                        std.fmt.fmtSliceHexLower(&header_root),
-                        std.fmt.fmtSliceHexLower(&block.parent_root),
+                        &header_root,
+                        &block.parent_root,
                     },
                 );
                 return FixtureError.UnsupportedFixture;

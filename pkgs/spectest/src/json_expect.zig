@@ -47,7 +47,7 @@ pub fn expectObject(
 ) FixtureError!std.json.ObjectMap {
     const value = getField(obj, field_names) orelse {
         std.debug.print(
-            "fixture {s} case {s}{}: missing field {s}\n",
+            "fixture {s} case {s}{any}: missing field {s}\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -56,7 +56,7 @@ pub fn expectObject(
         .object => |map| map,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be object\n",
+                "fixture {s} case {s}{any}: field {s} must be object\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -73,7 +73,7 @@ pub fn expectStringField(
 ) FixtureError![]const u8 {
     const value = getField(obj, field_names) orelse {
         std.debug.print(
-            "fixture {s} case {s}{}: missing field {s}\n",
+            "fixture {s} case {s}{any}: missing field {s}\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -90,7 +90,7 @@ pub fn expectU64Field(
 ) FixtureError!u64 {
     const value = getField(obj, field_names) orelse {
         std.debug.print(
-            "fixture {s} case {s}{}: missing field {s}\n",
+            "fixture {s} case {s}{any}: missing field {s}\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -108,7 +108,7 @@ pub fn expectBytesField(
 ) FixtureError!T {
     const value = getField(obj, field_names) orelse {
         std.debug.print(
-            "fixture {s} case {s}{}: missing hex field {s}\n",
+            "fixture {s} case {s}{any}: missing hex field {s}\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -126,7 +126,7 @@ pub fn expectStringValue(
         .string => |s| s,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be string\n",
+                "fixture {s} case {s}{any}: field {s} must be string\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -143,21 +143,21 @@ pub fn expectU64Value(
     return switch (value) {
         .integer => |i| if (i >= 0) @as(u64, @intCast(i)) else blk: {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} negative\n",
+                "fixture {s} case {s}{any}: field {s} negative\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             break :blk FixtureError.InvalidFixture;
         },
         .float => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be integer\n",
+                "fixture {s} case {s}{any}: field {s} must be integer\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
         },
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be numeric\n",
+                "fixture {s} case {s}{any}: field {s} must be numeric\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -182,7 +182,7 @@ pub fn expectBytesValue(
     const text = try expectStringValue(FixtureError, value, context, label);
     if (text.len < 2 or !std.mem.eql(u8, text[0..2], "0x")) {
         std.debug.print(
-            "fixture {s} case {s}{}: field {s} missing 0x prefix\n",
+            "fixture {s} case {s}{any}: field {s} missing 0x prefix\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -192,7 +192,7 @@ pub fn expectBytesValue(
     const expected_len = comptime (@typeInfo(T).array.len * 2);
     if (body.len != expected_len) {
         std.debug.print(
-            "fixture {s} case {s}{}: field {s} wrong length\n",
+            "fixture {s} case {s}{any}: field {s} wrong length\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -201,7 +201,7 @@ pub fn expectBytesValue(
     var out: T = undefined;
     _ = std.fmt.hexToBytes(&out, body) catch {
         std.debug.print(
-            "fixture {s} case {s}{}: field {s} invalid hex\n",
+            "fixture {s} case {s}{any}: field {s} invalid hex\n",
             .{ context.fixture_label, context.case_name, context.formatStep(), label },
         );
         return FixtureError.InvalidFixture;
@@ -219,7 +219,7 @@ pub fn expectObjectValue(
         .object => |map| map,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be object\n",
+                "fixture {s} case {s}{any}: field {s} must be object\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -237,7 +237,7 @@ pub fn expectArrayValue(
         .array => |arr| arr,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: field {s} must be array\n",
+                "fixture {s} case {s}{any}: field {s} must be array\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -259,7 +259,7 @@ pub fn appendBytesDataField(
         .array => |array| array,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: {s}.data must be array\n",
+                "fixture {s} case {s}{any}: {s}.data must be array\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -270,7 +270,7 @@ pub fn appendBytesDataField(
         const value = try expectBytesValue(FixtureError, T, item, context, label);
         list.append(value) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: {s} append failed: {s}\n",
+                "fixture {s} case {s}{any}: {s} append failed: {s}\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label, @errorName(err) },
             );
             return FixtureError.InvalidFixture;
@@ -291,7 +291,7 @@ pub fn appendBoolDataField(
         .array => |array| array,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{}: {s}.data must be array\n",
+                "fixture {s} case {s}{any}: {s}.data must be array\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label },
             );
             return FixtureError.InvalidFixture;
@@ -304,7 +304,7 @@ pub fn appendBoolDataField(
             .integer => |ival| ival != 0,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{}: {s} entries must be bool/int\n",
+                    "fixture {s} case {s}{any}: {s} entries must be bool/int\n",
                     .{ context.fixture_label, context.case_name, context.formatStep(), label },
                 );
                 return FixtureError.InvalidFixture;
@@ -312,7 +312,7 @@ pub fn appendBoolDataField(
         };
         list.append(flag) catch |err| {
             std.debug.print(
-                "fixture {s} case {s}{}: {s} append failed: {s}\n",
+                "fixture {s} case {s}{any}: {s} append failed: {s}\n",
                 .{ context.fixture_label, context.case_name, context.formatStep(), label, @errorName(err) },
             );
             return FixtureError.InvalidFixture;

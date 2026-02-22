@@ -155,12 +155,12 @@ pub fn aggregationBitsSet(bits: *AggregationBits, index: usize, value: bool) !vo
 }
 
 pub fn aggregationBitsToValidatorIndices(bits: *const AggregationBits, allocator: Allocator) !std.ArrayList(usize) {
-    var indices = std.ArrayList(usize).init(allocator);
-    errdefer indices.deinit();
+    var indices: std.ArrayList(usize) = .empty;
+    errdefer indices.deinit(allocator);
 
     for (0..bits.len()) |validator_index| {
         if (try bits.get(validator_index)) {
-            try indices.append(validator_index);
+            try indices.append(allocator, validator_index);
         }
     }
 
@@ -179,9 +179,9 @@ test "encode decode signed attestation roundtrip" {
         .signature = ZERO_SIGBYTES,
     };
 
-    var encoded = std.ArrayList(u8).init(std.testing.allocator);
-    defer encoded.deinit();
-    try ssz.serialize(SignedAttestation, signed_attestation, &encoded);
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try ssz.serialize(SignedAttestation, signed_attestation, &encoded, std.testing.allocator);
     try std.testing.expect(encoded.items.len > 0);
 
     // Convert to hex and compare with expected value.
@@ -191,7 +191,7 @@ test "encode decode signed attestation roundtrip" {
     defer std.testing.allocator.free(expected_value);
     @memset(expected_value, '0');
 
-    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{std.fmt.fmtSliceHexLower(encoded.items)});
+    const encoded_hex = try std.fmt.allocPrint(std.testing.allocator, "{x}", .{encoded.items});
     defer std.testing.allocator.free(encoded_hex);
     try std.testing.expectEqualStrings(expected_value, encoded_hex);
 

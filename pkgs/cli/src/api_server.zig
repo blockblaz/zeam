@@ -61,8 +61,21 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
 }
 
 fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, ctx: *ApiServer) void {
-    var buffer: [4096]u8 = undefined;
-    var http_server = std.http.Server.init(connection, &buffer);
+    const read_buffer = allocator.alloc(u8, 4096) catch {
+        ctx.logger.err("failed to allocate read buffer", .{});
+        return;
+    };
+    defer allocator.free(read_buffer);
+    const write_buffer = allocator.alloc(u8, 4096) catch {
+        ctx.logger.err("failed to allocate write buffer", .{});
+        return;
+    };
+    defer allocator.free(write_buffer);
+
+    var stream_reader = connection.stream.reader(read_buffer);
+    var stream_writer = connection.stream.writer(write_buffer);
+
+    var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
     var request = http_server.receiveHead() catch |err| {
         ctx.logger.warn("failed to receive HTTP head: {}", .{err});
         connection.stream.close();
@@ -87,7 +100,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         const request_allocator = arena.allocator();
 
         if (std.mem.eql(u8, request.head.target, "/metrics")) {
-            ctx.handleMetrics(&request, request_allocator);
+            ctx.handleMetrics(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             ctx.handleHealth(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
@@ -170,7 +183,7 @@ pub const ApiServer = struct {
             if (self.stopped.load(.acquire)) break;
             const connection = server.accept() catch |err| {
                 if (err == error.WouldBlock) {
-                    std.time.sleep(ACCEPT_POLL_NS);
+                    std.Thread.sleep(ACCEPT_POLL_NS);
                     continue;
                 }
                 self.logger.warn("failed to accept connection: {}", .{err});
@@ -186,21 +199,24 @@ pub const ApiServer = struct {
             defer self.sse_mutex.unlock();
             break :blk self.sse_active != 0;
         }) {
-            std.time.sleep(ACCEPT_POLL_NS);
+            std.Thread.sleep(ACCEPT_POLL_NS);
         }
     }
 
     /// Handle metrics endpoint
-    fn handleMetrics(_: *const Self, request: *std.http.Server.Request, allocator: std.mem.Allocator) void {
-        var metrics_output = std.ArrayList(u8).init(allocator);
-        defer metrics_output.deinit();
+    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
+        var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer allocating_writer.deinit();
 
-        api.writeMetrics(metrics_output.writer()) catch {
+        api.writeMetrics(&allocating_writer.writer) catch {
             _ = request.respond("Internal Server Error\n", .{}) catch {};
             return;
         };
 
-        _ = request.respond(metrics_output.items, .{
+        // Get the written data from the allocating writer
+        const written_data = allocating_writer.writer.buffer[0..allocating_writer.writer.end];
+
+        _ = request.respond(written_data, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
             },
@@ -233,10 +249,10 @@ pub const ApiServer = struct {
         };
 
         // Serialize lean state (BeamState) to SSZ
-        var ssz_output = std.ArrayList(u8).init(self.allocator);
-        defer ssz_output.deinit();
+        var ssz_output: std.ArrayList(u8) = .empty;
+        defer ssz_output.deinit(self.allocator);
 
-        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output) catch |err| {
+        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output, self.allocator) catch |err| {
             self.logger.err("failed to serialize finalized lean state to SSZ: {}", .{err});
             _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
             return;
@@ -303,12 +319,17 @@ pub const ApiServer = struct {
             "Access-Control-Allow-Headers: Cache-Control\r\n" ++
             "\r\n";
 
+        var write_buf: [4096]u8 = undefined;
+        var stream_writer = stream.writer(&write_buf);
+
         // Send initial response with SSE headers
-        try stream.writeAll(sse_headers);
+        try stream_writer.interface.writeAll(sse_headers);
+        try stream_writer.interface.flush();
 
         // Send initial connection event
         const connection_event = "event: connection\ndata: {\"status\":\"connected\"}\n\n";
-        try stream.writeAll(connection_event);
+        try stream_writer.interface.writeAll(connection_event);
+        try stream_writer.interface.flush();
 
         // Register this connection with the global event broadcaster
         const connection = try event_broadcaster.addGlobalConnection(stream);
@@ -326,7 +347,7 @@ pub const ApiServer = struct {
             };
 
             // Wait between SSE heartbeats
-            std.time.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
+            std.Thread.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
         }
     }
 
@@ -386,10 +407,10 @@ fn handleForkChoiceGraph(
 
     if (max_slots > MAX_ALLOWED_SLOTS) max_slots = MAX_ALLOWED_SLOTS;
 
-    var graph_json = std.ArrayList(u8).init(allocator);
-    defer graph_json.deinit();
+    var graph_json: std.ArrayList(u8) = .empty;
+    defer graph_json.deinit(allocator);
 
-    try node_lib.tree_visualizer.buildForkChoiceGraphJSON(&chain.forkChoice, graph_json.writer(), max_slots, allocator);
+    try node_lib.tree_visualizer.buildForkChoiceGraphJSON(&chain.forkChoice, &graph_json, max_slots, allocator);
 
     _ = request.respond(graph_json.items, .{
         .extra_headers = &.{
@@ -462,13 +483,13 @@ const RateLimiter = struct {
     }
 
     fn evictStale(self: *RateLimiter, now: u64) void {
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (now - entry.value_ptr.last_refill_ns > RATE_LIMIT_STALE_NS) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

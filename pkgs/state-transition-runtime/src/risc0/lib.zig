@@ -124,7 +124,7 @@ pub fn get_allocator() std.mem.Allocator {
         const mem_end: [*]u8 = @ptrFromInt(0xC000000);
         const mem_size: usize = @intFromPtr(mem_end) - @intFromPtr(mem_start);
         const mem_area: []u8 = mem_start[0..mem_size];
-        asm volatile ("" ::: "memory");
+        asm volatile ("" ::: .{ .memory = true });
 
         fixed_allocator = std.heap.FixedBufferAllocator.init(mem_area);
         fixed_allocator_initialized = true;
