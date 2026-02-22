@@ -890,6 +890,16 @@ pub const ForkChoice = struct {
             return self.fcStore.latest_justified;
         }
 
+        // Ensure target is not behind the justified source checkpoint
+        // This prevents creating invalid attestations where target slot is behind the justified source slot
+        // This can happen when the updateHeadUnlocked is not yet called for the new block
+        // and the target is calculated before the head is updated
+        // OnBlock calls update the latest_justified and attestation occurs on interval before the head is updated
+        const justified = self.fcStore.latest_justified;
+        if (nodes[target_idx].slot < justified.slot) {
+            return justified;
+        }
+
         return types.Checkpoint{
             .root = nodes[target_idx].blockRoot,
             .slot = nodes[target_idx].slot,

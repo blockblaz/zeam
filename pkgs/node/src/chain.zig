@@ -418,7 +418,10 @@ pub const BeamChain = struct {
             }
         };
 
-        // 4. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
+        try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+
+        // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
         //   them in the forkchoice
         _ = try self.forkChoice.onBlock(block, post_state, .{
@@ -827,7 +830,7 @@ pub const BeamChain = struct {
         // 9. Asap emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified.slot) {
-            if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot)) |just_event| {
+            if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.module_logger.warn("failed to broadcast justification event: {any}", .{err});
@@ -842,7 +845,7 @@ pub const BeamChain = struct {
         // Emit finalization event only when slot increases beyond last emitted
         const last_emitted_finalized = self.last_emitted_finalized;
         if (latest_finalized.slot > last_emitted_finalized.slot) {
-            if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot)) |final_event| {
+            if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.module_logger.warn("failed to broadcast finalization event: {any}", .{err});

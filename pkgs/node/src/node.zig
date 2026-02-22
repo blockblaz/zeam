@@ -996,27 +996,16 @@ pub const BeamNode = struct {
     pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         const block = signed_block.message.block;
 
-        // 1. Process locally through chain so that produced block first can be confirmed
+        // 1. Process locally through chain so the produced block is confirmed and persisted.
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
-        // check if the block has not already been received through the network
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
-        if (!hasBlock) {
-            self.logger.info("adding produced signed block to the chain: slot={d} proposer={d}", .{
+        if (hasBlock) {
+            self.logger.debug("produced block already present in forkchoice, finalizing chain persistence: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
-
-            const missing_roots = try self.chain.onBlock(signed_block, .{
-                .postState = self.chain.states.get(block_root),
-                .blockRoot = block_root,
-            });
-            defer self.allocator.free(missing_roots);
-
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
-            };
         } else {
             self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
                 block.slot,
@@ -1024,7 +1013,21 @@ pub const BeamNode = struct {
             });
         }
 
-        // 2. publish gossip message
+        // 2. Fetch missing blocks from the network to complete the chain.
+        // many blocks arrive with attestations pointing to heads the node hasn't processed yet,
+        // those attestations all get dropped, safeTarget stays stuck, and no progress is made.
+        // so we need to fetch the missing blocks to complete the chain.
+        const missing_roots = try self.chain.onBlock(signed_block, .{
+            .postState = self.chain.states.get(block_root),
+            .blockRoot = block_root,
+        });
+        defer self.allocator.free(missing_roots);
+
+        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+        };
+
+        // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.network.publish(&gossip_msg);
         self.logger.info("published block to network: slot={d} proposer={d}{any}", .{
@@ -1033,7 +1036,7 @@ pub const BeamNode = struct {
             self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
         });
 
-        // 3. followup with additional housekeeping tasks
+        // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
     }
 
@@ -1824,4 +1827,79 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
 
     // The parent entry should be fully cleaned up from the children map
     try std.testing.expect(node.network.fetched_block_children.get(parent_root) == null);
+}
+
+test "Node: publishBlock persists locally produced blocks for blocks-by-root sync" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var validator_ids = [_]usize{0};
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = &validator_ids,
+        .key_manager = &ctx.key_manager,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const slot: usize = 4;
+    const produced_block = try node.chain.produceBlock(.{
+        .slot = slot,
+        .proposer_index = validator_ids[0],
+    });
+    const produced_root = produced_block.blockRoot;
+
+    const proposer_attestation_data = try node.chain.constructAttestationData(.{ .slot = slot });
+    const proposer_attestation = types.Attestation{
+        .validator_id = validator_ids[0],
+        .data = proposer_attestation_data,
+    };
+    const proposer_signature = try ctx.key_manager.signAttestation(&proposer_attestation, allocator);
+
+    var signed_block = types.SignedBlockWithAttestation{
+        .message = .{
+            .block = produced_block.block,
+            .proposer_attestation = proposer_attestation,
+        },
+        .signature = .{
+            .attestation_signatures = produced_block.attestation_signatures,
+            .proposer_signature = proposer_signature,
+        },
+    };
+    defer signed_block.deinit();
+
+    try node.publishBlock(signed_block);
+
+    const stored_block_opt = node.chain.db.loadBlock(database.DbBlocksNamespace, produced_root);
+    try std.testing.expect(stored_block_opt != null);
+
+    if (stored_block_opt) |stored_block_value| {
+        var stored_block = stored_block_value;
+        defer stored_block.deinit();
+        try std.testing.expectEqual(@as(usize, slot), stored_block.message.block.slot);
+        try std.testing.expect(std.mem.eql(u8, &stored_block.message.block.parent_root, &signed_block.message.block.parent_root));
+    }
 }
