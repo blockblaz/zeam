@@ -143,13 +143,13 @@ pub const RootToSlotCache = struct {
 
     /// Remove all entries with slot <= finalized_slot.
     pub fn prune(self: *Self, finalized_slot: Slot) !void {
-        var keys_to_remove = std.ArrayList(Root).init(self.allocator);
-        defer keys_to_remove.deinit();
+        var keys_to_remove: std.ArrayList(Root) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.* <= finalized_slot) {
-                try keys_to_remove.append(entry.key_ptr.*);
+                try keys_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
 

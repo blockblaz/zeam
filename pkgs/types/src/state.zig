@@ -183,24 +183,6 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
-    fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot)) !void {
-        const start_slot: usize = @intCast(finalized_slot + 1);
-        const historical_len_usize: usize = self.historical_block_hashes.len();
-        for (start_slot..historical_len_usize) |i| {
-            const root = try self.historical_block_hashes.get(i);
-            if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
-            const slot_i: Slot = @intCast(i);
-
-            if (root_to_slot.getPtr(root)) |slot_ptr| {
-                if (slot_i > slot_ptr.*) {
-                    slot_ptr.* = slot_i;
-                }
-            } else {
-                try root_to_slot.put(allocator, root, slot_i);
-            }
-        }
-    }
-
     pub fn initRootToSlotCache(self: *const Self, cache: *utils.RootToSlotCache) !void {
         const start_slot: usize = @intCast(self.latest_finalized.slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
@@ -291,7 +273,7 @@ pub const BeamState = struct {
         }
     }
 
-    pub fn process_block_header(self: *Self, allocator: Allocator, staged_block: block.BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
+    pub fn process_block_header(self: *Self, allocator: Allocator, staged_block: block.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
         logger.debug("processing beam block header\n", .{});
 
         // 1. match state and block slot
@@ -331,9 +313,6 @@ pub const BeamState = struct {
 
         // extend historical block hashes structure using SSZ Lists directly
         try self.historical_block_hashes.append(staged_block.parent_root);
-        if (cache) |c| {
-            try c.put(staged_block.parent_root, self.latest_block_header.slot);
-        }
 
         const block_slot: usize = @intCast(staged_block.slot);
         const missed_slots: usize = @intCast(block_slot - self.latest_block_header.slot - 1);
@@ -353,7 +332,7 @@ pub const BeamState = struct {
         defer _ = block_timer.observe();
 
         // start block processing
-        try self.process_block_header(allocator, staged_block, logger, cache);
+        try self.process_block_header(allocator, staged_block, logger);
 
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
@@ -398,11 +377,12 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
-        // Use the global cache directly if provided, otherwise build a local map.
-        var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
-        defer root_to_slot.deinit(allocator);
-        if (cache == null) {
-            try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot);
+        // Use the global cache directly if provided, otherwise build a local cache.
+        var owned_cache: ?utils.RootToSlotCache = if (cache == null) utils.RootToSlotCache.init(allocator) else null;
+        defer if (owned_cache) |*oc| oc.deinit();
+        const block_cache = cache orelse &(owned_cache.?);
+        if (owned_cache != null) {
+            try self.initRootToSlotCache(block_cache);
         }
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
@@ -535,10 +515,9 @@ pub const BeamState = struct {
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
                             const root = entry.key_ptr.*;
-                            const slot_value = if (cache) |c| c.get(root) else root_to_slot.get(root);
-                            const slot = slot_value orelse return StateTransitionError.InvalidJustificationRoot;
+                            const slot = block_cache.get(root) orelse return StateTransitionError.InvalidJustificationRoot;
                             if (slot <= finalized_slot) {
-                                try roots_to_remove.append(root);
+                                try roots_to_remove.append(allocator, root);
                             }
                         }
                         for (roots_to_remove.items) |root| {
@@ -832,14 +811,14 @@ test "justified_slots do not include finalized boundary" {
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
-    try state.process_block_header(std.testing.allocator, block_1, logger, null);
+    try state.process_block_header(std.testing.allocator, block_1, logger);
 
     try std.testing.expectEqual(@as(usize, 0), state.justified_slots.len());
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_2.deinit();
-    try state.process_block_header(std.testing.allocator, block_2, logger, null);
+    try state.process_block_header(std.testing.allocator, block_2, logger);
 
     try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
     try std.testing.expectEqual(false, try state.justified_slots.get(0));
@@ -960,7 +939,7 @@ test "pruning keeps pending justifications" {
     try state.process_slots(std.testing.allocator, 5, logger);
     var block_5 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_5.deinit();
-    try state.process_block_header(std.testing.allocator, block_5, logger, null);
+    try state.process_block_header(std.testing.allocator, block_5, logger);
 
     // Phase 3: Seed a pending justification.
     const slot_3_root = try state.historical_block_hashes.get(3);
@@ -1027,10 +1006,16 @@ test "root_to_slot_cache lifecycle" {
     var cache = utils.RootToSlotCache.init(std.testing.allocator);
     defer cache.deinit();
 
+    // Initialize cache from genesis state (simulates chain init).
+    try state.initRootToSlotCache(&cache);
+
     // Phase 1: Build chain and justify slot 1.
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
+
+    // Simulate chain.zig adding parent to cache before STF.
+    try cache.put(block_1.parent_root, 0);
     try state.process_block(std.testing.allocator, block_1, logger, &cache);
 
     // After block 1: cache should have the genesis root at slot 0.
@@ -1054,6 +1039,9 @@ test "root_to_slot_cache lifecycle" {
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
     att_0_to_1_transferred = true;
     defer block_2.deinit();
+
+    // Simulate chain.zig adding parent to cache before STF.
+    try cache.put(block_2_parent_root, 1);
     try state.process_block(std.testing.allocator, block_2, logger, &cache);
 
     // After block 2: cache should have grown (genesis root + block 1 root).
@@ -1064,17 +1052,27 @@ test "root_to_slot_cache lifecycle" {
     try state.process_slots(std.testing.allocator, 3, logger);
     var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_3.deinit();
+
+    // Get block_3's parent_root for cache population.
+    var block_3_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_3_parent_root, std.testing.allocator);
+    try cache.put(block_3_parent_root, 2);
     try state.process_block(std.testing.allocator, block_3, logger, &cache);
 
     try state.process_slots(std.testing.allocator, 4, logger);
     var block_4 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_4.deinit();
+
+    // Get block_4's parent_root for cache population.
+    var block_4_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_4_parent_root, std.testing.allocator);
+    try cache.put(block_4_parent_root, 3);
     try state.process_block(std.testing.allocator, block_4, logger, &cache);
 
     try state.process_slots(std.testing.allocator, 5, logger);
     var block_5 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_5.deinit();
-    try state.process_block_header(std.testing.allocator, block_5, logger, &cache);
+    try state.process_block_header(std.testing.allocator, block_5, logger);
 
     // Phase 3: Seed a pending justification at slot 3.
     const slot_3_root = try state.historical_block_hashes.get(3);

@@ -675,6 +675,11 @@ pub const BeamChain = struct {
             break :computedroot cblock_root;
         };
 
+        // Add parent block to root-to-slot cache BEFORE STF (needed for attestation processing)
+        if (self.forkChoice.getBlock(block.parent_root)) |parent_block| {
+            try self.root_to_slot_cache.put(block.parent_root, parent_block.slot);
+        }
+
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
