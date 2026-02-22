@@ -419,6 +419,8 @@ pub fn build(b: *Builder) !void {
     tools_cli_exe.root_module.addImport("enr", enr);
     tools_cli_exe.root_module.addImport("build_options", build_options_module);
     tools_cli_exe.root_module.addImport("simargs", simargs);
+    tools_cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    tools_cli_exe.root_module.addImport("@zeam/types", zeam_types);
 
     const install_tools_cli = b.addInstallArtifact(tools_cli_exe, .{});
     tools_step.dependOn(&install_tools_cli.step);
@@ -598,6 +600,8 @@ pub fn build(b: *Builder) !void {
         .root_module = tools_cli_exe.root_module,
     });
     tools_cli_tests.root_module.addImport("enr", enr);
+    tools_cli_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
+    tools_cli_tests.root_module.addImport("@zeam/types", zeam_types);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
     setTestRunLabelFromCompile(b, run_tools_cli_test, tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);

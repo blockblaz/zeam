@@ -162,11 +162,80 @@ pub const KeyManager = struct {
     }
 };
 
+/// Maximum size of a serialized XMSS private key (20MB).
+const MAX_SK_SIZE = 1024 * 1024 * 20;
+
+/// Maximum size of a serialized XMSS public key (256 bytes).
+const MAX_PK_SIZE = 256;
+
+/// Try to load pre-generated test keys from the test-keys submodule.
+///
+/// Keys are stored as SSZ-encoded files at test-keys/hash-sig-keys/validator_{i}_sk.ssz
+/// and validator_{i}_pk.ssz. Loading from disk is near-instant compared to generating
+/// XMSS keys at runtime (which takes minutes for 32 validators).
+fn loadPreGeneratedKeys(
+    allocator: Allocator,
+    num_validators: usize,
+) !KeyManager {
+    var key_manager = KeyManager.init(allocator);
+    errdefer key_manager.deinit();
+
+    for (0..num_validators) |i| {
+        // Build file paths
+        var sk_path_buf: [256]u8 = undefined;
+        const sk_path = std.fmt.bufPrint(&sk_path_buf, "test-keys/hash-sig-keys/validator_{d}_sk.ssz", .{i}) catch unreachable;
+
+        var pk_path_buf: [256]u8 = undefined;
+        const pk_path = std.fmt.bufPrint(&pk_path_buf, "test-keys/hash-sig-keys/validator_{d}_pk.ssz", .{i}) catch unreachable;
+
+        // Read private key
+        var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch {
+            return error.KeyGenerationFailed;
+        };
+        defer sk_file.close();
+        const sk_data = sk_file.readToEndAlloc(allocator, MAX_SK_SIZE) catch {
+            return error.KeyGenerationFailed;
+        };
+        defer allocator.free(sk_data);
+
+        // Read public key
+        var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch {
+            return error.KeyGenerationFailed;
+        };
+        defer pk_file.close();
+        const pk_data = pk_file.readToEndAlloc(allocator, MAX_PK_SIZE) catch {
+            return error.KeyGenerationFailed;
+        };
+        defer allocator.free(pk_data);
+
+        // Reconstruct keypair from SSZ
+        var keypair = xmss.KeyPair.fromSsz(allocator, sk_data, pk_data) catch {
+            return error.KeyGenerationFailed;
+        };
+        errdefer keypair.deinit();
+
+        try key_manager.addKeypair(i, keypair);
+    }
+
+    std.debug.print("Loaded {d} pre-generated test keys from test-keys/\n", .{num_validators});
+    return key_manager;
+}
+
 pub fn getTestKeyManager(
     allocator: Allocator,
     num_validators: usize,
     max_slot: usize,
 ) !KeyManager {
+    // Try loading pre-generated keys first (fast path).
+    // Falls back to runtime generation if files don't exist.
+    if (num_validators <= 32) {
+        if (loadPreGeneratedKeys(allocator, num_validators)) |km| {
+            return km;
+        } else |_| {
+            std.debug.print("Pre-generated keys not found, falling back to runtime generation\n", .{});
+        }
+    }
+
     var key_manager = KeyManager.init(allocator);
     key_manager.owns_keypairs = false;
     errdefer key_manager.deinit();
