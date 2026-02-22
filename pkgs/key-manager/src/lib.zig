@@ -168,57 +168,58 @@ const MAX_SK_SIZE = 1024 * 1024 * 20;
 /// Maximum size of a serialized XMSS public key (256 bytes).
 const MAX_PK_SIZE = 256;
 
-/// Try to load pre-generated test keys from the test-keys submodule.
-///
-/// Keys are stored as SSZ-encoded files at test-keys/hash-sig-keys/validator_{i}_sk.ssz
-/// and validator_{i}_pk.ssz. Loading from disk is near-instant compared to generating
-/// XMSS keys at runtime (which takes minutes for 32 validators).
-fn loadPreGeneratedKeys(
-    allocator: Allocator,
-    num_validators: usize,
-) !KeyManager {
-    var key_manager = KeyManager.init(allocator);
-    errdefer key_manager.deinit();
+/// Number of pre-generated test keys available in the test-keys submodule.
+const NUM_PREGENERATED_KEYS: usize = 32;
 
-    for (0..num_validators) |i| {
-        // Build file paths
-        var sk_path_buf: [256]u8 = undefined;
-        const sk_path = std.fmt.bufPrint(&sk_path_buf, "test-keys/hash-sig-keys/validator_{d}_sk.ssz", .{i}) catch unreachable;
+/// Known paths to search for the test-keys directory.
+/// Zig test runners may execute from subdirectories, so we search upward.
+const TEST_KEY_SEARCH_PATHS = [_][]const u8{
+    "test-keys/hash-sig-keys",
+    "../test-keys/hash-sig-keys",
+    "../../test-keys/hash-sig-keys",
+    "../../../test-keys/hash-sig-keys",
+    "../../../../test-keys/hash-sig-keys",
+};
 
-        var pk_path_buf: [256]u8 = undefined;
-        const pk_path = std.fmt.bufPrint(&pk_path_buf, "test-keys/hash-sig-keys/validator_{d}_pk.ssz", .{i}) catch unreachable;
-
-        // Read private key
-        var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch {
-            return error.KeyGenerationFailed;
-        };
-        defer sk_file.close();
-        const sk_data = sk_file.readToEndAlloc(allocator, MAX_SK_SIZE) catch {
-            return error.KeyGenerationFailed;
-        };
-        defer allocator.free(sk_data);
-
-        // Read public key
-        var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch {
-            return error.KeyGenerationFailed;
-        };
-        defer pk_file.close();
-        const pk_data = pk_file.readToEndAlloc(allocator, MAX_PK_SIZE) catch {
-            return error.KeyGenerationFailed;
-        };
-        defer allocator.free(pk_data);
-
-        // Reconstruct keypair from SSZ
-        var keypair = xmss.KeyPair.fromSsz(allocator, sk_data, pk_data) catch {
-            return error.KeyGenerationFailed;
-        };
-        errdefer keypair.deinit();
-
-        try key_manager.addKeypair(i, keypair);
+/// Find the test-keys directory by searching known paths.
+fn findTestKeysDir() ?[]const u8 {
+    for (TEST_KEY_SEARCH_PATHS) |path| {
+        if (std.fs.cwd().openDir(path, .{})) |dir| {
+            var d = dir;
+            d.close();
+            return path;
+        } else |_| {}
     }
+    return null;
+}
 
-    std.debug.print("Loaded {d} pre-generated test keys from test-keys/\n", .{num_validators});
-    return key_manager;
+/// Load a single pre-generated key pair from SSZ files on disk.
+fn loadPreGeneratedKey(
+    allocator: Allocator,
+    keys_dir: []const u8,
+    index: usize,
+) !xmss.KeyPair {
+    // Build file paths
+    var sk_path_buf: [512]u8 = undefined;
+    const sk_path = std.fmt.bufPrint(&sk_path_buf, "{s}/validator_{d}_sk.ssz", .{ keys_dir, index }) catch unreachable;
+
+    var pk_path_buf: [512]u8 = undefined;
+    const pk_path = std.fmt.bufPrint(&pk_path_buf, "{s}/validator_{d}_pk.ssz", .{ keys_dir, index }) catch unreachable;
+
+    // Read private key
+    var sk_file = try std.fs.cwd().openFile(sk_path, .{});
+    defer sk_file.close();
+    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
+    defer allocator.free(sk_data);
+
+    // Read public key
+    var pk_file = try std.fs.cwd().openFile(pk_path, .{});
+    defer pk_file.close();
+    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
+    defer allocator.free(pk_data);
+
+    // Reconstruct keypair from SSZ
+    return xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
 }
 
 pub fn getTestKeyManager(
@@ -226,29 +227,45 @@ pub fn getTestKeyManager(
     num_validators: usize,
     max_slot: usize,
 ) !KeyManager {
-    // Try loading pre-generated keys first (fast path).
-    // Falls back to runtime generation if files don't exist.
-    if (num_validators <= 32) {
-        if (loadPreGeneratedKeys(allocator, num_validators)) |km| {
-            return km;
-        } else |_| {
-            std.debug.print("Pre-generated keys not found, falling back to runtime generation\n", .{});
-        }
-    }
-
     var key_manager = KeyManager.init(allocator);
-    key_manager.owns_keypairs = false;
     errdefer key_manager.deinit();
 
-    var num_active_epochs = max_slot + 1;
-    // to reuse cached keypairs, gen for 10 since most tests ask for < 10 max slot including
-    // building mock chain for tests. otherwise getOrCreateCachedKeyPair might cleanup previous
-    //  key generated for smaller life time
-    if (num_active_epochs < 10) num_active_epochs = 10;
+    // Determine how many keys we can load from pre-generated files
+    const keys_dir = findTestKeysDir();
+    const num_preloaded = if (keys_dir != null)
+        @min(num_validators, NUM_PREGENERATED_KEYS)
+    else
+        0;
 
-    for (0..num_validators) |i| {
-        const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
-        try key_manager.addKeypair(i, keypair);
+    // Load pre-generated keys (fast path: near-instant from SSZ files)
+    if (keys_dir) |dir| {
+        for (0..num_preloaded) |i| {
+            const keypair = loadPreGeneratedKey(allocator, dir, i) catch |err| {
+                std.debug.print("Failed to load pre-generated key {d}: {}\n", .{ i, err });
+                break;
+            };
+            key_manager.addKeypair(i, keypair) catch |err| {
+                std.debug.print("Failed to add pre-generated key {d}: {}\n", .{ i, err });
+                break;
+            };
+        }
+        std.debug.print("Loaded {d} pre-generated test keys from {s}\n", .{ num_preloaded, dir });
+    } else {
+        std.debug.print("Pre-generated keys not found, generating all keys at runtime\n", .{});
+    }
+
+    // Generate remaining keys at runtime (for validators beyond the pre-generated set)
+    if (num_validators > num_preloaded) {
+        key_manager.owns_keypairs = false; // cached keypairs are not owned
+
+        var num_active_epochs = max_slot + 1;
+        if (num_active_epochs < 10) num_active_epochs = 10;
+
+        for (num_preloaded..num_validators) |i| {
+            const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
+            try key_manager.addKeypair(i, keypair);
+        }
+        std.debug.print("Generated {d} additional keys at runtime\n", .{num_validators - num_preloaded});
     }
 
     return key_manager;
