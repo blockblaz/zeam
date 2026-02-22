@@ -372,7 +372,6 @@ pub const BeamState = struct {
             }
             justifications.deinit(allocator);
         }
-        errdefer justifications.deinit(allocator);
         try self.getJustification(allocator, &justifications);
 
         var finalized_slot: Slot = self.latest_finalized.slot;
@@ -381,9 +380,9 @@ pub const BeamState = struct {
         var owned_cache: ?utils.RootToSlotCache = if (cache == null) utils.RootToSlotCache.init(allocator) else null;
         defer if (owned_cache) |*oc| oc.deinit();
         const block_cache = cache orelse &(owned_cache.?);
-        if (owned_cache != null) {
-            try self.initRootToSlotCache(block_cache);
-        }
+        // Always ensure the cache has all historical roots from the current state.
+        // This is needed because the global cache may not have all roots yet during sync.
+        try self.initRootToSlotCache(block_cache);
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
