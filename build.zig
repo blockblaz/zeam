@@ -549,9 +549,12 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
     test_step.dependOn(&run_utils_tests.step);
 
+    // Build database tests in ReleaseSafe to avoid LLD/linker issues on macOS CI
+    // (RocksDB is already ReleaseSafe; Debug test binary can exceed link limits)
     const database_tests = b.addTest(.{
         .root_module = zeam_database,
     });
+    database_tests.root_module.optimize = .ReleaseSafe;
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
