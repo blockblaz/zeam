@@ -44,9 +44,7 @@ pub const ProtoNode = struct {
     // info populated lazily for tree visualization in snapshot for efficiency purposes
     numBranches: ?usize = null,
 
-    pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: ProtoNode, writer: anytype) !void {
         try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{x} }}", .{
             self.slot,
             self.weight,
@@ -943,7 +941,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={f} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,
