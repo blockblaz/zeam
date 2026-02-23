@@ -33,9 +33,7 @@ pub const BlockProductionParams = struct {
     slot: usize,
     proposer_index: usize,
 
-    pub fn format(self: BlockProductionParams, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: BlockProductionParams, writer: anytype) !void {
         try writer.print("BlockProductionParams{{ slot={d}, proposer_index={d} }}", .{ self.slot, self.proposer_index });
     }
 };
@@ -764,7 +762,7 @@ pub const BeamChain = struct {
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err("error processing block attestation={any} error={any}", .{ attestation, e });
+                        self.module_logger.err("error processing block attestation={f} error={any}", .{ attestation, e });
                         continue;
                     };
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
@@ -786,7 +784,7 @@ pub const BeamChain = struct {
             .signature = proposer_signature,
         };
         self.forkChoice.onGossipAttestation(signed_proposer_attestation, false) catch |e| {
-            self.module_logger.err("error processing proposer attestation={any} error={any}", .{ signed_proposer_attestation, e });
+            self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };
 
         const processing_time = onblock_timer.observe();
