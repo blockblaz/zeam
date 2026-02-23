@@ -39,7 +39,7 @@ const NodeOpts = struct {
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
-    is_checkpoint_sync: bool = false,
+    anchor_type: chainFactory.fcFactory.AnchorType = .genesis,
 };
 
 pub const BeamNode = struct {
@@ -73,7 +73,7 @@ pub const BeamNode = struct {
                 .db = opts.db,
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
-                .is_checkpoint_sync = opts.is_checkpoint_sync,
+                .anchor_type = opts.anchor_type,
             },
             network.connected_peers,
         );

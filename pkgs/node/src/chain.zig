@@ -52,7 +52,7 @@ pub const ChainOpts = struct {
     db: database.Db,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
-    is_checkpoint_sync: bool = false,
+    anchor_type: fcFactory.AnchorType = .genesis,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -129,7 +129,7 @@ pub const BeamChain = struct {
             .config = opts.config,
             .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
-            .is_checkpoint_sync = opts.is_checkpoint_sync,
+            .anchor_type = opts.anchor_type,
         });
 
         var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);

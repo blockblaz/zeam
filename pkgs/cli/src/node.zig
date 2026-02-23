@@ -240,7 +240,7 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
-            .is_checkpoint_sync = checkpoint_sync_succeeded,
+            .anchor_type = if (checkpoint_sync_succeeded) .finalized else .genesis,
         });
 
         // Start API server after chain is initialized so we can pass the chain pointer

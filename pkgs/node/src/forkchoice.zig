@@ -255,11 +255,18 @@ const AttestationTracker = struct {
     latestNew: ?ProtoAttestation = null,
 };
 
+/// How the fork choice anchor was obtained. Used to set initial store (justified/finalized).
+pub const AnchorType = enum {
+    genesis,
+    finalized,
+    head,
+};
+
 pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
-    is_checkpoint_sync: bool = false,
+    anchor_type: AnchorType = .genesis,
 };
 
 // Use shared signature map types from types package
@@ -328,36 +335,36 @@ pub const ForkChoice = struct {
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
-        const fc_store = if (opts.is_checkpoint_sync) blk: {
-            const finalized_cp = types.Checkpoint{
-                .slot = opts.anchorState.latest_finalized.slot,
-                .root = anchor_block_root,
-            };
-            opts.logger.info(
-                "forkchoice initialized from checkpoint sync: anchor_slot={d} finalized_slot={d} justified_slot=0 (to be determined from network)",
-                .{ anchorCP.slot, finalized_cp.slot },
-            );
-            break :blk ForkChoiceStore{
-                .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
-                .timeSlots = opts.anchorState.slot,
-                .latest_justified = .{ .slot = 0, .root = types.ZERO_HASH },
-                .latest_finalized = finalized_cp,
-            };
-        } else blk: {
-            if (opts.anchorState.slot == 0) {
-                opts.logger.info("forkchoice initialized from genesis", .{});
-            } else {
+        const fc_store = switch (opts.anchor_type) {
+            .head => return error.AnchorTypeHeadNotImplemented, // TODO: create issue for head anchor support
+            .finalized => blk: {
                 opts.logger.info(
-                    "forkchoice initialized from database: anchor_slot={d}",
+                    "forkchoice initialized from checkpoint sync (finalized): anchor_slot={d} justified_slot=0 (to be determined from network)",
                     .{anchorCP.slot},
                 );
-            }
-            break :blk ForkChoiceStore{
-                .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
-                .timeSlots = opts.anchorState.slot,
-                .latest_justified = anchorCP,
-                .latest_finalized = anchorCP,
-            };
+                break :blk ForkChoiceStore{
+                    .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
+                    .timeSlots = opts.anchorState.slot,
+                    .latest_justified = .{ .slot = 0, .root = types.ZERO_HASH },
+                    .latest_finalized = anchorCP,
+                };
+            },
+            .genesis => blk: {
+                if (opts.anchorState.slot == 0) {
+                    opts.logger.info("forkchoice initialized from genesis", .{});
+                } else {
+                    opts.logger.info(
+                        "forkchoice initialized from database: anchor_slot={d}",
+                        .{anchorCP.slot},
+                    );
+                }
+                break :blk ForkChoiceStore{
+                    .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
+                    .timeSlots = opts.anchorState.slot,
+                    .latest_justified = anchorCP,
+                    .latest_finalized = anchorCP,
+                };
+            },
         };
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
         const deltas: std.ArrayList(isize) = .empty;
