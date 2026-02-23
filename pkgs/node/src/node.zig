@@ -123,7 +123,7 @@ pub const BeamNode = struct {
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
-                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{any} hasParentBlock={} from peer={s}{any}", .{
+                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{f} hasParentBlock={} from peer={s}{f}", .{
                     block.slot,
                     &parent_root,
                     block.proposer_index,
@@ -180,7 +180,7 @@ pub const BeamNode = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip attestation for slot={d} validator={d}{any} from peer={s}{any}", .{
+                self.logger.info("received gossip attestation for slot={d} validator={d}{f} from peer={s}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -479,7 +479,7 @@ pub const BeamNode = struct {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
-                self.logger.warn("received unexpected block root 0x{x} from peer {s}{any}", .{
+                self.logger.warn("received unexpected block root 0x{x} from peer {s}{f}", .{
                     &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -532,7 +532,7 @@ pub const BeamNode = struct {
 
                 if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                     self.logger.info(
-                        "discarding pre-finalized block 0x{x} from peer {s}{any}, pruning cached descendants",
+                        "discarding pre-finalized block 0x{x} from peer {s}{f}, pruning cached descendants",
                         .{
                             &block_root,
                             block_ctx.peer_id,
@@ -543,7 +543,7 @@ pub const BeamNode = struct {
                     return;
                 }
 
-                self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{any}: {any}", .{
+                self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{f}: {any}", .{
                     &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -570,7 +570,7 @@ pub const BeamNode = struct {
                 self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
-            self.logger.warn("failed to compute block root from RPC response from peer={s}{any}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
+            self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
     }
 
@@ -592,14 +592,14 @@ pub const BeamNode = struct {
                 .status => |status_resp| {
                     switch (ctx_ptr.*) {
                         .status => |*status_ctx| {
-                            self.logger.info("received status response from peer {s}{any} head_slot={d}, finalized_slot={d}", .{
+                            self.logger.info("received status response from peer {s}{f} head_slot={d}, finalized_slot={d}", .{
                                 status_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 status_resp.head_slot,
                                 status_resp.finalized_slot,
                             });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn("status response received for unknown peer {s}{any}", .{
+                                self.logger.warn("status response received for unknown peer {s}{f}", .{
                                     status_ctx.peer_id,
                                     self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 });
@@ -613,7 +613,7 @@ pub const BeamNode = struct {
                                 .behind_peers => |info| {
                                     // Only sync from this peer if their finalized slot is ahead of ours
                                     if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
-                                        self.logger.info("peer {s}{any} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
+                                        self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                             status_resp.finalized_slot,
@@ -622,7 +622,7 @@ pub const BeamNode = struct {
                                         });
                                         const roots = [_]types.Root{status_resp.head_root};
                                         self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{any}: {any}", .{
+                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
                                                 status_ctx.peer_id,
                                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                                 err,
@@ -634,14 +634,14 @@ pub const BeamNode = struct {
                             }
                         },
                         else => {
-                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{any}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
                 .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
                         .blocks_by_root => |*block_ctx| {
-                            self.logger.info("received blocks-by-root chunk from peer {s}{any}", .{
+                            self.logger.info("received blocks-by-root chunk from peer {s}{f}", .{
                                 block_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             });
@@ -649,7 +649,7 @@ pub const BeamNode = struct {
                             try self.processBlockByRootChunk(block_ctx, &block_resp);
                         },
                         else => {
-                            self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{any}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
@@ -657,7 +657,7 @@ pub const BeamNode = struct {
             .failure => |err_payload| {
                 switch (ctx_ptr.*) {
                     .status => |status_ctx| {
-                        self.logger.warn("status request to peer {s}{any} failed ({d}): {s}", .{
+                        self.logger.warn("status request to peer {s}{f} failed ({d}): {s}", .{
                             status_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                             err_payload.code,
@@ -665,7 +665,7 @@ pub const BeamNode = struct {
                         });
                     },
                     .blocks_by_root => |block_ctx| {
-                        self.logger.warn("blocks-by-root request to peer {s}{any} failed ({d}): {s}", .{
+                        self.logger.warn("blocks-by-root request to peer {s}{f} failed ({d}): {s}", .{
                             block_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             err_payload.code,
@@ -778,7 +778,7 @@ pub const BeamNode = struct {
         };
 
         if (maybe_request) |request_info| {
-            self.logger.debug("requested {d} block(s) by root from peer {s}{any}, request_id={d}", .{
+            self.logger.debug("requested {d} block(s) by root from peer {s}{f}, request_id={d}", .{
                 missing_roots.items.len,
                 request_info.peer_id,
                 self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
@@ -792,7 +792,7 @@ pub const BeamNode = struct {
 
         try self.network.connectPeer(peer_id);
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.info("peer connected: {s}{any}, direction={s}, total peers: {d}", .{
+        self.logger.info("peer connected: {s}{f}, direction={s}, total peers: {d}", .{
             peer_id,
             node_name,
             @tagName(direction),
@@ -807,7 +807,7 @@ pub const BeamNode = struct {
         const status = self.chain.getStatus();
 
         const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("failed to send status request to peer {s}{any} {any}", .{
+            self.logger.warn("failed to send status request to peer {s}{f} {any}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
@@ -815,7 +815,7 @@ pub const BeamNode = struct {
             return;
         };
 
-        self.logger.info("sent status request to peer {s}{any}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+        self.logger.info("sent status request to peer {s}{f}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
             peer_id,
             self.node_registry.getNodeNameFromPeerId(peer_id),
             request_id,
@@ -828,7 +828,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("peer disconnected: {s}{any}, direction={s}, reason={s}, total peers: {d}", .{
+            self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 @tagName(direction),
@@ -962,7 +962,7 @@ pub const BeamNode = struct {
                         roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch continue;
                     }
 
-                    self.logger.warn("RPC request_id={d} to peer {s}{any} timed out after {d}s, retrying {d} roots", .{
+                    self.logger.warn("RPC request_id={d} to peer {s}{f} timed out after {d}s, retrying {d} roots", .{
                         request_id,
                         block_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -982,7 +982,7 @@ pub const BeamNode = struct {
                     }
                 },
                 .status => |status_ctx| {
-                    self.logger.warn("status RPC request_id={d} to peer {s}{any} timed out, finalizing", .{
+                    self.logger.warn("status RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
                         request_id,
                         status_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
@@ -1027,7 +1027,7 @@ pub const BeamNode = struct {
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.network.publish(&gossip_msg);
-        self.logger.info("published block to network: slot={d} proposer={d}{any}", .{
+        self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
             block.slot,
             block.proposer_index,
             self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
@@ -1052,7 +1052,7 @@ pub const BeamNode = struct {
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        self.logger.info("published attestation to network: slot={d} validator={d}{any}", .{
+        self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
             data.slot,
             validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(validator_id),

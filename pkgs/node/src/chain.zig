@@ -564,7 +564,7 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{any} hasBlock={} from peer={s}{any}", .{
+                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{f} hasBlock={} from peer={s}{f}", .{
                     block.slot,
                     &block_root,
                     block.proposer_index,
@@ -613,7 +613,7 @@ pub const BeamChain = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.module_logger.debug("chain received gossip attestation for slot={d} validator={d}{any} from peer={s}{any}", .{
+                self.module_logger.debug("chain received gossip attestation for slot={d} validator={d}{f} from peer={s}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -641,7 +641,7 @@ pub const BeamChain = struct {
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
-                self.module_logger.info("processed gossip attestation for slot={d} validator={d}{any}", .{
+                self.module_logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
