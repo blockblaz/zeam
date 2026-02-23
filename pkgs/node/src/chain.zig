@@ -208,7 +208,10 @@ pub const BeamChain = struct {
 
     /// Replay blocks that were queued because the forkchoice clock hadn't yet
     /// reached their slot.  Called from onInterval after advancing the clock.
-    fn processPendingBlocks(self: *Self) void {
+    /// Returns a slice of all missing attestation roots encountered while
+    /// processing queued blocks; the caller owns and must free the slice.
+    pub fn processPendingBlocks(self: *Self) []types.Root {
+        var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
         const fc_time = self.forkChoice.fcStore.time;
         var i: usize = 0;
         while (i < self.pending_blocks.items.len) {
@@ -238,10 +241,14 @@ pub const BeamChain = struct {
                 defer self.allocator.free(missing_roots);
 
                 self.onBlockFollowup(true, &queued_block);
+
+                // Accumulate missing roots so the caller can fetch them.
+                all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
             } else {
                 i += 1;
             }
         }
+        return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
@@ -271,10 +278,6 @@ pub const BeamChain = struct {
         });
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
-
-        // After advancing the forkchoice clock, replay any blocks that were
-        // queued because the clock hadn't reached their slot yet.
-        self.processPendingBlocks();
 
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
