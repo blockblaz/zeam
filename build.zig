@@ -127,11 +127,10 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
-    // add rocksdb — always build with ReleaseSafe to avoid LLD UnableToWriteArchive
-    // on Debug builds (the Debug archive exceeds LLD's size limits on CI runners)
+    // add rocksdb
     const rocksdb = b.dependency("rocksdb", .{
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = optimize,
     }).module("bindings");
 
     // add snappyz
@@ -555,6 +554,8 @@ pub fn build(b: *Builder) !void {
     const database_tests = b.addTest(.{
         .root_module = zeam_database,
     });
+    database_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, database_tests, target, prover);
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);

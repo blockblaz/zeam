@@ -56,9 +56,7 @@ pub const Attestation = struct {
     validator_id: ValidatorIndex,
     data: AttestationData,
 
-    pub fn format(self: Attestation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Attestation, writer: anytype) !void {
         try writer.print("Attestation{{ validator={d}, slot={d}, source_slot={d}, target_slot={d} }}", .{
             self.validator_id,
             self.data.slot,
@@ -86,9 +84,7 @@ pub const SignedAttestation = struct {
     message: AttestationData,
     signature: SIGBYTES,
 
-    pub fn format(self: SignedAttestation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: SignedAttestation, writer: anytype) !void {
         try writer.print("SignedAttestation{{ validator={d}, slot={d}, source_slot={d}, target_slot={d} }}", .{
             self.validator_id,
             self.message.slot,

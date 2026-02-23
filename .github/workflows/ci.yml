@@ -30,9 +30,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -101,9 +101,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -157,9 +157,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -211,9 +211,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -284,9 +284,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -324,9 +324,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
