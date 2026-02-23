@@ -621,7 +621,7 @@ pub const ReqRespRequestHandler = struct {
         const peer_id_opt = stream.getPeerId();
         const peer_id = peer_id_opt orelse "unknown";
         const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
-        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{any}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
+        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{f}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -631,7 +631,7 @@ pub const ReqRespRequestHandler = struct {
 
         for (self.handlers.items) |handler| {
             handler.onReqRespRequest(req, stream) catch |err| {
-                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{any}", .{ self.networkId, err, peer_id, node_name });
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{f}", .{ self.networkId, err, peer_id, node_name });
                 last_err = err;
                 continue;
             };
@@ -746,7 +746,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{any} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
@@ -756,7 +756,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{any} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
@@ -828,7 +828,7 @@ pub const GenericGossipHandler = struct {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{any}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
