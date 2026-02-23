@@ -644,14 +644,34 @@ pub const BeamChain = struct {
                     // onBlock would reject it with FutureSlot.  Queue the block and
                     // replay it from onInterval once the clock has advanced.
                     if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.time) {
-                        self.module_logger.info(
+                        self.module_logger.debug(
                             "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                             .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT },
                         );
                         var cloned: types.SignedBlockWithAttestation = undefined;
                         try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &cloned);
-                        try self.pending_blocks.append(self.allocator, cloned);
-                        return .{};
+
+                        // TODO: in beam sim, it seems to have queued after the oninterval fires even if block arrives pre on interval
+                        // because of race conditions between competing threads as the above sszClone aparently takes too much time
+                        // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
+                        // holding mutex between then for chain modification sections
+                        if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.time) {
+                            try self.pending_blocks.append(self.allocator, cloned);
+
+                            self.module_logger.info(
+                                "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT },
+                            );
+                            return .{};
+                        } else {
+                            self.module_logger.debug(
+                                //
+                                "chain already ticked while cloning block for queuing, skipping queuing and directly processing slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                                //
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT });
+                            // by the time we cloned, chain ticked, so we can directly add and deinit clone
+                            cloned.deinit();
+                        }
                     }
 
                     const missing_roots = self.onBlock(signed_block, .{
@@ -1196,9 +1216,10 @@ pub const BeamChain = struct {
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
-            self.module_logger.debug("block validation failed: future slot {d} > max allowed {d}", .{
+            self.module_logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
                 block.slot,
                 current_slot + max_future_tolerance,
+                self.forkChoice.fcStore.time,
             });
             return BlockValidationError.FutureSlot;
         }

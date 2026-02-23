@@ -1013,23 +1013,21 @@ pub const BeamNode = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
+        // 2. need to add the signed proposer attestation in forkchoice even if block was locally produced
+        //    TODO: might not be needed for locally produced block if we totally depend on the agggregators to serve us attestations
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (hasBlock) {
-            self.logger.debug("produced block already present in forkchoice, finalizing chain persistence: slot={d} proposer={d}", .{
+            self.logger.debug("reprocessing locally produced block to add signed proposer attestation: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
         } else {
-            self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
+            self.logger.debug("processing block not locally produced before publishing: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
         }
 
-        // 2. Fetch missing blocks from the network to complete the chain.
-        // many blocks arrive with attestations pointing to heads the node hasn't processed yet,
-        // those attestations all get dropped, safeTarget stays stuck, and no progress is made.
-        // so we need to fetch the missing blocks to complete the chain.
         const missing_roots = try self.chain.onBlock(signed_block, .{
             .postState = self.chain.states.get(block_root),
             .blockRoot = block_root,
