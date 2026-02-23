@@ -22,9 +22,7 @@ pub const Context = struct {
 pub const StepSuffix = struct {
     step: ?usize,
 
-    pub fn format(self: StepSuffix, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: StepSuffix, writer: anytype) !void {
         if (self.step) |idx| {
             try writer.print(" step #{}", .{idx});
         }

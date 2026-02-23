@@ -20,15 +20,7 @@ pub fn LazyJson(comptime T: type) type {
             };
         }
 
-        pub fn format(
-            self: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            _ = fmt;
-            _ = options;
-
+        pub fn format(self: @This(), writer: anytype) !void {
             const json_str = self.value.toJsonString(self.allocator) catch |e| {
                 try writer.print("<json error: {any}>", .{e});
                 return;
@@ -54,7 +46,7 @@ test "LazyJson formats JSON and frees allocation" {
 
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
-    try lazy_json.format("", .{}, buffer.writer(allocator));
+    try lazy_json.format(buffer.writer(allocator));
 
     try std.testing.expectEqualStrings("{\"ok\":true}", buffer.items);
 }
@@ -75,7 +67,7 @@ test "LazyJson formats error on toJsonString failure" {
 
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
-    try lazy_json.format("", .{}, buffer.writer(allocator));
+    try lazy_json.format(buffer.writer(allocator));
 
     try std.testing.expect(std.mem.containsAtLeast(u8, buffer.items, 1, "<json error:"));
 }
