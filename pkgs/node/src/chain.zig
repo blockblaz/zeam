@@ -114,6 +114,12 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
+    // Queue for blocks that arrived before forkchoice had ticked to their slot.
+    // When a peer gossips a block for the current slot before our local interval
+    // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
+    // blocks here and replay them in onInterval once the clock has caught up.
+    pending_blocks: std.ArrayList(types.SignedBlockWithAttestation),
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -153,6 +159,7 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            .pending_blocks = .empty,
         };
     }
 
@@ -181,6 +188,12 @@ pub const BeamChain = struct {
         // Clean up public key cache
         self.public_key_cache.deinit();
 
+        // Clean up any blocks that were queued waiting for the forkchoice clock
+        for (self.pending_blocks.items) |*block| {
+            block.deinit();
+        }
+        self.pending_blocks.deinit(self.allocator);
+
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         // self.anchor_state.deinit();
@@ -191,6 +204,51 @@ pub const BeamChain = struct {
         // tacking registrations and keeping it alive for 3*2=6 slots
         self.registered_validator_ids = validator_ids;
         zeam_metrics.metrics.lean_validators_count.set(self.registered_validator_ids.len);
+    }
+
+    /// Replay blocks that were queued because the forkchoice clock hadn't yet
+    /// reached their slot.  Called from onInterval after advancing the clock.
+    /// Returns a slice of all missing attestation roots encountered while
+    /// processing queued blocks; the caller owns and must free the slice.
+    pub fn processPendingBlocks(self: *Self) []types.Root {
+        var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
+        const fc_time = self.forkChoice.fcStore.time;
+        var i: usize = 0;
+        while (i < self.pending_blocks.items.len) {
+            const queued_slot = self.pending_blocks.items[i].message.block.slot;
+            if (queued_slot * constants.INTERVALS_PER_SLOT <= fc_time) {
+                // Remove from queue (ownership transferred to local var).
+                var queued_block = self.pending_blocks.orderedRemove(i);
+                defer queued_block.deinit();
+
+                var block_root: types.Root = undefined;
+                zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.message.block, &block_root, self.allocator) catch |err| {
+                    self.module_logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
+                    continue;
+                };
+
+                self.module_logger.info(
+                    "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
+                    .{ queued_slot, &block_root, fc_time },
+                );
+
+                const missing_roots = self.onBlock(queued_block, .{
+                    .blockRoot = block_root,
+                }) catch |err| {
+                    self.module_logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
+                    continue;
+                };
+                defer self.allocator.free(missing_roots);
+
+                self.onBlockFollowup(true, &queued_block);
+
+                // Accumulate missing roots so the caller can fetch them.
+                all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
+            } else {
+                i += 1;
+            }
+        }
+        return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
@@ -220,6 +278,7 @@ pub const BeamChain = struct {
         });
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
+
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
@@ -580,6 +639,21 @@ pub const BeamChain = struct {
                 if (!hasBlock) {
                     // Validation errors propagate to node.zig for context-aware logging
                     try self.validateBlock(block, true);
+
+                    // If the forkchoice clock hasn't yet ticked to this block's slot,
+                    // onBlock would reject it with FutureSlot.  Queue the block and
+                    // replay it from onInterval once the clock has advanced.
+                    if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.time) {
+                        self.module_logger.info(
+                            "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                            .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT },
+                        );
+                        var cloned: types.SignedBlockWithAttestation = undefined;
+                        try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &cloned);
+                        try self.pending_blocks.append(self.allocator, cloned);
+                        return .{};
+                    }
+
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {

@@ -906,6 +906,19 @@ pub const BeamNode = struct {
             return e;
         };
 
+        // Replay blocks that were queued waiting for the forkchoice clock to advance,
+        // then fetch any attestation head roots that were missing during replay.
+        const pending_missing_roots = self.chain.processPendingBlocks();
+        defer self.allocator.free(pending_missing_roots);
+        if (pending_missing_roots.len > 0) {
+            self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
+                self.logger.warn(
+                    "failed to fetch {d} missing block(s) from pending blocks: {any}",
+                    .{ pending_missing_roots.len, err },
+                );
+            };
+        }
+
         // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers
         self.sweepTimedOutRequests();
 
