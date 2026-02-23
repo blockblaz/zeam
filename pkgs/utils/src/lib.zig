@@ -39,6 +39,7 @@ pub const jsonToString = json_factory.jsonToString;
 
 const ssz_factory = @import("./ssz.zig");
 pub const hashTreeRoot = ssz_factory.hashTreeRoot;
+pub const fixedSszSize = ssz_factory.fixedSszSize;
 
 const fmt_factory = @import("./fmt.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
