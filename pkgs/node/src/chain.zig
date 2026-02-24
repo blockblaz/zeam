@@ -107,6 +107,8 @@ pub const BeamChain = struct {
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
+    // Cache for root to slot mapping to optimize block processing performance.
+    root_to_slot_cache: types.RootToSlotCache,
 
     // Callback for pruning cached blocks after finalization advances
     prune_cached_blocks_ctx: ?*anyopaque = null,
@@ -139,7 +141,7 @@ pub const BeamChain = struct {
         try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
         try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
 
-        return Self{
+        var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
             .forkChoice = fork_choice,
@@ -157,8 +159,13 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
         };
+        // Initialize cache with anchor block root and any post-finalized entries from state
+        try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
+        try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
+        return chain;
     }
 
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
@@ -185,6 +192,9 @@ pub const BeamChain = struct {
 
         // Clean up public key cache
         self.public_key_cache.deinit();
+
+        // Clean up root to slot cache
+        self.root_to_slot_cache.deinit();
 
         // Clean up any blocks that were queued waiting for the forkchoice clock
         for (self.pending_blocks.items) |*block| {
@@ -453,7 +463,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
+        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -774,12 +784,15 @@ pub const BeamChain = struct {
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
-                //
                 .logger = self.stf_logger,
                 .validSignatures = true,
+                .rootToSlotCache = &self.root_to_slot_cache,
             });
             break :computedstate cpost_state;
         };
+
+        // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
+        try self.root_to_slot_cache.put(block_root, block.slot);
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
@@ -1186,6 +1199,9 @@ pub const BeamChain = struct {
         //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
         //     }
         // }
+
+        // Prune root-to-slot cache up to finalized slot
+        try self.root_to_slot_cache.prune(latestFinalized.slot);
 
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
