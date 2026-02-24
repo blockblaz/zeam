@@ -14,6 +14,7 @@ const QUERY_SLOTS_PREFIX = "?slots=";
 const DEFAULT_MAX_SLOTS: usize = 50;
 const MAX_ALLOWED_SLOTS: usize = 200;
 const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
+const STARTUP_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 // Conservative defaults for a local metrics server.
 const MAX_SSE_CONNECTIONS: usize = 32;
 const MAX_GRAPH_INFLIGHT: usize = 2;
@@ -24,37 +25,64 @@ const RATE_LIMIT_CLEANUP_THRESHOLD: usize = RATE_LIMIT_MAX_ENTRIES / 2; // Trigg
 const RATE_LIMIT_STALE_NS: u64 = 10 * std.time.ns_per_min; // Evict entries idle past TTL.
 const RATE_LIMIT_CLEANUP_COOLDOWN_NS: u64 = 60 * std.time.ns_per_s;
 
+/// Startup status for synchronizing server thread initialization
+const StartupStatus = enum(u8) {
+    pending,
+    success,
+    failed,
+};
+
 /// API server that runs in a background thread
-/// Handles metrics, SSE events, health checks, forkchoice graph, and checkpoint state endpoints
+/// Handles SSE events, health checks, forkchoice graph, and checkpoint state endpoints
 /// chain is optional - if null, chain-dependent endpoints will return 503
 /// (API server starts before chain initialization, so chain may not be available yet)
+/// Note: Metrics are served by the separate metrics_server on a different port
 pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !*ApiServer {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
 
     var rate_limiter = try RateLimiter.init(allocator);
-    errdefer rate_limiter.deinit();
 
     // Create a logger instance for the API server
     const logger = logger_config.logger(.api_server);
 
     // Create the API server context
-    const ctx = try allocator.create(ApiServer);
-    errdefer allocator.destroy(ctx);
+    const ctx = allocator.create(ApiServer) catch |err| {
+        rate_limiter.deinit();
+        return err;
+    };
     ctx.* = .{
         .allocator = allocator,
         .port = port,
         .logger = logger,
         .chain = std.atomic.Value(?*BeamChain).init(chain),
         .stopped = std.atomic.Value(bool).init(false),
+        .startup_status = std.atomic.Value(StartupStatus).init(.pending),
         .sse_active = 0,
         .graph_inflight = 0,
         .rate_limiter = rate_limiter,
         .thread = undefined,
     };
 
-    ctx.thread = try std.Thread.spawn(.{}, ApiServer.run, .{ctx});
+    ctx.thread = std.Thread.spawn(.{}, ApiServer.run, .{ctx}) catch |err| {
+        rate_limiter.deinit();
+        allocator.destroy(ctx);
+        return err;
+    };
+
+    // Wait for thread to report startup result (success or failure)
+    while (ctx.startup_status.load(.acquire) == .pending) {
+        std.Thread.sleep(STARTUP_POLL_NS);
+    }
+
+    // Check if startup failed
+    if (ctx.startup_status.load(.acquire) == .failed) {
+        ctx.thread.join();
+        rate_limiter.deinit();
+        allocator.destroy(ctx);
+        return error.ServerStartupFailed;
+    }
 
     logger.info("API server started on port {d}", .{port});
     return ctx;
@@ -99,9 +127,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         defer arena.deinit();
         const request_allocator = arena.allocator();
 
-        if (std.mem.eql(u8, request.head.target, "/metrics")) {
-            ctx.handleMetrics(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
+        if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             ctx.handleHealth(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             ctx.handleFinalizedCheckpointState(&request) catch |err| {
@@ -142,6 +168,7 @@ pub const ApiServer = struct {
     logger: ModuleLogger,
     chain: std.atomic.Value(?*BeamChain),
     stopped: std.atomic.Value(bool),
+    startup_status: std.atomic.Value(StartupStatus),
     sse_active: usize,
     graph_inflight: usize,
     rate_limiter: RateLimiter,
@@ -152,7 +179,9 @@ pub const ApiServer = struct {
     const Self = @This();
 
     pub fn stop(self: *Self) void {
-        self.stopped.store(true, .seq_cst);
+        // Use swap to atomically set stopped=true and check if already stopped
+        // This prevents double-stop causing undefined behavior (double join/destroy)
+        if (self.stopped.swap(true, .seq_cst)) return;
         self.thread.join();
         self.rate_limiter.deinit();
         self.allocator.destroy(self);
@@ -169,15 +198,19 @@ pub const ApiServer = struct {
     fn run(self: *Self) void {
         const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
+            self.startup_status.store(.failed, .release);
             return;
         };
         var server = address.listen(.{ .reuse_address = true, .force_nonblocking = true }) catch |err| {
             self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
+            self.startup_status.store(.failed, .release);
             return;
         };
         defer server.deinit();
 
-        self.logger.info("HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+        // Signal successful startup to the spawning thread
+        self.startup_status.store(.success, .release);
+        self.logger.info("API server listening on http://0.0.0.0:{d}", .{self.port});
 
         while (true) {
             if (self.stopped.load(.acquire)) break;
@@ -201,26 +234,6 @@ pub const ApiServer = struct {
         }) {
             std.Thread.sleep(ACCEPT_POLL_NS);
         }
-    }
-
-    /// Handle metrics endpoint
-    fn handleMetrics(self: *const Self, request: *std.http.Server.Request) void {
-        var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer allocating_writer.deinit();
-
-        api.writeMetrics(&allocating_writer.writer) catch {
-            _ = request.respond("Internal Server Error\n", .{}) catch {};
-            return;
-        };
-
-        // Get the written data from the allocating writer
-        const written_data = allocating_writer.writer.buffer[0..allocating_writer.writer.end];
-
-        _ = request.respond(written_data, .{
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
-            },
-        }) catch {};
     }
 
     /// Handle health check endpoint
