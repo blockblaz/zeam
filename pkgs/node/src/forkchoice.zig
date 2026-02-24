@@ -333,14 +333,36 @@ pub const ForkChoice = struct {
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
+        // Fork choice initialization for different anchor types:
+        //
+        // Currently .finalized and .genesis have identical behavior - both use anchorCP
+        // (the anchor block's checkpoint) for latest_justified and latest_finalized.
+        // The distinction exists for:
+        //   1. Logging: different messages help debug initialization source
+        //   2. Future: may need different behavior (e.g., checkpoint sync might need
+        //      to handle weak subjectivity differently)
+        //
+        // Why not use .head for DB restarts?
+        // On restart, we load the latest FINALIZED state from DB (not head state).
+        // This is intentional - we only persist finalized states to avoid replaying
+        // from a potentially reorged head. The finalized state is safe to use as
+        // anchor because it cannot be reorged.
+        //
+        // Initialization flow on restart:
+        //   1. CLI calls db.loadLatestFinalizedState() to get most recent finalized state
+        //   2. This state becomes anchorState (e.g., slot 100 if that was last finalized)
+        //   3. Fork choice inits with anchorCP = {slot: 100, root: block_root_at_100}
+        //   4. ProtoArray starts with just this anchor block
+        //   5. Node syncs missing blocks from peers to rebuild the chain from anchor to head
+        //   6. As blocks are processed, fcStore.update() advances justified/finalized
+        //
+        // The anchor block is the only block in ProtoArray at init, so we must use
+        // anchorCP for latest_justified (fork choice head computation needs to find
+        // the justified root in ProtoArray).
         const fc_store = switch (opts.anchor_type) {
             .head => return error.AnchorTypeHeadNotImplemented, // TODO: create issue for head anchor support
             .finalized => blk: {
-                // For checkpoint sync, use the anchor checkpoint for both justified and finalized.
-                // The anchor block is the only block in the ProtoArray at init time, so we must
-                // reference it for fork choice head computation to work.
-                // As new blocks are processed, fcStore.update() will advance these values
-                // based on the post-state's justified/finalized checkpoints.
+                // Checkpoint sync: state downloaded from external peer
                 opts.logger.info(
                     "forkchoice initialized from checkpoint sync: anchor_slot={d} (state had justified={d} finalized={d})",
                     .{ anchorCP.slot, opts.anchorState.latest_justified.slot, opts.anchorState.latest_finalized.slot },
@@ -353,11 +375,12 @@ pub const ForkChoice = struct {
                 };
             },
             .genesis => blk: {
+                // Genesis start (slot=0) or DB restart (slot>0, loaded finalized state)
                 if (opts.anchorState.slot == 0) {
                     opts.logger.info("forkchoice initialized from genesis", .{});
                 } else {
                     opts.logger.info(
-                        "forkchoice initialized from database: anchor_slot={d}",
+                        "forkchoice initialized from database: anchor_slot={d} (loaded finalized state)",
                         .{anchorCP.slot},
                     );
                 }
