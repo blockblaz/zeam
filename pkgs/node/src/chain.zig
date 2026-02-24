@@ -162,6 +162,8 @@ pub const BeamChain = struct {
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
         };
+        // Initialize cache with anchor block root and any post-finalized entries from state
+        try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
         return chain;
     }
@@ -770,11 +772,6 @@ pub const BeamChain = struct {
             break :computedroot cblock_root;
         };
 
-        // Add parent block to root-to-slot cache BEFORE STF (needed for attestation processing)
-        if (self.forkChoice.getBlock(block.parent_root)) |parent_block| {
-            try self.root_to_slot_cache.put(block.parent_root, parent_block.slot);
-        }
-
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
@@ -793,6 +790,9 @@ pub const BeamChain = struct {
             });
             break :computedstate cpost_state;
         };
+
+        // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
+        try self.root_to_slot_cache.put(block_root, block.slot);
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);

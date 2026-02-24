@@ -380,9 +380,10 @@ pub const BeamState = struct {
         var owned_cache: ?utils.RootToSlotCache = if (cache == null) utils.RootToSlotCache.init(allocator) else null;
         defer if (owned_cache) |*oc| oc.deinit();
         const block_cache = cache orelse &(owned_cache.?);
-        // Always ensure the cache has all historical roots from the current state.
-        // This is needed because the global cache may not have all roots yet during sync.
-        try self.initRootToSlotCache(block_cache);
+        if (owned_cache != null) {
+            // Only populate cache in fallback path (tests). Chain.zig maintains the global cache.
+            try self.initRootToSlotCache(block_cache);
+        }
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -810,7 +811,7 @@ test "process_attestations invalid justifiable slot returns error without panic"
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
-    try state.process_block(std.testing.allocator, block_1, logger);
+    try state.process_block(std.testing.allocator, block_1, logger, null);
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
@@ -860,7 +861,7 @@ test "process_attestations invalid justifiable slot returns error without panic"
 
     try std.testing.expectError(
         StateTransitionError.InvalidJustifiableSlot,
-        state.process_attestations(std.testing.allocator, attestations_list, logger),
+        state.process_attestations(std.testing.allocator, attestations_list, logger, null),
     );
 }
 
