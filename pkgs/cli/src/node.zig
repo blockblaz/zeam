@@ -209,7 +209,13 @@ pub const Node = struct {
 
         // Fall back to database/genesis if checkpoint sync was not attempted or failed
         if (!checkpoint_sync_succeeded) {
-            // Try to load the latest finalized state from the database, fallback to genesis
+            // Try to load the latest finalized state from the database, fallback to genesis.
+            // On restart, loadLatestFinalizedState loads the most recent finalized state that
+            // was persisted. This state becomes the anchor for fork choice initialization.
+            // We use .genesis anchor_type for both genesis and DB restarts because:
+            // - The state was finalized by this node (trusted, unlike checkpoint sync from peers)
+            // - Fork choice treats anchor as both justified and finalized starting point
+            // - The forkchoice.zig init logs "from database" vs "from genesis" based on slot
             db.loadLatestFinalizedState(self.anchor_state) catch |err| {
                 self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
                 try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
@@ -244,6 +250,8 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
+            // .finalized: checkpoint sync from external peer (state not previously validated by us)
+            // .genesis: genesis start OR DB restart (state was finalized/validated by this node)
             .anchor_type = if (checkpoint_sync_succeeded) .finalized else .genesis,
         });
         errdefer self.beam_node.deinit();
