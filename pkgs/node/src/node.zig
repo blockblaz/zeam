@@ -356,6 +356,12 @@ pub const BeamNode = struct {
                             "Cached block 0x{x} still missing parent, keeping in cache",
                             .{&descendant_root},
                         );
+                    } else if (err == forkchoice.ForkChoiceError.FutureSlot) {
+                        // Keep future-slot blocks cached and retry on later intervals.
+                        self.logger.debug(
+                            "cached block 0x{x} is in a future slot, keeping in cache for retry",
+                            .{&descendant_root},
+                        );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
                         // Prune this block and all its cached descendants; they are no longer useful.
@@ -392,6 +398,28 @@ pub const BeamNode = struct {
                     self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
                 };
             }
+        }
+    }
+
+    fn retryReadyCachedDescendants(self: *Self) void {
+        if (self.network.fetched_blocks.count() == 0) {
+            return;
+        }
+
+        // Copy ready parent roots before processing because processing mutates cache maps.
+        var ready_parent_roots: std.ArrayList(types.Root) = .empty;
+        defer ready_parent_roots.deinit(self.allocator);
+
+        var it = self.network.fetched_block_children.iterator();
+        while (it.next()) |entry| {
+            const parent_root = entry.key_ptr.*;
+            if (self.chain.forkChoice.hasBlock(parent_root)) {
+                ready_parent_roots.append(self.allocator, parent_root) catch continue;
+            }
+        }
+
+        for (ready_parent_roots.items) |parent_root| {
+            self.processCachedDescendants(parent_root);
         }
     }
 
@@ -919,6 +947,9 @@ pub const BeamNode = struct {
             };
         }
 
+        // Retry cached descendants whose parents are now available and whose slot is no longer in the future.
+        self.retryReadyCachedDescendants();
+
         // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers
         self.sweepTimedOutRequests();
 
@@ -1412,6 +1443,75 @@ test "Node: processCachedDescendants basic flow" {
     try std.testing.expect(!node.network.hasFetchedBlock(block2_root));
 
     // Verify block2 is now in the chain
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
+}
+
+test "Node: processCachedDescendants keeps FutureSlot block cached for retry" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+    var mock_chain = try stf.genMockChain(allocator, 3, ctx.genesisConfig());
+    defer mock_chain.deinit(allocator);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[1]);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[2]);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const block1 = mock_chain.blocks[1];
+    const block2 = mock_chain.blocks[2];
+    const block1_root = mock_chain.blockRoots[1];
+    const block2_root = mock_chain.blockRoots[2];
+    const block1_slot: usize = @intCast(block1.message.block.slot);
+    const block2_slot: usize = @intCast(block2.message.block.slot);
+
+    // Cache child block first so processing it before slot tick returns FutureSlot.
+    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    try types.sszClone(allocator, types.SignedBlockWithAttestation, block2, block2_ptr);
+    try node.network.cacheFetchedBlock(block2_root, block2_ptr);
+
+    // Import parent block at its slot so cached descendant processing can start.
+    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
+    const missing_roots1 = try node.chain.onBlock(block1, .{});
+    defer allocator.free(missing_roots1);
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block1_root));
+
+    // First retry happens before slot-2 tick; block2 should stay cached.
+    node.processCachedDescendants(block1_root);
+    try std.testing.expect(node.network.hasFetchedBlock(block2_root));
+    try std.testing.expect(!node.chain.forkChoice.hasBlock(block2_root));
+
+    // After ticking to slot-2, interval retry should process and evict it.
+    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false);
+    node.retryReadyCachedDescendants();
+
+    try std.testing.expect(!node.network.hasFetchedBlock(block2_root));
     try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
 }
 
