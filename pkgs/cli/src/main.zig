@@ -34,6 +34,7 @@ const database = @import("@zeam/database");
 const sft_factory = @import("@zeam/state-transition");
 const api = @import("@zeam/api");
 const api_server = @import("api_server.zig");
+const metrics_server = @import("metrics_server.zig");
 
 const networks = @import("@zeam/network");
 
@@ -61,6 +62,7 @@ pub const NodeCommand = struct {
     validator_config: []const u8,
     metrics_enable: bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
+    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
     @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
@@ -77,8 +79,9 @@ pub const NodeCommand = struct {
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
         .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
-        .@"api-port" = "Port for the API server (metrics, health, events, forkchoice graph, checkpoint state)",
-        .metrics_enable = "Enable API server (metrics, health, events, forkchoice graph, checkpoint state)",
+        .@"api-port" = "Port for the API server (health, events, forkchoice graph, checkpoint state)",
+        .@"metrics-port" = "Port for the Prometheus metrics server",
+        .metrics_enable = "Enable API and metrics servers (health, events, forkchoice graph, checkpoint state, metrics)",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
@@ -92,12 +95,16 @@ const BeamCmd = struct {
     help: bool = false,
     mockNetwork: bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
+    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
 
-    pub fn format(self: BeamCmd, writer: anytype) !void {
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, data_dir=\"{s}\" }}", .{
+    pub fn format(self: BeamCmd, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\" }}", .{
             self.mockNetwork,
             self.@"api-port",
+            self.@"metrics-port",
             self.data_dir,
         });
     }
@@ -136,17 +143,17 @@ const ZeamArgs = struct {
 
             __commands__: union(enum) {
                 genconfig: struct {
-                    @"api-port": u16 = constants.DEFAULT_API_PORT,
+                    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
                     filename: []const u8 = "prometheus.yml",
                     help: bool = false,
 
                     pub const __shorts__ = .{
-                        .@"api-port" = .p,
+                        .@"metrics-port" = .p,
                         .filename = .f,
                     };
 
                     pub const __messages__ = .{
-                        .@"api-port" = "Port for the API server to scrape metrics from",
+                        .@"metrics-port" = "Port for the metrics server to scrape",
                         .filename = "output name for the config file",
                     };
                 },
@@ -317,14 +324,28 @@ fn mainInner() !void {
             };
 
             var api_server_handle: ?*api_server.ApiServer = null;
+            var metrics_server_handle: ?*metrics_server.MetricsServer = null;
             defer if (api_server_handle) |handle| handle.stop();
+            defer if (metrics_server_handle) |handle| handle.stop();
 
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
 
-            // Create logger config for API server
+            // Create logger config for API and metrics servers
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
+
+            // Validate that API and metrics ports are different
+            if (beamcmd.@"api-port" == beamcmd.@"metrics-port") {
+                std.log.err("API port and metrics port cannot be the same (both set to {d})", .{beamcmd.@"api-port"});
+                return error.PortConflict;
+            }
+
+            // Start metrics server (doesn't need chain reference)
+            metrics_server_handle = metrics_server.startMetricsServer(allocator, beamcmd.@"metrics-port", &api_logger_config) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start metrics server", .{ .port = beamcmd.@"metrics-port" });
+                return err;
+            };
 
             // Start API server early. Pass null for chain - in .beam command mode, chains are created later
             api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
@@ -646,7 +667,7 @@ fn mainInner() !void {
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
-                const generated_config = generatePrometheusConfig(allocator, genconfig.@"api-port") catch |err| {
+                const generated_config = generatePrometheusConfig(allocator, genconfig.@"metrics-port") catch |err| {
                     ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
                     return err;
                 };
@@ -690,6 +711,7 @@ fn mainInner() !void {
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
                 .api_port = leancmd.@"api-port",
+                .metrics_port = leancmd.@"metrics-port",
                 .bootnodes = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .genesis_spec = undefined,
                 .validator_assignments = &.{}, // Initialize to empty slice to avoid segfault in deinit
