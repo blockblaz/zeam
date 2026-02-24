@@ -52,7 +52,11 @@ fn visualizeTreeBranch(allocator: Allocator, tree_lines: *std.ArrayListUnmanaged
     var c_idx = node.firstChild;
     while (c_idx > 0) {
         const child_node = nodes[c_idx];
-        try children.append(allocator, .{ .id = c_idx, .recency = child_node.bestDescendant orelse child_node.slot });
+        try children.append(allocator, .{
+            //
+            .id = c_idx,
+            .recency = if (child_node.bestDescendant) |desc_idx| nodes[desc_idx].slot else child_node.slot,
+        });
 
         c_idx = child_node.nextSibling;
     }

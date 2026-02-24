@@ -97,9 +97,7 @@ const BeamCmd = struct {
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
     @"is-aggregator": bool = true,
 
-    pub fn format(self: BeamCmd, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: BeamCmd, writer: anytype) !void {
         try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, data_dir=\"{s}\", is-aggregator={} }}", .{
             self.mockNetwork,
             self.@"api-port",
@@ -186,14 +184,7 @@ const ZeamArgs = struct {
         .version = .v,
     };
 
-    pub fn format(
-        self: ZeamArgs,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: ZeamArgs, writer: anytype) !void {
         try writer.print("ZeamArgs(genesis={d}, log_filename=\"{s}\", console_log_level={s}, file_log_level={s}", .{
             self.genesis,
             self.log_filename,
@@ -203,7 +194,7 @@ const ZeamArgs = struct {
         try writer.writeAll(", command=");
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
-            .beam => |cmd| try writer.print("{any}", .{cmd}),
+            .beam => |cmd| try writer.print("{f}", .{cmd}),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
