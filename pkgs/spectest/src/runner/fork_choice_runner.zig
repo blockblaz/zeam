@@ -811,10 +811,10 @@ fn applyChecks(
 
         if (std.mem.eql(u8, key, "time")) {
             const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
-            if (ctx.fork_choice.fcStore.time != expected) {
+            if (ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) != expected) {
                 std.debug.print(
                     "fixture {s} case {s}{any}: store time mismatch got {d} expected {d}\n",
-                    .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.fcStore.time, expected },
+                    .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic), expected },
                 );
                 return FixtureError.FixtureMismatch;
             }
