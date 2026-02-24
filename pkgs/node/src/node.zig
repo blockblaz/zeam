@@ -349,6 +349,16 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
+                // Advance forkchoice clock to the block's slot to prevent FutureSlot
+                const block_slot = cached_block.message.block.slot;
+                self.chain.forkChoice.onInterval(block_slot * constants.INTERVALS_PER_SLOT, false) catch |err| {
+                    self.logger.warn(
+                        "cached block 0x{x}: failed to advance forkchoice clock: {any}",
+                        .{ &descendant_root, err },
+                    );
+                    continue;
+                };
+
                 const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
@@ -485,6 +495,15 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
             }
+
+            // Advance forkchoice clock to the block's slot to prevent FutureSlot
+            self.chain.forkChoice.onInterval(
+                signed_block.message.block.slot * constants.INTERVALS_PER_SLOT,
+                false,
+            ) catch |err| {
+                self.logger.warn("failed to advance forkchoice clock for RPC block 0x{x}: {any}", .{ &block_root, err });
+                return;
+            };
 
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
@@ -905,19 +924,6 @@ pub const BeamNode = struct {
             // no point going further if chain is not ticked properly
             return e;
         };
-
-        // Replay blocks that were queued waiting for the forkchoice clock to advance,
-        // then fetch any attestation head roots that were missing during replay.
-        const pending_missing_roots = self.chain.processPendingBlocks();
-        defer self.allocator.free(pending_missing_roots);
-        if (pending_missing_roots.len > 0) {
-            self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                self.logger.warn(
-                    "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                    .{ pending_missing_roots.len, err },
-                );
-            };
-        }
 
         // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers
         self.sweepTimedOutRequests();
@@ -1412,6 +1418,75 @@ test "Node: processCachedDescendants basic flow" {
     try std.testing.expect(!node.network.hasFetchedBlock(block2_root));
 
     // Verify block2 is now in the chain
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
+}
+
+test "Node: processCachedDescendants pre-advances forkchoice clock for future-slot blocks" {
+    // Verifies that processCachedDescendants automatically advances the forkchoice
+    // clock to a cached block's slot before calling onBlock, so blocks are processed
+    // immediately instead of being rejected with FutureSlot.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+    var mock_chain = try stf.genMockChain(allocator, 3, ctx.genesisConfig());
+    defer mock_chain.deinit(allocator);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[1]);
+    try ctx.signBlockWithValidatorKeys(allocator, &mock_chain.blocks[2]);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const block1 = mock_chain.blocks[1];
+    const block2 = mock_chain.blocks[2];
+    const block1_root = mock_chain.blockRoots[1];
+    const block2_root = mock_chain.blockRoots[2];
+    const block1_slot: usize = @intCast(block1.message.block.slot);
+
+    // Cache block2 before its parent is known.
+    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    try types.sszClone(allocator, types.SignedBlockWithAttestation, block2, block2_ptr);
+    try node.network.cacheFetchedBlock(block2_root, block2_ptr);
+
+    // Advance forkchoice clock ONLY to block1's slot — deliberately leave it
+    // behind block2's slot so that without the pre-advance fix, onBlock would
+    // reject block2 with FutureSlot.
+    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
+    const missing_roots1 = try node.chain.onBlock(block1, .{});
+    defer allocator.free(missing_roots1);
+    try std.testing.expect(node.chain.forkChoice.hasBlock(block1_root));
+
+    // Call processCachedDescendants WITHOUT advancing clock to block2's slot.
+    // The pre-advance inside processCachedDescendants should handle it.
+    node.processCachedDescendants(block1_root);
+
+    // block2 should be processed successfully (removed from cache, added to chain).
+    try std.testing.expect(!node.network.hasFetchedBlock(block2_root));
     try std.testing.expect(node.chain.forkChoice.hasBlock(block2_root));
 }
 
