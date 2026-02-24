@@ -330,6 +330,7 @@ pub const ForkChoice = struct {
             .slot_clock = zeam_utils.SlotTimeClock.init(
                 opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
                 opts.anchorState.slot,
+                0, // slotInterval is 0 at anchor: time is always a slot boundary
             ),
             .latest_justified = anchorCP,
             .latest_finalized = anchorCP,
@@ -781,6 +782,7 @@ pub const ForkChoice = struct {
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
+        self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
 
         switch (currentInterval) {
             0 => {
@@ -1670,7 +1672,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     // Create ForkChoice with head at F
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8),
+        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };
@@ -1984,7 +1986,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8),
+        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };
@@ -2931,7 +2933,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .slot_clock = zeam_utils.SlotTimeClock.init(3 * constants.INTERVALS_PER_SLOT, 3),
+        .slot_clock = zeam_utils.SlotTimeClock.init(3 * constants.INTERVALS_PER_SLOT, 3, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };

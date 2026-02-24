@@ -20,21 +20,21 @@ const Colors = struct {
 /// Owned by the forkchoice and read lock-free by the logger via atomic loads.
 /// `time` is the absolute interval count since genesis (4 intervals per slot).
 /// `timeSlots` is the current slot since genesis.
+/// `slotInterval` is the current interval within the slot (0-3), updated by
+/// the forkchoice on every tick so the logger never needs to know INTERVALS_PER_SLOT.
 pub const SlotTimeClock = struct {
     time: std.atomic.Value(u64),
     timeSlots: std.atomic.Value(u64),
+    slotInterval: std.atomic.Value(u64),
 
-    pub fn init(time: u64, timeSlots: u64) SlotTimeClock {
+    pub fn init(time: u64, timeSlots: u64, slotInterval: u64) SlotTimeClock {
         return .{
             .time = std.atomic.Value(u64).init(time),
             .timeSlots = std.atomic.Value(u64).init(timeSlots),
+            .slotInterval = std.atomic.Value(u64).init(slotInterval),
         };
     }
 };
-
-// Number of intervals per slot - mirrors node/constants.zig INTERVALS_PER_SLOT.
-// Defined here to avoid a cross-package dependency for log formatting.
-const INTERVALS_PER_SLOT: u64 = 4;
 
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
@@ -67,9 +67,8 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         // Format optional slot/interval suffix: " [s=<slot> i=<interval>]"
         var slot_buf: [32]u8 = undefined;
         const slot_str: []const u8 = if (slot_clock) |sc| blk: {
-            const t = sc.time.load(.monotonic);
             const s = sc.timeSlots.load(.monotonic);
-            const i = t % INTERVALS_PER_SLOT;
+            const i = sc.slotInterval.load(.monotonic);
             break :blk std.fmt.bufPrint(&slot_buf, " [s={d} i={d}]", .{ s, i }) catch "";
         } else "";
 
