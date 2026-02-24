@@ -336,14 +336,19 @@ pub const ForkChoice = struct {
         const fc_store = switch (opts.anchor_type) {
             .head => return error.AnchorTypeHeadNotImplemented, // TODO: create issue for head anchor support
             .finalized => blk: {
+                // For checkpoint sync, use the anchor checkpoint for both justified and finalized.
+                // The anchor block is the only block in the ProtoArray at init time, so we must
+                // reference it for fork choice head computation to work.
+                // As new blocks are processed, fcStore.update() will advance these values
+                // based on the post-state's justified/finalized checkpoints.
                 opts.logger.info(
-                    "forkchoice initialized from checkpoint sync (finalized): anchor_slot={d} justified_slot=0 (to be determined from network)",
-                    .{anchorCP.slot},
+                    "forkchoice initialized from checkpoint sync: anchor_slot={d} (state had justified={d} finalized={d})",
+                    .{ anchorCP.slot, opts.anchorState.latest_justified.slot, opts.anchorState.latest_finalized.slot },
                 );
                 break :blk ForkChoiceStore{
                     .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
                     .timeSlots = opts.anchorState.slot,
-                    .latest_justified = .{ .slot = 0, .root = types.ZERO_HASH },
+                    .latest_justified = anchorCP,
                     .latest_finalized = anchorCP,
                 };
             },
