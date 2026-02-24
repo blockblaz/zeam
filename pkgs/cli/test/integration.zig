@@ -170,19 +170,20 @@ const ZeamRequest = struct {
     }
 
     /// Make a request to the /metrics endpoint and return the response
+    /// Note: Metrics are served on the separate metrics port (default: 9668)
     fn getMetrics(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/metrics");
+        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT);
     }
 
     /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/lean/v0/health");
+        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
     }
 
-    /// Internal helper to make HTTP requests to any endpoint
-    fn makeRequest(self: ZeamRequest, endpoint: []const u8) ![]u8 {
+    /// Internal helper to make HTTP requests to any endpoint on the specified port
+    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
         // Create connection to the server
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, port);
         var connection = try net.tcpConnectToAddress(address);
         defer connection.close();
 
@@ -191,7 +192,7 @@ const ZeamRequest = struct {
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
             "Connection: close\r\n" ++
-            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
+            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, port });
 
         var conn_write_buf: [4096]u8 = undefined;
         var conn_writer = connection.writer(&conn_write_buf);
