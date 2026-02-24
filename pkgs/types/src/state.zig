@@ -801,6 +801,69 @@ fn makeBlock(
     };
 }
 
+test "process_attestations invalid justifiable slot returns error without panic" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    try state.process_slots(std.testing.allocator, 1, logger);
+    var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_1.deinit();
+    try state.process_block(std.testing.allocator, block_1, logger);
+
+    try state.process_slots(std.testing.allocator, 2, logger);
+    var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_2.deinit();
+    try state.process_block_header(std.testing.allocator, block_2, logger);
+
+    const slot_0_root = try state.historical_block_hashes.get(0);
+    const slot_1_root = try state.historical_block_hashes.get(1);
+
+    // Seed pending justifications so error unwind exercises map cleanup with allocated entries.
+    var pending_roots = try JustificationRoots.init(std.testing.allocator);
+    errdefer pending_roots.deinit();
+    try pending_roots.append(slot_1_root);
+
+    var pending_validators = try JustificationValidators.init(std.testing.allocator);
+    errdefer pending_validators.deinit();
+    try pending_validators.append(true);
+    try pending_validators.append(false);
+    try pending_validators.append(false);
+
+    state.justifications_roots.deinit();
+    state.justifications_roots = pending_roots;
+    state.justifications_validators.deinit();
+    state.justifications_validators = pending_validators;
+
+    state.latest_finalized = .{ .root = slot_1_root, .slot = 1 };
+
+    var att = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = slot_1_root, .slot = 1 },
+        .{ .root = slot_0_root, .slot = 0 },
+    );
+    var att_transferred = false;
+    defer if (!att_transferred) att.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*entry| {
+            entry.deinit();
+        }
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att);
+    att_transferred = true;
+
+    try std.testing.expectError(
+        StateTransitionError.InvalidJustifiableSlot,
+        state.process_attestations(std.testing.allocator, attestations_list, logger),
+    );
+}
+
 test "justified_slots do not include finalized boundary" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);

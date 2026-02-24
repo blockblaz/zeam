@@ -26,6 +26,7 @@ pub const NewHeadEvent = struct {
     parent_root: []const u8,
     state_root: []const u8,
     timely: bool,
+    node_id: ?u32,
 
     pub fn fromProtoBlock(allocator: Allocator, proto_block: types.ProtoBlock) !NewHeadEvent {
         const block_root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&proto_block.blockRoot});
@@ -38,6 +39,7 @@ pub const NewHeadEvent = struct {
             .parent_root = parent_root_hex,
             .state_root = state_root_hex,
             .timely = proto_block.timeliness,
+            .node_id = null,
         };
     }
 
@@ -48,6 +50,9 @@ pub const NewHeadEvent = struct {
         try obj.put("parent_root", json.Value{ .string = self.parent_root });
         try obj.put("state_root", json.Value{ .string = self.state_root });
         try obj.put("timely", json.Value{ .bool = self.timely });
+        if (self.node_id) |node_id| {
+            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+        }
         return json.Value{ .object = obj };
     }
 
@@ -69,14 +74,16 @@ pub const NewJustificationEvent = struct {
     slot: u64,
     root: []const u8,
     justified_slot: u64,
+    node_id: ?u32,
 
-    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewJustificationEvent {
+    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64, node_id: ?u32) !NewJustificationEvent {
         const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&checkpoint.root});
 
         return NewJustificationEvent{
             .slot = current_slot,
             .root = root_hex,
             .justified_slot = checkpoint.slot,
+            .node_id = node_id,
         };
     }
 
@@ -85,6 +92,9 @@ pub const NewJustificationEvent = struct {
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         try obj.put("root", json.Value{ .string = self.root });
         try obj.put("justified_slot", json.Value{ .integer = @as(i64, @intCast(self.justified_slot)) });
+        if (self.node_id) |node_id| {
+            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+        }
         return json.Value{ .object = obj };
     }
 
@@ -104,14 +114,16 @@ pub const NewFinalizationEvent = struct {
     slot: u64,
     root: []const u8,
     finalized_slot: u64,
+    node_id: ?u32,
 
-    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64) !NewFinalizationEvent {
+    pub fn fromCheckpoint(allocator: Allocator, checkpoint: Checkpoint, current_slot: u64, node_id: ?u32) !NewFinalizationEvent {
         const root_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&checkpoint.root});
 
         return NewFinalizationEvent{
             .slot = current_slot,
             .root = root_hex,
             .finalized_slot = checkpoint.slot,
+            .node_id = node_id,
         };
     }
 
@@ -120,6 +132,9 @@ pub const NewFinalizationEvent = struct {
         try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
         try obj.put("root", json.Value{ .string = self.root });
         try obj.put("finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
+        if (self.node_id) |node_id| {
+            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+        }
         return json.Value{ .object = obj };
     }
 
@@ -217,7 +232,7 @@ test "serialize new justification event" {
         .root = [_]u8{5} ** 32,
     };
 
-    var just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123);
+    var just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123, null);
     defer just_event.deinit(allocator);
 
     const chain_event = ChainEvent{ .new_justification = just_event };
@@ -237,7 +252,7 @@ test "serialize new finalization event" {
         .root = [_]u8{4} ** 32,
     };
 
-    var final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 123);
+    var final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 123, null);
     defer final_event.deinit(allocator);
 
     const chain_event = ChainEvent{ .new_finalization = final_event };
@@ -270,7 +285,7 @@ fn makeSampleChainEvent(allocator: Allocator, tag: ChainEventType) !ChainEvent {
                 .slot = 999_999,
                 .root = [_]u8{0x12} ** 32,
             };
-            const just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 999_999);
+            const just_event = try NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 999_999, null);
             break :blk ChainEvent{ .new_justification = just_event };
         },
         .new_finalization => blk: {
@@ -278,7 +293,7 @@ fn makeSampleChainEvent(allocator: Allocator, tag: ChainEventType) !ChainEvent {
                 .slot = 999_999,
                 .root = [_]u8{0x34} ** 32,
             };
-            const final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 999_999);
+            const final_event = try NewFinalizationEvent.fromCheckpoint(allocator, checkpoint, 999_999, null);
             break :blk ChainEvent{ .new_finalization = final_event };
         },
     };
