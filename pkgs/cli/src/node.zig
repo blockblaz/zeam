@@ -6,6 +6,7 @@ const Yaml = @import("yaml").Yaml;
 const configs = @import("@zeam/configs");
 const api = @import("@zeam/api");
 const api_server = @import("api_server.zig");
+const metrics_server = @import("metrics_server.zig");
 const event_broadcaster = api.event_broadcaster;
 const ChainConfig = configs.ChainConfig;
 const Chain = configs.Chain;
@@ -81,6 +82,7 @@ pub const NodeOptions = struct {
     metrics_enable: bool,
     is_aggregator: bool,
     api_port: u16,
+    metrics_port: u16,
     local_priv_key: []const u8,
     logger_config: *LoggerConfig,
     database_path: []const u8,
@@ -124,6 +126,7 @@ pub const Node = struct {
     db: database.Db,
     key_manager: key_manager_lib.KeyManager,
     api_server_handle: ?*api_server.ApiServer,
+    metrics_server_handle: ?*metrics_server.MetricsServer,
     anchor_state: *types.BeamState,
 
     const Self = @This();
@@ -136,6 +139,7 @@ pub const Node = struct {
         self.allocator = allocator;
         self.options = options;
         self.api_server_handle = null;
+        self.metrics_server_handle = null;
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
@@ -244,10 +248,27 @@ pub const Node = struct {
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
         });
+        errdefer self.beam_node.deinit();
 
-        // Start API server after chain is initialized so we can pass the chain pointer
+        // Start API and metrics servers
+        // Note: api.init() was already called above before beam_node.init()
         if (options.metrics_enable) {
-            try api.init(allocator);
+            // Validate that API and metrics ports are different
+            if (options.api_port == options.metrics_port) {
+                std.log.err("API port and metrics port cannot be the same (both set to {d})", .{options.api_port});
+                return error.PortConflict;
+            }
+
+            // Start metrics server (doesn't need chain reference)
+            self.metrics_server_handle = try metrics_server.startMetricsServer(
+                allocator,
+                options.metrics_port,
+                options.logger_config,
+            );
+            // Clean up metrics server if subsequent init operations fail
+            errdefer if (self.metrics_server_handle) |handle| handle.stop();
+
+            // Start API server (pass chain pointer for chain-dependent endpoints)
             self.api_server_handle = try api_server.startAPIServer(
                 allocator,
                 options.api_port,
@@ -265,6 +286,9 @@ pub const Node = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.api_server_handle) |handle| {
+            handle.stop();
+        }
+        if (self.metrics_server_handle) |handle| {
             handle.stop();
         }
         self.clock.deinit(self.allocator);
@@ -1359,6 +1383,7 @@ test "NodeOptions checkpoint_sync_url field is optional" {
         .metrics_enable = false,
         .is_aggregator = false,
         .api_port = 5052,
+        .metrics_port = 5053,
         .local_priv_key = try allocator.dupe(u8, "test"),
         .logger_config = &logger_config,
         .database_path = "test",
