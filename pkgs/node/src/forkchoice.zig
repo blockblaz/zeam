@@ -44,9 +44,7 @@ pub const ProtoNode = struct {
     // info populated lazily for tree visualization in snapshot for efficiency purposes
     numBranches: ?usize = null,
 
-    pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: ProtoNode, writer: anytype) !void {
         try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{x} }}", .{
             self.slot,
             self.weight,
@@ -886,6 +884,14 @@ pub const ForkChoice = struct {
         // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
         // This prevents creating invalid attestations where source slot exceeds target slot
         // If the calculated target is older than latest_justified, use latest_justified instead
+        // TODO figure out how this happens
+        //
+        // - one scenario is where checkpoint sync from finalized wrongly sets justified to the anchor and doesn't get updated
+        //
+        // - other is the below scenario but needs to be validated and fixed properly (from previous comments)
+        // This can happen when the updateHeadUnlocked is not yet called for the new block
+        // and the target is calculated before the head is updated
+        // OnBlock calls update the latest_justified and attestation occurs on interval before the head is updated
         if (nodes[target_idx].slot < self.fcStore.latest_justified.slot) {
             return self.fcStore.latest_justified;
         }
@@ -943,7 +949,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={f} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,

@@ -335,7 +335,7 @@ pub const ModuleLogger = struct {
 };
 
 /// Formatter for optional node names in logs
-/// Usage: logger.info("{}message", .{OptionalNode.init(maybe_node_name)})
+/// Usage: logger.info("{f}message", .{OptionalNode.init(maybe_node_name)})
 /// Outputs: "message" or "(node1) message"
 pub const OptionalNode = struct {
     name: ?[]const u8,
@@ -344,17 +344,10 @@ pub const OptionalNode = struct {
         return .{ .name = name };
     }
 
-    pub fn format(
-        self: OptionalNode,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
+    pub fn format(self: OptionalNode, writer: anytype) !void {
         const peer_color = Colors.peer;
         const reset_color = Colors.reset;
 
-        _ = fmt;
-        _ = options;
         if (self.name) |n| {
             try writer.print("({s}{s}{s})", .{ peer_color, n, reset_color });
         }
@@ -498,7 +491,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("alice");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print(" Peer connected: {s}, total peers: {d}", .{
             "peer123",
             5,
@@ -514,7 +507,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init(null);
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print("Peer connected: {s}, total peers: {d}", .{
             "peer456",
             3,
@@ -530,7 +523,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("validator-7");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print(" Published block: slot={d} proposer={d}", .{
             100,
             7,
@@ -546,7 +539,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.writeAll(" Message");
 
         try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", buffer.items);
