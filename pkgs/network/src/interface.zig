@@ -324,6 +324,40 @@ pub const GossipMessage = union(GossipTopicKind) {
         return cloned_data;
     }
 
+    /// Returns the SSZ type used for deserialization of a given gossip topic kind.
+    fn SszType(comptime tag: GossipTopicKind) type {
+        return switch (tag) {
+            .block => types.SignedBlockWithAttestation,
+            .attestation => types.SignedAttestation,
+            .aggregation => types.SignedAggregatedAttestation,
+        };
+    }
+
+    /// Deserialize an SSZ-encoded gossip message into a GossipMessage.
+    /// For attestation messages, `topic` must contain a valid `subnet_id`.
+    pub fn deserialize(
+        data: []const u8,
+        topic: GossipTopic,
+        allocator: Allocator,
+    ) error{ DeserializationFailed, MissingSubnetId }!Self {
+        switch (topic.kind) {
+            inline else => |tag| {
+                const T = SszType(tag);
+                var message_data: T = undefined;
+                ssz.deserialize(T, data, &message_data, allocator) catch {
+                    return error.DeserializationFailed;
+                };
+                return switch (tag) {
+                    .attestation => .{ .attestation = .{
+                        .subnet_id = topic.subnet_id orelse return error.MissingSubnetId,
+                        .message = message_data,
+                    } },
+                    inline else => |t| @unionInit(Self, @tagName(t), message_data),
+                };
+            },
+        }
+    }
+
     pub fn deinit(self: *Self) void {
         switch (self.*) {
             .block => |*block| block.deinit(),

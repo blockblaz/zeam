@@ -294,51 +294,26 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
-    var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
-        .block => blockmessage: {
-            var message_data: types.SignedBlockWithAttestation = undefined;
-            ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Block deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-
-            break :blockmessage .{ .block = message_data };
-        },
-        .attestation => attestationmessage: {
-            const subnet_id = topic.gossip_topic.subnet_id orelse {
+    var message: interface.GossipMessage = interface.GossipMessage.deserialize(
+        uncompressed_message,
+        topic.gossip_topic,
+        zigHandler.allocator,
+    ) catch |e| {
+        const kind_name = @tagName(topic.gossip_topic.kind);
+        switch (e) {
+            error.MissingSubnetId => {
                 zigHandler.logger.err("attestation topic missing subnet id: {s}", .{std.mem.span(topic_str)});
-                return;
-            };
-            var message_data: types.SignedAttestation = undefined;
-            ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "attestation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Attestation deserialization failed - debug file created: {s}", .{filename});
+            },
+            error.DeserializationFailed => {
+                zigHandler.logger.err("Error in deserializing the {s} message", .{kind_name});
+                if (writeFailedBytes(uncompressed_message, kind_name, zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("{s} deserialization failed - debug file created: {s}", .{ kind_name, filename });
                 } else {
-                    zigHandler.logger.err("Attestation deserialization failed - could not create debug file", .{});
+                    zigHandler.logger.err("{s} deserialization failed - could not create debug file", .{kind_name});
                 }
-                return;
-            };
-            break :attestationmessage .{ .attestation = .{ .subnet_id = subnet_id, .message = message_data } };
-        },
-        .aggregation => aggregationmessage: {
-            var message_data: types.SignedAggregatedAttestation = undefined;
-            ssz.deserialize(types.SignedAggregatedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed aggregated attestation message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "aggregation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Aggregation deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Aggregation deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-            break :aggregationmessage .{ .aggregation = message_data };
-        },
+            },
+        }
+        return;
     };
     defer message.deinit();
 
