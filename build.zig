@@ -812,6 +812,7 @@ fn build_zkvm_targets(
                 .root_source_file = b.path("pkgs/state-transition-runtime/src/main.zig"),
                 .target = target,
                 .optimize = optimize,
+                .strip = true, // Strip debug info to avoid RISC-V relocation overflow
             }),
         });
         // addimport to root module is even required afer declaring it in mod
