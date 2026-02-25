@@ -74,6 +74,7 @@ pub const GenesisSpec = utils.GenesisSpec;
 pub const ChainSpec = utils.ChainSpec;
 pub const sszClone = utils.sszClone;
 pub const IsJustifiableSlot = utils.IsJustifiableSlot;
+pub const RootToSlotCache = utils.RootToSlotCache;
 
 const zk = @import("./zk.zig");
 pub const ZkVm = zk.ZkVm;
