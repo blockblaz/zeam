@@ -675,6 +675,29 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
+                        // If forkchoice rejected the block as FutureSlot despite the
+                        // pre-check, a TOCTOU race occurred: fcStore.time was read
+                        // without the forkchoice mutex and advanced between the check
+                        // and onBlock acquiring the lock (libp2p backend runs gossip
+                        // on a separate thread).  Queue the block for replay instead
+                        // of dropping it.
+                        if (err == error.FutureSlot) {
+                            self.module_logger.info(
+                                "onBlock returned FutureSlot for slot={d} blockroot=0x{x} (fc_time={d}), queuing for retry",
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.time },
+                            );
+                            var cloned: types.SignedBlockWithAttestation = undefined;
+                            types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &cloned) catch |clone_err| {
+                                self.module_logger.err("failed to clone block for FutureSlot retry slot={d}: {any}", .{ block.slot, clone_err });
+                                return err;
+                            };
+                            self.pending_blocks.append(self.allocator, cloned) catch |append_err| {
+                                cloned.deinit();
+                                self.module_logger.err("failed to queue block for FutureSlot retry slot={d}: {any}", .{ block.slot, append_err });
+                                return err;
+                            };
+                            return .{};
+                        }
                         self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
