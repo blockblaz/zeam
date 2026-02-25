@@ -644,12 +644,24 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                if (!hasBlock) {
+                if (hasBlock) {
+                    self.module_logger.debug("reprocessing locally produced block to add signed proposer attestation: blockroot=0x{x} slot={d} proposer={d}", .{
+                        &block_root,
+                        block.slot,
+                        block.proposer_index,
+                    });
+                } else {
+                    self.module_logger.debug("processing block not locally produced before publishing: blockroot=0x{x} slot={d} proposer={d}", .{
+                        &block_root,
+                        block.slot,
+                        block.proposer_index,
+                    });
+
                     // Validation errors propagate to node.zig for context-aware logging
                     try self.validateBlock(block, true);
 
                     // If the forkchoice clock hasn't yet ticked to this block's slot,
-                    // onBlock would reject it with FutureSlot.  Queue the block and
+                    // onBlock would reject it with FutureSlot. Queue the block and
                     // replay it from onInterval once the clock has advanced.
                     if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
                         self.module_logger.debug(
@@ -681,36 +693,28 @@ pub const BeamChain = struct {
                             cloned.deinit();
                         }
                     }
+                }
 
-                    const missing_roots = self.onBlock(signed_block, .{
-                        .blockRoot = block_root,
-                    }) catch |err| {
-                        self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
-                            block.slot,
-                            &block_root,
-                            err,
-                        });
-                        return err;
-                    };
-                    // followup with additional housekeeping tasks
-                    self.onBlockFollowup(true, &signed_block);
-                    // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
-                    // which is responsible for freeing it after optionally fetching those roots.
-
-                    // Return both the block root and missing attestation roots so the node can:
-                    // 1. Call processCachedDescendants(block_root) to retry any cached children
-                    // 2. Fetch missing attestation head blocks via RPC
-                    return .{
-                        .processed_block_root = block_root,
-                        .missing_attestation_roots = missing_roots,
-                    };
-                } else {
-                    self.module_logger.debug("skipping processing the already present block slot={d} blockroot=0x{x}", .{
+                // Call onBlock even when block is already in FC so we get missing_roots and can trigger
+                // processCachedDescendants / fetchBlockByRoots (same pattern as publishBlock in node.zig).
+                const missing_roots = self.onBlock(signed_block, .{
+                    .blockRoot = block_root,
+                }) catch |err| {
+                    self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                         block.slot,
                         &block_root,
+                        err,
                     });
-                }
-                return .{};
+                    return err;
+                };
+
+                self.onBlockFollowup(true, &signed_block);
+
+                // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode).
+                return .{
+                    .processed_block_root = block_root,
+                    .missing_attestation_roots = missing_roots,
+                };
             },
             .attestation => |signed_attestation| {
                 const slot = signed_attestation.message.slot;
