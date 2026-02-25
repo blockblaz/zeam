@@ -117,6 +117,15 @@ pub const ValidatorClient = struct {
                     });
                     return null;
                 },
+                .fork_diverged => |info| {
+                    self.logger.err("skipping block production for slot={d} proposer={d}: FORK DIVERGED (our_finalized={d}, peer_finalized={d})", .{
+                        slot,
+                        slot_proposer_id,
+                        info.our_finalized_slot,
+                        info.peer_finalized_slot,
+                    });
+                    return null;
+                },
             }
 
             // 1. construct the block
@@ -181,6 +190,14 @@ pub const ValidatorClient = struct {
                     info.head_slot,
                     info.finalized_slot,
                     info.max_peer_finalized_slot,
+                });
+                return null;
+            },
+            .fork_diverged => |info| {
+                self.logger.err("skipping attestation production for slot={d}: FORK DIVERGED (our_finalized={d}, peer_finalized={d})", .{
+                    slot,
+                    info.our_finalized_slot,
+                    info.peer_finalized_slot,
                 });
                 return null;
             },

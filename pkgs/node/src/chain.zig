@@ -1455,6 +1455,12 @@ pub const BeamChain = struct {
             finalized_slot: types.Slot,
             max_peer_finalized_slot: types.Slot,
         },
+        fork_diverged: struct {
+            our_finalized_slot: types.Slot,
+            our_finalized_root: types.Root,
+            peer_finalized_slot: types.Slot,
+            peer_finalized_root: types.Root,
+        },
     };
 
     /// Returns detailed sync status information.
@@ -1467,9 +1473,13 @@ pub const BeamChain = struct {
 
         const our_head_slot = self.forkChoice.head.slot;
         const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        const our_finalized_root = self.forkChoice.fcStore.latest_finalized.root;
 
         // Find the maximum finalized slot reported by any peer
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
+        var found_fork_divergence: bool = false;
+        var diverged_peer_finalized_slot: types.Slot = 0;
+        var diverged_peer_finalized_root: types.Root = undefined;
 
         var peer_iter = self.connected_peers.iterator();
         while (peer_iter.next()) |entry| {
@@ -1478,7 +1488,31 @@ pub const BeamChain = struct {
                 if (status.finalized_slot > max_peer_finalized_slot) {
                     max_peer_finalized_slot = status.finalized_slot;
                 }
+
+                // Fork divergence check: if peer's finalized slot is at or ahead of our finalized slot
+                // but at or before our head, we should have their finalized block in forkchoice.
+                // If we don't, we're on a different fork.
+                // NOTE: We only check when peer.finalized >= our.finalized because blocks before
+                // our finalized checkpoint may have been pruned from forkchoice.
+                if (status.finalized_slot >= our_finalized_slot and
+                    status.finalized_slot <= our_head_slot and
+                    !self.forkChoice.hasBlock(status.finalized_root))
+                {
+                    found_fork_divergence = true;
+                    diverged_peer_finalized_slot = status.finalized_slot;
+                    diverged_peer_finalized_root = status.finalized_root;
+                }
             }
+        }
+
+        // Check 0: fork divergence detected — we're on a different chain than peers
+        if (found_fork_divergence) {
+            return .{ .fork_diverged = .{
+                .our_finalized_slot = our_finalized_slot,
+                .our_finalized_root = our_finalized_root,
+                .peer_finalized_slot = diverged_peer_finalized_slot,
+                .peer_finalized_root = diverged_peer_finalized_root,
+            } };
         }
 
         // Check 1: our head is behind peer finalization — we don't even have finalized blocks
