@@ -1791,8 +1791,8 @@ fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.Chai
 }
 
 fn advanceForkchoiceIntervals(ctx: *StepContext, target_intervals: u64, has_proposal: bool) !void {
-    while (ctx.fork_choice.fcStore.time < target_intervals) {
-        const next_interval: u64 = ctx.fork_choice.fcStore.time + 1;
+    while (ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) < target_intervals) {
+        const next_interval: u64 = ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) + 1;
         const signal_proposal = has_proposal and next_interval == target_intervals;
 
         try ctx.fork_choice.onInterval(next_interval, signal_proposal);
