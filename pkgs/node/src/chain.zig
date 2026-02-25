@@ -486,7 +486,10 @@ pub const BeamChain = struct {
         };
 
         // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+        // PS: this isn't required because forkchoice is already ticked before validator's oninterval is called
+        // which then leads to block production call
+        //
+        // try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
 
         // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
@@ -685,6 +688,9 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
+                        // we will not catch and enqueue block for FutureSlot error because this error here means
+                        // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
+                        // clock skew or race between oninterval and block arrival
                         self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
@@ -1228,6 +1234,7 @@ pub const BeamChain = struct {
 
         // 1. Future slot check - reject blocks too far in the future
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
+        // this can also happen because of race conditions between oninterval and block arrival
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
             self.module_logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
