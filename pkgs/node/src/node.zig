@@ -83,6 +83,9 @@ pub const BeamNode = struct {
             chain.deinit();
             allocator.destroy(chain);
         }
+        // Now that the chain is at its final heap location, point the logger config
+        // at the forkchoice slot clock so every log line carries slot/interval context.
+        opts.logger_config.slot_clock = &chain.forkChoice.fcStore.slot_clock;
         if (opts.validator_ids) |ids| {
             // key_manager is required when validator_ids is provided
             const km = opts.key_manager orelse return error.KeyManagerRequired;
@@ -921,9 +924,9 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
-        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.time) {
+        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
             self.logger.warn("skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
-                self.chain.forkChoice.fcStore.time,
+                self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic),
                 itime_intervals,
             });
             return;
