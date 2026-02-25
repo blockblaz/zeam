@@ -281,16 +281,14 @@ pub const BeamChain = struct {
             }
         }
 
-        const is_aggregator = self.is_aggregator_enabled and self.registered_validator_ids.len > 0;
-        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={any} is_aggregator={any}", .{
+        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={any}", .{
             time_intervals,
             slot,
             interval,
             has_proposal,
-            is_aggregator,
         });
 
-        try self.forkChoice.onInterval(time_intervals, has_proposal, is_aggregator);
+        try self.forkChoice.onInterval(time_intervals, has_proposal);
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
@@ -493,7 +491,7 @@ pub const BeamChain = struct {
         };
 
         // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false, self.is_aggregator_enabled);
+        try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
 
         // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
@@ -1045,7 +1043,7 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
 
         // Retry any pending gossip attestations/aggregations now that new states exist.
-        self.retryPendingGossip();
+        self.retryPendingAttestationGossip();
     }
 
     fn cachePendingAttestation(self: *Self, signed_attestation: networks.AttestationGossip) void {
@@ -1069,7 +1067,7 @@ pub const BeamChain = struct {
         };
     }
 
-    fn retryPendingGossip(self: *Self) void {
+    fn retryPendingAttestationGossip(self: *Self) void {
         if (self.pending_gossip_attestations.items.len > 0) {
             var remaining: std.ArrayList(networks.AttestationGossip) = .empty;
             for (self.pending_gossip_attestations.items) |att| {
@@ -1742,7 +1740,7 @@ test "process and add mock blocks into a node's chain" {
         const block_root = mock_chain.blockRoots[i];
         const current_slot = block.slot;
 
-        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false, false);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
         allocator.free(missing_roots);
 
@@ -1818,7 +1816,7 @@ test "printSlot output demonstration" {
         const block = signed_block.message.block;
         const current_slot = block.slot;
 
-        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false, false);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{});
         allocator.free(missing_roots);
     }
@@ -1891,7 +1889,7 @@ test "buildTreeVisualization integration test" {
         const block = signed_block.message.block;
         const current_slot = block.slot;
 
-        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false, false);
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{});
         allocator.free(missing_roots);
     }
@@ -1977,7 +1975,7 @@ test "attestation validation - comprehensive" {
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
         const block = signed_block.message.block;
-        try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false, false);
+        try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{});
         allocator.free(missing_roots);
     }
@@ -2250,7 +2248,7 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Add one block (slot 1)
     const block = mock_chain.blocks[1];
-    try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false, false);
+    try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
     const missing_roots = try beam_chain.onBlock(block, .{});
     allocator.free(missing_roots);
 
@@ -2350,7 +2348,7 @@ test "attestation processing - valid block attestation" {
     // Add blocks to chain
     for (1..mock_chain.blocks.len) |i| {
         const block = mock_chain.blocks[i];
-        try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false, false);
+        try beam_chain.forkChoice.onInterval(block.message.block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(block, .{});
         allocator.free(missing_roots);
     }

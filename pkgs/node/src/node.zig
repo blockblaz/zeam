@@ -1216,7 +1216,7 @@ pub const BeamNode = struct {
         // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
-            try self.chain.forkChoice.onInterval(@intCast(current_interval), false, false);
+            try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
             // Keep node interval state aligned with forkchoice catch-up to avoid
             // replaying historical validator duties when starting late.
             self.last_interval = current_interval;
@@ -1563,7 +1563,7 @@ test "Node: processCachedDescendants basic flow" {
     try std.testing.expect(!node.chain.forkChoice.hasBlock(block2_root));
 
     // Advance forkchoice time to block1 slot and add block1 to the chain
-    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false, false);
+    try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
     const missing_roots1 = try node.chain.onBlock(block1, .{});
     defer allocator.free(missing_roots1);
 
@@ -1572,7 +1572,7 @@ test "Node: processCachedDescendants basic flow" {
 
     // Now call processCachedDescendants with block1_root. This should discover
     // cached block2 as a descendant and process it automatically.
-    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false, false);
+    try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false);
     node.processCachedDescendants(block1_root);
 
     // Verify block2 was removed from cache because it was successfully processed

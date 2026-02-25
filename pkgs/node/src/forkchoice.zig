@@ -794,7 +794,7 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn tickIntervalUnlocked(self: *Self, hasProposal: bool, is_aggregator: bool) !void {
+    fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
         self.fcStore.time += 1;
         const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
 
@@ -807,10 +807,7 @@ pub const ForkChoice = struct {
                 }
             },
             1 => {},
-            2 => {
-                // Aggregation execution is driven by validator flow with an explicit state.
-                _ = is_aggregator;
-            },
+            2 => {},
             3 => {
                 _ = try self.updateSafeTargetUnlocked();
             },
@@ -823,11 +820,10 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool, is_aggregator: bool) !void {
+    fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool) !void {
         while (self.fcStore.time < time_intervals) {
             try self.tickIntervalUnlocked(
                 has_proposal and (self.fcStore.time + 1) == time_intervals,
-                is_aggregator,
             );
         }
     }
@@ -872,7 +868,7 @@ pub const ForkChoice = struct {
         // and FC would need to be protected by mutex to make it thread safe but for now
         // this is deterministally called after the fc has been ticked ahead
         // so the following call should be a no-op
-        try self.onInterval(time_intervals, true, false);
+        try self.onInterval(time_intervals, true);
         // accept any new attestations in case previous ontick was a no-op and either the validator
         // wasn't registered or there have been new attestations
         const head = try self.acceptNewAttestations();
@@ -1626,10 +1622,10 @@ pub const ForkChoice = struct {
         return self.onBlockUnlocked(block, state, opts);
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool, is_aggregator: bool) !void {
+    pub fn onInterval(self: *Self, time_intervals: usize, has_proposal: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.onIntervalUnlocked(time_intervals, has_proposal, is_aggregator);
+        return self.onIntervalUnlocked(time_intervals, has_proposal);
     }
 
     pub fn onAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
@@ -1860,7 +1856,7 @@ test "forkchoice block tree" {
         const current_slot = block.slot;
         try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
 
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false, false);
+        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
