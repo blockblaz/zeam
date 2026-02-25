@@ -141,7 +141,6 @@ pub const KeyPair = struct {
     handle: *HashSigKeyPair,
     public_key: *const HashSigPublicKey,
     private_key: *const HashSigPrivateKey,
-    allocator: Allocator,
 
     const Self = @This();
 
@@ -178,13 +177,11 @@ pub const KeyPair = struct {
             .handle = handle,
             .public_key = public_key,
             .private_key = private_key,
-            .allocator = allocator,
         };
     }
 
     /// Reconstruct a key pair from SSZ-encoded bytes
     pub fn fromSsz(
-        allocator: Allocator,
         private_key_ssz: []const u8,
         public_key_ssz: []const u8,
     ) HashSigError!Self {
@@ -215,7 +212,6 @@ pub const KeyPair = struct {
             .handle = handle,
             .public_key = public_key,
             .private_key = private_key,
-            .allocator = allocator,
         };
     }
 
@@ -261,8 +257,11 @@ pub const KeyPair = struct {
             signature.handle,
         );
 
-        if (result != 1) {
-            return HashSigError.VerificationFailed;
+        switch (result) {
+            1 => {},
+            0 => return HashSigError.VerificationFailed,
+            -1 => return HashSigError.InvalidSignature,
+            else => return HashSigError.VerificationFailed,
         }
     }
 
@@ -307,11 +306,22 @@ pub const KeyPair = struct {
     }
 };
 
-/// Wrapper for the hash signature
+/// Wrapper for the hash signature (opaque Rust handle)
 pub const Signature = struct {
     handle: *HashSigSignature,
 
     const Self = @This();
+
+    /// Maximum size for signature SSZ encoding buffer.
+    ///
+    /// Derivation for LOG_LIFETIME=32, HASH_LEN_FE=8, RAND_LEN_FE=7:
+    /// - Fixed part: 4 (path offset) + 28 (rho = 7*4) + 4 (hashes offset) = 36 bytes
+    /// - path.siblings: up to 32 siblings * 32 bytes = 1024 bytes + 4 (offset) = 1028 bytes
+    /// - hashes: up to 64 hashes * 32 bytes = 2048 bytes
+    /// - Total typical: ~3112 bytes
+    ///
+    /// Using 8192 as a safe upper bound with margin for larger signatures.
+    pub const MAX_SSZ_SIZE: usize = 8192;
 
     /// Deserialize a signature from SSZ bytes
     pub fn fromBytes(bytes: []const u8) HashSigError!Self {
@@ -408,7 +418,6 @@ test "HashSig: SSZ keypair roundtrip" {
 
     // Reconstruct from SSZ
     var restored_keypair = try KeyPair.fromSsz(
-        allocator,
         sk_buffer[0..sk_len],
         pk_buffer[0..pk_len],
     );

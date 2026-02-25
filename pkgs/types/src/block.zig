@@ -8,9 +8,26 @@ const zeam_utils = @import("@zeam/utils");
 const aggregation = @import("./aggregation.zig");
 const attestation = @import("./attestation.zig");
 const mini_3sf = @import("./mini_3sf.zig");
+const signature_mod = @import("./signature.zig");
 const state = @import("./state.zig");
 const utils = @import("./utils.zig");
 const validator = @import("./validator.zig");
+
+const XmssSignature = signature_mod.Signature;
+
+/// Container type for BlockSignatures with proper XmssSignature (used for HTR computation).
+/// Defined at module level to avoid duplicate definitions in sszRoot methods.
+const BlockSignaturesContainer = struct {
+    attestation_signatures: AttestationSignatures,
+    proposer_signature: XmssSignature,
+};
+
+/// Container type for SignedBlockWithAttestation with proper XmssSignature (used for HTR computation).
+/// Defined at module level to avoid duplicate definitions in sszRoot methods.
+const SignedBlockWithAttestationContainer = struct {
+    message: BlockWithAttestation,
+    signature: BlockSignaturesContainer,
+};
 
 const Allocator = std.mem.Allocator;
 const AggregatedAttestation = attestation.AggregatedAttestation;
@@ -21,7 +38,6 @@ const Slot = utils.Slot;
 const ValidatorIndex = utils.ValidatorIndex;
 const Bytes32 = utils.Bytes32;
 const SIGBYTES = utils.SIGBYTES;
-const SIGSIZE = utils.SIGSIZE;
 const Root = utils.Root;
 const ZERO_HASH = utils.ZERO_HASH;
 const ZERO_SIGBYTES = utils.ZERO_SIGBYTES;
@@ -241,6 +257,29 @@ pub const BlockSignatures = struct {
         defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
     }
+
+    /// Compute the SSZ hash_tree_root of this BlockSignatures.
+    /// This method deserializes the proposer_signature bytes to XmssSignature Container
+    /// to compute the correct hash_tree_root (as Container, not FixedBytes).
+    ///
+    /// The hash_tree_root is computed as:
+    ///   merkle_root([HTR(attestation_signatures), HTR(proposer_signature_as_container)])
+    ///
+    /// This matches leanSpec's BlockSignatures container structure.
+    pub fn sszRoot(self: *const BlockSignatures, allocator: Allocator) !Root {
+        // Deserialize proposer_signature bytes to XmssSignature Container
+        var xmss_sig = try XmssSignature.fromSszBytes(&self.proposer_signature, allocator);
+        defer xmss_sig.deinit();
+
+        const container = BlockSignaturesContainer{
+            .attestation_signatures = self.attestation_signatures,
+            .proposer_signature = xmss_sig,
+        };
+
+        var root: Root = undefined;
+        try zeam_utils.hashTreeRoot(BlockSignaturesContainer, container, &root, allocator);
+        return root;
+    }
 };
 
 pub const BlockWithAttestation = struct {
@@ -285,6 +324,34 @@ pub const SignedBlockWithAttestation = struct {
         var json_value = try self.toJson(allocator);
         defer freeJsonValue(&json_value, allocator);
         return utils.jsonToString(allocator, json_value);
+    }
+
+    /// Compute the SSZ hash_tree_root of this SignedBlockWithAttestation.
+    /// This method deserializes the proposer_signature bytes to XmssSignature Container
+    /// to compute the correct hash_tree_root (as Container, not FixedBytes).
+    ///
+    /// The hash_tree_root is computed as:
+    ///   merkle_root([HTR(message), HTR(signature_with_container_sig)])
+    ///
+    /// This matches leanSpec's SignedBlockWithAttestation container structure.
+    pub fn sszRoot(self: *const SignedBlockWithAttestation, allocator: Allocator) !Root {
+        // Deserialize proposer_signature bytes to XmssSignature Container
+        var xmss_sig = try XmssSignature.fromSszBytes(&self.signature.proposer_signature, allocator);
+        defer xmss_sig.deinit();
+
+        const signature_container = BlockSignaturesContainer{
+            .attestation_signatures = self.signature.attestation_signatures,
+            .proposer_signature = xmss_sig,
+        };
+
+        const container = SignedBlockWithAttestationContainer{
+            .message = self.message,
+            .signature = signature_container,
+        };
+
+        var root: Root = undefined;
+        try zeam_utils.hashTreeRoot(SignedBlockWithAttestationContainer, container, &root, allocator);
+        return root;
     }
 };
 
@@ -816,6 +883,130 @@ test "encode decode signed block with attestation roundtrip" {
     try std.testing.expect(decoded.message.proposer_attestation.data.slot == signed_block_with_attestation.message.proposer_attestation.data.slot);
     try std.testing.expect(std.mem.eql(u8, &decoded.message.proposer_attestation.data.head.root, &signed_block_with_attestation.message.proposer_attestation.data.head.root));
     try std.testing.expect(decoded.signature.attestation_signatures.len() == signed_block_with_attestation.signature.attestation_signatures.len());
+}
+
+test "SignedBlockWithAttestation sszRoot with real signature" {
+    const allocator = std.testing.allocator;
+
+    // Generate a keypair and sign a message
+    var keypair = try xmss.KeyPair.generate(allocator, "test_signed_block", 0, 10);
+    defer keypair.deinit();
+
+    var attestations = try AggregatedAttestations.init(allocator);
+    errdefer attestations.deinit();
+
+    var attestation_signatures = try AttestationSignatures.init(allocator);
+    errdefer attestation_signatures.deinit();
+
+    const block_with_attestation = BlockWithAttestation{
+        .block = .{
+            .slot = 1,
+            .proposer_index = 0,
+            .parent_root = ZERO_HASH,
+            .state_root = ZERO_HASH,
+            .body = .{ .attestations = attestations },
+        },
+        .proposer_attestation = .{
+            .validator_id = 0,
+            .data = .{
+                .slot = 1,
+                .head = .{ .root = ZERO_HASH, .slot = 1 },
+                .target = .{ .root = ZERO_HASH, .slot = 1 },
+                .source = .{ .root = ZERO_HASH, .slot = 0 },
+            },
+        },
+    };
+
+    // Compute block root for signing
+    var block_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(BlockWithAttestation, block_with_attestation, &block_root, allocator);
+
+    // Sign the block
+    var opaque_sig = try keypair.sign(&block_root, 0);
+    defer opaque_sig.deinit();
+
+    // Get signature bytes (zero-initialize to ensure trailing bytes are defined)
+    var sig_bytes: SIGBYTES = std.mem.zeroes(SIGBYTES);
+    const sig_len = try opaque_sig.toBytes(&sig_bytes);
+    try std.testing.expectEqual(sig_bytes.len, sig_len); // Ensure signature fills entire buffer
+
+    // Create SignedBlockWithAttestation
+    var signed_block = SignedBlockWithAttestation{
+        .message = block_with_attestation,
+        .signature = .{
+            .attestation_signatures = attestation_signatures,
+            .proposer_signature = sig_bytes,
+        },
+    };
+    defer signed_block.deinit();
+
+    // Compute sszRoot - this should use XmssSignature Container internally
+    const root = try signed_block.sszRoot(allocator);
+
+    // Verify root is non-zero (sanity check)
+    var is_zero = true;
+    for (root) |byte| {
+        if (byte != 0) {
+            is_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!is_zero);
+
+    // The root should be different from a naive hash_tree_root that treats signature as FixedBytes
+    var naive_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(SignedBlockWithAttestation, signed_block, &naive_root, allocator);
+
+    // These should be different because Container HTR != FixedBytes HTR for signature
+    try std.testing.expect(!std.mem.eql(u8, &root, &naive_root));
+}
+
+test "BlockSignatures sszRoot with real signature" {
+    const allocator = std.testing.allocator;
+
+    // Generate a keypair and sign a message
+    var keypair = try xmss.KeyPair.generate(allocator, "test_block_sig", 0, 10);
+    defer keypair.deinit();
+
+    var attestation_signatures = try AttestationSignatures.init(allocator);
+    errdefer attestation_signatures.deinit();
+
+    // Sign a dummy message
+    const message = [_]u8{42} ** 32;
+    var opaque_sig = try keypair.sign(&message, 0);
+    defer opaque_sig.deinit();
+
+    // Get signature bytes (zero-initialize to ensure trailing bytes are defined)
+    var sig_bytes: SIGBYTES = std.mem.zeroes(SIGBYTES);
+    const sig_len = try opaque_sig.toBytes(&sig_bytes);
+    try std.testing.expectEqual(sig_bytes.len, sig_len); // Ensure signature fills entire buffer
+
+    // Create BlockSignatures
+    var block_signatures = BlockSignatures{
+        .attestation_signatures = attestation_signatures,
+        .proposer_signature = sig_bytes,
+    };
+    defer block_signatures.deinit();
+
+    // Compute sszRoot
+    const root = try block_signatures.sszRoot(allocator);
+
+    // Verify root is non-zero
+    var is_zero = true;
+    for (root) |byte| {
+        if (byte != 0) {
+            is_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!is_zero);
+
+    // The root should be different from a naive hash_tree_root
+    var naive_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(BlockSignatures, block_signatures, &naive_root, allocator);
+
+    // These should be different because Container HTR != FixedBytes HTR for signature
+    try std.testing.expect(!std.mem.eql(u8, &root, &naive_root));
 }
 
 test "encode decode signed block with non-empty attestation signatures" {

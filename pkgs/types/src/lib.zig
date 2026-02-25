@@ -1,6 +1,12 @@
 const aggregation = @import("./aggregation.zig");
 pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
 
+const signature = @import("./signature.zig");
+pub const XmssSignature = signature.Signature;
+
+const signature_convert = @import("./signature_convert.zig");
+pub const xmssFromOpaqueSignature = signature_convert.fromOpaqueSignature;
+
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;
 pub const AttestationData = attestation.AttestationData;
