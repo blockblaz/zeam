@@ -694,7 +694,7 @@ pub const BeamChain = struct {
                         if (err == error.FutureSlot) {
                             self.module_logger.info(
                                 "onBlock returned FutureSlot for slot={d} blockroot=0x{x} (fc_time={d}), queuing for retry",
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.time },
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic) },
                             );
                             var cloned: types.SignedBlockWithAttestation = undefined;
                             types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &cloned) catch |clone_err| {
