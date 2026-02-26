@@ -167,49 +167,28 @@ pub fn buildForkChoiceJSON(
     output: *std.ArrayList(u8),
     allocator: Allocator,
 ) !void {
-    const writer = output.writer(allocator);
+    const w = output.writer(allocator);
+    try w.writeAll("{");
+    try w.print(
+        \\"head":{{"slot":{d},"root":"0x{x}"}},"justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":{{"root":"0x{x}"}},"validator_count":{d},"nodes":[
+    , .{
+        snapshot.head.slot,
+        &snapshot.head.blockRoot,
+        snapshot.latest_justified_slot,
+        &snapshot.latest_justified_root,
+        snapshot.latest_finalized_slot,
+        &snapshot.latest_finalized_root,
+        &snapshot.safe_target_root,
+        snapshot.validator_count,
+    });
 
-    try writer.writeAll("{");
-
-    // Head block info
-    try writer.print(
-        \\"head":{{"slot":{d},"root":"0x{x}"}},
-    , .{ snapshot.head.slot, &snapshot.head.blockRoot });
-
-    // Justified checkpoint
-    try writer.print(
-        \\"justified":{{"slot":{d},"root":"0x{x}"}},
-    , .{ snapshot.latest_justified_slot, &snapshot.latest_justified_root });
-
-    // Finalized checkpoint
-    try writer.print(
-        \\"finalized":{{"slot":{d},"root":"0x{x}"}},
-    , .{ snapshot.latest_finalized_slot, &snapshot.latest_finalized_root });
-
-    // Safe target
-    try writer.print(
-        \\"safe_target":{{"root":"0x{x}"}},
-    , .{&snapshot.safe_target_root});
-
-    // Validator count
-    try writer.print(
-        \\"validator_count":{d},
-    , .{snapshot.validator_count});
-
-    // Nodes array
-    try writer.writeAll("\"nodes\":[");
     for (snapshot.nodes, 0..) |node, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print(
+        if (i > 0) try w.writeAll(",");
+        try w.print(
             \\{{"slot":{d},"root":"0x{x}","parent_root":"0x{x}","weight":{d}}}
-        , .{
-            node.slot,
-            &node.blockRoot,
-            &node.parentRoot,
-            node.weight,
-        });
+        , .{ node.slot, &node.blockRoot, &node.parentRoot, node.weight });
     }
-    try writer.writeAll("]}");
+    try w.writeAll("]}");
 }
 
 /// Build fork choice graph in Grafana node-graph JSON format
