@@ -14,7 +14,7 @@ const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
 };
 
-const ProverChoice = enum { dummy, risc0, openvm, all };
+const ProverChoice = enum { dummy, risc0, openvm, sp1, ziren, all };
 
 fn setTestRunLabel(b: *Builder, run_step: *std.Build.Step.Run, name: []const u8) void {
     run_step.step.name = b.fmt("test {s}", .{name});
@@ -50,9 +50,23 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
             comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
+        .sp1 => {
+            comp.addObjectFile(b.path("rust/target/sp1-release/libsp1_glue.a"));
+            comp.addObjectFile(b.path("rust/target/sp1-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/sp1-release/libmultisig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/sp1-release/liblibp2p_glue.a"));
+        },
+        .ziren => {
+            comp.addObjectFile(b.path("rust/target/ziren-release/libziren_glue.a"));
+            comp.addObjectFile(b.path("rust/target/ziren-release/libhashsig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/ziren-release/libmultisig_glue.a"));
+            comp.addObjectFile(b.path("rust/target/ziren-release/liblibp2p_glue.a"));
+        },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libsp1_glue.a"));
+            comp.addObjectFile(b.path("rust/target/release/libziren_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
@@ -75,7 +89,7 @@ pub fn build(b: *Builder) !void {
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
 
     // Get prover choice (default to dummy)
-    const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, or all (default: dummy)") orelse "dummy";
+    const prover_option = b.option([]const u8, "prover", "Choose prover: dummy, risc0, openvm, sp1, ziren, or all (default: dummy)") orelse "dummy";
     const prover = std.meta.stringToEnum(ProverChoice, prover_option) orelse .dummy;
 
     const build_rust_lib_steps = build_rust_project(b, "rust", prover);
@@ -151,6 +165,8 @@ pub fn build(b: *Builder) !void {
     build_options.addOption([]const u8, "prover", @tagName(prover));
     build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
+    build_options.addOption(bool, "has_sp1", prover == .sp1 or prover == .all);
+    build_options.addOption(bool, "has_ziren", prover == .ziren or prover == .all);
     const use_poseidon = b.option(bool, "use_poseidon", "Use Poseidon SSZ hasher (default: false)") orelse false;
     build_options.addOption(bool, "use_poseidon", use_poseidon);
     const build_options_module = build_options.createModule();
@@ -702,6 +718,16 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
             "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
             "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
             "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
+        }),
+        .sp1 => b.addSystemCommand(&.{
+            "cargo",    "+nightly",  "-C",            path, "-Z",            "unstable-options",
+            "build",    "--profile", "sp1-release",   "-p", "libp2p-glue",   "-p",
+            "sp1-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
+        }),
+        .ziren => b.addSystemCommand(&.{
+            "cargo",      "+nightly",  "-C",              path, "-Z",            "unstable-options",
+            "build",      "--profile", "ziren-release",   "-p", "libp2p-glue",   "-p",
+            "ziren-glue", "-p",        "hashsig-glue",    "-p", "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
