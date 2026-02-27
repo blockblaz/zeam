@@ -94,7 +94,6 @@ pub const BeamNode = struct {
                 .network = network,
                 .logger = opts.logger_config.logger(.validator),
                 .key_manager = km,
-                .is_aggregator = opts.is_aggregator,
             });
             chain.registerValidatorIds(ids);
         }
@@ -1079,6 +1078,17 @@ pub const BeamNode = struct {
                     }
                 }
             }
+
+            if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
+                self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
+                return e;
+            }) |aggregations| {
+                defer self.allocator.free(aggregations);
+                self.publishProducedAggregations(aggregations) catch |e| {
+                    self.logger.err("error producing/publishing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
+                    return e;
+                };
+            }
         }
 
         self.last_interval = itime_intervals;
@@ -1212,6 +1222,20 @@ pub const BeamNode = struct {
         try self.network.publish(&gossip_msg);
 
         self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+    }
+
+    fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
+        var i: usize = 0;
+        while (i < aggregations.len) : (i += 1) {
+            self.publishAggregation(aggregations[i]) catch |err| {
+                var j: usize = i;
+                while (j < aggregations.len) : (j += 1) {
+                    aggregations[j].deinit();
+                }
+                return err;
+            };
+            aggregations[i].deinit();
+        }
     }
 
     pub fn run(self: *Self) !void {

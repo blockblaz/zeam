@@ -1456,6 +1456,44 @@ pub const BeamChain = struct {
         return self.forkChoice.aggregateCommitteeSignatures(state);
     }
 
+    pub fn maybeAggregateCommitteeSignaturesOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
+        const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
+        const interval_in_slot = time_intervals % constants.INTERVALS_PER_SLOT;
+        const aggregation_interval = 2;
+        if (interval_in_slot != aggregation_interval) return null;
+        if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
+
+        const sync_status = self.getSyncStatus();
+        switch (sync_status) {
+            .synced => {},
+            .no_peers => {
+                self.module_logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
+                return null;
+            },
+            .behind_peers => |info| {
+                self.module_logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                    slot,
+                    info.head_slot,
+                    info.finalized_slot,
+                    info.max_peer_finalized_slot,
+                });
+                return null;
+            },
+        }
+
+        const aggregations = self.aggregateCommitteeSignatures() catch |err| {
+            self.module_logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
+            return null;
+        };
+
+        if (aggregations.len == 0) {
+            self.allocator.free(aggregations);
+            return null;
+        }
+
+        return aggregations;
+    }
+
     pub fn getStatus(self: *Self) types.Status {
         const finalized = self.forkChoice.getLatestFinalized();
         const head = self.forkChoice.getHead();

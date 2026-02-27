@@ -65,7 +65,6 @@ pub const ValidatorClientParams = struct {
     network: networkFactory.Network,
     logger: zeam_utils.ModuleLogger,
     key_manager: *const key_manager_lib.KeyManager,
-    is_aggregator: bool = false,
 };
 
 pub const ValidatorClient = struct {
@@ -76,7 +75,6 @@ pub const ValidatorClient = struct {
     ids: []usize,
     logger: zeam_utils.ModuleLogger,
     key_manager: *const key_manager_lib.KeyManager,
-    is_aggregator_enabled: bool,
 
     const Self = @This();
     pub fn init(allocator: Allocator, config: configs.ChainConfig, opts: ValidatorClientParams) Self {
@@ -88,7 +86,6 @@ pub const ValidatorClient = struct {
             .ids = opts.ids,
             .logger = opts.logger,
             .key_manager = opts.key_manager,
-            .is_aggregator_enabled = opts.is_aggregator,
         };
     }
 
@@ -100,12 +97,7 @@ pub const ValidatorClient = struct {
         switch (interval) {
             0 => return self.maybeDoProposal(slot),
             1 => return self.mayBeDoAttestation(slot),
-            2 => {
-                if (self.is_aggregator_enabled) {
-                    return self.maybeDoAggregation(slot);
-                }
-                return null;
-            },
+            2 => return null,
             3 => return null,
             4 => return null,
             else => @panic("interval error"),
@@ -240,59 +232,11 @@ pub const ValidatorClient = struct {
                 .signature = signature,
             };
 
+            // TODO: Cache validator_id -> subnet_id mapping to avoid recomputing per interval for large validator sets.
             const subnet_id = try types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
             try result.addAttestation(subnet_id, signed_attestation);
             self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
-        return result;
-    }
-
-    pub fn maybeDoAggregation(self: *Self, slot: usize) !?ValidatorClientOutput {
-        if (!self.is_aggregator_enabled or self.ids.len == 0) return null;
-
-        // Check if chain is synced before producing aggregations
-        const sync_status = self.chain.getSyncStatus();
-        switch (sync_status) {
-            .synced => {},
-            .no_peers => {
-                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
-                return null;
-            },
-            .behind_peers => |info| {
-                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d} < max_peer_finalized_slot={d})", .{
-                    slot,
-                    info.head_slot,
-                    info.max_peer_finalized_slot,
-                });
-                return null;
-            },
-        }
-
-        const aggregations = self.chain.aggregateCommitteeSignatures() catch |err| {
-            self.logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
-            return null;
-        };
-        defer self.allocator.free(aggregations);
-
-        if (aggregations.len == 0) return null;
-
-        var result = ValidatorClientOutput.init(self.allocator);
-        errdefer result.deinit();
-
-        var i: usize = 0;
-        while (i < aggregations.len) : (i += 1) {
-            result.addAggregation(aggregations[i]) catch |err| {
-                // On transfer failure, deinit the unmoved tail to avoid leaking proofs.
-                var j: usize = i;
-                while (j < aggregations.len) : (j += 1) {
-                    aggregations[j].deinit();
-                }
-                return err;
-            };
-            aggregations[i].deinit();
-        }
-
-        self.logger.info("constructed {d} aggregations for slot={d}", .{ aggregations.len, slot });
         return result;
     }
 };
