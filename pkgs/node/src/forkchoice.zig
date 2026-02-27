@@ -218,22 +218,32 @@ pub const ForkChoiceStore = struct {
     // with the current slot and interval without acquiring any lock.
     slot_clock: zeam_utils.SlotTimeClock,
 
-    latest_justified: types.Checkpoint,
+    // Both fields are optional:
+    //   - Genesis: set to the anchor checkpoint at init time.
+    //   - Checkpoint-sync / DB recovery: left null at init; populated on the first
+    //     onBlock() call so they track real chain state rather than the stale anchor.
+    latest_justified: ?types.Checkpoint,
     // finalized is not tracked the same way in 3sf mini as it corresponds to head's finalized
     // however its unlikely that a finalized can be rolled back in a normal node operation
     // (for example a buggy chain has been finalized in which case node should be started with
     //  anchor of the new non buggy branch)
-    latest_finalized: types.Checkpoint,
+    latest_finalized: ?types.Checkpoint,
 
     const Self = @This();
-    pub fn update(self: *Self, justified: types.Checkpoint, finalized: types.Checkpoint) void {
-        if (justified.slot > self.latest_justified.slot) {
+
+    /// Update justified/finalized from a newly processed block state.
+    /// Returns true the first time latest_justified transitions from null → set,
+    /// which is used by ForkChoice to flip its status from .initing to .ready.
+    pub fn update(self: *Self, justified: types.Checkpoint, finalized: types.Checkpoint) bool {
+        var became_ready = false;
+        if (self.latest_justified == null or justified.slot > self.latest_justified.?.slot) {
+            if (self.latest_justified == null) became_ready = true;
             self.latest_justified = justified;
         }
-
-        if (finalized.slot > self.latest_finalized.slot) {
+        if (self.latest_finalized == null or finalized.slot > self.latest_finalized.?.slot) {
             self.latest_finalized = finalized;
         }
+        return became_ready;
     }
 };
 
@@ -268,6 +278,9 @@ const StoredAggregatedPayload = types.StoredAggregatedPayload;
 const AggregatedPayloadsList = types.AggregatedPayloadsList;
 const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
 
+/// Lifecycle status shared between ForkChoice and its Snapshot.
+pub const ForkChoiceStatus = enum { initing, ready };
+
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
     anchorState: *const types.BeamState,
@@ -292,14 +305,22 @@ pub const ForkChoice = struct {
     aggregated_payloads: AggregatedPayloadsMap,
     // Mutex to protect concurrent access to gossip_signatures and aggregated_payloads
     signatures_mutex: std.Thread.Mutex,
+    /// Lifecycle status of the forkchoice.
+    ///   .initing — anchor was a non-genesis finalized state (checkpoint-sync / DB recovery);
+    ///              latest_justified is not yet set; node must not produce blocks/attestations.
+    ///   .ready   — latest_justified has been populated; normal participation is allowed.
+    status: ForkChoiceStatus,
 
     const Self = @This();
 
     /// Thread-safe snapshot for observability
     pub const Snapshot = struct {
         head: ProtoNode,
-        latest_justified_root: [32]u8,
-        latest_finalized_root: [32]u8,
+        /// null when forkchoice is still initing (non-genesis anchor, no block seen yet).
+        latest_justified_root: ?[32]u8,
+        latest_finalized_root: ?[32]u8,
+        /// .initing until first onBlock sets latest_justified; .ready afterwards.
+        status: ForkChoiceStatus,
         nodes: []ProtoNode,
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
@@ -326,15 +347,26 @@ pub const ForkChoice = struct {
         };
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
+
+        // For genesis (slot 0) the anchor IS the justified/finalized checkpoint, so we set
+        // them immediately and the forkchoice starts in .ready state.
+        //
+        // For non-genesis anchors (checkpoint-sync or DB recovery) the anchor slot only
+        // reflects where we started syncing from; the real latest_justified / latest_finalized
+        // must be discovered by processing blocks via onBlock().  Setting them to the anchor
+        // here would mislead every consumer that compares against those checkpoints.
+        const is_genesis = opts.anchorState.slot == 0;
         const fc_store = ForkChoiceStore{
             .slot_clock = zeam_utils.SlotTimeClock.init(
                 opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
                 opts.anchorState.slot,
                 0, // slotInterval is 0 at anchor: time is always a slot boundary
             ),
-            .latest_justified = anchorCP,
-            .latest_finalized = anchorCP,
+            .latest_justified = if (is_genesis) anchorCP else null,
+            .latest_finalized = if (is_genesis) anchorCP else null,
         };
+        const initial_status: ForkChoiceStatus = if (is_genesis) .ready else .initing;
+
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
         const deltas: std.ArrayList(isize) = .empty;
         const gossip_signatures = SignaturesMap.init(allocator);
@@ -355,9 +387,20 @@ pub const ForkChoice = struct {
             .gossip_signatures = gossip_signatures,
             .aggregated_payloads = aggregated_payloads,
             .signatures_mutex = .{},
+            .status = initial_status,
         };
-        // No lock needed during init - struct not yet accessible to other threads
-        _ = try fc.updateHeadUnlocked();
+
+        if (is_genesis) {
+            opts.logger.info("forkchoice init: genesis anchor slot={d} root=0x{x} — status=ready", .{
+                opts.anchorState.slot, &anchor_block_root,
+            });
+            // No lock needed during init - struct not yet accessible to other threads
+            _ = try fc.updateHeadUnlocked();
+        } else {
+            opts.logger.info("forkchoice init: non-genesis anchor slot={d} root=0x{x} — status=initing, waiting for onBlock to set latest_justified/finalized", .{
+                opts.anchorState.slot, &anchor_block_root,
+            });
+        }
         return fc;
     }
 
@@ -410,16 +453,18 @@ pub const ForkChoice = struct {
             };
             return Snapshot{
                 .head = head_node,
-                .latest_justified_root = self.fcStore.latest_justified.root,
-                .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .latest_justified_root = if (self.fcStore.latest_justified) |cp| cp.root else null,
+                .latest_finalized_root = if (self.fcStore.latest_finalized) |cp| cp.root else null,
+                .status = self.status,
                 .nodes = nodes_copy,
             };
         };
 
         return Snapshot{
             .head = self.protoArray.nodes.items[head_idx],
-            .latest_justified_root = self.fcStore.latest_justified.root,
-            .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .latest_justified_root = if (self.fcStore.latest_justified) |cp| cp.root else null,
+            .latest_finalized_root = if (self.fcStore.latest_finalized) |cp| cp.root else null,
+            .status = self.status,
             .nodes = nodes_copy,
         };
     }
@@ -452,8 +497,11 @@ pub const ForkChoice = struct {
     }
 
     fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
-        const finalized_slot = self.fcStore.latest_finalized.slot;
-        const finalized_root = self.fcStore.latest_finalized.root;
+        // If finalized is not yet set (initing state) every block is accepted as a
+        // potential descendant; the check becomes meaningful once we have a real finalized CP.
+        const latest_finalized = self.fcStore.latest_finalized orelse return true;
+        const finalized_slot = latest_finalized.slot;
+        const finalized_root = latest_finalized.root;
 
         var searched_idx_or_null = self.protoArray.indices.get(blockRoot);
 
@@ -780,6 +828,20 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        // Skip attestation/safe-target work until forkchoice is ready.
+        // Clock still advances so the node stays in sync with wall-clock time.
+        if (self.status == .initing) {
+            _ = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic);
+            const currentInterval = self.fcStore.slot_clock.time.load(.monotonic) % constants.INTERVALS_PER_SLOT;
+            self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
+            if (currentInterval == 0) _ = self.fcStore.slot_clock.timeSlots.fetchAdd(1, .monotonic);
+            self.logger.debug("forkchoice ticked (initing) time(intervals)={d} slot={d}", .{
+                self.fcStore.slot_clock.time.load(.monotonic),
+                self.fcStore.slot_clock.timeSlots.load(.monotonic),
+            });
+            return;
+        }
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
@@ -827,6 +889,10 @@ pub const ForkChoice = struct {
     }
 
     pub fn getProposalHead(self: *Self, slot: types.Slot) !types.Checkpoint {
+        // Block construction requires an up-to-date latest_justified.
+        // Refuse until the forkchoice transitions to .ready via onBlock.
+        if (!self.isReady()) return ForkChoiceError.ForkChoiceNotReady;
+
         const time_intervals = slot * constants.INTERVALS_PER_SLOT;
         // this could be called independently by the validator when its a separate process
         // and FC would need to be protected by mutex to make it thread safe but for now
@@ -847,7 +913,8 @@ pub const ForkChoice = struct {
     fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
         var included_attestations: std.ArrayList(types.Attestation) = .empty;
 
-        const latest_justified = self.fcStore.latest_justified;
+        // Return empty slice if forkchoice is still initing (no justified yet).
+        const latest_justified = self.fcStore.latest_justified orelse return try included_attestations.toOwnedSlice(self.allocator);
 
         // TODO naive strategy to include all attestations that are consistent with the latest justified
         // replace by the other mini 3sf simple strategy to loop and see if justification happens and
@@ -882,23 +949,22 @@ pub const ForkChoice = struct {
             }
         }
 
-        while (!try types.IsJustifiableSlot(self.fcStore.latest_finalized.slot, nodes[target_idx].slot)) {
+        // latest_finalized is null only in .initing state; callers must check isReady() before
+        // calling getAttestationTarget.  Guard defensively to avoid a panic.
+        const lf = self.fcStore.latest_finalized orelse return ForkChoiceError.ForkChoiceNotReady;
+        const lj = self.fcStore.latest_justified orelse return ForkChoiceError.ForkChoiceNotReady;
+
+        while (!try types.IsJustifiableSlot(lf.slot, nodes[target_idx].slot)) {
             target_idx = nodes[target_idx].parent orelse return ForkChoiceError.InvalidTargetSearch;
         }
 
         // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
         // This prevents creating invalid attestations where source slot exceeds target slot
         // If the calculated target is older than latest_justified, use latest_justified instead
-        // TODO figure out how this happens
-        //
-        // - one scenario is where checkpoint sync from finalized wrongly sets justified to the anchor and doesn't get updated
-        //
-        // - other is the below scenario but needs to be validated and fixed properly (from previous comments)
-        // This can happen when the updateHeadUnlocked is not yet called for the new block
-        // and the target is calculated before the head is updated
-        // OnBlock calls update the latest_justified and attestation occurs on interval before the head is updated
-        if (nodes[target_idx].slot < self.fcStore.latest_justified.slot) {
-            return self.fcStore.latest_justified;
+        // With the new optional fields this scenario is properly handled: if forkchoice is still
+        // initing we return ForkChoiceNotReady above, so by here lj is always valid.
+        if (nodes[target_idx].slot < lj.slot) {
+            return lj;
         }
 
         return types.Checkpoint{
@@ -947,7 +1013,8 @@ pub const ForkChoice = struct {
         try self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
 
         // head is the best descendant of latest justified
-        const justified_idx = self.protoArray.indices.get(self.fcStore.latest_justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
+        const latest_justified = self.fcStore.latest_justified orelse return ForkChoiceError.ForkChoiceNotReady;
+        const justified_idx = self.protoArray.indices.get(latest_justified.root) orelse return ForkChoiceError.InvalidJustifiedRoot;
         const justified_node = self.protoArray.nodes.items[justified_idx];
 
         // if case of no best descendant latest justified is always best descendant
@@ -1234,7 +1301,7 @@ pub const ForkChoice = struct {
 
             if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
                 return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            } else if (if (self.fcStore.latest_finalized) |lf| slot < lf.slot else false) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -1245,7 +1312,17 @@ pub const ForkChoice = struct {
 
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
-            self.fcStore.update(justified, finalized);
+            const became_ready = self.fcStore.update(justified, finalized);
+
+            // First time latest_justified is set after a non-genesis init: transition to ready.
+            if (became_ready and self.status == .initing) {
+                self.status = .ready;
+                self.logger.info("forkchoice ready: first onBlock set latest_justified slot={d} root=0x{x} latest_finalized slot={d}", .{
+                    justified.slot,
+                    &justified.root,
+                    finalized.slot,
+                });
+            }
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
@@ -1352,6 +1429,7 @@ pub const ForkChoice = struct {
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {
+        if (!self.isReady()) return ForkChoiceError.ForkChoiceNotReady;
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.getAttestationTargetUnlocked();
@@ -1442,18 +1520,29 @@ pub const ForkChoice = struct {
         return self.safeTarget;
     }
 
-    /// Get the latest justified checkpoint
-    pub fn getLatestJustified(self: *Self) types.Checkpoint {
+    /// Get the latest justified checkpoint.
+    /// Returns null while the forkchoice is in .initing state (non-genesis anchor before first onBlock).
+    pub fn getLatestJustified(self: *Self) ?types.Checkpoint {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.fcStore.latest_justified;
     }
 
-    /// Get the latest finalized checkpoint
-    pub fn getLatestFinalized(self: *Self) types.Checkpoint {
+    /// Get the latest finalized checkpoint.
+    /// Returns null while the forkchoice is in .initing state (non-genesis anchor before first onBlock).
+    pub fn getLatestFinalized(self: *Self) ?types.Checkpoint {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.fcStore.latest_finalized;
+    }
+
+    /// Returns true once the forkchoice has seen at least one block (or was inited from genesis)
+    /// and latest_justified has been populated.  The node should gate attestation production and
+    /// block construction on this returning true.
+    pub fn isReady(self: *Self) bool {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.status == .ready;
     }
 
     /// Get the current time in slots
@@ -1505,6 +1594,9 @@ pub const ForkChoiceError = error{
     InvalidTargetAnchor,
     InvalidCanonicalTraversal,
     InvalidForkchoiceBlock,
+    /// Returned when an operation requires forkchoice to be ready (latest_justified set),
+    /// but the node is still in the initing state (checkpoint-sync / DB recovery).
+    ForkChoiceNotReady,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
@@ -1536,9 +1628,11 @@ test "forkchoice block tree" {
         .logger = module_logger,
     });
 
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
+    // Genesis init: latest_finalized must be set (non-null).
+    try std.testing.expect(fork_choice.fcStore.latest_finalized != null);
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.?.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.?.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
@@ -1692,6 +1786,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+        .status = .ready, // test constructs genesis-style anchor; mark ready directly
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2009,6 +2104,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+        .status = .ready, // test constructs genesis-style anchor; mark ready directly
     };
 
     return .{
@@ -2956,6 +3052,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+        .status = .ready, // test constructs genesis-style anchor; mark ready directly
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately

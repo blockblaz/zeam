@@ -196,7 +196,7 @@ pub fn buildForkChoiceGraphJSON(
     // Find the finalized node index to check ancestry
     const finalized_idx = blk: {
         for (proto_nodes, 0..) |n, i| {
-            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized_root)) {
+            if (if (snapshot.latest_finalized_root) |lfr| std.mem.eql(u8, &n.blockRoot, &lfr) else false) {
                 break :blk i;
             }
         }
@@ -208,14 +208,14 @@ pub fn buildForkChoiceGraphJSON(
 
         // Determine node role and color
         const is_head = std.mem.eql(u8, &pnode.blockRoot, &snapshot.head.blockRoot);
-        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified_root);
+        const is_justified = if (snapshot.latest_justified_root) |ljr| std.mem.eql(u8, &pnode.blockRoot, &ljr) else false;
 
         // A block is finalized if:
         // 1. It equals the finalized checkpoint, OR
         // 2. The finalized block is a descendant of it (block is ancestor of finalized)
         const is_finalized = blk: {
             // Check if this block IS the finalized block
-            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized_root)) {
+            if (if (snapshot.latest_finalized_root) |lfr| std.mem.eql(u8, &pnode.blockRoot, &lfr) else false) {
                 break :blk true;
             }
             // Check if this block is an ancestor of the finalized block
