@@ -298,7 +298,11 @@ pub const ApiServer = struct {
         };
 
         // Get justified checkpoint from chain (chain handles its own locking internally)
-        const justified_checkpoint = chain.getJustifiedCheckpoint();
+        const justified_checkpoint_opt = chain.getJustifiedCheckpoint();
+        const justified_checkpoint = justified_checkpoint_opt orelse {
+            _ = request.respond("{}", .{}) catch {};
+            return;
+        };
 
         // Convert checkpoint to JSON string
         const json_string = justified_checkpoint.toJsonString(self.allocator) catch |err| {

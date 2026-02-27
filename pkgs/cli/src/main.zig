@@ -619,7 +619,7 @@ fn mainInner() !void {
                     if (self.started) return;
 
                     // Wait until finalization has advanced beyond genesis on the reference node
-                    const finalized_slot = self.reference_node.chain.forkChoice.fcStore.latest_finalized.slot;
+                    const finalized_slot = if (self.reference_node.chain.forkChoice.fcStore.latest_finalized) |lf| lf.slot else 0;
                     if (finalized_slot == 0) return;
 
                     std.debug.print("\n=== STARTING NODE 3 (delayed sync node) at interval {d} ===\n", .{interval});

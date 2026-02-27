@@ -278,6 +278,9 @@ const StoredAggregatedPayload = types.StoredAggregatedPayload;
 const AggregatedPayloadsList = types.AggregatedPayloadsList;
 const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
 
+/// Lifecycle status shared between ForkChoice and its Snapshot.
+pub const ForkChoiceStatus = enum { initing, ready };
+
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
     anchorState: *const types.BeamState,
@@ -306,7 +309,7 @@ pub const ForkChoice = struct {
     ///   .initing — anchor was a non-genesis finalized state (checkpoint-sync / DB recovery);
     ///              latest_justified is not yet set; node must not produce blocks/attestations.
     ///   .ready   — latest_justified has been populated; normal participation is allowed.
-    status: enum { initing, ready },
+    status: ForkChoiceStatus,
 
     const Self = @This();
 
@@ -317,7 +320,7 @@ pub const ForkChoice = struct {
         latest_justified_root: ?[32]u8,
         latest_finalized_root: ?[32]u8,
         /// .initing until first onBlock sets latest_justified; .ready afterwards.
-        status: enum { initing, ready },
+        status: ForkChoiceStatus,
         nodes: []ProtoNode,
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
@@ -362,7 +365,7 @@ pub const ForkChoice = struct {
             .latest_justified = if (is_genesis) anchorCP else null,
             .latest_finalized = if (is_genesis) anchorCP else null,
         };
-        const initial_status: @TypeOf(@as(Self, undefined).status) = if (is_genesis) .ready else .initing;
+        const initial_status: ForkChoiceStatus = if (is_genesis) .ready else .initing;
 
         const attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator);
         const deltas: std.ArrayList(isize) = .empty;

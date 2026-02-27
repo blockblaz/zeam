@@ -96,9 +96,10 @@ pub const BeamChain = struct {
     block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
     db: database.Db,
-    // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam)
-    last_emitted_justified: types.Checkpoint,
-    last_emitted_finalized: types.Checkpoint,
+    // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam).
+    // Stored as optional to match forkchoice's optional justified/finalized (null = initing).
+    last_emitted_justified: ?types.Checkpoint,
+    last_emitted_finalized: ?types.Checkpoint,
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
@@ -296,7 +297,7 @@ pub const BeamChain = struct {
             // Periodic pruning: prune old non-canonical states every N slots
             // This ensures we prune even when finalization doesn't advance
             if (slot > 0 and slot % constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS == 0) {
-                const finalized = self.forkChoice.getLatestFinalized();
+                const finalized = self.forkChoice.getLatestFinalized() orelse return;
                 // no need to work extra if finalization is not far behind
                 if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
                     self.module_logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
@@ -546,7 +547,7 @@ pub const BeamChain = struct {
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.getLatestJustified(),
+            .source = self.forkChoice.getLatestJustified() orelse return error.ForkChoiceNotReady,
         };
 
         return attestation_data;
@@ -564,7 +565,7 @@ pub const BeamChain = struct {
         else
             self.forkChoice.getHead();
 
-        // Get additional chain information
+        // Get additional chain information (may be null if forkchoice is still initing)
         const justified = self.forkChoice.getLatestJustified();
         const finalized = self.forkChoice.getLatestFinalized();
 
@@ -601,10 +602,10 @@ pub const BeamChain = struct {
             &fc_head.parentRoot,
             &fc_head.stateRoot,
             if (is_timely) "YES" else "NO",
-            justified.slot,
-            &justified.root,
-            finalized.slot,
-            &finalized.root,
+            if (justified) |j| j.slot else 0,
+            if (justified) |j| &j.root else &([_]u8{0} ** 32),
+            if (finalized) |f| f.slot else 0,
+            if (finalized) |f| &f.root else &([_]u8{0} ** 32),
         });
 
         // Build tree visualization (thread-safe snapshot)
@@ -939,63 +940,75 @@ pub const BeamChain = struct {
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
         // 9. Asap emit justification/finalization events based on forkchoice store
-        // Emit justification event only when slot increases beyond last emitted
-        if (latest_justified.slot > self.last_emitted_justified.slot) {
-            if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
-                var chain_event = api.events.ChainEvent{ .new_justification = just_event };
-                event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("failed to broadcast justification event: {any}", .{err});
-                    chain_event.deinit(self.allocator);
-                };
-                self.last_emitted_justified = latest_justified;
-            } else |err| {
-                self.module_logger.warn("failed to create justification event: {any}", .{err});
-            }
-        }
-
-        // Emit finalization event only when slot increases beyond last emitted
-        const last_emitted_finalized = self.last_emitted_finalized;
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
-            if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
-                var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
-                event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("failed to broadcast finalization event: {any}", .{err});
-                    chain_event.deinit(self.allocator);
-                };
-                self.last_emitted_finalized = latest_finalized;
-            } else |err| {
-                self.module_logger.warn("failed to create finalization event: {any}", .{err});
-            }
-        }
-
-        // Update finalized slot indices and cleanup if finalization has advanced
-        // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
-            self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
-                // Record failed finalization attempt
-                zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
-                self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
-                    last_emitted_finalized.slot,
-                    latest_finalized.slot,
-                    err,
-                });
-            };
-
-            // Prune signature maps for finalized attestations
-            self.forkChoice.pruneSignatureMaps(latest_finalized.slot) catch |err| {
-                self.module_logger.warn("failed to prune signature maps: {any}", .{err});
-            };
-
-            // Prune cached blocks at or before finalized slot
-            if (self.prune_cached_blocks_fn) |prune_fn| {
-                if (self.prune_cached_blocks_ctx) |ctx| {
-                    const pruned = prune_fn(ctx, latest_finalized);
-                    if (pruned > 0) {
-                        self.module_logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
-                    }
+        // Emit justification event only when slot increases beyond last emitted.
+        // Skip entirely if forkchoice is still initing (latest_justified is null).
+        if (latest_justified) |lj| {
+            const last_emitted_justified_slot = if (self.last_emitted_justified) |x| x.slot else 0;
+            if (lj.slot > last_emitted_justified_slot) {
+                if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, lj, new_head.slot, self.nodeId)) |just_event| {
+                    var chain_event = api.events.ChainEvent{ .new_justification = just_event };
+                    event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
+                        self.module_logger.warn("failed to broadcast justification event: {any}", .{err});
+                        chain_event.deinit(self.allocator);
+                    };
+                    self.last_emitted_justified = lj;
+                } else |err| {
+                    self.module_logger.warn("failed to create justification event: {any}", .{err});
                 }
             }
         }
+
+        // Emit finalization event only when slot increases beyond last emitted.
+        // Skip entirely if forkchoice is still initing (latest_finalized is null).
+        const last_emitted_finalized = self.last_emitted_finalized;
+        if (latest_finalized) |lf| {
+            const last_emitted_finalized_slot = if (last_emitted_finalized) |x| x.slot else 0;
+            if (lf.slot > last_emitted_finalized_slot) {
+                if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, lf, new_head.slot, self.nodeId)) |final_event| {
+                    var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
+                    event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
+                        self.module_logger.warn("failed to broadcast finalization event: {any}", .{err});
+                        chain_event.deinit(self.allocator);
+                    };
+                    self.last_emitted_finalized = lf;
+                } else |err| {
+                    self.module_logger.warn("failed to create finalization event: {any}", .{err});
+                }
+            }
+        }
+
+        // Update finalized slot indices and cleanup if finalization has advanced.
+        // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
+        if (latest_finalized) |lf| {
+            const last_emitted_finalized_slot = if (last_emitted_finalized) |x| x.slot else 0;
+            if (lf.slot > last_emitted_finalized_slot) {
+                const prev_finalized = last_emitted_finalized orelse types.Checkpoint{ .slot = 0, .root = std.mem.zeroes([32]u8) };
+                self.processFinalizationAdvancement(prev_finalized, lf, pruneForkchoice) catch |err| {
+                    // Record failed finalization attempt
+                    zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
+                    self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                        prev_finalized.slot,
+                        lf.slot,
+                        err,
+                    });
+                };
+
+                // Prune signature maps for finalized attestations
+                self.forkChoice.pruneSignatureMaps(lf.slot) catch |err| {
+                    self.module_logger.warn("failed to prune signature maps: {any}", .{err});
+                };
+
+                // Prune cached blocks at or before finalized slot
+                if (self.prune_cached_blocks_fn) |prune_fn| {
+                    if (self.prune_cached_blocks_ctx) |ctx| {
+                        const pruned = prune_fn(ctx, lf);
+                        if (pruned > 0) {
+                            self.module_logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, lf.slot });
+                        }
+                    }
+                }
+            } // close if (lf.slot > last_emitted_finalized_slot)
+        } // close if (latest_finalized) |lf|
 
         // Store aggregated payloads from the block for future block building
         if (signedBlock) |block| {
@@ -1011,8 +1024,8 @@ pub const BeamChain = struct {
             fc_nodes_count_after_block,
         });
 
-        zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
-        zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+        if (latest_justified) |lj| zeam_metrics.metrics.lean_latest_justified_slot.set(lj.slot);
+        if (latest_finalized) |lf| zeam_metrics.metrics.lean_latest_finalized_slot.set(lf.slot);
     }
 
     /// Store aggregated signature payloads from a block for future block building
@@ -1230,7 +1243,7 @@ pub const BeamChain = struct {
         _ = is_from_gossip;
 
         const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
-        const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        const finalized_slot = if (self.forkChoice.fcStore.latest_finalized) |lf| lf.slot else 0;
 
         // 1. Future slot check - reject blocks too far in the future
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
@@ -1406,8 +1419,8 @@ pub const BeamChain = struct {
         const head = self.forkChoice.getHead();
 
         return .{
-            .finalized_root = finalized.root,
-            .finalized_slot = finalized.slot,
+            .finalized_root = if (finalized) |f| f.root else std.mem.zeroes([32]u8),
+            .finalized_slot = if (finalized) |f| f.slot else 0,
             .head_root = head.blockRoot,
             .head_slot = head.slot,
         };
@@ -1417,7 +1430,7 @@ pub const BeamChain = struct {
     /// First checks in-memory states map, then cached DB state, then falls back to database
     /// Returns null if the state is not available in any location
     pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
-        const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
+        const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized orelse return null;
 
         // First try to get from in-memory states map
         if (self.states.get(finalized_checkpoint.root)) |state| {
@@ -1448,9 +1461,9 @@ pub const BeamChain = struct {
         return state_ptr;
     }
 
-    /// Get the latest justified checkpoint
-    /// Returns the checkpoint with slot and root of the most recent justified checkpoint
-    pub fn getJustifiedCheckpoint(self: *Self) types.Checkpoint {
+    /// Get the latest justified checkpoint.
+    /// Returns null if forkchoice is still initing (non-genesis anchor before first onBlock).
+    pub fn getJustifiedCheckpoint(self: *Self) ?types.Checkpoint {
         return self.forkChoice.fcStore.latest_justified;
     }
 
@@ -1473,7 +1486,7 @@ pub const BeamChain = struct {
         }
 
         const our_head_slot = self.forkChoice.head.slot;
-        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        const our_finalized_slot = if (self.forkChoice.fcStore.latest_finalized) |lf| lf.slot else 0;
 
         // Find the maximum finalized slot reported by any peer
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
@@ -1578,9 +1591,11 @@ test "process and add mock blocks into a node's chain" {
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.blockRoots[0]));
+    // Genesis init: latest_finalized must be set.
+    try std.testing.expect(beam_chain.forkChoice.getLatestFinalized() != null);
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().?.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
-    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().?.root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
     try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.block.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
@@ -1607,8 +1622,8 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestJustified().root, &mock_chain.latestJustified[i].root));
-        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.latestFinalized[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestJustified().?.root, &mock_chain.latestJustified[i].root));
+        try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().?.root, &mock_chain.latestFinalized[i].root));
         try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getHead().blockRoot, &mock_chain.latestHead[i].root));
     }
 

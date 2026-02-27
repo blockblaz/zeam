@@ -422,7 +422,7 @@ pub const BeamNode = struct {
         signed_block: types.SignedBlockWithAttestation,
         depth: u32,
     ) CacheBlockError!types.Root {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        const finalized_slot = if (self.chain.forkChoice.fcStore.latest_finalized) |lf| lf.slot else 0;
         const block_slot = signed_block.message.block.slot;
 
         // Early rejection: don't cache blocks at or before finalized slot
@@ -615,7 +615,7 @@ pub const BeamNode = struct {
                             switch (sync_status) {
                                 .behind_peers => |info| {
                                     // Only sync from this peer if their finalized slot is ahead of ours
-                                    if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
+                                    if (status_resp.finalized_slot > if (self.chain.forkChoice.fcStore.latest_finalized) |lf| lf.slot else 0) {
                                         self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
