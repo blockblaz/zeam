@@ -327,7 +327,7 @@ pub const BeamState = struct {
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
 
-    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
+    fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
         const block_timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
         defer _ = block_timer.observe();
 
