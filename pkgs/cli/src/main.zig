@@ -68,6 +68,7 @@ pub const NodeCommand = struct {
     @"network-dir": []const u8 = "./network",
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
     @"checkpoint-sync-url": ?[]const u8 = null,
+    @"is-aggregator": bool = false,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -87,6 +88,7 @@ pub const NodeCommand = struct {
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
+        .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
         .help = "Show help information for the node command",
     };
 };
@@ -97,15 +99,15 @@ const BeamCmd = struct {
     @"api-port": u16 = constants.DEFAULT_API_PORT,
     @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
+    @"is-aggregator": bool = true,
 
-    pub fn format(self: BeamCmd, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\" }}", .{
+    pub fn format(self: BeamCmd, writer: anytype) !void {
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={} }}", .{
             self.mockNetwork,
             self.@"api-port",
             self.@"metrics-port",
             self.data_dir,
+            self.@"is-aggregator",
         });
     }
 };
@@ -202,7 +204,7 @@ const ZeamArgs = struct {
             .prometheus => |cmd| switch (cmd.__commands__) {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
             },
-            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", api_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.@"api-port" }),
+            .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", api_port={d}, is-aggregator={})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.@"api-port", cmd.@"is-aggregator" }),
         }
         try writer.writeAll(")");
     }
@@ -476,6 +478,7 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
                     .node_registry = test_registry1,
+                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -499,6 +502,7 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
                     .node_registry = test_registry2,
+                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
@@ -521,6 +525,7 @@ fn mainInner() !void {
                     .listen_addresses = listen_addresses3,
                     .connect_peers = connect_peers3,
                     .node_registry = test_registry3,
+                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
@@ -566,6 +571,7 @@ fn mainInner() !void {
                 .db = db_1,
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
+                .is_aggregator = beamcmd.@"is-aggregator",
             });
 
             if (api_server_handle) |handle| {
@@ -585,6 +591,7 @@ fn mainInner() !void {
                 .db = db_2,
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
+                .is_aggregator = beamcmd.@"is-aggregator",
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -602,6 +609,7 @@ fn mainInner() !void {
                 .db = db_3,
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
+                .is_aggregator = beamcmd.@"is-aggregator",
             });
 
             // Delayed runner - starts both network3 and node3 together
@@ -710,6 +718,7 @@ fn mainInner() !void {
                 .validator_config = leancmd.validator_config,
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
+                .is_aggregator = leancmd.@"is-aggregator",
                 .api_port = leancmd.@"api-port",
                 .metrics_port = leancmd.@"metrics-port",
                 .bootnodes = &.{}, // Initialize to empty slice to avoid segfault in deinit

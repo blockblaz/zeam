@@ -786,7 +786,7 @@ test "Mock messaging across two subscribers" {
     var subscriber2 = TestSubscriber{};
 
     // Both subscribers subscribe to the same block topic using the complete network interface
-    var topics = [_]interface.GossipTopic{.block};
+    var topics = [_]interface.GossipTopic{.{ .kind = .block }};
     const network = mock.getNetworkInterface();
     try network.gossip.subscribe(&topics, subscriber1.getCallbackHandler());
     try network.gossip.subscribe(&topics, subscriber2.getCallbackHandler());

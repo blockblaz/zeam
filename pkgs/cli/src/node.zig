@@ -80,6 +80,7 @@ pub const NodeOptions = struct {
     validator_assignments: []ValidatorAssignment,
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
+    is_aggregator: bool,
     api_port: u16,
     metrics_port: u16,
     local_priv_key: []const u8,
@@ -171,6 +172,7 @@ pub const Node = struct {
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
+            .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
@@ -244,6 +246,7 @@ pub const Node = struct {
             .db = db,
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
+            .is_aggregator = options.is_aggregator,
         });
         errdefer self.beam_node.deinit();
 
@@ -377,7 +380,12 @@ pub const Node = struct {
             defer enr_fields.deinit(self.allocator);
 
             // Construct ENR from fields and private key
-            self.enr = try constructENRFromFields(self.allocator, self.options.local_priv_key, enr_fields);
+            self.enr = try constructENRFromFields(
+                self.allocator,
+                self.options.local_priv_key,
+                enr_fields,
+                self.options.is_aggregator,
+            );
         }
 
         // Overriding the IP to 0.0.0.0 to listen on all interfaces
@@ -565,6 +573,7 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.is_aggregator = node_cmd.@"is-aggregator";
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
@@ -829,6 +838,30 @@ fn getPrivateKeyFromValidatorConfig(allocator: std.mem.Allocator, node_key: []co
     return error.InvalidNodeKey;
 }
 
+fn getIsAggregatorFromValidatorConfig(node_key: []const u8, validator_config: Yaml) !bool {
+    for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
+        const name_value = entry.map.get("name").?;
+        if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
+            const value = entry.map.get("is_aggregator") orelse return false;
+            return switch (value) {
+                .boolean => |b| b,
+                .scalar => |s| blk: {
+                    if (std.ascii.eqlIgnoreCase(s, "true")) break :blk true;
+                    if (std.ascii.eqlIgnoreCase(s, "false")) break :blk false;
+                    const i = std.fmt.parseInt(i64, s, 10) catch break :blk error.InvalidAggregatorFlag;
+                    return switch (i) {
+                        0 => false,
+                        1 => true,
+                        else => error.InvalidAggregatorFlag,
+                    };
+                },
+                else => error.InvalidAggregatorFlag,
+            };
+        }
+    }
+    return error.InvalidNodeKey;
+}
+
 fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []const u8, validator_config: Yaml) !EnrFields {
     for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
         const name_value = entry.map.get("name").?;
@@ -913,7 +946,12 @@ fn getEnrFieldsFromValidatorConfig(allocator: std.mem.Allocator, node_key: []con
     return error.InvalidNodeKey;
 }
 
-fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8, enr_fields: EnrFields) !ENR {
+fn constructENRFromFields(
+    allocator: std.mem.Allocator,
+    private_key: []const u8,
+    enr_fields: EnrFields,
+    is_aggregator: bool,
+) !ENR {
     // Clean up private key (remove 0x prefix if present)
     const secret_key_str = if (std.mem.startsWith(u8, private_key, "0x"))
         private_key[2..]
@@ -986,6 +1024,13 @@ fn constructENRFromFields(allocator: std.mem.Allocator, private_key: []const u8,
             return error.ENRSetSEQFailed;
         };
     }
+
+    // Advertise aggregator capability in ENR.
+    // 0x00 = false, 0x01 = true.
+    const is_aggregator_bytes = [_]u8{if (is_aggregator) 0x01 else 0x00};
+    signable_enr.set("is_aggregator", &is_aggregator_bytes) catch {
+        return error.ENRSetIsAggregatorFailed;
+    };
 
     // Set custom fields
     var custom_iterator = enr_fields.custom_fields.iterator();
@@ -1075,9 +1120,10 @@ pub fn populateNodeNameRegistry(
                 if (privkey_value == .scalar) {
                     const enr_fields_value = entry.map.get("enrFields");
                     if (enr_fields_value != null) {
+                        const is_aggregator = getIsAggregatorFromValidatorConfig(node_name, parsed_validator_config) catch break :blk null;
                         var enr_fields = getEnrFieldsFromValidatorConfig(allocator, node_name, parsed_validator_config) catch break :blk null;
                         defer enr_fields.deinit(allocator);
-                        var enr = constructENRFromFields(allocator, privkey_value.scalar, enr_fields) catch break :blk null;
+                        var enr = constructENRFromFields(allocator, privkey_value.scalar, enr_fields, is_aggregator) catch break :blk null;
                         defer enr.deinit();
                         const pid = enr.peerId(allocator) catch break :blk null;
                         const pid_str_slice = pid.toBase58(&peer_id_buf) catch break :blk null;
@@ -1198,7 +1244,7 @@ test "ENR construction from fields" {
     defer std.testing.allocator.free(private_key);
 
     // Construct ENR from fields
-    const constructed_enr = try constructENRFromFields(std.testing.allocator, private_key, enr_fields);
+    const constructed_enr = try constructENRFromFields(std.testing.allocator, private_key, enr_fields, true);
 
     // Verify the ENR was constructed successfully
     // We can't easily verify the exact ENR content without knowing the exact signature,
@@ -1207,6 +1253,7 @@ test "ENR construction from fields" {
     try std.testing.expect(constructed_enr.kvs.get("quic") != null);
     try std.testing.expect(constructed_enr.kvs.get("tcp") != null);
     try std.testing.expect(constructed_enr.kvs.get("seq") != null);
+    try std.testing.expect(constructed_enr.kvs.get("is_aggregator") != null);
 }
 
 test "compare roots from genGensisBlock and genGenesisState and genStateBlockHeader" {
@@ -1334,6 +1381,7 @@ test "NodeOptions checkpoint_sync_url field is optional" {
         .validator_assignments = &[_]ValidatorAssignment{},
         .genesis_spec = genesis_spec,
         .metrics_enable = false,
+        .is_aggregator = false,
         .api_port = 5052,
         .metrics_port = 5053,
         .local_priv_key = try allocator.dupe(u8, "test"),

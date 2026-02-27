@@ -14,6 +14,7 @@ pub const Bytes32 = [32]u8;
 pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
+pub const SubnetId = u32;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
@@ -30,6 +31,16 @@ pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData };
 
 const json = std.json;
+
+pub const SubnetIdError = error{InvalidCommitteeCount};
+
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: SubnetId) SubnetIdError!SubnetId {
+    if (committee_count == 0) {
+        return error.InvalidCommitteeCount;
+    }
+    const committee_count_index: ValidatorIndex = committee_count;
+    return @intCast(validator_id % committee_count_index);
+}
 
 pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
@@ -174,6 +185,7 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
+    attestation_committee_count: SubnetId,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -183,6 +195,7 @@ pub const ChainSpec = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
+        try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
         return json.Value{ .object = obj };
     }
 

@@ -183,6 +183,7 @@ const StepContext = struct {
     state_map: *StateMap,
     allocated_states: *StateList,
     label_map: *LabelMap,
+    block_attestations: *BlockAttestationList,
     fork_logger: zeam_utils.ModuleLogger,
     base_context: Context,
 };
@@ -190,6 +191,19 @@ const StepContext = struct {
 const StateMap = std.AutoHashMapUnmanaged(types.Root, *types.BeamState);
 const StateList = std.ArrayList(*types.BeamState);
 const LabelMap = std.StringHashMapUnmanaged(types.Root);
+const BlockAttestationSummary = struct {
+    participants: []u64,
+    attestation_slot: u64,
+    target_slot: u64,
+};
+const BlockAttestationList = std.ArrayListUnmanaged(BlockAttestationSummary);
+
+fn clearBlockAttestations(allocator: Allocator, list: *BlockAttestationList) void {
+    for (list.items) |entry| {
+        allocator.free(entry.participants);
+    }
+    list.clearRetainingCapacity();
+}
 
 fn runCase(
     comptime spec_fork: Fork,
@@ -290,6 +304,12 @@ fn runCase(
     var label_map = LabelMap.empty;
     defer label_map.deinit(allocator);
 
+    var block_attestations = BlockAttestationList.empty;
+    defer {
+        clearBlockAttestations(allocator, &block_attestations);
+        block_attestations.deinit(allocator);
+    }
+
     var anchor_root: types.Root = undefined;
     zeam_utils.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_root, allocator) catch |err| {
         std.debug.print(
@@ -337,6 +357,7 @@ fn runCase(
         .state_map = &state_map,
         .allocated_states = &allocated_states,
         .label_map = &label_map,
+        .block_attestations = &block_attestations,
         .fork_logger = logger_config.logger(.forkchoice),
         .base_context = ctx,
     };
@@ -606,6 +627,52 @@ fn processBlockStep(
     var block = try buildBlock(ctx.allocator, fixture_path, case_name, block_value, step_index);
     defer block.deinit();
 
+    // Capture aggregated attestations for block-level checks.
+    clearBlockAttestations(ctx.allocator, ctx.block_attestations);
+    const aggregated_attestations = block.body.attestations.constSlice();
+    ctx.block_attestations.ensureTotalCapacity(ctx.allocator, aggregated_attestations.len) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{any}: failed to allocate block attestations ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    for (aggregated_attestations) |aggregated_attestation| {
+        var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to parse aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer indices.deinit(ctx.allocator);
+        const participants = ctx.allocator.alloc(u64, indices.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to allocate participants ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        var participants_owned_by_block_attestations = false;
+        errdefer if (!participants_owned_by_block_attestations) ctx.allocator.free(participants);
+        for (indices.items, 0..) |idx, i| {
+            participants[i] = @intCast(idx);
+        }
+        std.sort.heap(u64, participants, {}, std.sort.asc(u64));
+        ctx.block_attestations.append(ctx.allocator, .{
+            .participants = participants,
+            .attestation_slot = aggregated_attestation.data.slot,
+            .target_slot = aggregated_attestation.data.target.slot,
+        }) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to record block attestation ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        participants_owned_by_block_attestations = true;
+    }
+
     var block_root: types.Root = undefined;
     zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, ctx.allocator) catch |err| {
         std.debug.print(
@@ -624,7 +691,7 @@ fn processBlockStep(
     };
 
     const target_intervals = slotToIntervals(block.slot);
-    try ctx.fork_choice.onInterval(target_intervals, true);
+    try advanceForkchoiceIntervals(ctx, target_intervals, true);
 
     const new_state_ptr = try ctx.allocator.create(types.BeamState);
     errdefer {
@@ -654,8 +721,6 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
-    _ = try ctx.fork_choice.updateHead();
-
     ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{any}: failed to index block state ({s})\n",
@@ -670,6 +735,62 @@ fn processBlockStep(
         );
         return FixtureError.InvalidFixture;
     };
+
+    // Store block body attestations as known aggregated payloads (spec-aligned).
+    for (aggregated_attestations) |aggregated_attestation| {
+        var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to parse aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer indices.deinit(ctx.allocator);
+
+        var proof_template = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to init proof template ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer proof_template.deinit();
+
+        const bits_len = aggregated_attestation.aggregation_bits.len();
+        for (0..bits_len) |i| {
+            if (aggregated_attestation.aggregation_bits.get(i) catch false) {
+                types.aggregationBitsSet(&proof_template.participants, i, true) catch |err| {
+                    std.debug.print(
+                        "fixture {s} case {s}{any}: failed to set aggregation bit ({s})\n",
+                        .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
+            }
+        }
+
+        for (indices.items) |validator_index| {
+            var proof_clone: types.AggregatedSignatureProof = undefined;
+            types.sszClone(ctx.allocator, types.AggregatedSignatureProof, proof_template, &proof_clone) catch |err| {
+                std.debug.print(
+                    "fixture {s} case {s}{any}: failed to clone proof ({s})\n",
+                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                );
+                return FixtureError.InvalidFixture;
+            };
+            errdefer proof_clone.deinit();
+
+            ctx.fork_choice.storeAggregatedPayload(@intCast(validator_index), &aggregated_attestation.data, proof_clone) catch |err| {
+                std.debug.print(
+                    "fixture {s} case {s}{any}: failed to store aggregated payload ({s})\n",
+                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                );
+                return FixtureError.FixtureMismatch;
+            };
+        }
+    }
+
+    _ = try ctx.fork_choice.updateHead();
 
     var proposer_attestation = buildProposerAttestation(block, block_root, parent_state_ptr) catch |err| {
         std.debug.print(
@@ -690,11 +811,46 @@ fn processBlockStep(
         }
     }
 
-    const attestation = types.Attestation{
+    const signed_attestation = types.SignedAttestation{
         .validator_id = proposer_attestation.validator_id,
-        .data = proposer_attestation.data,
+        .message = proposer_attestation.data,
+        .signature = types.ZERO_SIGBYTES,
     };
-    try ctx.fork_choice.onAttestation(attestation, false);
+    // Proposer attestation is treated as gossip and queued as a new aggregated payload.
+    try ctx.fork_choice.onGossipAttestation(signed_attestation, false);
+
+    const proposer_data_root = try proposer_attestation.data.sszRoot(ctx.allocator);
+    try ctx.fork_choice.attestation_data_by_root.put(proposer_data_root, proposer_attestation.data);
+
+    var proposer_proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{any}: failed to init proposer proof ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    errdefer proposer_proof.deinit();
+
+    types.aggregationBitsSet(&proposer_proof.participants, proposer_attestation.validator_id, true) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{any}: failed to set proposer participant bit ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+
+    const sig_key = types.SignatureKey{
+        .validator_id = proposer_attestation.validator_id,
+        .data_root = proposer_data_root,
+    };
+    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(sig_key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .empty;
+    }
+    try gop.value_ptr.append(ctx.allocator, .{
+        .slot = proposer_attestation.data.slot,
+        .proof = proposer_proof,
+    });
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {
@@ -738,7 +894,7 @@ fn processTickStep(
     }
 
     const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-    try ctx.fork_choice.onInterval(target_intervals, false);
+    try advanceForkchoiceIntervals(ctx, target_intervals, false);
 }
 
 fn applyChecks(
@@ -871,6 +1027,24 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "blockAttestationCount")) {
+            const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
+            const actual: u64 = @intCast(ctx.block_attestations.items.len);
+            if (actual != expected) {
+                std.debug.print(
+                    "fixture {s} case {s}{any}: block attestation count mismatch got {d} expected {d}\n",
+                    .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "blockAttestations")) {
+            try verifyBlockAttestations(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
         if (std.mem.eql(u8, key, "lexicographicHeadAmong")) {
             try verifyLexicographicHead(ctx, fixture_path, case_name, step_index, value);
             continue;
@@ -881,6 +1055,118 @@ fn applyChecks(
             .{ fixture_path, case_name, formatStep(step_index), key },
         );
         return FixtureError.UnsupportedFixture;
+    }
+}
+
+fn verifyBlockAttestations(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    const arr = switch (value) {
+        .array => |entries| entries,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{any}: blockAttestations must be array\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+
+    if (ctx.block_attestations.items.len != arr.items.len) {
+        std.debug.print(
+            "fixture {s} case {s}{any}: block attestation count mismatch got {d} expected {d}\n",
+            .{ fixture_path, case_name, formatStep(step_index), ctx.block_attestations.items.len, arr.items.len },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+
+    const matched = ctx.allocator.alloc(bool, ctx.block_attestations.items.len) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{any}: failed to allocate match buffer ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    defer ctx.allocator.free(matched);
+    @memset(matched, false);
+
+    for (arr.items) |entry| {
+        const obj = switch (entry) {
+            .object => |map| map,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{any}: blockAttestations entry must be object\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+
+        const participants_value = obj.get("participants") orelse {
+            std.debug.print(
+                "fixture {s} case {s}{any}: blockAttestations missing participants\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        const participants_arr = switch (participants_value) {
+            .array => |entries| entries,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{any}: blockAttestations participants must be array\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        const expected_participants = ctx.allocator.alloc(u64, participants_arr.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to allocate expected participants ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer ctx.allocator.free(expected_participants);
+        for (participants_arr.items, 0..) |participant_value, idx| {
+            expected_participants[idx] = try expectU64Value(participant_value, fixture_path, case_name, step_index, "participants");
+        }
+        std.sort.heap(u64, expected_participants, {}, std.sort.asc(u64));
+
+        const expected_attestation_slot = try expectU64Field(obj, &.{"attestationSlot"}, fixture_path, case_name, step_index, "attestationSlot");
+        const expected_target_slot = try expectU64Field(obj, &.{"targetSlot"}, fixture_path, case_name, step_index, "targetSlot");
+
+        var found = false;
+        for (ctx.block_attestations.items, 0..) |actual, actual_idx| {
+            if (matched[actual_idx]) continue;
+            if (actual.attestation_slot != expected_attestation_slot) continue;
+            if (actual.target_slot != expected_target_slot) continue;
+            if (actual.participants.len != expected_participants.len) continue;
+
+            var equal = true;
+            for (actual.participants, 0..) |p, p_idx| {
+                if (p != expected_participants[p_idx]) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (!equal) continue;
+
+            matched[actual_idx] = true;
+            found = true;
+            break;
+        }
+
+        if (!found) {
+            std.debug.print(
+                "fixture {s} case {s}{any}: blockAttestations entry mismatch\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.FixtureMismatch;
+        }
     }
 }
 
@@ -1502,6 +1788,15 @@ fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.Chai
         std.debug.print("spectest: unable to init chain config: {s}\n", .{@errorName(err)});
         return FixtureError.InvalidFixture;
     };
+}
+
+fn advanceForkchoiceIntervals(ctx: *StepContext, target_intervals: u64, has_proposal: bool) !void {
+    while (ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) < target_intervals) {
+        const next_interval: u64 = ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) + 1;
+        const signal_proposal = has_proposal and next_interval == target_intervals;
+
+        try ctx.fork_choice.onInterval(next_interval, signal_proposal);
+    }
 }
 
 fn slotToIntervals(slot: u64) u64 {

@@ -14,8 +14,8 @@ const networks = @import("@zeam/network");
 const constants = @import("./constants.zig");
 
 pub const ValidatorClientOutput = struct {
-    gossip_messages: std.ArrayList(networks.GossipMessage),
     allocator: Allocator,
+    gossip_messages: std.ArrayList(networks.GossipMessage),
 
     const Self = @This();
 
@@ -27,6 +27,12 @@ pub const ValidatorClientOutput = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.gossip_messages.items) |*gossip_msg| {
+            switch (gossip_msg.*) {
+                .aggregation => |*signed_aggregation| signed_aggregation.deinit(),
+                else => {},
+            }
+        }
         self.gossip_messages.deinit(self.allocator);
     }
 
@@ -35,8 +41,19 @@ pub const ValidatorClientOutput = struct {
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 
-    pub fn addAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
+    pub fn addAttestation(self: *Self, subnet_id: types.SubnetId, signed_attestation: types.SignedAttestation) !void {
+        var cloned_attestation: types.SignedAttestation = undefined;
+        try types.sszClone(self.allocator, types.SignedAttestation, signed_attestation, &cloned_attestation);
+        const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = cloned_attestation } };
+        try self.gossip_messages.append(self.allocator, gossip_msg);
+    }
+
+    pub fn addAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+        var cloned_aggregation: types.SignedAggregatedAttestation = undefined;
+        try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned_aggregation);
+        errdefer cloned_aggregation.deinit();
+
+        const gossip_msg = networks.GossipMessage{ .aggregation = cloned_aggregation };
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
 };
@@ -82,6 +99,7 @@ pub const ValidatorClient = struct {
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
+            4 => return null,
             else => @panic("interval error"),
         }
     }
@@ -214,7 +232,9 @@ pub const ValidatorClient = struct {
                 .signature = signature,
             };
 
-            try result.addAttestation(signed_attestation);
+            // TODO: Cache validator_id -> subnet_id mapping to avoid recomputing per interval for large validator sets.
+            const subnet_id = try types.computeSubnetId(@intCast(validator_id), self.config.spec.attestation_committee_count);
+            try result.addAttestation(subnet_id, signed_attestation);
             self.logger.info("constructed attestation slot={d} validator={d}", .{ slot, validator_id });
         }
         return result;
