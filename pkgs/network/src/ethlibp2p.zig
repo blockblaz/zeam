@@ -148,7 +148,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     const response_method_name = @tagName(response_method);
     const node_name = ctx.zigHandler.node_registry.getNodeNameFromPeerId(ctx.peer_id);
     ctx.zigHandler.logger.debug(
-        "network-{d}:: serverStreamSendResponse ctx.method={s} response.tag={s} peer={s}{any}",
+        "network-{d}:: serverStreamSendResponse ctx.method={s} response.tag={s} peer={s}{f}",
         .{ ctx.zigHandler.params.networkId, @tagName(ctx.method), @tagName(response_method), ctx.peer_id, node_name },
     );
 
@@ -161,7 +161,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     }
     const encoded = response.serialize(allocator) catch |err| {
         ctx.zigHandler.logger.err(
-            "network-{d}:: Failed to serialize {s} response for peer={s}{any} channel={d}: {any}",
+            "network-{d}:: Failed to serialize {s} response for peer={s}{f} channel={d}: {any}",
             .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id, err },
         );
         return err;
@@ -170,7 +170,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
 
     const framed = snappyframesz.encode(allocator, encoded) catch |err| {
         ctx.zigHandler.logger.err(
-            "network-{d}:: Failed to snappy-frame {s} response for peer={s}{any} channel={d}: {any}",
+            "network-{d}:: Failed to snappy-frame {s} response for peer={s}{f} channel={d}: {any}",
             .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id, err },
         );
         return err;
@@ -181,7 +181,7 @@ fn serverStreamSendResponse(ptr: *anyopaque, response: *const interface.ReqRespR
     defer allocator.free(frame);
 
     ctx.zigHandler.logger.debug(
-        "network-{d}:: Streaming {s} response to peer={s}{any} channel={d}",
+        "network-{d}:: Streaming {s} response to peer={s}{f} channel={d}",
         .{ ctx.zigHandler.params.networkId, response_method_name, ctx.peer_id, node_name, ctx.channel_id },
     );
 
@@ -205,7 +205,7 @@ fn serverStreamSendError(ptr: *anyopaque, code: u32, message: []const u8) anyerr
 
     const node_name = ctx.zigHandler.node_registry.getNodeNameFromPeerId(ctx.peer_id);
     ctx.zigHandler.logger.warn(
-        "network-{d}:: Streaming RPC error to peer={s}{any} channel={d} code={d}: {s}",
+        "network-{d}:: Streaming RPC error to peer={s}{f} channel={d} code={d}: {s}",
         .{ ctx.zigHandler.params.networkId, ctx.peer_id, node_name, ctx.channel_id, code, message },
     );
 
@@ -330,7 +330,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         .block => |signed_block| {
             const block = signed_block.message.block;
             zigHandler.logger.debug(
-                "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
+                "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{
                     zigHandler.params.networkId,
                     block.slot,
@@ -346,7 +346,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             const slot = signed_attestation.message.slot;
             const validator_id = signed_attestation.validator_id;
             zigHandler.logger.debug(
-                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
+                "network-{d}:: received gossip attestation slot={d} validator={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{
                     zigHandler.params.networkId,
                     slot,
@@ -362,7 +362,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     // Debug-only JSON dump (conversion happens only if debug is actually emitted).
     zigHandler.logger.debug(
-        "network-{d}:: gossip payload json topic={s} from peer={s}{any}: {any}",
+        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {any}",
         .{
             zigHandler.params.networkId,
             std.mem.span(topic_str),
@@ -374,7 +374,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     // TODO: figure out why scheduling on the loop is not working
     zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
-        zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}{any}", .{ e, sender_peer_id_slice, node_name });
+        zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}{f}", .{ e, sender_peer_id_slice, node_name });
     };
 }
 
@@ -392,7 +392,7 @@ export fn handleRPCRequestFromRustBridge(
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const rpc_protocol = LeanSupportedProtocol.fromSlice(protocol_slice) orelse {
         zigHandler.logger.warn(
-            "network-{d}:: Unsupported RPC protocol from peer={s}{any} on channel={d}: {s}",
+            "network-{d}:: Unsupported RPC protocol from peer={s}{f} on channel={d}: {s}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, protocol_slice },
         );
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Unsupported RPC protocol");
@@ -403,7 +403,7 @@ export fn handleRPCRequestFromRustBridge(
 
     const request_frame_info = parseRequestFrame(request_frame) catch |err| {
         zigHandler.logger.err(
-            "network-{d}:: Invalid RPC request frame from peer={s}{any} protocol={s}: {any}",
+            "network-{d}:: Invalid RPC request frame from peer={s}{f} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Invalid RPC request frame");
@@ -412,7 +412,7 @@ export fn handleRPCRequestFromRustBridge(
 
     const request_bytes = snappyframesz.decode(zigHandler.allocator, request_frame_info.payload) catch |err| {
         zigHandler.logger.err(
-            "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{any} protocol={s}: {any}",
+            "network-{d}:: Failed to decode snappy-framed RPC request from peer={s}{f} protocol={s}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, protocol_slice, err },
         );
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to decode RPC request");
@@ -421,7 +421,7 @@ export fn handleRPCRequestFromRustBridge(
     defer zigHandler.allocator.free(request_bytes);
     if (request_bytes.len != request_frame_info.declared_len) {
         zigHandler.logger.err(
-            "network-{d}:: Invalid RPC request length from peer={s}{any} protocol={s}: declared={d} decoded={d}",
+            "network-{d}:: Invalid RPC request length from peer={s}{f} protocol={s}: declared={d} decoded={d}",
             .{
                 zigHandler.params.networkId,
                 peer_id_slice,
@@ -439,13 +439,13 @@ export fn handleRPCRequestFromRustBridge(
     var request = interface.ReqRespRequest.deserialize(zigHandler.allocator, method, request_bytes) catch |err| {
         const label = method.name();
         zigHandler.logger.err(
-            "Error in deserializing the {s} RPC request from peer={s}{any}: {any}",
+            "Error in deserializing the {s} RPC request from peer={s}{f}: {any}",
             .{ label, peer_id_slice, node_name, err },
         );
         if (writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s} from peer={s}{any}", .{ label, filename, peer_id_slice, node_name });
+            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s} from peer={s}{f}", .{ label, filename, peer_id_slice, node_name });
         } else {
-            zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{any}", .{ label, peer_id_slice, node_name });
+            zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
         }
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
         return;
@@ -453,13 +453,13 @@ export fn handleRPCRequestFromRustBridge(
     defer request.deinit();
 
     zigHandler.logger.debug(
-        "network-{d}:: received RPC request peer={s}{any} protocol={s} channel={d} size={d}",
+        "network-{d}:: received RPC request peer={s}{f} protocol={s} channel={d} size={d}",
         .{ zigHandler.params.networkId, peer_id_slice, node_name, rpc_protocol.protocolId(), channel_id, request_bytes.len },
     );
 
     // Debug-only JSON dump (conversion happens only if debug is actually emitted).
     zigHandler.logger.debug(
-        "network-{d}:: rpc request json peer={s}{any} protocol={s} channel={d}: {any}",
+        "network-{d}:: rpc request json peer={s}{f} protocol={s} channel={d}: {any}",
         .{
             zigHandler.params.networkId,
             peer_id_slice,
@@ -490,7 +490,7 @@ export fn handleRPCRequestFromRustBridge(
 
     zigHandler.reqrespHandler.onReqRespRequest(&request, stream) catch |e| {
         zigHandler.logger.err(
-            "network-{d}:: Error while handling RPC request from peer={s}{any} on channel={d}: {any}",
+            "network-{d}:: Error while handling RPC request from peer={s}{f} on channel={d}: {any}",
             .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, e },
         );
 
@@ -500,14 +500,14 @@ export fn handleRPCRequestFromRustBridge(
                 defer zigHandler.allocator.free(owned);
                 stream.sendError(1, owned) catch |send_err| {
                     zigHandler.logger.err(
-                        "network-{d}:: Failed to send RPC error response for peer={s}{any} channel={d}: {any}",
+                        "network-{d}:: Failed to send RPC error response for peer={s}{f} channel={d}: {any}",
                         .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, send_err },
                     );
                 };
             } else {
                 stream.finish() catch |finish_err| {
                     zigHandler.logger.err(
-                        "network-{d}:: Failed to finalize errored RPC stream for peer={s}{any} channel={d}: {any}",
+                        "network-{d}:: Failed to finalize errored RPC stream for peer={s}{f} channel={d}: {any}",
                         .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, finish_err },
                     );
                 };
@@ -519,7 +519,7 @@ export fn handleRPCRequestFromRustBridge(
     if (!stream.isFinished()) {
         stream.finish() catch |finish_err| {
             zigHandler.logger.err(
-                "network-{d}:: Failed to finalize RPC stream for peer={s}{any} channel={d}: {any}",
+                "network-{d}:: Failed to finalize RPC stream for peer={s}{f} channel={d}: {any}",
                 .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, finish_err },
             );
         };
@@ -540,7 +540,7 @@ export fn handleRPCResponseFromRustBridge(
 
     const callback_ptr = zigHandler.rpcCallbacks.getPtr(request_id) orelse {
         zigHandler.logger.warn(
-            "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{any}",
+            "network-{d}:: Received RPC response for unknown request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_slice, peer_id_slice, node_name },
         );
         return;
@@ -562,7 +562,7 @@ export fn handleRPCResponseFromRustBridge(
     const method = callback_ptr.method;
     if (protocol != method) {
         zigHandler.logger.warn(
-            "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s} from peer={s}{any}",
+            "network-{d}:: RPC protocol/method mismatch for request_id={d}: protocol={s} method={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol.protocolId(), @tagName(method), callback_peer_id, callback_node_name },
         );
     }
@@ -582,13 +582,13 @@ export fn handleRPCResponseFromRustBridge(
 
     if (parsed_frame.code != 0) {
         zigHandler.logger.warn(
-            "network-{d}:: RPC error response for request_id={d} protocol={s} code={d} from peer={s}{any}",
+            "network-{d}:: RPC error response for request_id={d} protocol={s} code={d} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol.protocolId(), parsed_frame.code, callback_peer_id, callback_node_name },
         );
 
         const owned_message = zigHandler.allocator.dupe(u8, parsed_frame.payload) catch |dup_err| {
             zigHandler.logger.err(
-                "network-{d}:: Failed to duplicate RPC error payload for request_id={d} from peer={s}{any}: {any}",
+                "network-{d}:: Failed to duplicate RPC error payload for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, dup_err },
             );
             zigHandler.notifyRpcErrorFmt(
@@ -647,13 +647,13 @@ export fn handleRPCResponseFromRustBridge(
     defer event.deinit(zigHandler.allocator);
 
     zigHandler.logger.debug(
-        "network-{d}:: Received RPC response for request_id={d} protocol={s} size={d} from peer={s}{any}",
+        "network-{d}:: Received RPC response for request_id={d} protocol={s} size={d} from peer={s}{f}",
         .{ zigHandler.params.networkId, request_id, protocol.protocolId(), response_bytes.len, callback_peer_id, callback_node_name },
     );
 
     callback_ptr.notify(&event) catch |notify_err| {
         zigHandler.logger.err(
-            "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{any}: {any}",
+            "network-{d}:: Failed to notify RPC success callback for request_id={d} from peer={s}{f}: {any}",
             .{ zigHandler.params.networkId, request_id, callback_peer_id, callback_node_name, notify_err },
         );
     };
@@ -680,7 +680,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
         defer event.deinit(zigHandler.allocator);
 
         zigHandler.logger.debug(
-            "network-{d}:: Received RPC end-of-stream for request_id={d} protocol={s} from peer={s}{any}",
+            "network-{d}:: Received RPC end-of-stream for request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_str, callback_peer_id, callback_node_name },
         );
 
@@ -693,7 +693,7 @@ export fn handleRPCEndOfStreamFromRustBridge(
         callback.deinit();
     } else {
         zigHandler.logger.warn(
-            "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s} from peer={s}{any}",
+            "network-{d}:: Received RPC end-of-stream for unknown request_id={d} protocol={s} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_str, peer_id_slice, node_name },
         );
     }
@@ -718,7 +718,7 @@ export fn handleRPCErrorFromRustBridge(
 
         const owned_message = zigHandler.allocator.dupe(u8, message_slice) catch |alloc_err| {
             zigHandler.logger.err(
-                "network-{d}:: Failed to duplicate RPC error message for request_id={d} from peer={s}{any}: {any}",
+                "network-{d}:: Failed to duplicate RPC error message for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, alloc_err },
             );
             callback.deinit();
@@ -732,13 +732,13 @@ export fn handleRPCErrorFromRustBridge(
         defer event.deinit(zigHandler.allocator);
 
         zigHandler.logger.warn(
-            "network-{d}:: Received RPC error for request_id={d} protocol={s} code={d} from peer={s}{any}",
+            "network-{d}:: Received RPC error for request_id={d} protocol={s} code={d} from peer={s}{f}",
             .{ zigHandler.params.networkId, request_id, protocol_str, code, peer_id, node_name },
         );
 
         callback.notify(&event) catch |notify_err| {
             zigHandler.logger.err(
-                "network-{d}:: Failed to notify RPC error for request_id={d} from peer={s}{any}: {any}",
+                "network-{d}:: Failed to notify RPC error for request_id={d} from peer={s}{f}: {any}",
                 .{ zigHandler.params.networkId, request_id, peer_id, node_name, notify_err },
             );
         };
@@ -759,7 +759,7 @@ export fn handlePeerConnectedFromRustBridge(
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const dir = @as(interface.PeerDirection, @enumFromInt(direction));
-    zigHandler.logger.info("network-{d}:: Peer connected: {s}{any} direction={s}", .{
+    zigHandler.logger.info("network-{d}:: Peer connected: {s}{f} direction={s}", .{
         zigHandler.params.networkId,
         peer_id_slice,
         node_name,
@@ -781,7 +781,7 @@ export fn handlePeerDisconnectedFromRustBridge(
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const dir = @as(interface.PeerDirection, @enumFromInt(direction));
     const rsn = @as(interface.DisconnectionReason, @enumFromInt(reason));
-    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{any} direction={s} reason={s}", .{
+    zigHandler.logger.info("network-{d}:: Peer disconnected: {s}{f} direction={s} reason={s}", .{
         zigHandler.params.networkId,
         peer_id_slice,
         node_name,
@@ -1049,7 +1049,7 @@ pub const EthLibp2p = struct {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
         const encoded_message = req.serialize(self.allocator) catch |err| {
             self.logger.err(
-                "network-{d}:: Failed to serialize RPC request for peer={s}{any} method={s}: {any}",
+                "network-{d}:: Failed to serialize RPC request for peer={s}{f} method={s}: {any}",
                 .{ self.params.networkId, peer_id, node_name, @tagName(method), err },
             );
             return err;
@@ -1059,7 +1059,7 @@ pub const EthLibp2p = struct {
 
         const framed_payload = snappyframesz.encode(self.allocator, encoded_message) catch |err| {
             self.logger.err(
-                "network-{d}:: Failed to snappy-frame RPC request payload for peer={s}{any} protocol_tag={d}: {any}",
+                "network-{d}:: Failed to snappy-frame RPC request payload for peer={s}{f} protocol_tag={d}: {any}",
                 .{ self.params.networkId, peer_id, node_name, protocol_tag, err },
             );
             return err;
@@ -1068,7 +1068,7 @@ pub const EthLibp2p = struct {
 
         const frame = buildRequestFrame(self.allocator, encoded_message.len, framed_payload) catch |err| {
             self.logger.err(
-                "network-{d}:: Failed to build RPC request frame for peer={s}{any} protocol_tag={d}: {any}",
+                "network-{d}:: Failed to build RPC request frame for peer={s}{f} protocol_tag={d}: {any}",
                 .{ self.params.networkId, peer_id, node_name, protocol_tag, err },
             );
             return err;
@@ -1096,7 +1096,7 @@ pub const EthLibp2p = struct {
             self.rpcCallbacks.put(self.allocator, request_id, callback_entry) catch |err| {
                 self.allocator.free(peer_id_copy);
                 self.logger.err(
-                    "network-{d}:: Failed to register RPC callback for request_id={d} peer={s}{any}: {any}",
+                    "network-{d}:: Failed to register RPC callback for request_id={d} peer={s}{f}: {any}",
                     .{ self.params.networkId, request_id, peer_id, node_name, err },
                 );
                 return err;
@@ -1125,7 +1125,7 @@ pub const EthLibp2p = struct {
             const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
             callback.notify(&event) catch |notify_err| {
                 self.logger.err(
-                    "network-{d}:: Failed to deliver RPC error callback for request_id={d} from peer={s}{any}: {any}",
+                    "network-{d}:: Failed to deliver RPC error callback for request_id={d} from peer={s}{f}: {any}",
                     .{ self.params.networkId, request_id, peer_id, node_name, notify_err },
                 );
             };
@@ -1151,7 +1151,7 @@ pub const EthLibp2p = struct {
         const node_name = if (callback_ptr) |cb| self.node_registry.getNodeNameFromPeerId(cb.peer_id) else zeam_utils.OptionalNode.init(null);
         const owned_message = std.fmt.allocPrint(self.allocator, fmt, args) catch |alloc_err| {
             self.logger.err(
-                "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{any}: {any}",
+                "network-{d}:: Failed to allocate RPC error message for request_id={d} from peer={s}{f}: {any}",
                 .{ self.params.networkId, request_id, peer_id, node_name, alloc_err },
             );
             return;

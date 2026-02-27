@@ -44,9 +44,7 @@ pub const ProtoNode = struct {
     // info populated lazily for tree visualization in snapshot for efficiency purposes
     numBranches: ?usize = null,
 
-    pub fn format(self: ProtoNode, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: ProtoNode, writer: anytype) !void {
         try writer.print("ProtoNode{{ slot={d}, weight={d}, blockRoot=0x{x} }}", .{
             self.slot,
             self.weight,
@@ -215,9 +213,10 @@ const OnBlockOpts = struct {
 };
 
 pub const ForkChoiceStore = struct {
-    // time in intervals and slots since genesis
-    time: types.Interval,
-    timeSlots: types.Slot,
+    // Shared slot/interval clock - updated by the forkchoice on every tick.
+    // Also pointed to by ZeamLoggerConfig so loggers can annotate each line
+    // with the current slot and interval without acquiring any lock.
+    slot_clock: zeam_utils.SlotTimeClock,
 
     latest_justified: types.Checkpoint,
     // finalized is not tracked the same way in 3sf mini as it corresponds to head's finalized
@@ -328,8 +327,11 @@ pub const ForkChoice = struct {
         const proto_array = try ProtoArray.init(allocator, anchor_block);
         const anchorCP = types.Checkpoint{ .slot = opts.anchorState.slot, .root = anchor_block_root };
         const fc_store = ForkChoiceStore{
-            .time = opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
-            .timeSlots = opts.anchorState.slot,
+            .slot_clock = zeam_utils.SlotTimeClock.init(
+                opts.anchorState.slot * constants.INTERVALS_PER_SLOT,
+                opts.anchorState.slot,
+                0, // slotInterval is 0 at anchor: time is always a slot boundary
+            ),
             .latest_justified = anchorCP,
             .latest_finalized = anchorCP,
         };
@@ -778,12 +780,13 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
-        self.fcStore.time += 1;
-        const currentInterval = self.fcStore.time % constants.INTERVALS_PER_SLOT;
+        const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
+        const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
+        self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
 
         switch (currentInterval) {
             0 => {
-                self.fcStore.timeSlots += 1;
+                _ = self.fcStore.slot_clock.timeSlots.fetchAdd(1, .monotonic);
                 if (hasProposal) {
                     _ = try self.acceptNewAttestationsUnlocked();
                 }
@@ -797,13 +800,13 @@ pub const ForkChoice = struct {
             },
             else => @panic("invalid interval"),
         }
-        self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.time, self.fcStore.timeSlots });
+        self.logger.debug("forkchoice ticked to time(intervals)={d} slot={d}", .{ self.fcStore.slot_clock.time.load(.monotonic), self.fcStore.slot_clock.timeSlots.load(.monotonic) });
     }
 
     // Internal unlocked version - assumes caller holds lock
     fn onIntervalUnlocked(self: *Self, time_intervals: usize, has_proposal: bool) !void {
-        while (self.fcStore.time < time_intervals) {
-            try self.tickIntervalUnlocked(has_proposal and (self.fcStore.time + 1) == time_intervals);
+        while (self.fcStore.slot_clock.time.load(.monotonic) < time_intervals) {
+            try self.tickIntervalUnlocked(has_proposal and (self.fcStore.slot_clock.time.load(.monotonic) + 1) == time_intervals);
         }
     }
 
@@ -886,6 +889,14 @@ pub const ForkChoice = struct {
         // Ensure target is at or after the source (latest_justified) to maintain invariant: source.slot <= target.slot
         // This prevents creating invalid attestations where source slot exceeds target slot
         // If the calculated target is older than latest_justified, use latest_justified instead
+        // TODO figure out how this happens
+        //
+        // - one scenario is where checkpoint sync from finalized wrongly sets justified to the anchor and doesn't get updated
+        //
+        // - other is the below scenario but needs to be validated and fixed properly (from previous comments)
+        // This can happen when the updateHeadUnlocked is not yet called for the new block
+        // and the target is calculated before the head is updated
+        // OnBlock calls update the latest_justified and attestation occurs on interval before the head is updated
         if (nodes[target_idx].slot < self.fcStore.latest_justified.slot) {
             return self.fcStore.latest_justified;
         }
@@ -943,7 +954,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={f} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,
@@ -1095,7 +1106,7 @@ pub const ForkChoice = struct {
                 attestation_tracker.latestNew = null;
             }
         } else {
-            if (attestation_slot > self.fcStore.timeSlots) {
+            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
                 return ForkChoiceError.InvalidFutureAttestation;
             }
             // just update latest new attested head of the validator
@@ -1221,7 +1232,7 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.time) {
+            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
                 return ForkChoiceError.FutureSlot;
             } else if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
@@ -1449,7 +1460,7 @@ pub const ForkChoice = struct {
     pub fn getCurrentSlot(self: *Self) types.Slot {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.fcStore.timeSlots;
+        return self.fcStore.slot_clock.timeSlots.load(.monotonic);
     }
 
     /// Check if a block exists and get its slot (thread-safe)
@@ -1661,8 +1672,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     // Create ForkChoice with head at F
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .time = 8 * constants.INTERVALS_PER_SLOT,
-        .timeSlots = 8,
+        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };
@@ -1976,8 +1986,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .time = 8 * constants.INTERVALS_PER_SLOT,
-        .timeSlots = 8,
+        .slot_clock = zeam_utils.SlotTimeClock.init(8 * constants.INTERVALS_PER_SLOT, 8, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };
@@ -2924,8 +2933,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
 
     const anchorCP = types.Checkpoint{ .slot = 0, .root = createTestRoot(0xAA) };
     const fc_store = ForkChoiceStore{
-        .time = 3 * constants.INTERVALS_PER_SLOT,
-        .timeSlots = 3,
+        .slot_clock = zeam_utils.SlotTimeClock.init(3 * constants.INTERVALS_PER_SLOT, 3, 0),
         .latest_justified = anchorCP,
         .latest_finalized = anchorCP,
     };
