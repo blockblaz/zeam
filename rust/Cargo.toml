@@ -5,10 +5,11 @@ members = [
   "openvm-glue",
   "risc0-glue",
   "sp1-glue",
+  "ziren-glue",
   "hashsig-glue",
   "multisig-glue",
 ]
-default-members = ["libp2p-glue", "openvm-glue", "risc0-glue", "sp1-glue", "hashsig-glue", "multisig-glue"]
+default-members = ["libp2p-glue", "openvm-glue", "risc0-glue", "sp1-glue", "ziren-glue", "hashsig-glue", "multisig-glue"]
 
 [profile.release]
 # LTO (Link Time Optimization) is disabled to avoid symbol conflicts between risc0 and openvm.
@@ -36,6 +37,14 @@ panic = "abort"      # Remove unwinding code for smaller binary
 
 # Optimized profile for SP1-only builds (maximum size reduction)
 [profile.sp1-release]
+inherits = "release"
+lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
+opt-level = "z"      # Optimize for size instead of speed
+codegen-units = 1    # Better optimization (slower compilation)
+panic = "abort"      # Remove unwinding code for smaller binary
+
+# Optimized profile for Ziren-only builds (maximum size reduction)
+[profile.ziren-release]
 inherits = "release"
 lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
 opt-level = "z"      # Optimize for size instead of speed
