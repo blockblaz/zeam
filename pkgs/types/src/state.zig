@@ -223,7 +223,7 @@ pub const BeamState = struct {
         }
     }
 
-    fn shiftJustifiedSlots(self: *Self, delta: Slot, allocator: Allocator) !void {
+    pub fn shiftJustifiedSlots(self: *Self, delta: Slot, allocator: Allocator) !void {
         if (delta == 0) {
             return;
         }
