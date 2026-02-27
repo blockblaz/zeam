@@ -63,6 +63,31 @@ fn openvm_verify_stub(binary_path: [*]const u8, binary_path_len: usize, receipt:
 const openvm_prove_fn = if (build_options.has_openvm) openvm_prove else openvm_prove_stub;
 const openvm_verify_fn = if (build_options.has_openvm) openvm_verify else openvm_verify_stub;
 
+// Conditionally declare extern functions - these will only be linked if the library is included
+extern fn sp1_prove(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) callconv(.c) u32;
+extern fn sp1_verify(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) callconv(.c) bool;
+
+fn sp1_prove_stub(serialized: [*]const u8, len: usize, binary_path: [*]const u8, binary_path_length: usize, output: [*]u8, output_len: usize) u32 {
+    _ = serialized;
+    _ = len;
+    _ = binary_path;
+    _ = binary_path_length;
+    _ = output;
+    _ = output_len;
+    @panic("SP1 support not compiled in");
+}
+
+fn sp1_verify_stub(binary_path: [*]const u8, binary_path_len: usize, receipt: [*]const u8, receipt_len: usize) bool {
+    _ = binary_path;
+    _ = binary_path_len;
+    _ = receipt;
+    _ = receipt_len;
+    @panic("SP1 support not compiled in");
+}
+
+const sp1_prove_fn = if (build_options.has_sp1) sp1_prove else sp1_prove_stub;
+const sp1_verify_fn = if (build_options.has_sp1) sp1_verify else sp1_verify_stub;
+
 const PowdrConfig = struct {
     program_path: []const u8,
     output_dir: []const u8,
@@ -78,6 +103,10 @@ const OpenVMConfig = struct {
     result_path: []const u8,
 };
 
+const SP1Config = struct {
+    program_path: []const u8,
+};
+
 const DummyConfig = struct {
     // Empty struct - dummy prover doesn't need configuration
 };
@@ -86,6 +115,7 @@ const ZKVMConfig = union(enum) {
     powdr: PowdrConfig,
     risc0: Risc0Config,
     openvm: OpenVMConfig,
+    sp1: SP1Config,
     dummy: DummyConfig,
 };
 pub const ZKVMs = std.meta.Tag(ZKVMConfig);
@@ -127,6 +157,7 @@ pub fn prove_transition(state: types.BeamState, block: types.BeamBlock, opts: ZK
         .powdr => return error.RiscVPowdrIsDeprecated,
         .risc0 => |risc0cfg| risc0_prove_fn(serialized.items.ptr, serialized.items.len, risc0cfg.program_path.ptr, risc0cfg.program_path.len, output.ptr, output.len),
         .openvm => |openvmcfg| openvm_prove_fn(serialized.items.ptr, serialized.items.len, output.ptr, output.len, openvmcfg.program_path.ptr, openvmcfg.program_path.len, openvmcfg.result_path.ptr, openvmcfg.result_path.len),
+        .sp1 => |sp1cfg| sp1_prove_fn(serialized.items.ptr, serialized.items.len, sp1cfg.program_path.ptr, sp1cfg.program_path.len, output.ptr, output.len),
         .dummy => blk: {
             // For dummy prover, we actually run the transition function to test it
             // This ensures the transition function works and tests allocations
@@ -161,6 +192,7 @@ pub fn verify_transition(stf_proof: types.BeamSTFProof, state_root: types.Bytes3
     const valid = switch (opts.zkvm) {
         .risc0 => |risc0cfg| risc0_verify_fn(risc0cfg.program_path.ptr, risc0cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         .openvm => |openvmcfg| openvm_verify_fn(openvmcfg.program_path.ptr, openvmcfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
+        .sp1 => |sp1cfg| sp1_verify(sp1cfg.program_path.ptr, sp1cfg.program_path.len, stf_proof.proof.ptr, stf_proof.proof.len),
         .dummy => blk: {
             const expected_proof = "DUMMY_PROOF_V1";
             if (stf_proof.proof.len >= expected_proof.len) {
