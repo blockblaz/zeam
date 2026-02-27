@@ -294,33 +294,24 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
+    // Deserialize gossip message by dispatching on the topic kind.
+    // Using `inline else` with `std.meta.TagPayload` makes this generic:
+    // any new gossip type added to `GossipMessage` is automatically handled
+    // without requiring a new deserialization block here.
     const message: interface.GossipMessage = switch (topic.gossip_topic) {
-        .block => blockmessage: {
-            var message_data: types.SignedBlockWithAttestation = undefined;
-            ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
+        inline else => |tag| msg: {
+            const PayloadType = std.meta.TagPayload(interface.GossipMessage, tag);
+            var message_data: PayloadType = undefined;
+            ssz.deserialize(PayloadType, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
+                zigHandler.logger.err("Error in deserializing the {s} message: {any}", .{ @tagName(tag), e });
+                if (writeFailedBytes(uncompressed_message, @tagName(tag), zigHandler.allocator, null, zigHandler.logger)) |filename| {
+                    zigHandler.logger.err("{s} deserialization failed - debug file created: {s}", .{ @tagName(tag), filename });
                 } else {
-                    zigHandler.logger.err("Block deserialization failed - could not create debug file", .{});
+                    zigHandler.logger.err("{s} deserialization failed - could not create debug file", .{@tagName(tag)});
                 }
                 return;
             };
-
-            break :blockmessage .{ .block = message_data };
-        },
-        .attestation => attestationmessage: {
-            var message_data: types.SignedAttestation = undefined;
-            ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "attestation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Attestation deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Attestation deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-            break :attestationmessage .{ .attestation = message_data };
+            break :msg @unionInit(interface.GossipMessage, @tagName(tag), message_data);
         },
     };
 
