@@ -108,9 +108,6 @@ pub const BeamChain = struct {
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
-    // Pending gossip attestations/aggregations waiting for target state to be available.
-    pending_gossip_attestations: std.ArrayList(networks.AttestationGossip),
-    pending_gossip_aggregations: std.ArrayList(types.SignedAggregatedAttestation),
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
 
@@ -164,8 +161,6 @@ pub const BeamChain = struct {
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = opts.is_aggregator,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
-            .pending_gossip_attestations = .empty,
-            .pending_gossip_aggregations = .empty,
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
         };
@@ -199,13 +194,6 @@ pub const BeamChain = struct {
 
         // Clean up public key cache
         self.public_key_cache.deinit();
-
-        // Clean up pending gossip queues
-        for (self.pending_gossip_aggregations.items) |*agg| {
-            agg.deinit();
-        }
-        self.pending_gossip_attestations.deinit(self.allocator);
-        self.pending_gossip_aggregations.deinit(self.allocator);
 
         // Clean up root to slot cache
         self.root_to_slot_cache.deinit();
@@ -765,10 +753,6 @@ pub const BeamChain = struct {
                 // Process validated attestation
                 self.onGossipAttestation(signed_attestation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    if (err == AttestationValidationError.MissingState) {
-                        self.cachePendingAttestation(signed_attestation);
-                        return .{};
-                    }
                     self.module_logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
@@ -788,10 +772,6 @@ pub const BeamChain = struct {
                 });
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    if (err == error.MissingState) {
-                        self.cachePendingAggregation(signed_aggregation);
-                        return .{};
-                    }
                     self.module_logger.err("aggregation processing error: {any}", .{err});
                     return err;
                 };
@@ -934,23 +914,7 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
-        var store_signature = false;
-        if (self.is_aggregator_enabled and self.registered_validator_ids.len > 0) {
-            const committee_count = self.config.spec.attestation_committee_count;
-            const proposer_subnet_id = try types.computeSubnetId(
-                @intCast(signed_proposer_attestation.validator_id),
-                committee_count,
-            );
-            for (self.registered_validator_ids) |validator_id| {
-                const local_subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
-                if (local_subnet_id == proposer_subnet_id) {
-                    store_signature = true;
-                    break;
-                }
-            }
-        }
-
-        self.forkChoice.onGossipAttestation(signed_proposer_attestation, store_signature) catch |e| {
+        self.forkChoice.onGossipAttestation(signed_proposer_attestation, true) catch |e| {
             self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -1060,74 +1024,6 @@ pub const BeamChain = struct {
 
         zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
-
-        // Retry any pending gossip attestations/aggregations now that new states exist.
-        self.retryPendingAttestationGossip();
-    }
-
-    fn cachePendingAttestation(self: *Self, signed_attestation: networks.AttestationGossip) void {
-        self.pending_gossip_attestations.append(self.allocator, signed_attestation) catch |err| {
-            self.module_logger.warn("failed to cache pending attestation: {any}", .{err});
-        };
-    }
-
-    fn cachePendingAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) void {
-        var cloned_proof: types.AggregatedSignatureProof = undefined;
-        types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof) catch |err| {
-            self.module_logger.warn("failed to clone pending aggregation: {any}", .{err});
-            return;
-        };
-        self.pending_gossip_aggregations.append(self.allocator, .{
-            .data = signed_aggregation.data,
-            .proof = cloned_proof,
-        }) catch |err| {
-            self.module_logger.warn("failed to cache pending aggregation: {any}", .{err});
-            cloned_proof.deinit();
-        };
-    }
-
-    fn retryPendingAttestationGossip(self: *Self) void {
-        if (self.pending_gossip_attestations.items.len > 0) {
-            var remaining: std.ArrayList(networks.AttestationGossip) = .empty;
-            for (self.pending_gossip_attestations.items) |att| {
-                self.onGossipAttestation(att) catch |err| {
-                    switch (err) {
-                        AttestationValidationError.MissingState, AttestationValidationError.UnknownHeadBlock, AttestationValidationError.UnknownSourceBlock, AttestationValidationError.UnknownTargetBlock => {
-                            remaining.append(self.allocator, att) catch |append_err| {
-                                self.module_logger.warn("failed to keep pending attestation: {any}", .{append_err});
-                            };
-                        },
-                        else => {
-                            self.module_logger.warn("dropping pending attestation: {any}", .{err});
-                        },
-                    }
-                    continue;
-                };
-            }
-            self.pending_gossip_attestations.deinit(self.allocator);
-            self.pending_gossip_attestations = remaining;
-        }
-
-        if (self.pending_gossip_aggregations.items.len > 0) {
-            var remaining: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
-            for (self.pending_gossip_aggregations.items) |*agg| {
-                self.onGossipAggregatedAttestation(agg.*) catch |err| {
-                    if (err == error.MissingState) {
-                        remaining.append(self.allocator, agg.*) catch |append_err| {
-                            self.module_logger.warn("failed to keep pending aggregation: {any}", .{append_err});
-                            agg.deinit();
-                        };
-                    } else {
-                        self.module_logger.warn("dropping pending aggregation: {any}", .{err});
-                        agg.deinit();
-                    }
-                    continue;
-                };
-                agg.deinit();
-            }
-            self.pending_gossip_aggregations.deinit(self.allocator);
-            self.pending_gossip_aggregations = remaining;
-        }
     }
 
     /// Store aggregated signature payloads from a block for future block building
@@ -1513,19 +1409,7 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        var store_signature = false;
-        if (self.is_aggregator_enabled and self.registered_validator_ids.len > 0) {
-            const committee_count = self.config.spec.attestation_committee_count;
-            for (self.registered_validator_ids) |validator_id| {
-                const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
-                if (subnet_id == signedAttestation.subnet_id) {
-                    store_signature = true;
-                    break;
-                }
-            }
-        }
-
-        return self.forkChoice.onGossipAttestation(signedAttestation.message, store_signature);
+        return self.forkChoice.onGossipAttestation(signedAttestation.message, true);
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {

@@ -185,8 +185,10 @@ pub const ProtoArray = struct {
                         if (bestChild.weight < node.weight) {
                             updateBest = true;
                         } else if (bestChild.weight == node.weight) {
-                            // tie break by lexicographically highest root (leanSpec)
-                            if (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt) {
+                            // tie break by slot else by hash
+                            if (node.slot > bestChild.slot) {
+                                updateBest = true;
+                            } else if (node.slot == bestChild.slot and (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt)) {
                                 updateBest = true;
                             }
                         }
