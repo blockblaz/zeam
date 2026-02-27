@@ -4791,6 +4791,7 @@ dependencies = [
  "bincode",
  "openvm",
  "openvm-build",
+ "openvm-circuit",
  "openvm-sdk",
  "openvm-stark-sdk",
  "openvm-transpiler",
