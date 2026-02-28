@@ -184,13 +184,9 @@ pub const ProtoArray = struct {
                     if (bestChildOrNull) |bestChild| {
                         if (bestChild.weight < node.weight) {
                             updateBest = true;
-                        } else if (bestChild.weight == node.weight) {
-                            // tie break by slot else by hash
-                            if (node.slot > bestChild.slot) {
-                                updateBest = true;
-                            } else if (node.slot == bestChild.slot and (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt)) {
-                                updateBest = true;
-                            }
+                        } else if (bestChild.weight == node.weight and (std.mem.order(u8, &bestChild.blockRoot, &node.blockRoot) == .lt)) {
+                            // tie break by lexicographically larger block root (leanSpec-compatible)
+                            updateBest = true;
                         }
                     } else {
                         updateBest = true;
@@ -1976,6 +1972,35 @@ fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte:
         .timeliness = true,
         .confirmed = true,
     };
+}
+
+test "protoarray tie-break aligns with leanSpec hash ordering" {
+    const allocator = std.testing.allocator;
+
+    const anchor_block = createTestProtoBlock(0, 0xAA, 0x00);
+    var proto_array = try ProtoArray.init(allocator, anchor_block);
+    defer proto_array.nodes.deinit(proto_array.allocator);
+    defer proto_array.indices.deinit();
+
+    // Equal-weight siblings with different slots.
+    // leanSpec picks lexicographically larger root, not higher slot.
+    try proto_array.onBlock(createTestProtoBlock(2, 0x10, 0xAA), 2);
+    try proto_array.onBlock(createTestProtoBlock(1, 0x20, 0xAA), 2);
+
+    var deltas = try allocator.alloc(isize, proto_array.nodes.items.len);
+    defer allocator.free(deltas);
+    @memset(deltas, 0);
+    deltas[1] = 1;
+    deltas[2] = 1;
+
+    try proto_array.applyDeltasUnlocked(deltas, 0);
+
+    const anchor_idx = proto_array.indices.get(createTestRoot(0xAA)).?;
+    const best_child_idx = proto_array.nodes.items[anchor_idx].bestChild.?;
+    const best_child = proto_array.nodes.items[best_child_idx];
+
+    try std.testing.expect(std.mem.eql(u8, &best_child.blockRoot, &createTestRoot(0x20)));
+    try std.testing.expectEqual(@as(types.Slot, 1), best_child.slot);
 }
 
 test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
