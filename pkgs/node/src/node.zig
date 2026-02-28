@@ -633,7 +633,7 @@ pub const BeamNode = struct {
                                         };
                                     }
                                 },
-                                .synced, .no_peers => {},
+                                .synced, .no_peers, .fc_initing => {},
                             }
                         },
                         else => {

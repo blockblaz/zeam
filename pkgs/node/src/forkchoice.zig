@@ -268,6 +268,11 @@ const StoredAggregatedPayload = types.StoredAggregatedPayload;
 const AggregatedPayloadsList = types.AggregatedPayloadsList;
 const AggregatedPayloadsMap = types.AggregatedPayloadsMap;
 
+/// Tracks whether the forkchoice has observed a real justified checkpoint via onBlock.
+/// For genesis (anchor slot == 0) we start ready; for checkpoint-sync or DB restore we
+/// start initing and transition once the first block-driven justified update arrives.
+pub const ForkChoiceStatus = enum { initing, ready };
+
 pub const ForkChoice = struct {
     protoArray: ProtoArray,
     anchorState: *const types.BeamState,
@@ -292,6 +297,11 @@ pub const ForkChoice = struct {
     aggregated_payloads: AggregatedPayloadsMap,
     // Mutex to protect concurrent access to gossip_signatures and aggregated_payloads
     signatures_mutex: std.Thread.Mutex,
+    // Tracks whether FC has observed a real justified checkpoint via block processing.
+    // Starts as `initing` for checkpoint-sync init (anchor slot > 0); transitions to
+    // `ready` on the first block-driven justified update.  Validator duties (block
+    // production, attestation) must not run while status == .initing.
+    status: ForkChoiceStatus,
 
     const Self = @This();
 
@@ -355,7 +365,16 @@ pub const ForkChoice = struct {
             .gossip_signatures = gossip_signatures,
             .aggregated_payloads = aggregated_payloads,
             .signatures_mutex = .{},
+            // Genesis (slot == 0) is immediately ready; checkpoint-sync / DB-restore anchors
+            // (slot > 0) start in `initing` and become `ready` once the first real justified
+            // checkpoint is observed through block processing.
+            .status = if (opts.anchorState.slot == 0) .ready else .initing,
         };
+        if (fc.status == .initing) {
+            fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
+        } else {
+            fc.logger.info("[forkchoice] init: genesis anchor — status=ready", .{});
+        }
         // No lock needed during init - struct not yet accessible to other threads
         _ = try fc.updateHeadUnlocked();
         return fc;
@@ -1245,7 +1264,14 @@ pub const ForkChoice = struct {
 
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
+            const prev_justified_slot = self.fcStore.latest_justified.slot;
             self.fcStore.update(justified, finalized);
+            // Transition from initing to ready once we observe a real justified checkpoint
+            // that is strictly newer than the anchor (i.e., actual chain progress has been seen).
+            if (self.status == .initing and self.fcStore.latest_justified.slot > prev_justified_slot) {
+                self.status = .ready;
+                self.logger.info("[forkchoice] status=ready: first justified checkpoint observed slot={d} root={x} — validator duties now enabled", .{ self.fcStore.latest_justified.slot, &self.fcStore.latest_justified.root });
+            }
 
             const block_root: [32]u8 = opts.blockRoot orelse computedroot: {
                 var cblock_root: [32]u8 = undefined;
@@ -1454,6 +1480,16 @@ pub const ForkChoice = struct {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
         return self.fcStore.latest_finalized;
+    }
+
+    /// Returns true when the forkchoice has observed a real justified checkpoint via block
+    /// processing and is ready for validator duties (block production, attestation).
+    /// For genesis init this is immediately true; for checkpoint-sync it becomes true
+    /// after the first onBlock call that advances latest_justified.
+    pub fn isReady(self: *Self) bool {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.status == .ready;
     }
 
     /// Get the current time in slots
@@ -1692,6 +1728,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+            .status = .ready,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2009,6 +2046,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+            .status = .ready,
     };
 
     return .{
@@ -2956,6 +2994,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .gossip_signatures = SignaturesMap.init(allocator),
         .aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
+            .status = .ready,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately

@@ -103,6 +103,10 @@ pub const ValidatorClient = struct {
             const sync_status = self.chain.getSyncStatus();
             switch (sync_status) {
                 .synced => {},
+                .fc_initing => {
+                    self.logger.info("skipping block production for slot={d} proposer={d}: forkchoice still initing (awaiting first justified checkpoint)", .{ slot, slot_proposer_id });
+                    return null;
+                },
                 .no_peers => {
                     self.logger.warn("skipping block production for slot={d} proposer={d}: no peers connected", .{ slot, slot_proposer_id });
                     return null;
@@ -171,6 +175,10 @@ pub const ValidatorClient = struct {
         const sync_status = self.chain.getSyncStatus();
         switch (sync_status) {
             .synced => {},
+            .fc_initing => {
+                self.logger.info("skipping attestation production for slot={d}: forkchoice still initing (awaiting first justified checkpoint)", .{slot});
+                return null;
+            },
             .no_peers => {
                 self.logger.warn("skipping attestation production for slot={d}: no peers connected", .{slot});
                 return null;
