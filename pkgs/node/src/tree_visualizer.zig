@@ -160,6 +160,37 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
     return indent.toOwnedSlice(allocator);
 }
 
+/// Build fork choice JSON for the /lean/v0/fork_choice API endpoint.
+/// Matches the leanSpec format with head, justified, finalized, safe_target, and nodes.
+pub fn buildForkChoiceJSON(
+    snapshot: fcFactory.ForkChoice.Snapshot,
+    output: *std.ArrayList(u8),
+    allocator: Allocator,
+) !void {
+    const w = output.writer(allocator);
+    try w.writeAll("{");
+    try w.print(
+        \\"head":{{"slot":{d},"root":"0x{x}"}},"justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":{{"root":"0x{x}"}},"validator_count":{d},"nodes":[
+    , .{
+        snapshot.head.slot,
+        &snapshot.head.blockRoot,
+        snapshot.latest_justified_slot,
+        &snapshot.latest_justified_root,
+        snapshot.latest_finalized_slot,
+        &snapshot.latest_finalized_root,
+        &snapshot.safe_target_root,
+        snapshot.validator_count,
+    });
+
+    for (snapshot.nodes, 0..) |node, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print(
+            \\{{"slot":{d},"root":"0x{x}","parent_root":"0x{x}","weight":{d}}}
+        , .{ node.slot, &node.blockRoot, &node.parentRoot, node.weight });
+    }
+    try w.writeAll("]}");
+}
+
 /// Build fork choice graph in Grafana node-graph JSON format
 pub fn buildForkChoiceGraphJSON(
     forkchoice: *fcFactory.ForkChoice,

@@ -124,7 +124,20 @@ jobs:
         exit 1
 
     - name: build
-      run: zig build all
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build all; then
+            echo "Build succeeded on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed (e.g. HttpConnectionClosing when fetching deps), retrying in 10 seconds..."
+          sleep 10
+          attempt=$((attempt + 1))
+        done
+        echo "Build failed after $max_attempts attempts"
+        exit 1
 
   build-all-provers:
     name: build-all-provers
@@ -178,7 +191,20 @@ jobs:
         exit 1
 
     - name: Build with all provers
-      run: zig build -Dprover=all
+      run: |
+        max_attempts=5
+        attempt=1
+        while [ $attempt -le $max_attempts ]; do
+          if zig build -Dprover=all; then
+            echo "Build succeeded on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed (e.g. HttpConnectionClosing when fetching deps), retrying in 10 seconds..."
+          sleep 10
+          attempt=$((attempt + 1))
+        done
+        echo "Build failed after $max_attempts attempts"
+        exit 1
 
   test:
     name: test

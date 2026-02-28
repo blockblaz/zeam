@@ -299,7 +299,11 @@ pub const ForkChoice = struct {
     pub const Snapshot = struct {
         head: ProtoNode,
         latest_justified_root: [32]u8,
+        latest_justified_slot: types.Slot,
         latest_finalized_root: [32]u8,
+        latest_finalized_slot: types.Slot,
+        safe_target_root: [32]u8,
+        validator_count: u64,
         nodes: []ProtoNode,
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
@@ -411,7 +415,11 @@ pub const ForkChoice = struct {
             return Snapshot{
                 .head = head_node,
                 .latest_justified_root = self.fcStore.latest_justified.root,
+                .latest_justified_slot = self.fcStore.latest_justified.slot,
                 .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .latest_finalized_slot = self.fcStore.latest_finalized.slot,
+                .safe_target_root = self.safeTarget.blockRoot,
+                .validator_count = self.config.genesis.numValidators(),
                 .nodes = nodes_copy,
             };
         };
@@ -419,7 +427,11 @@ pub const ForkChoice = struct {
         return Snapshot{
             .head = self.protoArray.nodes.items[head_idx],
             .latest_justified_root = self.fcStore.latest_justified.root,
+            .latest_justified_slot = self.fcStore.latest_justified.slot,
             .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .latest_finalized_slot = self.fcStore.latest_finalized.slot,
+            .safe_target_root = self.safeTarget.blockRoot,
+            .validator_count = self.config.genesis.numValidators(),
             .nodes = nodes_copy,
         };
     }
