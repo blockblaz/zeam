@@ -343,6 +343,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("@zeam/xmss", zeam_xmss);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -586,6 +587,10 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
     spectests.root_module.addImport("ssz", ssz);
+    spectests.root_module.addImport("@zeam/xmss", zeam_xmss);
+
+    spectests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, spectests, target, prover);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
 
