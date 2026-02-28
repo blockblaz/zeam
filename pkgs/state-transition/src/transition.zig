@@ -1,7 +1,6 @@
 const std = @import("std");
 const json = std.json;
 const types = @import("@zeam/types");
-const utils = types.utils;
 
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
@@ -22,6 +21,7 @@ pub const StateTransitionOpts = struct {
     logger: zeam_utils.ModuleLogger,
     // Optional pre-populated justifications map; if null, built from state internally
     justifications: ?*std.AutoHashMapUnmanaged(types.Root, []u8) = null,
+    rootToSlotCache: ?*types.RootToSlotCache = null,
 };
 
 // pub fn process_epoch(state: types.BeamState) void {
@@ -38,7 +38,7 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
     }
 }
 
-pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*types.RootToSlotCache) !void {
     // prepare pre state to process block for that slot, may be rename prepare_pre_stateCollapse comment
     const transition_timer = zeam_metrics.lean_state_transition_time_seconds.start();
     defer _ = transition_timer.observe();
@@ -47,7 +47,7 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
     try state.process_slots(allocator, block.slot, logger);
 
     // process block and modify the pre state to post state
-    try state.process_block(allocator, block.*, .{ .logger = logger, .justifications = null });
+    try state.process_block(allocator, block.*, .{ .logger = logger, .justifications = null, .rootToSlotCache = cache });
 
     logger.debug("extracting state root\n", .{});
     // extract the post state root

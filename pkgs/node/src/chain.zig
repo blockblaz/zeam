@@ -108,6 +108,8 @@ pub const BeamChain = struct {
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
+    // Cache for root to slot mapping to optimize block processing performance.
+    root_to_slot_cache: types.RootToSlotCache,
 
     // Callback for pruning cached blocks after finalization advances
     prune_cached_blocks_ctx: ?*anyopaque = null,
@@ -140,7 +142,7 @@ pub const BeamChain = struct {
         try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
         try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
 
-        return Self{
+        var chain = Self{
             .nodeId = opts.nodeId,
             .config = opts.config,
             .forkChoice = fork_choice,
@@ -159,8 +161,13 @@ pub const BeamChain = struct {
             .justifications_cache = std.AutoHashMap(types.Root, std.AutoHashMapUnmanaged(types.Root, []u8)).init(allocator),
             .force_block_production = opts.force_block_production,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
+            .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
         };
+        // Initialize cache with anchor block root and any post-finalized entries from state
+        try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
+        try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
+        return chain;
     }
 
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
@@ -199,6 +206,9 @@ pub const BeamChain = struct {
         // Clean up public key cache
         self.public_key_cache.deinit();
 
+        // Clean up root to slot cache
+        self.root_to_slot_cache.deinit();
+
         // Clean up any blocks that were queued waiting for the forkchoice clock
         for (self.pending_blocks.items) |*block| {
             block.deinit();
@@ -223,7 +233,7 @@ pub const BeamChain = struct {
     /// processing queued blocks; the caller owns and must free the slice.
     pub fn processPendingBlocks(self: *Self) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
-        const fc_time = self.forkChoice.fcStore.time;
+        const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
         var i: usize = 0;
         while (i < self.pending_blocks.items.len) {
             const queued_slot = self.pending_blocks.items[i].message.block.slot;
@@ -466,7 +476,7 @@ pub const BeamChain = struct {
         self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger);
+        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -489,7 +499,10 @@ pub const BeamChain = struct {
         };
 
         // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+        // PS: this isn't required because forkchoice is already ticked before validator's oninterval is called
+        // which then leads to block production call
+        //
+        // try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
 
         // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
@@ -654,10 +667,10 @@ pub const BeamChain = struct {
                     // If the forkchoice clock hasn't yet ticked to this block's slot,
                     // onBlock would reject it with FutureSlot.  Queue the block and
                     // replay it from onInterval once the clock has advanced.
-                    if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.time) {
+                    if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
                         self.module_logger.debug(
                             "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                            .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT },
+                            .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                         );
                         var cloned: types.SignedBlockWithAttestation = undefined;
                         try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &cloned);
@@ -666,12 +679,12 @@ pub const BeamChain = struct {
                         // because of race conditions between competing threads as the above sszClone aparently takes too much time
                         // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
                         // holding mutex between then for chain modification sections
-                        if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.time) {
+                        if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
                             try self.pending_blocks.append(self.allocator, cloned);
 
                             self.module_logger.info(
                                 "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT },
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                             );
                             return .{};
                         } else {
@@ -679,7 +692,7 @@ pub const BeamChain = struct {
                                 //
                                 "chain already ticked while cloning block for queuing, skipping queuing and directly processing slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                                 //
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.time, block.slot * constants.INTERVALS_PER_SLOT });
+                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT });
                             // by the time we cloned, chain ticked, so we can directly add and deinit clone
                             cloned.deinit();
                         }
@@ -688,6 +701,9 @@ pub const BeamChain = struct {
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
+                        // we will not catch and enqueue block for FutureSlot error because this error here means
+                        // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
+                        // clock skew or race between oninterval and block arrival
                         self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
@@ -831,6 +847,7 @@ pub const BeamChain = struct {
                 .logger = self.stf_logger,
                 .validSignatures = true,
                 .justifications = &justifications,
+                .rootToSlotCache = &self.root_to_slot_cache,
             });
 
             // 5. store justifications to cache (clear old entries first)
@@ -850,6 +867,9 @@ pub const BeamChain = struct {
 
             break :computedstate cpost_state;
         };
+
+        // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
+        try self.root_to_slot_cache.put(block_root, block.slot);
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
@@ -1267,6 +1287,9 @@ pub const BeamChain = struct {
         //     }
         // }
 
+        // Prune root-to-slot cache up to finalized slot
+        try self.root_to_slot_cache.prune(latestFinalized.slot);
+
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
 
@@ -1287,17 +1310,18 @@ pub const BeamChain = struct {
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
         _ = is_from_gossip;
 
-        const current_slot = self.forkChoice.fcStore.timeSlots;
+        const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
         const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
         // 1. Future slot check - reject blocks too far in the future
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
+        // this can also happen because of race conditions between oninterval and block arrival
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
             self.module_logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
                 block.slot,
                 current_slot + max_future_tolerance,
-                self.forkChoice.fcStore.time,
+                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
             });
             return BlockValidationError.FutureSlot;
         }
