@@ -37,18 +37,17 @@ fn process_execution_payload_header(state: *types.BeamState, block: types.BeamBl
 }
 
 pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *types.BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*types.RootToSlotCache) !void {
-    // prepare pre state to process block for that slot, may be rename prepare_pre_stateCollapse comment
     const transition_timer = zeam_metrics.lean_state_transition_time_seconds.start();
     defer _ = transition_timer.observe();
 
-    // prepare pre state to process block for that slot, may be rename prepare_pre_state
-    try state.process_slots(allocator, block.slot, logger);
+    var cached_state = types.CachedState.init(allocator, state, logger);
+    defer cached_state.deinit();
 
-    // process block and modify the pre state to post state
-    try state.process_block(allocator, block.*, logger, cache);
+    try cached_state.process_slots(block.slot);
+    try cached_state.process_block(block.*, cache);
 
     logger.debug("extracting state root\n", .{});
-    // extract the post state root
+    try cached_state.flushJustifications();
     var state_root: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(*types.BeamState, state, &state_root, allocator);
     block.state_root = state_root;
@@ -201,11 +200,12 @@ pub fn apply_transition(allocator: Allocator, state: *types.BeamState, block: ty
         return StateTransitionError.InvalidBlockSignatures;
     }
 
-    // prepare the pre state for this block slot
-    try state.process_slots(allocator, block.slot, opts.logger);
+    var cached_state = types.CachedState.init(allocator, state, opts.logger);
+    defer cached_state.deinit();
 
-    // process the block
-    try state.process_block(allocator, block, opts.logger, opts.rootToSlotCache);
+    try cached_state.process_slots(block.slot);
+    try cached_state.process_block(block, opts.rootToSlotCache);
+    try cached_state.flushJustifications();
 
     const validateResult = opts.validateResult;
     if (validateResult) {

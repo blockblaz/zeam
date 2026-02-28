@@ -40,6 +40,8 @@ pub const JustificationRoots = state.JustificationRoots;
 pub const JustifiedSlots = state.JustifiedSlots;
 pub const JustificationValidators = state.JustificationValidators;
 
+pub const CachedState = @import("./cached_state.zig").CachedState;
+
 const validator = @import("./validator.zig");
 pub const Validator = validator.Validator;
 pub const Validators = validator.Validators;
