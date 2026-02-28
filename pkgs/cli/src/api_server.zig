@@ -129,6 +129,8 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
 
         if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             ctx.handleHealth(&request);
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/ready")) {
+            ctx.handleReady(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             ctx.handleFinalizedCheckpointState(&request) catch |err| {
                 ctx.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
@@ -236,7 +238,7 @@ pub const ApiServer = struct {
         }
     }
 
-    /// Handle health check endpoint
+    /// Handle health check endpoint (liveness)
     fn handleHealth(_: *const Self, request: *std.http.Server.Request) void {
         const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
         _ = request.respond(response, .{
@@ -244,6 +246,25 @@ pub const ApiServer = struct {
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
         }) catch {};
+    }
+
+    /// Handle readiness check endpoint
+    /// Returns 200 if chain is initialized and ready to serve requests, 503 otherwise
+    fn handleReady(self: *const Self, request: *std.http.Server.Request) void {
+        if (self.getChain()) |_| {
+            _ = request.respond("{\"ready\":true}", .{
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                },
+            }) catch {};
+        } else {
+            _ = request.respond("{\"ready\":false}", .{
+                .status = .service_unavailable,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                },
+            }) catch {};
+        }
     }
 
     /// Handle finalized checkpoint state endpoint
