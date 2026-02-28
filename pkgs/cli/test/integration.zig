@@ -176,8 +176,9 @@ const ZeamRequest = struct {
     }
 
     /// Make a request to the /lean/v0/health endpoint and return the response
+    /// Note: Health checks are served on the metrics port (default: 9668)
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
+        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_METRICS_PORT);
     }
 
     /// Internal helper to make HTTP requests to any endpoint on the specified port

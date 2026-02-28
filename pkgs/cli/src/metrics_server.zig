@@ -8,7 +8,7 @@ const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
 const STARTUP_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 
 /// Lightweight server for metrics and health endpoints.
-/// Serves /metrics (Prometheus) and /health (liveness check).
+/// Serves /metrics (Prometheus) and /lean/v0/health (liveness check).
 /// Starts early, before chain initialization, with no chain dependency.
 pub fn startMetricsServer(
     allocator: std.mem.Allocator,
@@ -131,7 +131,7 @@ pub const MetricsServer = struct {
 
         if (std.mem.eql(u8, request.head.target, "/metrics")) {
             self.handleMetrics(&request);
-        } else if (std.mem.eql(u8, request.head.target, "/health")) {
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
             handleHealth(&request);
         } else {
             _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};

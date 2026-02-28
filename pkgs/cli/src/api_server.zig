@@ -126,7 +126,9 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         defer arena.deinit();
         const request_allocator = arena.allocator();
 
-        if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
+        if (std.mem.eql(u8, request.head.target, "/lean/v0/ready")) {
+            ctx.handleReady(&request);
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             ctx.handleFinalizedCheckpointState(&request) catch |err| {
                 ctx.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
@@ -218,6 +220,16 @@ pub const ApiServer = struct {
         }) {
             std.Thread.sleep(ACCEPT_POLL_NS);
         }
+    }
+
+    /// Handle readiness check endpoint
+    /// Returns 200 when API server is running (chain is always initialized at this point)
+    fn handleReady(_: *const Self, request: *std.http.Server.Request) void {
+        _ = request.respond("{\"ready\":true}", .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
     }
 
     /// Handle finalized checkpoint state endpoint
