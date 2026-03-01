@@ -347,12 +347,6 @@ fn mainInner() !void {
                 return err;
             };
 
-            // Start API server early. Pass null for chain - in .beam command mode, chains are created later
-            api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
-                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
-                return err;
-            };
-
             std.debug.print("beam={any}\n", .{beamcmd});
 
             const mock_network = beamcmd.mockNetwork;
@@ -568,9 +562,11 @@ fn mainInner() !void {
                 .node_registry = registry_1,
             });
 
-            if (api_server_handle) |handle| {
-                handle.setChain(beam_node_1.chain);
-            }
+            // Start API server after chain initialization so chain can be passed directly
+            api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, beam_node_1.chain) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
+                return err;
+            };
 
             var beam_node_2: BeamNode = undefined;
             try beam_node_2.init(allocator, .{

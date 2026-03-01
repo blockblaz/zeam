@@ -162,24 +162,26 @@ The API system is initialized at startup in `pkgs/cli/src/main.zig`:
 // Initialize metrics
 try api.init(allocator);
 
-// Start HTTP server in background thread
-// chain can be null for early startup (chain-dependent endpoints return 503 until set)
-var handle = try api_server.startAPIServer(allocator, port, logger_config, chain);
+// Start metrics server early (no chain dependency)
+var metrics_handle = try metrics_server.startMetricsServer(allocator, metrics_port, logger_config);
 
-// Later, set chain if started with null
-handle.setChain(beam_chain);
+// After chain initialization, start API server
+var api_handle = try api_server.startAPIServer(allocator, api_port, logger_config, chain);
 
 // Graceful shutdown
-handle.stop();
+api_handle.stop();
+metrics_handle.stop();
 ```
 
-The server exposes:
-- SSE at `/events`
-- Metrics at `/metrics`
-- Health at `/lean/v0/health`
-- Checkpoint state at `/lean/v0/states/finalized`
-- Justified checkpoint at `/lean/v0/checkpoints/justified`
-- Fork choice visualization at `/api/forkchoice/graph`
+**Metrics Server** (port 9668) - starts immediately:
+- `/metrics` - Prometheus metrics
+- `/health` - Liveness check (JSON)
+
+**API Server** (port 9667) - starts after chain init:
+- `/events` - SSE event streaming
+- `/lean/v0/states/finalized` - Checkpoint state (SSZ)
+- `/lean/v0/checkpoints/justified` - Justified checkpoint (JSON)
+- `/api/forkchoice/graph` - Fork choice visualization (JSON)
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
 

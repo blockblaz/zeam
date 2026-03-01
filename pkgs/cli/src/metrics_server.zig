@@ -7,9 +7,9 @@ const ModuleLogger = utils_lib.ModuleLogger;
 const ACCEPT_POLL_NS: u64 = 50 * std.time.ns_per_ms;
 const STARTUP_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 
-/// Simple metrics server that only serves Prometheus metrics at /metrics endpoint.
-/// This is a lightweight server separate from the main API server.
-/// It has no rate limiting, SSE support, or chain dependency.
+/// Lightweight server for metrics and health endpoints.
+/// Serves /metrics (Prometheus) and /health (liveness check).
+/// Starts early, before chain initialization, with no chain dependency.
 pub fn startMetricsServer(
     allocator: std.mem.Allocator,
     port: u16,
@@ -131,6 +131,8 @@ pub const MetricsServer = struct {
 
         if (std.mem.eql(u8, request.head.target, "/metrics")) {
             self.handleMetrics(&request);
+        } else if (std.mem.eql(u8, request.head.target, "/health")) {
+            handleHealth(&request);
         } else {
             _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
         }
@@ -156,3 +158,13 @@ pub const MetricsServer = struct {
         }) catch {};
     }
 };
+
+/// Handle health check endpoint (liveness) - always returns healthy
+fn handleHealth(request: *std.http.Server.Request) void {
+    const response = "{\"status\":\"healthy\",\"service\":\"zeam\"}";
+    _ = request.respond(response, .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+        },
+    }) catch {};
+}
