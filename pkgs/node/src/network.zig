@@ -169,12 +169,12 @@ pub const Network = struct {
         if (roots.len == 0) return error.NoBlockRootsRequested;
 
         var request = networks.ReqRespRequest{
-            .blocks_by_root = .{ .roots = try ssz.utils.List(types.Root, params.MAX_REQUEST_BLOCKS).init(self.allocator) },
+            .blocks_by_root = try types.BlockByRootRequest.init(self.allocator),
         };
         errdefer request.deinit();
 
         for (roots) |root| {
-            try request.blocks_by_root.roots.append(root);
+            try request.blocks_by_root.append(root);
         }
 
         const request_id = try self.backend.reqresp.sendRequest(peer_id, &request, callback);
