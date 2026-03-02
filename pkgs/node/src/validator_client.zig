@@ -47,15 +47,6 @@ pub const ValidatorClientOutput = struct {
         const gossip_msg = networks.GossipMessage{ .attestation = .{ .subnet_id = subnet_id, .message = cloned_attestation } };
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
-
-    pub fn addAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
-        var cloned_aggregation: types.SignedAggregatedAttestation = undefined;
-        try types.sszClone(self.allocator, types.SignedAggregatedAttestation, signed_aggregation, &cloned_aggregation);
-        errdefer cloned_aggregation.deinit();
-
-        const gossip_msg = networks.GossipMessage{ .aggregation = cloned_aggregation };
-        try self.gossip_messages.append(self.allocator, gossip_msg);
-    }
 };
 
 pub const ValidatorClientParams = struct {
