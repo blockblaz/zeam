@@ -1458,9 +1458,6 @@ pub const BeamChain = struct {
 
     pub fn maybeAggregateCommitteeSignaturesOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        const interval_in_slot = time_intervals % constants.INTERVALS_PER_SLOT;
-        const aggregation_interval = 2;
-        if (interval_in_slot != aggregation_interval) return null;
         if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
 
         const sync_status = self.getSyncStatus();

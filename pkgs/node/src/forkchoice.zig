@@ -864,6 +864,21 @@ pub const ForkChoice = struct {
                 self.latest_new_aggregated_payloads.clearAndFree();
             }
         }
+
+        // Promote latestNew → latestKnown in attestation tracker.
+        // Attestations that were "new" (gossip) are now "known" (accepted).
+        for (0..self.config.genesis.numValidators()) |validator_id| {
+            var tracker = self.attestations.get(validator_id) orelse continue;
+            if (tracker.latestNew) |new_att| {
+                const known_slot = if (tracker.latestKnown) |k| k.slot else 0;
+                if (new_att.slot > known_slot) {
+                    tracker.latestKnown = tracker.latestNew;
+                }
+                tracker.latestNew = null;
+                try self.attestations.put(validator_id, tracker);
+            }
+        }
+
         return self.updateHeadUnlocked();
     }
 
@@ -970,36 +985,8 @@ pub const ForkChoice = struct {
         return attestations;
     }
 
-    fn applyAggregatedPayloadAttestations(
-        self: *Self,
-        payloads: *const AggregatedPayloadsMap,
-        is_from_block: bool,
-    ) !void {
-        if (payloads.count() == 0) return;
-
-        var attestations = try self.extractAttestationsFromAggregatedPayloads(payloads);
-        defer attestations.deinit();
-
-        var it = attestations.iterator();
-        while (it.next()) |entry| {
-            const validator_id = entry.key_ptr.*;
-            const att_data = entry.value_ptr.*;
-            const attestation = types.Attestation{
-                .validator_id = validator_id,
-                .data = att_data,
-            };
-            self.onAttestationUnlocked(attestation, is_from_block) catch |err| {
-                self.logger.debug("skip aggregated attestation update validator={d} slot={d}: {any}", .{
-                    validator_id,
-                    att_data.slot,
-                    err,
-                });
-                continue;
-            };
-        }
-    }
-
     // Internal unlocked version - assumes caller holds lock
+    // Always reads from the per-validator attestation tracker (sole source of truth for fork choice).
     fn computeDeltasUnlocked(self: *Self, from_known: bool) ![]isize {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
@@ -1011,15 +998,6 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
-        const payloads = if (from_known) &self.latest_known_aggregated_payloads else &self.latest_new_aggregated_payloads;
-        const use_payloads = payloads.count() > 0;
-
-        var attestation_map = if (use_payloads)
-            try self.extractAttestationsFromAggregatedPayloads(payloads)
-        else
-            std.AutoHashMap(types.ValidatorIndex, types.AttestationData).init(self.allocator);
-        defer attestation_map.deinit();
-
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
             if (attestation_tracker.appliedIndex) |applied_index| {
@@ -1027,36 +1005,10 @@ pub const ForkChoice = struct {
             }
             attestation_tracker.appliedIndex = null;
 
-            var latest_attestation: ?ProtoAttestation = null;
-            if (use_payloads) {
-                if (attestation_map.get(@intCast(validator_id))) |attestation_data| {
-                    if (self.protoArray.indices.get(attestation_data.head.root)) |new_head_index| {
-                        latest_attestation = .{
-                            .index = new_head_index,
-                            .slot = attestation_data.slot,
-                            .attestation_data = attestation_data,
-                        };
-                    } else {
-                        latest_attestation = null;
-                    }
-                    if (from_known) {
-                        attestation_tracker.latestKnown = latest_attestation;
-                    } else {
-                        attestation_tracker.latestNew = latest_attestation;
-                    }
-                } else {
-                    if (from_known) {
-                        attestation_tracker.latestKnown = null;
-                    } else {
-                        attestation_tracker.latestNew = null;
-                    }
-                }
-            } else {
-                latest_attestation = if (from_known)
-                    attestation_tracker.latestKnown
-                else
-                    attestation_tracker.latestNew;
-            }
+            const latest_attestation = if (from_known)
+                attestation_tracker.latestKnown
+            else
+                attestation_tracker.latestNew;
 
             if (latest_attestation) |delta_attestation| {
                 self.deltas.items[delta_attestation.index] += validatorWeight;
@@ -1095,7 +1047,6 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn updateHeadUnlocked(self: *Self) !ProtoBlock {
-        try self.applyAggregatedPayloadAttestations(&self.latest_known_aggregated_payloads, true);
         const previous_head = self.head;
         self.head = try self.computeFCHeadUnlocked(true, 0);
 
@@ -1128,7 +1079,6 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        try self.applyAggregatedPayloadAttestations(&self.latest_new_aggregated_payloads, false);
         self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
@@ -1290,32 +1240,47 @@ pub const ForkChoice = struct {
     fn onGossipAggregatedAttestationUnlocked(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         const data_root = try signed_aggregation.data.sszRoot(self.allocator);
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
-        try self.attestation_data_by_root.put(data_root, signed_aggregation.data);
-
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signed_aggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        for (validator_indices.items) |validator_index| {
-            const sig_key = SignatureKey{
-                .validator_id = @intCast(validator_index),
-                .data_root = data_root,
-            };
-            const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
+        {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+
+            try self.attestation_data_by_root.put(data_root, signed_aggregation.data);
+
+            for (validator_indices.items) |validator_index| {
+                const sig_key = SignatureKey{
+                    .validator_id = @intCast(validator_index),
+                    .data_root = data_root,
+                };
+                const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+
+                var cloned_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
+                errdefer cloned_proof.deinit();
+
+                try gop.value_ptr.append(self.allocator, .{
+                    .slot = signed_aggregation.data.slot,
+                    .proof = cloned_proof,
+                });
             }
+        }
 
-            var cloned_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
-            errdefer cloned_proof.deinit();
-
-            try gop.value_ptr.append(self.allocator, .{
-                .slot = signed_aggregation.data.slot,
-                .proof = cloned_proof,
-            });
+        // Update attestation tracker for each validator so fork choice sees this vote
+        for (validator_indices.items) |validator_index| {
+            const attestation = types.Attestation{
+                .validator_id = @intCast(validator_index),
+                .data = signed_aggregation.data,
+            };
+            self.onAttestationUnlocked(attestation, false) catch |err| {
+                self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                    validator_index, err,
+                });
+            };
         }
     }
 
