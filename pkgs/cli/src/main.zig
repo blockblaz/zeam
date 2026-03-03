@@ -114,12 +114,14 @@ const BeamCmd = struct {
 /// Test-only CLI: sign a fixed message for (epoch, slot) and dump signature hex.
 const TestsigCmd = struct {
     help: bool = false,
-    @"private-key": []const u8,
+    @"private-key": ?[]const u8 = null,
+    @"key-path": ?[]const u8 = null,
     epoch: u64 = 0,
     slot: u64 = 0,
 
     pub const __messages__ = .{
-        .@"private-key" = "Seed phrase for key generation (testing only)",
+        .@"private-key" = "Seed phrase for key generation (testing only); use with --key-path for SSZ key files",
+        .@"key-path" = "Path to validator_X_pk.ssz; loads keypair from pk.ssz and same-dir validator_X_sk.ssz",
         .epoch = "Epoch number for signing",
         .slot = "Slot number (encoded in signed message)",
         .help = "Show help for testsig",
@@ -770,17 +772,68 @@ fn mainInner() !void {
             };
         },
         .testsig => |cmd| {
-            const num_active_epochs = @max(cmd.epoch + 1, 1);
-            var keypair = xmss.KeyPair.generate(
-                allocator,
-                cmd.@"private-key",
-                0,
-                num_active_epochs,
-            ) catch |err| {
-                ErrorHandler.logErrorWithOperation(err, "generate key from seed");
+            var keypair: xmss.KeyPair = undefined;
+
+            if (cmd.@"key-path") |key_path| {
+                if (!std.mem.endsWith(u8, key_path, "_pk.ssz")) {
+                    std.debug.print("key-path must point to a file named *_pk.ssz (e.g. validator_0_pk.ssz)\n", .{});
+                    return error.InvalidKeyPath;
+                }
+                const sk_path = std.fmt.allocPrint(allocator, "{s}_sk.ssz", .{key_path[0 .. key_path.len - "_pk.ssz".len]}) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "build private key path");
+                    return err;
+                };
+                defer allocator.free(sk_path);
+
+                const pk_file = std.fs.cwd().openFile(key_path, .{}) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "open public key file", .{ .path = key_path });
+                    return err;
+                };
+                defer pk_file.close();
+                const pk_bytes = pk_file.readToEndAlloc(allocator, 256) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "read public key file");
+                    return err;
+                };
+                defer allocator.free(pk_bytes);
+
+                const sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "open private key file", .{ .path = sk_path });
+                    return err;
+                };
+                defer sk_file.close();
+                const sk_bytes = sk_file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "read private key file");
+                    return err;
+                };
+                defer allocator.free(sk_bytes);
+
+                keypair = xmss.KeyPair.fromSsz(allocator, sk_bytes, pk_bytes) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "load keypair from SSZ");
+                    return err;
+                };
+            } else if (cmd.@"private-key") |seed| {
+                const num_active_epochs = @max(cmd.epoch + 1, 1);
+                keypair = xmss.KeyPair.generate(allocator, seed, 0, num_active_epochs) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "generate key from seed");
+                    return err;
+                };
+            } else {
+                std.debug.print("testsig requires either --private-key (seed) or --key-path (path to *_pk.ssz)\n", .{});
+                return error.MissingTestsigKey;
+            }
+            defer keypair.deinit();
+
+            var pk_buf: [64]u8 = undefined;
+            const pk_len = keypair.pubkeyToBytes(&pk_buf) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "serialize public key");
                 return err;
             };
-            defer keypair.deinit();
+            const pk_hex = std.fmt.allocPrint(allocator, "0x{x}", .{pk_buf[0..pk_len]}) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "format public key hex");
+                return err;
+            };
+            defer allocator.free(pk_hex);
+            std.debug.print("public_key: {s}\n", .{pk_hex});
 
             var message: [32]u8 = [_]u8{0} ** 32;
             std.mem.writeInt(u64, message[0..8], cmd.slot, .little);
