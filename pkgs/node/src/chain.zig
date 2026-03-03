@@ -923,6 +923,7 @@ pub const BeamChain = struct {
             .message = signedBlock.message.proposer_attestation.data,
             .signature = proposer_signature,
         };
+
         self.forkChoice.onGossipAttestation(signed_proposer_attestation, true) catch |e| {
             self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };

@@ -917,23 +917,27 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
         var included_attestations: std.ArrayList(types.Attestation) = .empty;
-        if (self.latest_known_aggregated_payloads.count() == 0) {
-            return included_attestations.toOwnedSlice(self.allocator);
+
+        const latest_justified = self.fcStore.latest_justified;
+
+        // TODO naive strategy to include all attestations that are consistent with the latest justified
+        // replace by the other mini 3sf simple strategy to loop and see if justification happens and
+        // till no further attestations can be added
+        for (0..self.config.genesis.numValidators()) |validator_id| {
+            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
+                .latestKnown orelse ProtoAttestation{}).attestation_data;
+
+            if (attestation_data) |att_data| {
+                if (std.mem.eql(u8, &latest_justified.root, &att_data.source.root)) {
+                    const attestation = types.Attestation{
+                        .data = att_data,
+                        .validator_id = validator_id,
+                    };
+                    try included_attestations.append(self.allocator, attestation);
+                }
+            }
         }
 
-        var attestation_map = try self.extractAttestationsFromAggregatedPayloads(&self.latest_known_aggregated_payloads);
-        defer attestation_map.deinit();
-
-        var it = attestation_map.iterator();
-        while (it.next()) |entry| {
-            const validator_id = entry.key_ptr.*;
-            const att_data = entry.value_ptr.*;
-            const attestation = types.Attestation{
-                .data = att_data,
-                .validator_id = validator_id,
-            };
-            try included_attestations.append(self.allocator, attestation);
-        }
         return included_attestations.toOwnedSlice(self.allocator);
     }
 
@@ -964,40 +968,6 @@ pub const ForkChoice = struct {
             .root = nodes[target_idx].blockRoot,
             .slot = nodes[target_idx].slot,
         };
-    }
-
-    // Internal unlocked version - assumes caller holds lock
-    fn extractAttestationsFromAggregatedPayloads(
-        self: *Self,
-        payloads: *const AggregatedPayloadsMap,
-    ) !std.AutoHashMap(types.ValidatorIndex, types.AttestationData) {
-        var attestations = std.AutoHashMap(types.ValidatorIndex, types.AttestationData).init(self.allocator);
-        errdefer attestations.deinit();
-
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
-        var it = payloads.iterator();
-        while (it.next()) |entry| {
-            const data_root = entry.key_ptr.data_root;
-            const attestation_data = self.attestation_data_by_root.get(data_root) orelse continue;
-
-            for (entry.value_ptr.items) |*stored| {
-                const participants_len = stored.proof.participants.len();
-                for (0..participants_len) |validator_index| {
-                    if (!(try stored.proof.participants.get(validator_index))) continue;
-                    const validator_id: types.ValidatorIndex = @intCast(validator_index);
-                    if (attestations.get(validator_id)) |existing| {
-                        if (existing.slot >= attestation_data.slot) {
-                            continue;
-                        }
-                    }
-                    try attestations.put(validator_id, attestation_data);
-                }
-            }
-        }
-
-        return attestations;
     }
 
     // Internal unlocked version - assumes caller holds lock
