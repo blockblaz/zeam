@@ -14,6 +14,7 @@ pub const std_options: std.Options = .{
 };
 
 const types = @import("@zeam/types");
+const xmss = @import("@zeam/xmss");
 const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
@@ -110,6 +111,21 @@ const BeamCmd = struct {
     }
 };
 
+/// Test-only CLI: sign a fixed message for (epoch, slot) and dump signature hex.
+const TestsigCmd = struct {
+    help: bool = false,
+    @"private-key": []const u8,
+    epoch: u64 = 0,
+    slot: u64 = 0,
+
+    pub const __messages__ = .{
+        .@"private-key" = "Seed phrase for key generation (testing only)",
+        .epoch = "Epoch number for signing",
+        .slot = "Slot number (encoded in signed message)",
+        .help = "Show help for testsig",
+    };
+};
+
 const ZeamArgs = struct {
     genesis: u64 = 1234,
     log_filename: []const u8 = "consensus", // Default logger filename
@@ -164,6 +180,7 @@ const ZeamArgs = struct {
             },
         },
         node: NodeCommand,
+        testsig: TestsigCmd,
 
         pub const __messages__ = .{
             .clock = "Run the clock service for slot timing",
@@ -171,6 +188,7 @@ const ZeamArgs = struct {
             .prove = "Generate and verify ZK proofs for state transitions on a mock chain",
             .prometheus = "Prometheus configuration management",
             .node = "Run a lean node",
+            .testsig = "Dump a signature for (private-key, epoch, slot); testing only",
         };
     },
 
@@ -203,6 +221,7 @@ const ZeamArgs = struct {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
             },
             .node => |cmd| try writer.print("node(node-id=\"{s}\", custom_genesis=\"{s}\", validator_config=\"{s}\", data-dir=\"{s}\", api_port={d})", .{ cmd.@"node-id", cmd.custom_genesis, cmd.validator_config, cmd.@"data-dir", cmd.@"api-port" }),
+            .testsig => |cmd| try writer.print("testsig(epoch={d}, slot={d})", .{ cmd.epoch, cmd.slot }),
         }
         try writer.writeAll(")");
     }
@@ -213,6 +232,9 @@ const ErrorHandler = error_handler.ErrorHandler;
 
 pub fn main() void {
     mainInner() catch |err| {
+        if (err == error.MissingSubCommand) {
+            std.process.exit(1);
+        }
         ErrorHandler.handleApplicationError(err);
         std.process.exit(1);
     };
@@ -232,10 +254,12 @@ fn mainInner() !void {
     const app_description = "Zeam - Zig implementation of Beam Chain, a ZK-based Ethereum Consensus Protocol";
     const app_version = build_options.version;
 
-    const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+
+    const opts = simargs.parse(parse_arena.allocator(), ZeamArgs, app_description, app_version) catch |err| {
         std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
         std.debug.print("Run 'zeam --help' for usage information.\n", .{});
-        ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
     defer opts.deinit();
@@ -744,6 +768,43 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "run lean node");
                 return err;
             };
+        },
+        .testsig => |cmd| {
+            const num_active_epochs = @max(cmd.epoch + 1, 1);
+            var keypair = xmss.KeyPair.generate(
+                allocator,
+                cmd.@"private-key",
+                0,
+                num_active_epochs,
+            ) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "generate key from seed");
+                return err;
+            };
+            defer keypair.deinit();
+
+            var message: [32]u8 = [_]u8{0} ** 32;
+            std.mem.writeInt(u64, message[0..8], cmd.slot, .little);
+
+            const epoch_u32: u32 = @intCast(cmd.epoch);
+            var signature = keypair.sign(&message, epoch_u32) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "sign message");
+                return err;
+            };
+            defer signature.deinit();
+
+            var sig_buf: [types.SIGSIZE]u8 = undefined;
+            const bytes_written = signature.toBytes(&sig_buf) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "serialize signature");
+                return err;
+            };
+
+            const sig_slice = sig_buf[0..bytes_written];
+            const hex_str = std.fmt.allocPrint(allocator, "0x{x}", .{sig_slice}) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "format signature hex");
+                return err;
+            };
+            defer allocator.free(hex_str);
+            std.debug.print("signature: {s}\n", .{hex_str});
         },
     }
 }
