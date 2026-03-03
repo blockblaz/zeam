@@ -891,6 +891,15 @@ pub const BeamChain = struct {
                         continue;
                     };
 
+                    self.forkChoice.onAttestation(attestation, true) catch |e| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                        self.module_logger.err(
+                            "failed to apply block attestation to forkchoice tracker: validator={d} slot={d} error={any}",
+                            .{ validator_index, attestation.data.slot, e },
+                        );
+                        continue;
+                    };
+
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
             }
