@@ -1472,6 +1472,10 @@ pub const BeamChain = struct {
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
             .synced => {},
+            .fc_initing => {
+                self.module_logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
+                return null;
+            },
             .no_peers => {
                 self.module_logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
                 return null;
@@ -1556,6 +1560,10 @@ pub const BeamChain = struct {
     pub const SyncStatus = union(enum) {
         synced,
         no_peers,
+        /// Forkchoice is in its init phase (checkpoint-sync or DB restore): it has not yet
+        /// observed a real justified checkpoint via block processing.  Validator duties must
+        /// not run until the first onBlock-driven justified update transitions FC to ready.
+        fc_initing,
         behind_peers: struct {
             head_slot: types.Slot,
             finalized_slot: types.Slot,
@@ -1565,6 +1573,12 @@ pub const BeamChain = struct {
 
     /// Returns detailed sync status information.
     pub fn getSyncStatus(self: *Self) SyncStatus {
+        // If forkchoice is still initializing (checkpoint-sync / DB-restore), block production
+        // and attestation must be deferred until we observe the first real justified checkpoint.
+        if (!self.forkChoice.isReady()) {
+            return .fc_initing;
+        }
+
         // If no peers connected, we can't verify sync status - assume not synced
         // Unless force_block_production is enabled, which allows block generation without peers
         if (self.connected_peers.count() == 0 and !self.force_block_production) {
