@@ -1880,6 +1880,10 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     defer node.deinit();
 
     const slot: usize = 4;
+    // Advance the forkchoice clock to the target slot (mimics production flow where
+    // onInterval is called before block production)
+    try node.chain.forkChoice.onInterval(slot * constants.INTERVALS_PER_SLOT, false);
+
     const produced_block = try node.chain.produceBlock(.{
         .slot = slot,
         .proposer_index = validator_ids[0],
