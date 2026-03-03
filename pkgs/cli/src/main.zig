@@ -782,6 +782,18 @@ fn mainInner() !void {
             };
             defer keypair.deinit();
 
+            var pk_buf: [64]u8 = undefined;
+            const pk_len = keypair.pubkeyToBytes(&pk_buf) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "serialize public key");
+                return err;
+            };
+            const pk_hex = std.fmt.allocPrint(allocator, "0x{x}", .{pk_buf[0..pk_len]}) catch |err| {
+                ErrorHandler.logErrorWithOperation(err, "format public key hex");
+                return err;
+            };
+            defer allocator.free(pk_hex);
+            std.debug.print("public_key: {s}\n", .{pk_hex});
+
             var message: [32]u8 = [_]u8{0} ** 32;
             std.mem.writeInt(u64, message[0..8], cmd.slot, .little);
 
