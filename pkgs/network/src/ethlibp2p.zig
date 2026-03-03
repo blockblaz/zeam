@@ -276,6 +276,28 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     return filename;
 }
 
+/// Generic SSZ deserializer for gossip messages. Returns null on failure (with
+/// error logging and debug-file creation), so callers can simply `orelse return`.
+fn deserializeGossipMessage(
+    comptime T: type,
+    comptime label: []const u8,
+    data: []const u8,
+    allocator: Allocator,
+    logger: zeam_utils.ModuleLogger,
+) ?T {
+    var message_data: T = undefined;
+    ssz.deserialize(T, data, &message_data, allocator) catch |e| {
+        logger.err("Error in deserializing the signed {s} message: {any}", .{ label, e });
+        if (writeFailedBytes(data, label, allocator, null, logger)) |filename| {
+            logger.err("{s} deserialization failed - debug file created: {s}", .{ label, filename });
+        } else {
+            logger.err("{s} deserialization failed - could not create debug file", .{label});
+        }
+        return null;
+    };
+    return message_data;
+}
+
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize, sender_peer_id: [*:0]const u8) void {
     const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
         zigHandler.logger.err("Ignoring Invalid topic_id={s} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
@@ -295,50 +317,34 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
     defer zigHandler.allocator.free(uncompressed_message);
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
-        .block => blockmessage: {
-            var message_data: types.SignedBlockWithAttestation = undefined;
-            ssz.deserialize(types.SignedBlockWithAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed block message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "block", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Block deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Block deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-
-            break :blockmessage .{ .block = message_data };
-        },
-        .attestation => attestationmessage: {
+        .block => .{ .block = deserializeGossipMessage(
+            types.SignedBlockWithAttestation,
+            "block",
+            uncompressed_message,
+            zigHandler.allocator,
+            zigHandler.logger,
+        ) orelse return },
+        .attestation => blk: {
             const subnet_id = topic.gossip_topic.subnet_id orelse {
                 zigHandler.logger.err("attestation topic missing subnet id: {s}", .{std.mem.span(topic_str)});
                 return;
             };
-            var message_data: types.SignedAttestation = undefined;
-            ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "attestation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Attestation deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Attestation deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-            break :attestationmessage .{ .attestation = .{ .subnet_id = subnet_id, .message = message_data } };
+            const msg = deserializeGossipMessage(
+                types.SignedAttestation,
+                "attestation",
+                uncompressed_message,
+                zigHandler.allocator,
+                zigHandler.logger,
+            ) orelse return;
+            break :blk .{ .attestation = .{ .subnet_id = subnet_id, .message = msg } };
         },
-        .aggregation => aggregationmessage: {
-            var message_data: types.SignedAggregatedAttestation = undefined;
-            ssz.deserialize(types.SignedAggregatedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
-                zigHandler.logger.err("Error in deserializing the signed aggregated attestation message: {any}", .{e});
-                if (writeFailedBytes(uncompressed_message, "aggregation", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-                    zigHandler.logger.err("Aggregation deserialization failed - debug file created: {s}", .{filename});
-                } else {
-                    zigHandler.logger.err("Aggregation deserialization failed - could not create debug file", .{});
-                }
-                return;
-            };
-            break :aggregationmessage .{ .aggregation = message_data };
-        },
+        .aggregation => .{ .aggregation = deserializeGossipMessage(
+            types.SignedAggregatedAttestation,
+            "aggregation",
+            uncompressed_message,
+            zigHandler.allocator,
+            zigHandler.logger,
+        ) orelse return },
     };
     defer message.deinit();
 
