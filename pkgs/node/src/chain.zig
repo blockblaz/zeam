@@ -844,6 +844,7 @@ pub const BeamChain = struct {
                     "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
                     .{ &freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
                 );
+                return BlockProcessingError.InvalidSignatureGroups;
             }
 
             for (aggregated_attestations, 0..) |aggregated_attestation, index| {
@@ -1613,7 +1614,10 @@ pub const BeamChain = struct {
     }
 };
 
-pub const BlockProcessingError = error{MissingPreState};
+pub const BlockProcessingError = error{
+    MissingPreState,
+    InvalidSignatureGroups,
+};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
     MissingState,
