@@ -1112,7 +1112,7 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn onGossipAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation, store_signature: bool) !void {
+    fn onSignedAttestationUnlocked(self: *Self, signed_attestation: types.SignedAttestation) !void {
         // Attestation validation is done by the caller (chain layer)
         // This function assumes the attestation has already been validated
 
@@ -1127,17 +1127,15 @@ pub const ForkChoice = struct {
             defer self.signatures_mutex.unlock();
             try self.attestation_data_by_root.put(data_root, attestation_data);
 
-            if (store_signature) {
-                // Store the gossip signature for later aggregation
-                const sig_key = SignatureKey{
-                    .validator_id = validator_id,
-                    .data_root = data_root,
-                };
-                try self.gossip_signatures.put(sig_key, .{
-                    .slot = attestation_slot,
-                    .signature = signed_attestation.signature,
-                });
-            }
+            // Store the gossip signature for later aggregation
+            const sig_key = SignatureKey{
+                .validator_id = validator_id,
+                .data_root = data_root,
+            };
+            try self.gossip_signatures.put(sig_key, .{
+                .slot = attestation_slot,
+                .signature = signed_attestation.signature,
+            });
         }
 
         const attestation = types.Attestation{
@@ -1559,10 +1557,10 @@ pub const ForkChoice = struct {
         return self.onAttestationUnlocked(attestation, is_from_block);
     }
 
-    pub fn onGossipAttestation(self: *Self, signed_attestation: types.SignedAttestation, store_signature: bool) !void {
+    pub fn onSignedAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.onGossipAttestationUnlocked(signed_attestation, store_signature);
+        return self.onSignedAttestationUnlocked(signed_attestation);
     }
 
     pub fn updateSafeTarget(self: *Self) !ProtoBlock {
@@ -1866,11 +1864,11 @@ test "aggregateCommitteeSignatures prunes aggregated gossip signatures" {
     };
     const signature = try key_manager.signAttestation(&attestation, allocator);
 
-    try fork_choice.onGossipAttestation(.{
+    try fork_choice.onSignedAttestation(.{
         .validator_id = 0,
         .message = attestation_data,
         .signature = signature,
-    }, true);
+    });
 
     const data_root = try attestation_data.sszRoot(allocator);
     const aggregations = try fork_choice.aggregateCommitteeSignatures(&mock_chain.genesis_state);
@@ -2315,7 +2313,7 @@ fn stageAggregatedAttestation(
     fork_choice: *ForkChoice,
     signed_attestation: types.SignedAttestation,
 ) !void {
-    try fork_choice.onGossipAttestation(signed_attestation.message, true);
+    try fork_choice.onSignedAttestation(signed_attestation.message);
 
     var proof = try types.AggregatedSignatureProof.init(allocator);
     errdefer proof.deinit();
@@ -3495,7 +3493,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
     // Only vote on canonical chain — fork branch has zero weight
     for (0..4) |validator_id| {
         const att = createTestSignedAttestation(validator_id, createTestRoot(0xFF), 8);
-        try ctx.fork_choice.onGossipAttestation(att, true);
+        try ctx.fork_choice.onSignedAttestation(att);
     }
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null

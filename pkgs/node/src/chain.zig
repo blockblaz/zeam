@@ -403,7 +403,7 @@ pub const BeamChain = struct {
             aggregation.attestation_signatures.deinit();
         };
         // Lock mutex only for the duration of computeAggregatedSignatures to avoid deadlock:
-        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onGossipAttestation
+        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onSignedAttestation
         // acquires mutex then signatures_mutex. Holding signatures_mutex across onBlock/updateHead
         // would allow: (this thread: signatures_mutex -> mutex) vs (gossip: mutex -> signatures_mutex).
         {
@@ -923,7 +923,7 @@ pub const BeamChain = struct {
             .signature = proposer_signature,
         };
 
-        self.forkChoice.onGossipAttestation(signed_proposer_attestation, true) catch |e| {
+        self.forkChoice.onSignedAttestation(signed_proposer_attestation) catch |e| {
             self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -1385,7 +1385,7 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        return self.forkChoice.onGossipAttestation(signedAttestation.message, true);
+        return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {

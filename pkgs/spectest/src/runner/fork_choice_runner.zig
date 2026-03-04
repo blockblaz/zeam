@@ -817,7 +817,7 @@ fn processBlockStep(
         .signature = types.ZERO_SIGBYTES,
     };
     // Proposer attestation is treated as gossip and queued as a new aggregated payload.
-    try ctx.fork_choice.onGossipAttestation(signed_attestation, false);
+    try ctx.fork_choice.onSignedAttestation(signed_attestation);
 
     const proposer_data_root = try proposer_attestation.data.sszRoot(ctx.allocator);
     try ctx.fork_choice.attestation_data_by_root.put(proposer_data_root, proposer_attestation.data);
