@@ -736,6 +736,30 @@ pub const BeamChain = struct {
                     sender_node_name,
                 });
 
+                // Only process incoming gossip attestations if we are an aggregator
+                // and have registered validator IDs in this attestation's subnet.
+                if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) {
+                    self.logger.debug("skipping gossip attestation subnet={d}: node is not an aggregator", .{signed_attestation.subnet_id});
+                    return .{};
+                }
+
+                // Check if any of our registered validator IDs belong to this subnet
+                const committee_count = self.config.spec.attestation_committee_count;
+                if (committee_count > 0) {
+                    var subnet_has_our_validator = false;
+                    for (self.registered_validator_ids) |vid| {
+                        const subnet = try types.computeSubnetId(@intCast(vid), committee_count);
+                        if (subnet == @as(u64, signed_attestation.subnet_id)) {
+                            subnet_has_our_validator = true;
+                            break;
+                        }
+                    }
+                    if (!subnet_has_our_validator) {
+                        self.logger.debug("skipping gossip attestation subnet={d}: no registered validators in subnet", .{signed_attestation.subnet_id});
+                        return .{};
+                    }
+                }
+
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestation(signed_attestation.message.toAttestation(), false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
