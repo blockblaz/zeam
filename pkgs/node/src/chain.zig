@@ -850,16 +850,10 @@ pub const BeamChain = struct {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
 
-                // Get participant indices from the signature proof
-                const signature_proof = if (index < signature_groups.len)
-                    &signature_groups[index]
-                else
-                    null;
+                // Get participant indices from the signature proof, length already validated
+                const signature_proof = &signature_groups[index];
 
-                var participant_indices: std.ArrayList(usize) = if (signature_proof) |proof|
-                    try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
-                else
-                    .empty;
+                var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
                 defer participant_indices.deinit(self.allocator);
 
                 if (validator_indices.items.len != participant_indices.items.len) {
@@ -903,16 +897,14 @@ pub const BeamChain = struct {
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
 
-                if (signature_proof) |proof| {
-                    var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-                    defer self.allocator.free(validator_ids);
-                    for (validator_indices.items, 0..) |vi, i| {
-                        validator_ids[i] = @intCast(vi);
-                    }
-                    self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof.*, true) catch |e| {
-                        self.module_logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
-                    };
+                var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+                defer self.allocator.free(validator_ids);
+                for (validator_indices.items, 0..) |vi, i| {
+                    validator_ids[i] = @intCast(vi);
                 }
+                self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
+                    self.module_logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
+                };
             }
 
             // 5. fc update head
@@ -1405,6 +1397,19 @@ pub const BeamChain = struct {
         defer self.allocator.free(validator_ids);
         for (validator_indices.items, 0..) |vi, i| {
             validator_ids[i] = @intCast(vi);
+        }
+
+        // Update attestation trackers for gossip attestations so fork choice sees these votes
+        for (validator_ids) |validator_id| {
+            const attestation = types.Attestation{
+                .validator_id = validator_id,
+                .data = signedAggregation.data,
+            };
+            self.forkChoice.onAttestation(attestation, false) catch |err| {
+                self.module_logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                    validator_id, err,
+                });
+            };
         }
 
         try self.forkChoice.storeAggregatedPayload(validator_ids, &signedAggregation.data, signedAggregation.proof, false);

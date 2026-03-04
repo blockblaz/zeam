@@ -1205,11 +1205,6 @@ pub const ForkChoice = struct {
     ) !void {
         const data_root = try attestation_data.sszRoot(self.allocator);
 
-        if (!is_from_block) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
-
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
@@ -1239,21 +1234,6 @@ pub const ForkChoice = struct {
                     .slot = attestation_data.slot,
                     .proof = cloned_proof,
                 });
-            }
-        }
-
-        // Update attestation trackers for gossip attestations so fork choice sees these votes
-        if (!is_from_block) {
-            for (validator_ids) |validator_id| {
-                const attestation = types.Attestation{
-                    .validator_id = validator_id,
-                    .data = attestation_data.*,
-                };
-                self.onAttestationUnlocked(attestation, false) catch |err| {
-                    self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
-                        validator_id, err,
-                    });
-                };
             }
         }
     }
