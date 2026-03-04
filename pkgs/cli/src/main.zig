@@ -850,9 +850,11 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "serialize signature");
                 return err;
             };
+            if (bytes_written < types.SIGSIZE) {
+                @memset(sig_buf[bytes_written..], 0);
+            }
 
-            const sig_slice = sig_buf[0..bytes_written];
-            const hex_str = std.fmt.allocPrint(allocator, "0x{x}", .{sig_slice}) catch |err| {
+            const hex_str = std.fmt.allocPrint(allocator, "0x{x}", .{sig_buf}) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "format signature hex");
                 return err;
             };
