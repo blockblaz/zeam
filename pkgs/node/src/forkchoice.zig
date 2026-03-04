@@ -2316,7 +2316,7 @@ fn stageAggregatedAttestation(
     try fork_choice.onSignedAttestation(signed_attestation);
 
     var proof = try types.AggregatedSignatureProof.init(allocator);
-    errdefer proof.deinit();
+    defer proof.deinit();
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
