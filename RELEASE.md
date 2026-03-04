@@ -14,16 +14,37 @@ The Zeam release process uses a GitHub Actions workflow that automatically creat
 
 ## Step-by-Step Release Process
 
-### 1. Create Release Branch
+### 1. Update Release Branch or create Release branch from Main
 
-Start by creating a release branch from the latest `main` branch:
+If `release` doesn't exist yet, create it from `main`. Otherwise, update it with the latest `main` branch:
+
+#### Option A: Release Branch Already Exists
+
 ```bash
 # Ensure you're on main and up to date
 git checkout main
 git pull origin main
 
-# Create and checkout release branch
-git checkout -b release 
+# Checkout the existing release branch
+git checkout release
+git pull origin release
+
+# Merge latest main into release
+git merge main --no-edit
+```
+
+#### Option B: Create Release Branch for the First Time
+
+```bash
+# Ensure you're on main and up to date
+git checkout main
+git pull origin main
+
+# Create and checkout new release branch from main
+git checkout -b release
+
+# Push the new release branch to remote
+git push -u origin release
 ```
 
 ### 2. Create Empty Commit (Required for PR)
