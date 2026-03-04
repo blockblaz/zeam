@@ -55,7 +55,10 @@ fn getOrCreateCachedKeyPair(
 pub const KeyManager = struct {
     keys: std.AutoHashMap(usize, xmss.KeyPair),
     allocator: Allocator,
-    owns_keypairs: bool,
+    /// Number of keypairs owned by this manager (allocated with our allocator).
+/// Keypairs with index < num_owned_keypairs will be freed on deinit.
+/// Cached/runtime-generated keypairs (index >= num_owned_keypairs) are not owned.
+num_owned_keypairs: usize,
 
     const Self = @This();
 
@@ -63,14 +66,14 @@ pub const KeyManager = struct {
         return Self{
             .keys = std.AutoHashMap(usize, xmss.KeyPair).init(allocator),
             .allocator = allocator,
-            .owns_keypairs = true,
+            .num_owned_keypairs = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.owns_keypairs) {
-            var it = self.keys.iterator();
-            while (it.next()) |entry| {
+        var it = self.keys.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.* < self.num_owned_keypairs) {
                 entry.value_ptr.deinit();
             }
         }
@@ -233,6 +236,7 @@ pub fn getTestKeyManager(
         0;
 
     // Load pre-generated keys (fast path: near-instant from SSZ files)
+    var actually_loaded: usize = 0;
     if (keys_dir) |dir| {
         for (0..num_preloaded) |i| {
             const keypair = loadPreGeneratedKey(allocator, dir, i) catch |err| {
@@ -243,24 +247,24 @@ pub fn getTestKeyManager(
                 std.debug.print("Failed to add pre-generated key {d}: {}\n", .{ i, err });
                 break;
             };
+            actually_loaded += 1;
         }
-        std.debug.print("Loaded {d} pre-generated test keys from {s}\n", .{ num_preloaded, dir });
+        key_manager.num_owned_keypairs = actually_loaded;
+        std.debug.print("Loaded {d} pre-generated test keys from {s}\n", .{ actually_loaded, dir });
     } else {
         std.debug.print("Pre-generated keys not found, generating all keys at runtime\n", .{});
     }
 
-    // Generate remaining keys at runtime (for validators beyond the pre-generated set)
-    if (num_validators > num_preloaded) {
-        key_manager.owns_keypairs = false; // cached keypairs are not owned
-
+    // Generate remaining keys at runtime (for validators beyond the loaded set)
+    if (num_validators > actually_loaded) {
         var num_active_epochs = max_slot + 1;
         if (num_active_epochs < 10) num_active_epochs = 10;
 
-        for (num_preloaded..num_validators) |i| {
+        for (actually_loaded..num_validators) |i| {
             const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
             try key_manager.addKeypair(i, keypair);
         }
-        std.debug.print("Generated {d} additional keys at runtime\n", .{num_validators - num_preloaded});
+        std.debug.print("Generated {d} additional keys at runtime\n", .{num_validators - actually_loaded});
     }
 
     return key_manager;
