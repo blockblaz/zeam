@@ -183,18 +183,20 @@ pub const BeamState = struct {
         self.justifications_validators = new_justifications_validators;
     }
 
-    fn fillRootToSlot(self: *const Self, allocator: Allocator, finalized_slot: Slot, root_to_slot: *std.AutoHashMapUnmanaged(Root, Slot)) !void {
-        const start_slot: usize = @intCast(finalized_slot + 1);
+    pub fn initRootToSlotCache(self: *const Self, cache: *utils.RootToSlotCache) !void {
+        const start_slot: usize = @intCast(self.latest_finalized.slot + 1);
         const historical_len_usize: usize = self.historical_block_hashes.len();
+        if (start_slot >= historical_len_usize) return;
         for (start_slot..historical_len_usize) |i| {
             const root = try self.historical_block_hashes.get(i);
+            if (std.mem.eql(u8, &root, &utils.ZERO_HASH)) continue;
             const slot_i: Slot = @intCast(i);
-            if (root_to_slot.getPtr(root)) |slot_ptr| {
-                if (slot_i > slot_ptr.*) {
-                    slot_ptr.* = slot_i;
+            if (cache.get(root)) |existing| {
+                if (slot_i > existing) {
+                    try cache.put(root, slot_i);
                 }
             } else {
-                try root_to_slot.put(allocator, root, slot_i);
+                try cache.put(root, slot_i);
             }
         }
     }
@@ -325,7 +327,7 @@ pub const BeamState = struct {
         try staged_block.blockToLatestBlockHeader(allocator, &self.latest_block_header);
     }
 
-    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    pub fn process_block(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
         const block_timer = zeam_metrics.lean_state_transition_block_processing_time_seconds.start();
         defer _ = block_timer.observe();
 
@@ -334,15 +336,15 @@ pub const BeamState = struct {
 
         // PQ devner-0 has no execution
         // try process_execution_payload_header(state, block);
-        try self.process_operations(allocator, staged_block, logger);
+        try self.process_operations(allocator, staged_block, logger, cache);
     }
 
-    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger) !void {
+    fn process_operations(self: *Self, allocator: Allocator, staged_block: BeamBlock, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
         // 1. process attestations
-        try self.process_attestations(allocator, staged_block.body.attestations, logger);
+        try self.process_attestations(allocator, staged_block.body.attestations, logger, cache);
     }
 
-    fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, logger: zeam_utils.ModuleLogger) !void {
+    fn process_attestations(self: *Self, allocator: Allocator, attestations: AggregatedAttestations, logger: zeam_utils.ModuleLogger, cache: ?*utils.RootToSlotCache) !void {
         const attestations_timer = zeam_metrics.lean_state_transition_attestations_processing_time_seconds.start();
         defer _ = attestations_timer.observe();
 
@@ -374,9 +376,14 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
-        var root_to_slot: std.AutoHashMapUnmanaged(Root, Slot) = .empty;
-        defer root_to_slot.deinit(allocator);
-        try self.fillRootToSlot(allocator, finalized_slot, &root_to_slot);
+        // Use the global cache directly if provided, otherwise build a local cache.
+        var owned_cache: ?utils.RootToSlotCache = if (cache == null) utils.RootToSlotCache.init(allocator) else null;
+        defer if (owned_cache) |*oc| oc.deinit();
+        const block_cache = cache orelse &(owned_cache.?);
+        if (owned_cache != null) {
+            // Only populate cache in fallback path (tests). Chain.zig maintains the global cache.
+            try self.initRootToSlotCache(block_cache);
+        }
 
         // need to cast to usize for slicing ops but does this makes the STF target arch dependent?
         const num_validators: usize = @intCast(self.validatorCount());
@@ -421,6 +428,7 @@ pub const BeamState = struct {
             const has_correct_source_root = std.mem.eql(u8, &attestation_data.source.root, &stored_source_root);
             const has_correct_target_root = std.mem.eql(u8, &attestation_data.target.root, &stored_target_root);
             const has_known_root = has_correct_source_root and has_correct_target_root;
+
             const target_not_ahead = target_slot <= source_slot;
             const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
 
@@ -506,9 +514,10 @@ pub const BeamState = struct {
                         defer roots_to_remove.deinit(allocator);
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
-                            const slot_value = root_to_slot.get(entry.key_ptr.*) orelse return StateTransitionError.InvalidJustificationRoot;
-                            if (slot_value <= finalized_slot) {
-                                try roots_to_remove.append(allocator, entry.key_ptr.*);
+                            const root = entry.key_ptr.*;
+                            const slot = block_cache.get(root) orelse return StateTransitionError.InvalidJustificationRoot;
+                            if (slot <= finalized_slot) {
+                                try roots_to_remove.append(allocator, root);
                             }
                         }
                         for (roots_to_remove.items) |root| {
@@ -802,7 +811,7 @@ test "process_attestations invalid justifiable slot returns error without panic"
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
-    try state.process_block(std.testing.allocator, block_1, logger);
+    try state.process_block(std.testing.allocator, block_1, logger, null);
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
@@ -852,7 +861,7 @@ test "process_attestations invalid justifiable slot returns error without panic"
 
     try std.testing.expectError(
         StateTransitionError.InvalidJustifiableSlot,
-        state.process_attestations(std.testing.allocator, attestations_list, logger),
+        state.process_attestations(std.testing.allocator, attestations_list, logger, null),
     );
 }
 
@@ -887,7 +896,7 @@ test "justified_slots rebases when finalization advances" {
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
-    try state.process_block(std.testing.allocator, block_1, logger);
+    try state.process_block(std.testing.allocator, block_1, logger, null);
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2_parent_root: Root = undefined;
@@ -906,7 +915,7 @@ test "justified_slots rebases when finalization advances" {
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
     att_0_to_1_transferred = true;
     defer block_2.deinit();
-    try state.process_block(std.testing.allocator, block_2, logger);
+    try state.process_block(std.testing.allocator, block_2, logger, null);
 
     try state.process_slots(std.testing.allocator, 3, logger);
     var block_3_parent_root: Root = undefined;
@@ -925,7 +934,7 @@ test "justified_slots rebases when finalization advances" {
     var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_1_to_2});
     att_1_to_2_transferred = true;
     defer block_3.deinit();
-    try state.process_block(std.testing.allocator, block_3, logger);
+    try state.process_block(std.testing.allocator, block_3, logger, null);
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(usize, 1), state.justified_slots.len());
@@ -955,7 +964,7 @@ test "pruning keeps pending justifications" {
     try state.process_slots(std.testing.allocator, 1, logger);
     var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_1.deinit();
-    try state.process_block(std.testing.allocator, block_1, logger);
+    try state.process_block(std.testing.allocator, block_1, logger, null);
 
     try state.process_slots(std.testing.allocator, 2, logger);
     var block_2_parent_root: Root = undefined;
@@ -974,7 +983,7 @@ test "pruning keeps pending justifications" {
     var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
     att_0_to_1_transferred = true;
     defer block_2.deinit();
-    try state.process_block(std.testing.allocator, block_2, logger);
+    try state.process_block(std.testing.allocator, block_2, logger, null);
 
     try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 1), state.latest_justified.slot);
@@ -983,12 +992,12 @@ test "pruning keeps pending justifications" {
     try state.process_slots(std.testing.allocator, 3, logger);
     var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_3.deinit();
-    try state.process_block(std.testing.allocator, block_3, logger);
+    try state.process_block(std.testing.allocator, block_3, logger, null);
 
     try state.process_slots(std.testing.allocator, 4, logger);
     var block_4 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
     defer block_4.deinit();
-    try state.process_block(std.testing.allocator, block_4, logger);
+    try state.process_block(std.testing.allocator, block_4, logger, null);
 
     try state.process_slots(std.testing.allocator, 5, logger);
     var block_5 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
@@ -1036,11 +1045,146 @@ test "pruning keeps pending justifications" {
     try attestations_list.append(att_1_to_2);
     att_1_to_2_transferred = true;
 
-    try state.process_attestations(std.testing.allocator, attestations_list, logger);
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
 
     try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
     try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
 
+    var found = false;
+    for (state.justifications_roots.constSlice()) |root| {
+        if (std.mem.eql(u8, &root, &slot_3_root)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "root_to_slot_cache lifecycle" {
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    var cache = utils.RootToSlotCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    // Initialize cache from genesis state (simulates chain init).
+    try state.initRootToSlotCache(&cache);
+
+    // Phase 1: Build chain and justify slot 1.
+    try state.process_slots(std.testing.allocator, 1, logger);
+    var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_1.deinit();
+
+    // Simulate chain.zig adding parent to cache before STF.
+    try cache.put(block_1.parent_root, 0);
+    try state.process_block(std.testing.allocator, block_1, logger, &cache);
+
+    // After block 1: cache should have the genesis root at slot 0.
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
+    try std.testing.expectEqual(@as(Slot, 0), cache.get(block_1.parent_root).?);
+
+    try state.process_slots(std.testing.allocator, 2, logger);
+    var block_2_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
+
+    var att_0_to_1 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = block_1.parent_root, .slot = 0 },
+        .{ .root = block_2_parent_root, .slot = 1 },
+    );
+    var att_0_to_1_transferred = false;
+    defer if (!att_0_to_1_transferred) att_0_to_1.deinit();
+
+    var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
+    att_0_to_1_transferred = true;
+    defer block_2.deinit();
+
+    // Simulate chain.zig adding parent to cache before STF.
+    try cache.put(block_2_parent_root, 1);
+    try state.process_block(std.testing.allocator, block_2, logger, &cache);
+
+    // After block 2: cache should have grown (genesis root + block 1 root).
+    try std.testing.expect(cache.count() >= 2);
+    try std.testing.expectEqual(@as(Slot, 1), cache.get(block_2_parent_root).?);
+
+    // Phase 2: Extend chain.
+    try state.process_slots(std.testing.allocator, 3, logger);
+    var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_3.deinit();
+
+    // Get block_3's parent_root for cache population.
+    var block_3_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_3_parent_root, std.testing.allocator);
+    try cache.put(block_3_parent_root, 2);
+    try state.process_block(std.testing.allocator, block_3, logger, &cache);
+
+    try state.process_slots(std.testing.allocator, 4, logger);
+    var block_4 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_4.deinit();
+
+    // Get block_4's parent_root for cache population.
+    var block_4_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_4_parent_root, std.testing.allocator);
+    try cache.put(block_4_parent_root, 3);
+    try state.process_block(std.testing.allocator, block_4, logger, &cache);
+
+    try state.process_slots(std.testing.allocator, 5, logger);
+    var block_5 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_5.deinit();
+    try state.process_block_header(std.testing.allocator, block_5, logger);
+
+    // Phase 3: Seed a pending justification at slot 3.
+    const slot_3_root = try state.historical_block_hashes.get(3);
+
+    var pending_roots = try JustificationRoots.init(std.testing.allocator);
+    errdefer pending_roots.deinit();
+    try pending_roots.append(slot_3_root);
+
+    var pending_validators = try JustificationValidators.init(std.testing.allocator);
+    errdefer pending_validators.deinit();
+    try pending_validators.append(true);
+    try pending_validators.append(false);
+    try pending_validators.append(false);
+
+    state.justifications_roots.deinit();
+    state.justifications_roots = pending_roots;
+    state.justifications_validators.deinit();
+    state.justifications_validators = pending_validators;
+
+    // Phase 4: Trigger finalization via attestation from slot 1 to slot 2.
+    const source_1_root = try state.historical_block_hashes.get(1);
+    const slot_2_root = try state.historical_block_hashes.get(2);
+    var att_1_to_2 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = source_1_root, .slot = 1 },
+        .{ .root = slot_2_root, .slot = 2 },
+    );
+    var att_1_to_2_transferred = false;
+    defer if (!att_1_to_2_transferred) att_1_to_2.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*att| {
+            att.deinit();
+        }
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_1_to_2);
+    att_1_to_2_transferred = true;
+
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, &cache);
+
+    // Verify finalization advanced and justification cleanup used the cache.
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
+
+    // Verify pending justification at slot 3 survived cleanup.
     var found = false;
     for (state.justifications_roots.constSlice()) |root| {
         if (std.mem.eql(u8, &root, &slot_3_root)) {
