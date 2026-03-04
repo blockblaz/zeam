@@ -505,6 +505,7 @@ fn mainInner() !void {
                     .connect_peers = null,
                     .node_registry = test_registry1,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
+                    .is_aggregator = beamcmd.@"is-aggregator",
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -529,6 +530,7 @@ fn mainInner() !void {
                     .connect_peers = connect_peers,
                     .node_registry = test_registry2,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
+                    .is_aggregator = beamcmd.@"is-aggregator",
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
@@ -552,6 +554,7 @@ fn mainInner() !void {
                     .connect_peers = connect_peers3,
                     .node_registry = test_registry3,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
+                    .is_aggregator = beamcmd.@"is-aggregator",
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});

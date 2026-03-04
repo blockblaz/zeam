@@ -173,6 +173,7 @@ pub const Node = struct {
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
             .attestation_committee_count = chain_config.spec.attestation_committee_count,
+            .is_aggregator = options.is_aggregator,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
