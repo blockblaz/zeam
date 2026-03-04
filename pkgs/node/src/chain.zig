@@ -403,7 +403,7 @@ pub const BeamChain = struct {
             aggregation.attestation_signatures.deinit();
         };
         // Lock mutex only for the duration of computeAggregatedSignatures to avoid deadlock:
-        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onGossipAttestation
+        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onSignedAttestation
         // acquires mutex then signatures_mutex. Holding signatures_mutex across onBlock/updateHead
         // would allow: (this thread: signatures_mutex -> mutex) vs (gossip: mutex -> signatures_mutex).
         {
@@ -844,22 +844,17 @@ pub const BeamChain = struct {
                     "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
                     .{ &freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
                 );
+                return BlockProcessingError.InvalidSignatureGroups;
             }
 
             for (aggregated_attestations, 0..) |aggregated_attestation, index| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
 
-                // Get participant indices from the signature proof
-                const signature_proof = if (index < signature_groups.len)
-                    &signature_groups[index]
-                else
-                    null;
+                // Get participant indices from the signature proof, length already validated
+                const signature_proof = &signature_groups[index];
 
-                var participant_indices: std.ArrayList(usize) = if (signature_proof) |proof|
-                    try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator)
-                else
-                    .empty;
+                var participant_indices: std.ArrayList(usize) = try types.aggregationBitsToValidatorIndices(&signature_proof.participants, self.allocator);
                 defer participant_indices.deinit(self.allocator);
 
                 if (validator_indices.items.len != participant_indices.items.len) {
@@ -902,12 +897,17 @@ pub const BeamChain = struct {
 
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
-            }
 
-            // Store aggregated payloads from the block before updating head
-            self.storeAggregatedPayloads(&signedBlock) catch |err| {
-                self.module_logger.warn("failed to store aggregated payloads: {any}", .{err});
-            };
+                // store the aggregated payloads in known
+                var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+                defer self.allocator.free(validator_ids);
+                for (validator_indices.items, 0..) |vi, i| {
+                    validator_ids[i] = @intCast(vi);
+                }
+                self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
+                    self.module_logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
+                };
+            }
 
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
@@ -924,7 +924,7 @@ pub const BeamChain = struct {
             .signature = proposer_signature,
         };
 
-        self.forkChoice.onGossipAttestation(signed_proposer_attestation, true) catch |e| {
+        self.forkChoice.onSignedAttestation(signed_proposer_attestation) catch |e| {
             self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };
 
@@ -1034,39 +1034,6 @@ pub const BeamChain = struct {
 
         zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
-    }
-
-    /// Store aggregated signature payloads from a block for future block building
-    fn storeAggregatedPayloads(self: *Self, signedBlock: *const types.SignedBlockWithAttestation) !void {
-        const block = signedBlock.message.block;
-        const aggregated_attestations = block.body.attestations.constSlice();
-        const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
-
-        for (aggregated_attestations, 0..) |aggregated_attestation, index| {
-            const signature_proof = if (index < signature_groups.len)
-                &signature_groups[index]
-            else
-                continue;
-
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
-            defer validator_indices.deinit(self.allocator);
-
-            for (validator_indices.items) |validator_index| {
-                const validator_id: types.ValidatorIndex = @intCast(validator_index);
-
-                // Clone the proof since we need to store it and the block data may be freed
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                types.sszClone(self.allocator, types.AggregatedSignatureProof, signature_proof.*, &cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to clone aggregated proof for validator={d}: {any}", .{ validator_index, e });
-                    continue;
-                };
-
-                self.forkChoice.storeAggregatedPayload(validator_id, &aggregated_attestation.data, cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to store aggregated payload for validator={d}: {any}", .{ validator_index, e });
-                    cloned_proof.deinit();
-                };
-            }
-        }
     }
 
     /// Update block database with block, state, and slot indices
@@ -1419,12 +1386,35 @@ pub const BeamChain = struct {
             &signedAttestation.message.signature,
         );
 
-        return self.forkChoice.onGossipAttestation(signedAttestation.message, true);
+        return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
         try self.verifyAggregatedAttestation(signedAggregation);
-        return self.forkChoice.onGossipAggregatedAttestation(signedAggregation);
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
+        defer validator_indices.deinit(self.allocator);
+
+        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+        defer self.allocator.free(validator_ids);
+        for (validator_indices.items, 0..) |vi, i| {
+            validator_ids[i] = @intCast(vi);
+        }
+
+        // Update attestation trackers for gossip attestations so fork choice sees these votes
+        for (validator_ids) |validator_id| {
+            const attestation = types.Attestation{
+                .validator_id = validator_id,
+                .data = signedAggregation.data,
+            };
+            self.forkChoice.onAttestation(attestation, false) catch |err| {
+                self.module_logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                    validator_id, err,
+                });
+            };
+        }
+
+        try self.forkChoice.storeAggregatedPayload(validator_ids, &signedAggregation.data, signedAggregation.proof, false);
     }
 
     fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
@@ -1624,7 +1614,10 @@ pub const BeamChain = struct {
     }
 };
 
-pub const BlockProcessingError = error{MissingPreState};
+pub const BlockProcessingError = error{
+    MissingPreState,
+    InvalidSignatureGroups,
+};
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
     MissingState,
