@@ -171,25 +171,20 @@ const MAX_PK_SIZE = 256;
 /// Number of pre-generated test keys available in the test-keys submodule.
 const NUM_PREGENERATED_KEYS: usize = 32;
 
-/// Known paths to search for the test-keys directory.
-/// Zig test runners may execute from subdirectories, so we search upward.
-const TEST_KEY_SEARCH_PATHS = [_][]const u8{
-    "test-keys/hash-sig-keys",
-    "../test-keys/hash-sig-keys",
-    "../../test-keys/hash-sig-keys",
-    "../../../test-keys/hash-sig-keys",
-    "../../../../test-keys/hash-sig-keys",
-};
+const build_options = @import("build_options");
 
-/// Find the test-keys directory by searching known paths.
+/// Find the test-keys directory using the repo root path injected by build.zig.
 fn findTestKeysDir() ?[]const u8 {
-    for (TEST_KEY_SEARCH_PATHS) |path| {
-        if (std.fs.cwd().openDir(path, .{})) |dir| {
-            var d = dir;
-            d.close();
-            return path;
-        } else |_| {}
-    }
+    const keys_path = build_options.test_keys_path;
+    if (keys_path.len == 0) return null;
+
+    // Verify it actually exists at runtime
+    if (std.fs.cwd().openDir(keys_path, .{})) |dir| {
+        var d = dir;
+        d.close();
+        return keys_path;
+    } else |_| {}
+
     return null;
 }
 
