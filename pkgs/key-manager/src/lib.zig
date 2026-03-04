@@ -55,10 +55,8 @@ fn getOrCreateCachedKeyPair(
 pub const KeyManager = struct {
     keys: std.AutoHashMap(usize, xmss.KeyPair),
     allocator: Allocator,
-    /// Number of keypairs owned by this manager (allocated with our allocator).
-/// Keypairs with index < num_owned_keypairs will be freed on deinit.
-/// Cached/runtime-generated keypairs (index >= num_owned_keypairs) are not owned.
-num_owned_keypairs: usize,
+    /// Tracks which keypairs are owned (allocated by us) vs borrowed (cached).
+owned_keys: std.AutoHashMap(usize, void),
 
     const Self = @This();
 
@@ -66,21 +64,29 @@ num_owned_keypairs: usize,
         return Self{
             .keys = std.AutoHashMap(usize, xmss.KeyPair).init(allocator),
             .allocator = allocator,
-            .num_owned_keypairs = 0,
+            .owned_keys = std.AutoHashMap(usize, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
         var it = self.keys.iterator();
         while (it.next()) |entry| {
-            if (entry.key_ptr.* < self.num_owned_keypairs) {
+            if (self.owned_keys.contains(entry.key_ptr.*)) {
                 entry.value_ptr.deinit();
             }
         }
         self.keys.deinit();
+        self.owned_keys.deinit();
     }
 
+    /// Add an owned keypair that will be freed on deinit.
     pub fn addKeypair(self: *Self, validator_id: usize, keypair: xmss.KeyPair) !void {
+        try self.keys.put(validator_id, keypair);
+        try self.owned_keys.put(validator_id, {});
+    }
+
+    /// Add a cached/borrowed keypair that will NOT be freed on deinit.
+    pub fn addCachedKeypair(self: *Self, validator_id: usize, keypair: xmss.KeyPair) !void {
         try self.keys.put(validator_id, keypair);
     }
 
@@ -249,7 +255,6 @@ pub fn getTestKeyManager(
             };
             actually_loaded += 1;
         }
-        key_manager.num_owned_keypairs = actually_loaded;
         std.debug.print("Loaded {d} pre-generated test keys from {s}\n", .{ actually_loaded, dir });
     } else {
         std.debug.print("Pre-generated keys not found, generating all keys at runtime\n", .{});
@@ -262,7 +267,7 @@ pub fn getTestKeyManager(
 
         for (actually_loaded..num_validators) |i| {
             const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
-            try key_manager.addKeypair(i, keypair);
+            try key_manager.addCachedKeypair(i, keypair);
         }
         std.debug.print("Generated {d} additional keys at runtime\n", .{num_validators - actually_loaded});
     }
