@@ -1264,13 +1264,18 @@ pub const BeamNode = struct {
         const committee_count = self.chain.config.spec.attestation_committee_count;
         if (committee_count > 0) {
             if (self.validator) |validator| {
-                var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
-                defer seen_subnets.deinit();
-                for (validator.ids) |validator_id| {
-                    const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
-                    if (seen_subnets.contains(@intCast(subnet_id))) continue;
-                    try seen_subnets.put(@intCast(subnet_id), {});
-                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
+                // Only subscribe to attestation subnets if this node is an aggregator.
+                // Non-aggregators publish their own attestations but must not receive/process
+                // attestations from others on the gossip subnet.
+                if (self.chain.is_aggregator_enabled) {
+                    var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
+                    defer seen_subnets.deinit();
+                    for (validator.ids) |validator_id| {
+                        const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
+                        if (seen_subnets.contains(@intCast(subnet_id))) continue;
+                        try seen_subnets.put(@intCast(subnet_id), {});
+                        try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
+                    }
                 }
             } else {
                 // Keep parity with leanSpec: passive nodes subscribe to subnet 0.
