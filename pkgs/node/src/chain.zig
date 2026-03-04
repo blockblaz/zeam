@@ -89,9 +89,9 @@ pub const BeamChain = struct {
     states: std.AutoHashMap(types.Root, *types.BeamState),
     nodeId: u32,
     // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
-    // For all other modules, we just need module_logger
+    // For all other modules, we just need logger
     zeam_logger_config: *zeam_utils.ZeamLoggerConfig,
-    module_logger: zeam_utils.ModuleLogger,
+    logger: zeam_utils.ModuleLogger,
     stf_logger: zeam_utils.ModuleLogger,
     block_building_logger: zeam_utils.ModuleLogger,
     registered_validator_ids: []usize = &[_]usize{},
@@ -150,7 +150,7 @@ pub const BeamChain = struct {
             .states = states,
             .anchor_state = opts.anchorState,
             .zeam_logger_config = logger_config,
-            .module_logger = logger_config.logger(.chain),
+            .logger = logger_config.logger(.chain),
             .stf_logger = logger_config.logger(.state_transition),
             .block_building_logger = logger_config.logger(.state_transition_block_building),
             .db = opts.db,
@@ -232,11 +232,11 @@ pub const BeamChain = struct {
 
                 var block_root: types.Root = undefined;
                 zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.message.block, &block_root, self.allocator) catch |err| {
-                    self.module_logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
+                    self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
                     continue;
                 };
 
-                self.module_logger.info(
+                self.logger.info(
                     "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
                     .{ queued_slot, &block_root, fc_time },
                 );
@@ -244,7 +244,7 @@ pub const BeamChain = struct {
                 const missing_roots = self.onBlock(queued_block, .{
                     .blockRoot = block_root,
                 }) catch |err| {
-                    self.module_logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
+                    self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
                     continue;
                 };
                 defer self.allocator.free(missing_roots);
@@ -279,7 +279,7 @@ pub const BeamChain = struct {
             }
         }
 
-        self.module_logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={any}", .{
+        self.logger.debug("ticking chain to time(intervals)={d} = slot={d} interval={d} has_proposal={any}", .{
             time_intervals,
             slot,
             interval,
@@ -299,12 +299,12 @@ pub const BeamChain = struct {
                 const finalized = self.forkChoice.getLatestFinalized();
                 // no need to work extra if finalization is not far behind
                 if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
-                    self.module_logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
+                    self.logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
                     const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
 
                     // prune if finalization hasn't happened since a long time
                     if (pruningAnchor.slot > finalized.slot) {
-                        self.module_logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
+                        self.logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
                             slot,
                             finalized.slot,
                             pruningAnchor.slot,
@@ -321,7 +321,7 @@ pub const BeamChain = struct {
                         _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
                         _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
                         const pruned_count = states_count_before - self.states.count();
-                        self.module_logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
+                        self.logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
                             //
                             pruned_count,
                             slot,
@@ -329,14 +329,14 @@ pub const BeamChain = struct {
                             pruningAnchor.slot,
                         });
                     } else {
-                        self.module_logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
+                        self.logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
                             slot,
                             finalized.slot,
                             pruningAnchor.slot,
                         });
                     }
                 } else {
-                    self.module_logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
+                    self.logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
                         slot,
                         finalized.slot,
                     });
@@ -345,7 +345,7 @@ pub const BeamChain = struct {
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
-            self.module_logger.err("error rotating log file: {any}", .{err});
+            self.logger.err("error rotating log file: {any}", .{err});
         };
     }
 
@@ -359,7 +359,7 @@ pub const BeamChain = struct {
         //             latest_new = try latest_new_att.message.toJsonString(self.allocator);
         //         }
         //     }
-        //     self.module_logger.warn("validator id={d} vote is={s}", .{ entry.key_ptr.*, latest_new });
+        //     self.logger.warn("validator id={d} vote is={s}", .{ entry.key_ptr.*, latest_new });
         // }
 
         // right now with integrated validator into node produceBlock is always gurranteed to be
@@ -463,7 +463,7 @@ pub const BeamChain = struct {
         const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
 
-        self.module_logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
+        self.logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
@@ -471,7 +471,7 @@ pub const BeamChain = struct {
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
 
-        self.module_logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
+        self.logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -533,7 +533,7 @@ pub const BeamChain = struct {
         const safe_target_str = try safe_target.toJsonString(self.allocator);
         defer self.allocator.free(safe_target_str);
 
-        self.module_logger.info("constructing attestation data at slot={d} with chain head={s} safe_target={s}", .{
+        self.logger.info("constructing attestation data at slot={d} with chain head={s} safe_target={s}", .{
             slot,
             head_str,
             safe_target_str,
@@ -543,7 +543,7 @@ pub const BeamChain = struct {
         const target_str = try target.toJsonString(self.allocator);
         defer self.allocator.free(target_str);
 
-        self.module_logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
+        self.logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
 
         const attestation_data = types.AttestationData{
             .slot = slot,
@@ -561,7 +561,7 @@ pub const BeamChain = struct {
         // logs show it has been updated. debug and fix the call below
         const fc_head = if (islot > 0)
             self.forkChoice.updateHead() catch |err| {
-                self.module_logger.err("forkchoice updatehead error={any}", .{err});
+                self.logger.err("forkchoice updatehead error={any}", .{err});
                 return;
             }
         else
@@ -579,8 +579,8 @@ pub const BeamChain = struct {
         const states_count = self.states.count();
         const fc_nodes_count = self.forkChoice.getNodeCount();
 
-        self.module_logger.debug("cached states={d}, forkchoice nodes={d}", .{ states_count, fc_nodes_count });
-        self.module_logger.info(
+        self.logger.debug("cached states={d}, forkchoice nodes={d}", .{ states_count, fc_nodes_count });
+        self.logger.info(
             \\
             \\+===============================================================+
             \\  CHAIN STATUS: Current Slot: {d} | Head Slot: {d} | Behind: {d}
@@ -621,7 +621,7 @@ pub const BeamChain = struct {
             break :blk tree_visualizer.buildTreeVisualization(arena.allocator(), snapshot.nodes, tree_depth, null) catch "Tree visualization failed";
         };
         // Print forkchoice tree separate because when it gets big the logger skips the entire log
-        self.module_logger.info(
+        self.logger.info(
             \\  ForkChoice Tree:
             \\{s}
             \\
@@ -640,7 +640,7 @@ pub const BeamChain = struct {
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
 
-                self.module_logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{f} hasBlock={} from peer={s}{f}", .{
+                self.logger.debug("chain received gossip block for slot={d} blockroot=0x{x} proposer={d}{f} hasBlock={} from peer={s}{f}", .{
                     block.slot,
                     &block_root,
                     block.proposer_index,
@@ -658,7 +658,7 @@ pub const BeamChain = struct {
                     // onBlock would reject it with FutureSlot.  Queue the block and
                     // replay it from onInterval once the clock has advanced.
                     if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                        self.module_logger.debug(
+                        self.logger.debug(
                             "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                             .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                         );
@@ -672,13 +672,13 @@ pub const BeamChain = struct {
                         if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
                             try self.pending_blocks.append(self.allocator, cloned);
 
-                            self.module_logger.info(
+                            self.logger.info(
                                 "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                                 .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
                             );
                             return .{};
                         } else {
-                            self.module_logger.debug(
+                            self.logger.debug(
                                 //
                                 "chain already ticked while cloning block for queuing, skipping queuing and directly processing slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
                                 //
@@ -694,7 +694,7 @@ pub const BeamChain = struct {
                         // we will not catch and enqueue block for FutureSlot error because this error here means
                         // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
                         // clock skew or race between oninterval and block arrival
-                        self.module_logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
+                        self.logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
                             err,
@@ -714,7 +714,7 @@ pub const BeamChain = struct {
                         .missing_attestation_roots = missing_roots,
                     };
                 } else {
-                    self.module_logger.debug("skipping processing the already present block slot={d} blockroot=0x{x}", .{
+                    self.logger.debug("skipping processing the already present block slot={d} blockroot=0x{x}", .{
                         block.slot,
                         &block_root,
                     });
@@ -727,7 +727,7 @@ pub const BeamChain = struct {
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.module_logger.debug("chain received gossip attestation for subnet={d} slot={d} validator={d}{f} from peer={s}{f}", .{
+                self.logger.debug("chain received gossip attestation for subnet={d} slot={d} validator={d}{f} from peer={s}{f}", .{
                     signed_attestation.subnet_id,
                     slot,
                     validator_id,
@@ -744,7 +744,7 @@ pub const BeamChain = struct {
                     switch (err) {
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
                         else => {
-                            self.module_logger.warn("gossip attestation validation failed: {any}", .{err});
+                            self.logger.warn("gossip attestation validation failed: {any}", .{err});
                             return .{};
                         },
                     }
@@ -753,10 +753,10 @@ pub const BeamChain = struct {
                 // Process validated attestation
                 self.onGossipAttestation(signed_attestation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    self.module_logger.err("attestation processing error: {any}", .{err});
+                    self.logger.err("attestation processing error: {any}", .{err});
                     return err;
                 };
-                self.module_logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
@@ -765,14 +765,14 @@ pub const BeamChain = struct {
                 return .{};
             },
             .aggregation => |signed_aggregation| {
-                self.module_logger.debug("chain received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.debug("chain received gossip aggregation for slot={d} from peer={s}{any}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    self.module_logger.err("aggregation processing error: {any}", .{err});
+                    self.logger.err("aggregation processing error: {any}", .{err});
                     return err;
                 };
                 return .{};
@@ -831,7 +831,7 @@ pub const BeamChain = struct {
             });
 
             // 4. fc onattestations
-            self.module_logger.debug("processing attestations of block with root=0x{x} slot={d}", .{
+            self.logger.debug("processing attestations of block with root=0x{x} slot={d}", .{
                 &freshFcBlock.blockRoot,
                 block.slot,
             });
@@ -840,7 +840,7 @@ pub const BeamChain = struct {
             const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
 
             if (aggregated_attestations.len != signature_groups.len) {
-                self.module_logger.err(
+                self.logger.err(
                     "signature group count mismatch for block root=0x{x}: attestations={d} signature_groups={d}",
                     .{ &freshFcBlock.blockRoot, aggregated_attestations.len, signature_groups.len },
                 );
@@ -859,7 +859,7 @@ pub const BeamChain = struct {
 
                 if (validator_indices.items.len != participant_indices.items.len) {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                    self.module_logger.err(
+                    self.logger.err(
                         "attestation signature mismatch index={d} validators={d} participants={d}",
                         .{ index, validator_indices.items.len, participant_indices.items.len },
                     );
@@ -879,7 +879,7 @@ pub const BeamChain = struct {
                             try missing_roots.append(self.allocator, attestation.data.head.root);
                         }
 
-                        self.module_logger.err("invalid attestation in block: validator={d} error={any}", .{
+                        self.logger.err("invalid attestation in block: validator={d} error={any}", .{
                             validator_index,
                             e,
                         });
@@ -888,7 +888,7 @@ pub const BeamChain = struct {
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        self.module_logger.err(
+                        self.logger.err(
                             "failed to apply block attestation to forkchoice tracker: validator={d} slot={d} error={any}",
                             .{ validator_index, attestation.data.slot, e },
                         );
@@ -905,7 +905,7 @@ pub const BeamChain = struct {
                     validator_ids[i] = @intCast(vi);
                 }
                 self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
-                    self.module_logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
+                    self.logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
                 };
             }
 
@@ -925,21 +925,21 @@ pub const BeamChain = struct {
         };
 
         self.forkChoice.onSignedAttestation(signed_proposer_attestation) catch |e| {
-            self.module_logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
+            self.logger.err("error processing proposer attestation={f} error={any}", .{ signed_proposer_attestation, e });
         };
 
         const processing_time = onblock_timer.observe();
 
         // 7. Save block and state to database and confirm the block in forkchoice
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
-            self.module_logger.err("failed to update block database for block root=0x{x}: {any}", .{
+            self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
                 err,
             });
         };
         try self.forkChoice.confirmBlock(block_root);
 
-        self.module_logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={any} computed state={any})", .{
+        self.logger.info("processed block with root=0x{x} slot={d} processing time={d} (computed root={any} computed state={any})", .{
             &fcBlock.blockRoot,
             block.slot,
             processing_time,
@@ -956,11 +956,11 @@ pub const BeamChain = struct {
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
             event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                self.module_logger.warn("failed to broadcast head event: {any}", .{err});
+                self.logger.warn("failed to broadcast head event: {any}", .{err});
                 chain_event.deinit(self.allocator);
             };
         } else |err| {
-            self.module_logger.warn("failed to create head event: {any}", .{err});
+            self.logger.warn("failed to create head event: {any}", .{err});
         }
 
         const latest_justified = self.forkChoice.getLatestJustified();
@@ -972,12 +972,12 @@ pub const BeamChain = struct {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("failed to broadcast justification event: {any}", .{err});
+                    self.logger.warn("failed to broadcast justification event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_justified = latest_justified;
             } else |err| {
-                self.module_logger.warn("failed to create justification event: {any}", .{err});
+                self.logger.warn("failed to create justification event: {any}", .{err});
             }
         }
 
@@ -987,12 +987,12 @@ pub const BeamChain = struct {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.module_logger.warn("failed to broadcast finalization event: {any}", .{err});
+                    self.logger.warn("failed to broadcast finalization event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
                 self.last_emitted_finalized = latest_finalized;
             } else |err| {
-                self.module_logger.warn("failed to create finalization event: {any}", .{err});
+                self.logger.warn("failed to create finalization event: {any}", .{err});
             }
         }
 
@@ -1002,7 +1002,7 @@ pub const BeamChain = struct {
             self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
                 // Record failed finalization attempt
                 zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
-                self.module_logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                self.logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
                     last_emitted_finalized.slot,
                     latest_finalized.slot,
                     err,
@@ -1011,7 +1011,7 @@ pub const BeamChain = struct {
 
             // Prune stale attestation data when finalization advances
             self.forkChoice.pruneStaleAttestationData(latest_finalized.slot) catch |err| {
-                self.module_logger.warn("failed to prune stale attestation data: {any}", .{err});
+                self.logger.warn("failed to prune stale attestation data: {any}", .{err});
             };
 
             // Prune cached blocks at or before finalized slot
@@ -1019,7 +1019,7 @@ pub const BeamChain = struct {
                 if (self.prune_cached_blocks_ctx) |ctx| {
                     const pruned = prune_fn(ctx, latest_finalized);
                     if (pruned > 0) {
-                        self.module_logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
+                        self.logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
                     }
                 }
             }
@@ -1027,7 +1027,7 @@ pub const BeamChain = struct {
 
         const states_count_after_block = self.states.count();
         const fc_nodes_count_after_block = self.forkChoice.getNodeCount();
-        self.module_logger.info("completed on block followup with states_count={d} fc_nodes_count={d}", .{
+        self.logger.info("completed on block followup with states_count={d} fc_nodes_count={d}", .{
             states_count_after_block,
             fc_nodes_count_after_block,
         });
@@ -1071,7 +1071,7 @@ pub const BeamChain = struct {
     ///                    All states in canonical_blocks are kept, all others are pruned
     fn pruneStates(self: *Self, roots: []types.Root, pruneType: []const u8) usize {
         const states_count_before = self.states.count();
-        self.module_logger.debug("pruning for {s} (states_count={d}, roots={d})", .{
+        self.logger.debug("pruning for {s} (states_count={d}, roots={d})", .{
             pruneType,
             states_count_before,
             roots.len,
@@ -1084,7 +1084,7 @@ pub const BeamChain = struct {
                 const state_ptr = entry.value;
                 state_ptr.deinit();
                 self.allocator.destroy(state_ptr);
-                self.module_logger.debug("pruned state for root 0x{x}", .{
+                self.logger.debug("pruned state for root 0x{x}", .{
                     &root,
                 });
             }
@@ -1092,7 +1092,7 @@ pub const BeamChain = struct {
 
         const states_count_after = self.states.count();
         const pruned_count = states_count_before - states_count_after;
-        self.module_logger.debug("pruning completed for {s} removed {d} states (states: {d} -> {d})", .{
+        self.logger.debug("pruning completed for {s} removed {d} states (states: {d} -> {d})", .{
             pruneType,
             pruned_count,
             states_count_before,
@@ -1106,7 +1106,7 @@ pub const BeamChain = struct {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
-        self.module_logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
+        self.logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
 
         // 1. Do canonoical analysis to segment forkchoice
         var canonical_view = std.AutoHashMap(types.Root, void).init(self.allocator);
@@ -1122,7 +1122,7 @@ pub const BeamChain = struct {
 
         // finalized_ancestor_roots has the previous finalized included
         const newly_finalized_count = finalized_roots.len - 1;
-        self.module_logger.info("finalization canonicality analysis (previousFinalized slot={d} to latestFinalized slot={d}): newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
+        self.logger.info("finalization canonicality analysis (previousFinalized slot={d} to latestFinalized slot={d}): newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
             previousFinalized.slot,
             //
             latestFinalized.slot,
@@ -1136,7 +1136,7 @@ pub const BeamChain = struct {
         for (finalized_roots) |root| {
             const slot = self.forkChoice.getBlockSlot(root) orelse return error.FinalizedBlockNotInForkChoice;
             batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot, root);
-            self.module_logger.debug("added block 0x{x} at slot {d} to finalized index", .{
+            self.logger.debug("added block 0x{x} at slot {d} to finalized index", .{
                 &root,
                 slot,
             });
@@ -1155,7 +1155,7 @@ pub const BeamChain = struct {
         _ = self.pruneStates(finalized_roots[1..finalized_roots.len], "finalized ancestors");
         _ = self.pruneStates(non_canonical_roots, "finalized non canonical");
         const pruned_count = states_count_before - self.states.count();
-        self.module_logger.info("state pruning completed (slots latestFinalized={d} to latestFinalized={d}) removed {d} states", .{
+        self.logger.info("state pruning completed (slots latestFinalized={d} to latestFinalized={d}) removed {d} states", .{
             previousFinalized.slot,
             latestFinalized.slot,
             pruned_count,
@@ -1182,7 +1182,7 @@ pub const BeamChain = struct {
         //             }
         //         }
         //         if (slot_orphaned_count > 0) {
-        //             self.module_logger.debug("Removed {d} orphaned block at slot {d} from database", .{
+        //             self.logger.debug("Removed {d} orphaned block at slot {d} from database", .{
         //                 slot_orphaned_count,
         //                 slot,
         //             });
@@ -1190,7 +1190,7 @@ pub const BeamChain = struct {
 
         //         // Remove the unfinalized slot index
         //         batch.deleteUnfinalizedSlotIndexFromBatch(database.DbUnfinalizedSlotsNamespace, slot);
-        //         self.module_logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
+        //         self.logger.debug("Removed {d} unfinalized index for slot {d}", .{ unfinalized_blockroots.len, slot });
         //     }
         // }
 
@@ -1200,7 +1200,7 @@ pub const BeamChain = struct {
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
 
-        self.module_logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
+        self.logger.debug("finalization advanced  previousFinalized slot={d} to latestFinalized slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
     }
 
     /// Validate incoming block before expensive processing.
@@ -1225,7 +1225,7 @@ pub const BeamChain = struct {
         // this can also happen because of race conditions between oninterval and block arrival
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
-            self.module_logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
+            self.logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
                 block.slot,
                 current_slot + max_future_tolerance,
                 self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
@@ -1235,7 +1235,7 @@ pub const BeamChain = struct {
 
         // 2. Pre-finalized slot check - reject blocks before finalized slot
         if (block.slot < finalized_slot) {
-            self.module_logger.debug("block validation failed: pre-finalized slot {d} < finalized {d}", .{
+            self.logger.debug("block validation failed: pre-finalized slot {d} < finalized {d}", .{
                 block.slot,
                 finalized_slot,
             });
@@ -1246,7 +1246,7 @@ pub const BeamChain = struct {
         // This is a fast pre-check; actual proposer validity is verified during signature verification
         // We use VALIDATOR_REGISTRY_LIMIT as the upper bound since the validator set can grow beyond genesis
         if (block.proposer_index >= params.VALIDATOR_REGISTRY_LIMIT) {
-            self.module_logger.debug("block validation failed: proposer_index {d} >= VALIDATOR_REGISTRY_LIMIT {d}", .{
+            self.logger.debug("block validation failed: proposer_index {d} >= VALIDATOR_REGISTRY_LIMIT {d}", .{
                 block.proposer_index,
                 params.VALIDATOR_REGISTRY_LIMIT,
             });
@@ -1262,7 +1262,7 @@ pub const BeamChain = struct {
 
         // 5. Slot ordering check - block slot must be greater than parent slot
         if (block.slot <= parent_block.?.slot) {
-            self.module_logger.debug("block validation failed: slot {d} <= parent slot {d}", .{
+            self.logger.debug("block validation failed: slot {d} <= parent slot {d}", .{
                 block.slot,
                 parent_block.?.slot,
             });
@@ -1284,14 +1284,14 @@ pub const BeamChain = struct {
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
         const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
-            self.module_logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
+            self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
                 &data.source.root,
             });
             return AttestationValidationError.UnknownSourceBlock;
         };
 
         const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
+            self.logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
                 data.target.slot,
                 &data.target.root,
             });
@@ -1299,7 +1299,7 @@ pub const BeamChain = struct {
         };
 
         const head_block = self.forkChoice.getProtoNode(data.head.root) orelse {
-            self.module_logger.debug("attestation validation failed: unknown head block slot={d} root=0x{x}", .{
+            self.logger.debug("attestation validation failed: unknown head block slot={d} root=0x{x}", .{
                 data.head.slot,
                 &data.head.root,
             });
@@ -1309,7 +1309,7 @@ pub const BeamChain = struct {
 
         // 2. Validate slot relationships
         if (source_block.slot > target_block.slot) {
-            self.module_logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
+            self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
                 source_block.slot,
                 target_block.slot,
             });
@@ -1318,7 +1318,7 @@ pub const BeamChain = struct {
 
         //    This corresponds to leanSpec's: assert attestation.source.slot <= attestation.target.slot
         if (data.source.slot > data.target.slot) {
-            self.module_logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
+            self.logger.debug("attestation validation failed: source checkpoint slot {d} > target checkpoint slot {d}", .{
                 data.source.slot,
                 data.target.slot,
             });
@@ -1327,7 +1327,7 @@ pub const BeamChain = struct {
 
         // 3. Validate checkpoint slots match block slots
         if (source_block.slot != data.source.slot) {
-            self.module_logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
+            self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
                 source_block.slot,
                 data.source.slot,
             });
@@ -1336,7 +1336,7 @@ pub const BeamChain = struct {
 
         //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
         if (target_block.slot != data.target.slot) {
-            self.module_logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
+            self.logger.debug("attestation validation failed: target block slot {d} != target checkpoint slot {d}", .{
                 target_block.slot,
                 data.target.slot,
             });
@@ -1355,14 +1355,14 @@ pub const BeamChain = struct {
             current_slot; // Gossip attestations: no future slots allowed
 
         if (data.slot > max_allowed_slot) {
-            self.module_logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
+            self.logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
                 data.slot,
                 max_allowed_slot,
                 is_from_block,
             });
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-        self.module_logger.debug("attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
+        self.logger.debug("attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
             attestation.validator_id,
             data.slot,
             data.source.slot,
@@ -1408,7 +1408,7 @@ pub const BeamChain = struct {
                 .data = signedAggregation.data,
             };
             self.forkChoice.onAttestation(attestation, false) catch |err| {
-                self.module_logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
                     validator_id, err,
                 });
             };
@@ -1464,15 +1464,15 @@ pub const BeamChain = struct {
         switch (sync_status) {
             .synced => {},
             .fc_initing => {
-                self.module_logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
+                self.logger.warn("skipping aggregation production for slot={d}: forkchoice initializing", .{slot});
                 return null;
             },
             .no_peers => {
-                self.module_logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
+                self.logger.warn("skipping aggregation production for slot={d}: no peers connected", .{slot});
                 return null;
             },
             .behind_peers => |info| {
-                self.module_logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
+                self.logger.warn("skipping aggregation production for slot={d}: behind peers (head_slot={d}, finalized_slot={d}, max_peer_finalized_slot={d})", .{
                     slot,
                     info.head_slot,
                     info.finalized_slot,
@@ -1483,7 +1483,7 @@ pub const BeamChain = struct {
         }
 
         const aggregations = self.aggregateCommitteeSignatures() catch |err| {
-            self.module_logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
+            self.logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
             return null;
         };
 
@@ -1525,20 +1525,20 @@ pub const BeamChain = struct {
 
         // Fallback: try to load from database
         const state_ptr = self.allocator.create(types.BeamState) catch |err| {
-            self.module_logger.warn("failed to allocate memory for finalized state: {any}", .{err});
+            self.logger.warn("failed to allocate memory for finalized state: {any}", .{err});
             return null;
         };
 
         self.db.loadLatestFinalizedState(state_ptr) catch |err| {
             self.allocator.destroy(state_ptr);
-            self.module_logger.warn("finalized state not available in database: {any}", .{err});
+            self.logger.warn("finalized state not available in database: {any}", .{err});
             return null;
         };
 
         // Cache in separate field (not in states map to avoid affecting pruning)
         self.cached_finalized_state = state_ptr;
 
-        self.module_logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
+        self.logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
         return state_ptr;
     }
 
