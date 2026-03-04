@@ -902,12 +902,18 @@ pub const BeamChain = struct {
 
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
-            }
 
-            // Store aggregated payloads from the block before updating head
-            self.storeAggregatedPayloads(&signedBlock) catch |err| {
-                self.module_logger.warn("failed to store aggregated payloads: {any}", .{err});
-            };
+                if (signature_proof) |proof| {
+                    var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+                    defer self.allocator.free(validator_ids);
+                    for (validator_indices.items, 0..) |vi, i| {
+                        validator_ids[i] = @intCast(vi);
+                    }
+                    self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof.*, true) catch |e| {
+                        self.module_logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
+                    };
+                }
+            }
 
             // 5. fc update head
             _ = try self.forkChoice.updateHead();
@@ -1034,33 +1040,6 @@ pub const BeamChain = struct {
 
         zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
-    }
-
-    /// Store aggregated signature payloads from a block for future block building
-    fn storeAggregatedPayloads(self: *Self, signedBlock: *const types.SignedBlockWithAttestation) !void {
-        const block = signedBlock.message.block;
-        const aggregated_attestations = block.body.attestations.constSlice();
-        const signature_groups = signedBlock.signature.attestation_signatures.constSlice();
-
-        for (aggregated_attestations, 0..) |aggregated_attestation, index| {
-            const signature_proof = if (index < signature_groups.len)
-                &signature_groups[index]
-            else
-                continue;
-
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
-            defer validator_indices.deinit(self.allocator);
-
-            var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-            defer self.allocator.free(validator_ids);
-            for (validator_indices.items, 0..) |vi, i| {
-                validator_ids[i] = @intCast(vi);
-            }
-
-            self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
-                self.module_logger.warn("failed to store aggregated payloads for attestation index={d}: {any}", .{ index, e });
-            };
-        }
     }
 
     /// Update block database with block, state, and slot indices
