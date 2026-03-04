@@ -897,6 +897,7 @@ pub const BeamChain = struct {
                     zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
 
+                // store the aggregated payloads in known
                 var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
                 defer self.allocator.free(validator_ids);
                 for (validator_indices.items, 0..) |vi, i| {
