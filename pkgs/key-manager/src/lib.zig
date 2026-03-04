@@ -56,7 +56,7 @@ pub const KeyManager = struct {
     keys: std.AutoHashMap(usize, xmss.KeyPair),
     allocator: Allocator,
     /// Tracks which keypairs are owned (allocated by us) vs borrowed (cached).
-owned_keys: std.AutoHashMap(usize, void),
+    owned_keys: std.AutoHashMap(usize, void),
 
     const Self = @This();
 
