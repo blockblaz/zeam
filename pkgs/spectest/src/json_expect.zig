@@ -243,6 +243,23 @@ pub fn expectArrayValue(
     };
 }
 
+pub fn expectArrayField(
+    comptime FixtureError: type,
+    obj: std.json.ObjectMap,
+    field_names: []const []const u8,
+    context: Context,
+    label: []const u8,
+) FixtureError!std.json.Array {
+    const value = getField(obj, field_names) orelse {
+        std.debug.print(
+            "fixture {s} case {s}{}: missing field {s}\n",
+            .{ context.fixture_label, context.case_name, context.formatStep(), label },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    return expectArrayValue(FixtureError, value, context, label);
+}
+
 pub fn appendBytesDataField(
     comptime FixtureError: type,
     comptime T: type,
