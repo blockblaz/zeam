@@ -1192,87 +1192,70 @@ pub const ForkChoice = struct {
         try self.attestations.put(validator_id, attestation_tracker);
     }
 
-    /// Store an aggregated signature proof for a validator from a block.
-    /// This allows future block builders to reuse this aggregation.
+    /// Store aggregated signature proofs for multiple validators.
+    /// If is_from_block, stores in latest_known_aggregated_payloads (immediately available for block building).
+    /// Otherwise, stores in latest_new_aggregated_payloads (promoted to known via periodic ticks).
+    /// For gossip attestations, also updates fork choice attestation trackers.
     pub fn storeAggregatedPayload(
         self: *Self,
-        validator_id: types.ValidatorIndex,
+        validator_ids: []const types.ValidatorIndex,
         attestation_data: *const types.AttestationData,
         proof: types.AggregatedSignatureProof,
+        is_from_block: bool,
     ) !void {
         const data_root = try attestation_data.sszRoot(self.allocator);
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
-        try self.attestation_data_by_root.put(data_root, attestation_data.*);
-        const sig_key = SignatureKey{
-            .validator_id = validator_id,
-            .data_root = data_root,
-        };
-
-        // Get or create the list for this key
-        const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
+        if (!is_from_block) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
         }
-        try gop.value_ptr.append(self.allocator, .{
-            .slot = attestation_data.slot,
-            .proof = proof,
-        });
-    }
-
-    fn onGossipAggregatedAttestationUnlocked(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
-        const data_root = try signed_aggregation.data.sszRoot(self.allocator);
-
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&signed_aggregation.proof.participants, self.allocator);
-        defer validator_indices.deinit(self.allocator);
 
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
 
-            try self.attestation_data_by_root.put(data_root, signed_aggregation.data);
+            try self.attestation_data_by_root.put(data_root, attestation_data.*);
 
-            for (validator_indices.items) |validator_index| {
+            const target_map = if (is_from_block)
+                &self.latest_known_aggregated_payloads
+            else
+                &self.latest_new_aggregated_payloads;
+
+            for (validator_ids) |validator_id| {
                 const sig_key = SignatureKey{
-                    .validator_id = @intCast(validator_index),
+                    .validator_id = validator_id,
                     .data_root = data_root,
                 };
-                const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
+                const gop = try target_map.getOrPut(sig_key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .empty;
                 }
 
                 var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, signed_aggregation.proof, &cloned_proof);
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
                 errdefer cloned_proof.deinit();
 
                 try gop.value_ptr.append(self.allocator, .{
-                    .slot = signed_aggregation.data.slot,
+                    .slot = attestation_data.slot,
                     .proof = cloned_proof,
                 });
             }
         }
 
-        // Update attestation tracker for each validator so fork choice sees this vote
-        for (validator_indices.items) |validator_index| {
-            const attestation = types.Attestation{
-                .validator_id = @intCast(validator_index),
-                .data = signed_aggregation.data,
-            };
-            self.onAttestationUnlocked(attestation, false) catch |err| {
-                self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
-                    validator_index, err,
-                });
-            };
+        // Update attestation trackers for gossip attestations so fork choice sees these votes
+        if (!is_from_block) {
+            for (validator_ids) |validator_id| {
+                const attestation = types.Attestation{
+                    .validator_id = validator_id,
+                    .data = attestation_data.*,
+                };
+                self.onAttestationUnlocked(attestation, false) catch |err| {
+                    self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                        validator_id, err,
+                    });
+                };
+            }
         }
-    }
-
-    pub fn onGossipAggregatedAttestation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.onGossipAggregatedAttestationUnlocked(signed_aggregation);
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
@@ -2353,19 +2336,12 @@ fn stageAggregatedAttestation(
     signed_attestation: types.SignedAttestation,
 ) !void {
     var proof = try types.AggregatedSignatureProof.init(allocator);
-    var proof_needs_deinit = true;
-    errdefer if (proof_needs_deinit) proof.deinit();
+    errdefer proof.deinit();
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
-    var signed_aggregation = types.SignedAggregatedAttestation{
-        .data = signed_attestation.message,
-        .proof = proof,
-    };
-    proof_needs_deinit = false;
-    defer signed_aggregation.proof.deinit();
-
-    try fork_choice.onGossipAggregatedAttestation(signed_aggregation);
+    const validator_ids = [_]types.ValidatorIndex{signed_attestation.validator_id};
+    try fork_choice.storeAggregatedPayload(&validator_ids, &signed_attestation.message, proof, false);
 }
 
 // Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.

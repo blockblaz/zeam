@@ -1051,21 +1051,15 @@ pub const BeamChain = struct {
             var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
             defer validator_indices.deinit(self.allocator);
 
-            for (validator_indices.items) |validator_index| {
-                const validator_id: types.ValidatorIndex = @intCast(validator_index);
-
-                // Clone the proof since we need to store it and the block data may be freed
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                types.sszClone(self.allocator, types.AggregatedSignatureProof, signature_proof.*, &cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to clone aggregated proof for validator={d}: {any}", .{ validator_index, e });
-                    continue;
-                };
-
-                self.forkChoice.storeAggregatedPayload(validator_id, &aggregated_attestation.data, cloned_proof) catch |e| {
-                    self.module_logger.warn("failed to store aggregated payload for validator={d}: {any}", .{ validator_index, e });
-                    cloned_proof.deinit();
-                };
+            var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+            defer self.allocator.free(validator_ids);
+            for (validator_indices.items, 0..) |vi, i| {
+                validator_ids[i] = @intCast(vi);
             }
+
+            self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
+                self.module_logger.warn("failed to store aggregated payloads for attestation index={d}: {any}", .{ index, e });
+            };
         }
     }
 
@@ -1424,7 +1418,17 @@ pub const BeamChain = struct {
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
         try self.verifyAggregatedAttestation(signedAggregation);
-        return self.forkChoice.onGossipAggregatedAttestation(signedAggregation);
+
+        var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
+        defer validator_indices.deinit(self.allocator);
+
+        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+        defer self.allocator.free(validator_ids);
+        for (validator_indices.items, 0..) |vi, i| {
+            validator_ids[i] = @intCast(vi);
+        }
+
+        try self.forkChoice.storeAggregatedPayload(validator_ids, &signedAggregation.data, signedAggregation.proof, false);
     }
 
     fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
