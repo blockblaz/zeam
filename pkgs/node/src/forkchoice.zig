@@ -2313,7 +2313,7 @@ fn stageAggregatedAttestation(
     fork_choice: *ForkChoice,
     signed_attestation: types.SignedAttestation,
 ) !void {
-    try fork_choice.onSignedAttestation(signed_attestation.message);
+    try fork_choice.onSignedAttestation(signed_attestation);
 
     var proof = try types.AggregatedSignatureProof.init(allocator);
     errdefer proof.deinit();
