@@ -2,6 +2,7 @@ const std = @import("std");
 const enr = @import("enr");
 const build_options = @import("build_options");
 const simargs = @import("simargs");
+const xmss = @import("@zeam/xmss");
 
 pub const max_enr_txt_size = enr.max_enr_txt_size;
 
@@ -11,9 +12,11 @@ const ToolsArgs = struct {
 
     __commands__: union(enum) {
         enrgen: ENRGenCmd,
+        keygen: KeyGenCmd,
 
         pub const __messages__ = .{
             .enrgen = "Generate a new ENR (Ethereum Node Record)",
+            .keygen = "Generate pre-computed XMSS test validator keys",
         };
     },
 
@@ -48,6 +51,27 @@ const ToolsArgs = struct {
             .quic = "QUIC port for discovery",
             .out = "Output file path (prints to stdout if not specified)",
             .help = "Show help information for the enrgen command",
+        };
+    };
+
+    const KeyGenCmd = struct {
+        @"num-validators": usize = 32,
+        @"num-active-epochs": usize = 1000,
+        @"output-dir": []const u8 = "test-keys",
+        help: bool = false,
+
+        pub const __shorts__ = .{
+            .@"num-validators" = .n,
+            .@"num-active-epochs" = .e,
+            .@"output-dir" = .o,
+            .help = .h,
+        };
+
+        pub const __messages__ = .{
+            .@"num-validators" = "Number of validator key pairs to generate (default: 32)",
+            .@"num-active-epochs" = "Number of active epochs for each key (default: 1000)",
+            .@"output-dir" = "Output directory for generated keys (default: test-keys)",
+            .help = "Show help information for the keygen command",
         };
     };
 };
@@ -86,6 +110,12 @@ pub fn main() !void {
     defer enr.deinitGlobalSecp256k1Ctx();
 
     switch (opts.args.__commands__) {
+        .keygen => |cmd| {
+            handleKeyGen(allocator, cmd) catch |err| {
+                std.debug.print("Error generating keys: {}\n", .{err});
+                std.process.exit(1);
+            };
+        },
         .enrgen => |cmd| {
             handleENRGen(cmd) catch |err| switch (err) {
                 error.EmptySecretKey => {
@@ -111,6 +141,119 @@ pub fn main() !void {
             };
         },
     }
+}
+
+fn handleKeyGen(allocator: std.mem.Allocator, cmd: ToolsArgs.KeyGenCmd) !void {
+    const num_validators = cmd.@"num-validators";
+    const num_active_epochs = cmd.@"num-active-epochs";
+    const output_dir = cmd.@"output-dir";
+
+    std.debug.print("Generating {d} validator keys with {d} active epochs...\n", .{ num_validators, num_active_epochs });
+    std.debug.print("Output directory: {s}\n", .{output_dir});
+
+    // Create output directories
+    const hash_sig_dir = try std.fmt.allocPrint(allocator, "{s}/hash-sig-keys", .{output_dir});
+    defer allocator.free(hash_sig_dir);
+
+    std.fs.cwd().makePath(hash_sig_dir) catch |err| {
+        std.debug.print("Error creating directory {s}: {}\n", .{ hash_sig_dir, err });
+        return err;
+    };
+
+    // Allocate buffers for serialization
+    // Private keys can be very large (~5-10MB for XMSS)
+    const sk_buffer = try allocator.alloc(u8, 1024 * 1024 * 20); // 20MB
+    defer allocator.free(sk_buffer);
+    var pk_buffer: [256]u8 = undefined;
+
+    // Open manifest file
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/validator-keys-manifest.yaml", .{output_dir});
+    defer allocator.free(manifest_path);
+    const manifest_file = try std.fs.cwd().createFile(manifest_path, .{});
+    defer manifest_file.close();
+
+    var manifest_buf: [4096]u8 = undefined;
+    var manifest_writer = manifest_file.writer(&manifest_buf);
+
+    // Write manifest header
+    try manifest_writer.interface.print(
+        \\key_scheme: SIGTopLevelTargetSumLifetime32Dim64Base8
+        \\hash_function: Poseidon2
+        \\encoding: TargetSum
+        \\lifetime: {d}
+        \\num_active_epochs: {d}
+        \\num_validators: {d}
+        \\validators:
+        \\
+    , .{ num_active_epochs, num_active_epochs, num_validators });
+
+    for (0..num_validators) |i| {
+        std.debug.print("  Generating validator {d}/{d}...\n", .{ i + 1, num_validators });
+
+        // Generate keypair with deterministic seed
+        const seed = try std.fmt.allocPrint(allocator, "test_validator_{d}", .{i});
+        defer allocator.free(seed);
+
+        var keypair = try xmss.KeyPair.generate(allocator, seed, 0, num_active_epochs);
+        defer keypair.deinit();
+
+        // Serialize public key
+        const pk_len = try keypair.pubkeyToBytes(&pk_buffer);
+
+        // Serialize private key
+        const sk_len = try keypair.privkeyToBytes(sk_buffer);
+
+        std.debug.print("    PK size: {d} bytes, SK size: {d} bytes\n", .{ pk_len, sk_len });
+
+        // Write private key file
+        const sk_filename = try std.fmt.allocPrint(allocator, "validator_{d}_sk.ssz", .{i});
+        defer allocator.free(sk_filename);
+        const sk_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hash_sig_dir, sk_filename });
+        defer allocator.free(sk_path);
+
+        const sk_file = try std.fs.cwd().createFile(sk_path, .{});
+        defer sk_file.close();
+        var sk_write_buf: [65536]u8 = undefined;
+        var sk_writer = sk_file.writer(&sk_write_buf);
+        try sk_writer.interface.writeAll(sk_buffer[0..sk_len]);
+        try sk_writer.interface.flush();
+
+        // Write public key file
+        const pk_filename = try std.fmt.allocPrint(allocator, "validator_{d}_pk.ssz", .{i});
+        defer allocator.free(pk_filename);
+        const pk_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hash_sig_dir, pk_filename });
+        defer allocator.free(pk_path);
+
+        const pk_file = try std.fs.cwd().createFile(pk_path, .{});
+        defer pk_file.close();
+        var pk_write_buf: [4096]u8 = undefined;
+        var pk_writer = pk_file.writer(&pk_write_buf);
+        try pk_writer.interface.writeAll(pk_buffer[0..pk_len]);
+        try pk_writer.interface.flush();
+
+        // Write manifest entry with pubkey as hex
+        // Format pubkey bytes as hex string
+        var hex_buf: [512]u8 = undefined;
+        const hex_len = pk_len * 2;
+        for (pk_buffer[0..pk_len], 0..) |byte, j| {
+            const high = byte >> 4;
+            const low = byte & 0x0f;
+            hex_buf[j * 2] = if (high < 10) '0' + high else 'a' + high - 10;
+            hex_buf[j * 2 + 1] = if (low < 10) '0' + low else 'a' + low - 10;
+        }
+
+        try manifest_writer.interface.print(
+            \\- index: {d}
+            \\  pubkey_hex: "0x{s}"
+            \\  privkey_file: {s}
+            \\
+        , .{ i, hex_buf[0..hex_len], sk_filename });
+    }
+
+    try manifest_writer.interface.flush();
+
+    std.debug.print("\nDone! Generated {d} keys in {s}/\n", .{ num_validators, output_dir });
+    std.debug.print("Manifest written to {s}\n", .{manifest_path});
 }
 
 fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {

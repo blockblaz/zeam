@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -82,6 +84,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -135,6 +139,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -261,6 +267,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -299,6 +307,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
+        submodules: recursive
         fetch-depth: 0  # Fetch full history to get git commit info
 
     - name: Set up Zig
