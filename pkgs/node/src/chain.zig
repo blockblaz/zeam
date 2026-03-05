@@ -384,9 +384,10 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        // Use the two-phase aggregation algorithm:
-        // Phase 1: Collect individual signatures from gossip_signatures
-        // Phase 2: Fallback to latest_known_aggregated_payloads using greedy set-cover
+        // Use recursive aggregation algorithm:
+        // Step 1: Collect individual gossip signatures
+        // Step 2: Greedy child proof selection from known payloads
+        // Step 3: Recursive aggregate — children first, gossip sigs last
         var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
@@ -899,12 +900,7 @@ pub const BeamChain = struct {
                 }
 
                 // store the aggregated payloads in known
-                var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-                defer self.allocator.free(validator_ids);
-                for (validator_indices.items, 0..) |vi, i| {
-                    validator_ids[i] = @intCast(vi);
-                }
-                self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
+                self.forkChoice.storeAggregatedPayload(&aggregated_attestation.data, signature_proof.*, true) catch |e| {
                     self.logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
                 };
             }
@@ -1395,14 +1391,9 @@ pub const BeamChain = struct {
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-        defer self.allocator.free(validator_ids);
-        for (validator_indices.items, 0..) |vi, i| {
-            validator_ids[i] = @intCast(vi);
-        }
-
         // Update attestation trackers for gossip attestations so fork choice sees these votes
-        for (validator_ids) |validator_id| {
+        for (validator_indices.items) |vi| {
+            const validator_id: types.ValidatorIndex = @intCast(vi);
             const attestation = types.Attestation{
                 .validator_id = validator_id,
                 .data = signedAggregation.data,
@@ -1414,7 +1405,7 @@ pub const BeamChain = struct {
             };
         }
 
-        try self.forkChoice.storeAggregatedPayload(validator_ids, &signedAggregation.data, signedAggregation.proof, false);
+        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
     fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
@@ -1450,10 +1441,10 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn aggregateCommitteeSignatures(self: *Self) ![]types.SignedAggregatedAttestation {
+    pub fn aggregateCommitteeSignaturesAndPayloads(self: *Self) ![]types.SignedAggregatedAttestation {
         const head_root = self.forkChoice.head.blockRoot;
         const state = self.states.get(head_root) orelse return error.MissingState;
-        return self.forkChoice.aggregateCommitteeSignatures(state);
+        return self.forkChoice.aggregateCommitteeSignaturesAndPayloads(state);
     }
 
     pub fn maybeAggregateCommitteeSignaturesOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
@@ -1482,7 +1473,7 @@ pub const BeamChain = struct {
             },
         }
 
-        const aggregations = self.aggregateCommitteeSignatures() catch |err| {
+        const aggregations = self.aggregateCommitteeSignaturesAndPayloads() catch |err| {
             self.logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
             return null;
         };
