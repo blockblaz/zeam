@@ -769,19 +769,7 @@ fn processBlockStep(
             }
         }
 
-        var validator_ids = ctx.allocator.alloc(types.ValidatorIndex, indices.items.len) catch |err| {
-            std.debug.print(
-                "fixture {s} case {s}{any}: failed to allocate validator ids ({s})\n",
-                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-            );
-            return FixtureError.InvalidFixture;
-        };
-        defer ctx.allocator.free(validator_ids);
-        for (indices.items, 0..) |vi, i| {
-            validator_ids[i] = @intCast(vi);
-        }
-
-        ctx.fork_choice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof_template, true) catch |err| {
+        ctx.fork_choice.storeAggregatedPayload(&aggregated_attestation.data, proof_template, true) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{any}: failed to store aggregated payload ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
@@ -839,11 +827,7 @@ fn processBlockStep(
         return FixtureError.InvalidFixture;
     };
 
-    const sig_key = types.SignatureKey{
-        .validator_id = proposer_attestation.validator_id,
-        .data_root = proposer_data_root,
-    };
-    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(sig_key);
+    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(proposer_data_root);
     if (!gop.found_existing) {
         gop.value_ptr.* = .empty;
     }
