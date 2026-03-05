@@ -212,10 +212,21 @@ pub const Node = struct {
         // Fall back to database/genesis if checkpoint sync was not attempted or failed
         if (!checkpoint_sync_succeeded) {
             // Try to load the latest finalized state from the database, fallback to genesis
-            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
-                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+            if (db.loadLatestFinalizedState(self.anchor_state)) {
+                self.logger.info("recovered finalized state from database at slot {d}", .{self.anchor_state.slot});
+                // Verify the loaded state's genesis time matches our config
+                if (self.anchor_state.config.genesis_time != chain_config.genesis.genesis_time) {
+                    self.logger.warn("database state genesis time mismatch (db={d}, config={d}), falling back to genesis", .{
+                        self.anchor_state.config.genesis_time,
+                        chain_config.genesis.genesis_time,
+                    });
+                    self.anchor_state.deinit();
+                    try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+                }
+            } else |err| {
+                self.logger.warn("could not load finalized state from database ({any}), starting from genesis", .{err});
                 try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-            };
+            }
         }
         errdefer self.anchor_state.deinit();
 
