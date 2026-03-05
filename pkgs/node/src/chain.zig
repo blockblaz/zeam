@@ -410,7 +410,7 @@ pub const BeamChain = struct {
             self.forkChoice.signatures_mutex.lock();
             defer self.forkChoice.signatures_mutex.unlock();
 
-            const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
+            const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
             try aggregation.computeAggregatedSignatures(
                 attestations,
                 &pre_state.validators,

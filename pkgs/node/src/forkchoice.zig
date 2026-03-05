@@ -877,6 +877,9 @@ pub const ForkChoice = struct {
                     source_list.* = .empty;
                 }
                 self.latest_new_aggregated_payloads.clearAndFree();
+                // Update fork-choice store gauges after promotion
+                zeam_metrics.metrics.lean_latest_known_aggregated_payloads.set(@intCast(self.latest_known_aggregated_payloads.count()));
+                zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(self.latest_new_aggregated_payloads.count()));
             }
         }
 
@@ -1136,6 +1139,7 @@ pub const ForkChoice = struct {
                 .slot = attestation_slot,
                 .signature = signed_attestation.signature,
             });
+            zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(self.gossip_signatures.count()));
         }
 
         const attestation = types.Attestation{
@@ -1237,6 +1241,9 @@ pub const ForkChoice = struct {
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+        const aggregation_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = aggregation_timer.observe();
+
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
         var attestations: std.ArrayList(types.Attestation) = .{};
@@ -1319,6 +1326,9 @@ pub const ForkChoice = struct {
                 // payload, remove it from the gossip signature map to prevent re-aggregation.
                 _ = self.gossip_signatures.remove(sig_key);
             }
+            // Update fork-choice store gauges after aggregation
+            zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(self.latest_new_aggregated_payloads.count()));
+            zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(self.gossip_signatures.count()));
 
             var output_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);

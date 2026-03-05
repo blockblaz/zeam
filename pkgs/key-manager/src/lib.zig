@@ -147,10 +147,12 @@ pub const KeyManager = struct {
         attestation: *const types.Attestation,
         allocator: Allocator,
     ) !xmss.Signature {
+        zeam_metrics.metrics.lean_pq_sig_attestation_signatures_total.incr();
+
         const validator_index: usize = @intCast(attestation.validator_id);
         const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
 
-        const signing_timer = zeam_metrics.lean_pq_signature_attestation_signing_time_seconds.start();
+        const signing_timer = zeam_metrics.lean_pq_sig_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.AttestationData, attestation.data, &message, allocator);
 

@@ -268,6 +268,12 @@ pub const Node = struct {
             // Clean up metrics server if subsequent init operations fail
             errdefer if (self.metrics_server_handle) |handle| handle.stop();
 
+            // Set validator status gauges on node start
+            zeam_metrics.metrics.lean_is_aggregator.set(if (options.is_aggregator) 1 else 0);
+            // Committee subnet and count are placeholders until subnet logic is implemented
+            zeam_metrics.metrics.lean_attestation_committee_subnet.set(0);
+            zeam_metrics.metrics.lean_attestation_committee_count.set(0);
+
             // Start API server (pass chain pointer for chain-dependent endpoints)
             self.api_server_handle = try api_server.startAPIServer(
                 allocator,
