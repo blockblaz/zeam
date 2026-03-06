@@ -769,25 +769,25 @@ fn processBlockStep(
             }
         }
 
-        for (indices.items) |validator_index| {
-            var proof_clone: types.AggregatedSignatureProof = undefined;
-            types.sszClone(ctx.allocator, types.AggregatedSignatureProof, proof_template, &proof_clone) catch |err| {
-                std.debug.print(
-                    "fixture {s} case {s}{any}: failed to clone proof ({s})\n",
-                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                );
-                return FixtureError.InvalidFixture;
-            };
-            errdefer proof_clone.deinit();
-
-            ctx.fork_choice.storeAggregatedPayload(@intCast(validator_index), &aggregated_attestation.data, proof_clone) catch |err| {
-                std.debug.print(
-                    "fixture {s} case {s}{any}: failed to store aggregated payload ({s})\n",
-                    .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-                );
-                return FixtureError.FixtureMismatch;
-            };
+        var validator_ids = ctx.allocator.alloc(types.ValidatorIndex, indices.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to allocate validator ids ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer ctx.allocator.free(validator_ids);
+        for (indices.items, 0..) |vi, i| {
+            validator_ids[i] = @intCast(vi);
         }
+
+        ctx.fork_choice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof_template, true) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{any}: failed to store aggregated payload ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.FixtureMismatch;
+        };
     }
 
     _ = try ctx.fork_choice.updateHead();
@@ -817,7 +817,7 @@ fn processBlockStep(
         .signature = types.ZERO_SIGBYTES,
     };
     // Proposer attestation is treated as gossip and queued as a new aggregated payload.
-    try ctx.fork_choice.onGossipAttestation(signed_attestation, false);
+    try ctx.fork_choice.onSignedAttestation(signed_attestation);
 
     const proposer_data_root = try proposer_attestation.data.sszRoot(ctx.allocator);
     try ctx.fork_choice.attestation_data_by_root.put(proposer_data_root, proposer_attestation.data);
