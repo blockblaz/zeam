@@ -85,7 +85,7 @@ pub const CachedState = struct {
         try self.process_attestations(staged_block.body.attestations, cache);
     }
 
-    fn process_attestations(self: *Self, attestations: AggregatedAttestations, cache: ?*RootToSlotCache) !void {
+    pub fn process_attestations(self: *Self, attestations: AggregatedAttestations, cache: ?*RootToSlotCache) !void {
         const allocator = self.allocator;
         const logger = self.logger;
 
