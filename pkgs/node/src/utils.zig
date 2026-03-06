@@ -3,6 +3,7 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 
 const xev = @import("xev");
+const types = @import("@zeam/types");
 
 pub const EventLoop = struct {
     loop: *xev.Loop,
@@ -41,3 +42,7 @@ pub const OnIntervalCbWrapper = struct {
         return self.onIntervalCb(self.ptr, self.interval);
     }
 };
+
+pub fn computeSubnetId(validator_id: types.ValidatorIndex, committee_count: types.SubnetId) error{InvalidCommitteeCount}!types.SubnetId {
+    return types.computeSubnetId(validator_id, committee_count);
+}
