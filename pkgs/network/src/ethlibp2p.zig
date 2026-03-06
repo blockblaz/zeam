@@ -1079,7 +1079,7 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
-        self.logger.debug("network-{d}:: publishing to rust bridge data={any} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
+        self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
