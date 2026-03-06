@@ -32,7 +32,7 @@ pub const NodeTestOptions = struct {
 pub const NodeTestContext = struct {
     allocator: Allocator,
     loop: xev.Loop,
-    logger_config: zeam_utils.ZeamLoggerConfig,
+    logger_config: *zeam_utils.ZeamLoggerConfig,
     key_manager: key_manager.KeyManager,
     validator_pubkeys: []const types.Bytes52,
     genesis_config: types.GenesisSpec,
@@ -50,7 +50,9 @@ pub const NodeTestContext = struct {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
-        var logger_config = zeam_utils.getTestLoggerConfig();
+        const logger_config = try allocator.create(zeam_utils.ZeamLoggerConfig);
+        errdefer allocator.destroy(logger_config);
+        logger_config.* = zeam_utils.getTestLoggerConfig();
 
         var km = try key_manager.getTestKeyManager(allocator, opts.num_validators, opts.key_manager_slots);
         errdefer km.deinit();
@@ -123,6 +125,8 @@ pub const NodeTestContext = struct {
         if (self.spec_name_owned) {
             self.allocator.free(self.spec_name);
         }
+        self.logger_config.deinit();
+        self.allocator.destroy(self.logger_config);
     }
 
     pub fn loopPtr(self: *NodeTestContext) *xev.Loop {
@@ -130,7 +134,7 @@ pub const NodeTestContext = struct {
     }
 
     pub fn loggerConfig(self: *NodeTestContext) *zeam_utils.ZeamLoggerConfig {
-        return &self.logger_config;
+        return self.logger_config;
     }
 
     pub fn takeAnchorState(self: *NodeTestContext) *types.BeamState {
@@ -147,12 +151,6 @@ pub const NodeTestContext = struct {
 
     pub fn clockPtr(self: *NodeTestContext) *clockFactory.Clock {
         return &self.clock;
-    }
-
-    /// Fix up the db's logger pointer to point to this struct's logger_config.
-    /// Must be called after init() when the struct has a stable address.
-    pub fn fixupDbLogger(self: *NodeTestContext) void {
-        self.db.logger = self.logger_config.logger(.database);
     }
 
     pub fn dbInstance(self: *NodeTestContext) database.Db {
@@ -176,15 +174,15 @@ pub const NodeTestContext = struct {
             errdefer signature_proof.deinit();
 
             var indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, allocator);
-            defer indices.deinit();
+            defer indices.deinit(allocator);
 
             // Collect signature handles for aggregation
-            var signature_handles = std.ArrayList(xmss.Signature).init(allocator);
+            var signature_handles: std.ArrayList(xmss.Signature) = .empty;
             defer {
                 for (signature_handles.items) |*sig| {
                     sig.deinit();
                 }
-                signature_handles.deinit();
+                signature_handles.deinit(allocator);
             }
 
             // Sign attestation for each validator and set participant bits
@@ -199,7 +197,7 @@ pub const NodeTestContext = struct {
 
                 // Sign and keep the handle for aggregation
                 const sig = try self.key_manager.signAttestationWithHandle(&attestation, allocator);
-                try signature_handles.append(sig);
+                try signature_handles.append(allocator, sig);
             }
 
             // Perform actual aggregation if we have signatures

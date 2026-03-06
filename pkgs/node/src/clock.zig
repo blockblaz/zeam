@@ -17,14 +17,13 @@ pub const Clock = struct {
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
     on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
+    allocator: Allocator,
 
     timer: xev.Timer,
 
     const Self = @This();
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         try writer.print("Clock{{ genesis_time_ms={d}, current_interval={d} }}", .{ self.genesis_time_ms, self.current_interval });
     }
 
@@ -46,7 +45,8 @@ pub const Clock = struct {
             .current_interval = current_interval,
             .events = events,
             .timer = timer,
-            .on_interval_cbs = std.ArrayList(*OnIntervalCbWrapper).init(allocator),
+            .on_interval_cbs = .empty,
+            .allocator = allocator,
         };
     }
 
@@ -55,7 +55,7 @@ pub const Clock = struct {
         for (self.on_interval_cbs.items) |cbWrapper| {
             allocator.destroy(cbWrapper);
         }
-        self.on_interval_cbs.deinit();
+        self.on_interval_cbs.deinit(allocator);
     }
 
     pub fn tickInterval(self: *Self) void {
@@ -104,6 +104,6 @@ pub const Clock = struct {
     }
 
     pub fn subscribeOnSlot(self: *Self, cb: *OnIntervalCbWrapper) !void {
-        try self.on_interval_cbs.append(cb);
+        try self.on_interval_cbs.append(self.allocator, cb);
     }
 };

@@ -64,10 +64,8 @@ pub const GossipSub = struct {
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
-    pub fn format(self: GossipSub, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: GossipSub, writer: anytype) !void {
         _ = self;
-        _ = fmt;
-        _ = options;
         try writer.writeAll("GossipSub");
     }
 
@@ -118,10 +116,8 @@ pub const OnGossipCbHandler = struct {
     onGossipCb: OnGossipCbType,
     // c: xev.Completion = undefined,
 
-    pub fn format(self: OnGossipCbHandler, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: OnGossipCbHandler, writer: anytype) !void {
         _ = self;
-        _ = fmt;
-        _ = options;
         try writer.writeAll("OnGossipCbHandler");
     }
 
@@ -158,7 +154,7 @@ pub const LeanNetworkTopic = struct {
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
-        return try std.fmt.allocPrintZ(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
+        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() }, 0);
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
@@ -222,9 +218,7 @@ pub const GossipMessage = union(GossipTopic) {
         return std.meta.activeTag(self.*);
     }
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
                 blk.message.block.slot,
@@ -238,17 +232,17 @@ pub const GossipMessage = union(GossipTopic) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized);
+                try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     pub fn clone(self: *const Self, allocator: Allocator) !*Self {
@@ -330,9 +324,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 
     const Self = @This();
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
             .status => try writer.writeAll("ReqRespRequest{ status }"),
@@ -353,17 +345,17 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized);
+                try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
@@ -423,17 +415,17 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     }
 
     pub fn serialize(self: *const ReqRespResponse, allocator: Allocator) ![]u8 {
-        var serialized = std.ArrayList(u8).init(allocator);
-        errdefer serialized.deinit();
+        var serialized: std.ArrayList(u8) = .empty;
+        errdefer serialized.deinit(allocator);
 
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized);
+                try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
 
-        return serialized.toOwnedSlice();
+        return serialized.toOwnedSlice(allocator);
     }
 
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
@@ -592,7 +584,7 @@ pub const OnReqRespRequestCbHandler = struct {
 };
 pub const ReqRespRequestHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnReqRespRequestCbHandler),
+    handlers: std.ArrayList(OnReqRespRequestCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -621,7 +613,7 @@ pub const ReqRespRequestHandler = struct {
         const peer_id_opt = stream.getPeerId();
         const peer_id = peer_id_opt orelse "unknown";
         const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
-        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
+        self.logger.debug("network-{d}:: onReqRespRequest={f} handlers={d} from peer={s}{f}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -631,7 +623,7 @@ pub const ReqRespRequestHandler = struct {
 
         for (self.handlers.items) |handler| {
             handler.onReqRespRequest(req, stream) catch |err| {
-                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{}", .{ self.networkId, err, peer_id, node_name });
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{f}", .{ self.networkId, err, peer_id, node_name });
                 last_err = err;
                 continue;
             };
@@ -659,9 +651,7 @@ const MessagePublishWrapper = struct {
 
     const Self = @This();
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         try writer.print("MessagePublishWrapper{{ networkId={d}, topic={s}, sender={s} }}", .{
             self.networkId,
             self.data.getGossipTopic().encode(),
@@ -719,7 +709,7 @@ pub const OnPeerEventCbHandler = struct {
 
 pub const PeerEventHandler = struct {
     allocator: Allocator,
-    handlers: std.ArrayListUnmanaged(OnPeerEventCbHandler),
+    handlers: std.ArrayList(OnPeerEventCbHandler),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -746,7 +736,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
@@ -756,7 +746,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
@@ -778,7 +768,7 @@ pub const GenericGossipHandler = struct {
     loop: *xev.Loop,
     timer: xev.Timer,
     allocator: Allocator,
-    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)),
+    onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)),
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -788,7 +778,7 @@ pub const GenericGossipHandler = struct {
         const timer = try xev.Timer.init();
         errdefer timer.deinit();
 
-        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayListUnmanaged(OnGossipCbHandler)) = .empty;
+        var onGossipHandlers: std.AutoHashMapUnmanaged(GossipTopic, std.ArrayList(OnGossipCbHandler)) = .empty;
         errdefer {
             var it = onGossipHandlers.iterator();
             while (it.next()) |entry| {
@@ -799,7 +789,7 @@ pub const GenericGossipHandler = struct {
         try onGossipHandlers.ensureTotalCapacity(allocator, @intCast(std.enums.values(GossipTopic).len));
 
         for (std.enums.values(GossipTopic)) |topic| {
-            var arr: std.ArrayListUnmanaged(OnGossipCbHandler) = .empty;
+            var arr: std.ArrayList(OnGossipCbHandler) = .empty;
             errdefer arr.deinit(allocator);
             try onGossipHandlers.put(allocator, topic, arr);
         }
@@ -828,7 +818,7 @@ pub const GenericGossipHandler = struct {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -836,7 +826,7 @@ pub const GenericGossipHandler = struct {
             if (scheduleOnLoop) {
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={s}", .{ self.networkId, publishWrapper, gossip_topic.encode() });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={s}", .{ self.networkId, publishWrapper, gossip_topic.encode() });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);

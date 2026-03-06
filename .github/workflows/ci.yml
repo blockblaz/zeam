@@ -22,15 +22,15 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Cache Zig packages
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Fetch Zig dependencies with retry
       run: |
@@ -86,7 +86,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -97,9 +97,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -128,7 +128,7 @@ jobs:
 
   build-all-provers:
     name: build-all-provers
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: build  # Only run if the build job succeeds
     strategy:
       matrix:
@@ -139,7 +139,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -151,9 +151,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -182,7 +182,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -194,7 +194,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -205,9 +205,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -255,7 +255,7 @@ jobs:
     - name: Generate LeanSpec fixtures
       if: steps.cache-leanspec.outputs.cache-hit != 'true'
       working-directory: leanSpec
-      run: uv run fill --clean --fork=devnet
+      run: uv run fill --clean --fork=devnet -n auto
     
     - name: Generate spec fixtures
       run: zig build spectest:generate --summary all
@@ -275,7 +275,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -286,9 +286,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
@@ -314,7 +314,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -325,9 +325,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/zig
-        key: ${{ runner.os }}-zig-packages-${{ hashFiles('build.zig.zon') }}
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
-          ${{ runner.os }}-zig-packages-
+          ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2

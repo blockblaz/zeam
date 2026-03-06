@@ -20,8 +20,7 @@ fn sys_write(fd: u32, data: []const u8) void {
           [file_descriptor] "{a3}" (fd),
           [write_buf] "{a4}" (data.ptr),
           [write_buf_len] "{a5}" (data.len),
-        : "memory"
-    );
+        : .{ .memory = true });
 }
 
 fn sys_read(fd: u32, nrequested: usize, buffer: []u8, nread: *u32, last: *u32) void {
@@ -40,8 +39,7 @@ fn sys_read(fd: u32, nrequested: usize, buffer: []u8, nread: *u32, last: *u32) v
           [syscall_name] "{a2}" (syscall_name.ptr),
           [file_descriptor] "{a3}" (fd),
           [main_requested] "{a4}" (nrequested),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     nread.* = a0;
     last.* = a1;

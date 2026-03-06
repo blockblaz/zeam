@@ -160,7 +160,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.14.1
+        version: 0.15.2
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1

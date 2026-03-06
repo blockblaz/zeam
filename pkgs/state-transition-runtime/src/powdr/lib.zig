@@ -7,8 +7,7 @@ fn native_hash(data: *[12]u64) [4]u64 {
         :
         : [scallnum] "{t0}" (@intFromEnum(syscalls.native_hash)),
           [subcommand] "{a0}" (data),
-        : "memory"
-    );
+        : .{ .memory = true });
     var ret: [4]u64 = undefined;
     std.mem.copyForwards(u64, ret[0..], data.*[0..4]);
     return ret;
@@ -72,15 +71,13 @@ fn finalize() void {
             : [scallnum] "{t0}" (@intFromEnum(syscalls.commit_public)),
               [fd] "{a0}" (i * 2),
               [idx] "{a1}" (low),
-            : "memory"
-        );
+            : .{ .memory = true });
         asm volatile ("ecall"
             :
             : [scallnum] "{t0}" (@intFromEnum(syscalls.commit_public)),
               [fd] "{a0}" (i * 2 + 1),
               [idx] "{a1}" (high),
-            : "memory"
-        );
+            : .{ .memory = true });
     }
 }
 

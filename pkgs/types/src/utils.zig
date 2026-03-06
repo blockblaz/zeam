@@ -107,8 +107,57 @@ pub fn setSlotJustified(finalized_slot: types.Slot, justified_slots: *types.Just
 
 // Helper function to convert bytes to hex string
 pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "0x{s}", .{std.fmt.fmtSliceHexLower(bytes)});
+    return try std.fmt.allocPrint(allocator, "0x{x}", .{bytes});
 }
+
+/// Cache for root to slot mapping to optimize block processing performance.
+/// Thread-safety: NOT thread-safe.
+pub const RootToSlotCache = struct {
+    cache: std.AutoHashMap(Root, Slot),
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .cache = std.AutoHashMap(Root, Slot).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.cache.deinit();
+    }
+
+    pub fn put(self: *Self, root: Root, slot: Slot) !void {
+        try self.cache.put(root, slot);
+    }
+
+    pub fn get(self: *const Self, root: Root) ?Slot {
+        return self.cache.get(root);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.cache.count();
+    }
+
+    /// Remove all entries with slot <= finalized_slot.
+    pub fn prune(self: *Self, finalized_slot: Slot) !void {
+        var keys_to_remove: std.ArrayList(Root) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
+
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* <= finalized_slot) {
+                try keys_to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (keys_to_remove.items) |key| {
+            _ = self.cache.remove(key);
+        }
+    }
+};
 
 pub const GenesisSpec = struct {
     genesis_time: u64,
@@ -148,10 +197,10 @@ pub const ChainSpec = struct {
 // replace by a better mechanisms which could be upstreated into the ssz lib as well
 // pass a pointer where you want to clone the data
 pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !void {
-    var bytes = std.ArrayList(u8).init(allocator);
-    defer bytes.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
 
-    try ssz.serialize(T, data, &bytes);
+    try ssz.serialize(T, data, &bytes, allocator);
     try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
@@ -168,9 +217,9 @@ test "isSlotJustified treats finalized boundary as implicit" {
 test "ssz import" {
     const data: u16 = 0x5566;
     const serialized_data = [_]u8{ 0x66, 0x55 };
-    var list = std.ArrayList(u8).init(std.testing.allocator);
-    defer list.deinit();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
 
-    try ssz.serialize(u16, data, &list);
+    try ssz.serialize(u16, data, &list, std.testing.allocator);
     try std.testing.expect(std.mem.eql(u8, list.items, serialized_data[0..]));
 }

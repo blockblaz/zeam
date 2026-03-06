@@ -43,7 +43,16 @@ pub const PendingRPC = union(enum) {
     }
 };
 
-pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPC);
+pub const PendingRPCEntry = struct {
+    request: PendingRPC,
+    created_at: i64,
+
+    pub fn deinit(self: *PendingRPCEntry, allocator: Allocator) void {
+        self.request.deinit(allocator);
+    }
+};
+
+pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPCEntry);
 // key: block root, value: depth
 pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
@@ -64,6 +73,7 @@ pub const Network = struct {
     pending_block_roots: PendingBlockRootMap,
     fetched_blocks: FetchedBlockMap,
     fetched_block_children: ChildrenMap,
+    timed_out_requests: std.ArrayList(u64),
 
     const Self = @This();
 
@@ -94,10 +104,13 @@ pub const Network = struct {
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
             .fetched_block_children = fetched_block_children,
+            .timed_out_requests = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.timed_out_requests.deinit(self.allocator);
+
         var rpc_it = self.pending_rpc_requests.iterator();
         while (rpc_it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
@@ -116,7 +129,7 @@ pub const Network = struct {
 
         var children_it = self.fetched_block_children.iterator();
         while (children_it.next()) |entry| {
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.fetched_block_children.deinit();
 
@@ -232,17 +245,17 @@ pub const Network = struct {
 
             // Finalize all pending RPC requests for this peer
             var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove = std.ArrayList(u64).init(self.allocator);
-            defer request_ids_to_remove.deinit();
+            var request_ids_to_remove: std.ArrayList(u64) = .empty;
+            defer request_ids_to_remove.deinit(self.allocator);
 
             while (rpc_it.next()) |rpc_entry| {
-                const pending_peer_id = switch (rpc_entry.value_ptr.*) {
+                const pending_peer_id = switch (rpc_entry.value_ptr.request) {
                     .status => |*ctx| ctx.peer_id,
                     .blocks_by_root => |*ctx| ctx.peer_id,
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
                     // If we can't allocate, skip this request (should be rare)
-                    request_ids_to_remove.append(rpc_entry.key_ptr.*) catch continue;
+                    request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
                 }
             }
 
@@ -310,13 +323,13 @@ pub const Network = struct {
 
         const created_new_entry = !gop.found_existing;
         if (created_new_entry) {
-            gop.value_ptr.* = std.ArrayList(types.Root).init(self.allocator);
+            gop.value_ptr.* = .empty;
         }
         errdefer if (created_new_entry) {
-            gop.value_ptr.deinit();
+            gop.value_ptr.deinit(self.allocator);
             _ = self.fetched_block_children.remove(parent_root);
         };
-        try gop.value_ptr.append(root);
+        try gop.value_ptr.append(self.allocator, root);
     }
 
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
@@ -335,7 +348,7 @@ pub const Network = struct {
                 }
                 // Clean up the parent entry if no children remain
                 if (children_list.items.len == 0) {
-                    children_list.deinit();
+                    children_list.deinit(self.allocator);
                     _ = self.fetched_block_children.remove(parent_root);
                 }
             }
@@ -354,6 +367,72 @@ pub const Network = struct {
             return children_list.items;
         }
         return &[_]types.Root{};
+    }
+
+    /// Remove a block and its entire chain: walk up to ancestors (parents)
+    /// and down to descendants (children), removing all from cache and
+    /// clearing any matching pending block roots.
+    /// Uses a set for the worklist to handle multiple chains sharing common blocks.
+    /// Returns the number of blocks removed.
+    pub fn pruneCachedBlocks(self: *Self, root: types.Root, finalized_checkpoint: ?types.Checkpoint) usize {
+        if (finalized_checkpoint) |fc| {
+            if (std.mem.eql(u8, &root, &fc.root)) {
+                // Never prune the finalized checkpoint root directly; keep it cached for descendants.
+                return 0;
+            }
+        }
+
+        var to_remove = std.AutoArrayHashMap(types.Root, void).init(self.allocator);
+        defer to_remove.deinit();
+
+        to_remove.put(root, {}) catch return 0;
+
+        // Walk up: traverse parent chain and add all cached ancestors
+        var current = root;
+        while (self.getFetchedBlock(current)) |block_ptr| {
+            const parent_root = block_ptr.message.block.parent_root;
+            if (self.hasFetchedBlock(parent_root)) {
+                to_remove.put(parent_root, {}) catch break;
+                current = parent_root;
+            } else {
+                break;
+            }
+        }
+
+        // Walk down: process entries, expanding children as we go.
+        // We iterate by index since new entries may be appended during iteration.
+        var i: usize = 0;
+        while (i < to_remove.count()) : (i += 1) {
+            const current_root = to_remove.keys()[i];
+
+            // Enqueue children before removing (since removal modifies the children map)
+            const children_slice = self.getChildrenOfBlock(current_root);
+            for (children_slice) |child_root| {
+                // When pruning due to finalization, keep children that are on
+                // the finalized chain (matching root at or after finalized slot).
+                if (finalized_checkpoint) |fc| {
+                    if (self.getFetchedBlock(child_root)) |child_block| {
+                        if (child_block.message.block.slot >= fc.slot and
+                            std.mem.eql(u8, &child_root, &fc.root))
+                        {
+                            // This child is the finalized block — skip it (keep it and its descendants)
+                            continue;
+                        }
+                    }
+                }
+                to_remove.put(child_root, {}) catch continue;
+            }
+        }
+
+        // Remove all collected roots
+        var pruned: usize = 0;
+        for (to_remove.keys()) |entry_root| {
+            if (self.removeFetchedBlock(entry_root)) {
+                pruned += 1;
+            }
+            _ = self.removePendingBlockRoot(entry_root);
+        }
+        return pruned;
     }
 
     pub fn sendStatusRequest(
@@ -375,7 +454,10 @@ pub const Network = struct {
 
         const request_id = try self.sendStatus(peer_id, status, handler);
 
-        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+            .request = pending,
+            .created_at = std.time.timestamp(),
+        }) catch |err| {
             pending.deinit(self.allocator);
             return err;
         };
@@ -427,7 +509,10 @@ pub const Network = struct {
             return err;
         };
 
-        self.pending_rpc_requests.put(request_id, pending) catch |err| {
+        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+            .request = pending,
+            .created_at = std.time.timestamp(),
+        }) catch |err| {
             pending.deinit(self.allocator);
             return err;
         };
@@ -465,14 +550,25 @@ pub const Network = struct {
         };
     }
 
-    pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPC {
+    pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPCEntry {
         return self.pending_rpc_requests.getPtr(request_id);
+    }
+
+    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
+        self.timed_out_requests.clearAndFree(self.allocator);
+        var it = self.pending_rpc_requests.iterator();
+        while (it.next()) |entry| {
+            if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
+                try self.timed_out_requests.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+        return self.timed_out_requests.items;
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {
         if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
-            var ctx = entry.value;
-            switch (ctx) {
+            var rpc_entry = entry.value;
+            switch (rpc_entry.request) {
                 .blocks_by_root => |block_ctx| {
                     for (block_ctx.requested_roots) |root| {
                         _ = self.removePendingBlockRoot(root);
@@ -480,7 +576,7 @@ pub const Network = struct {
                 },
                 .status => {},
             }
-            ctx.deinit(self.allocator);
+            rpc_entry.deinit(self.allocator);
         }
     }
 };

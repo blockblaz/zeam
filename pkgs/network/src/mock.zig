@@ -23,7 +23,7 @@ pub const Mock = struct {
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     peerLookup: std.StringHashMapUnmanaged(usize),
     ownerToPeer: std.AutoHashMapUnmanaged(usize, usize),
-    peers: std.ArrayListUnmanaged(Peer),
+    peers: std.ArrayList(Peer),
     connectedPairs: std.AutoHashMapUnmanaged(PairKey, void),
     activeStreams: std.AutoHashMapUnmanaged(u64, *MockServerStream),
     timer: xev.Timer,
@@ -63,7 +63,7 @@ pub const Mock = struct {
         // Buffer responses for async delivery to avoid timing issues.
         // In the mock, the target handler is called synchronously within sendRequest(),
         // so responses would arrive before sendRequest() returns the request_id.
-        buffered_responses: std.ArrayListUnmanaged(interface.ReqRespResponse) = .empty,
+        buffered_responses: std.ArrayList(interface.ReqRespResponse) = .empty,
         error_response: ?struct { code: u32, message: []const u8 } = null,
     };
 
@@ -862,7 +862,7 @@ test "Mock status RPC between peers" {
         const Self = @This();
         allocator: Allocator,
         status: types.Status,
-        connections: std.ArrayListUnmanaged([]u8) = .empty,
+        connections: std.ArrayList([]u8) = .empty,
         received_status: ?types.Status = null,
         completed: bool = false,
         failures: u32 = 0,

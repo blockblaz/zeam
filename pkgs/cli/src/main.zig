@@ -5,13 +5,21 @@ const constants = @import("constants.zig");
 
 const simargs = @import("simargs");
 
+// Suppress verbose YAML tokenizer/parser debug logs while preserving errors/warnings
+pub const std_options: std.Options = .{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .tokenizer, .level = .err },
+        .{ .scope = .parser, .level = .err },
+    },
+};
+
 const types = @import("@zeam/types");
 const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -26,6 +34,7 @@ const database = @import("@zeam/database");
 const sft_factory = @import("@zeam/state-transition");
 const api = @import("@zeam/api");
 const api_server = @import("api_server.zig");
+const metrics_server = @import("metrics_server.zig");
 
 const networks = @import("@zeam/network");
 
@@ -53,6 +62,7 @@ pub const NodeCommand = struct {
     validator_config: []const u8,
     metrics_enable: bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
+    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     override_genesis_time: ?u64,
     @"sig-keys-dir": []const u8 = "hash-sig-keys",
     @"network-dir": []const u8 = "./network",
@@ -69,8 +79,9 @@ pub const NodeCommand = struct {
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
         .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
-        .@"api-port" = "Port for the API server (metrics, health, events, checkpoint state)",
-        .metrics_enable = "Enable metrics endpoint",
+        .@"api-port" = "Port for the API server (health, events, forkchoice graph, checkpoint state)",
+        .@"metrics-port" = "Port for the Prometheus metrics server",
+        .metrics_enable = "Enable API and metrics servers (health, events, forkchoice graph, checkpoint state, metrics)",
         .@"network-dir" = "Directory to store network related information, e.g., peer ids, keys, etc.",
         .override_genesis_time = "Override genesis time in the config.yaml",
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
@@ -84,14 +95,16 @@ const BeamCmd = struct {
     help: bool = false,
     mockNetwork: bool = false,
     @"api-port": u16 = constants.DEFAULT_API_PORT,
+    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
 
     pub fn format(self: BeamCmd, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
         _ = options;
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, data_dir=\"{s}\" }}", .{
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\" }}", .{
             self.mockNetwork,
             self.@"api-port",
+            self.@"metrics-port",
             self.data_dir,
         });
     }
@@ -130,17 +143,17 @@ const ZeamArgs = struct {
 
             __commands__: union(enum) {
                 genconfig: struct {
-                    @"api-port": u16 = constants.DEFAULT_API_PORT,
+                    @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
                     filename: []const u8 = "prometheus.yml",
                     help: bool = false,
 
                     pub const __shorts__ = .{
-                        .@"api-port" = .p,
+                        .@"metrics-port" = .p,
                         .filename = .f,
                     };
 
                     pub const __messages__ = .{
-                        .@"api-port" = "Port for the API server to scrape metrics from",
+                        .@"metrics-port" = "Port for the metrics server to scrape",
                         .filename = "output name for the config file",
                     };
                 },
@@ -174,14 +187,7 @@ const ZeamArgs = struct {
         .version = .v,
     };
 
-    pub fn format(
-        self: ZeamArgs,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: ZeamArgs, writer: anytype) !void {
         try writer.print("ZeamArgs(genesis={d}, log_filename=\"{s}\", console_log_level={s}, file_log_level={s}", .{
             self.genesis,
             self.log_filename,
@@ -191,7 +197,7 @@ const ZeamArgs = struct {
         try writer.writeAll(", command=");
         switch (self.__commands__) {
             .clock => try writer.writeAll("clock"),
-            .beam => |cmd| try writer.print("{any}", .{cmd}),
+            .beam => |cmd| try writer.print("{f}", .{cmd}),
             .prove => |cmd| try writer.print("prove(zkvm={s}, dist_dir=\"{s}\")", .{ @tagName(cmd.zkvm), cmd.dist_dir }),
             .prometheus => |cmd| switch (cmd.__commands__) {
                 .genconfig => |genconfig| try writer.print("prometheus.genconfig(api_port={d}, filename=\"{s}\")", .{ genconfig.@"api-port", genconfig.filename }),
@@ -227,9 +233,8 @@ fn mainInner() !void {
     const app_version = build_options.version;
 
     const opts = simargs.parse(allocator, ZeamArgs, app_description, app_version) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)}) catch {};
-        stderr.print("Run 'zeam --help' for usage information.\n", .{}) catch {};
+        std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
+        std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         ErrorHandler.logErrorWithOperation(err, "parse command-line arguments");
         return err;
     };
@@ -318,16 +323,32 @@ fn mainInner() !void {
                 return err;
             };
 
+            var api_server_handle: ?*api_server.ApiServer = null;
+            var metrics_server_handle: ?*metrics_server.MetricsServer = null;
+            defer if (api_server_handle) |handle| handle.stop();
+            defer if (metrics_server_handle) |handle| handle.stop();
+
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
 
-            // Create logger config for API server
+            // Create logger config for API and metrics servers
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
 
-            // Start metrics HTTP server
-            // Pass null for chain - in .beam command mode, chains are created later and the checkpoint sync endpoint won't be available
-            api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
+            // Validate that API and metrics ports are different
+            if (beamcmd.@"api-port" == beamcmd.@"metrics-port") {
+                std.log.err("API port and metrics port cannot be the same (both set to {d})", .{beamcmd.@"api-port"});
+                return error.PortConflict;
+            }
+
+            // Start metrics server (doesn't need chain reference)
+            metrics_server_handle = metrics_server.startMetricsServer(allocator, beamcmd.@"metrics-port", &api_logger_config) catch |err| {
+                ErrorHandler.logErrorWithDetails(err, "start metrics server", .{ .port = beamcmd.@"metrics-port" });
+                return err;
+            };
+
+            // Start API server early. Pass null for chain - in .beam command mode, chains are created later
+            api_server_handle = api_server.startAPIServer(allocator, beamcmd.@"api-port", &api_logger_config, null) catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "start API server", .{ .port = beamcmd.@"api-port" });
                 return err;
             };
@@ -547,6 +568,10 @@ fn mainInner() !void {
                 .node_registry = registry_1,
             });
 
+            if (api_server_handle) |handle| {
+                handle.setChain(beam_node_1.chain);
+            }
+
             var beam_node_2: BeamNode = undefined;
             try beam_node_2.init(allocator, .{
                 // options
@@ -642,18 +667,26 @@ fn mainInner() !void {
         },
         .prometheus => |prometheus| switch (prometheus.__commands__) {
             .genconfig => |genconfig| {
-                const generated_config = generatePrometheusConfig(allocator, genconfig.@"api-port") catch |err| {
+                const generated_config = generatePrometheusConfig(allocator, genconfig.@"metrics-port") catch |err| {
                     ErrorHandler.logErrorWithOperation(err, "generate Prometheus config");
                     return err;
                 };
+                defer allocator.free(generated_config);
+
                 const cwd = std.fs.cwd();
                 const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
                     return err;
                 };
                 defer config_file.close();
-                config_file.writeAll(generated_config) catch |err| {
+                var write_buf: [4096]u8 = undefined;
+                var writer = config_file.writer(&write_buf);
+                writer.interface.writeAll(generated_config) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
+                    return err;
+                };
+                writer.interface.flush() catch |err| {
+                    ErrorHandler.logErrorWithDetails(err, "flush Prometheus config", .{ .filename = genconfig.filename });
                     return err;
                 };
                 std.log.info("Successfully generated Prometheus config: {s}", .{genconfig.filename});
@@ -678,13 +711,14 @@ fn mainInner() !void {
                 .node_key_index = undefined,
                 .metrics_enable = leancmd.metrics_enable,
                 .api_port = leancmd.@"api-port",
-                .bootnodes = undefined,
+                .metrics_port = leancmd.@"metrics-port",
+                .bootnodes = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .genesis_spec = undefined,
-                .validator_assignments = undefined,
-                .local_priv_key = undefined,
+                .validator_assignments = &.{}, // Initialize to empty slice to avoid segfault in deinit
+                .local_priv_key = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .logger_config = &zeam_logger_config,
                 .database_path = leancmd.@"data-dir",
-                .hash_sig_key_dir = undefined,
+                .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
             };
 

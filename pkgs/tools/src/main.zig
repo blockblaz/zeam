@@ -3,6 +3,8 @@ const enr = @import("enr");
 const build_options = @import("build_options");
 const simargs = @import("simargs");
 
+pub const max_enr_txt_size = enr.max_enr_txt_size;
+
 const ToolsArgs = struct {
     help: bool = false,
     version: bool = false,
@@ -120,17 +122,30 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
         return error.EmptyIPAddress;
     }
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var buffer: std.ArrayList(u8) = .empty;
+    try genENR(cmd.sk, cmd.ip, cmd.quic, buffer.writer(alloc));
+
     if (cmd.out) |output_path| {
+        // Write the result to the file
         const file = try std.fs.cwd().createFile(output_path, .{});
         defer file.close();
-
-        const writer = file.writer();
-        try genENR(cmd.sk, cmd.ip, cmd.quic, writer);
+        var write_buf: [max_enr_txt_size]u8 = undefined;
+        var file_writer = file.writer(&write_buf);
+        try file_writer.interface.writeAll(buffer.items);
+        try file_writer.interface.flush();
 
         std.debug.print("ENR written to: {s}\n", .{output_path});
     } else {
-        const stdout = std.io.getStdOut().writer();
-        try genENR(cmd.sk, cmd.ip, cmd.quic, stdout);
+        // Write the result to stdout
+        const stdout = std.fs.File.stdout();
+        var stdout_write_buf: [max_enr_txt_size]u8 = undefined;
+        var stdout_writer = stdout.writer(&stdout_write_buf);
+        try stdout_writer.interface.writeAll(buffer.items);
+        try stdout_writer.interface.flush();
     }
 }
 
@@ -171,42 +186,39 @@ fn genENR(secret_key: []const u8, ip: []const u8, quic: u16, out_writer: anytype
 }
 
 test "generate ENR to buffer" {
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    try genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "192.0.2.1", 1234, writer);
+    try genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "192.0.2.1", 1234, buffer.writer(allocator));
 
-    const result = fbs.getWritten();
-
-    try std.testing.expectEqualStrings("enr:-IW4QP3E2K97wLIvYbu2upNn5CfjWdD4kmW6YjxNcdroKIA_V81rQhAtp_JG711GtlHXStpGT03JZzM1I3VoAj9S5Z-AgmlkgnY0gmlwhMAAAgGEcXVpY4IE0olzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", result);
+    try std.testing.expectEqualStrings("enr:-IW4QP3E2K97wLIvYbu2upNn5CfjWdD4kmW6YjxNcdroKIA_V81rQhAtp_JG711GtlHXStpGT03JZzM1I3VoAj9S5Z-AgmlkgnY0gmlwhMAAAgGEcXVpY4IE0olzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", buffer.items);
 }
 
 test "generate ENR with 0x prefix" {
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    try genENR("0xb71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "127.0.0.1", 30303, writer);
+    try genENR("0xb71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "127.0.0.1", 30303, buffer.writer(allocator));
 
-    const result = fbs.getWritten();
-    try std.testing.expectEqualStrings("enr:-IW4QI9SLVH8scoBp80eUJdBENXALDXyf4psnqjs9be2rVYgcLY-R9FUPU0Ykg1o44fYBacr3V9OyfyXuggsBIDgbSOAgmlkgnY0gmlwhH8AAAGEcXVpY4J2X4lzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", result);
+    try std.testing.expectEqualStrings("enr:-IW4QI9SLVH8scoBp80eUJdBENXALDXyf4psnqjs9be2rVYgcLY-R9FUPU0Ykg1o44fYBacr3V9OyfyXuggsBIDgbSOAgmlkgnY0gmlwhH8AAAGEcXVpY4J2X4lzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", buffer.items);
 }
 
 test "invalid secret key length" {
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    const result = genENR("invalid", "127.0.0.1", 30303, writer);
+    const result = genENR("invalid", "127.0.0.1", 30303, buffer.writer(allocator));
     try std.testing.expectError(error.InvalidSecretKeyLength, result);
 }
 
 test "invalid IP address" {
-    var buffer: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
+    const allocator = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    const result = genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "invalid.ip", 30303, writer);
+    const result = genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "invalid.ip", 30303, buffer.writer(allocator));
     try std.testing.expectError(error.InvalidIPAddress, result);
 }

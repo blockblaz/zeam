@@ -13,7 +13,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
 }
 
 /// Writes metrics to a writer (for Prometheus endpoint).
-pub fn writeMetrics(writer: anytype) !void {
+pub fn writeMetrics(writer: *std.Io.Writer) !void {
     try zeam_metrics.writeMetrics(writer);
 }
 
@@ -23,3 +23,7 @@ pub const routes = @import("./routes.zig");
 // Event system modules
 pub const events = @import("./events.zig");
 pub const event_broadcaster = @import("./event_broadcaster.zig");
+
+test "get tests" {
+    @import("std").testing.refAllDeclsRecursive(@This());
+}
