@@ -249,8 +249,6 @@ jobs:
       with:
         path: leanSpec/fixtures
         key: ${{ runner.os }}-leanspec-${{ hashFiles('leanSpec/**/*.py', 'leanSpec/**/*.yml', 'leanSpec/**/*.yaml', 'leanSpec/**/*.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-leanspec-
 
     - name: Generate LeanSpec fixtures
       if: steps['cache-leanspec'].outputs.cache-hit != 'true'
