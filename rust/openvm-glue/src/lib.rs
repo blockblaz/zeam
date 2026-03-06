@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use openvm_platform::platform::memory::MEM_SIZE;
 use openvm_circuit::arch::ContinuationVmProof;
+use openvm_platform::platform::memory::MEM_SIZE;
 use openvm_sdk::{
     config::{AppConfig, SdkVmConfig},
     keygen::AppVerifyingKey,
@@ -190,7 +190,10 @@ extern "C" fn openvm_verify(
     let elf_bytes = match fs::read(binary_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("openvm_verify: failed to read ELF at {}: {}", binary_path, e);
+            eprintln!(
+                "openvm_verify: failed to read ELF at {}: {}",
+                binary_path, e
+            );
             return false;
         }
     };
