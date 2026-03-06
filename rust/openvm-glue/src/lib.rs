@@ -2,9 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use openvm_platform::platform::memory::MEM_SIZE;
+use openvm_circuit::arch::ContinuationVmProof;
 use openvm_sdk::{
     config::{AppConfig, SdkVmConfig},
-    Sdk, StdIn,
+    keygen::AppVerifyingKey,
+    Sdk, StdIn, SC,
 };
 use openvm_stark_sdk::config::FriParameters;
 use openvm_transpiler::elf::Elf;
@@ -144,12 +146,89 @@ extern "C" fn openvm_prove(
 
 #[no_mangle]
 extern "C" fn openvm_verify(
-    _binary_path: *const u8,
-    _binary_path_len: usize,
-    _receipt: *const u8,
-    _receipt_len: usize,
+    binary_path: *const u8,
+    binary_path_len: usize,
+    receipt: *const u8,
+    receipt_len: usize,
 ) -> bool {
-    // TODO: Implement verification
-    eprintln!("OpenVM verification not yet implemented");
-    true
+    let binary_path_slice = unsafe {
+        if !binary_path.is_null() {
+            std::slice::from_raw_parts(binary_path, binary_path_len)
+        } else {
+            eprintln!("openvm_verify: binary_path is null");
+            return false;
+        }
+    };
+
+    let receipt_slice = unsafe {
+        if !receipt.is_null() {
+            std::slice::from_raw_parts(receipt, receipt_len)
+        } else {
+            eprintln!("openvm_verify: receipt is null");
+            return false;
+        }
+    };
+
+    let binary_path = match std::str::from_utf8(binary_path_slice) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("openvm_verify: invalid binary path: {}", e);
+            return false;
+        }
+    };
+
+    // Deserialize the proof package from receipt bytes
+    let proof_package: OpenVMProofPackage = match bincode::deserialize(receipt_slice) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("openvm_verify: failed to deserialize proof package: {}", e);
+            return false;
+        }
+    };
+
+    // Verify ELF hash: read the binary ELF and check it matches the hash in the proof
+    let elf_bytes = match fs::read(binary_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("openvm_verify: failed to read ELF at {}: {}", binary_path, e);
+            return false;
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&elf_bytes);
+    let computed_hash = hasher.finalize().to_vec();
+
+    if computed_hash != proof_package.elf_hash {
+        eprintln!("openvm_verify: ELF hash mismatch — proof was generated for a different binary");
+        return false;
+    }
+
+    // Deserialize the continuation VM proof
+    let proof: ContinuationVmProof<SC> = match bincode::deserialize(&proof_package.proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("openvm_verify: failed to deserialize proof: {}", e);
+            return false;
+        }
+    };
+
+    // Deserialize the app verifying key
+    let app_vk: AppVerifyingKey = match bincode::deserialize(&proof_package.vk_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("openvm_verify: failed to deserialize verifying key: {}", e);
+            return false;
+        }
+    };
+
+    // Verify the proof using the SDK
+    let sdk = Sdk::new();
+    match sdk.verify_app_proof(&app_vk, &proof) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("openvm_verify: proof verification failed: {}", e);
+            false
+        }
+    }
 }
