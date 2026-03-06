@@ -382,6 +382,9 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
                     node_name,
                 },
             );
+            // Subscribe+ignore: non-aggregator nodes are subscribed for mesh health
+            // but do not process attestation messages. Return early without calling onGossip.
+            if (!zigHandler.params.is_aggregator) return;
         },
         .aggregation => |signed_aggregation| {
             zigHandler.logger.debug(
@@ -931,9 +934,9 @@ pub const EthLibp2pParams = struct {
     connect_peers: ?[]const Multiaddr,
     node_registry: *const NodeNameRegistry,
     attestation_committee_count: types.SubnetId,
-    /// When false, attestation subnet topics are not subscribed at the libp2p level.
-    /// The node can still publish to attestation subnets without subscribing.
-    /// Set to true only for aggregator nodes that need to receive peer attestations.
+    /// When true, the node processes received attestation gossip messages (aggregator mode).
+    /// When false, the node subscribes to attestation subnets for mesh health but ignores
+    /// received attestations without forwarding them to the gossip handler (Subscribe+ignore).
     is_aggregator: bool = false,
 };
 
@@ -1033,19 +1036,20 @@ pub const EthLibp2p = struct {
         for (std.enums.values(interface.GossipTopicKind)) |kind| {
             switch (kind) {
                 .attestation => {
-                    // Only subscribe to attestation subnets at the libp2p level if this
-                    // node is an aggregator. Non-aggregators can still publish attestations
-                    // to subnets without subscribing (gossipsub allows publish-only).
-                    if (self.params.is_aggregator) {
-                        const subnet_count = try getAttestationSubnetCount(self.params.attestation_committee_count);
-                        for (0..subnet_count) |i| {
-                            const subnet_id: types.SubnetId = @intCast(i);
-                            const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
-                            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
-                            defer topic.deinit();
-                            const topic_str = try topic.encode();
-                            try topics_list.append(self.allocator, topic_str);
-                        }
+                    // Subscribe to all attestation subnets at the libp2p level unconditionally.
+                    // This is the "Subscribe+ignore" approach: every node joins the mesh for
+                    // attestation subnets to maintain mesh health and contribute to routing.
+                    // Non-aggregator nodes receive attestation messages but skip processing them
+                    // (see handleGossipFromRustBridge). This is more robust than flood-publish
+                    // (publish-without-subscribing) because the node is a real mesh participant.
+                    const subnet_count = try getAttestationSubnetCount(self.params.attestation_committee_count);
+                    for (0..subnet_count) |i| {
+                        const subnet_id: types.SubnetId = @intCast(i);
+                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
+                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                        defer topic.deinit();
+                        const topic_str = try topic.encode();
+                        try topics_list.append(self.allocator, topic_str);
                     }
                 },
                 else => {
