@@ -128,10 +128,10 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("yaml");
 
-    // add rocksdb
+    // add rocksdb — always use ReleaseFast to minimize disk usage (debug info is huge)
     const rocksdb = b.dependency("rocksdb", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     }).module("bindings");
 
     // add snappyz
