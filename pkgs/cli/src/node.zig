@@ -183,6 +183,35 @@ pub const Node = struct {
 
         self.logger = options.logger_config.logger(.node);
 
+        // Probe the database immediately after opening: try to load the latest
+        // finalized state and verify its genesis time against our config.
+        // If there is a mismatch the DB belongs to a different genesis, so wipe
+        // it now — before any other state-loading path runs — so that every
+        // subsequent path (checkpoint sync, database load, genesis) works with
+        // a clean DB.
+        {
+            var probe_state: types.BeamState = undefined;
+            if (db.loadLatestFinalizedState(&probe_state)) {
+                defer probe_state.deinit();
+                if (probe_state.config.genesis_time != chain_config.genesis.genesis_time) {
+                    self.logger.warn("database genesis time mismatch (db={d}, config={d}), wiping stale database", .{
+                        probe_state.config.genesis_time,
+                        chain_config.genesis.genesis_time,
+                    });
+                    db.deinit();
+                    const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
+                    defer allocator.free(rocksdb_path);
+                    std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+                        self.logger.warn("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                    };
+                    db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+                    self.logger.info("stale database wiped, starting fresh", .{});
+                }
+            } else |_| {
+                // Empty or unreadable DB — nothing to check, proceed normally.
+            }
+        }
+
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
@@ -211,11 +240,14 @@ pub const Node = struct {
 
         // Fall back to database/genesis if checkpoint sync was not attempted or failed
         if (!checkpoint_sync_succeeded) {
-            // Try to load the latest finalized state from the database, fallback to genesis
-            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
-                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
+            // Try to load the latest finalized state from the database, fallback to genesis.
+            // Genesis time is already validated above so no mismatch check needed here.
+            if (db.loadLatestFinalizedState(self.anchor_state)) {
+                self.logger.info("recovered finalized state from database at slot {d}", .{self.anchor_state.slot});
+            } else |err| {
+                self.logger.warn("could not load finalized state from database ({any}), starting from genesis", .{err});
                 try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-            };
+            }
         }
         errdefer self.anchor_state.deinit();
 
