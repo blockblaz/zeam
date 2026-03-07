@@ -311,10 +311,8 @@ pub const ForkChoice = struct {
     /// Thread-safe snapshot for observability
     pub const Snapshot = struct {
         head: ProtoNode,
-        latest_justified_root: [32]u8,
-        latest_justified_slot: types.Slot,
-        latest_finalized_root: [32]u8,
-        latest_finalized_slot: types.Slot,
+        latest_justified: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
         safe_target_root: [32]u8,
         validator_count: u64,
         nodes: []ProtoNode,
@@ -440,10 +438,8 @@ pub const ForkChoice = struct {
             };
             return Snapshot{
                 .head = head_node,
-                .latest_justified_root = self.fcStore.latest_justified.root,
-                .latest_justified_slot = self.fcStore.latest_justified.slot,
-                .latest_finalized_root = self.fcStore.latest_finalized.root,
-                .latest_finalized_slot = self.fcStore.latest_finalized.slot,
+                .latest_justified = self.fcStore.latest_justified,
+                .latest_finalized = self.fcStore.latest_finalized,
                 .safe_target_root = self.safeTarget.blockRoot,
                 .validator_count = self.config.genesis.numValidators(),
                 .nodes = nodes_copy,
@@ -452,10 +448,8 @@ pub const ForkChoice = struct {
 
         return Snapshot{
             .head = self.protoArray.nodes.items[head_idx],
-            .latest_justified_root = self.fcStore.latest_justified.root,
-            .latest_justified_slot = self.fcStore.latest_justified.slot,
-            .latest_finalized_root = self.fcStore.latest_finalized.root,
-            .latest_finalized_slot = self.fcStore.latest_finalized.slot,
+            .latest_justified = self.fcStore.latest_justified,
+            .latest_finalized = self.fcStore.latest_finalized,
             .safe_target_root = self.safeTarget.blockRoot,
             .validator_count = self.config.genesis.numValidators(),
             .nodes = nodes_copy,
