@@ -206,22 +206,6 @@ pub const Node = struct {
                     };
                     db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
                     self.logger.info("stale database wiped, starting fresh", .{});
-                    // Re-check: if there is somehow still a state in the freshly opened DB
-                    // with a mismatching genesis time (e.g. the wipe failed silently), log
-                    // and return an error so the node does not start in an inconsistent state.
-                    var post_wipe_probe: types.BeamState = undefined;
-                    if (db.loadLatestFinalizedState(&post_wipe_probe)) {
-                        defer post_wipe_probe.deinit();
-                        if (post_wipe_probe.config.genesis_time != chain_config.genesis.genesis_time) {
-                            self.logger.err("genesis time still mismatches after database wipe (db={d}, config={d})", .{
-                                post_wipe_probe.config.genesis_time,
-                                chain_config.genesis.genesis_time,
-                            });
-                            return error.GenesisTimeMismatch;
-                        }
-                    } else |_| {
-                        // Fresh DB has no state — expected after a wipe.
-                    }
                 }
             } else |_| {
                 // Empty or unreadable DB — nothing to check, proceed normally.
@@ -1450,3 +1434,4 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
 }
+
