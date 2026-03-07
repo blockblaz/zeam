@@ -27,7 +27,7 @@ pub fn get_input(allocator: std.mem.Allocator) []const u8 {
     const input_len: usize = @intCast(len_buf);
 
     const word_count: u32 = @intCast((input_len + 3) / 4);
-    const buf = allocator.alignedAlloc(u8, 4, word_count * 4) catch @panic("could not allocate space for input");
+    const buf = allocator.alignedAlloc(u8, .@"4", word_count * 4) catch @panic("could not allocate space for input");
 
     io.hint_buffer_u32(buf.ptr, word_count);
 

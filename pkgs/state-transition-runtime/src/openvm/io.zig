@@ -16,8 +16,7 @@ pub fn hint_store_u32(ptr: *u32) void {
     asm volatile (".insn i 0x0b, 1, %[ptr], x0, 0"
         :
         : [ptr] "r" (ptr),
-        : "memory"
-    );
+        : .{ .memory = true });
 }
 
 pub fn hint_buffer_u32(ptr: [*]u8, word_count: u32) void {
@@ -25,6 +24,5 @@ pub fn hint_buffer_u32(ptr: [*]u8, word_count: u32) void {
         :
         : [ptr] "r" (ptr),
           [wc] "r" (word_count),
-        : "memory"
-    );
+        : .{ .memory = true });
 }
