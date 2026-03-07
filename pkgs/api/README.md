@@ -2,14 +2,18 @@
 
 ## Overview
 
-This package provides the HTTP API server for the Zeam node with the following endpoints:
+This package provides two HTTP servers for the Zeam node:
 
-- Server-Sent Events (SSE) stream for real-time chain events at `/events`
-- Prometheus metrics endpoint at `/metrics`
-- Health check at `/lean/v0/health`
-- Finalized checkpoint state at `/lean/v0/states/finalized` (for checkpoint sync)
-- Justified checkpoint information at `/lean/v0/checkpoints/justified`
-- Fork choice graph visualization at `/api/forkchoice/graph` (Grafana node-graph compatible)
+**Metrics Server** (port 9668) - starts immediately:
+- `/metrics` - Prometheus metrics
+- `/lean/v0/health` - Liveness check
+
+**API Server** (port 9667) - starts after chain init:
+- `/lean/v0/ready` - Readiness check
+- `/lean/v0/states/finalized` - Checkpoint state (for checkpoint sync)
+- `/lean/v0/checkpoints/justified` - Justified checkpoint info
+- `/api/forkchoice/graph` - Fork choice visualization (Grafana compatible)
+- `/events` - SSE stream for real-time chain events
 
 ## Package Components
 
@@ -32,9 +36,10 @@ Provides real-time chain event streaming via Server-Sent Events:
 - `new_justification` - New justified checkpoint
 - `new_finalization` - New finalized checkpoint
 
-### 2. Health Checks
+### 2. Health & Readiness Checks
 
-Simple health check endpoint at `/lean/v0/health`.
+- `/lean/v0/health` on metrics server (9668) - Liveness check, available immediately
+- `/lean/v0/ready` on API server (9667) - Readiness check, available after chain init
 
 ## Event System
 
@@ -100,12 +105,20 @@ Streams real-time chain events (head, justification, finalization).
 curl -N http://localhost:9667/events
 ```
 
-### `/lean/v0/health`
+### `/lean/v0/health` (Metrics Server)
 
-Returns node health status.
+Returns liveness status. Available immediately on metrics port.
 
 ```sh
-curl http://localhost:9667/lean/v0/health
+curl http://localhost:9668/lean/v0/health
+```
+
+### `/lean/v0/ready` (API Server)
+
+Returns readiness status. Available after chain initialization.
+
+```sh
+curl http://localhost:9667/lean/v0/ready
 ```
 
 ### `/api/forkchoice/graph`
@@ -162,24 +175,27 @@ The API system is initialized at startup in `pkgs/cli/src/main.zig`:
 // Initialize metrics
 try api.init(allocator);
 
-// Start HTTP server in background thread
-// chain can be null for early startup (chain-dependent endpoints return 503 until set)
-var handle = try api_server.startAPIServer(allocator, port, logger_config, chain);
+// Start metrics server early (no chain dependency)
+var metrics_handle = try metrics_server.startMetricsServer(allocator, metrics_port, logger_config);
 
-// Later, set chain if started with null
-handle.setChain(beam_chain);
+// After chain initialization, start API server
+var api_handle = try api_server.startAPIServer(allocator, api_port, logger_config, chain);
 
 // Graceful shutdown
-handle.stop();
+api_handle.stop();
+metrics_handle.stop();
 ```
 
-The server exposes:
-- SSE at `/events`
-- Metrics at `/metrics`
-- Health at `/lean/v0/health`
-- Checkpoint state at `/lean/v0/states/finalized`
-- Justified checkpoint at `/lean/v0/checkpoints/justified`
-- Fork choice visualization at `/api/forkchoice/graph`
+**Metrics Server** (port 9668) - starts immediately:
+- `/metrics` - Prometheus metrics
+- `/lean/v0/health` - Liveness check (JSON)
+
+**API Server** (port 9667) - starts after chain init:
+- `/lean/v0/ready` - Readiness check (JSON)
+- `/lean/v0/states/finalized` - Checkpoint state (SSZ)
+- `/lean/v0/checkpoints/justified` - Justified checkpoint (JSON)
+- `/api/forkchoice/graph` - Fork choice visualization (JSON)
+- `/events` - SSE event streaming
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
 
@@ -223,26 +239,29 @@ pkgs/cli/src/api_server.zig ← HTTP server (serves via endpoints)
 Start a node:
 
 ```sh
-./zig-out/bin/zeam beam --mockNetwork --api-port 9668
+./zig-out/bin/zeam beam --mockNetwork
 ```
 
 Test endpoints:
 
 ```sh
-# SSE events
-curl -N http://localhost:9668/events
-
-# Metrics
-curl http://localhost:9668/metrics
-
-# Health
+# Health (metrics server - port 9668)
 curl http://localhost:9668/lean/v0/health
 
-# Checkpoint state
-curl http://localhost:9668/lean/v0/states/finalized -o state.ssz
+# Metrics (metrics server - port 9668)
+curl http://localhost:9668/metrics
 
-# Justified checkpoint
-curl http://localhost:9668/lean/v0/checkpoints/justified
+# Readiness (API server - port 9667)
+curl http://localhost:9667/lean/v0/ready
+
+# SSE events (API server - port 9667)
+curl -N http://localhost:9667/events
+
+# Checkpoint state (API server - port 9667)
+curl http://localhost:9667/lean/v0/states/finalized -o state.ssz
+
+# Justified checkpoint (API server - port 9667)
+curl http://localhost:9667/lean/v0/checkpoints/justified
 ```
 
 ## Visualization with Prometheus & Grafana
