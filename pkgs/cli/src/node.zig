@@ -1434,4 +1434,3 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
 }
-
