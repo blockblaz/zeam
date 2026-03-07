@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub fn print_str(str: []const u8) void {
     asm volatile (".insn i 0x0b, 3, x0, %[ptr], 1"
         :
