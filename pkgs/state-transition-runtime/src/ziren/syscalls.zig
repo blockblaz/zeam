@@ -26,8 +26,7 @@ pub inline fn syscall_0(num: u32) u32 {
     return asm volatile ("syscall"
         : [ret] "={$2}" (-> u32),
         : [num] "{$2}" (num),
-        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true }
-    );
+        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true });
 }
 
 pub inline fn syscall_1(num: u32, a0: u32) u32 {
@@ -35,8 +34,7 @@ pub inline fn syscall_1(num: u32, a0: u32) u32 {
         : [ret] "={$2}" (-> u32),
         : [num] "{$2}" (num),
           [a0] "{$4}" (a0),
-        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true }
-    );
+        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true });
 }
 
 pub inline fn syscall_2(num: u32, a0: u32, a1: u32) u32 {
@@ -45,8 +43,7 @@ pub inline fn syscall_2(num: u32, a0: u32, a1: u32) u32 {
         : [num] "{$2}" (num),
           [a0] "{$4}" (a0),
           [a1] "{$5}" (a1),
-        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true }
-    );
+        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true });
 }
 
 pub inline fn syscall_3(num: u32, a0: u32, a1: u32, a2: u32) u32 {
@@ -56,8 +53,7 @@ pub inline fn syscall_3(num: u32, a0: u32, a1: u32, a2: u32) u32 {
           [a0] "{$4}" (a0),
           [a1] "{$5}" (a1),
           [a2] "{$6}" (a2),
-        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true }
-    );
+        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true });
 }
 
 pub inline fn syscall_noreturn(num: u32, a0: u32) noreturn {
@@ -65,7 +61,6 @@ pub inline fn syscall_noreturn(num: u32, a0: u32) noreturn {
         :
         : [num] "{$2}" (num),
           [a0] "{$4}" (a0),
-        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true }
-    );
+        : .{ .r1 = true, .r3 = true, .r7 = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .r24 = true, .r25 = true, .memory = true });
     unreachable;
 }
