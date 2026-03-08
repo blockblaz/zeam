@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use bincode::Options;
 use openvm_circuit::arch::ContinuationVmProof;
 use openvm_platform::platform::memory::MEM_SIZE;
 use openvm_sdk::{
@@ -9,7 +10,6 @@ use openvm_sdk::{
 };
 use openvm_stark_sdk::config::FriParameters;
 use openvm_transpiler::elf::Elf;
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -68,13 +68,22 @@ extern "C" fn openvm_prove(
         panic!("Input length {} exceeds maximum {}", len, MAX_INPUT_LEN);
     }
     if output_len > MAX_OUTPUT_LEN {
-        panic!("Output length {} exceeds maximum {}", output_len, MAX_OUTPUT_LEN);
+        panic!(
+            "Output length {} exceeds maximum {}",
+            output_len, MAX_OUTPUT_LEN
+        );
     }
     if binary_path_len > MAX_PATH_LEN {
-        panic!("Binary path length {} exceeds maximum {}", binary_path_len, MAX_PATH_LEN);
+        panic!(
+            "Binary path length {} exceeds maximum {}",
+            binary_path_len, MAX_PATH_LEN
+        );
     }
     if result_path_len > MAX_PATH_LEN {
-        panic!("Result path length {} exceeds maximum {}", result_path_len, MAX_PATH_LEN);
+        panic!(
+            "Result path length {} exceeds maximum {}",
+            result_path_len, MAX_PATH_LEN
+        );
     }
 
     let serialized_block = unsafe {
@@ -185,11 +194,17 @@ extern "C" fn openvm_verify(
     receipt_len: usize,
 ) -> bool {
     if binary_path_len > MAX_PATH_LEN {
-        eprintln!("openvm_verify: binary path length {} exceeds maximum {}", binary_path_len, MAX_PATH_LEN);
+        eprintln!(
+            "openvm_verify: binary path length {} exceeds maximum {}",
+            binary_path_len, MAX_PATH_LEN
+        );
         return false;
     }
     if receipt_len > MAX_RECEIPT_LEN {
-        eprintln!("openvm_verify: receipt length {} exceeds maximum {}", receipt_len, MAX_RECEIPT_LEN);
+        eprintln!(
+            "openvm_verify: receipt length {} exceeds maximum {}",
+            receipt_len, MAX_RECEIPT_LEN
+        );
         return false;
     }
 
@@ -243,7 +258,10 @@ extern "C" fn openvm_verify(
             return false;
         }
         Err(e) => {
-            eprintln!("openvm_verify: failed to stat ELF at {}: {}", binary_path, e);
+            eprintln!(
+                "openvm_verify: failed to stat ELF at {}: {}",
+                binary_path, e
+            );
             return false;
         }
         _ => {}
