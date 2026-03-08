@@ -6,6 +6,8 @@
 
 ## LeanSpec Client Documentation
 
+[Lean Consensus Book](https://github.com/leanEthereum/leanSpec/blob/main/lean_consensus.pdf)
+
 [LeanSpec Client Docs](https://github.com/leanEthereum/leanSpec/tree/main/docs/client)
 
 - [Chain](https://github.com/leanEthereum/leanSpec/blob/main/docs/client/chain.md)
