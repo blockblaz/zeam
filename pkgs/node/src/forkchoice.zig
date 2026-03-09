@@ -250,9 +250,8 @@ const AttestationSource = enum {
     new,
     /// Merge both pools: for each validator, use the attestation with the
     /// higher slot. This is needed for safe-target calculation at interval 3,
-    /// where "new" has not yet been promoted but "known" may contain
-    /// attestations that bypassed the gossip pipeline (e.g. proposer's own
-    /// attestation bundled in a block, or a node's self-attestation).
+    /// where "new" has not yet been promoted but "known" contains the
+    /// proposer's attestation (bundled in the block, never enters "new").
     merged,
 };
 
@@ -1009,9 +1008,8 @@ pub const ForkChoice = struct {
                 .new => attestation_tracker.latestNew,
                 .merged => blk: {
                     // Merge both pools: pick whichever has the higher slot.
-                    // This ensures attestations that bypassed gossip (e.g.
-                    // proposer's own attestation in a block, or self-attestation)
-                    // are included in the safe target calculation.
+                    // The proposer's attestation is only in "known" (bundled
+                    // in the block); without merging it would be missed.
                     const known = attestation_tracker.latestKnown;
                     const new = attestation_tracker.latestNew;
                     if (known == null) break :blk new;
@@ -1090,10 +1088,9 @@ pub const ForkChoice = struct {
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         // Merge both known and new attestation pools for safe target calculation.
-        // At interval 3, some attestations may only exist in "known" (e.g.
-        // proposer's own attestation bundled in a block, or self-attestation
-        // that bypasses the gossip pipeline). Using only "new" would undercount
-        // support and cause the safe target to stall.
+        // At interval 3, the proposer's attestation only exists in "known"
+        // (bundled in the block via onBlock, skipped by mayBeDoAttestation).
+        // Using only "new" would miss that vote and undercount support.
         self.safeTarget = try self.computeFCHeadUnlocked(.merged, cutoff_weight);
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
