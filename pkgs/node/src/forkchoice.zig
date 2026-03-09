@@ -242,6 +242,20 @@ const ProtoAttestation = struct {
     attestation_data: ?types.AttestationData = null,
 };
 
+/// Which attestation pool(s) to use when computing fork-choice deltas.
+const AttestationSource = enum {
+    /// Only on-chain / previously-accepted attestations.
+    known,
+    /// Only fresh gossip attestations not yet on-chain.
+    new,
+    /// Merge both pools: for each validator, use the attestation with the
+    /// higher slot. This is needed for safe-target calculation at interval 3,
+    /// where "new" has not yet been promoted but "known" may contain
+    /// attestations that bypassed the gossip pipeline (e.g. proposer's own
+    /// attestation bundled in a block, or a node's self-attestation).
+    merged,
+};
+
 const AttestationTracker = struct {
     // prev latest attestation applied index null if not applied
     appliedIndex: ?usize = null,
@@ -972,7 +986,7 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     // Always reads from the per-validator attestation tracker (sole source of truth for fork choice).
-    fn computeDeltasUnlocked(self: *Self, from_known: bool) ![]isize {
+    fn computeDeltasUnlocked(self: *Self, source: AttestationSource) ![]isize {
         // prep the deltas data structure
         while (self.deltas.items.len < self.protoArray.nodes.items.len) {
             try self.deltas.append(self.allocator, 0);
@@ -990,10 +1004,21 @@ pub const ForkChoice = struct {
             }
             attestation_tracker.appliedIndex = null;
 
-            const latest_attestation = if (from_known)
-                attestation_tracker.latestKnown
-            else
-                attestation_tracker.latestNew;
+            const latest_attestation = switch (source) {
+                .known => attestation_tracker.latestKnown,
+                .new => attestation_tracker.latestNew,
+                .merged => blk: {
+                    // Merge both pools: pick whichever has the higher slot.
+                    // This ensures attestations that bypassed gossip (e.g.
+                    // proposer's own attestation in a block, or self-attestation)
+                    // are included in the safe target calculation.
+                    const known = attestation_tracker.latestKnown;
+                    const new = attestation_tracker.latestNew;
+                    if (known == null) break :blk new;
+                    if (new == null) break :blk known;
+                    break :blk if (new.?.slot > known.?.slot) new else known;
+                },
+            };
 
             if (latest_attestation) |delta_attestation| {
                 self.deltas.items[delta_attestation.index] += validatorWeight;
@@ -1006,8 +1031,8 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn computeFCHeadUnlocked(self: *Self, from_known: bool, cutoff_weight: u64) !ProtoBlock {
-        const deltas = try self.computeDeltasUnlocked(from_known);
+    fn computeFCHeadUnlocked(self: *Self, source: AttestationSource, cutoff_weight: u64) !ProtoBlock {
+        const deltas = try self.computeDeltasUnlocked(source);
         try self.protoArray.applyDeltasUnlocked(deltas, cutoff_weight);
 
         // head is the best descendant of latest justified
@@ -1018,8 +1043,8 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
-            from_known,
+        self.logger.debug("computeFCHead source={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+            source,
             cutoff_weight,
             deltas.len,
             justified_node,
@@ -1033,7 +1058,7 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn updateHeadUnlocked(self: *Self) !ProtoBlock {
         const previous_head = self.head;
-        self.head = try self.computeFCHeadUnlocked(true, 0);
+        self.head = try self.computeFCHeadUnlocked(.known, 0);
 
         // Update the lean_head_slot metric
         zeam_metrics.metrics.lean_head_slot.set(self.head.slot);
@@ -1064,7 +1089,12 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
+        // Merge both known and new attestation pools for safe target calculation.
+        // At interval 3, some attestations may only exist in "known" (e.g.
+        // proposer's own attestation bundled in a block, or self-attestation
+        // that bypasses the gossip pipeline). Using only "new" would undercount
+        // support and cause the safe target to stall.
+        self.safeTarget = try self.computeFCHeadUnlocked(.merged, cutoff_weight);
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
@@ -1633,10 +1663,10 @@ pub const ForkChoice = struct {
         return self.confirmBlockUnlocked(blockRoot);
     }
 
-    pub fn computeDeltas(self: *Self, from_known: bool) ![]isize {
+    pub fn computeDeltas(self: *Self, source: AttestationSource) ![]isize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.computeDeltasUnlocked(from_known);
+        return self.computeDeltasUnlocked(source);
     }
 
     pub fn applyDeltas(self: *Self, deltas: []isize, cutoff_weight: u64) !void {
@@ -2527,7 +2557,7 @@ test "rebase: parent pointer integrity after pruning" {
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items[8].parent.? == 7); // I -> H
 
     // Populate deltas array (required before rebase)
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Rebase to C (0xCC)
     try ctx.fork_choice.rebase(createTestRoot(0xCC), null);
@@ -2620,7 +2650,7 @@ test "rebase: bestChild and bestDescendant remapping" {
     _ = try ctx.fork_choice.acceptNewAttestations();
 
     // Apply deltas to establish weights and bestChild/bestDescendant
-    const deltas = try ctx.fork_choice.computeDeltas(true);
+    const deltas = try ctx.fork_choice.computeDeltas(.known);
     try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Verify pre-rebase bestChild/bestDescendant
@@ -2721,7 +2751,7 @@ test "rebase: weight preservation after rebase" {
     _ = try ctx.fork_choice.acceptNewAttestations();
 
     // Apply deltas to establish weights
-    const deltas = try ctx.fork_choice.computeDeltas(true);
+    const deltas = try ctx.fork_choice.computeDeltas(.known);
     try ctx.fork_choice.applyDeltas(deltas, 0);
 
     // Record pre-rebase weights for nodes that will remain
@@ -2801,7 +2831,7 @@ test "rebase: attestation tracker latestKnown index remapping" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att3);
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Verify pre-rebase attestation indices
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestKnown.?.index == 3); // D
@@ -2850,7 +2880,7 @@ test "rebase: attestation tracker latestNew index remapping" {
     const att1 = createTestSignedAttestation(1, createTestRoot(0xFF), 8); // F
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att1);
 
-    _ = try ctx.fork_choice.computeDeltas(false);
+    _ = try ctx.fork_choice.computeDeltas(.new);
 
     // Verify pre-rebase: latestNew is set, latestKnown is null
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestNew.?.index == 3);
@@ -2899,7 +2929,7 @@ test "rebase: attestation tracker appliedIndex remapping" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att3);
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Verify pre-rebase appliedIndex values
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.appliedIndex.? == 3); // D
@@ -2960,7 +2990,7 @@ test "rebase: orphaned attestations set to null" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att3);
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Verify pre-rebase attestation indices
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestKnown.?.index == 1); // B
@@ -3040,8 +3070,8 @@ test "rebase: mixed latestKnown and latestNew with orphaned votes" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att1_new);
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att2_new);
 
-    _ = try ctx.fork_choice.computeDeltas(true);
-    _ = try ctx.fork_choice.computeDeltas(false);
+    _ = try ctx.fork_choice.computeDeltas(.known);
+    _ = try ctx.fork_choice.computeDeltas(.new);
 
     // Verify pre-rebase state
     try std.testing.expect(ctx.fork_choice.attestations.get(0).?.latestKnown.?.index == 3); // D
@@ -3089,7 +3119,7 @@ test "rebase: edge case - genesis rebase (no-op)" {
     const att = createTestSignedAttestation(0, createTestRoot(0xFF), 8);
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att);
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Record pre-rebase state
     const pre_node_count = ctx.fork_choice.protoArray.nodes.items.len;
@@ -3133,7 +3163,7 @@ test "rebase: edge case - rebase to head (prune all but head)" {
     const att = createTestSignedAttestation(0, createTestRoot(0xFF), 8);
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att);
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Rebase to F (0xFF, head)
     try ctx.fork_choice.rebase(createTestRoot(0xFF), null);
@@ -3184,7 +3214,7 @@ test "rebase: edge case - missed slots preserved in remaining tree" {
     defer ctx.deinit();
 
     // Populate deltas array (required before rebase)
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Rebase to D (0xDD, slot 5)
     try ctx.fork_choice.rebase(createTestRoot(0xDD), null);
@@ -3224,7 +3254,7 @@ test "rebase: error - InvalidTargetAnchor for non-existent root" {
     const pre_node_count = ctx.fork_choice.protoArray.nodes.items.len;
 
     // Populate deltas array (required before rebase in normal cases)
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Try to rebase to non-existent root
     const non_existent_root = createTestRoot(0x99);
@@ -3272,7 +3302,7 @@ test "rebase: complex fork with attestations on multiple branches" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att3);
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Rebase to D (0xDD)
     try ctx.fork_choice.rebase(createTestRoot(0xDD), null);
@@ -3400,7 +3430,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     }
 
     _ = try fork_choice.acceptNewAttestations();
-    _ = try fork_choice.computeDeltas(true);
+    _ = try fork_choice.computeDeltas(.known);
 
     // Verify all attestations are set
     for (0..validator_count) |validator_id| {
@@ -3456,7 +3486,7 @@ test "rebase: deltas array is properly shrunk" {
     }
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Record pre-rebase deltas length (should match node count = 9)
     const pre_deltas_len = ctx.fork_choice.deltas.items.len;
@@ -3497,7 +3527,7 @@ test "rebase: bestChild/bestDescendant null handled in rebase (issue #545)" {
     }
 
     // applyDeltas with cutoff_weight=1 can leave some nodes with bestChild set, bestDescendant null
-    const deltas = try ctx.fork_choice.computeDeltas(true);
+    const deltas = try ctx.fork_choice.computeDeltas(.known);
     try ctx.fork_choice.applyDeltas(deltas, 1);
 
     // Rebase to C — must not panic (previously hit "null best descendant for a non null best child")
@@ -3566,7 +3596,7 @@ test "rebase: to fork branch node (G) removes previous canonical chain" {
     try stageAggregatedAttestation(allocator, &ctx.fork_choice, att3);
 
     _ = try ctx.fork_choice.acceptNewAttestations();
-    _ = try ctx.fork_choice.computeDeltas(true);
+    _ = try ctx.fork_choice.computeDeltas(.known);
 
     // Verify pre-rebase state
     try std.testing.expect(ctx.fork_choice.protoArray.nodes.items.len == 9);
