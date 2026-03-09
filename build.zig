@@ -81,6 +81,13 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
         comp.linkFramework("CoreFoundation");
         comp.linkFramework("SystemConfiguration");
         comp.linkFramework("Security");
+    } else if (target.result.os.tag == .linux) {
+        // Rust's native_tls crate uses OpenSSL on Linux (via openssl-sys).
+        // The prover glue libraries (risc0, sp1, etc.) pull in reqwest →
+        // hyper_tls → native_tls → openssl, so we need to link against
+        // libssl and libcrypto.
+        comp.linkSystemLibrary("ssl");
+        comp.linkSystemLibrary("crypto");
     }
 }
 
