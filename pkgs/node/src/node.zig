@@ -1080,7 +1080,7 @@ pub const BeamNode = struct {
             }
 
             const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
-            if (interval_in_slot == 2) {
+            if (interval_in_slot == 3) {
                 if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
                     return e;
