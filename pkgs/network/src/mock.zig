@@ -622,7 +622,7 @@ pub const Mock = struct {
             // Fallback to default if no peers found
             break :blk "mock_publisher";
         };
-        return self.gossipHandler.onGossip(data, sender_peer_id, true);
+        return self.gossipHandler.onGossip(data, sender_peer_id, false);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -632,7 +632,7 @@ pub const Mock = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const interface.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.gossipHandler.onGossip(data, sender_peer_id, true);
+        return self.gossipHandler.onGossip(data, sender_peer_id, false);
     }
 
     pub fn sendRequest(ptr: *anyopaque, peer_id: []const u8, req: *const interface.ReqRespRequest, callback: ?interface.OnReqRespResponseCbHandler) anyerror!u64 {
