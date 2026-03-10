@@ -771,6 +771,18 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
+                // Validate attestation data before processing (same rules as individual gossip attestations)
+                self.validateAttestationData(signed_aggregation.data, false) catch |err| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    switch (err) {
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        else => {
+                            self.logger.warn("gossip aggregation validation failed: {any}", .{err});
+                            return .{};
+                        },
+                    }
+                };
+
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
@@ -1374,11 +1386,6 @@ pub const BeamChain = struct {
         });
     }
 
-    /// Thin wrapper around validateAttestationData for callers that have a full Attestation.
-    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
-        return self.validateAttestationData(attestation.data, is_from_block);
-    }
-
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
@@ -1397,9 +1404,6 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate the attestation data first (same rules as individual gossip attestations)
-        try self.validateAttestationData(signedAggregation.data, false);
-
         try self.verifyAggregatedAttestation(signedAggregation);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
@@ -1973,7 +1977,7 @@ test "attestation validation - comprehensive" {
             .signature = ZERO_SIGBYTES,
         };
         // Should pass validation
-        try beam_chain.validateAttestation(valid_attestation.toAttestation(), false);
+        try beam_chain.validateAttestationData(valid_attestation.message, false);
     }
 
     // Test 2: Unknown source block
@@ -1998,7 +2002,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 3: Unknown target block
@@ -2023,7 +2027,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 4: Unknown head block
@@ -2048,7 +2052,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
     // Test 5: Source slot exceeds target slot (block slots)
     {
@@ -2071,7 +2075,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 6: Source checkpoint slot exceeds target checkpoint slot
@@ -2095,7 +2099,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 7: Source checkpoint slot mismatch
@@ -2119,7 +2123,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 8: Target checkpoint slot mismatch
@@ -2143,7 +2147,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 9: Attestation too far in future (for gossip)
@@ -2167,7 +2171,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.toAttestation(), false));
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(future_attestation.message, false));
     }
 }
 
@@ -2244,11 +2248,11 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Gossip attestations: should FAIL for next slot (current + 1)
     // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
 
     // Block attestations: should PASS for next slot (current + 1)
     // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
-    try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), true);
+    try beam_chain.validateAttestationData(next_slot_attestation.message, true);
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
@@ -2269,8 +2273,8 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
     // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), true));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
