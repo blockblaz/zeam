@@ -884,14 +884,9 @@ pub const ForkChoice = struct {
         // Attestations that were "new" (gossip) are now "known" (accepted).
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            if (tracker.latestNew) |new_att| {
-                const known_slot = if (tracker.latestKnown) |k| k.slot else 0;
-                if (new_att.slot > known_slot) {
-                    tracker.latestKnown = tracker.latestNew;
-                }
-                tracker.latestNew = null;
-                try self.attestations.put(validator_id, tracker);
-            }
+            // latest new is always ahead of latestknow (and will be non null if latestknown is not null)
+            tracker.latestKnown = tracker.latestNew;
+            try self.attestations.put(validator_id, tracker);
         }
 
         return self.updateHeadUnlocked();
@@ -1166,12 +1161,12 @@ pub const ForkChoice = struct {
                     .slot = attestation_slot,
                     .attestation_data = attestation_data,
                 };
-            }
 
-            // also clear out our latest new non included attestation if this is even later than that
-            const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-            if (attestation_slot > attestation_tracker_latest_new_slot) {
-                attestation_tracker.latestNew = null;
+                // also clear out our latest new non included attestation if this is even later than that
+                const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
+                if (attestation_slot > attestation_tracker_latest_new_slot) {
+                    attestation_tracker.latestNew = attestation_tracker.latestKnown;
+                }
             }
         } else {
             if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
