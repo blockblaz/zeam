@@ -617,7 +617,7 @@ fn mainInner() !void {
                 .db = db_2,
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
-                .is_aggregator = beamcmd.@"is-aggregator",
+                .is_aggregator = false,
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -635,7 +635,7 @@ fn mainInner() !void {
                 .db = db_3,
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
-                .is_aggregator = beamcmd.@"is-aggregator",
+                .is_aggregator = false,
             });
 
             // Delayed runner - starts both network3 and node3 together
