@@ -83,6 +83,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Free disk space (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcrunner /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        df -h /
+
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
@@ -135,6 +142,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
     - uses: actions/checkout@v4
+
+    - name: Free disk space (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcrunner /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        df -h /
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -190,6 +204,13 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
+
+    - name: Free disk space (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcrunner /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        df -h /
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
@@ -262,6 +283,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Free disk space (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcrunner /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        df -h /
+
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
@@ -300,6 +328,13 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0  # Fetch full history to get git commit info
+
+    - name: Free disk space (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcrunner /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force || true
+        df -h /
 
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
