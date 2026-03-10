@@ -737,7 +737,7 @@ pub const BeamChain = struct {
                 });
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_attestation.message.toAttestation(), false) catch |err| {
+                self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     // Propagate unknown block errors to node.zig for context-aware logging
                     // (downgrade to debug when the missing block is already being fetched)
@@ -874,24 +874,21 @@ pub const BeamChain = struct {
                     continue;
                 }
 
+                // Validate aggregated attestation data once before processing individual validators
+                self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                    if (e == AttestationValidationError.UnknownHeadBlock) {
+                        try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                    }
+                    self.logger.err("invalid aggregated attestation data in block: error={any}", .{e});
+                    continue;
+                };
+
                 for (validator_indices.items) |validator_index| {
                     const validator_id: types.ValidatorIndex = @intCast(validator_index);
                     const attestation = types.Attestation{
                         .validator_id = validator_id,
                         .data = aggregated_attestation.data,
-                    };
-
-                    self.validateAttestation(attestation, true) catch |e| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        if (e == AttestationValidationError.UnknownHeadBlock) {
-                            try missing_roots.append(self.allocator, attestation.data.head.root);
-                        }
-
-                        self.logger.err("invalid attestation in block: validator={d} error={any}", .{
-                            validator_index,
-                            e,
-                        });
-                        continue;
                     };
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
