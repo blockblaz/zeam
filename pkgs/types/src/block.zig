@@ -33,20 +33,19 @@ const json = std.json;
 const freeJsonValue = utils.freeJsonValue;
 
 // signatures_map types for aggregation
-/// SignatureKey is used to index signatures by (validator_id, data_root).
-pub const SignatureKey = struct {
-    validator_id: ValidatorIndex,
-    data_root: Root,
-};
 
-/// Stored signatures_map entry
+/// Stored signatures_map entry: per-validator signature + slot metadata.
 pub const StoredSignature = struct {
     slot: Slot,
     signature: SIGBYTES,
 };
 
-/// Map type for signatures_map: SignatureKey -> individual XMSS signature bytes + slot metadata
-pub const SignaturesMap = std.AutoHashMap(SignatureKey, StoredSignature);
+/// Inner map: ValidatorIndex -> StoredSignature for a given AttestationData.
+pub const GossipSignaturesInnerMap = std.AutoHashMap(ValidatorIndex, StoredSignature);
+
+/// Map type for gossip signatures: AttestationData -> per-validator signatures.
+/// Replaces the old SignatureKey(validator_id, data_root) -> StoredSignature design.
+pub const SignaturesMap = std.AutoHashMap(attestation.AttestationData, GossipSignaturesInnerMap);
 
 /// Stored aggregated payload entry
 pub const StoredAggregatedPayload = struct {
@@ -57,8 +56,9 @@ pub const StoredAggregatedPayload = struct {
 /// List of aggregated payloads for a single key
 pub const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
 
-/// Map type for aggregated payloads: SignatureKey -> list of AggregatedSignatureProof
-pub const AggregatedPayloadsMap = std.AutoHashMap(SignatureKey, AggregatedPayloadsList);
+/// Map type for aggregated payloads: AttestationData -> list of AggregatedSignatureProof.
+/// Replaces the old SignatureKey(validator_id, data_root) -> AggregatedPayloadsList design.
+pub const AggregatedPayloadsMap = std.AutoHashMap(attestation.AttestationData, AggregatedPayloadsList);
 
 // Types
 pub const BeamBlockBody = struct {
@@ -379,7 +379,6 @@ pub const AggregatedAttestationsResult = struct {
 
         // Process each group
         for (groups.items) |*group| {
-            const data_root = group.data_root;
             const epoch: u64 = group.data.slot;
             var message_hash: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(attestation.AttestationData, group.data, &message_hash, allocator);
@@ -422,9 +421,12 @@ pub const AggregatedAttestationsResult = struct {
 
             // Attempt to collect each validator's signature from signatures_map
             var validator_it = group.validator_bits.iterator(.{});
+            // Look up the inner map for this attestation data (keyed by AttestationData directly)
+            const inner_map_opt = signatures_map.getPtr(group.data);
             while (validator_it.next()) |validator_id| {
                 const vid: ValidatorIndex = @intCast(validator_id);
-                if (signatures_map.get(.{ .validator_id = vid, .data_root = data_root })) |sig_entry| {
+                const sig_entry_opt: ?StoredSignature = if (inner_map_opt) |inner| inner.get(vid) else null;
+                if (sig_entry_opt) |sig_entry| {
                     // Check if it's not a zero signature
                     if (!std.mem.eql(u8, &sig_entry.signature, &ZERO_SIGBYTES)) {
                         // Deserialize signature
@@ -464,26 +466,25 @@ pub const AggregatedAttestationsResult = struct {
                 }
             }
 
-            // Phase 2: Fallback to aggregated_payloads using greedy set-cover
+            // Phase 2: Fallback to aggregated_payloads using greedy set-cover.
+            // Candidates are now keyed by AttestationData directly (not per-validator).
             if (aggregated_payloads) |agg_payloads| {
+                const candidates_opt = agg_payloads.get(group.data);
+
                 // Temporary bitset for computing coverage
                 var proof_bits = try std.DynamicBitSet.initEmpty(allocator, max_validator);
                 defer proof_bits.deinit();
 
                 while (remaining.count() > 0) {
-                    // Pick any remaining validator to look up proofs
-                    const target_id = remaining.findFirstSet() orelse break;
-                    const vid: ValidatorIndex = @intCast(target_id);
-
-                    // Remove the target_id from remaining if not covered by stored proofs
-                    const candidates = agg_payloads.get(.{ .validator_id = vid, .data_root = data_root }) orelse {
-                        remaining.unset(target_id);
-                        continue;
+                    const candidates = candidates_opt orelse {
+                        // No proofs for this attestation data — clear remaining
+                        remaining.setRangeValue(.{ .start = 0, .end = remaining.capacity() }, false);
+                        break;
                     };
 
                     if (candidates.items.len == 0) {
-                        remaining.unset(target_id);
-                        continue;
+                        remaining.setRangeValue(.{ .start = 0, .end = remaining.capacity() }, false);
+                        break;
                     }
 
                     // Find the proof covering the most remaining validators (greedy set-cover)
@@ -523,8 +524,9 @@ pub const AggregatedAttestationsResult = struct {
                     }
 
                     if (best_proof == null or max_coverage == 0) {
-                        remaining.unset(target_id);
-                        continue;
+                        // No proof covers any remaining validator — stop
+                        remaining.setRangeValue(.{ .start = 0, .end = remaining.capacity() }, false);
+                        break;
                     }
 
                     // Clone and add the proof
