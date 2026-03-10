@@ -2394,6 +2394,5 @@ test "attestation processing - valid block attestation" {
     try beam_chain.onGossipAttestation(gossip_attestation);
 
     // Verify the attestation data was recorded for aggregation
-    const data_root = try valid_attestation.message.sszRoot(allocator);
-    try std.testing.expect(beam_chain.forkChoice.attestation_data_by_root.get(data_root) != null);
+    try std.testing.expect(beam_chain.forkChoice.gossip_signatures.get(valid_attestation.message) != null);
 }
