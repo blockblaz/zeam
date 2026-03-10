@@ -1846,7 +1846,6 @@ test "aggregateCommitteeSignatures prunes aggregated gossip signatures" {
         .signature = signature,
     });
 
-    const data_root = try attestation_data.sszRoot(allocator);
     const aggregations = try fork_choice.aggregateCommitteeSignatures(&mock_chain.genesis_state);
     defer {
         for (aggregations) |*signed_aggregation| {
@@ -1857,10 +1856,7 @@ test "aggregateCommitteeSignatures prunes aggregated gossip signatures" {
 
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
     try std.testing.expectEqual(@as(usize, 0), fork_choice.gossip_signatures.count());
-    try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(.{
-        .validator_id = 0,
-        .data_root = data_root,
-    }) != null);
+    try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(attestation_data) != null);
 }
 
 // Helper function to create a deterministic test root filled with a specific byte
