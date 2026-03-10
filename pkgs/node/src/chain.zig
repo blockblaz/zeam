@@ -786,35 +786,16 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Validate attestation data before processing (same rules as individual gossip attestations)
-                self.validateAttestationData(signed_aggregation.data, false) catch |err| {
+                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
-                            const att_data = signed_aggregation.data;
-                            const missing_root = if (err == error.UnknownHeadBlock)
-                                att_data.head.root
-                            else if (err == error.UnknownSourceBlock)
-                                att_data.source.root
-                            else
-                                att_data.target.root;
-                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
-                            errdefer roots.deinit(self.allocator);
-                            try roots.append(self.allocator, missing_root);
-                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
-                        },
+                        // Propagate unknown block errors to node.zig for context-aware logging
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
                         else => {
-                            self.logger.warn("gossip aggregation validation failed: {any}", .{err});
+                            self.logger.warn("gossip aggregation processing error: {any}", .{err});
                             return .{};
                         },
                     }
-                };
-
-                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
-                    self.logger.warn("gossip aggregation processing error: {any}", .{err});
-                    return .{};
                 };
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
                 return .{};
@@ -1421,6 +1402,11 @@ pub const BeamChain = struct {
         });
     }
 
+    /// Thin wrapper around validateAttestationData for callers that have a full Attestation.
+    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+        return self.validateAttestationData(attestation.data, is_from_block);
+    }
+
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
@@ -1439,6 +1425,9 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+        // Validate the attestation data first (same rules as individual gossip attestations)
+        try self.validateAttestationData(signedAggregation.data, false);
+
         try self.verifyAggregatedAttestation(signedAggregation);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
