@@ -1064,7 +1064,12 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
+        const new_safe = try self.computeFCHeadUnlocked(false, cutoff_weight);
+        // safeTarget must never regress: once 2/3 of validators confirmed a block,
+        // clearing latestNew (e.g. after block inclusion) must not undo that signal.
+        if (new_safe.slot > self.safeTarget.slot) {
+            self.safeTarget = new_safe;
+        }
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
