@@ -12,6 +12,7 @@ openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" 
 openvm-build = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" }
 openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v1.1.1" }
 openvm-transpiler = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" }
+openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", tag = "v1.3.0" }
 
 [lib]
 crate-type = ["staticlib"]
