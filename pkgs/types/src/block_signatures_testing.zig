@@ -15,12 +15,12 @@ const validator = @import("./validator.zig");
 const block = @import("./block.zig");
 const Allocator = std.mem.Allocator;
 const SignaturesMap = block.SignaturesMap;
+const GossipSignaturesInnerMap = block.GossipSignaturesInnerMap;
 const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
 const ValidatorIndex = utils.ValidatorIndex;
 const Root = utils.Root;
 const ZERO_HASH = utils.ZERO_HASH;
 
-const SignatureKey = block.SignatureKey;
 const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
 const AggregatedPayloadsList = block.AggregatedPayloadsList;
 
@@ -95,7 +95,7 @@ const TestContext = struct {
         };
     }
 
-    /// Sign an attestation and add to signatures map
+    /// Sign an attestation and add to signatures map (keyed by AttestationData)
     pub fn addToSignatureMap(
         self: *TestContext,
         signatures_map: *SignaturesMap,
@@ -103,10 +103,14 @@ const TestContext = struct {
     ) !void {
         const att = self.createAttestation(validator_id);
         const sig_bytes = try self.key_manager.signAttestation(&att, self.allocator);
-        try signatures_map.put(
-            .{ .validator_id = validator_id, .data_root = self.data_root },
-            .{ .slot = self.attestation_data.slot, .signature = sig_bytes },
-        );
+        const gop = try signatures_map.getOrPut(self.attestation_data);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = GossipSignaturesInnerMap.init(self.allocator);
+        }
+        try gop.value_ptr.put(validator_id, .{
+            .slot = self.attestation_data.slot,
+            .signature = sig_bytes,
+        });
     }
 
     /// Create an aggregated proof covering specified validators
@@ -181,15 +185,13 @@ const TestContext = struct {
         return proof;
     }
 
-    /// Add an aggregated proof to the payloads map for a specific validator
+    /// Add an aggregated proof to the payloads map (keyed by AttestationData)
     pub fn addAggregatedPayload(
         self: *TestContext,
         payloads_map: *AggregatedPayloadsMap,
-        lookup_validator_id: ValidatorIndex,
         proof: aggregation.AggregatedSignatureProof,
     ) !void {
-        const key = SignatureKey{ .validator_id = lookup_validator_id, .data_root = self.data_root };
-        const gop = try payloads_map.getOrPut(key);
+        const gop = try payloads_map.getOrPut(self.attestation_data);
         if (!gop.found_existing) {
             gop.value_ptr.* = AggregatedPayloadsList.init(self.allocator);
         }
@@ -220,6 +222,8 @@ const TestContext = struct {
 };
 
 fn deinitSignaturesMap(map: *SignaturesMap) void {
+    var it = map.valueIterator();
+    while (it.next()) |inner| inner.deinit();
     map.deinit();
 }
 
@@ -313,7 +317,7 @@ test "computeAggregatedSignatures: 2 signatures_map, 2 in aggregated proof" {
 
     const proof_2_3 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 2, 3 });
     // Add to both validator 2 and 3's lookup
-    try ctx.addAggregatedPayload(&payloads_map, 2, proof_2_3);
+    try ctx.addAggregatedPayload(&payloads_map, proof_2_3);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -378,7 +382,7 @@ test "computeAggregatedSignatures: full overlap uses stored only" {
     defer deinitPayloadsMap(&payloads_map);
 
     const proof_all = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 0, 1, 2, 3 });
-    try ctx.addAggregatedPayload(&payloads_map, 2, proof_all);
+    try ctx.addAggregatedPayload(&payloads_map, proof_all);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -435,8 +439,8 @@ test "computeAggregatedSignatures: greedy set-cover" {
     const proof_b = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2 });
 
     // Add proof A and B for validator 1 lookup
-    try ctx.addAggregatedPayload(&payloads_map, 1, proof_a);
-    try ctx.addAggregatedPayload(&payloads_map, 1, proof_b);
+    try ctx.addAggregatedPayload(&payloads_map, proof_a);
+    try ctx.addAggregatedPayload(&payloads_map, proof_b);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -503,7 +507,7 @@ test "computeAggregatedSignatures: partial signatures_map overlap maximizes cove
     defer deinitPayloadsMap(&payloads_map);
 
     const proof_2_3_4 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 2, 3, 4 });
-    try ctx.addAggregatedPayload(&payloads_map, 3, proof_2_3_4);
+    try ctx.addAggregatedPayload(&payloads_map, proof_2_3_4);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -1021,7 +1025,7 @@ test "computeAggregatedSignatures: validator without signature excluded" {
     defer deinitPayloadsMap(&payloads_map);
 
     const proof_2_3 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 2, 3 });
-    try ctx.addAggregatedPayload(&payloads_map, 2, proof_2_3);
+    try ctx.addAggregatedPayload(&payloads_map, proof_2_3);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -1095,7 +1099,7 @@ test "computeAggregatedSignatures: empty signatures_map with full aggregated pay
     defer deinitPayloadsMap(&payloads_map);
 
     const proof_1_2_3_4 = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2, 3, 4 });
-    try ctx.addAggregatedPayload(&payloads_map, 1, proof_1_2_3_4);
+    try ctx.addAggregatedPayload(&payloads_map, proof_1_2_3_4);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
