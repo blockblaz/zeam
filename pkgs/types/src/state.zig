@@ -376,6 +376,8 @@ pub const BeamState = struct {
 
         var finalized_slot: Slot = self.latest_finalized.slot;
 
+        const original_finalized_slot: Slot = self.latest_finalized.slot;
+
         // Use the global cache directly if provided, otherwise build a local cache.
         var owned_cache: ?utils.RootToSlotCache = if (cache == null) utils.RootToSlotCache.init(allocator) else null;
         defer if (owned_cache) |*oc| oc.deinit();
@@ -430,7 +432,7 @@ pub const BeamState = struct {
             const has_known_root = has_correct_source_root and has_correct_target_root;
 
             const target_not_ahead = target_slot <= source_slot;
-            const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
+            const is_target_justifiable = try utils.IsJustifiableSlot(original_finalized_slot, target_slot);
 
             if (!is_source_justified or
                 // not present in 3sf mini but once a target is justified no need to run loop
@@ -495,7 +497,7 @@ pub const BeamState = struct {
                 const end_slot_usize: usize = @intCast(target_slot);
                 for (start_slot_usize..end_slot_usize) |slot_usize| {
                     const slot: Slot = @intCast(slot_usize);
-                    if (try utils.IsJustifiableSlot(self.latest_finalized.slot, slot)) {
+                    if (try utils.IsJustifiableSlot(original_finalized_slot, slot)) {
                         can_target_finalize = false;
                         break;
                     }
