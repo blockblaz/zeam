@@ -884,7 +884,7 @@ pub const ForkChoice = struct {
         // Attestations that were "new" (gossip) are now "known" (accepted).
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            // latest new is always ahead of latestknow (and will be non null if latestknown is not null)
+            // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
             tracker.latestKnown = tracker.latestNew;
             try self.attestations.put(validator_id, tracker);
         }
