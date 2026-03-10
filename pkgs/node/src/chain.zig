@@ -772,9 +772,17 @@ pub const BeamChain = struct {
                 });
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    self.logger.err("aggregation processing error: {any}", .{err});
-                    return err;
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    switch (err) {
+                        // Propagate unknown block errors to node.zig for context-aware logging
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        else => {
+                            self.logger.warn("gossip aggregation processing error: {any}", .{err});
+                            return .{};
+                        },
+                    }
                 };
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
                 return .{};
             },
         }
@@ -1277,10 +1285,9 @@ pub const BeamChain = struct {
     /// Per leanSpec:
     /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
     /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
-    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
-        const data = attestation.data;
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
         const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
@@ -1362,8 +1369,7 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-        self.logger.debug("attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
-            attestation.validator_id,
+        self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
             data.target.slot,
@@ -1371,10 +1377,14 @@ pub const BeamChain = struct {
         });
     }
 
+    /// Thin wrapper around validateAttestationData for callers that have a full Attestation.
+    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+        return self.validateAttestationData(attestation.data, is_from_block);
+    }
+
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
-        // Validate attestation before processing (gossip = not from block)
+        // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
-        try self.validateAttestation(attestation, false);
 
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
 
@@ -1390,6 +1400,9 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+        // Validate the attestation data first (same rules as individual gossip attestations)
+        try self.validateAttestationData(signedAggregation.data, false);
+
         try self.verifyAggregatedAttestation(signedAggregation);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
