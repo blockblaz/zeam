@@ -277,21 +277,26 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             else => unreachable,
         }
 
-        // Build gossip signatures map from attestations
+        // Build gossip signatures map from attestations (keyed by AttestationData)
         var signatures_map = types.SignaturesMap.init(allocator);
-        defer signatures_map.deinit();
+        defer {
+            var it = signatures_map.iterator();
+            while (it.next()) |e| e.value_ptr.deinit();
+            signatures_map.deinit();
+        }
 
         for (attestations.items) |attestation| {
             // Get the serialized signature bytes
             const sig_buffer = try key_manager.signAttestation(&attestation, allocator);
 
-            // Compute data root for the signature key
-            const data_root = try attestation.data.sszRoot(allocator);
-
-            try signatures_map.put(
-                .{ .validator_id = attestation.validator_id, .data_root = data_root },
-                .{ .slot = attestation.data.slot, .signature = sig_buffer },
-            );
+            const gop = try signatures_map.getOrPut(attestation.data);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = types.GossipSignaturesInnerMap.init(allocator);
+            }
+            try gop.value_ptr.put(attestation.validator_id, .{
+                .slot = attestation.data.slot,
+                .signature = sig_buffer,
+            });
         }
 
         // Compute aggregated signatures using the shared method

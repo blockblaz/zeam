@@ -819,9 +819,6 @@ fn processBlockStep(
     // Proposer attestation is treated as gossip and queued as a new aggregated payload.
     try ctx.fork_choice.onSignedAttestation(signed_attestation);
 
-    const proposer_data_root = try proposer_attestation.data.sszRoot(ctx.allocator);
-    try ctx.fork_choice.attestation_data_by_root.put(proposer_data_root, proposer_attestation.data);
-
     var proposer_proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
         std.debug.print(
             "fixture {s} case {s}{any}: failed to init proposer proof ({s})\n",
@@ -839,11 +836,7 @@ fn processBlockStep(
         return FixtureError.InvalidFixture;
     };
 
-    const sig_key = types.SignatureKey{
-        .validator_id = proposer_attestation.validator_id,
-        .data_root = proposer_data_root,
-    };
-    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(sig_key);
+    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(proposer_attestation.data);
     if (!gop.found_existing) {
         gop.value_ptr.* = .empty;
     }
