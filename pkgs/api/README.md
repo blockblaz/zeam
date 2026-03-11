@@ -9,6 +9,7 @@ This package provides the HTTP API server for the Zeam node with the following e
 - Health check at `/lean/v0/health`
 - Finalized checkpoint state at `/lean/v0/states/finalized` (for checkpoint sync)
 - Justified checkpoint information at `/lean/v0/checkpoints/justified`
+- Fork choice state at `/lean/v0/fork_choice` (full fork choice snapshot as JSON)
 - Fork choice graph visualization at `/api/forkchoice/graph` (Grafana node-graph compatible)
 
 ## Package Components
@@ -152,6 +153,33 @@ Returns:
 - **Status 503**: Returned if chain is not initialized
 - **Example response**: `{"root":"0x1234...","slot":42}`
 
+### `/lean/v0/fork_choice`
+
+Returns the full fork choice state as JSON, including head, justified/finalized checkpoints, safe target, and all proto nodes in the fork choice tree.
+
+```sh
+curl http://localhost:9667/lean/v0/fork_choice
+```
+
+Returns:
+- **Content-Type**: `application/json`
+- **Status 503**: Returned if chain is not initialized
+- **Example response**:
+
+```json
+{
+  "head": {"slot": 100, "root": "0x1234..."},
+  "justified": {"slot": 96, "root": "0xabcd..."},
+  "finalized": {"slot": 64, "root": "0x5678..."},
+  "safe_target": {"root": "0x9abc..."},
+  "validator_count": 4,
+  "nodes": [
+    {"slot": 64, "root": "0x5678...", "parent_root": "0x0000...", "weight": 4},
+    {"slot": 65, "root": "0xdef0...", "parent_root": "0x5678...", "weight": 4}
+  ]
+}
+```
+
 ## Usage
 
 ### Initialization
@@ -179,6 +207,7 @@ The server exposes:
 - Health at `/lean/v0/health`
 - Checkpoint state at `/lean/v0/states/finalized`
 - Justified checkpoint at `/lean/v0/checkpoints/justified`
+- Fork choice state at `/lean/v0/fork_choice`
 - Fork choice visualization at `/api/forkchoice/graph`
 
 **Note**: On freestanding targets (ZKVM), the HTTP server is automatically disabled.
@@ -243,6 +272,9 @@ curl http://localhost:9668/lean/v0/states/finalized -o state.ssz
 
 # Justified checkpoint
 curl http://localhost:9668/lean/v0/checkpoints/justified
+
+# Fork choice state
+curl http://localhost:9668/lean/v0/fork_choice
 ```
 
 ## Visualization with Prometheus & Grafana

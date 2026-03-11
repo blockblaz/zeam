@@ -1,20 +1,56 @@
+OUTPUT_FORMAT("elf32-littleriscv", "elf32-littleriscv", "elf32-littleriscv")
+OUTPUT_ARCH(riscv)
 ENTRY(_start)
- 
-SECTIONS {
-    STACK_TOP = 0x00200400;
 
-    . = 0x200800;
- 
-    .text : ALIGN(1K) {
-        KEEP(*(.text._start))
-        *(.text)
-    }
- 
-    .rodata : ALIGN(4K) {
-        *(.rodata)
-    }
- 
-    .data : ALIGN(4K) {
-        *(.data)
-    }
+MEMORY {
+  stack : ORIGIN = 0x00000400, LENGTH = 0x00200000
+  ram   : ORIGIN = 0x00200800, LENGTH = 0x77DFF800
+}
+
+SECTIONS {
+  STACK_TOP = 0x00200400;
+
+  . = 0x00200800;
+  .text 0x00200800 : ALIGN(4) {
+    KEEP(*(.init))
+    . = ALIGN(4);
+    KEEP(*(.text._start))
+    *(.text*)
+    . = ALIGN(4);
+    *(.rodata*)
+    . = ALIGN(4);
+    *(.srodata*)
+  } >ram
+
+  . = ALIGN(4);
+
+  .data : ALIGN(4) {
+    *(.data .data.*)
+    *(.gnu.linkonce.d.*)
+    __global_pointer$ = . + 0x800;
+    *(.sdata .sdata.* .sdata2.*)
+    *(.gnu.linkonce.s.*)
+  } >ram
+
+  . = ALIGN(4);
+
+  .bss (NOLOAD) : ALIGN(4) {
+    __bss_start = .;
+    *(.sbss*)
+    *(.gnu.linkonce.sb.*)
+    *(.bss .bss.*)
+    *(.gnu.linkonce.b.*)
+    *(COMMON)
+    . = ALIGN(4);
+    __bss_end = .;
+  } >ram
+
+  _end = .;
+
+  /DISCARD/ : {
+    *(.rel*)
+    *(.comment)
+    *(.eh_frame)
+    *(.riscv.attributes)
+  }
 }
