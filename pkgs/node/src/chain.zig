@@ -739,10 +739,21 @@ pub const BeamChain = struct {
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    // Propagate unknown block errors to node.zig for context-aware logging
-                    // (downgrade to debug when the missing block is already being fetched)
                     switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
+                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
+                            const att_data = signed_attestation.message.message;
+                            const missing_root = if (err == error.UnknownHeadBlock)
+                                att_data.head.root
+                            else if (err == error.UnknownSourceBlock)
+                                att_data.source.root
+                            else
+                                att_data.target.root;
+                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
+                            errdefer roots.deinit(self.allocator);
+                            try roots.append(self.allocator, missing_root);
+                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
                         else => {
                             self.logger.warn("gossip attestation validation failed: {any}", .{err});
                             return .{};
@@ -775,7 +786,20 @@ pub const BeamChain = struct {
                 self.validateAttestationData(signed_aggregation.data, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
+                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
+                            const att_data = signed_aggregation.data;
+                            const missing_root = if (err == error.UnknownHeadBlock)
+                                att_data.head.root
+                            else if (err == error.UnknownSourceBlock)
+                                att_data.source.root
+                            else
+                                att_data.target.root;
+                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
+                            errdefer roots.deinit(self.allocator);
+                            try roots.append(self.allocator, missing_root);
+                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
                         else => {
                             self.logger.warn("gossip aggregation validation failed: {any}", .{err});
                             return .{};
@@ -785,14 +809,8 @@ pub const BeamChain = struct {
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
-                    switch (err) {
-                        // Propagate unknown block errors to node.zig for context-aware logging
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
-                        else => {
-                            self.logger.warn("gossip aggregation processing error: {any}", .{err});
-                            return .{};
-                        },
-                    }
+                    self.logger.warn("gossip aggregation processing error: {any}", .{err});
+                    return .{};
                 };
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
                 return .{};
