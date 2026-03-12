@@ -139,6 +139,11 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
                 ctx.logger.warn("failed to handle justified checkpoint request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/fork_choice")) {
+            ctx.handleForkChoice(&request, request_allocator) catch |err| {
+                ctx.logger.warn("failed to handle fork choice request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
         } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
             const chain = ctx.getChain() orelse {
                 _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
@@ -315,6 +320,41 @@ pub const ApiServer = struct {
             },
         }) catch |err| {
             self.logger.warn("failed to respond with justified checkpoint: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Handle fork choice endpoint
+    /// Returns full fork choice state as JSON at /lean/v0/fork_choice
+    /// Includes head, justified, finalized checkpoints, safe target, and all proto nodes
+    fn handleForkChoice(self: *const Self, request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
+        const chain = self.getChain() orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        const snapshot = chain.forkChoice.snapshot(allocator) catch |err| {
+            self.logger.err("failed to get fork choice snapshot: {}", .{err});
+            _ = request.respond("Internal Server Error: Snapshot failed\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+        defer snapshot.deinit(allocator);
+
+        var json_output: std.ArrayList(u8) = .empty;
+        defer json_output.deinit(allocator);
+
+        node_lib.tree_visualizer.buildForkChoiceJSON(snapshot, &json_output, allocator) catch |err| {
+            self.logger.err("failed to build fork choice JSON: {}", .{err});
+            _ = request.respond("Internal Server Error: JSON serialization failed\n", .{ .status = .internal_server_error }) catch {};
+            return;
+        };
+
+        _ = request.respond(json_output.items, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch |err| {
+            self.logger.warn("failed to respond with fork choice: {}", .{err});
             return err;
         };
     }

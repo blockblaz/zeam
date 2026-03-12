@@ -272,29 +272,33 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Attestation validation failed due to missing head/source/target block -
+                // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                    if (data.* == .attestation) {
-                        const att = data.attestation;
-                        const att_data = att.message.message;
+                    const att_data: ?@TypeOf(data.attestation.message.message) = switch (data.*) {
+                        .attestation => |att| att.message.message,
+                        .aggregation => |agg| agg.data,
+                        else => null,
+                    };
+                    if (att_data) |ad| {
                         const missing_root = if (err == error.UnknownHeadBlock)
-                            att_data.head.root
+                            ad.head.root
                         else if (err == error.UnknownSourceBlock)
-                            att_data.source.root
+                            ad.source.root
                         else
-                            att_data.target.root;
+                            ad.target.root;
 
+                        const kind: []const u8 = if (data.* == .attestation) "attestation" else "aggregation";
                         if (self.network.hasPendingBlockRoot(missing_root)) {
-                            self.logger.debug("gossip attestation validation deferred slot={d} validator={d} error={any} (block fetch in progress)", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.debug("gossip {s} validation deferred slot={d} error={any} (block fetch in progress)", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         } else {
-                            self.logger.warn("gossip attestation validation failed slot={d} validator={d} error={any}", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.warn("gossip {s} validation failed slot={d} error={any}", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         }
@@ -317,16 +321,15 @@ pub const BeamNode = struct {
             self.processCachedDescendants(processed_root);
         }
 
-        // Fetch any attestation head roots that were missing while processing the block.
-        // We only own the slice when the block was actually processed (onBlock allocates it).
+        // Fetch any block roots that were missing while processing a block or validating attestation/aggregation gossip.
+        // We own the slice whenever it's non-empty (onBlock and onGossip both allocate it).
         const missing_roots = result.missing_attestation_roots;
-        const owns_missing_roots = result.processed_block_root != null;
-        defer if (owns_missing_roots) self.allocator.free(missing_roots);
+        defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
-        if (missing_roots.len > 0 and owns_missing_roots) {
+        if (missing_roots.len > 0) {
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
                 self.logger.warn(
-                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    "failed to fetch {d} missing block root(s) from gossip: {any}",
                     .{ missing_roots.len, err },
                 );
             };

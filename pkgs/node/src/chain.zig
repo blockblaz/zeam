@@ -737,12 +737,23 @@ pub const BeamChain = struct {
                 });
 
                 // Validate attestation before processing (gossip = not from block)
-                self.validateAttestation(signed_attestation.message.toAttestation(), false) catch |err| {
+                self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    // Propagate unknown block errors to node.zig for context-aware logging
-                    // (downgrade to debug when the missing block is already being fetched)
                     switch (err) {
-                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
+                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
+                            const att_data = signed_attestation.message.message;
+                            const missing_root = if (err == error.UnknownHeadBlock)
+                                att_data.head.root
+                            else if (err == error.UnknownSourceBlock)
+                                att_data.source.root
+                            else
+                                att_data.target.root;
+                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
+                            errdefer roots.deinit(self.allocator);
+                            try roots.append(self.allocator, missing_root);
+                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
                         else => {
                             self.logger.warn("gossip attestation validation failed: {any}", .{err});
                             return .{};
@@ -771,10 +782,37 @@ pub const BeamChain = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    self.logger.err("aggregation processing error: {any}", .{err});
-                    return err;
+                // Validate attestation data before processing (same rules as individual gossip attestations)
+                self.validateAttestationData(signed_aggregation.data, false) catch |err| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    switch (err) {
+                        error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
+                            // Add the missing root to the result so node's onGossip can enqueue it for fetching
+                            const att_data = signed_aggregation.data;
+                            const missing_root = if (err == error.UnknownHeadBlock)
+                                att_data.head.root
+                            else if (err == error.UnknownSourceBlock)
+                                att_data.source.root
+                            else
+                                att_data.target.root;
+                            var roots: std.ArrayListUnmanaged(types.Root) = .empty;
+                            errdefer roots.deinit(self.allocator);
+                            try roots.append(self.allocator, missing_root);
+                            return .{ .missing_attestation_roots = try roots.toOwnedSlice(self.allocator) };
+                        },
+                        else => {
+                            self.logger.warn("gossip aggregation validation failed: {any}", .{err});
+                            return .{};
+                        },
+                    }
                 };
+
+                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    self.logger.warn("gossip aggregation processing error: {any}", .{err});
+                    return .{};
+                };
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
                 return .{};
             },
         }
@@ -866,24 +904,21 @@ pub const BeamChain = struct {
                     continue;
                 }
 
+                // Validate aggregated attestation data once before processing individual validators
+                self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
+                    if (e == AttestationValidationError.UnknownHeadBlock) {
+                        try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
+                    }
+                    self.logger.err("invalid aggregated attestation data in block: error={any}", .{e});
+                    continue;
+                };
+
                 for (validator_indices.items) |validator_index| {
                     const validator_id: types.ValidatorIndex = @intCast(validator_index);
                     const attestation = types.Attestation{
                         .validator_id = validator_id,
                         .data = aggregated_attestation.data,
-                    };
-
-                    self.validateAttestation(attestation, true) catch |e| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
-                        if (e == AttestationValidationError.UnknownHeadBlock) {
-                            try missing_roots.append(self.allocator, attestation.data.head.root);
-                        }
-
-                        self.logger.err("invalid attestation in block: validator={d} error={any}", .{
-                            validator_index,
-                            e,
-                        });
-                        continue;
                     };
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
@@ -1277,10 +1312,9 @@ pub const BeamChain = struct {
     /// Per leanSpec:
     /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
     /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
-    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
+    pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
-        const data = attestation.data;
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
         const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
@@ -1362,8 +1396,7 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.AttestationTooFarInFuture;
         }
-        self.logger.debug("attestation validation passed: validator={d} slot={d} source={d} target={d} is_from_block={any}", .{
-            attestation.validator_id,
+        self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
             data.source.slot,
             data.target.slot,
@@ -1372,9 +1405,8 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
-        // Validate attestation before processing (gossip = not from block)
+        // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
-        try self.validateAttestation(attestation, false);
 
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
 
@@ -1963,7 +1995,7 @@ test "attestation validation - comprehensive" {
             .signature = ZERO_SIGBYTES,
         };
         // Should pass validation
-        try beam_chain.validateAttestation(valid_attestation.toAttestation(), false);
+        try beam_chain.validateAttestationData(valid_attestation.message, false);
     }
 
     // Test 2: Unknown source block
@@ -1988,7 +2020,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownSourceBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 3: Unknown target block
@@ -2013,7 +2045,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownTargetBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 4: Unknown head block
@@ -2038,7 +2070,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.UnknownHeadBlock, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
     // Test 5: Source slot exceeds target slot (block slots)
     {
@@ -2061,7 +2093,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 6: Source checkpoint slot exceeds target checkpoint slot
@@ -2085,7 +2117,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceSlotExceedsTarget, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 7: Source checkpoint slot mismatch
@@ -2109,7 +2141,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.SourceCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 8: Target checkpoint slot mismatch
@@ -2133,7 +2165,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestation(invalid_attestation.toAttestation(), false));
+        try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
     // Test 9: Attestation too far in future (for gossip)
@@ -2157,7 +2189,7 @@ test "attestation validation - comprehensive" {
             },
             .signature = ZERO_SIGBYTES,
         };
-        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(future_attestation.toAttestation(), false));
+        try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(future_attestation.message, false));
     }
 }
 
@@ -2234,11 +2266,11 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Gossip attestations: should FAIL for next slot (current + 1)
     // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(next_slot_attestation.toAttestation(), false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
 
     // Block attestations: should PASS for next slot (current + 1)
     // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
-    try beam_chain.validateAttestation(next_slot_attestation.toAttestation(), true);
+    try beam_chain.validateAttestationData(next_slot_attestation.message, true);
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
@@ -2259,8 +2291,8 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
     // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestation(too_far_attestation.toAttestation(), true));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
