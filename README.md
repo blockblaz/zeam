@@ -174,6 +174,24 @@ docker build -f Dockerfile.prebuilt \
   -t blockblaz/zeam:latest .
 ```
 
+### Troubleshooting
+
+**Build fails with `EndOfStream` error**
+
+If you encounter errors like:
+```
+error: invalid HTTP response: EndOfStream
+```
+
+This may be caused by proxy environment variables interfering with Zig's HTTP client (related to the [Zig HTTP connection pool bug](https://github.com/ziglang/zig/issues/21316) mentioned above).
+
+Try building without proxy settings:
+```bash
+env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY \
+    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+    zig build -Doptimize=ReleaseFast
+```
+
 ---
 
 ## Running a Local Devnet
