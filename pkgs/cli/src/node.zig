@@ -202,7 +202,8 @@ pub const Node = struct {
                     const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
                     defer allocator.free(rocksdb_path);
                     std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
-                        self.logger.warn("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                        self.logger.err("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                        return wipe_err;
                     };
                     db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
                     self.logger.info("stale database wiped, starting fresh", .{});
