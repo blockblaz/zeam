@@ -4,3 +4,6 @@
 [submodule "leanSpec"]
 	path = leanSpec
 	url = https://github.com/leanEthereum/leanSpec
+[submodule "test-keys"]
+	path = test-keys
+	url = https://github.com/blockblaz/zeam-test-keys.git
