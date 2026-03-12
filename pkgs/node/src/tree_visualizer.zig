@@ -160,6 +160,37 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
     return indent.toOwnedSlice(allocator);
 }
 
+/// Build fork choice JSON for the /lean/v0/fork_choice API endpoint.
+/// Matches the leanSpec format with head, justified, finalized, safe_target, and nodes.
+pub fn buildForkChoiceJSON(
+    snapshot: fcFactory.ForkChoice.Snapshot,
+    output: *std.ArrayList(u8),
+    allocator: Allocator,
+) !void {
+    const w = output.writer(allocator);
+    try w.writeAll("{");
+    try w.print(
+        \\"head":{{"slot":{d},"root":"0x{x}"}},"justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":{{"root":"0x{x}"}},"validator_count":{d},"nodes":[
+    , .{
+        snapshot.head.slot,
+        &snapshot.head.blockRoot,
+        snapshot.latest_justified.slot,
+        &snapshot.latest_justified.root,
+        snapshot.latest_finalized.slot,
+        &snapshot.latest_finalized.root,
+        &snapshot.safe_target_root,
+        snapshot.validator_count,
+    });
+
+    for (snapshot.nodes, 0..) |node, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print(
+            \\{{"slot":{d},"root":"0x{x}","parent_root":"0x{x}","weight":{d}}}
+        , .{ node.slot, &node.blockRoot, &node.parentRoot, node.weight });
+    }
+    try w.writeAll("]}");
+}
+
 /// Build fork choice graph in Grafana node-graph JSON format
 pub fn buildForkChoiceGraphJSON(
     forkchoice: *fcFactory.ForkChoice,
@@ -196,7 +227,7 @@ pub fn buildForkChoiceGraphJSON(
     // Find the finalized node index to check ancestry
     const finalized_idx = blk: {
         for (proto_nodes, 0..) |n, i| {
-            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized_root)) {
+            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized.root)) {
                 break :blk i;
             }
         }
@@ -208,14 +239,14 @@ pub fn buildForkChoiceGraphJSON(
 
         // Determine node role and color
         const is_head = std.mem.eql(u8, &pnode.blockRoot, &snapshot.head.blockRoot);
-        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified_root);
+        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified.root);
 
         // A block is finalized if:
         // 1. It equals the finalized checkpoint, OR
         // 2. The finalized block is a descendant of it (block is ancestor of finalized)
         const is_finalized = blk: {
             // Check if this block IS the finalized block
-            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized_root)) {
+            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized.root)) {
                 break :blk true;
             }
             // Check if this block is an ancestor of the finalized block
