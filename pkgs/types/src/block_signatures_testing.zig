@@ -272,6 +272,7 @@ test "computeAggregatedSignatures: all 4 in signatures_map" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 1 aggregated attestation covering all 4 validators
@@ -323,6 +324,7 @@ test "computeAggregatedSignatures: 2 signatures_map, 2 in aggregated proof" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 2 aggregated attestations
@@ -388,6 +390,7 @@ test "computeAggregatedSignatures: full overlap uses stored only" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have only 1 aggregated attestation:
@@ -424,18 +427,19 @@ test "computeAggregatedSignatures: greedy set-cover" {
     try ctx.addToSignatureMap(&signatures_map, 0);
 
     // Create competing aggregated proofs:
-    // Proof A: covers 1,2,3 (optimal)
-    // Proof B: covers 1,2 (suboptimal)
-    // Proof C: covers 2,3 (suboptimal)
-    var payloads_map = AggregatedPayloadsMap.init(allocator);
-    defer deinitPayloadsMap(&payloads_map);
+    // Proof A: covers 1,2,3 (optimal) — in new_payloads (selected first)
+    // Proof B: covers 1,2 (suboptimal) — in known_payloads (helper, not selected since A covers more)
+    var new_payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&new_payloads_map);
+
+    var known_payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&known_payloads_map);
 
     const proof_a = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2, 3 });
     const proof_b = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2 });
 
-    // Add proof A and B for validator 1 lookup
-    try ctx.addAggregatedPayload(&payloads_map, proof_a);
-    try ctx.addAggregatedPayload(&payloads_map, proof_b);
+    try ctx.addAggregatedPayload(&new_payloads_map, proof_a);
+    try ctx.addAggregatedPayload(&known_payloads_map, proof_b);
 
     // Create aggregation context and compute
     var agg_ctx = try AggregatedAttestationsResult.init(allocator);
@@ -445,7 +449,8 @@ test "computeAggregatedSignatures: greedy set-cover" {
         &attestations_list,
         &ctx.validators,
         &signatures_map,
-        &payloads_map,
+        &new_payloads_map,
+        &known_payloads_map,
     );
 
     // Should have exactly 2 aggregated attestations:
@@ -498,6 +503,7 @@ test "computeAggregatedSignatures: partial signatures_map overlap maximizes cove
     try ctx.addToSignatureMap(&signatures_map, 2);
 
     // Create aggregated proof for validators 2, 3, 4 (overlaps with signatures_map on 2)
+    // Place in known_payloads — it extends gossip coverage as a helper
     var payloads_map = AggregatedPayloadsMap.init(allocator);
     defer deinitPayloadsMap(&payloads_map);
 
@@ -512,6 +518,7 @@ test "computeAggregatedSignatures: partial signatures_map overlap maximizes cove
         &attestations_list,
         &ctx.validators,
         &signatures_map,
+        null,
         &payloads_map,
     );
 
@@ -565,6 +572,7 @@ test "computeAggregatedSignatures: empty attestations" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have no attestations
@@ -605,6 +613,7 @@ test "computeAggregatedSignatures: no signatures available" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have no attestations (all validators uncovered)
@@ -672,6 +681,7 @@ test "computeAggregatedSignatures: multiple data roots" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 2 aggregated attestations (one per data root)
@@ -727,6 +737,7 @@ test "computeAggregatedSignatures: single validator" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 1 aggregated attestation with 1 validator
@@ -955,6 +966,7 @@ test "computeAggregatedSignatures: complex 3 groups" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Expected results:
@@ -1033,6 +1045,7 @@ test "computeAggregatedSignatures: validator without signature excluded" {
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 2 aggregated attestations:
@@ -1107,6 +1120,7 @@ test "computeAggregatedSignatures: empty signatures_map with full aggregated pay
         &ctx.validators,
         &signatures_map,
         &payloads_map,
+        null,
     );
 
     // Should have exactly 1 aggregated attestation covering all 4 validators
@@ -1116,4 +1130,86 @@ test "computeAggregatedSignatures: empty signatures_map with full aggregated pay
     // Verify attestation_bits are set for validators 1, 2, 3, 4
     const att_bits = &(try agg_ctx.attestations.get(0)).aggregation_bits;
     try std.testing.expect(try TestContext.checkParticipants(att_bits, &[_]ValidatorIndex{ 1, 2, 3, 4 }));
+}
+
+// ============================================================================
+// Test: new_payloads preferred over known_payloads (two-pass greedy ordering)
+// When new and known payloads cover the same validators, new_payloads is selected first.
+// ============================================================================
+test "computeAggregatedSignatures: new_payloads preferred over known_payloads" {
+    const allocator = std.testing.allocator;
+
+    var ctx = try TestContext.init(allocator, 6);
+    defer ctx.deinit();
+
+    // Create attestations for validators 0..5
+    var attestations_list = [_]attestation.Attestation{
+        ctx.createAttestation(0),
+        ctx.createAttestation(1),
+        ctx.createAttestation(2),
+        ctx.createAttestation(3),
+        ctx.createAttestation(4),
+        ctx.createAttestation(5),
+    };
+
+    // Add gossip signature for validator 0 only
+    var signatures_map = SignaturesMap.init(allocator);
+    defer deinitSignaturesMap(&signatures_map);
+    try ctx.addToSignatureMap(&signatures_map, 0);
+
+    // new_payloads: proof covering {1, 2, 3} (3 validators)
+    var new_payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&new_payloads_map);
+    const new_proof = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2, 3 });
+    try ctx.addAggregatedPayload(&new_payloads_map, new_proof);
+
+    // known_payloads: proof covering {1, 2, 3, 4, 5} (5 validators, superset)
+    // Even though this covers more, new_payloads proof is tried first in pass 1.
+    // Since new proof covers {1,2,3}, known proof only adds {4,5} in pass 2.
+    var known_payloads_map = AggregatedPayloadsMap.init(allocator);
+    defer deinitPayloadsMap(&known_payloads_map);
+    const known_proof = try ctx.createAggregatedProof(&[_]ValidatorIndex{ 1, 2, 3, 4, 5 });
+    try ctx.addAggregatedPayload(&known_payloads_map, known_proof);
+
+    var agg_ctx = try AggregatedAttestationsResult.init(allocator);
+    defer agg_ctx.deinit();
+
+    try agg_ctx.computeAggregatedSignatures(
+        &attestations_list,
+        &ctx.validators,
+        &signatures_map,
+        &new_payloads_map,
+        &known_payloads_map,
+    );
+
+    // Should produce 3 aggregated attestations:
+    // 1. gossip for validator 0
+    // 2. new_payloads proof for {1,2,3} (selected first in pass 1)
+    // 3. known_payloads proof for {1,2,3,4,5} (selected in pass 2, adds {4,5})
+    // Together covers {0,1,2,3,4,5}
+    try std.testing.expectEqual(@as(usize, 3), agg_ctx.attestations.len());
+    try std.testing.expectEqual(@as(usize, 3), agg_ctx.attestation_signatures.len());
+
+    // Verify all attestations exist
+    var found_0 = false;
+    var found_1_2_3 = false;
+    var found_1_2_3_4_5 = false;
+
+    for (0..agg_ctx.attestations.len()) |i| {
+        const bits = &(try agg_ctx.attestations.get(i)).aggregation_bits;
+        if (try TestContext.checkParticipants(bits, &[_]ValidatorIndex{0})) {
+            found_0 = true;
+        }
+        if (try TestContext.checkParticipants(bits, &[_]ValidatorIndex{ 1, 2, 3 })) {
+            found_1_2_3 = true;
+        }
+        if (try TestContext.checkParticipants(bits, &[_]ValidatorIndex{ 1, 2, 3, 4, 5 })) {
+            found_1_2_3_4_5 = true;
+        }
+    }
+
+    try std.testing.expect(found_0);
+    // At least one of the child proofs should be present
+    // The new proof {1,2,3} is selected first, then known {1,2,3,4,5} adds {4,5}
+    try std.testing.expect(found_1_2_3 or found_1_2_3_4_5);
 }

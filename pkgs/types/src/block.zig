@@ -327,14 +327,15 @@ pub const AggregatedAttestationsResult = struct {
 
     /// Compute aggregated signatures using recursive aggregation:
     /// Step 1: Collect individual gossip signatures from signatures_map
-    /// Step 2: Greedy child proof selection from children_payloads (children first)
-    /// Step 3: Recursive aggregate — combine selected children + remaining gossip sigs (gossip last)
+    /// Step 2: Greedy child proof selection — new_payloads first, then known_payloads as helpers
+    /// Step 3: Recursive aggregate — combine selected children + remaining gossip sigs
     pub fn computeAggregatedSignatures(
         self: *Self,
         attestations_list: []const Attestation,
         validators: *const Validators,
         signatures_map: *const SignaturesMap,
-        children_payloads: ?*const AggregatedPayloadsMap,
+        new_payloads: ?*const AggregatedPayloadsMap,
+        known_payloads: ?*const AggregatedPayloadsMap,
     ) !void {
         const allocator = self.allocator;
 
@@ -442,8 +443,7 @@ pub const AggregatedAttestationsResult = struct {
                 }
             }
 
-            // Step 2: Greedy child proof selection from children_payloads
-            // Per review: children first, pick proofs with maximum coverage of remaining validators
+            // Step 2: Greedy child proof selection — new_payloads first, known_payloads as helpers
             var selected_children: std.ArrayList(aggregation.AggregatedSignatureProof) = .empty;
             defer {
                 for (selected_children.items) |*child| {
@@ -456,73 +456,24 @@ pub const AggregatedAttestationsResult = struct {
             var covered_by_children = try std.DynamicBitSet.initEmpty(allocator, max_validator);
             defer covered_by_children.deinit();
 
-            if (children_payloads) |cp| {
-                if (cp.get(data_root)) |candidates| {
-                    if (candidates.items.len > 0) {
-                        // Build a bitset of all validators in the group not covered by gossip
-                        var remaining = try std.DynamicBitSet.initEmpty(allocator, max_validator);
-                        defer remaining.deinit();
-
-                        var vit = group.validator_bits.iterator(.{});
-                        while (vit.next()) |vid| {
-                            // Skip validators already available via gossip
-                            if (!sigmap_available.isSet(vid)) {
-                                remaining.set(vid);
-                            }
-                        }
-
-                        // Track which candidate proofs we've already selected (by index)
-                        var used = try allocator.alloc(bool, candidates.items.len);
-                        defer allocator.free(used);
-                        @memset(used, false);
-
-                        while (remaining.count() > 0) {
-                            // Find candidate proof with maximum coverage of remaining validators
-                            var best_idx: ?usize = null;
-                            var max_coverage: usize = 0;
-
-                            for (candidates.items, 0..) |*stored, idx| {
-                                if (used[idx]) continue;
-                                const proof = &stored.proof;
-                                var coverage: usize = 0;
-
-                                for (0..proof.participants.len()) |i| {
-                                    if (proof.participants.get(i) catch false) {
-                                        if (i < remaining.capacity() and remaining.isSet(i)) {
-                                            coverage += 1;
-                                        }
-                                    }
-                                }
-
-                                if (coverage > max_coverage) {
-                                    max_coverage = coverage;
-                                    best_idx = idx;
-                                }
-                            }
-
-                            if (best_idx == null or max_coverage == 0) break;
-
-                            // Clone and select the best proof
-                            used[best_idx.?] = true;
-                            var cloned: aggregation.AggregatedSignatureProof = undefined;
-                            try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, candidates.items[best_idx.?].proof, &cloned);
-                            errdefer cloned.deinit();
-                            try selected_children.append(allocator, cloned);
-
-                            // Mark covered validators
-                            for (0..cloned.participants.len()) |i| {
-                                if (cloned.participants.get(i) catch false) {
-                                    if (i < remaining.capacity()) remaining.unset(i);
-                                    if (i >= covered_by_children.capacity()) {
-                                        try covered_by_children.resize(i + 1, false);
-                                    }
-                                    covered_by_children.set(i);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // First pass: greedy extend from new_payloads
+            try extendProofsGreedily(
+                allocator,
+                new_payloads,
+                data_root,
+                &selected_children,
+                &covered_by_children,
+                &sigmap_available,
+            );
+            // Second pass: greedy extend from known_payloads (as helpers)
+            try extendProofsGreedily(
+                allocator,
+                known_payloads,
+                data_root,
+                &selected_children,
+                &covered_by_children,
+                &sigmap_available,
+            );
 
             // Step 3: Recursive aggregate — combine children + gossip sigs (gossip last)
             // Filter gossip sigs to exclude validators already covered by children
@@ -647,6 +598,74 @@ pub const AggregatedAttestationsResult = struct {
         self.attestation_signatures.deinit();
     }
 };
+
+/// Greedy proof selection: pick proofs from `payloads_map` for `data_root` that cover
+/// the most uncovered validators. Appends selected proofs to `selected` and marks
+/// covered validators in `covered`. Skips validators already in `gossip_available`.
+fn extendProofsGreedily(
+    allocator: Allocator,
+    payloads_map: ?*const AggregatedPayloadsMap,
+    data_root: Root,
+    selected: *std.ArrayList(aggregation.AggregatedSignatureProof),
+    covered: *std.DynamicBitSet,
+    gossip_available: *const std.DynamicBitSet,
+) !void {
+    const pm = payloads_map orelse return;
+    const candidates = pm.get(data_root) orelse return;
+    if (candidates.items.len == 0) return;
+
+    // Track which candidate proofs we've already selected (by index)
+    var used = try allocator.alloc(bool, candidates.items.len);
+    defer allocator.free(used);
+    @memset(used, false);
+
+    while (true) {
+        // Find candidate proof with maximum coverage of uncovered, non-gossip validators
+        var best_idx: ?usize = null;
+        var max_coverage: usize = 0;
+
+        for (candidates.items, 0..) |*stored, idx| {
+            if (used[idx]) continue;
+            const proof = &stored.proof;
+            var coverage: usize = 0;
+
+            for (0..proof.participants.len()) |i| {
+                if (proof.participants.get(i) catch false) {
+                    // Count this validator if not already covered by children or gossip
+                    const already_covered = (i < covered.capacity() and covered.isSet(i));
+                    const has_gossip = (i < gossip_available.capacity() and gossip_available.isSet(i));
+                    if (!already_covered and !has_gossip) {
+                        coverage += 1;
+                    }
+                }
+            }
+
+            if (coverage > max_coverage) {
+                max_coverage = coverage;
+                best_idx = idx;
+            }
+        }
+
+        if (best_idx == null or max_coverage == 0) break;
+
+        // Clone and select the best proof
+        used[best_idx.?] = true;
+        var cloned: aggregation.AggregatedSignatureProof = undefined;
+        try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, candidates.items[best_idx.?].proof, &cloned);
+        errdefer cloned.deinit();
+        try selected.append(allocator, cloned);
+
+        // Mark covered validators
+        for (0..cloned.participants.len()) |i| {
+            if (cloned.participants.get(i) catch false) {
+                if (i >= covered.capacity()) {
+                    try covered.resize(i + 1, false);
+                }
+                covered.set(i);
+            }
+        }
+    }
+}
 
 pub const BlockByRootRequest = struct {
     roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),

@@ -416,6 +416,7 @@ pub const BeamChain = struct {
                 attestations,
                 &pre_state.validators,
                 &self.forkChoice.gossip_signatures,
+                null,
                 &self.forkChoice.latest_known_aggregated_payloads,
             );
             _ = building_timer.observe();

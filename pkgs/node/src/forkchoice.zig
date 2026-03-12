@@ -1248,13 +1248,10 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        // Build attestation list from ALL sources (gossip + new payloads + known payloads with fresh roots)
-        var attestations = try self.attestationsFromGossipAndPayloads();
+        // Build attestation list from gossip signatures + new payloads only
+        // (known payloads are used as helpers in greedy selection, not as independent sources)
+        var attestations = try self.attestationsFromGossipAndNewPayloads();
         defer attestations.deinit(self.allocator);
-
-        // Merge payloads for recursive aggregation
-        var merged_payloads = try self.mergedAggregatedPayloadsLocked();
-        defer deinitAggregatedPayloadsMap(self.allocator, &merged_payloads);
 
         var agg = try types.AggregatedAttestationsResult.init(self.allocator);
         var agg_att_cleanup = true;
@@ -1272,11 +1269,13 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
+        // Pass new and known payloads separately for two-pass greedy selection
         try agg.computeAggregatedSignatures(
             attestations.items,
             &state.validators,
             &self.gossip_signatures,
-            &merged_payloads,
+            &self.latest_new_aggregated_payloads,
+            &self.latest_known_aggregated_payloads,
         );
 
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
@@ -1287,6 +1286,10 @@ pub const ForkChoice = struct {
             results.deinit(self.allocator);
         }
 
+        // Replace latest_new_aggregated_payloads with fresh aggregation results
+        var new_payloads = AggregatedPayloadsMap.init(self.allocator);
+        errdefer deinitAggregatedPayloadsMap(self.allocator, &new_payloads);
+
         const agg_attestations = agg.attestations.constSlice();
         const agg_signatures = agg.attestation_signatures.constSlice();
 
@@ -1296,8 +1299,8 @@ pub const ForkChoice = struct {
 
             try self.attestation_data_by_root.put(data_root, agg_att.data);
 
-            // Store once per data_root (not per-validator)
-            const gop = try self.latest_new_aggregated_payloads.getOrPut(data_root);
+            // Store proof into new payloads map
+            const gop = try new_payloads.getOrPut(data_root);
             if (!gop.found_existing) {
                 gop.value_ptr.* = .empty;
             }
@@ -1310,16 +1313,6 @@ pub const ForkChoice = struct {
                 .proof = cloned_proof,
             });
 
-            // Remove gossip signatures for validators covered by this aggregation
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-            defer validator_indices.deinit(self.allocator);
-            for (validator_indices.items) |validator_index| {
-                _ = self.gossip_signatures.remove(.{
-                    .validator_id = @intCast(validator_index),
-                    .data_root = data_root,
-                });
-            }
-
             var output_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
             errdefer output_proof.deinit();
@@ -1328,6 +1321,13 @@ pub const ForkChoice = struct {
                 .proof = output_proof,
             });
         }
+
+        // Replace latest_new_aggregated_payloads (not append)
+        deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
+        self.latest_new_aggregated_payloads = new_payloads;
+
+        // Clear all gossip signatures — they've been consumed by aggregation
+        self.clearGossipSignaturesLocked();
 
         agg_att_cleanup = false;
         agg_sig_cleanup = false;
@@ -1343,27 +1343,10 @@ pub const ForkChoice = struct {
         return results.toOwnedSlice(self.allocator);
     }
 
-    /// Build attestation list from all sources for recursive aggregation.
-    /// Known payloads are only included when their data root also appears in
-    /// gossip or new payload sets (fresh contributions).
+    /// Build attestation list from gossip signatures and new payloads.
+    /// Known payloads are NOT included — they serve only as greedy selection helpers.
     /// Caller must hold signatures_mutex.
-    fn attestationsFromGossipAndPayloads(self: *Self) !std.ArrayList(types.Attestation) {
-        // Collect fresh data_roots from gossip + new payloads
-        var fresh_data_roots = std.AutoHashMap(types.Root, void).init(self.allocator);
-        defer fresh_data_roots.deinit();
-
-        var gossip_it = self.gossip_signatures.iterator();
-        while (gossip_it.next()) |entry| {
-            try fresh_data_roots.put(entry.key_ptr.data_root, {});
-        }
-
-        var new_it = self.latest_new_aggregated_payloads.iterator();
-        while (new_it.next()) |entry| {
-            try fresh_data_roots.put(entry.key_ptr.*, {});
-        }
-
-        // Collect all unique (validator_id, data_root) pairs from all sources
-        // Use a set to deduplicate
+    fn attestationsFromGossipAndNewPayloads(self: *Self) !std.ArrayList(types.Attestation) {
         var seen_keys = std.AutoHashMap(SignatureKey, void).init(self.allocator);
         defer seen_keys.deinit();
 
@@ -1371,8 +1354,8 @@ pub const ForkChoice = struct {
         errdefer attestation_list.deinit(self.allocator);
 
         // From gossip_signatures
-        var gossip_it2 = self.gossip_signatures.iterator();
-        while (gossip_it2.next()) |entry| {
+        var gossip_it = self.gossip_signatures.iterator();
+        while (gossip_it.next()) |entry| {
             const sig_key = entry.key_ptr.*;
             const att_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
             if (!seen_keys.contains(sig_key)) {
@@ -1385,32 +1368,9 @@ pub const ForkChoice = struct {
         }
 
         // From latest_new_aggregated_payloads
-        var new_it2 = self.latest_new_aggregated_payloads.iterator();
-        while (new_it2.next()) |entry| {
+        var new_it = self.latest_new_aggregated_payloads.iterator();
+        while (new_it.next()) |entry| {
             const data_root = entry.key_ptr.*;
-            const att_data = self.attestation_data_by_root.get(data_root) orelse continue;
-            for (entry.value_ptr.items) |*stored| {
-                for (0..stored.proof.participants.len()) |i| {
-                    if (stored.proof.participants.get(i) catch false) {
-                        const vid: types.ValidatorIndex = @intCast(i);
-                        const sig_key = SignatureKey{ .validator_id = vid, .data_root = data_root };
-                        if (!seen_keys.contains(sig_key)) {
-                            try seen_keys.put(sig_key, {});
-                            try attestation_list.append(self.allocator, .{
-                                .validator_id = vid,
-                                .data = att_data,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // From latest_known_aggregated_payloads (only where data_root is fresh)
-        var known_it = self.latest_known_aggregated_payloads.iterator();
-        while (known_it.next()) |entry| {
-            const data_root = entry.key_ptr.*;
-            if (!fresh_data_roots.contains(data_root)) continue;
             const att_data = self.attestation_data_by_root.get(data_root) orelse continue;
             for (entry.value_ptr.items) |*stored| {
                 for (0..stored.proof.participants.len()) |i| {
@@ -1432,49 +1392,9 @@ pub const ForkChoice = struct {
         return attestation_list;
     }
 
-    /// Merge new and known aggregated payloads into a single temporary map view.
-    /// Caller must hold signatures_mutex. Caller owns and must deinit the returned map.
-    fn mergedAggregatedPayloadsLocked(self: *Self) !AggregatedPayloadsMap {
-        var merged = AggregatedPayloadsMap.init(self.allocator);
-        errdefer deinitAggregatedPayloadsMap(self.allocator, &merged);
-
-        // Copy known payloads (clone proofs since merged map has independent ownership)
-        var known_it = self.latest_known_aggregated_payloads.iterator();
-        while (known_it.next()) |entry| {
-            const gop = try merged.getOrPut(entry.key_ptr.*);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
-            }
-            for (entry.value_ptr.items) |*stored| {
-                var cloned: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, stored.proof, &cloned);
-                errdefer cloned.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = stored.slot,
-                    .proof = cloned,
-                });
-            }
-        }
-
-        // Overlay new payloads (clone proofs)
-        var new_it = self.latest_new_aggregated_payloads.iterator();
-        while (new_it.next()) |entry| {
-            const gop = try merged.getOrPut(entry.key_ptr.*);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
-            }
-            for (entry.value_ptr.items) |*stored| {
-                var cloned: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, stored.proof, &cloned);
-                errdefer cloned.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = stored.slot,
-                    .proof = cloned,
-                });
-            }
-        }
-
-        return merged;
+    /// Clear all gossip signatures. Caller must hold signatures_mutex.
+    fn clearGossipSignaturesLocked(self: *Self) void {
+        self.gossip_signatures.clearAndFree();
     }
 
     pub fn aggregateCommitteeSignaturesAndPayloads(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
