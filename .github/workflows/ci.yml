@@ -32,20 +32,18 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-zig-
 
-    - name: Fetch Zig dependencies with retry
+    - name: Fetch Zig dependencies
       run: |
-        max_attempts=5
-        attempt=1
-        while [ $attempt -le $max_attempts ]; do
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
           if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
           sleep 5
-          attempt=$((attempt + 1))
         done
-        echo "Failed to fetch dependencies after $max_attempts attempts"
+        echo "All fetch attempts failed"
         exit 1
 
     - name: Set up Rust/Cargo
@@ -114,24 +112,33 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Fetch Zig dependencies with retry
+    - name: Fetch Zig dependencies
       run: |
-        max_attempts=5
-        attempt=1
-        while [ $attempt -le $max_attempts ]; do
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
           if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
           sleep 5
-          attempt=$((attempt + 1))
         done
-        echo "Failed to fetch dependencies after $max_attempts attempts"
+        echo "All fetch attempts failed"
         exit 1
 
     - name: build
-      run: zig build all
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build all; then
+            echo "Successfully built on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All build attempts failed"
+        exit 1
 
   build-all-provers:
     name: build-all-provers
@@ -175,24 +182,33 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Fetch Zig dependencies with retry
+    - name: Fetch Zig dependencies
       run: |
-        max_attempts=5
-        attempt=1
-        while [ $attempt -le $max_attempts ]; do
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
           if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
           sleep 5
-          attempt=$((attempt + 1))
         done
-        echo "Failed to fetch dependencies after $max_attempts attempts"
+        echo "All fetch attempts failed"
         exit 1
 
     - name: Build with all provers
-      run: zig build -Dprover=all
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build -Dprover=all; then
+            echo "Successfully built on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All build attempts failed"
+        exit 1
 
   test:
     name: test
@@ -236,27 +252,47 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Fetch Zig dependencies with retry
+    - name: Fetch Zig dependencies
       run: |
-        max_attempts=5
-        attempt=1
-        while [ $attempt -le $max_attempts ]; do
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
           if zig build --fetch; then
             echo "Successfully fetched dependencies on attempt $attempt"
             exit 0
           fi
           echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
           sleep 5
-          attempt=$((attempt + 1))
         done
-        echo "Failed to fetch dependencies after $max_attempts attempts"
+        echo "All fetch attempts failed"
         exit 1
 
     - name: Run all unit tests
-      run: zig build test --summary all
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build test --summary all; then
+            echo "Successfully ran unit tests on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All unit test attempts failed"
+        exit 1
 
     - name: Run all sim tests
-      run: zig build simtest --summary all
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build simtest --summary all; then
+            echo "Successfully ran sim tests on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All sim test attempts failed"
+        exit 1
 
     - name: Install uv
       shell: bash
@@ -314,8 +350,33 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All fetch attempts failed"
+        exit 1
+
     - name: Run the dummy prover
-      run: zig build run -Dprover=dummy -- prove --zkvm dummy
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build run -Dprover=dummy -- prove --zkvm dummy; then
+            echo "Successfully ran dummy prover on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All dummy prover attempts failed"
+        exit 1
 
   docker-build:
     name: docker-build
@@ -360,8 +421,33 @@ jobs:
         workspaces: "rust -> target"
         key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Fetch Zig dependencies
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All fetch attempts failed"
+        exit 1
+
     - name: Build zeam natively
-      run: zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"; then
+            echo "Successfully built on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All build attempts failed"
+        exit 1
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3

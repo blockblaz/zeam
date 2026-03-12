@@ -272,29 +272,33 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Attestation validation failed due to missing head/source/target block -
+                // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                    if (data.* == .attestation) {
-                        const att = data.attestation;
-                        const att_data = att.message.message;
+                    const att_data: ?@TypeOf(data.attestation.message.message) = switch (data.*) {
+                        .attestation => |att| att.message.message,
+                        .aggregation => |agg| agg.data,
+                        else => null,
+                    };
+                    if (att_data) |ad| {
                         const missing_root = if (err == error.UnknownHeadBlock)
-                            att_data.head.root
+                            ad.head.root
                         else if (err == error.UnknownSourceBlock)
-                            att_data.source.root
+                            ad.source.root
                         else
-                            att_data.target.root;
+                            ad.target.root;
 
+                        const kind: []const u8 = if (data.* == .attestation) "attestation" else "aggregation";
                         if (self.network.hasPendingBlockRoot(missing_root)) {
-                            self.logger.debug("gossip attestation validation deferred slot={d} validator={d} error={any} (block fetch in progress)", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.debug("gossip {s} validation deferred slot={d} error={any} (block fetch in progress)", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         } else {
-                            self.logger.warn("gossip attestation validation failed slot={d} validator={d} error={any}", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.warn("gossip {s} validation failed slot={d} error={any}", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         }
