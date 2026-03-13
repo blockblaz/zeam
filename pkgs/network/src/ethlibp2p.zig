@@ -385,7 +385,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
         .aggregation => |signed_aggregation| {
             zigHandler.logger.debug(
-                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
+                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{
                     zigHandler.params.networkId,
                     signed_aggregation.data.slot,
@@ -400,7 +400,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     // Debug-only JSON dump (conversion happens only if debug is actually emitted).
     zigHandler.logger.debug(
-        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {any}",
+        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {f}",
         .{
             zigHandler.params.networkId,
             std.mem.span(topic_str),

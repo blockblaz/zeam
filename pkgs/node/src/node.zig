@@ -197,7 +197,7 @@ pub const BeamNode = struct {
             },
             .aggregation => |signed_aggregation| {
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{f}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
@@ -391,6 +391,17 @@ pub const BeamNode = struct {
         // Try to process each descendant
         for (descendants_to_process.items) |descendant_root| {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                // Skip if already known to fork choice — same guard as processBlockByRootChunk
+                if (self.chain.forkChoice.hasBlock(descendant_root)) {
+                    self.logger.debug(
+                        "cached block 0x{x} is already known to fork choice, skipping re-processing",
+                        .{&descendant_root},
+                    );
+                    _ = self.network.removeFetchedBlock(descendant_root);
+                    self.processCachedDescendants(descendant_root);
+                    continue;
+                }
+
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
                     .{&descendant_root},
@@ -600,6 +611,19 @@ pub const BeamNode = struct {
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
+            }
+
+            // Skip STF re-processing if the block is already known to fork choice
+            // (e.g. the checkpoint sync anchor block — it is the trust root and does not
+            // need state-transition re-processing; re-processing it would cause an infinite
+            // fetch loop because onBlock would always see it as "already processed").
+            if (self.chain.forkChoice.hasBlock(block_root)) {
+                self.logger.debug(
+                    "block 0x{x} is already known to fork choice, skipping re-processing",
+                    .{&block_root},
+                );
+                self.processCachedDescendants(block_root);
+                return;
             }
 
             // Try to add the block to the chain

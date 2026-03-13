@@ -17,14 +17,12 @@ const networks = @import("@zeam/network");
 const Multiaddr = @import("multiaddr").Multiaddr;
 const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
-const xmss = @import("@zeam/xmss");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
 const zeam_utils = @import("@zeam/utils");
-const constants = @import("constants.zig");
 const database = @import("@zeam/database");
 const json = std.json;
 const utils = @import("@zeam/utils");
@@ -452,29 +450,11 @@ pub const Node = struct {
             const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
             defer self.allocator.free(pk_path);
 
-            // Read secret key
-            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigSecretKeyMissing,
+            var keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            defer sk_file.close();
-            const secret_ssz = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
-            defer self.allocator.free(secret_ssz);
-
-            // Read public key
-            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigPublicKeyMissing,
-                else => return err,
-            };
-            defer pk_file.close();
-            const public_ssz = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
-            defer self.allocator.free(public_ssz);
-
-            var keypair = try xmss.KeyPair.fromSsz(
-                self.allocator,
-                secret_ssz,
-                public_ssz,
-            );
             errdefer keypair.deinit();
 
             try self.key_manager.addKeypair(assignment.index, keypair);

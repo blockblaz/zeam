@@ -28,6 +28,7 @@ const Chain = configs.Chain;
 const ChainOptions = configs.ChainOptions;
 
 const utils_lib = @import("@zeam/utils");
+const key_manager_lib = @import("@zeam/key-manager");
 const zeam_metrics = @import("@zeam/metrics");
 
 const database = @import("@zeam/database");
@@ -396,7 +397,6 @@ fn mainInner() !void {
             var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
 
             // Create key manager FIRST to get validator pubkeys for genesis
-            const key_manager_lib = @import("@zeam/key-manager");
             // Using 3 validators for 3-node setup with initial sync testing
             // Nodes 1,2 start immediately; Node 3 starts after finalization to test sync
             const num_validators: usize = 3;
@@ -484,7 +484,7 @@ fn mainInner() !void {
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 backend3 = network.getNetworkInterface();
-                logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
                 network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
@@ -554,7 +554,7 @@ fn mainInner() !void {
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -794,30 +794,8 @@ fn mainInner() !void {
                 };
                 defer allocator.free(sk_path);
 
-                const pk_file = std.fs.cwd().openFile(key_path, .{}) catch |err| {
-                    ErrorHandler.logErrorWithDetails(err, "open public key file", .{ .path = key_path });
-                    return err;
-                };
-                defer pk_file.close();
-                const pk_bytes = pk_file.readToEndAlloc(allocator, 256) catch |err| {
-                    ErrorHandler.logErrorWithOperation(err, "read public key file");
-                    return err;
-                };
-                defer allocator.free(pk_bytes);
-
-                const sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| {
-                    ErrorHandler.logErrorWithDetails(err, "open private key file", .{ .path = sk_path });
-                    return err;
-                };
-                defer sk_file.close();
-                const sk_bytes = sk_file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
-                    ErrorHandler.logErrorWithOperation(err, "read private key file");
-                    return err;
-                };
-                defer allocator.free(sk_bytes);
-
-                keypair = xmss.KeyPair.fromSsz(allocator, sk_bytes, pk_bytes) catch |err| {
-                    ErrorHandler.logErrorWithOperation(err, "load keypair from SSZ");
+                keypair = key_manager_lib.loadKeypairFromFiles(allocator, sk_path, key_path) catch |err| {
+                    ErrorHandler.logErrorWithOperation(err, "load keypair from SSZ files");
                     return err;
                 };
             } else if (cmd.@"private-key") |seed| {
