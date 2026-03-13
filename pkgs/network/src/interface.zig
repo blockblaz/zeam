@@ -724,7 +724,7 @@ const MessagePublishWrapper = struct {
     const Self = @This();
 
     pub fn format(self: Self, writer: anytype) !void {
-        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={any}, sender={s} }}", .{
+        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={f}, sender={s} }}", .{
             self.networkId,
             self.data.getGossipTopic(),
             self.sender_peer_id,

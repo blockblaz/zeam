@@ -484,7 +484,7 @@ fn mainInner() !void {
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 backend3 = network.getNetworkInterface();
-                logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
                 network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
@@ -554,7 +554,7 @@ fn mainInner() !void {
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
