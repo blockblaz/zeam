@@ -183,74 +183,64 @@ pub const Node = struct {
 
         self.logger = options.logger_config.logger(.node);
 
-        // Probe the database immediately after opening: try to load the latest
-        // finalized state and verify its genesis time against our config.
-        // If there is a mismatch the DB belongs to a different genesis, so wipe
-        // it now — before any other state-loading path runs — so that every
-        // subsequent path (checkpoint sync, database load, genesis) works with
-        // a clean DB.
-        {
-            var probe_state: types.BeamState = undefined;
-            if (db.loadLatestFinalizedState(&probe_state)) {
-                defer probe_state.deinit();
-                if (probe_state.config.genesis_time != chain_config.genesis.genesis_time) {
-                    self.logger.warn("database genesis time mismatch (db={d}, config={d}), wiping stale database", .{
-                        probe_state.config.genesis_time,
-                        chain_config.genesis.genesis_time,
-                    });
-                    db.deinit();
-                    const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
-                    defer allocator.free(rocksdb_path);
-                    std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
-                        self.logger.err("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
-                        return wipe_err;
-                    };
-                    db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
-                    self.logger.info("stale database wiped, starting fresh", .{});
-                }
-            } else |_| {
-                // Empty or unreadable DB — nothing to check, proceed normally.
-            }
-        }
-
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
+        errdefer self.anchor_state.deinit();
 
-        // Initialize anchor state with priority: checkpoint URL > database > genesis
-        var checkpoint_sync_succeeded = false;
+        // load a valid local state available in db else genesis
+        var local_finalized_state: types.BeamState = undefined;
+        if (db.loadLatestFinalizedState(&local_finalized_state)) {
+            if (local_finalized_state.config.genesis_time != chain_config.genesis.genesis_time) {
+                self.logger.warn("database genesis time mismatch (db={d}, config={d}), wiping stale database", .{
+                    local_finalized_state.config.genesis_time,
+                    chain_config.genesis.genesis_time,
+                });
+                db.deinit();
+                const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
+                defer allocator.free(rocksdb_path);
+                std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+                    self.logger.err("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                    return wipe_err;
+                };
+                db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+                self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
+
+                local_finalized_state.deinit();
+                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+            } else {
+                self.anchor_state.* = local_finalized_state;
+            }
+        } else |_| {
+            self.logger.info("starting fresh & generating genesis as found no saved finalized state in db", .{});
+            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+        }
+
+        // check if a valid and more recent checkpoint finalized state is available
         if (options.checkpoint_sync_url) |checkpoint_url| {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Try checkpoint sync, fall back to database/genesis on failure
-            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
-                self.anchor_state.* = downloaded_state;
-
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
+                var downloaded_state = downloaded_state_const;
                 // Verify state against genesis config
-                if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
-                    self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
-                    checkpoint_sync_succeeded = true;
+                if (verifyCheckpointState(allocator, &downloaded_state, &chain_config.genesis, self.logger)) {
+                    if (downloaded_state.slot > self.anchor_state.slot) {
+                        self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
+                        self.anchor_state.deinit();
+                        self.anchor_state.* = downloaded_state;
+                    } else {
+                        self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
+                        downloaded_state.deinit();
+                    }
                 } else |verify_err| {
                     self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
-                    self.anchor_state.deinit();
+                    downloaded_state.deinit();
                 }
             } else |download_err| {
                 self.logger.warn("checkpoint sync failed: {}, falling back to database/genesis", .{download_err});
             }
         }
-
-        // Fall back to database/genesis if checkpoint sync was not attempted or failed
-        if (!checkpoint_sync_succeeded) {
-            // Try to load the latest finalized state from the database, fallback to genesis.
-            // Genesis time is already validated above so no mismatch check needed here.
-            if (db.loadLatestFinalizedState(self.anchor_state)) {
-                self.logger.info("recovered finalized state from database at slot {d}", .{self.anchor_state.slot});
-            } else |err| {
-                self.logger.warn("could not load finalized state from database ({any}), starting from genesis", .{err});
-                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-            }
-        }
-        errdefer self.anchor_state.deinit();
 
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
