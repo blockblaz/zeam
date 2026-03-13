@@ -602,6 +602,19 @@ pub const BeamNode = struct {
                 });
             }
 
+            // Skip STF re-processing if the block is already known to fork choice
+            // (e.g. the checkpoint sync anchor block — it is the trust root and does not
+            // need state-transition re-processing; re-processing it would cause an infinite
+            // fetch loop because onBlock would always see it as "already processed").
+            if (self.chain.forkChoice.hasBlock(block_root)) {
+                self.logger.debug(
+                    "block 0x{x} is already known to fork choice, skipping re-processing",
+                    .{&block_root},
+                );
+                self.processCachedDescendants(block_root);
+                return;
+            }
+
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
