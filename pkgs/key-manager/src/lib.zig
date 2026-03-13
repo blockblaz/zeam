@@ -172,10 +172,41 @@ pub const KeyManager = struct {
 };
 
 /// Maximum size of a serialized XMSS private key (20MB).
-const MAX_SK_SIZE = 1024 * 1024 * 20;
+pub const MAX_SK_SIZE = 1024 * 1024 * 20;
 
 /// Maximum size of a serialized XMSS public key (256 bytes).
-const MAX_PK_SIZE = 256;
+pub const MAX_PK_SIZE = 256;
+
+/// Load an XMSS keypair from SSZ files on disk.
+///
+/// `sk_path` must point to the secret key SSZ file (`*_sk.ssz`).
+/// `pk_path` must point to the public key SSZ file (`*_pk.ssz`).
+///
+/// Returns a fully initialised `xmss.KeyPair`. The caller owns the keypair
+/// and must call `keypair.deinit()` when it is no longer needed.
+pub fn loadKeypairFromFiles(
+    allocator: Allocator,
+    sk_path: []const u8,
+    pk_path: []const u8,
+) !xmss.KeyPair {
+    var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SecretKeyFileNotFound,
+        else => return err,
+    };
+    defer sk_file.close();
+    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
+    defer allocator.free(sk_data);
+
+    var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.PublicKeyFileNotFound,
+        else => return err,
+    };
+    defer pk_file.close();
+    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
+    defer allocator.free(pk_data);
+
+    return xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
+}
 
 /// Number of pre-generated test keys available in the test-keys submodule.
 const NUM_PREGENERATED_KEYS: usize = 32;
@@ -210,20 +241,7 @@ fn loadPreGeneratedKey(
     var pk_path_buf: [512]u8 = undefined;
     const pk_path = std.fmt.bufPrint(&pk_path_buf, "{s}/validator_{d}_pk.ssz", .{ keys_dir, index }) catch unreachable;
 
-    // Read private key
-    var sk_file = try std.fs.cwd().openFile(sk_path, .{});
-    defer sk_file.close();
-    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
-    defer allocator.free(sk_data);
-
-    // Read public key
-    var pk_file = try std.fs.cwd().openFile(pk_path, .{});
-    defer pk_file.close();
-    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
-    defer allocator.free(pk_data);
-
-    // Reconstruct keypair from SSZ
-    return xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
+    return loadKeypairFromFiles(allocator, sk_path, pk_path);
 }
 
 pub fn getTestKeyManager(
