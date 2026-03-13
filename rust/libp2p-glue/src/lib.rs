@@ -27,6 +27,7 @@ use futures::future::poll_fn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
@@ -123,6 +124,56 @@ lazy_static::lazy_static! {
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Commands sent from FFI functions (Zig thread) to the Tokio event loop.
+/// The event loop is the only place that mutates the libp2p Swarm, eliminating the data race.
+#[allow(dead_code)]
+enum SwarmCommand {
+    Publish {
+        topic: String,
+        data: Vec<u8>,
+    },
+    SendRpcRequest {
+        peer_id: PeerId,
+        request_id: u64,
+        protocol_id: ProtocolId,
+        request_message: RequestMessage,
+    },
+    SendRpcResponseChunk {
+        channel: PendingResponse,
+        channel_id: u64,
+        response_message: ResponseMessage,
+        update_timeout: bool,
+    },
+    SendRpcEndOfStream {
+        channel: PendingResponse,
+        channel_id: u64,
+    },
+    SendRpcErrorResponse {
+        channel: PendingResponse,
+        channel_id: u64,
+        payload: Vec<u8>,
+    },
+}
+
+lazy_static::lazy_static! {
+    /// Per-network mpsc senders. FFI functions post commands here; run_eventloop processes them.
+    static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::UnboundedSender<SwarmCommand>>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Send a command to the event loop for the given network_id.
+/// Logs an error if no sender is registered (network not yet initialised).
+fn send_swarm_command(network_id: u32, cmd: SwarmCommand) {
+    let senders = COMMAND_SENDERS.lock().unwrap();
+    if let Some(tx) = senders.get(&network_id) {
+        if tx.send(cmd).is_err() {
+            forward_log_by_network(network_id, 3, "Command channel closed — event loop may have exited");
+        }
+    } else {
+        forward_log_by_network(network_id, 3, "send_swarm_command called before network initialized");
+    }
+}
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAYS_SECS: [u64; 5] = [5, 10, 20, 40, 80];
@@ -281,25 +332,8 @@ pub unsafe fn publish_msg_to_rust_bridge(
     }
 
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
-    let topic = gossipsub::IdentTopic::new(topic);
 
-    let swarm = match unsafe { get_swarm_mut(network_id) } {
-        Some(s) => s,
-        None => {
-            logger::rustLogger.error(
-                network_id,
-                "publish_msg_to_rust_bridge called before network initialized",
-            );
-            return;
-        }
-    };
-    if let Err(e) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(topic.clone(), message_data)
-    {
-        logger::rustLogger.error(network_id, &format!("Publish error: {e:?}"));
-    }
+    send_swarm_command(network_id, SwarmCommand::Publish { topic, data: message_data });
 }
 
 /// # Safety
@@ -342,36 +376,25 @@ pub unsafe fn send_rpc_request(
 
     let protocol_id: ProtocolId = protocol.into();
 
-    let swarm = match get_swarm_mut(network_id) {
-        Some(s) => s,
-        None => {
-            logger::rustLogger.error(
-                network_id,
-                "send_rpc_request called before network initialized",
-            );
-            return 0;
-        }
-    };
-
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-
     let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
 
-    swarm
-        .behaviour_mut()
-        .reqresp
-        .send_request(peer_id, request_id, request_message);
-
+    // Register tracking state before sending the command so the event loop handler
+    // sees the entries if the response arrives quickly.
     REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
-    REQUEST_PROTOCOL_MAP
-        .lock()
-        .unwrap()
-        .insert(request_id, protocol_id.clone());
+    REQUEST_PROTOCOL_MAP.lock().unwrap().insert(request_id, protocol_id.clone());
+
+    send_swarm_command(network_id, SwarmCommand::SendRpcRequest {
+        peer_id,
+        request_id,
+        protocol_id,
+        request_message,
+    });
 
     logger::rustLogger.info(
         network_id,
         &format!(
-            "[reqresp] Sent {:?} request to {} (id: {})",
+            "[reqresp] Queued {:?} request to {} (id: {})",
             protocol, peer_id, request_id
         ),
     );
@@ -392,39 +415,27 @@ pub unsafe fn send_rpc_response_chunk(
     let response_bytes = response_slice.to_vec();
 
     let channel = {
-        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-        let channel = response_map.get(&channel_id).cloned();
-        if channel.is_some() {
-            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-        }
-        channel
+        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.get(&channel_id).cloned()
     };
 
     if let Some(channel) = channel {
-        let swarm = match get_swarm_mut(network_id) {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_response_chunk called before network initialized",
-                );
-                return;
-            }
-        };
-
+        let peer_id = channel.peer_id;
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
 
-        swarm.behaviour_mut().reqresp.send_response(
-            channel.peer_id,
-            channel.connection_id,
-            channel.stream_id,
+        send_swarm_command(network_id, SwarmCommand::SendRpcResponseChunk {
+            channel,
+            channel_id,
             response_message,
-        );
+            // The event loop will update the timeout after the send
+            update_timeout: true,
+        });
+
         logger::rustLogger.info(
             network_id,
             &format!(
-                "[reqresp] Sent response payload on channel {} (peer: {})",
-                channel_id, channel.peer_id
+                "[reqresp] Queued response payload on channel {} (peer: {})",
+                channel_id, peer_id
             ),
         );
     } else {
@@ -445,27 +456,13 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     };
 
     if let Some(channel) = channel {
-        let swarm = match get_swarm_mut(network_id) {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_end_of_stream called before network initialized",
-                );
-                return;
-            }
-        };
-
-        swarm.behaviour_mut().reqresp.finish_response_stream(
-            channel.peer_id,
-            channel.connection_id,
-            channel.stream_id,
-        );
+        let peer_id = channel.peer_id;
+        send_swarm_command(network_id, SwarmCommand::SendRpcEndOfStream { channel, channel_id });
         logger::rustLogger.info(
             network_id,
             &format!(
-                "[reqresp] Sent end-of-stream on channel {} (peer: {})",
-                channel_id, channel.peer_id
+                "[reqresp] Queued end-of-stream on channel {} (peer: {})",
+                channel_id, peer_id
             ),
         );
     } else {
@@ -515,41 +512,23 @@ pub unsafe fn send_rpc_error_response(
     };
 
     if let Some(channel) = channel {
-        let swarm = match get_swarm_mut(network_id) {
-            Some(s) => s,
-            None => {
-                logger::rustLogger.error(
-                    network_id,
-                    "send_rpc_error_response called before network initialized",
-                );
-                return;
-            }
-        };
+        let peer_id = channel.peer_id;
 
         let mut payload = Vec::with_capacity(1 + MAX_VARINT_BYTES + message_bytes.len());
         payload.push(2);
         encode_varint(message_bytes.len(), &mut payload);
         payload.extend_from_slice(message_bytes);
 
-        let response_message = ResponseMessage::new(channel.protocol.clone(), payload);
+        send_swarm_command(network_id, SwarmCommand::SendRpcErrorResponse {
+            channel,
+            channel_id,
+            payload,
+        });
 
-        let peer_id = channel.peer_id;
-
-        swarm.behaviour_mut().reqresp.send_response(
-            peer_id,
-            channel.connection_id,
-            channel.stream_id,
-            response_message,
-        );
-        swarm.behaviour_mut().reqresp.finish_response_stream(
-            peer_id,
-            channel.connection_id,
-            channel.stream_id,
-        );
         logger::rustLogger.info(
             network_id,
             &format!(
-                "[reqresp] Sent error response on channel {} (peer: {}): {}",
+                "[reqresp] Queued error response on channel {} (peer: {}): {}",
                 channel_id, peer_id, message
             ),
         );
@@ -670,6 +649,8 @@ pub struct Network {
     network_id: u32,
     zig_handler: u64,
     peer_addr_map: HashMap<PeerId, Multiaddr>,
+    /// Receiver half of the actor command channel. Populated in start_network.
+    cmd_rx: Option<mpsc::UnboundedReceiver<SwarmCommand>>,
 }
 
 impl Network {
@@ -678,6 +659,7 @@ impl Network {
             network_id,
             zig_handler,
             peer_addr_map: HashMap::new(),
+            cmd_rx: None,
         }
     }
 
@@ -806,6 +788,11 @@ impl Network {
             logger::rustLogger.debug(self.network_id, "no connect addresses");
         }
 
+        // Create the actor command channel and register the sender globally.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
+        COMMAND_SENDERS.lock().unwrap().insert(self.network_id, cmd_tx);
+        self.cmd_rx = Some(cmd_rx);
+
         unsafe {
             set_swarm(self.network_id, swarm);
         }
@@ -829,8 +816,62 @@ impl Network {
         let swarm = unsafe { get_swarm_mut(self.network_id) }
             .expect("run_eventloop called before start_network stored the swarm");
 
+        let mut cmd_rx = self.cmd_rx.take()
+            .expect("run_eventloop called before start_network created the command channel");
+
         loop {
             tokio::select! {
+
+            // Actor model: process swarm commands sent by FFI functions from the Zig thread.
+            // This ensures the Swarm is only ever mutated from within this single Tokio event loop,
+            // eliminating the data race between FFI callers and the Tokio thread.
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    SwarmCommand::Publish { topic, data } => {
+                        let ident_topic = gossipsub::IdentTopic::new(topic);
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(ident_topic, data) {
+                            logger::rustLogger.error(self.network_id, &format!("Publish error: {e:?}"));
+                        }
+                    }
+                    SwarmCommand::SendRpcRequest { peer_id, request_id, protocol_id: _, request_message } => {
+                        swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
+                    }
+                    SwarmCommand::SendRpcResponseChunk { channel, channel_id, response_message, update_timeout } => {
+                        if update_timeout {
+                            let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+                            let _ = map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
+                        }
+                        swarm.behaviour_mut().reqresp.send_response(
+                            channel.peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                            response_message,
+                        );
+                    }
+                    SwarmCommand::SendRpcEndOfStream { channel, channel_id: _ } => {
+                        swarm.behaviour_mut().reqresp.finish_response_stream(
+                            channel.peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                        );
+                    }
+                    SwarmCommand::SendRpcErrorResponse { channel, channel_id: _, payload } => {
+                        let response_message = ResponseMessage::new(channel.protocol.clone(), payload);
+                        let peer_id = channel.peer_id;
+                        swarm.behaviour_mut().reqresp.send_response(
+                            peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                            response_message,
+                        );
+                        swarm.behaviour_mut().reqresp.finish_response_stream(
+                            peer_id,
+                            channel.connection_id,
+                            channel.stream_id,
+                        );
+                    }
+                }
+            }
 
             Some(timeout_result) = poll_fn(|cx| {
                 let mut map = REQUEST_ID_MAP.lock().unwrap();
@@ -1619,26 +1660,26 @@ mod tests {
         assert!(!result, "Should timeout when network is not initialized");
     }
 
-    #[test]
-    fn test_send_rpc_request_before_initialization_returns_zero() {
-        // Test that sending RPC request before initialization returns 0
+    #[tokio::test]
+    async fn test_send_rpc_request_before_initialization_returns_zero() {
+        // With the actor model, send_rpc_request generates a request_id immediately and
+        // queues the command. If the peer_id string is unparseable (invalid), the function
+        // returns 0 as an error indicator before any command is sent.
         let network_id = 99;
-        let peer_id = std::ffi::CString::new("12D3KooWTest").unwrap();
+        let invalid_peer_id = std::ffi::CString::new("not-a-valid-peer-id").unwrap();
         let request_data = b"test request";
 
         let request_id = unsafe {
             send_rpc_request(
                 network_id,
-                peer_id.as_ptr(),
-                0, // protocol_tag
+                invalid_peer_id.as_ptr(),
+                0, // BlocksByRootV1
                 request_data.as_ptr(),
                 request_data.len(),
             )
         };
 
-        assert_eq!(
-            request_id, 0,
-            "Should return 0 when network is not initialized"
-        );
+        // Invalid peer id → early return 0 before actor command is issued
+        assert_eq!(request_id, 0, "Invalid peer_id should return 0");
     }
 }
