@@ -347,13 +347,18 @@ pub unsafe fn publish_msg_to_rust_bridge(
 
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
 
-    send_swarm_command(
+    if !send_swarm_command(
         network_id,
         SwarmCommand::Publish {
             topic,
             data: message_data,
         },
-    );
+    ) {
+        logger::rustLogger.error(
+            network_id,
+            "publish_msg_to_rust_bridge: failed to queue publish command — command channel unavailable",
+        );
+    }
 }
 
 /// # Safety
@@ -454,30 +459,31 @@ pub unsafe fn send_rpc_response_chunk(
         let peer_id = channel.peer_id;
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
 
-        // Update the idle timeout eagerly (before the command is dequeued by the event loop)
-        // so that queued activity prevents premature channel expiry under load.
-        {
-            let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-            let _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-        }
-
-        send_swarm_command(
+        if send_swarm_command(
             network_id,
             SwarmCommand::SendRpcResponseChunk {
                 channel,
                 channel_id,
                 response_message,
-                update_timeout: false,
+                update_timeout: true,
             },
-        );
-
-        logger::rustLogger.info(
-            network_id,
-            &format!(
-                "[reqresp] Queued response payload on channel {} (peer: {})",
-                channel_id, peer_id
-            ),
-        );
+        ) {
+            logger::rustLogger.info(
+                network_id,
+                &format!(
+                    "[reqresp] Queued response payload on channel {} (peer: {})",
+                    channel_id, peer_id
+                ),
+            );
+        } else {
+            logger::rustLogger.error(
+                network_id,
+                &format!(
+                    "[reqresp] Failed to queue response payload on channel {} (peer: {}): command channel unavailable",
+                    channel_id, peer_id
+                ),
+            );
+        }
     } else {
         logger::rustLogger.error(
             network_id,
@@ -497,20 +503,34 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
 
     if let Some(channel) = channel {
         let peer_id = channel.peer_id;
-        send_swarm_command(
+        if send_swarm_command(
             network_id,
             SwarmCommand::SendRpcEndOfStream {
-                channel,
+                channel: channel.clone(),
                 channel_id,
             },
-        );
-        logger::rustLogger.info(
-            network_id,
-            &format!(
-                "[reqresp] Queued end-of-stream on channel {} (peer: {})",
-                channel_id, peer_id
-            ),
-        );
+        ) {
+            logger::rustLogger.info(
+                network_id,
+                &format!(
+                    "[reqresp] Queued end-of-stream on channel {} (peer: {})",
+                    channel_id, peer_id
+                ),
+            );
+        } else {
+            // Command could not be enqueued — re-insert the channel to preserve state.
+            RESPONSE_CHANNEL_MAP
+                .lock()
+                .unwrap()
+                .insert(channel_id, channel);
+            logger::rustLogger.error(
+                network_id,
+                &format!(
+                    "[reqresp] Failed to queue end-of-stream on channel {} (peer: {}): command channel unavailable",
+                    channel_id, peer_id
+                ),
+            );
+        }
     } else {
         logger::rustLogger.error(
             network_id,
@@ -565,22 +585,35 @@ pub unsafe fn send_rpc_error_response(
         encode_varint(message_bytes.len(), &mut payload);
         payload.extend_from_slice(message_bytes);
 
-        send_swarm_command(
+        if send_swarm_command(
             network_id,
             SwarmCommand::SendRpcErrorResponse {
-                channel,
+                channel: channel.clone(),
                 channel_id,
                 payload,
             },
-        );
-
-        logger::rustLogger.info(
-            network_id,
-            &format!(
-                "[reqresp] Queued error response on channel {} (peer: {}): {}",
-                channel_id, peer_id, message
-            ),
-        );
+        ) {
+            logger::rustLogger.info(
+                network_id,
+                &format!(
+                    "[reqresp] Queued error response on channel {} (peer: {}): {}",
+                    channel_id, peer_id, message
+                ),
+            );
+        } else {
+            // Command could not be enqueued — re-insert the channel to preserve state.
+            RESPONSE_CHANNEL_MAP
+                .lock()
+                .unwrap()
+                .insert(channel_id, channel);
+            logger::rustLogger.error(
+                network_id,
+                &format!(
+                    "[reqresp] Failed to queue error response on channel {} (peer: {}): command channel unavailable",
+                    channel_id, peer_id
+                ),
+            );
+        }
     } else {
         logger::rustLogger.error(
             network_id,
