@@ -168,10 +168,18 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) {
     let senders = COMMAND_SENDERS.lock().unwrap();
     if let Some(tx) = senders.get(&network_id) {
         if tx.send(cmd).is_err() {
-            forward_log_by_network(network_id, 3, "Command channel closed — event loop may have exited");
+            forward_log_by_network(
+                network_id,
+                3,
+                "Command channel closed — event loop may have exited",
+            );
         }
     } else {
-        forward_log_by_network(network_id, 3, "send_swarm_command called before network initialized");
+        forward_log_by_network(
+            network_id,
+            3,
+            "send_swarm_command called before network initialized",
+        );
     }
 }
 
@@ -333,7 +341,13 @@ pub unsafe fn publish_msg_to_rust_bridge(
 
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
 
-    send_swarm_command(network_id, SwarmCommand::Publish { topic, data: message_data });
+    send_swarm_command(
+        network_id,
+        SwarmCommand::Publish {
+            topic,
+            data: message_data,
+        },
+    );
 }
 
 /// # Safety
@@ -382,14 +396,20 @@ pub unsafe fn send_rpc_request(
     // Register tracking state before sending the command so the event loop handler
     // sees the entries if the response arrives quickly.
     REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
-    REQUEST_PROTOCOL_MAP.lock().unwrap().insert(request_id, protocol_id.clone());
+    REQUEST_PROTOCOL_MAP
+        .lock()
+        .unwrap()
+        .insert(request_id, protocol_id.clone());
 
-    send_swarm_command(network_id, SwarmCommand::SendRpcRequest {
-        peer_id,
-        request_id,
-        protocol_id,
-        request_message,
-    });
+    send_swarm_command(
+        network_id,
+        SwarmCommand::SendRpcRequest {
+            peer_id,
+            request_id,
+            protocol_id,
+            request_message,
+        },
+    );
 
     logger::rustLogger.info(
         network_id,
@@ -423,13 +443,16 @@ pub unsafe fn send_rpc_response_chunk(
         let peer_id = channel.peer_id;
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
 
-        send_swarm_command(network_id, SwarmCommand::SendRpcResponseChunk {
-            channel,
-            channel_id,
-            response_message,
-            // The event loop will update the timeout after the send
-            update_timeout: true,
-        });
+        send_swarm_command(
+            network_id,
+            SwarmCommand::SendRpcResponseChunk {
+                channel,
+                channel_id,
+                response_message,
+                // The event loop will update the timeout after the send
+                update_timeout: true,
+            },
+        );
 
         logger::rustLogger.info(
             network_id,
@@ -457,7 +480,13 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
 
     if let Some(channel) = channel {
         let peer_id = channel.peer_id;
-        send_swarm_command(network_id, SwarmCommand::SendRpcEndOfStream { channel, channel_id });
+        send_swarm_command(
+            network_id,
+            SwarmCommand::SendRpcEndOfStream {
+                channel,
+                channel_id,
+            },
+        );
         logger::rustLogger.info(
             network_id,
             &format!(
@@ -519,11 +548,14 @@ pub unsafe fn send_rpc_error_response(
         encode_varint(message_bytes.len(), &mut payload);
         payload.extend_from_slice(message_bytes);
 
-        send_swarm_command(network_id, SwarmCommand::SendRpcErrorResponse {
-            channel,
-            channel_id,
-            payload,
-        });
+        send_swarm_command(
+            network_id,
+            SwarmCommand::SendRpcErrorResponse {
+                channel,
+                channel_id,
+                payload,
+            },
+        );
 
         logger::rustLogger.info(
             network_id,
@@ -790,7 +822,10 @@ impl Network {
 
         // Create the actor command channel and register the sender globally.
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
-        COMMAND_SENDERS.lock().unwrap().insert(self.network_id, cmd_tx);
+        COMMAND_SENDERS
+            .lock()
+            .unwrap()
+            .insert(self.network_id, cmd_tx);
         self.cmd_rx = Some(cmd_rx);
 
         unsafe {
@@ -816,7 +851,9 @@ impl Network {
         let swarm = unsafe { get_swarm_mut(self.network_id) }
             .expect("run_eventloop called before start_network stored the swarm");
 
-        let mut cmd_rx = self.cmd_rx.take()
+        let mut cmd_rx = self
+            .cmd_rx
+            .take()
             .expect("run_eventloop called before start_network created the command channel");
 
         loop {
