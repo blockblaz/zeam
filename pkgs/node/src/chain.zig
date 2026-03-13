@@ -463,7 +463,7 @@ pub const BeamChain = struct {
         const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
 
-        self.logger.debug("node-{d}::going for block production opts={any} raw block={s}", .{ self.nodeId, opts, block_str });
+        self.logger.debug("node-{d}::going for block production opts={f} raw block={s}", .{ self.nodeId, opts, block_str });
 
         // 2. apply STF to get post state & update post state root & cache it
         try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
@@ -471,7 +471,7 @@ pub const BeamChain = struct {
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
 
-        self.logger.debug("applied raw block opts={any} raw block={s}", .{ opts, block_str_2 });
+        self.logger.debug("applied raw block opts={f} raw block={s}", .{ opts, block_str_2 });
 
         // 3. cache state to save recompute while adding the block on publish
         var block_root: [32]u8 = undefined;
@@ -776,7 +776,7 @@ pub const BeamChain = struct {
                 return .{};
             },
             .aggregation => |signed_aggregation| {
-                self.logger.debug("chain received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.debug("chain received gossip aggregation for slot={d} from peer={s}{f}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
