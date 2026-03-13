@@ -451,7 +451,8 @@ pub const Node = struct {
             defer self.allocator.free(pk_path);
 
             var keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigSecretKeyMissing,
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
             errdefer keypair.deinit();

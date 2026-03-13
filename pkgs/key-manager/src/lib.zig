@@ -189,12 +189,18 @@ pub fn loadKeypairFromFiles(
     sk_path: []const u8,
     pk_path: []const u8,
 ) !xmss.KeyPair {
-    var sk_file = try std.fs.cwd().openFile(sk_path, .{});
+    var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SecretKeyFileNotFound,
+        else => return err,
+    };
     defer sk_file.close();
     const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
     defer allocator.free(sk_data);
 
-    var pk_file = try std.fs.cwd().openFile(pk_path, .{});
+    var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.PublicKeyFileNotFound,
+        else => return err,
+    };
     defer pk_file.close();
     const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
     defer allocator.free(pk_data);
