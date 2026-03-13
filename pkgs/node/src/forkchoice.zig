@@ -864,10 +864,10 @@ pub const ForkChoice = struct {
             if (self.latest_new_aggregated_payloads.count() > 0) {
                 var it = self.latest_new_aggregated_payloads.iterator();
                 while (it.next()) |entry| {
-                    const sig_key = entry.key_ptr.*;
+                    const data_root = entry.key_ptr.*;
                     const source_list = entry.value_ptr;
 
-                    const gop = try self.latest_known_aggregated_payloads.getOrPut(sig_key);
+                    const gop = try self.latest_known_aggregated_payloads.getOrPut(data_root);
                     if (!gop.found_existing) {
                         gop.value_ptr.* = .empty;
                     }
@@ -1208,7 +1208,6 @@ pub const ForkChoice = struct {
     /// For gossip attestations, also updates fork choice attestation trackers.
     pub fn storeAggregatedPayload(
         self: *Self,
-        validator_ids: []const types.ValidatorIndex,
         attestation_data: *const types.AttestationData,
         proof: types.AggregatedSignatureProof,
         is_from_block: bool,
@@ -1226,68 +1225,57 @@ pub const ForkChoice = struct {
             else
                 &self.latest_new_aggregated_payloads;
 
-            for (validator_ids) |validator_id| {
-                const sig_key = SignatureKey{
-                    .validator_id = validator_id,
-                    .data_root = data_root,
-                };
-                const gop = try target_map.getOrPut(sig_key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .empty;
-                }
-
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-                errdefer cloned_proof.deinit();
-
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = attestation_data.slot,
-                    .proof = cloned_proof,
-                });
+            // Store once per data_root (not per-validator) — single clone
+            const gop = try target_map.getOrPut(data_root);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
             }
+
+            var cloned_proof: types.AggregatedSignatureProof = undefined;
+            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+            errdefer cloned_proof.deinit();
+
+            try gop.value_ptr.append(self.allocator, .{
+                .slot = attestation_data.slot,
+                .proof = cloned_proof,
+            });
         }
     }
 
-    fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+    fn aggregateCommitteeSignaturesAndPayloadsUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
-
-        var attestations: std.ArrayList(types.Attestation) = .{};
-        defer attestations.deinit(self.allocator);
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        var sig_it = self.gossip_signatures.iterator();
-        while (sig_it.next()) |entry| {
-            const sig_key = entry.key_ptr.*;
-            const attestation_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
-            try attestations.append(self.allocator, .{
-                .validator_id = sig_key.validator_id,
-                .data = attestation_data,
-            });
-        }
+        // Build attestation list from gossip signatures + new payloads only
+        // (known payloads are used as helpers in greedy selection, not as independent sources)
+        var attestations = try self.attestationsFromGossipAndNewPayloads();
+        defer attestations.deinit(self.allocator);
 
-        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        var agg = try types.AggregatedAttestationsResult.init(self.allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
         errdefer if (agg_att_cleanup) {
-            for (aggregation.attestations.slice()) |*att| {
+            for (agg.attestations.slice()) |*att| {
                 att.deinit();
             }
-            aggregation.attestations.deinit();
+            agg.attestations.deinit();
         };
         errdefer if (agg_sig_cleanup) {
-            for (aggregation.attestation_signatures.slice()) |*sig| {
+            for (agg.attestation_signatures.slice()) |*sig| {
                 sig.deinit();
             }
-            aggregation.attestation_signatures.deinit();
+            agg.attestation_signatures.deinit();
         };
 
-        try aggregation.computeAggregatedSignatures(
+        // Pass new and known payloads separately for two-pass greedy selection
+        try agg.computeAggregatedSignatures(
             attestations.items,
             &state.validators,
             &self.gossip_signatures,
-            null,
+            &self.latest_new_aggregated_payloads,
+            &self.latest_known_aggregated_payloads,
         );
 
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
@@ -1298,8 +1286,12 @@ pub const ForkChoice = struct {
             results.deinit(self.allocator);
         }
 
-        const agg_attestations = aggregation.attestations.constSlice();
-        const agg_signatures = aggregation.attestation_signatures.constSlice();
+        // Replace latest_new_aggregated_payloads with fresh aggregation results
+        var new_payloads = AggregatedPayloadsMap.init(self.allocator);
+        errdefer deinitAggregatedPayloadsMap(self.allocator, &new_payloads);
+
+        const agg_attestations = agg.attestations.constSlice();
+        const agg_signatures = agg.attestation_signatures.constSlice();
 
         for (agg_attestations, 0..) |agg_att, index| {
             const proof = agg_signatures[index];
@@ -1307,30 +1299,19 @@ pub const ForkChoice = struct {
 
             try self.attestation_data_by_root.put(data_root, agg_att.data);
 
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-            defer validator_indices.deinit(self.allocator);
-
-            for (validator_indices.items) |validator_index| {
-                const sig_key = SignatureKey{
-                    .validator_id = @intCast(validator_index),
-                    .data_root = data_root,
-                };
-                const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .empty;
-                }
-
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-                errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = agg_att.data.slot,
-                    .proof = cloned_proof,
-                });
-                // Align with leanSpec: once this signature is represented by an aggregated
-                // payload, remove it from the gossip signature map to prevent re-aggregation.
-                _ = self.gossip_signatures.remove(sig_key);
+            // Store proof into new payloads map
+            const gop = try new_payloads.getOrPut(data_root);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
             }
+
+            var cloned_proof: types.AggregatedSignatureProof = undefined;
+            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+            errdefer cloned_proof.deinit();
+            try gop.value_ptr.append(self.allocator, .{
+                .slot = agg_att.data.slot,
+                .proof = cloned_proof,
+            });
 
             var output_proof: types.AggregatedSignatureProof = undefined;
             try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
@@ -1341,24 +1322,85 @@ pub const ForkChoice = struct {
             });
         }
 
+        // Replace latest_new_aggregated_payloads (not append)
+        deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
+        self.latest_new_aggregated_payloads = new_payloads;
+
+        // Clear all gossip signatures — they've been consumed by aggregation
+        self.clearGossipSignaturesLocked();
+
         agg_att_cleanup = false;
         agg_sig_cleanup = false;
-        for (aggregation.attestations.slice()) |*att| {
+        for (agg.attestations.slice()) |*att| {
             att.deinit();
         }
-        aggregation.attestations.deinit();
-        for (aggregation.attestation_signatures.slice()) |*sig| {
+        agg.attestations.deinit();
+        for (agg.attestation_signatures.slice()) |*sig| {
             sig.deinit();
         }
-        aggregation.attestation_signatures.deinit();
+        agg.attestation_signatures.deinit();
 
         return results.toOwnedSlice(self.allocator);
     }
 
-    pub fn aggregateCommitteeSignatures(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+    /// Build attestation list from gossip signatures and new payloads.
+    /// Known payloads are NOT included — they serve only as greedy selection helpers.
+    /// Caller must hold signatures_mutex.
+    fn attestationsFromGossipAndNewPayloads(self: *Self) !std.ArrayList(types.Attestation) {
+        var seen_keys = std.AutoHashMap(SignatureKey, void).init(self.allocator);
+        defer seen_keys.deinit();
+
+        var attestation_list: std.ArrayList(types.Attestation) = .{};
+        errdefer attestation_list.deinit(self.allocator);
+
+        // From gossip_signatures
+        var gossip_it = self.gossip_signatures.iterator();
+        while (gossip_it.next()) |entry| {
+            const sig_key = entry.key_ptr.*;
+            const att_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
+            if (!seen_keys.contains(sig_key)) {
+                try seen_keys.put(sig_key, {});
+                try attestation_list.append(self.allocator, .{
+                    .validator_id = sig_key.validator_id,
+                    .data = att_data,
+                });
+            }
+        }
+
+        // From latest_new_aggregated_payloads
+        var new_it = self.latest_new_aggregated_payloads.iterator();
+        while (new_it.next()) |entry| {
+            const data_root = entry.key_ptr.*;
+            const att_data = self.attestation_data_by_root.get(data_root) orelse continue;
+            for (entry.value_ptr.items) |*stored| {
+                for (0..stored.proof.participants.len()) |i| {
+                    if (stored.proof.participants.get(i) catch false) {
+                        const vid: types.ValidatorIndex = @intCast(i);
+                        const sig_key = SignatureKey{ .validator_id = vid, .data_root = data_root };
+                        if (!seen_keys.contains(sig_key)) {
+                            try seen_keys.put(sig_key, {});
+                            try attestation_list.append(self.allocator, .{
+                                .validator_id = vid,
+                                .data = att_data,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        return attestation_list;
+    }
+
+    /// Clear all gossip signatures. Caller must hold signatures_mutex.
+    fn clearGossipSignaturesLocked(self: *Self) void {
+        self.gossip_signatures.clearAndFree();
+    }
+
+    pub fn aggregateCommitteeSignaturesAndPayloads(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.aggregateCommitteeSignaturesUnlocked(state_opt);
+        return self.aggregateCommitteeSignaturesAndPayloadsUnlocked(state_opt);
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -1428,13 +1470,13 @@ pub const ForkChoice = struct {
         payloads: *AggregatedPayloadsMap,
         stale_roots: *const std.AutoHashMap(types.Root, void),
     ) !usize {
-        var keys_to_remove: std.ArrayList(SignatureKey) = .{};
+        var keys_to_remove: std.ArrayList(types.Root) = .{};
         defer keys_to_remove.deinit(allocator);
 
         var removed_total: usize = 0;
         var it = payloads.iterator();
         while (it.next()) |entry| {
-            if (!stale_roots.contains(entry.key_ptr.data_root)) continue;
+            if (!stale_roots.contains(entry.key_ptr.*)) continue;
 
             for (entry.value_ptr.items) |*stored| {
                 stored.proof.deinit();
@@ -1443,8 +1485,8 @@ pub const ForkChoice = struct {
             try keys_to_remove.append(allocator, entry.key_ptr.*);
         }
 
-        for (keys_to_remove.items) |sig_key| {
-            if (payloads.fetchRemove(sig_key)) |kv| {
+        for (keys_to_remove.items) |root| {
+            if (payloads.fetchRemove(root)) |kv| {
                 var mutable_val = kv.value;
                 mutable_val.deinit(allocator);
             }
@@ -1884,7 +1926,7 @@ test "aggregateCommitteeSignatures prunes aggregated gossip signatures" {
     });
 
     const data_root = try attestation_data.sszRoot(allocator);
-    const aggregations = try fork_choice.aggregateCommitteeSignatures(&mock_chain.genesis_state);
+    const aggregations = try fork_choice.aggregateCommitteeSignaturesAndPayloads(&mock_chain.genesis_state);
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();
@@ -1894,10 +1936,7 @@ test "aggregateCommitteeSignatures prunes aggregated gossip signatures" {
 
     try std.testing.expectEqual(@as(usize, 1), aggregations.len);
     try std.testing.expectEqual(@as(usize, 0), fork_choice.gossip_signatures.count());
-    try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(.{
-        .validator_id = 0,
-        .data_root = data_root,
-    }) != null);
+    try std.testing.expect(fork_choice.latest_new_aggregated_payloads.get(data_root) != null);
 }
 
 // Helper function to create a deterministic test root filled with a specific byte
@@ -2333,8 +2372,7 @@ fn stageAggregatedAttestation(
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
-    const validator_ids = [_]types.ValidatorIndex{signed_attestation.validator_id};
-    try fork_choice.storeAggregatedPayload(&validator_ids, &signed_attestation.message, proof, false);
+    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false);
 }
 
 // Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.

@@ -315,6 +315,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             &beam_state.validators,
             &signatures_map,
             null, // no pre-aggregated payloads in mock
+            null,
         );
 
         const proposer_index = slot % genesis_config.numValidators();
