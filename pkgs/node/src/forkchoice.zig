@@ -924,9 +924,10 @@ pub const ForkChoice = struct {
         // TODO naive strategy to include all attestations that are consistent with the latest justified
         // replace by the other mini 3sf simple strategy to loop and see if justification happens and
         // till no further attestations can be added
-        for (0..self.config.genesis.numValidators()) |validator_id| {
-            const attestation_data = ((self.attestations.get(validator_id) orelse AttestationTracker{})
-                .latestKnown orelse ProtoAttestation{}).attestation_data;
+        var att_iter = self.attestations.iterator();
+        while (att_iter.next()) |entry| {
+            const validator_id = entry.key_ptr.*;
+            const attestation_data = (entry.value_ptr.latestKnown orelse ProtoAttestation{}).attestation_data;
 
             if (attestation_data) |att_data| {
                 if (std.mem.eql(u8, &latest_justified.root, &att_data.source.root)) {
@@ -984,23 +985,22 @@ pub const ForkChoice = struct {
         // balances are right now same for the dummy chain and each weighing 1
         const validatorWeight = 1;
 
-        for (0..self.config.genesis.numValidators()) |validator_id| {
-            var attestation_tracker = self.attestations.get(validator_id) orelse AttestationTracker{};
-            if (attestation_tracker.appliedIndex) |applied_index| {
+        var delta_iter = self.attestations.iterator();
+        while (delta_iter.next()) |entry| {
+            if (entry.value_ptr.appliedIndex) |applied_index| {
                 self.deltas.items[applied_index] -= validatorWeight;
             }
-            attestation_tracker.appliedIndex = null;
+            entry.value_ptr.appliedIndex = null;
 
             const latest_attestation = if (from_known)
-                attestation_tracker.latestKnown
+                entry.value_ptr.latestKnown
             else
-                attestation_tracker.latestNew;
+                entry.value_ptr.latestNew;
 
             if (latest_attestation) |delta_attestation| {
                 self.deltas.items[delta_attestation.index] += validatorWeight;
-                attestation_tracker.appliedIndex = delta_attestation.index;
+                entry.value_ptr.appliedIndex = delta_attestation.index;
             }
-            try self.attestations.put(validator_id, attestation_tracker);
         }
 
         return self.deltas.items;
