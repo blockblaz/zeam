@@ -391,6 +391,17 @@ pub const BeamNode = struct {
         // Try to process each descendant
         for (descendants_to_process.items) |descendant_root| {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                // Skip if already known to fork choice — same guard as processBlockByRootChunk
+                if (self.chain.forkChoice.hasBlock(descendant_root)) {
+                    self.logger.debug(
+                        "cached block 0x{x} is already known to fork choice, skipping re-processing",
+                        .{&descendant_root},
+                    );
+                    _ = self.network.removeFetchedBlock(descendant_root);
+                    self.processCachedDescendants(descendant_root);
+                    continue;
+                }
+
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
                     .{&descendant_root},
