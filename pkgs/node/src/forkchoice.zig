@@ -147,8 +147,10 @@ pub const ProtoArray = struct {
         }
 
         // iterate backwards apply deltas and propagating deltas to parents
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_a = self.nodes.items.len;
+        while (node_idx_a > 0) {
+            node_idx_a -= 1;
+            const node_idx = node_idx_a;
             const node_delta = deltas[node_idx];
             self.nodes.items[node_idx].weight += node_delta;
             if (self.nodes.items[node_idx].parent) |parent_idx| {
@@ -158,8 +160,10 @@ pub const ProtoArray = struct {
 
         // re-iterate backwards and calc best child and descendant
         // there seems to be no filter block tree in the mini3sf fc
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_b = self.nodes.items.len;
+        while (node_idx_b > 0) {
+            node_idx_b -= 1;
+            const node_idx = node_idx_b;
             const node = self.nodes.items[node_idx];
 
             if (self.nodes.items[node_idx].parent) |parent_idx| {
@@ -311,8 +315,10 @@ pub const ForkChoice = struct {
     /// Thread-safe snapshot for observability
     pub const Snapshot = struct {
         head: ProtoNode,
-        latest_justified_root: [32]u8,
-        latest_finalized_root: [32]u8,
+        latest_justified: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        safe_target_root: [32]u8,
+        validator_count: u64,
         nodes: []ProtoNode,
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
@@ -436,16 +442,20 @@ pub const ForkChoice = struct {
             };
             return Snapshot{
                 .head = head_node,
-                .latest_justified_root = self.fcStore.latest_justified.root,
-                .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .latest_justified = self.fcStore.latest_justified,
+                .latest_finalized = self.fcStore.latest_finalized,
+                .safe_target_root = self.safeTarget.blockRoot,
+                .validator_count = self.config.genesis.numValidators(),
                 .nodes = nodes_copy,
             };
         };
 
         return Snapshot{
             .head = self.protoArray.nodes.items[head_idx],
-            .latest_justified_root = self.fcStore.latest_justified.root,
-            .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .latest_justified = self.fcStore.latest_justified,
+            .latest_finalized = self.fcStore.latest_finalized,
+            .safe_target_root = self.safeTarget.blockRoot,
+            .validator_count = self.config.genesis.numValidators(),
             .nodes = nodes_copy,
         };
     }
@@ -884,14 +894,9 @@ pub const ForkChoice = struct {
         // Attestations that were "new" (gossip) are now "known" (accepted).
         for (0..self.config.genesis.numValidators()) |validator_id| {
             var tracker = self.attestations.get(validator_id) orelse continue;
-            if (tracker.latestNew) |new_att| {
-                const known_slot = if (tracker.latestKnown) |k| k.slot else 0;
-                if (new_att.slot > known_slot) {
-                    tracker.latestKnown = tracker.latestNew;
-                }
-                tracker.latestNew = null;
-                try self.attestations.put(validator_id, tracker);
-            }
+            // latestNew is always ahead of latestKnown (and will be non null if latestknown is not null)
+            tracker.latestKnown = tracker.latestNew;
+            try self.attestations.put(validator_id, tracker);
         }
 
         return self.updateHeadUnlocked();
@@ -1018,7 +1023,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={f} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,
@@ -1064,7 +1069,18 @@ pub const ForkChoice = struct {
     // Internal unlocked version - assumes caller holds lock
     fn updateSafeTargetUnlocked(self: *Self) !ProtoBlock {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
-        self.safeTarget = try self.computeFCHeadUnlocked(false, cutoff_weight);
+        const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
+
+        // can't regress on safe target
+        if (safe_target.slot < self.safeTarget.slot) {
+            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
+                safe_target.slot,
+                self.safeTarget.slot,
+            });
+            return ForkChoiceError.InvalidSafeTargetCompute;
+        }
+
+        self.safeTarget = safe_target;
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
@@ -1166,12 +1182,12 @@ pub const ForkChoice = struct {
                     .slot = attestation_slot,
                     .attestation_data = attestation_data,
                 };
-            }
 
-            // also clear out our latest new non included attestation if this is even later than that
-            const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
-            if (attestation_slot > attestation_tracker_latest_new_slot) {
-                attestation_tracker.latestNew = null;
+                // also clear out our latest new non included attestation if this is even later than that
+                const attestation_tracker_latest_new_slot = (attestation_tracker.latestNew orelse ProtoAttestation{}).slot;
+                if (attestation_slot > attestation_tracker_latest_new_slot) {
+                    attestation_tracker.latestNew = attestation_tracker.latestKnown;
+                }
             }
         } else {
             if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
@@ -1741,6 +1757,7 @@ pub const ForkChoiceError = error{
     InvalidTargetAnchor,
     InvalidCanonicalTraversal,
     InvalidForkchoiceBlock,
+    InvalidSafeTargetCompute,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added

@@ -4,6 +4,17 @@
 
 [Zeam & Beam Wiki](https://github.com/blockblaz/zeam/wiki)
 
+## LeanSpec Client Documentation
+
+[Lean Consensus Book](https://github.com/leanEthereum/leanSpec/blob/main/lean_consensus.pdf)
+
+[LeanSpec Client Docs](https://github.com/leanEthereum/leanSpec/tree/main/docs/client)
+
+- [Chain](https://github.com/leanEthereum/leanSpec/blob/main/docs/client/chain.md)
+- [Fork Choice](https://github.com/leanEthereum/leanSpec/blob/main/docs/client/forkchoice.md)
+- [Networking](https://github.com/leanEthereum/leanSpec/blob/main/docs/client/networking.md)
+- [Validator](https://github.com/leanEthereum/leanSpec/blob/main/docs/client/validator.md)
+
 ## Zeam Client POC
 
 While the Beam research community is working on Beam specs, we at Zeam are aiming to have a POC of one of

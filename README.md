@@ -109,7 +109,7 @@ Zeam is developing and contributing to the Zig Ethereum ecosystem. These librari
 
 | Library | Description |
 |---------|-------------|
-| [ssz.zig](https://github.com/blockblaz/ssz.zig) | SSZ serialization with configurable hash function |
+| [ssz.zig](https://github.com/blockblaz/ssz.zig) | SSZ serialization with configurable hash function (SHA256 or Poseidon2) |
 | [zig-snappy](https://github.com/blockblaz/zig-snappy) / [snappyframesz](https://github.com/blockblaz/snappyframesz) | Snappy compression |
 | [zig-libp2p-pocs](https://github.com/blockblaz/zig-libp2p-pocs) | Zig ↔ Rust libp2p interop |
 | [hash-sigz](https://github.com/blockblaz/hash-sigz) | Hash-based signature schemes |
@@ -143,6 +143,8 @@ To include the git version in the binary:
 zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 ```
 
+
+> To use Poseidon2 as the SSZ hash function instead of SHA256, see [resources/poseidon.md](resources/poseidon.md).
 ### Running the Prover Demo
 
 ```bash
@@ -170,6 +172,24 @@ docker build -f Dockerfile.prebuilt \
   --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
   --build-arg GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
   -t blockblaz/zeam:latest .
+```
+
+### Troubleshooting
+
+**Build fails with `EndOfStream` error**
+
+If you encounter errors like:
+```
+error: invalid HTTP response: EndOfStream
+```
+
+This may be caused by proxy environment variables interfering with Zig's HTTP client (related to the [Zig HTTP connection pool bug](https://github.com/ziglang/zig/issues/21316) mentioned above).
+
+Try building without proxy settings:
+```bash
+env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY \
+    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+    zig build -Doptimize=ReleaseFast
 ```
 
 ---
