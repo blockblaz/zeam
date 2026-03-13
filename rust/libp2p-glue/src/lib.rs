@@ -163,9 +163,10 @@ lazy_static::lazy_static! {
 }
 
 /// Send a command to the event loop for the given network_id.
-/// Logs an error if no sender is registered (network not yet initialised).
-fn send_swarm_command(network_id: u32, cmd: SwarmCommand) {
-    let senders = COMMAND_SENDERS.lock().unwrap();
+/// Returns `true` if the command was successfully enqueued, `false` otherwise.
+/// On channel close the stale sender is removed from `COMMAND_SENDERS`.
+fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
+    let mut senders = COMMAND_SENDERS.lock().unwrap();
     if let Some(tx) = senders.get(&network_id) {
         if tx.send(cmd).is_err() {
             forward_log_by_network(
@@ -173,6 +174,10 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) {
                 3,
                 "Command channel closed — event loop may have exited",
             );
+            senders.remove(&network_id);
+            false
+        } else {
+            true
         }
     } else {
         forward_log_by_network(
@@ -180,6 +185,7 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) {
             3,
             "send_swarm_command called before network initialized",
         );
+        false
     }
 }
 
@@ -401,7 +407,7 @@ pub unsafe fn send_rpc_request(
         .unwrap()
         .insert(request_id, protocol_id.clone());
 
-    send_swarm_command(
+    if !send_swarm_command(
         network_id,
         SwarmCommand::SendRpcRequest {
             peer_id,
@@ -409,7 +415,12 @@ pub unsafe fn send_rpc_request(
             protocol_id,
             request_message,
         },
-    );
+    ) {
+        // Command could not be queued — roll back the map inserts to avoid stale state.
+        REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+        REQUEST_PROTOCOL_MAP.lock().unwrap().remove(&request_id);
+        return 0;
+    }
 
     logger::rustLogger.info(
         network_id,
@@ -443,14 +454,20 @@ pub unsafe fn send_rpc_response_chunk(
         let peer_id = channel.peer_id;
         let response_message = ResponseMessage::new(channel.protocol.clone(), response_bytes);
 
+        // Update the idle timeout eagerly (before the command is dequeued by the event loop)
+        // so that queued activity prevents premature channel expiry under load.
+        {
+            let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+            let _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
+        }
+
         send_swarm_command(
             network_id,
             SwarmCommand::SendRpcResponseChunk {
                 channel,
                 channel_id,
                 response_message,
-                // The event loop will update the timeout after the send
-                update_timeout: true,
+                update_timeout: false,
             },
         );
 
@@ -862,7 +879,16 @@ impl Network {
             // Actor model: process swarm commands sent by FFI functions from the Zig thread.
             // This ensures the Swarm is only ever mutated from within this single Tokio event loop,
             // eliminating the data race between FFI callers and the Tokio thread.
-            Some(cmd) = cmd_rx.recv() => {
+            cmd = cmd_rx.recv() => {
+                let cmd = match cmd {
+                    Some(cmd) => cmd,
+                    None => {
+                        // All senders dropped — command channel closed. Clean up and exit loop.
+                        COMMAND_SENDERS.lock().unwrap().remove(&self.network_id);
+                        logger::rustLogger.warn(self.network_id, "Command channel closed; exiting event loop");
+                        break;
+                    }
+                };
                 match cmd {
                     SwarmCommand::Publish { topic, data } => {
                         let ident_topic = gossipsub::IdentTopic::new(topic);
@@ -1698,11 +1724,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_rpc_request_before_initialization_returns_zero() {
-        // With the actor model, send_rpc_request generates a request_id immediately and
-        // queues the command. If the peer_id string is unparseable (invalid), the function
-        // returns 0 as an error indicator before any command is sent.
-        let network_id = 99;
+    async fn test_send_rpc_request_invalid_peer_id_returns_zero() {
+        // When the peer_id string is unparseable the function returns 0 as an error
+        // indicator before any actor command is queued.
+        let network_id = 9901;
         let invalid_peer_id = std::ffi::CString::new("not-a-valid-peer-id").unwrap();
         let request_data = b"test request";
 
@@ -1718,5 +1743,42 @@ mod tests {
 
         // Invalid peer id → early return 0 before actor command is issued
         assert_eq!(request_id, 0, "Invalid peer_id should return 0");
+    }
+
+    #[test]
+    fn test_send_rpc_request_uninitialised_network_returns_zero() {
+        // With the actor model, send_rpc_request inserts tracking state then calls
+        // send_swarm_command.  When no command sender is registered for the network_id
+        // the command cannot be queued, so the function must roll back the map inserts
+        // and return 0 so that Zig treats the call as a dispatch failure.
+        let network_id = 9902; // never initialised
+                               // Use a syntactically valid PeerId so we reach the actor-command path.
+        let peer_id_str =
+            std::ffi::CString::new("12D3KooWNvDnLYAGWnqNAJKBBBzYBp7MBmHmWkGxhXJKPJDGH1a").unwrap();
+        let request_data = b"test request";
+
+        let request_id = unsafe {
+            send_rpc_request(
+                network_id,
+                peer_id_str.as_ptr(),
+                0, // BlocksByRootV1
+                request_data.as_ptr(),
+                request_data.len(),
+            )
+        };
+
+        assert_eq!(
+            request_id, 0,
+            "Uninitialised network should return 0 and not leak map entries"
+        );
+
+        // Verify the map entries were rolled back.
+        assert!(
+            !REQUEST_PROTOCOL_MAP
+                .lock()
+                .unwrap()
+                .contains_key(&request_id),
+            "REQUEST_PROTOCOL_MAP should not contain rolled-back request_id"
+        );
     }
 }
