@@ -4,8 +4,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .ssz = .{
-            .url = "git+https://github.com/blockblaz/ssz.zig#c5394395dd7d0f8eda685c4723ad25ebbf550570",
-            .hash = "ssz-0.0.9-Lfwd693UAgBn89Sl4ljI4p3jW6ioLgonPWIdhIeIUDMN",
+            .url = "git+https://github.com/blockblaz/ssz.zig#50ddfa98d3b6485ae4e445a61a3b5392be3e9a62",
+            .hash = "ssz-0.0.9-Lfwd6zf0AgAYs-N72OTKqQGZEe6tF-YfpHn41ykIlDiH",
         },
         .zigcli = .{
             .url = "git+https://github.com/jiacai2050/zigcli#67a06e34cbe25a39bb86e35796cc5a0ca45a31f7",
