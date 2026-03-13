@@ -197,7 +197,7 @@ pub const BeamNode = struct {
             },
             .aggregation => |signed_aggregation| {
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{f}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
