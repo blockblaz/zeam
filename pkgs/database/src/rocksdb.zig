@@ -606,25 +606,27 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         ) !void {
             // Load the latest finalized slot from metadata
             const finalized_slot = self.loadLatestFinalizedSlot(database.DbDefaultNamespace) orelse {
-                self.logger.info("no finalized state found in database, will use genesis", .{});
+                self.logger.info("no finalized slot metadata found in database, will use genesis", .{});
                 return error.NoFinalizedStateFound;
             };
 
-            self.logger.info("found latest finalized slot {d}, loading block root...", .{finalized_slot});
+            self.logger.info("found latest finalized slot {d} in database, loading block root...", .{finalized_slot});
 
             // Load the block root for this finalized slot
             const block_root = self.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot) orelse {
-                self.logger.warn("finalized slot {d} found in metadata but not in finalized index", .{finalized_slot});
+                self.logger.warn("finalized slot {d} found in metadata but block root not in finalized index — database may be corrupt", .{finalized_slot});
                 return error.FinalizedSlotNotFoundInIndex;
             };
+
+            self.logger.info("found block root 0x{x} for finalized slot {d}, loading state...", .{ &block_root, finalized_slot });
 
             // Load the state from the database
             if (self.loadState(database.DbStatesNamespace, block_root)) |state| {
                 state_ptr.* = state;
-                self.logger.info("successfully loaded finalized state at slot {d}", .{finalized_slot});
+                self.logger.info("successfully recovered finalized state from database: slot={d}, block_root=0x{x}", .{ finalized_slot, &block_root });
                 return;
             } else {
-                self.logger.warn("finalized slot {d} found in index but state not in database", .{finalized_slot});
+                self.logger.warn("finalized slot {d} block_root=0x{x} found in index but state not in database — state may have been pruned or database is corrupt", .{ finalized_slot, &block_root });
                 return error.FinalizedStateNotFoundInDatabase;
             }
         }
