@@ -860,6 +860,10 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
+        // Capture counts outside lock scope for metrics update
+        var known_payloads_count: usize = 0;
+        var new_payloads_count: usize = 0;
+        var payloads_updated = false;
         {
             // Keep payload migration synchronized with other signature/payload map writers.
             self.signatures_mutex.lock();
@@ -887,7 +891,16 @@ pub const ForkChoice = struct {
                     source_list.* = .empty;
                 }
                 self.latest_new_aggregated_payloads.clearAndFree();
+                // Capture counts for metrics update outside lock
+                known_payloads_count = self.latest_known_aggregated_payloads.count();
+                new_payloads_count = self.latest_new_aggregated_payloads.count();
+                payloads_updated = true;
             }
+        }
+        // Update fork-choice store gauges after promotion (outside lock scope)
+        if (payloads_updated) {
+            zeam_metrics.metrics.lean_latest_known_aggregated_payloads.set(@intCast(known_payloads_count));
+            zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
         }
 
         // Promote latestNew → latestKnown in attestation tracker.
@@ -1138,6 +1151,7 @@ pub const ForkChoice = struct {
 
         // Store attestation data by root for later aggregation
         const data_root = try attestation_data.sszRoot(self.allocator);
+        var gossip_signatures_count: usize = 0;
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
@@ -1152,7 +1166,10 @@ pub const ForkChoice = struct {
                 .slot = attestation_slot,
                 .signature = signed_attestation.signature,
             });
+            gossip_signatures_count = self.gossip_signatures.count();
         }
+        // Update metric outside lock scope
+        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_signatures_count));
 
         const attestation = types.Attestation{
             .validator_id = validator_id,
@@ -1253,13 +1270,20 @@ pub const ForkChoice = struct {
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+        const aggregation_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = aggregation_timer.observe();
+
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
         var attestations: std.ArrayList(types.Attestation) = .{};
         defer attestations.deinit(self.allocator);
 
+        // Capture counts for metrics update outside lock scope
+        var new_payloads_count: usize = 0;
+        var gossip_sigs_count: usize = 0;
+
         self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
+        errdefer self.signatures_mutex.unlock();
 
         var sig_it = self.gossip_signatures.iterator();
         while (sig_it.next()) |entry| {
@@ -1355,6 +1379,17 @@ pub const ForkChoice = struct {
             sig.deinit();
         }
         aggregation.attestation_signatures.deinit();
+
+        // Capture counts before releasing lock
+        new_payloads_count = self.latest_new_aggregated_payloads.count();
+        gossip_sigs_count = self.gossip_signatures.count();
+
+        // Release lock before updating metrics
+        self.signatures_mutex.unlock();
+
+        // Update fork-choice store gauges after aggregation (outside lock scope)
+        zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
+        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_sigs_count));
 
         return results.toOwnedSlice(self.allocator);
     }
