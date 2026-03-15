@@ -393,12 +393,8 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
                 if (offset != 4) return error.InvalidEncoding;
                 const list_data_len = bytes.len - 4;
                 if (list_data_len % 32 != 0) return error.InvalidEncoding;
-                if (list_data_len / 32 > consensus_params.MAX_REQUEST_BLOCKS) return error.InvalidEncoding;
             },
-            .status => {
-                // Status is a fixed-size struct: 2 Roots (32 bytes each) + 2 Slots (8 bytes each) = 80 bytes
-                if (bytes.len != 80) return error.InvalidEncoding;
-            },
+            .status => {},
         }
     }
 
@@ -500,10 +496,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
                 if (signature_offset < message_offset) return error.InvalidEncoding;
                 if (signature_offset > bytes.len) return error.InvalidEncoding;
             },
-            .status => {
-                // Status is a fixed-size struct: 2 Roots (32 bytes each) + 2 Slots (8 bytes each) = 80 bytes
-                if (bytes.len != 80) return error.InvalidEncoding;
-            },
+            .status => {},
         }
     }
 
@@ -1064,7 +1057,7 @@ test "blocks_by_root deserialize rejects more than MAX_REQUEST_BLOCKS roots" {
     std.mem.writeInt(u32, payload[0..4], 4, .little);
     @memset(payload[4..], 0xab);
 
-    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, payload));
+    try std.testing.expectError(error.PayloadTooLarge, ReqRespRequest.deserialize(allocator, .blocks_by_root, payload));
 }
 
 test "blocks_by_root roundtrip serialize/deserialize" {
@@ -1092,18 +1085,18 @@ test "blocks_by_root roundtrip serialize/deserialize" {
 
 test "response status deserialize rejects empty bytes" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .status, &.{}));
+    try std.testing.expectError(error.PayloadTooSmall, ReqRespResponse.deserialize(allocator, .status, &.{}));
 }
 
 test "response status deserialize rejects wrong length" {
     const allocator = std.testing.allocator;
     var bad: [79]u8 = undefined;
     @memset(&bad, 0);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .status, &bad));
+    try std.testing.expectError(error.PayloadTooSmall, ReqRespResponse.deserialize(allocator, .status, &bad));
 
     var bad2: [81]u8 = undefined;
     @memset(&bad2, 0);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .status, &bad2));
+    try std.testing.expectError(error.PayloadTooLarge, ReqRespResponse.deserialize(allocator, .status, &bad2));
 }
 
 test "response status roundtrip serialize/deserialize" {

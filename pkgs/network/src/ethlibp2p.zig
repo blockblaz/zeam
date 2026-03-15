@@ -26,20 +26,6 @@ const ServerStreamError = error{
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
-// SSZ size constants derived directly from type definitions for payload validation.
-const CHECKPOINT_SSZ_SIZE = zeam_utils.fixedSszSize(types.Checkpoint);
-const ATTESTATION_DATA_SSZ_SIZE = zeam_utils.fixedSszSize(types.AttestationData);
-const SIGNED_ATTESTATION_SSZ_SIZE = zeam_utils.fixedSszSize(types.SignedAttestation);
-
-comptime {
-    if (ATTESTATION_DATA_SSZ_SIZE != 8 + 3 * CHECKPOINT_SSZ_SIZE) {
-        @compileError("AttestationData SSZ layout changed; revisit payload size assumptions");
-    }
-    if (SIGNED_ATTESTATION_SSZ_SIZE != 8 + ATTESTATION_DATA_SSZ_SIZE + types.SIGSIZE) {
-        @compileError("SignedAttestation SSZ layout changed; revisit payload size assumptions");
-    }
-}
-
 // SignedBlockWithAttestation is variable-size with 2 variable fields (message, signature).
 // SSZ struct encoding: at least 2 offsets (4 bytes each) = 8 bytes minimum.
 const MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE = 8;
@@ -390,13 +376,6 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
             break :blockmessage .{ .block = message_data };
         },
         .attestation => attestationmessage: {
-            if (uncompressed_message.len != SIGNED_ATTESTATION_SSZ_SIZE) {
-                zigHandler.logger.err(
-                    "Gossip attestation message size mismatch: got {d} bytes, expected {d}",
-                    .{ uncompressed_message.len, SIGNED_ATTESTATION_SSZ_SIZE },
-                );
-                return;
-            }
             var message_data: types.SignedAttestation = undefined;
             ssz.deserialize(types.SignedAttestation, uncompressed_message, &message_data, zigHandler.allocator) catch |e| {
                 zigHandler.logger.err("Error in deserializing the signed attestation message: {any}", .{e});
@@ -1309,23 +1288,6 @@ pub const EthLibp2p = struct {
         return result;
     }
 };
-
-test "SIGNED_ATTESTATION_SSZ_SIZE matches actual serialized size" {
-    const attestation = types.SignedAttestation{
-        .validator_id = 0,
-        .message = .{
-            .slot = 0,
-            .head = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-            .target = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-            .source = .{ .root = [_]u8{0} ** 32, .slot = 0 },
-        },
-        .signature = [_]u8{0} ** types.SIGSIZE,
-    };
-    var serialized: std.ArrayList(u8) = .empty;
-    defer serialized.deinit(std.testing.allocator);
-    try ssz.serialize(types.SignedAttestation, attestation, &serialized, std.testing.allocator);
-    try std.testing.expectEqual(SIGNED_ATTESTATION_SSZ_SIZE, serialized.items.len);
-}
 
 test "validateGossipSnappyHeader rejects oversized declared size" {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
