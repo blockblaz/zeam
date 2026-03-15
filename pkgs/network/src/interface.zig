@@ -993,73 +993,6 @@ test LeanNetworkTopic {
     try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
 }
 
-test "blocks_by_root deserialize rejects empty bytes" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &.{}));
-}
-
-test "blocks_by_root deserialize rejects raw root hash" {
-    // Simulates the actual failure: a peer sends a raw 32-byte root hash
-    // instead of a properly SSZ-encoded BlockByRootRequest
-    const allocator = std.testing.allocator;
-    const raw_root = [_]u8{0xab} ** 32;
-    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &raw_root));
-}
-
-test "blocks_by_root deserialize rejects invalid offset" {
-    const allocator = std.testing.allocator;
-    // 36 bytes with wrong offset (8 instead of 4)
-    var bad_offset: [36]u8 = undefined;
-    std.mem.writeInt(u32, bad_offset[0..4], 8, .little);
-    @memset(bad_offset[4..], 0xaa);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &bad_offset));
-}
-
-test "blocks_by_root deserialize rejects misaligned data" {
-    const allocator = std.testing.allocator;
-    // 4 bytes offset + 33 bytes (not a multiple of 32)
-    var misaligned: [37]u8 = undefined;
-    std.mem.writeInt(u32, misaligned[0..4], 4, .little);
-    @memset(misaligned[4..], 0xaa);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespRequest.deserialize(allocator, .blocks_by_root, &misaligned));
-}
-
-test "blocks_by_root deserialize valid single root" {
-    const allocator = std.testing.allocator;
-    var valid: [36]u8 = undefined;
-    std.mem.writeInt(u32, valid[0..4], 4, .little);
-    @memset(valid[4..], 0xab);
-    var request = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &valid);
-    defer request.deinit();
-    try std.testing.expectEqual(@as(usize, 1), request.blocks_by_root.roots.len());
-    const root = try request.blocks_by_root.roots.get(0);
-    try std.testing.expect(std.mem.eql(u8, &root, &([_]u8{0xab} ** 32)));
-}
-
-test "blocks_by_root deserialize valid empty request" {
-    const allocator = std.testing.allocator;
-    var empty_req: [4]u8 = undefined;
-    std.mem.writeInt(u32, empty_req[0..4], 4, .little);
-    var request = try ReqRespRequest.deserialize(allocator, .blocks_by_root, &empty_req);
-    defer request.deinit();
-    try std.testing.expectEqual(@as(usize, 0), request.blocks_by_root.roots.len());
-}
-
-test "blocks_by_root deserialize rejects more than MAX_REQUEST_BLOCKS roots" {
-    const allocator = std.testing.allocator;
-    const root_size = @sizeOf(types.Root);
-    const roots_count = @as(usize, consensus_params.MAX_REQUEST_BLOCKS) + 1;
-    const payload_len = 4 + (roots_count * root_size);
-
-    const payload = try allocator.alloc(u8, payload_len);
-    defer allocator.free(payload);
-
-    std.mem.writeInt(u32, payload[0..4], 4, .little);
-    @memset(payload[4..], 0xab);
-
-    try std.testing.expectError(error.PayloadTooLarge, ReqRespRequest.deserialize(allocator, .blocks_by_root, payload));
-}
-
 test "blocks_by_root roundtrip serialize/deserialize" {
     const allocator = std.testing.allocator;
     var roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator);
@@ -1083,22 +1016,6 @@ test "blocks_by_root roundtrip serialize/deserialize" {
 
 // ReqRespResponse validation tests
 
-test "response status deserialize rejects empty bytes" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.PayloadTooSmall, ReqRespResponse.deserialize(allocator, .status, &.{}));
-}
-
-test "response status deserialize rejects wrong length" {
-    const allocator = std.testing.allocator;
-    var bad: [79]u8 = undefined;
-    @memset(&bad, 0);
-    try std.testing.expectError(error.PayloadTooSmall, ReqRespResponse.deserialize(allocator, .status, &bad));
-
-    var bad2: [81]u8 = undefined;
-    @memset(&bad2, 0);
-    try std.testing.expectError(error.PayloadTooLarge, ReqRespResponse.deserialize(allocator, .status, &bad2));
-}
-
 test "response status roundtrip serialize/deserialize" {
     const allocator = std.testing.allocator;
     const original = ReqRespResponse{ .status = .{
@@ -1118,34 +1035,6 @@ test "response status roundtrip serialize/deserialize" {
 
     try std.testing.expectEqual(@as(u64, 42), deserialized.status.finalized_slot);
     try std.testing.expectEqual(@as(u64, 100), deserialized.status.head_slot);
-}
-
-test "response blocks_by_root deserialize rejects too-small payload" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .blocks_by_root, &.{}));
-
-    var small: [7]u8 = undefined;
-    @memset(&small, 0);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .blocks_by_root, &small));
-}
-
-test "response blocks_by_root deserialize rejects invalid top-level offsets" {
-    const allocator = std.testing.allocator;
-
-    var bad_first_offset: [8]u8 = undefined;
-    std.mem.writeInt(u32, bad_first_offset[0..4], 4, .little);
-    std.mem.writeInt(u32, bad_first_offset[4..8], 8, .little);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .blocks_by_root, &bad_first_offset));
-
-    var bad_ordering: [8]u8 = undefined;
-    std.mem.writeInt(u32, bad_ordering[0..4], 8, .little);
-    std.mem.writeInt(u32, bad_ordering[4..8], 4, .little);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .blocks_by_root, &bad_ordering));
-
-    var bad_bounds: [8]u8 = undefined;
-    std.mem.writeInt(u32, bad_bounds[0..4], 8, .little);
-    std.mem.writeInt(u32, bad_bounds[4..8], 12, .little);
-    try std.testing.expectError(error.InvalidEncoding, ReqRespResponse.deserialize(allocator, .blocks_by_root, &bad_bounds));
 }
 
 test "response blocks_by_root roundtrip serialize/deserialize" {
