@@ -139,7 +139,11 @@ pub const BeamChain = struct {
 
         var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
         const cloned_anchor_state = try allocator.create(types.BeamState);
+        // Destroy outer allocation if sszClone fails (interior not yet allocated).
+        errdefer allocator.destroy(cloned_anchor_state);
         try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
+        // Interior fields are now allocated; deinit them if states.put fails (LIFO order).
+        errdefer cloned_anchor_state.deinit();
         try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
 
         var chain = Self{
@@ -833,11 +837,18 @@ pub const BeamChain = struct {
             break :computedroot cblock_root;
         };
 
+        const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
+            // If sszClone or anything after fails, destroy the outer allocation.
+            errdefer self.allocator.destroy(cpost_state);
+
             try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
+            // sszClone succeeded — interior heap fields are now allocated.
+            // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
+            errdefer cpost_state.deinit();
 
             // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
             // Use public key cache to avoid repeated SSZ deserialization of validator public keys
@@ -850,6 +861,12 @@ pub const BeamChain = struct {
                 .rootToSlotCache = &self.root_to_slot_cache,
             });
             break :computedstate cpost_state;
+        };
+        // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
+        // updateHead, or InvalidSignatureGroups), we must free it before returning the error.
+        errdefer if (post_state_owned) {
+            post_state.deinit();
+            self.allocator.destroy(post_state);
         };
 
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
