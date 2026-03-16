@@ -26,10 +26,6 @@ const ServerStreamError = error{
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
-// SignedBlockWithAttestation is variable-size with 2 variable fields (message, signature).
-// SSZ struct encoding: at least 2 offsets (4 bytes each) = 8 bytes minimum.
-const MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE = 8;
-
 const FrameDecodeError = error{
     EmptyFrame,
     PayloadTooLarge,
@@ -60,42 +56,6 @@ fn validateGossipSnappyHeader(message_bytes: []const u8) (uvarint.VarintParseErr
     return .{
         .value = decoded.value,
         .length = decoded.length,
-    };
-}
-
-fn validateSignedBlockWithAttestation(bytes: []const u8) !void {
-    if (bytes.len < MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE) {
-        return error.InvalidEncoding;
-    }
-
-    const message_offset: usize = @intCast(std.mem.readInt(u32, bytes[0..4], .little));
-    const signature_offset: usize = @intCast(std.mem.readInt(u32, bytes[4..8], .little));
-
-    if (message_offset != MIN_SIGNED_BLOCK_WITH_ATTESTATION_SSZ_SIZE) {
-        return error.InvalidEncoding;
-    }
-    if (signature_offset < message_offset) {
-        return error.InvalidEncoding;
-    }
-    if (signature_offset > bytes.len) {
-        return error.InvalidEncoding;
-    }
-}
-
-fn initSignedBlockWithAttestation(allocator: Allocator) !types.SignedBlockWithAttestation {
-    var block: types.BeamBlock = undefined;
-    try block.setToDefault(allocator);
-    errdefer block.deinit();
-
-    var signatures = try types.createBlockSignatures(allocator, 0);
-    errdefer signatures.deinit();
-
-    return .{
-        .message = .{
-            .block = block,
-            .proposer_attestation = undefined,
-        },
-        .signature = signatures,
     };
 }
 
@@ -1339,16 +1299,4 @@ test "validateGossipSnappyHeader rejects oversized declared size" {
     var scratch: [MAX_VARINT_BYTES]u8 = undefined;
     const encoded = uvarint.encode(usize, MAX_RPC_MESSAGE_SIZE + 1, &scratch);
     try std.testing.expectError(error.PayloadTooLarge, validateGossipSnappyHeader(encoded));
-}
-
-test "validateSignedBlockWithAttestationTopLevelOffsets rejects invalid offsets" {
-    var bad_first: [8]u8 = undefined;
-    std.mem.writeInt(u32, bad_first[0..4], 4, .little);
-    std.mem.writeInt(u32, bad_first[4..8], 8, .little);
-    try std.testing.expectError(error.InvalidEncoding, validateSignedBlockWithAttestation(&bad_first));
-
-    var bad_second: [8]u8 = undefined;
-    std.mem.writeInt(u32, bad_second[0..4], 8, .little);
-    std.mem.writeInt(u32, bad_second[4..8], 4, .little);
-    try std.testing.expectError(error.InvalidEncoding, validateSignedBlockWithAttestation(&bad_second));
 }
