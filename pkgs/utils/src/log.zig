@@ -16,9 +16,29 @@ const Colors = struct {
     const peer = "\x1b[38;5;201m"; // Pink;
 };
 
+/// Shared clock that tracks the node's slot and interval position.
+/// Owned by the forkchoice and read lock-free by the logger via atomic loads.
+/// `time` is the absolute interval count since genesis (4 intervals per slot).
+/// `timeSlots` is the current slot since genesis.
+/// `slotInterval` is the current interval within the slot (0-3), updated by
+/// the forkchoice on every tick so the logger never needs to know INTERVALS_PER_SLOT.
+pub const SlotTimeClock = struct {
+    time: std.atomic.Value(u64),
+    timeSlots: std.atomic.Value(u64),
+    slotInterval: std.atomic.Value(u64),
+
+    pub fn init(time: u64, timeSlots: u64, slotInterval: u64) SlotTimeClock {
+        return .{
+            .time = std.atomic.Value(u64).init(time),
+            .timeSlots = std.atomic.Value(u64).init(timeSlots),
+            .slotInterval = std.atomic.Value(u64).init(slotInterval),
+        };
+    }
+};
+
 // having activeLevel non comptime and dynamic allows us env based logging and even a keystroke activated one
 // on a running client, may be can be revised later
-pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileLogParams: ?FileLogParams, moduleTag: ?ModuleTag) void {
+pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileLogParams: ?FileLogParams, moduleTag: ?ModuleTag, slot_clock: ?*const SlotTimeClock) void {
     if ((@intFromEnum(level) > @intFromEnum(activeLevel)) and (fileLogParams == null or (@intFromEnum(level) > @intFromEnum(fileLogParams.?.fileActiveLevel)))) {
         return;
     }
@@ -44,6 +64,14 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         var ts_buf: [64]u8 = undefined;
         const timestamp_str = getFormattedTimestamp(&ts_buf);
 
+        // Format optional slot/interval suffix: " [s=<slot> i=<interval>]"
+        var slot_buf: [32]u8 = undefined;
+        const slot_str: []const u8 = if (slot_clock) |sc| blk: {
+            const s = sc.timeSlots.load(.monotonic);
+            const i = sc.slotInterval.load(.monotonic);
+            break :blk std.fmt.bufPrint(&slot_buf, " [s={d} i={d}]", .{ s, i }) catch "";
+        } else "";
+
         // Get colors
         const level_color = getLevelColor(level);
         const timestamp_color = Colors.timestamp;
@@ -55,14 +83,14 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
         var print_str = if (moduleTag) |tag|
             std.fmt.bufPrint(
                 buf[0..],
-                "{s}{s}{s} {s}[{s}]{s} {s}{s}{s} {s}[{s}]{s} " ++ fmt ++ "\n",
-                .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color, module_color, getModuleTagName(tag), reset_color } ++ args,
+                "{s}{s}{s}{s} {s}[{s}]{s} {s}{s}{s} {s}[{s}]{s} " ++ fmt ++ "\n",
+                .{ timestamp_color, timestamp_str, slot_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color, module_color, getModuleTagName(tag), reset_color } ++ args,
             ) catch return
         else
             std.fmt.bufPrint(
                 buf[0..],
-                "{s}{s}{s} {s}[{s}]{s} {s}{s}{s} " ++ fmt ++ "\n",
-                .{ timestamp_color, timestamp_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
+                "{s}{s}{s}{s} {s}[{s}]{s} {s}{s}{s} " ++ fmt ++ "\n",
+                .{ timestamp_color, timestamp_str, slot_str, reset_color, level_color, comptime level.asText(), reset_color, scope_color, scope_prefix, reset_color } ++ args,
             ) catch return;
 
         // Print to stderr
@@ -78,8 +106,8 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
             if (fileLogParams.?.monocolorFile) {
                 print_str = std.fmt.bufPrint(
                     buf[0..],
-                    "{s} {s}" ++ fmt ++ "\n",
-                    .{ timestamp_str, prefix } ++ args,
+                    "{s}{s} {s}" ++ fmt ++ "\n",
+                    .{ timestamp_str, slot_str, prefix } ++ args,
                 ) catch return;
             }
 
@@ -96,7 +124,7 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
     }
 }
 
-pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams, moduleTag: ?ModuleTag) void {
+pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype, fileParams: ?FileParams, moduleTag: ?ModuleTag, slot_clock: ?*const SlotTimeClock) void {
     // Convert FileParams to FileLogParams - only create if file exists
     const fileLogParams: ?FileLogParams = if ((fileParams != null) and (fileParams.?.file != null))
         FileLogParams{ .fileActiveLevel = fileParams.?.fileBehaviour.fileActiveLevel, .file = fileParams.?.file.?, .monocolorFile = fileParams.?.fileBehaviour.monocolorFile }
@@ -104,11 +132,11 @@ pub fn log(scope: LoggerScope, activeLevel: std.log.Level, comptime level: std.l
         null;
 
     switch (scope) {
-        .default => return compTimeLog(.default, activeLevel, level, fmt, args, fileLogParams, moduleTag),
-        .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams, moduleTag),
-        .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams, moduleTag),
-        .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams, moduleTag),
-        .n4 => return compTimeLog(.n4, activeLevel, level, fmt, args, fileLogParams, moduleTag),
+        .default => return compTimeLog(.default, activeLevel, level, fmt, args, fileLogParams, moduleTag, slot_clock),
+        .n1 => return compTimeLog(.n1, activeLevel, level, fmt, args, fileLogParams, moduleTag, slot_clock),
+        .n2 => return compTimeLog(.n2, activeLevel, level, fmt, args, fileLogParams, moduleTag, slot_clock),
+        .n3 => return compTimeLog(.n3, activeLevel, level, fmt, args, fileLogParams, moduleTag, slot_clock),
+        .n4 => return compTimeLog(.n4, activeLevel, level, fmt, args, fileLogParams, moduleTag, slot_clock),
     }
 }
 
@@ -130,6 +158,7 @@ pub const ModuleTag = enum {
     forkchoice,
     gossip_handler,
     metrics,
+    metrics_server,
     network,
     network_test,
     node,
@@ -174,6 +203,11 @@ pub const ZeamLoggerConfig = struct {
     activeLevel: std.log.Level,
     scope: LoggerScope,
     fileParams: ?FileParams,
+    /// Optional pointer to the shared slot/interval clock from the forkchoice.
+    /// When set, each log line includes the current slot and interval-within-slot
+    /// as a suffix on the timestamp (e.g. " [s=42 i=2]").
+    /// Not set for loggers created in a proving-manager / STF host context.
+    slot_clock: ?*const SlotTimeClock = null,
 
     const Self = @This();
     pub fn init(scope: LoggerScope, activeLevel: std.log.Level, fileBehaviourParams: ?FileBehaviourParams) Self {
@@ -281,6 +315,7 @@ pub const ModuleLogger = struct {
             args,
             self.config.fileParams,
             self.moduleTag,
+            self.config.slot_clock,
         );
     }
 
@@ -297,6 +332,7 @@ pub const ModuleLogger = struct {
             args,
             self.config.fileParams,
             self.moduleTag,
+            self.config.slot_clock,
         );
     }
 
@@ -313,6 +349,7 @@ pub const ModuleLogger = struct {
             args,
             self.config.fileParams,
             self.moduleTag,
+            self.config.slot_clock,
         );
     }
 
@@ -329,12 +366,13 @@ pub const ModuleLogger = struct {
             args,
             self.config.fileParams,
             self.moduleTag,
+            self.config.slot_clock,
         );
     }
 };
 
 /// Formatter for optional node names in logs
-/// Usage: logger.info("{}message", .{OptionalNode.init(maybe_node_name)})
+/// Usage: logger.info("{f}message", .{OptionalNode.init(maybe_node_name)})
 /// Outputs: "message" or "(node1) message"
 pub const OptionalNode = struct {
     name: ?[]const u8,
@@ -343,17 +381,10 @@ pub const OptionalNode = struct {
         return .{ .name = name };
     }
 
-    pub fn format(
-        self: OptionalNode,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
+    pub fn format(self: OptionalNode, writer: anytype) !void {
         const peer_color = Colors.peer;
         const reset_color = Colors.reset;
 
-        _ = fmt;
-        _ = options;
         if (self.name) |n| {
             try writer.print("({s}{s}{s})", .{ peer_color, n, reset_color });
         }
@@ -466,6 +497,7 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
         .forkchoice => "forkchoice",
         .gossip_handler => "gossip",
         .metrics => "metrics",
+        .metrics_server => "metrics-server",
         .network => "network",
         .network_test => "network-test",
         .node => "node",
@@ -496,7 +528,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("alice");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print(" Peer connected: {s}, total peers: {d}", .{
             "peer123",
             5,
@@ -512,7 +544,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init(null);
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print("Peer connected: {s}, total peers: {d}", .{
             "peer456",
             3,
@@ -528,7 +560,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("validator-7");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.print(" Published block: slot={d} proposer={d}", .{
             100,
             7,
@@ -544,7 +576,7 @@ test "OptionalNode formatter" {
         const writer = buffer.writer(allocator);
 
         const node = OptionalNode.init("");
-        try node.format("", .{}, writer);
+        try node.format(writer);
         try writer.writeAll(" Message");
 
         try testing.expectEqualStrings("(" ++ Colors.peer ++ Colors.reset ++ ") Message", buffer.items);

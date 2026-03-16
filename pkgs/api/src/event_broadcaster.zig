@@ -272,7 +272,7 @@ test "global broadcaster functionality" {
         .root = [_]u8{5} ** 32,
     };
 
-    const just_event = try events.NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123);
+    const just_event = try events.NewJustificationEvent.fromCheckpoint(allocator, checkpoint, 123, null);
 
     var chain_event = events.ChainEvent{ .new_justification = just_event };
 

@@ -64,10 +64,8 @@ pub const GossipSub = struct {
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
-    pub fn format(self: GossipSub, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: GossipSub, writer: anytype) !void {
         _ = self;
-        _ = fmt;
-        _ = options;
         try writer.writeAll("GossipSub");
     }
 
@@ -118,10 +116,8 @@ pub const OnGossipCbHandler = struct {
     onGossipCb: OnGossipCbType,
     // c: xev.Completion = undefined,
 
-    pub fn format(self: OnGossipCbHandler, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: OnGossipCbHandler, writer: anytype) !void {
         _ = self;
-        _ = fmt;
-        _ = options;
         try writer.writeAll("OnGossipCbHandler");
     }
 
@@ -158,11 +154,15 @@ pub const LeanNetworkTopic = struct {
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
-        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() }, 0);
+        const gossip_part = try self.gossip_topic.encode(self.allocator);
+        defer self.allocator.free(gossip_part);
+        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, gossip_part, self.encoding.encode() }, 0);
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
-        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, self.gossip_topic.encode(), self.encoding.encode() });
+        const topic_name = try self.gossip_topic.encode(self.allocator);
+        defer self.allocator.free(topic_name);
+        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, topic_name, self.encoding.encode() });
     }
 
     // topic format: /leanconsensus/<network>/<name>/<encoding>
@@ -194,45 +194,91 @@ pub const LeanNetworkTopic = struct {
     }
 };
 
-pub const GossipTopic = enum {
+pub const GossipTopicKind = enum {
     block,
     attestation,
+    aggregation,
+};
 
-    pub fn encode(self: GossipTopic) []const u8 {
-        return std.enums.tagName(GossipTopic, self).?;
+pub const GossipTopic = struct {
+    kind: GossipTopicKind,
+    subnet_id: ?types.SubnetId = null,
+
+    pub fn encode(self: GossipTopic, allocator: Allocator) ![]u8 {
+        if (self.kind == .attestation) {
+            const subnet_id = self.subnet_id orelse return error.MissingSubnetId;
+            return std.fmt.allocPrint(allocator, "attestation_{d}", .{subnet_id});
+        }
+        return allocator.dupe(u8, @tagName(self.kind));
     }
 
     pub fn decode(encoded: []const u8) !GossipTopic {
-        return std.meta.stringToEnum(GossipTopic, encoded) orelse error.InvalidDecoding;
+        if (std.mem.startsWith(u8, encoded, "attestation_")) {
+            const subnet_slice = encoded["attestation_".len..];
+            const subnet_id = std.fmt.parseInt(types.SubnetId, subnet_slice, 10) catch return error.InvalidDecoding;
+            return GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
+        }
+        const kind = std.meta.stringToEnum(GossipTopicKind, encoded) orelse return error.InvalidDecoding;
+        return GossipTopic{ .kind = kind };
+    }
+
+    pub fn format(self: GossipTopic, writer: anytype) !void {
+        switch (self.kind) {
+            .block, .aggregation => try writer.writeAll(@tagName(self.kind)),
+            .attestation => {
+                if (self.subnet_id) |subnet_id| {
+                    try writer.print("attestation_{d}", .{subnet_id});
+                } else {
+                    try writer.writeAll(@tagName(self.kind));
+                }
+            },
+        }
     }
 };
 
-pub const GossipMessage = union(GossipTopic) {
+pub const AttestationGossip = struct {
+    subnet_id: types.SubnetId,
+    message: types.SignedAttestation,
+};
+
+pub const GossipMessage = union(GossipTopicKind) {
     block: types.SignedBlockWithAttestation,
-    attestation: types.SignedAttestation,
+    attestation: AttestationGossip,
+    aggregation: types.SignedAggregatedAttestation,
 
     const Self = @This();
 
     pub fn getLeanNetworkTopic(self: *const Self, allocator: Allocator, network_name: []const u8) !LeanNetworkTopic {
-        const gossip_topic = std.meta.activeTag(self.*);
+        const gossip_kind = std.meta.activeTag(self.*);
+        const gossip_topic = switch (gossip_kind) {
+            .block => GossipTopic{ .kind = .block },
+            .aggregation => GossipTopic{ .kind = .aggregation },
+            .attestation => GossipTopic{ .kind = .attestation, .subnet_id = self.attestation.subnet_id },
+        };
         return try LeanNetworkTopic.init(allocator, gossip_topic, .ssz_snappy, network_name);
     }
 
     pub fn getGossipTopic(self: *const Self) GossipTopic {
-        return std.meta.activeTag(self.*);
+        return switch (std.meta.activeTag(self.*)) {
+            .block => GossipTopic{ .kind = .block },
+            .aggregation => GossipTopic{ .kind = .aggregation },
+            .attestation => GossipTopic{ .kind = .attestation, .subnet_id = self.attestation.subnet_id },
+        };
     }
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
                 blk.message.block.slot,
                 blk.message.block.proposer_index,
             }),
-            .attestation => |att| try writer.print("GossipMessage{{ attestation: validator={d}, slot={d} }}", .{
-                att.validator_id,
-                att.message.slot,
+            .attestation => |att| try writer.print("GossipMessage{{ attestation: subnet={d} validator={d}, slot={d} }}", .{
+                att.subnet_id,
+                att.message.validator_id,
+                att.message.message.slot,
+            }),
+            .aggregation => |agg| try writer.print("GossipMessage{{ aggregation: slot={d} }}", .{
+                agg.data.slot,
             }),
         }
     }
@@ -244,7 +290,10 @@ pub const GossipMessage = union(GossipTopic) {
         switch (self.*) {
             inline else => |payload, tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                try ssz.serialize(PayloadType, payload, &serialized, allocator);
+                switch (tag) {
+                    .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized, allocator),
+                    else => try ssz.serialize(PayloadType, payload, &serialized, allocator),
+                }
             },
         }
 
@@ -261,11 +310,24 @@ pub const GossipMessage = union(GossipTopic) {
             },
             .attestation => {
                 cloned_data.* = .{ .attestation = undefined };
-                try types.sszClone(allocator, types.SignedAttestation, self.attestation, &cloned_data.attestation);
+                cloned_data.attestation.subnet_id = self.attestation.subnet_id;
+                try types.sszClone(allocator, types.SignedAttestation, self.attestation.message, &cloned_data.attestation.message);
+            },
+            .aggregation => {
+                cloned_data.* = .{ .aggregation = undefined };
+                try types.sszClone(allocator, types.SignedAggregatedAttestation, self.aggregation, &cloned_data.aggregation);
             },
         }
 
         return cloned_data;
+    }
+
+    pub fn deinit(self: *Self) void {
+        switch (self.*) {
+            .block => |*block| block.deinit(),
+            .attestation => {},
+            .aggregation => |*aggregation| aggregation.deinit(),
+        }
     }
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
@@ -274,8 +336,12 @@ pub const GossipMessage = union(GossipTopic) {
                 std.log.err("Failed to convert block to JSON: {any}", .{e});
                 return e;
             },
-            .attestation => |attestation| attestation.toJson(allocator) catch |e| {
+            .attestation => |attestation| attestation.message.toJson(allocator) catch |e| {
                 std.log.err("Failed to convert attestation to JSON: {any}", .{e});
+                return e;
+            },
+            .aggregation => |aggregation| aggregation.toJson(allocator) catch |e| {
+                std.log.err("Failed to convert aggregation to JSON: {any}", .{e});
                 return e;
             },
         };
@@ -330,9 +396,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 
     const Self = @This();
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
             .status => try writer.writeAll("ReqRespRequest{ status }"),
@@ -689,7 +753,7 @@ pub const ReqRespRequestHandler = struct {
         const peer_id_opt = stream.getPeerId();
         const peer_id = peer_id_opt orelse "unknown";
         const node_name = if (peer_id_opt) |pid| self.node_registry.getNodeNameFromPeerId(pid) else zeam_utils.OptionalNode.init(null);
-        self.logger.debug("network-{d}:: onReqRespRequest={any} handlers={d} from peer={s}{any}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
+        self.logger.debug("network-{d}:: onReqRespRequest={f} handlers={d} from peer={s}{f}", .{ self.networkId, req.*, self.handlers.items.len, peer_id, node_name });
         if (self.handlers.items.len == 0) {
             return error.NoHandlerSubscribed;
         }
@@ -699,7 +763,7 @@ pub const ReqRespRequestHandler = struct {
 
         for (self.handlers.items) |handler| {
             handler.onReqRespRequest(req, stream) catch |err| {
-                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{any}", .{ self.networkId, err, peer_id, node_name });
+                self.logger.err("network-{d}:: onReqRespRequest handler error={any} from peer={s}{f}", .{ self.networkId, err, peer_id, node_name });
                 last_err = err;
                 continue;
             };
@@ -720,19 +784,17 @@ pub const ReqRespRequestHandler = struct {
 const MessagePublishWrapper = struct {
     allocator: Allocator,
     handler: OnGossipCbHandler,
-    data: *const GossipMessage,
+    data: *GossipMessage,
     sender_peer_id: []const u8,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
 
-    pub fn format(self: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={s}, sender={s} }}", .{
+    pub fn format(self: Self, writer: anytype) !void {
+        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={f}, sender={s} }}", .{
             self.networkId,
-            self.data.getGossipTopic().encode(),
+            self.data.getGossipTopic(),
             self.sender_peer_id,
         });
     }
@@ -755,6 +817,7 @@ const MessagePublishWrapper = struct {
 
     fn deinit(self: *Self) void {
         self.allocator.free(self.sender_peer_id);
+        self.data.deinit();
         self.allocator.destroy(self.data);
         self.allocator.destroy(self);
     }
@@ -814,7 +877,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerConnected(self: *Self, peer_id: []const u8, direction: PeerDirection) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{any} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerConnected peer_id={s}{f} direction={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerConnected(peer_id, direction) catch |e| {
                 self.logger.err("network-{d}:: onPeerConnected handler error={any}", .{ self.networkId, e });
@@ -824,7 +887,7 @@ pub const PeerEventHandler = struct {
 
     pub fn onPeerDisconnected(self: *Self, peer_id: []const u8, direction: PeerDirection, reason: DisconnectionReason) anyerror!void {
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{any} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
+        self.logger.debug("network-{d}:: PeerEventHandler.onPeerDisconnected peer_id={s}{f} direction={s} reason={s}, handlers={d}", .{ self.networkId, peer_id, node_name, @tagName(direction), @tagName(reason), self.handlers.items.len });
         for (self.handlers.items) |handler| {
             handler.onPeerDisconnected(peer_id, direction, reason) catch |e| {
                 self.logger.err("network-{d}:: onPeerDisconnected handler error={any}", .{ self.networkId, e });
@@ -864,13 +927,6 @@ pub const GenericGossipHandler = struct {
             }
             onGossipHandlers.deinit(allocator);
         }
-        try onGossipHandlers.ensureTotalCapacity(allocator, @intCast(std.enums.values(GossipTopic).len));
-
-        for (std.enums.values(GossipTopic)) |topic| {
-            var arr: std.ArrayList(OnGossipCbHandler) = .empty;
-            errdefer arr.deinit(allocator);
-            try onGossipHandlers.put(allocator, topic, arr);
-        }
 
         return Self{
             .allocator = allocator,
@@ -894,9 +950,13 @@ pub const GenericGossipHandler = struct {
 
     pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8, scheduleOnLoop: bool) anyerror!void {
         const gossip_topic = data.getGossipTopic();
-        const handlerArr = self.onGossipHandlers.get(gossip_topic).?;
+        const handlerArr = self.onGossipHandlers.get(gossip_topic) orelse {
+            const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+            self.logger.debug("network-{d}:: ongossip no handlers for topic={f} from peer={s}{f}", .{ self.networkId, gossip_topic, sender_peer_id, node_name });
+            return;
+        };
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={s} from peer={s}{any}", .{ self.networkId, handlerArr.items.len, gossip_topic.encode(), sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={f} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic, sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -904,7 +964,7 @@ pub const GenericGossipHandler = struct {
             if (scheduleOnLoop) {
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={any} for topic={s}", .{ self.networkId, publishWrapper, gossip_topic.encode() });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);
@@ -946,10 +1006,13 @@ pub const GenericGossipHandler = struct {
 
     pub fn subscribe(self: *Self, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void {
         for (topics) |topic| {
-            // handlerarr should already be there
-            var handlerArr = self.onGossipHandlers.get(topic).?;
+            const gop = try self.onGossipHandlers.getOrPut(self.allocator, topic);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+            var handlerArr = gop.value_ptr.*;
             try handlerArr.append(self.allocator, handler);
-            try self.onGossipHandlers.put(self.allocator, topic, handlerArr);
+            gop.value_ptr.* = handlerArr;
         }
     }
 };
@@ -963,13 +1026,19 @@ test GossipEncoding {
 }
 
 test GossipTopic {
-    const gossip_topic = GossipTopic.block;
-    try std.testing.expect(std.mem.eql(u8, gossip_topic.encode(), "block"));
-    try std.testing.expectEqual(gossip_topic, try GossipTopic.decode("block"));
+    const allocator = std.testing.allocator;
 
-    const gossip_topic2 = GossipTopic.attestation;
-    try std.testing.expect(std.mem.eql(u8, gossip_topic2.encode(), "attestation"));
-    try std.testing.expectEqual(gossip_topic2, try GossipTopic.decode("attestation"));
+    const block_topic = GossipTopic{ .kind = .block };
+    const block_encoded = try block_topic.encode(allocator);
+    defer allocator.free(block_encoded);
+    try std.testing.expect(std.mem.eql(u8, block_encoded, "block"));
+    try std.testing.expectEqual(block_topic, try GossipTopic.decode("block"));
+
+    const att_topic = GossipTopic{ .kind = .attestation, .subnet_id = 0 };
+    const att_encoded = try att_topic.encode(allocator);
+    defer allocator.free(att_encoded);
+    try std.testing.expect(std.mem.eql(u8, att_encoded, "attestation_0"));
+    try std.testing.expectEqual(att_topic, try GossipTopic.decode("attestation_0"));
 
     try std.testing.expectError(error.InvalidDecoding, GossipTopic.decode("invalid"));
 }
@@ -977,7 +1046,7 @@ test GossipTopic {
 test LeanNetworkTopic {
     const allocator = std.testing.allocator;
 
-    var topic = try LeanNetworkTopic.init(allocator, .block, .ssz_snappy, "devnet0");
+    var topic = try LeanNetworkTopic.init(allocator, .{ .kind = .block }, .ssz_snappy, "devnet0");
     defer topic.deinit();
 
     const topic_str = try topic.encodeZ();

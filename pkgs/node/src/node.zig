@@ -39,6 +39,7 @@ const NodeOpts = struct {
     db: database.Db,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
+    is_aggregator: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -48,6 +49,7 @@ pub const BeamNode = struct {
     network: networkFactory.Network,
     validator: ?validatorClient.ValidatorClient = null,
     nodeId: u32,
+    last_interval: isize,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
 
@@ -72,6 +74,7 @@ pub const BeamNode = struct {
                 .db = opts.db,
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
+                .is_aggregator = opts.is_aggregator,
             },
             network.connected_peers,
         );
@@ -79,6 +82,9 @@ pub const BeamNode = struct {
             chain.deinit();
             allocator.destroy(chain);
         }
+        // Now that the chain is at its final heap location, point the logger config
+        // at the forkchoice slot clock so every log line carries slot/interval context.
+        opts.logger_config.slot_clock = &chain.forkChoice.fcStore.slot_clock;
         if (opts.validator_ids) |ids| {
             // key_manager is required when validator_ids is provided
             const km = opts.key_manager orelse return error.KeyManagerRequired;
@@ -99,6 +105,7 @@ pub const BeamNode = struct {
             .network = network,
             .validator = validator,
             .nodeId = opts.nodeId,
+            .last_interval = -1,
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
         };
@@ -123,7 +130,7 @@ pub const BeamNode = struct {
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
-                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{any} hasParentBlock={} from peer={s}{any}", .{
+                self.logger.info("received gossip block for slot={d} parent_root=0x{x} proposer={d}{f} hasParentBlock={} from peer={s}{f}", .{
                     block.slot,
                     &parent_root,
                     block.proposer_index,
@@ -175,15 +182,23 @@ pub const BeamNode = struct {
                 }
             },
             .attestation => |signed_attestation| {
-                const slot = signed_attestation.message.slot;
-                const validator_id = signed_attestation.validator_id;
+                const slot = signed_attestation.message.message.slot;
+                const validator_id = signed_attestation.message.validator_id;
                 const validator_node_name = self.node_registry.getNodeNameFromValidatorIndex(validator_id);
 
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip attestation for slot={d} validator={d}{any} from peer={s}{any}", .{
+                self.logger.info("received gossip attestation for slot={d} validator={d}{f} from peer={s}{f}", .{
                     slot,
                     validator_id,
                     validator_node_name,
+                    sender_peer_id,
+                    sender_node_name,
+                });
+            },
+            .aggregation => |signed_aggregation| {
+                const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{f}", .{
+                    signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
                 });
@@ -228,29 +243,62 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Attestation validation failed due to missing head/source/target block -
+                // Block arrived too early for local clock - cache and retry later.
+                error.FutureSlot => {
+                    if (data.* == .block) {
+                        const signed_block = data.block;
+                        var block_root: types.Root = undefined;
+                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                            if (self.cacheFutureBlock(block_root, signed_block)) |_| {
+                                self.logger.debug(
+                                    "cached future gossip block 0x{s} at slot {d}",
+                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
+                                );
+                            } else |cache_err| {
+                                if (cache_err == CacheBlockError.PreFinalized) {
+                                    self.logger.info(
+                                        "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
+                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
+                                    );
+                                    _ = self.network.pruneCachedBlocks(block_root, null);
+                                } else {
+                                    self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
+                                        std.fmt.bytesToHex(block_root, .lower)[0..],
+                                        cache_err,
+                                    });
+                                }
+                            }
+                        } else |_| {}
+                    }
+                    return;
+                },
+                // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                    if (data.* == .attestation) {
-                        const att = data.attestation;
-                        const att_data = att.message;
+                    const att_data: ?@TypeOf(data.attestation.message.message) = switch (data.*) {
+                        .attestation => |att| att.message.message,
+                        .aggregation => |agg| agg.data,
+                        else => null,
+                    };
+                    if (att_data) |ad| {
                         const missing_root = if (err == error.UnknownHeadBlock)
-                            att_data.head.root
+                            ad.head.root
                         else if (err == error.UnknownSourceBlock)
-                            att_data.source.root
+                            ad.source.root
                         else
-                            att_data.target.root;
+                            ad.target.root;
 
+                        const kind: []const u8 = if (data.* == .attestation) "attestation" else "aggregation";
                         if (self.network.hasPendingBlockRoot(missing_root)) {
-                            self.logger.debug("gossip attestation validation deferred slot={d} validator={d} error={any} (block fetch in progress)", .{
-                                att_data.slot,
-                                att.validator_id,
+                            self.logger.debug("gossip {s} validation deferred slot={d} error={any} (block fetch in progress)", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         } else {
-                            self.logger.warn("gossip attestation validation failed slot={d} validator={d} error={any}", .{
-                                att_data.slot,
-                                att.validator_id,
+                            self.logger.warn("gossip {s} validation failed slot={d} error={any}", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         }
@@ -273,16 +321,15 @@ pub const BeamNode = struct {
             self.processCachedDescendants(processed_root);
         }
 
-        // Fetch any attestation head roots that were missing while processing the block.
-        // We only own the slice when the block was actually processed (onBlock allocates it).
+        // Fetch any block roots that were missing while processing a block or validating attestation/aggregation gossip.
+        // We own the slice whenever it's non-empty (onBlock and onGossip both allocate it).
         const missing_roots = result.missing_attestation_roots;
-        const owns_missing_roots = result.processed_block_root != null;
-        defer if (owns_missing_roots) self.allocator.free(missing_roots);
+        defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
-        if (missing_roots.len > 0 and owns_missing_roots) {
+        if (missing_roots.len > 0) {
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
                 self.logger.warn(
-                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    "failed to fetch {d} missing block root(s) from gossip: {any}",
                     .{ missing_roots.len, err },
                 );
             };
@@ -344,6 +391,17 @@ pub const BeamNode = struct {
         // Try to process each descendant
         for (descendants_to_process.items) |descendant_root| {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                // Skip if already known to fork choice — same guard as processBlockByRootChunk
+                if (self.chain.forkChoice.hasBlock(descendant_root)) {
+                    self.logger.debug(
+                        "cached block 0x{x} is already known to fork choice, skipping re-processing",
+                        .{&descendant_root},
+                    );
+                    _ = self.network.removeFetchedBlock(descendant_root);
+                    self.processCachedDescendants(descendant_root);
+                    continue;
+                }
+
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
                     .{&descendant_root},
@@ -355,6 +413,12 @@ pub const BeamNode = struct {
                         self.logger.debug(
                             "Cached block 0x{x} still missing parent, keeping in cache",
                             .{&descendant_root},
+                        );
+                    } else if (err == error.FutureSlot) {
+                        // Block is still in the future, keep it cached
+                        self.logger.debug(
+                            "Cached block 0x{s} still in future slot, keeping in cache",
+                            .{std.fmt.bytesToHex(descendant_root, .lower)[0..]},
                         );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
@@ -392,6 +456,27 @@ pub const BeamNode = struct {
                     self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
                 };
             }
+        }
+    }
+
+    fn processReadyCachedBlocks(self: *Self, current_slot: types.Slot) void {
+        var parent_roots = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer parent_roots.deinit();
+
+        var it = self.network.fetched_blocks.iterator();
+        while (it.next()) |entry| {
+            const block = entry.value_ptr.*.message.block;
+            if (block.slot <= current_slot) {
+                const parent_root = block.parent_root;
+                if (self.chain.forkChoice.hasBlock(parent_root)) {
+                    parent_roots.put(parent_root, {}) catch {};
+                }
+            }
+        }
+
+        var pit = parent_roots.iterator();
+        while (pit.next()) |entry| {
+            self.processCachedDescendants(entry.key_ptr.*);
         }
     }
 
@@ -473,17 +558,72 @@ pub const BeamNode = struct {
         return parent_root;
     }
 
+    fn cacheFutureBlock(
+        self: *Self,
+        block_root: types.Root,
+        signed_block: types.SignedBlockWithAttestation,
+    ) CacheBlockError!void {
+        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        const block_slot = signed_block.message.block.slot;
+
+        if (block_slot <= finalized_slot) {
+            return CacheBlockError.PreFinalized;
+        }
+
+        if (self.network.hasFetchedBlock(block_root)) {
+            return CacheBlockError.AlreadyCached;
+        }
+
+        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
+            self.logger.warn("Cache full ({d} blocks), rejecting future block 0x{s} at slot {d}", .{
+                self.network.fetched_blocks.count(),
+                std.fmt.bytesToHex(block_root, .lower)[0..],
+                block_slot,
+            });
+            return CacheBlockError.CachingFailed;
+        }
+
+        const block_ptr = self.allocator.create(types.SignedBlockWithAttestation) catch {
+            return CacheBlockError.AllocationFailed;
+        };
+        var block_owned = true;
+        errdefer if (block_owned) self.allocator.destroy(block_ptr);
+
+        types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, block_ptr) catch {
+            return CacheBlockError.CloneFailed;
+        };
+        errdefer if (block_owned) block_ptr.deinit();
+
+        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
+            return CacheBlockError.CachingFailed;
+        };
+        block_owned = false;
+    }
+
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) !void {
         var block_root: types.Root = undefined;
         if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
-                self.logger.warn("received unexpected block root 0x{x} from peer {s}{any}", .{
+                self.logger.warn("received unexpected block root 0x{x} from peer {s}{f}", .{
                     &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
+            }
+
+            // Skip STF re-processing if the block is already known to fork choice
+            // (e.g. the checkpoint sync anchor block — it is the trust root and does not
+            // need state-transition re-processing; re-processing it would cause an infinite
+            // fetch loop because onBlock would always see it as "already processed").
+            if (self.chain.forkChoice.hasBlock(block_root)) {
+                self.logger.debug(
+                    "block 0x{x} is already known to fork choice, skipping re-processing",
+                    .{&block_root},
+                );
+                self.processCachedDescendants(block_root);
+                return;
             }
 
             // Try to add the block to the chain
@@ -532,7 +672,7 @@ pub const BeamNode = struct {
 
                 if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                     self.logger.info(
-                        "discarding pre-finalized block 0x{x} from peer {s}{any}, pruning cached descendants",
+                        "discarding pre-finalized block 0x{x} from peer {s}{f}, pruning cached descendants",
                         .{
                             &block_root,
                             block_ctx.peer_id,
@@ -543,7 +683,7 @@ pub const BeamNode = struct {
                     return;
                 }
 
-                self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{any}: {any}", .{
+                self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{f}: {any}", .{
                     &block_root,
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -570,7 +710,7 @@ pub const BeamNode = struct {
                 self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
             };
         } else |err| {
-            self.logger.warn("failed to compute block root from RPC response from peer={s}{any}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
+            self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
     }
 
@@ -592,14 +732,14 @@ pub const BeamNode = struct {
                 .status => |status_resp| {
                     switch (ctx_ptr.*) {
                         .status => |*status_ctx| {
-                            self.logger.info("received status response from peer {s}{any} head_slot={d}, finalized_slot={d}", .{
+                            self.logger.info("received status response from peer {s}{f} head_slot={d}, finalized_slot={d}", .{
                                 status_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 status_resp.head_slot,
                                 status_resp.finalized_slot,
                             });
                             if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn("status response received for unknown peer {s}{any}", .{
+                                self.logger.warn("status response received for unknown peer {s}{f}", .{
                                     status_ctx.peer_id,
                                     self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                 });
@@ -613,7 +753,7 @@ pub const BeamNode = struct {
                                 .behind_peers => |info| {
                                     // Only sync from this peer if their finalized slot is ahead of ours
                                     if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
-                                        self.logger.info("peer {s}{any} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
+                                        self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                             status_resp.finalized_slot,
@@ -622,7 +762,7 @@ pub const BeamNode = struct {
                                         });
                                         const roots = [_]types.Root{status_resp.head_root};
                                         self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{any}: {any}", .{
+                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
                                                 status_ctx.peer_id,
                                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                                 err,
@@ -630,18 +770,18 @@ pub const BeamNode = struct {
                                         };
                                     }
                                 },
-                                .synced, .no_peers => {},
+                                .synced, .no_peers, .fc_initing => {},
                             }
                         },
                         else => {
-                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{any}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
                 .blocks_by_root => |block_resp| {
                     switch (ctx_ptr.*) {
                         .blocks_by_root => |*block_ctx| {
-                            self.logger.info("received blocks-by-root chunk from peer {s}{any}", .{
+                            self.logger.info("received blocks-by-root chunk from peer {s}{f}", .{
                                 block_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             });
@@ -649,7 +789,7 @@ pub const BeamNode = struct {
                             try self.processBlockByRootChunk(block_ctx, &block_resp);
                         },
                         else => {
-                            self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{any}", .{ request_id, peer_id, node_name });
+                            self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
@@ -657,7 +797,7 @@ pub const BeamNode = struct {
             .failure => |err_payload| {
                 switch (ctx_ptr.*) {
                     .status => |status_ctx| {
-                        self.logger.warn("status request to peer {s}{any} failed ({d}): {s}", .{
+                        self.logger.warn("status request to peer {s}{f} failed ({d}): {s}", .{
                             status_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                             err_payload.code,
@@ -665,7 +805,7 @@ pub const BeamNode = struct {
                         });
                     },
                     .blocks_by_root => |block_ctx| {
-                        self.logger.warn("blocks-by-root request to peer {s}{any} failed ({d}): {s}", .{
+                        self.logger.warn("blocks-by-root request to peer {s}{f} failed ({d}): {s}", .{
                             block_ctx.peer_id,
                             self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             err_payload.code,
@@ -778,7 +918,7 @@ pub const BeamNode = struct {
         };
 
         if (maybe_request) |request_info| {
-            self.logger.debug("requested {d} block(s) by root from peer {s}{any}, request_id={d}", .{
+            self.logger.debug("requested {d} block(s) by root from peer {s}{f}, request_id={d}", .{
                 missing_roots.items.len,
                 request_info.peer_id,
                 self.node_registry.getNodeNameFromPeerId(request_info.peer_id),
@@ -792,7 +932,7 @@ pub const BeamNode = struct {
 
         try self.network.connectPeer(peer_id);
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
-        self.logger.info("peer connected: {s}{any}, direction={s}, total peers: {d}", .{
+        self.logger.info("peer connected: {s}{f}, direction={s}, total peers: {d}", .{
             peer_id,
             node_name,
             @tagName(direction),
@@ -807,7 +947,7 @@ pub const BeamNode = struct {
         const status = self.chain.getStatus();
 
         const request_id = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
-            self.logger.warn("failed to send status request to peer {s}{any} {any}", .{
+            self.logger.warn("failed to send status request to peer {s}{f} {any}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 err,
@@ -815,7 +955,7 @@ pub const BeamNode = struct {
             return;
         };
 
-        self.logger.info("sent status request to peer {s}{any}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
+        self.logger.info("sent status request to peer {s}{f}: request_id={d}, head_slot={d}, finalized_slot={d}", .{
             peer_id,
             self.node_registry.getNodeNameFromPeerId(peer_id),
             request_id,
@@ -828,7 +968,7 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         if (self.network.disconnectPeer(peer_id)) {
-            self.logger.info("peer disconnected: {s}{any}, direction={s}, reason={s}, total peers: {d}", .{
+            self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
                 self.node_registry.getNodeNameFromPeerId(peer_id),
                 @tagName(direction),
@@ -879,9 +1019,9 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
-        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.time) {
+        if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
             self.logger.warn("skipping onInterval for node ad chain is already ahead at time={d} of the misfired interval time={d}", .{
-                self.chain.forkChoice.fcStore.time,
+                self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic),
                 itime_intervals,
             });
             return;
@@ -898,47 +1038,90 @@ pub const BeamNode = struct {
             }
             return;
         }
-        const interval: usize = @intCast(itime_intervals);
 
-        self.chain.onInterval(interval) catch |e| {
-            self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-            // no point going further if chain is not ticked properly
-            return e;
-        };
+        var start_interval: isize = self.last_interval + 1;
+        if (start_interval < 1) start_interval = 1;
+        if (start_interval > itime_intervals) return;
 
-        // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers
-        self.sweepTimedOutRequests();
-
-        if (self.validator) |*validator| {
-            // we also tick validator per interval in case it would
-            // need to sync its future duties when its an independent validator
-            var validator_output = validator.onInterval(interval) catch |e| {
-                self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+        var current_interval: isize = start_interval;
+        while (current_interval <= itime_intervals) : (current_interval += 1) {
+            const interval: usize = @intCast(current_interval);
+            self.chain.onInterval(interval) catch |e| {
+                self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+                // no point going further if chain is not ticked properly
                 return e;
             };
 
-            if (validator_output) |*output| {
-                defer output.deinit();
-                for (output.gossip_messages.items) |gossip_msg| {
+            // Replay blocks that were queued waiting for the forkchoice clock to advance,
+            // then fetch any attestation head roots that were missing during replay.
+            const pending_missing_roots = self.chain.processPendingBlocks();
+            defer self.allocator.free(pending_missing_roots);
+            if (pending_missing_roots.len > 0) {
+                self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
+                    self.logger.warn(
+                        "failed to fetch {d} missing block(s) from pending blocks: {any}",
+                        .{ pending_missing_roots.len, err },
+                    );
+                };
+            }
 
-                    // Process based on message type
-                    switch (gossip_msg) {
-                        .block => |signed_block| {
-                            self.publishBlock(signed_block) catch |e| {
-                                self.logger.err("error publishing block from validator: err={any}", .{e});
-                                return e;
-                            };
-                        },
-                        .attestation => |signed_attestation| {
-                            self.publishAttestation(signed_attestation) catch |e| {
-                                self.logger.err("error publishing attestation from validator: err={any}", .{e});
-                                return e;
-                            };
-                        },
+            // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
+            self.sweepTimedOutRequests();
+
+            const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
+            self.processReadyCachedBlocks(slot);
+            if (self.validator) |*validator| {
+                // we also tick validator per interval in case it would
+                // need to sync its future duties when its an independent validator
+                var validator_output = validator.onInterval(interval) catch |e| {
+                    self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                    return e;
+                };
+
+                if (validator_output) |*output| {
+                    defer output.deinit();
+                    for (output.gossip_messages.items) |gossip_msg| {
+                        // Process based on message type
+                        switch (gossip_msg) {
+                            .block => |signed_block| {
+                                self.publishBlock(signed_block) catch |e| {
+                                    self.logger.err("error publishing block from validator: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                            .attestation => |signed_attestation| {
+                                self.publishAttestation(signed_attestation) catch |e| {
+                                    self.logger.err("error publishing attestation from validator: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                            .aggregation => |signed_aggregation| {
+                                self.publishAggregation(signed_aggregation) catch |e| {
+                                    self.logger.err("error publishing aggregation from validator: err={any}", .{e});
+                                    return e;
+                                };
+                            },
+                        }
                     }
                 }
             }
+
+            const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
+            if (interval_in_slot == 2) {
+                if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
+                    self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
+                    return e;
+                }) |aggregations| {
+                    defer self.allocator.free(aggregations);
+                    self.publishProducedAggregations(aggregations) catch |e| {
+                        self.logger.err("error producing/publishing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
+                        return e;
+                    };
+                }
+            }
         }
+
+        self.last_interval = itime_intervals;
     }
 
     fn sweepTimedOutRequests(self: *Self) void {
@@ -962,7 +1145,7 @@ pub const BeamNode = struct {
                         roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch continue;
                     }
 
-                    self.logger.warn("RPC request_id={d} to peer {s}{any} timed out after {d}s, retrying {d} roots", .{
+                    self.logger.warn("RPC request_id={d} to peer {s}{f} timed out after {d}s, retrying {d} roots", .{
                         request_id,
                         block_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
@@ -982,7 +1165,7 @@ pub const BeamNode = struct {
                     }
                 },
                 .status => |status_ctx| {
-                    self.logger.warn("status RPC request_id={d} to peer {s}{any} timed out, finalizing", .{
+                    self.logger.warn("status RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
                         request_id,
                         status_ctx.peer_id,
                         self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
@@ -996,50 +1179,52 @@ pub const BeamNode = struct {
     pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
         const block = signed_block.message.block;
 
-        // 1. Process locally through chain so that produced block first can be confirmed
+        // 1. Process locally through chain so the produced block is confirmed and persisted.
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
 
-        // check if the block has not already been received through the network
+        // 2. need to add the signed proposer attestation in forkchoice even if block was locally produced
+        //    TODO: might not be needed for locally produced block if we totally depend on the agggregators to serve us attestations
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
-        if (!hasBlock) {
-            self.logger.info("adding produced signed block to the chain: slot={d} proposer={d}", .{
+        if (hasBlock) {
+            self.logger.debug("reprocessing locally produced block to add signed proposer attestation: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
-
-            const missing_roots = try self.chain.onBlock(signed_block, .{
-                .postState = self.chain.states.get(block_root),
-                .blockRoot = block_root,
-            });
-            defer self.allocator.free(missing_roots);
-
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
-            };
         } else {
-            self.logger.debug("skip adding produced signed block to chain as already present: slot={d} proposer={d}", .{
+            self.logger.debug("processing block not locally produced before publishing: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });
         }
 
-        // 2. publish gossip message
+        const missing_roots = try self.chain.onBlock(signed_block, .{
+            .postState = self.chain.states.get(block_root),
+            .blockRoot = block_root,
+        });
+        defer self.allocator.free(missing_roots);
+
+        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+        };
+
+        // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.network.publish(&gossip_msg);
-        self.logger.info("published block to network: slot={d} proposer={d}{any}", .{
+        self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
             block.slot,
             block.proposer_index,
             self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
         });
 
-        // 3. followup with additional housekeeping tasks
+        // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
     }
 
-    pub fn publishAttestation(self: *Self, signed_attestation: types.SignedAttestation) !void {
-        const data = signed_attestation.message;
-        const validator_id = signed_attestation.validator_id;
+    pub fn publishAttestation(self: *Self, signed_attestation: networks.AttestationGossip) !void {
+        const data = signed_attestation.message.message;
+        const validator_id = signed_attestation.message.validator_id;
+        _ = signed_attestation.subnet_id;
 
         // 1. Process locally through chain
         self.logger.info("adding locally produced attestation to chain: slot={d} validator={d}", .{
@@ -1052,11 +1237,35 @@ pub const BeamNode = struct {
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
         try self.network.publish(&gossip_msg);
 
-        self.logger.info("published attestation to network: slot={d} validator={d}{any}", .{
+        self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
             data.slot,
             validator_id,
             self.node_registry.getNodeNameFromValidatorIndex(validator_id),
         });
+    }
+
+    pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
+        self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
+        try self.chain.onGossipAggregatedAttestation(signed_aggregation);
+
+        const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
+        try self.network.publish(&gossip_msg);
+
+        self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+    }
+
+    fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
+        var i: usize = 0;
+        while (i < aggregations.len) : (i += 1) {
+            self.publishAggregation(aggregations[i]) catch |err| {
+                var j: usize = i;
+                while (j < aggregations.len) : (j += 1) {
+                    aggregations[j].deinit();
+                }
+                return err;
+            };
+            aggregations[i].deinit();
+        }
     }
 
     pub fn run(self: *Self) !void {
@@ -1065,12 +1274,40 @@ pub const BeamNode = struct {
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
             try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
+            // Keep node interval state aligned with forkchoice catch-up to avoid
+            // replaying historical validator duties when starting late.
+            self.last_interval = current_interval;
             self.logger.info("fork choice time caught up to interval {d}", .{current_interval});
         }
 
         const handler = try self.getOnGossipCbHandler();
-        var topics = [_]networks.GossipTopic{ .block, .attestation };
-        try self.network.backend.gossip.subscribe(&topics, handler);
+
+        var topics_list: std.ArrayList(networks.GossipTopic) = .empty;
+        defer topics_list.deinit(self.allocator);
+
+        try topics_list.append(self.allocator, .{ .kind = .block });
+        try topics_list.append(self.allocator, .{ .kind = .aggregation });
+
+        const committee_count = self.chain.config.spec.attestation_committee_count;
+        if (committee_count > 0) {
+            if (self.validator) |validator| {
+                var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
+                defer seen_subnets.deinit();
+                for (validator.ids) |validator_id| {
+                    const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
+                    if (seen_subnets.contains(@intCast(subnet_id))) continue;
+                    try seen_subnets.put(@intCast(subnet_id), {});
+                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
+                }
+            } else {
+                // Keep parity with leanSpec: passive nodes subscribe to subnet 0.
+                try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
+            }
+        }
+
+        const topics_slice = try topics_list.toOwnedSlice(self.allocator);
+        defer self.allocator.free(topics_slice);
+        try self.network.backend.gossip.subscribe(topics_slice, handler);
 
         const peer_handler = self.getPeerEventHandler();
         try self.network.backend.peers.subscribe(peer_handler);
@@ -1138,6 +1375,7 @@ test "Node peer tracking on connect/disconnect" {
         .spec = .{
             .preset = params.Preset.minimal,
             .name = spec_name,
+            .attestation_committee_count = 1,
         },
     };
 
@@ -1824,4 +2062,83 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
 
     // The parent entry should be fully cleaned up from the children map
     try std.testing.expect(node.network.fetched_block_children.get(parent_root) == null);
+}
+
+test "Node: publishBlock persists locally produced blocks for blocks-by-root sync" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var validator_ids = [_]usize{0};
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = &validator_ids,
+        .key_manager = &ctx.key_manager,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const slot: usize = 4;
+    // Advance the forkchoice clock to the target slot (mimics production flow where
+    // onInterval is called before block production)
+    try node.chain.forkChoice.onInterval(slot * constants.INTERVALS_PER_SLOT, false);
+
+    const produced_block = try node.chain.produceBlock(.{
+        .slot = slot,
+        .proposer_index = validator_ids[0],
+    });
+    const produced_root = produced_block.blockRoot;
+
+    const proposer_attestation_data = try node.chain.constructAttestationData(.{ .slot = slot });
+    const proposer_attestation = types.Attestation{
+        .validator_id = validator_ids[0],
+        .data = proposer_attestation_data,
+    };
+    const proposer_signature = try ctx.key_manager.signAttestation(&proposer_attestation, allocator);
+
+    var signed_block = types.SignedBlockWithAttestation{
+        .message = .{
+            .block = produced_block.block,
+            .proposer_attestation = proposer_attestation,
+        },
+        .signature = .{
+            .attestation_signatures = produced_block.attestation_signatures,
+            .proposer_signature = proposer_signature,
+        },
+    };
+    defer signed_block.deinit();
+
+    try node.publishBlock(signed_block);
+
+    const stored_block_opt = node.chain.db.loadBlock(database.DbBlocksNamespace, produced_root);
+    try std.testing.expect(stored_block_opt != null);
+
+    if (stored_block_opt) |stored_block_value| {
+        var stored_block = stored_block_value;
+        defer stored_block.deinit();
+        try std.testing.expectEqual(@as(usize, slot), stored_block.message.block.slot);
+        try std.testing.expect(std.mem.eql(u8, &stored_block.message.block.parent_root, &signed_block.message.block.parent_root));
+    }
 }

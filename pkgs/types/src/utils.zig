@@ -14,6 +14,7 @@ pub const Bytes32 = [32]u8;
 pub const Slot = u64;
 pub const Interval = u64;
 pub const ValidatorIndex = u64;
+pub const SubnetId = u32;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
@@ -30,6 +31,16 @@ pub const ZERO_SIGBYTES = [_]u8{0} ** SIGSIZE;
 pub const StateTransitionError = error{ InvalidParentRoot, InvalidPreState, InvalidPostState, InvalidExecutionPayloadHeaderTimestamp, InvalidJustifiableSlot, InvalidValidatorId, InvalidBlockSignatures, InvalidLatestBlockHeader, InvalidProposer, InvalidJustificationIndex, InvalidJustificationCapacity, InvalidJustificationTargetSlot, InvalidJustificationRoot, InvalidSlotIndex, DuplicateAttestationData };
 
 const json = std.json;
+
+pub const SubnetIdError = error{InvalidCommitteeCount};
+
+pub fn computeSubnetId(validator_id: ValidatorIndex, committee_count: SubnetId) SubnetIdError!SubnetId {
+    if (committee_count == 0) {
+        return error.InvalidCommitteeCount;
+    }
+    const committee_count_index: ValidatorIndex = committee_count;
+    return @intCast(validator_id % committee_count_index);
+}
 
 pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
@@ -110,6 +121,55 @@ pub fn BytesToHex(allocator: Allocator, bytes: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "0x{x}", .{bytes});
 }
 
+/// Cache for root to slot mapping to optimize block processing performance.
+/// Thread-safety: NOT thread-safe.
+pub const RootToSlotCache = struct {
+    cache: std.AutoHashMap(Root, Slot),
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .cache = std.AutoHashMap(Root, Slot).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.cache.deinit();
+    }
+
+    pub fn put(self: *Self, root: Root, slot: Slot) !void {
+        try self.cache.put(root, slot);
+    }
+
+    pub fn get(self: *const Self, root: Root) ?Slot {
+        return self.cache.get(root);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.cache.count();
+    }
+
+    /// Remove all entries with slot <= finalized_slot.
+    pub fn prune(self: *Self, finalized_slot: Slot) !void {
+        var keys_to_remove: std.ArrayList(Root) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
+
+        var iter = self.cache.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* <= finalized_slot) {
+                try keys_to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (keys_to_remove.items) |key| {
+            _ = self.cache.remove(key);
+        }
+    }
+};
+
 pub const GenesisSpec = struct {
     genesis_time: u64,
     validator_pubkeys: []const Bytes52,
@@ -125,6 +185,7 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
+    attestation_committee_count: SubnetId,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -134,6 +195,7 @@ pub const ChainSpec = struct {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
+        try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
         return json.Value{ .object = obj };
     }
 

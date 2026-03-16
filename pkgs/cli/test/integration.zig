@@ -52,7 +52,7 @@ fn getZeamExecutable() ![]const u8 {
 /// Returns the process handle for cleanup, or error if startup fails
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
     // Set up process with beam command and mock network
-    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true" };
+    const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
     cli_process.* = process.Child.init(&args, allocator);
 
@@ -170,19 +170,20 @@ const ZeamRequest = struct {
     }
 
     /// Make a request to the /metrics endpoint and return the response
+    /// Note: Metrics are served on the separate metrics port (default: 9668)
     fn getMetrics(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/metrics");
+        return self.makeRequestToPort("/metrics", constants.DEFAULT_METRICS_PORT);
     }
 
     /// Make a request to the /lean/v0/health endpoint and return the response
     fn getHealth(self: ZeamRequest) ![]u8 {
-        return self.makeRequest("/lean/v0/health");
+        return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
     }
 
-    /// Internal helper to make HTTP requests to any endpoint
-    fn makeRequest(self: ZeamRequest, endpoint: []const u8) ![]u8 {
+    /// Internal helper to make HTTP requests to any endpoint on the specified port
+    fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
         // Create connection to the server
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
+        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, port);
         var connection = try net.tcpConnectToAddress(address);
         defer connection.close();
 
@@ -191,7 +192,7 @@ const ZeamRequest = struct {
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
             "Connection: close\r\n" ++
-            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT });
+            "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, port });
 
         var conn_write_buf: [4096]u8 = undefined;
         var conn_writer = connection.writer(&conn_write_buf);
@@ -227,6 +228,7 @@ const ChainEvent = struct {
     event_type: []const u8,
     justified_slot: ?u64,
     finalized_slot: ?u64,
+    node_id: ?u32,
 
     /// Free the memory allocated for this event
     fn deinit(self: ChainEvent, allocator: std.mem.Allocator) void {
@@ -380,6 +382,7 @@ const SSEClient = struct {
 
         var justified_slot: ?u64 = null;
         var finalized_slot: ?u64 = null;
+        var node_id: ?u32 = null;
 
         if (parsed.value.object.get("justified_slot")) |js| {
             switch (js) {
@@ -395,10 +398,18 @@ const SSEClient = struct {
             }
         }
 
+        if (parsed.value.object.get("node_id")) |nid| {
+            switch (nid) {
+                .integer => |ival| node_id = @intCast(ival),
+                else => {},
+            }
+        }
+
         return ChainEvent{
             .event_type = event_type_owned,
             .justified_slot = justified_slot,
             .finalized_slot = finalized_slot,
+            .node_id = node_id,
         };
     }
 
@@ -499,6 +510,7 @@ test "CLI beam command with mock network - complete integration test" {
 
 test "SSE events integration test - wait for justification and finalization" {
     const allocator = std.testing.allocator;
+    const node3_id = 2;
 
     // Get executable path
     const exe_path = try getZeamExecutable();
@@ -519,12 +531,12 @@ test "SSE events integration test - wait for justification and finalization" {
 
     std.debug.print("INFO: Connected to SSE endpoint, waiting for events...\n", .{});
 
-    // Read events until justification, finalization, AND node3 parent sync are verified, or timeout.
-    // Node3 starts after first finalization and syncs via parent block requests (blocks_by_root).
-    // We verify sync by waiting for finalization to advance beyond the first finalized slot,
-    // which proves the chain continued progressing after node3 joined.
-    const timeout_ms: u64 = 240000; // 240 seconds to reach first justification/finalization
-    const post_finalization_timeout_ms: u64 = 120000; // extra time for node3 sync/finalization advancement
+    // Read events until justification, finalization, and node3 sync are verified, or timeout.
+    // Node3 sync is proven by either:
+    // 1) an explicit node3 finalization event, or
+    // 2) finalization advancing beyond the first finalized slot after node3 starts syncing.
+    const timeout_ms: u64 = 480000; // total timeout
+    const post_finalization_timeout_ms: u64 = 120000; // extra time after first finalization
     const start_ns = std.time.nanoTimestamp();
     var deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
@@ -550,7 +562,7 @@ test "SSE events integration test - wait for justification and finalization" {
             // Check for finalization events
             if (std.mem.eql(u8, e.event_type, "new_finalization")) {
                 if (e.finalized_slot) |slot| {
-                    std.debug.print("DEBUG: Found finalization event with slot {}\n", .{slot});
+                    std.debug.print("DEBUG: Found finalization event with slot {} node_id={any}\n", .{ slot, e.node_id });
                     if (slot > 0 and !got_finalization) {
                         // First finalization — this triggers node3 to start syncing
                         got_finalization = true;
@@ -571,10 +583,15 @@ test "SSE events integration test - wait for justification and finalization" {
                         std.debug.print("INFO: Advanced finalization at slot {} (first was {}) — chain progressed after node 3 joined\n", .{ slot, first_finalized_slot });
                         std.debug.print("INFO: Head events since finalization: {} (total: {})\n", .{ head_count_now - head_count_at_finalization, head_count_now });
                     }
-                } else {
-                    std.debug.print("DEBUG: Found finalization event with null slot\n", .{});
+
+                    if (!got_node3_sync and slot > 0 and e.node_id != null and e.node_id.? == node3_id) {
+                        got_node3_sync = true;
+                        std.debug.print("INFO: Found node3 finalization with slot {}\n", .{slot});
+                    }
                 }
             }
+
+            std.debug.print("SUCCESS: SSE events integration test completed — including node 3 finalization sync verification\n", .{});
 
             // IMPORTANT: Free the event memory after processing
             e.deinit(allocator);

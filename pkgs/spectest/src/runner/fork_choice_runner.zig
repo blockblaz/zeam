@@ -183,6 +183,7 @@ const StepContext = struct {
     state_map: *StateMap,
     allocated_states: *StateList,
     label_map: *LabelMap,
+    block_attestations: *BlockAttestationList,
     fork_logger: zeam_utils.ModuleLogger,
     base_context: Context,
 };
@@ -190,6 +191,19 @@ const StepContext = struct {
 const StateMap = std.AutoHashMapUnmanaged(types.Root, *types.BeamState);
 const StateList = std.ArrayList(*types.BeamState);
 const LabelMap = std.StringHashMapUnmanaged(types.Root);
+const BlockAttestationSummary = struct {
+    participants: []u64,
+    attestation_slot: u64,
+    target_slot: u64,
+};
+const BlockAttestationList = std.ArrayListUnmanaged(BlockAttestationSummary);
+
+fn clearBlockAttestations(allocator: Allocator, list: *BlockAttestationList) void {
+    for (list.items) |entry| {
+        allocator.free(entry.participants);
+    }
+    list.clearRetainingCapacity();
+}
 
 fn runCase(
     comptime spec_fork: Fork,
@@ -290,6 +304,12 @@ fn runCase(
     var label_map = LabelMap.empty;
     defer label_map.deinit(allocator);
 
+    var block_attestations = BlockAttestationList.empty;
+    defer {
+        clearBlockAttestations(allocator, &block_attestations);
+        block_attestations.deinit(allocator);
+    }
+
     var anchor_root: types.Root = undefined;
     zeam_utils.hashTreeRoot(types.BeamBlock, anchor_block, &anchor_root, allocator) catch |err| {
         std.debug.print(
@@ -337,6 +357,7 @@ fn runCase(
         .state_map = &state_map,
         .allocated_states = &allocated_states,
         .label_map = &label_map,
+        .block_attestations = &block_attestations,
         .fork_logger = logger_config.logger(.forkchoice),
         .base_context = ctx,
     };
@@ -372,7 +393,7 @@ fn runStep(
         .object => |map| map,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: expected object\n",
+                "fixture {s} case {s}{f}: expected object\n",
                 .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
             );
             return FixtureError.InvalidFixture;
@@ -383,7 +404,7 @@ fn runStep(
         .bool => |b| b,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: valid must be bool\n",
+                "fixture {s} case {s}{f}: valid must be bool\n",
                 .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
             );
             return FixtureError.InvalidFixture;
@@ -401,13 +422,13 @@ fn runStep(
             break :blk processTickStep(ctx, json_ctx.fixture_label, json_ctx.case_name, step_index, step_obj);
         } else if (std.mem.eql(u8, step_type, "attestation")) {
             std.debug.print(
-                "fixture {s} case {s}{any}: attestation steps unsupported\n",
+                "fixture {s} case {s}{f}: attestation steps unsupported\n",
                 .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
             );
             return FixtureError.UnsupportedFixture;
         } else {
             std.debug.print(
-                "fixture {s} case {s}{any}: unknown stepType {s}\n",
+                "fixture {s} case {s}{f}: unknown stepType {s}\n",
                 .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep(), step_type },
             );
             return FixtureError.InvalidFixture;
@@ -417,7 +438,7 @@ fn runStep(
     result catch |err| {
         if (valid_flag) {
             std.debug.print(
-                "fixture {s} case {s}{any}: unexpected error {s}\n",
+                "fixture {s} case {s}{f}: unexpected error {s}\n",
                 .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep(), @errorName(err) },
             );
             return FixtureError.FixtureMismatch;
@@ -427,7 +448,7 @@ fn runStep(
 
     if (!valid_flag) {
         std.debug.print(
-            "fixture {s} case {s}{any}: expected failure but succeeded\n",
+            "fixture {s} case {s}{f}: expected failure but succeeded\n",
             .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
         );
         return FixtureError.FixtureMismatch;
@@ -438,7 +459,7 @@ fn runStep(
             .object => |map| map,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: checks must be object\n",
+                    "fixture {s} case {s}{f}: checks must be object\n",
                     .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
                 );
                 return FixtureError.InvalidFixture;
@@ -583,7 +604,7 @@ fn processBlockStep(
 ) !void {
     const block_wrapper = step_obj.get("block") orelse {
         std.debug.print(
-            "fixture {s} case {s}{any}: block step missing block field\n",
+            "fixture {s} case {s}{f}: block step missing block field\n",
             .{ fixture_path, case_name, formatStep(step_index) },
         );
         return FixtureError.InvalidFixture;
@@ -606,10 +627,56 @@ fn processBlockStep(
     var block = try buildBlock(ctx.allocator, fixture_path, case_name, block_value, step_index);
     defer block.deinit();
 
+    // Capture aggregated attestations for block-level checks.
+    clearBlockAttestations(ctx.allocator, ctx.block_attestations);
+    const aggregated_attestations = block.body.attestations.constSlice();
+    ctx.block_attestations.ensureTotalCapacity(ctx.allocator, aggregated_attestations.len) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to allocate block attestations ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    for (aggregated_attestations) |aggregated_attestation| {
+        var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to parse aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer indices.deinit(ctx.allocator);
+        const participants = ctx.allocator.alloc(u64, indices.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to allocate participants ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        var participants_owned_by_block_attestations = false;
+        errdefer if (!participants_owned_by_block_attestations) ctx.allocator.free(participants);
+        for (indices.items, 0..) |idx, i| {
+            participants[i] = @intCast(idx);
+        }
+        std.sort.heap(u64, participants, {}, std.sort.asc(u64));
+        ctx.block_attestations.append(ctx.allocator, .{
+            .participants = participants,
+            .attestation_slot = aggregated_attestation.data.slot,
+            .target_slot = aggregated_attestation.data.target.slot,
+        }) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to record block attestation ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        participants_owned_by_block_attestations = true;
+    }
+
     var block_root: types.Root = undefined;
     zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, ctx.allocator) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: hashing block failed ({s})\n",
+            "fixture {s} case {s}{f}: hashing block failed ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
@@ -617,14 +684,14 @@ fn processBlockStep(
 
     const parent_state_ptr = ctx.state_map.get(block.parent_root) orelse {
         std.debug.print(
-            "fixture {s} case {s}{any}: parent root 0x{x} unknown\n",
+            "fixture {s} case {s}{f}: parent root 0x{x} unknown\n",
             .{ fixture_path, case_name, formatStep(step_index), &block.parent_root },
         );
         return FixtureError.FixtureMismatch;
     };
 
     const target_intervals = slotToIntervals(block.slot);
-    try ctx.fork_choice.onInterval(target_intervals, true);
+    try advanceForkchoiceIntervals(ctx, target_intervals, true);
 
     const new_state_ptr = try ctx.allocator.create(types.BeamState);
     errdefer {
@@ -635,7 +702,7 @@ fn processBlockStep(
 
     state_transition.apply_transition(ctx.allocator, new_state_ptr, block, .{ .logger = ctx.fork_logger, .validateResult = false }) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: state transition failed {s}\n",
+            "fixture {s} case {s}{f}: state transition failed {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.FixtureMismatch;
@@ -648,32 +715,86 @@ fn processBlockStep(
         .confirmed = true,
     }) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: forkchoice onBlock failed {s}\n",
+            "fixture {s} case {s}{f}: forkchoice onBlock failed {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.FixtureMismatch;
     };
 
-    _ = try ctx.fork_choice.updateHead();
-
     ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: failed to index block state ({s})\n",
+            "fixture {s} case {s}{f}: failed to index block state ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
     };
     ctx.allocated_states.append(ctx.allocator, new_state_ptr) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: failed to track state allocation ({s})\n",
+            "fixture {s} case {s}{f}: failed to track state allocation ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.InvalidFixture;
     };
 
+    // Store block body attestations as known aggregated payloads (spec-aligned).
+    for (aggregated_attestations) |aggregated_attestation| {
+        var indices = types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to parse aggregation bits ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer indices.deinit(ctx.allocator);
+
+        var proof_template = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to init proof template ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer proof_template.deinit();
+
+        const bits_len = aggregated_attestation.aggregation_bits.len();
+        for (0..bits_len) |i| {
+            if (aggregated_attestation.aggregation_bits.get(i) catch false) {
+                types.aggregationBitsSet(&proof_template.participants, i, true) catch |err| {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: failed to set aggregation bit ({s})\n",
+                        .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
+            }
+        }
+
+        var validator_ids = ctx.allocator.alloc(types.ValidatorIndex, indices.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to allocate validator ids ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer ctx.allocator.free(validator_ids);
+        for (indices.items, 0..) |vi, i| {
+            validator_ids[i] = @intCast(vi);
+        }
+
+        ctx.fork_choice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof_template, true) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to store aggregated payload ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.FixtureMismatch;
+        };
+    }
+
+    _ = try ctx.fork_choice.updateHead();
+
     var proposer_attestation = buildProposerAttestation(block, block_root, parent_state_ptr) catch |err| {
         std.debug.print(
-            "fixture {s} case {s}{any}: unable to build proposer attestation ({s})\n",
+            "fixture {s} case {s}{f}: unable to build proposer attestation ({s})\n",
             .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
         );
         return FixtureError.FixtureMismatch;
@@ -690,11 +811,46 @@ fn processBlockStep(
         }
     }
 
-    const attestation = types.Attestation{
+    const signed_attestation = types.SignedAttestation{
         .validator_id = proposer_attestation.validator_id,
-        .data = proposer_attestation.data,
+        .message = proposer_attestation.data,
+        .signature = types.ZERO_SIGBYTES,
     };
-    try ctx.fork_choice.onAttestation(attestation, false);
+    // Proposer attestation is treated as gossip and queued as a new aggregated payload.
+    try ctx.fork_choice.onSignedAttestation(signed_attestation);
+
+    const proposer_data_root = try proposer_attestation.data.sszRoot(ctx.allocator);
+    try ctx.fork_choice.attestation_data_by_root.put(proposer_data_root, proposer_attestation.data);
+
+    var proposer_proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to init proposer proof ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    errdefer proposer_proof.deinit();
+
+    types.aggregationBitsSet(&proposer_proof.participants, proposer_attestation.validator_id, true) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to set proposer participant bit ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+
+    const sig_key = types.SignatureKey{
+        .validator_id = proposer_attestation.validator_id,
+        .data_root = proposer_data_root,
+    };
+    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(sig_key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .empty;
+    }
+    try gop.value_ptr.append(ctx.allocator, .{
+        .slot = proposer_attestation.data.slot,
+        .proof = proposer_proof,
+    });
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {
@@ -702,7 +858,7 @@ fn processBlockStep(
                 .string => |s| s,
                 else => {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: blockRootLabel must be string\n",
+                        "fixture {s} case {s}{f}: blockRootLabel must be string\n",
                         .{ fixture_path, case_name, formatStep(step_index) },
                     );
                     return FixtureError.InvalidFixture;
@@ -710,7 +866,7 @@ fn processBlockStep(
             };
             ctx.label_map.put(ctx.allocator, label, block_root) catch |err| {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: failed to record blockRootLabel {s} ({s})\n",
+                    "fixture {s} case {s}{f}: failed to record blockRootLabel {s} ({s})\n",
                     .{ fixture_path, case_name, formatStep(step_index), label, @errorName(err) },
                 );
                 return FixtureError.InvalidFixture;
@@ -731,14 +887,14 @@ fn processTickStep(
     const anchor_genesis_time = ctx.fork_choice.anchorState.config.genesis_time;
     if (time_value < anchor_genesis_time) {
         std.debug.print(
-            "fixture {s} case {s}{any}: tick time before genesis\n",
+            "fixture {s} case {s}{f}: tick time before genesis\n",
             .{ fixture_path, case_name, formatStep(step_index) },
         );
         return FixtureError.InvalidFixture;
     }
 
     const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-    try ctx.fork_choice.onInterval(target_intervals, false);
+    try advanceForkchoiceIntervals(ctx, target_intervals, false);
 }
 
 fn applyChecks(
@@ -757,7 +913,7 @@ fn applyChecks(
             const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
             if (ctx.fork_choice.head.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: head slot mismatch got {d} expected {d}\n",
+                    "fixture {s} case {s}{f}: head slot mismatch got {d} expected {d}\n",
                     .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.head.slot, expected },
                 );
                 return FixtureError.FixtureMismatch;
@@ -769,7 +925,7 @@ fn applyChecks(
             const expected = try expectRootValue(value, fixture_path, case_name, step_index, key);
             if (!std.mem.eql(u8, &ctx.fork_choice.head.blockRoot, &expected)) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: head root mismatch\n",
+                    "fixture {s} case {s}{f}: head root mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.FixtureMismatch;
@@ -782,7 +938,7 @@ fn applyChecks(
                 .string => |s| s,
                 else => {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: headRootLabel must be string\n",
+                        "fixture {s} case {s}{f}: headRootLabel must be string\n",
                         .{ fixture_path, case_name, formatStep(step_index) },
                     );
                     return FixtureError.InvalidFixture;
@@ -792,7 +948,7 @@ fn applyChecks(
             if (ctx.label_map.get(label)) |expected_root| {
                 if (!std.mem.eql(u8, &head_root, &expected_root)) {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: head root label {s} mismatch\n",
+                        "fixture {s} case {s}{f}: head root label {s} mismatch\n",
                         .{ fixture_path, case_name, formatStep(step_index), label },
                     );
                     return FixtureError.FixtureMismatch;
@@ -800,7 +956,7 @@ fn applyChecks(
             } else {
                 ctx.label_map.put(ctx.allocator, label, head_root) catch |err| {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: failed to record label {s} ({s})\n",
+                        "fixture {s} case {s}{f}: failed to record label {s} ({s})\n",
                         .{ fixture_path, case_name, formatStep(step_index), label, @errorName(err) },
                     );
                     return FixtureError.InvalidFixture;
@@ -811,10 +967,10 @@ fn applyChecks(
 
         if (std.mem.eql(u8, key, "time")) {
             const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
-            if (ctx.fork_choice.fcStore.time != expected) {
+            if (ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: store time mismatch got {d} expected {d}\n",
-                    .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.fcStore.time, expected },
+                    "fixture {s} case {s}{f}: store time mismatch got {d} expected {d}\n",
+                    .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic), expected },
                 );
                 return FixtureError.FixtureMismatch;
             }
@@ -826,7 +982,7 @@ fn applyChecks(
             const actual = ctx.fork_choice.fcStore.latest_justified.slot;
             if (actual != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: latest justified slot mismatch got {d} expected {d}\n",
+                    "fixture {s} case {s}{f}: latest justified slot mismatch got {d} expected {d}\n",
                     .{ fixture_path, case_name, formatStep(step_index), actual, expected },
                 );
                 return FixtureError.FixtureMismatch;
@@ -839,7 +995,7 @@ fn applyChecks(
             const actual = ctx.fork_choice.fcStore.latest_finalized.slot;
             if (actual != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: latest finalized slot mismatch got {d} expected {d}\n",
+                    "fixture {s} case {s}{f}: latest finalized slot mismatch got {d} expected {d}\n",
                     .{ fixture_path, case_name, formatStep(step_index), actual, expected },
                 );
                 return FixtureError.FixtureMismatch;
@@ -851,14 +1007,14 @@ fn applyChecks(
             const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
             const checkpoint = ctx.fork_choice.getAttestationTarget() catch |err| {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: attestation target failed {s}\n",
+                    "fixture {s} case {s}{f}: attestation target failed {s}\n",
                     .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
                 );
                 return FixtureError.FixtureMismatch;
             };
             if (checkpoint.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: attestation target slot mismatch\n",
+                    "fixture {s} case {s}{f}: attestation target slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.FixtureMismatch;
@@ -871,16 +1027,146 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "blockAttestationCount")) {
+            const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
+            const actual: u64 = @intCast(ctx.block_attestations.items.len);
+            if (actual != expected) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: block attestation count mismatch got {d} expected {d}\n",
+                    .{ fixture_path, case_name, formatStep(step_index), actual, expected },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "blockAttestations")) {
+            try verifyBlockAttestations(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
         if (std.mem.eql(u8, key, "lexicographicHeadAmong")) {
             try verifyLexicographicHead(ctx, fixture_path, case_name, step_index, value);
             continue;
         }
 
         std.debug.print(
-            "fixture {s} case {s}{any}: unsupported check {s}\n",
+            "fixture {s} case {s}{f}: unsupported check {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), key },
         );
         return FixtureError.UnsupportedFixture;
+    }
+}
+
+fn verifyBlockAttestations(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    const arr = switch (value) {
+        .array => |entries| entries,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{f}: blockAttestations must be array\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+
+    if (ctx.block_attestations.items.len != arr.items.len) {
+        std.debug.print(
+            "fixture {s} case {s}{f}: block attestation count mismatch got {d} expected {d}\n",
+            .{ fixture_path, case_name, formatStep(step_index), ctx.block_attestations.items.len, arr.items.len },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+
+    const matched = ctx.allocator.alloc(bool, ctx.block_attestations.items.len) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to allocate match buffer ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    defer ctx.allocator.free(matched);
+    @memset(matched, false);
+
+    for (arr.items) |entry| {
+        const obj = switch (entry) {
+            .object => |map| map,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: blockAttestations entry must be object\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+
+        const participants_value = obj.get("participants") orelse {
+            std.debug.print(
+                "fixture {s} case {s}{f}: blockAttestations missing participants\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        const participants_arr = switch (participants_value) {
+            .array => |entries| entries,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: blockAttestations participants must be array\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        const expected_participants = ctx.allocator.alloc(u64, participants_arr.items.len) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to allocate expected participants ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+        defer ctx.allocator.free(expected_participants);
+        for (participants_arr.items, 0..) |participant_value, idx| {
+            expected_participants[idx] = try expectU64Value(participant_value, fixture_path, case_name, step_index, "participants");
+        }
+        std.sort.heap(u64, expected_participants, {}, std.sort.asc(u64));
+
+        const expected_attestation_slot = try expectU64Field(obj, &.{"attestationSlot"}, fixture_path, case_name, step_index, "attestationSlot");
+        const expected_target_slot = try expectU64Field(obj, &.{"targetSlot"}, fixture_path, case_name, step_index, "targetSlot");
+
+        var found = false;
+        for (ctx.block_attestations.items, 0..) |actual, actual_idx| {
+            if (matched[actual_idx]) continue;
+            if (actual.attestation_slot != expected_attestation_slot) continue;
+            if (actual.target_slot != expected_target_slot) continue;
+            if (actual.participants.len != expected_participants.len) continue;
+
+            var equal = true;
+            for (actual.participants, 0..) |p, p_idx| {
+                if (p != expected_participants[p_idx]) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (!equal) continue;
+
+            matched[actual_idx] = true;
+            found = true;
+            break;
+        }
+
+        if (!found) {
+            std.debug.print(
+                "fixture {s} case {s}{f}: blockAttestations entry mismatch\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.FixtureMismatch;
+        }
     }
 }
 
@@ -895,7 +1181,7 @@ fn verifyAttestationChecks(
         .array => |array| array,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: attestationChecks must be array\n",
+                "fixture {s} case {s}{f}: attestationChecks must be array\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -907,7 +1193,7 @@ fn verifyAttestationChecks(
             .object => |map| map,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: attestationCheck entry must be object\n",
+                    "fixture {s} case {s}{f}: attestationCheck entry must be object\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.InvalidFixture;
@@ -919,7 +1205,7 @@ fn verifyAttestationChecks(
 
         const tracker = ctx.fork_choice.attestations.get(validator) orelse {
             std.debug.print(
-                "fixture {s} case {s}{any}: attestation tracker missing for validator {d}\n",
+                "fixture {s} case {s}{f}: attestation tracker missing for validator {d}\n",
                 .{ fixture_path, case_name, formatStep(step_index), validator },
             );
             return FixtureError.FixtureMismatch;
@@ -934,7 +1220,7 @@ fn verifyAttestationChecks(
 
         if (proto == null) {
             std.debug.print(
-                "fixture {s} case {s}{any}: validator {d} missing {s} attestation\n",
+                "fixture {s} case {s}{f}: validator {d} missing {s} attestation\n",
                 .{ fixture_path, case_name, formatStep(step_index), validator, location },
             );
             return FixtureError.FixtureMismatch;
@@ -942,7 +1228,7 @@ fn verifyAttestationChecks(
 
         const attestation_data = proto.?.attestation_data orelse {
             std.debug.print(
-                "fixture {s} case {s}{any}: validator {d} has no attestation payload\n",
+                "fixture {s} case {s}{f}: validator {d} has no attestation payload\n",
                 .{ fixture_path, case_name, formatStep(step_index), validator },
             );
             return FixtureError.FixtureMismatch;
@@ -952,7 +1238,7 @@ fn verifyAttestationChecks(
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "attestationSlot");
             if (attestation_data.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: validator {d} attestation slot mismatch\n",
+                    "fixture {s} case {s}{f}: validator {d} attestation slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
                 );
                 return FixtureError.FixtureMismatch;
@@ -963,7 +1249,7 @@ fn verifyAttestationChecks(
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "headSlot");
             if (attestation_data.head.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: validator {d} head slot mismatch\n",
+                    "fixture {s} case {s}{f}: validator {d} head slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
                 );
                 return FixtureError.FixtureMismatch;
@@ -974,7 +1260,7 @@ fn verifyAttestationChecks(
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "sourceSlot");
             if (attestation_data.source.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: validator {d} source slot mismatch\n",
+                    "fixture {s} case {s}{f}: validator {d} source slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
                 );
                 return FixtureError.FixtureMismatch;
@@ -985,7 +1271,7 @@ fn verifyAttestationChecks(
             const expected = try expectU64Value(slot_value, fixture_path, case_name, step_index, "targetSlot");
             if (attestation_data.target.slot != expected) {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: validator {d} target slot mismatch\n",
+                    "fixture {s} case {s}{f}: validator {d} target slot mismatch\n",
                     .{ fixture_path, case_name, formatStep(step_index), validator },
                 );
                 return FixtureError.FixtureMismatch;
@@ -1005,7 +1291,7 @@ fn verifyLexicographicHead(
         .array => |entries| entries,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: lexicographicHeadAmong must be array\n",
+                "fixture {s} case {s}{f}: lexicographicHeadAmong must be array\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -1014,7 +1300,7 @@ fn verifyLexicographicHead(
 
     if (arr.items.len == 0) {
         std.debug.print(
-            "fixture {s} case {s}{any}: lexicographicHeadAmong cannot be empty\n",
+            "fixture {s} case {s}{f}: lexicographicHeadAmong cannot be empty\n",
             .{ fixture_path, case_name, formatStep(step_index) },
         );
         return FixtureError.InvalidFixture;
@@ -1028,7 +1314,7 @@ fn verifyLexicographicHead(
             .string => |s| s,
             else => {
                 std.debug.print(
-                    "fixture {s} case {s}{any}: lexicographicHeadAmong entries must be strings\n",
+                    "fixture {s} case {s}{f}: lexicographicHeadAmong entries must be strings\n",
                     .{ fixture_path, case_name, formatStep(step_index) },
                 );
                 return FixtureError.InvalidFixture;
@@ -1037,7 +1323,7 @@ fn verifyLexicographicHead(
 
         const root = ctx.label_map.get(label) orelse {
             std.debug.print(
-                "fixture {s} case {s}{any}: lexicographicHeadAmong label {s} not found (missing prior headRootLabel?)\n",
+                "fixture {s} case {s}{f}: lexicographicHeadAmong label {s} not found (missing prior headRootLabel?)\n",
                 .{ fixture_path, case_name, formatStep(step_index), label },
             );
             return FixtureError.InvalidFixture;
@@ -1058,7 +1344,7 @@ fn verifyLexicographicHead(
     const head_root = ctx.fork_choice.head.blockRoot;
     if (!std.mem.eql(u8, &head_root, &expected_root)) {
         std.debug.print(
-            "fixture {s} case {s}{any}: head root mismatch for lexicographicHeadAmong (expected label {s})\n",
+            "fixture {s} case {s}{f}: head root mismatch for lexicographicHeadAmong (expected label {s})\n",
             .{ fixture_path, case_name, formatStep(step_index), best_label },
         );
         return FixtureError.FixtureMismatch;
@@ -1094,7 +1380,7 @@ fn parseFixtureProposerAttestation(
         .object => |map| map,
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: proposerAttestation must be object\n",
+                "fixture {s} case {s}{f}: proposerAttestation must be object\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -1212,7 +1498,7 @@ fn parseAttestations(
                 .array => |array| array,
                 else => {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: attestations.data must be array\n",
+                        "fixture {s} case {s}{f}: attestations.data must be array\n",
                         .{ fixture_path, case_name, formatStep(step_index) },
                     );
                     return FixtureError.InvalidFixture;
@@ -1227,7 +1513,7 @@ fn parseAttestations(
                     .object => |map| map,
                     else => {
                         std.debug.print(
-                            "fixture {s} case {s}{any}: attestation #{} must be object\n",
+                            "fixture {s} case {s}{f}: attestation #{} must be object\n",
                             .{ fixture_path, case_name, formatStep(step_index), idx },
                         );
                         return FixtureError.InvalidFixture;
@@ -1236,7 +1522,7 @@ fn parseAttestations(
 
                 const bits_value = att_obj.get("aggregationBits") orelse {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: attestation #{} missing aggregationBits\n",
+                        "fixture {s} case {s}{f}: attestation #{} missing aggregationBits\n",
                         .{ fixture_path, case_name, formatStep(step_index), idx },
                     );
                     return FixtureError.InvalidFixture;
@@ -1245,7 +1531,7 @@ fn parseAttestations(
                     .object => |map| map,
                     else => {
                         std.debug.print(
-                            "fixture {s} case {s}{any}: attestation #{} aggregationBits must be object\n",
+                            "fixture {s} case {s}{f}: attestation #{} aggregationBits must be object\n",
                             .{ fixture_path, case_name, formatStep(step_index), idx },
                         );
                         return FixtureError.InvalidFixture;
@@ -1253,7 +1539,7 @@ fn parseAttestations(
                 };
                 const bits_data_value = bits_obj.get("data") orelse {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: attestation #{} aggregationBits missing data\n",
+                        "fixture {s} case {s}{f}: attestation #{} aggregationBits missing data\n",
                         .{ fixture_path, case_name, formatStep(step_index), idx },
                     );
                     return FixtureError.InvalidFixture;
@@ -1262,7 +1548,7 @@ fn parseAttestations(
                     .array => |array| array,
                     else => {
                         std.debug.print(
-                            "fixture {s} case {s}{any}: attestation #{} aggregationBits.data must be array\n",
+                            "fixture {s} case {s}{f}: attestation #{} aggregationBits.data must be array\n",
                             .{ fixture_path, case_name, formatStep(step_index), idx },
                         );
                         return FixtureError.InvalidFixture;
@@ -1277,7 +1563,7 @@ fn parseAttestations(
                         .bool => |b| b,
                         else => {
                             std.debug.print(
-                                "fixture {s} case {s}{any}: attestation #{} aggregationBits element must be bool\n",
+                                "fixture {s} case {s}{f}: attestation #{} aggregationBits element must be bool\n",
                                 .{ fixture_path, case_name, formatStep(step_index), idx },
                             );
                             return FixtureError.InvalidFixture;
@@ -1329,7 +1615,7 @@ fn parseAttestations(
 
                 aggregated_attestations.append(aggregated_attestation) catch |err| {
                     std.debug.print(
-                        "fixture {s} case {s}{any}: attestation #{} append failed: {s}\n",
+                        "fixture {s} case {s}{f}: attestation #{} append failed: {s}\n",
                         .{ fixture_path, case_name, formatStep(step_index), idx, @errorName(err) },
                     );
                     return FixtureError.InvalidFixture;
@@ -1340,7 +1626,7 @@ fn parseAttestations(
         },
         else => {
             std.debug.print(
-                "fixture {s} case {s}{any}: attestations must be object\n",
+                "fixture {s} case {s}{f}: attestations must be object\n",
                 .{ fixture_path, case_name, formatStep(step_index) },
             );
             return FixtureError.InvalidFixture;
@@ -1502,6 +1788,15 @@ fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.Chai
         std.debug.print("spectest: unable to init chain config: {s}\n", .{@errorName(err)});
         return FixtureError.InvalidFixture;
     };
+}
+
+fn advanceForkchoiceIntervals(ctx: *StepContext, target_intervals: u64, has_proposal: bool) !void {
+    while (ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) < target_intervals) {
+        const next_interval: u64 = ctx.fork_choice.fcStore.slot_clock.time.load(.monotonic) + 1;
+        const signal_proposal = has_proposal and next_interval == target_intervals;
+
+        try ctx.fork_choice.onInterval(next_interval, signal_proposal);
+    }
 }
 
 fn slotToIntervals(slot: u64) u64 {
