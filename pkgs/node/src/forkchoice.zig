@@ -1278,46 +1278,6 @@ pub const ForkChoice = struct {
         var attestations: std.ArrayList(types.Attestation) = .{};
         defer attestations.deinit(self.allocator);
 
-        // Capture counts for metrics update outside lock scope
-        var new_payloads_count: usize = 0;
-        var gossip_sigs_count: usize = 0;
-
-        self.signatures_mutex.lock();
-        errdefer self.signatures_mutex.unlock();
-
-        var sig_it = self.gossip_signatures.iterator();
-        while (sig_it.next()) |entry| {
-            const sig_key = entry.key_ptr.*;
-            const attestation_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
-            try attestations.append(self.allocator, .{
-                .validator_id = sig_key.validator_id,
-                .data = attestation_data,
-            });
-        }
-
-        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
-        var agg_att_cleanup = true;
-        var agg_sig_cleanup = true;
-        errdefer if (agg_att_cleanup) {
-            for (aggregation.attestations.slice()) |*att| {
-                att.deinit();
-            }
-            aggregation.attestations.deinit();
-        };
-        errdefer if (agg_sig_cleanup) {
-            for (aggregation.attestation_signatures.slice()) |*sig| {
-                sig.deinit();
-            }
-            aggregation.attestation_signatures.deinit();
-        };
-
-        try aggregation.computeAggregatedSignatures(
-            attestations.items,
-            &state.validators,
-            &self.gossip_signatures,
-            null,
-        );
-
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
         errdefer {
             for (results.items) |*signed| {
@@ -1326,66 +1286,106 @@ pub const ForkChoice = struct {
             results.deinit(self.allocator);
         }
 
-        const agg_attestations = aggregation.attestations.constSlice();
-        const agg_signatures = aggregation.attestation_signatures.constSlice();
+        // Capture counts for metrics update outside lock scope
+        var new_payloads_count: usize = 0;
+        var gossip_sigs_count: usize = 0;
 
-        for (agg_attestations, 0..) |agg_att, index| {
-            const proof = agg_signatures[index];
-            const data_root = try agg_att.data.sszRoot(self.allocator);
+        {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
 
-            try self.attestation_data_by_root.put(data_root, agg_att.data);
-
-            var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-            defer validator_indices.deinit(self.allocator);
-
-            for (validator_indices.items) |validator_index| {
-                const sig_key = SignatureKey{
-                    .validator_id = @intCast(validator_index),
-                    .data_root = data_root,
-                };
-                const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .empty;
-                }
-
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-                errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = agg_att.data.slot,
-                    .proof = cloned_proof,
+            var sig_it = self.gossip_signatures.iterator();
+            while (sig_it.next()) |entry| {
+                const sig_key = entry.key_ptr.*;
+                const attestation_data = self.attestation_data_by_root.get(sig_key.data_root) orelse continue;
+                try attestations.append(self.allocator, .{
+                    .validator_id = sig_key.validator_id,
+                    .data = attestation_data,
                 });
-                // Align with leanSpec: once this signature is represented by an aggregated
-                // payload, remove it from the gossip signature map to prevent re-aggregation.
-                _ = self.gossip_signatures.remove(sig_key);
             }
 
-            var output_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
-            errdefer output_proof.deinit();
-            try results.append(self.allocator, .{
-                .data = agg_att.data,
-                .proof = output_proof,
-            });
-        }
+            var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+            var agg_att_cleanup = true;
+            var agg_sig_cleanup = true;
+            errdefer if (agg_att_cleanup) {
+                for (aggregation.attestations.slice()) |*att| {
+                    att.deinit();
+                }
+                aggregation.attestations.deinit();
+            };
+            errdefer if (agg_sig_cleanup) {
+                for (aggregation.attestation_signatures.slice()) |*sig| {
+                    sig.deinit();
+                }
+                aggregation.attestation_signatures.deinit();
+            };
 
-        agg_att_cleanup = false;
-        agg_sig_cleanup = false;
-        for (aggregation.attestations.slice()) |*att| {
-            att.deinit();
-        }
-        aggregation.attestations.deinit();
-        for (aggregation.attestation_signatures.slice()) |*sig| {
-            sig.deinit();
-        }
-        aggregation.attestation_signatures.deinit();
+            try aggregation.computeAggregatedSignatures(
+                attestations.items,
+                &state.validators,
+                &self.gossip_signatures,
+                null,
+            );
 
-        // Capture counts before releasing lock
-        new_payloads_count = self.latest_new_aggregated_payloads.count();
-        gossip_sigs_count = self.gossip_signatures.count();
+            const agg_attestations = aggregation.attestations.constSlice();
+            const agg_signatures = aggregation.attestation_signatures.constSlice();
 
-        // Release lock before updating metrics
-        self.signatures_mutex.unlock();
+            for (agg_attestations, 0..) |agg_att, index| {
+                const proof = agg_signatures[index];
+                const data_root = try agg_att.data.sszRoot(self.allocator);
+
+                try self.attestation_data_by_root.put(data_root, agg_att.data);
+
+                var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
+                defer validator_indices.deinit(self.allocator);
+
+                for (validator_indices.items) |validator_index| {
+                    const sig_key = SignatureKey{
+                        .validator_id = @intCast(validator_index),
+                        .data_root = data_root,
+                    };
+                    const gop = try self.latest_new_aggregated_payloads.getOrPut(sig_key);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .empty;
+                    }
+
+                    var cloned_proof: types.AggregatedSignatureProof = undefined;
+                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+                    errdefer cloned_proof.deinit();
+                    try gop.value_ptr.append(self.allocator, .{
+                        .slot = agg_att.data.slot,
+                        .proof = cloned_proof,
+                    });
+                    // Align with leanSpec: once this signature is represented by an aggregated
+                    // payload, remove it from the gossip signature map to prevent re-aggregation.
+                    _ = self.gossip_signatures.remove(sig_key);
+                }
+
+                var output_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
+                errdefer output_proof.deinit();
+                try results.append(self.allocator, .{
+                    .data = agg_att.data,
+                    .proof = output_proof,
+                });
+            }
+
+            agg_att_cleanup = false;
+            agg_sig_cleanup = false;
+            for (aggregation.attestations.slice()) |*att| {
+                att.deinit();
+            }
+            aggregation.attestations.deinit();
+            for (aggregation.attestation_signatures.slice()) |*sig| {
+                sig.deinit();
+            }
+            aggregation.attestation_signatures.deinit();
+
+            // Capture counts while holding the lock
+            new_payloads_count = self.latest_new_aggregated_payloads.count();
+            gossip_sigs_count = self.gossip_signatures.count();
+        }
+        // Lock released here by defer
 
         // Update fork-choice store gauges after aggregation (outside lock scope)
         zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
