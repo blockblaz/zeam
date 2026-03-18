@@ -1424,7 +1424,6 @@ pub const BeamChain = struct {
         });
     }
 
-
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
