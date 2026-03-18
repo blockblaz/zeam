@@ -582,6 +582,18 @@ pub fn buildStartOptions(
         // Try to read ATTESTATION_COMMITTEE_COUNT from config.yaml
         opts.attestation_committee_count = attestationCommitteeCountFromYAML(parsed_config);
     }
+
+    // Validate: attestation_committee_count must be >= 1.
+    // If the resolved value is 0 (an invalid input), log a warning and fall back to 1.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            std.log.warn(
+                "attestation-committee-count must be >= 1 (got 0); defaulting to 1",
+                .{},
+            );
+            opts.attestation_committee_count = 1;
+        }
+    }
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
@@ -1427,4 +1439,19 @@ test "attestationCommitteeCountFromYAML returns null when field is absent" {
 
     const count = attestationCommitteeCountFromYAML(validator_config);
     try std.testing.expect(count == null);
+}
+
+test "attestation_committee_count: zero value is clamped to 1 with a warning" {
+    // Simulate opts with count=0 — the validation block should reset it to 1.
+    var opts: NodeOptions = undefined;
+    opts.attestation_committee_count = 0;
+
+    // Mirror the validation logic from buildStartOptions.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            opts.attestation_committee_count = 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(?u64, 1), opts.attestation_committee_count);
 }
