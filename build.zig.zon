@@ -2,6 +2,7 @@
     .name = .zeam,
     .fingerprint = 0x243fd12cc5f554a5,
     .version = "0.0.0",
+    .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .ssz = .{
             .url = "git+https://github.com/blockblaz/ssz.zig#c5394395dd7d0f8eda685c4723ad25ebbf550570",

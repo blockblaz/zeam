@@ -197,7 +197,7 @@ pub const BeamNode = struct {
             },
             .aggregation => |signed_aggregation| {
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{f}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
@@ -321,16 +321,15 @@ pub const BeamNode = struct {
             self.processCachedDescendants(processed_root);
         }
 
-        // Fetch any attestation head roots that were missing while processing the block.
-        // We only own the slice when the block was actually processed (onBlock allocates it).
+        // Fetch any block roots that were missing while processing a block or validating attestation/aggregation gossip.
+        // We own the slice whenever it's non-empty (onBlock and onGossip both allocate it).
         const missing_roots = result.missing_attestation_roots;
-        const owns_missing_roots = result.processed_block_root != null;
-        defer if (owns_missing_roots) self.allocator.free(missing_roots);
+        defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
-        if (missing_roots.len > 0 and owns_missing_roots) {
+        if (missing_roots.len > 0) {
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
                 self.logger.warn(
-                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    "failed to fetch {d} missing block root(s) from gossip: {any}",
                     .{ missing_roots.len, err },
                 );
             };
@@ -392,6 +391,17 @@ pub const BeamNode = struct {
         // Try to process each descendant
         for (descendants_to_process.items) |descendant_root| {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                // Skip if already known to fork choice — same guard as processBlockByRootChunk
+                if (self.chain.forkChoice.hasBlock(descendant_root)) {
+                    self.logger.debug(
+                        "cached block 0x{x} is already known to fork choice, skipping re-processing",
+                        .{&descendant_root},
+                    );
+                    _ = self.network.removeFetchedBlock(descendant_root);
+                    self.processCachedDescendants(descendant_root);
+                    continue;
+                }
+
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
                     .{&descendant_root},
@@ -601,6 +611,19 @@ pub const BeamNode = struct {
                     block_ctx.peer_id,
                     self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                 });
+            }
+
+            // Skip STF re-processing if the block is already known to fork choice
+            // (e.g. the checkpoint sync anchor block — it is the trust root and does not
+            // need state-transition re-processing; re-processing it would cause an infinite
+            // fetch loop because onBlock would always see it as "already processed").
+            if (self.chain.forkChoice.hasBlock(block_root)) {
+                self.logger.debug(
+                    "block 0x{x} is already known to fork choice, skipping re-processing",
+                    .{&block_root},
+                );
+                self.processCachedDescendants(block_root);
+                return;
             }
 
             // Try to add the block to the chain

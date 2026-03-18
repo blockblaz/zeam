@@ -147,8 +147,10 @@ pub const ProtoArray = struct {
         }
 
         // iterate backwards apply deltas and propagating deltas to parents
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_a = self.nodes.items.len;
+        while (node_idx_a > 0) {
+            node_idx_a -= 1;
+            const node_idx = node_idx_a;
             const node_delta = deltas[node_idx];
             self.nodes.items[node_idx].weight += node_delta;
             if (self.nodes.items[node_idx].parent) |parent_idx| {
@@ -158,8 +160,10 @@ pub const ProtoArray = struct {
 
         // re-iterate backwards and calc best child and descendant
         // there seems to be no filter block tree in the mini3sf fc
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_b = self.nodes.items.len;
+        while (node_idx_b > 0) {
+            node_idx_b -= 1;
+            const node_idx = node_idx_b;
             const node = self.nodes.items[node_idx];
 
             if (self.nodes.items[node_idx].parent) |parent_idx| {
@@ -309,8 +313,10 @@ pub const ForkChoice = struct {
     /// Thread-safe snapshot for observability
     pub const Snapshot = struct {
         head: ProtoNode,
-        latest_justified_root: [32]u8,
-        latest_finalized_root: [32]u8,
+        latest_justified: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        safe_target_root: [32]u8,
+        validator_count: u64,
         nodes: []ProtoNode,
 
         pub fn deinit(self: Snapshot, allocator: Allocator) void {
@@ -432,16 +438,20 @@ pub const ForkChoice = struct {
             };
             return Snapshot{
                 .head = head_node,
-                .latest_justified_root = self.fcStore.latest_justified.root,
-                .latest_finalized_root = self.fcStore.latest_finalized.root,
+                .latest_justified = self.fcStore.latest_justified,
+                .latest_finalized = self.fcStore.latest_finalized,
+                .safe_target_root = self.safeTarget.blockRoot,
+                .validator_count = self.config.genesis.numValidators(),
                 .nodes = nodes_copy,
             };
         };
 
         return Snapshot{
             .head = self.protoArray.nodes.items[head_idx],
-            .latest_justified_root = self.fcStore.latest_justified.root,
-            .latest_finalized_root = self.fcStore.latest_finalized.root,
+            .latest_justified = self.fcStore.latest_justified,
+            .latest_finalized = self.fcStore.latest_finalized,
+            .safe_target_root = self.safeTarget.blockRoot,
+            .validator_count = self.config.genesis.numValidators(),
             .nodes = nodes_copy,
         };
     }
@@ -1013,7 +1023,7 @@ pub const ForkChoice = struct {
         const best_descendant_idx = justified_node.bestDescendant orelse justified_idx;
         const best_descendant = self.protoArray.nodes.items[best_descendant_idx];
 
-        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={any} best_descendant_idx={d}", .{
+        self.logger.debug("computeFCHead from_known={} cutoff_weight={d} deltas_len={d} justified_node={f} best_descendant_idx={d}", .{
             from_known,
             cutoff_weight,
             deltas.len,
