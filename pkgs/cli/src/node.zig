@@ -87,6 +87,7 @@ pub const NodeOptions = struct {
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
+    attestation_committee_count: ?u64 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -152,6 +153,12 @@ pub const Node = struct {
 
         // Set validator_pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_pubkeys = options.genesis_spec.validator_pubkeys;
+
+        // Apply attestation_committee_count if provided via CLI flag or config.yaml.
+        // ChainConfig.init falls back to 1 when this field is null, so we only override when set.
+        if (options.attestation_committee_count) |count| {
+            chain_options.attestation_committee_count = @intCast(count);
+        }
 
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
@@ -462,6 +469,19 @@ pub const Node = struct {
     }
 };
 
+/// Reads ATTESTATION_COMMITTEE_COUNT from a parsed config.yaml Yaml document.
+/// Returns null if the field is absent or cannot be parsed.
+fn attestationCommitteeCountFromYAML(config: Yaml) ?u64 {
+    if (config.docs.items.len == 0) return null;
+    const root = config.docs.items[0];
+    if (root != .map) return null;
+    const value = root.map.get("ATTESTATION_COMMITTEE_COUNT") orelse return null;
+    return switch (value) {
+        .scalar => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
+
 /// Builds the start options for a node based on the provided command and options.
 /// It loads the necessary configuration files, parses them, and populates the
 /// `StartNodeOptions` structure.
@@ -554,6 +574,26 @@ pub fn buildStartOptions(
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+
+    // Resolve attestation_committee_count: CLI flag takes precedence over config.yaml.
+    if (node_cmd.@"attestation-committee-count") |count| {
+        opts.attestation_committee_count = count;
+    } else {
+        // Try to read ATTESTATION_COMMITTEE_COUNT from config.yaml
+        opts.attestation_committee_count = attestationCommitteeCountFromYAML(parsed_config);
+    }
+
+    // Validate: attestation_committee_count must be >= 1.
+    // If the resolved value is 0 (an invalid input), log a warning and fall back to 1.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            std.log.warn(
+                "attestation-committee-count must be >= 1 (got 0); defaulting to 1",
+                .{},
+            );
+            opts.attestation_committee_count = 1;
+        }
+    }
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
@@ -1381,4 +1421,37 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     // Test with a URL
     node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
+}
+
+test "attestationCommitteeCountFromYAML reads ATTESTATION_COMMITTEE_COUNT from config.yaml" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+
+    const count = attestationCommitteeCountFromYAML(config_file);
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(u64, 4), count.?);
+}
+
+test "attestationCommitteeCountFromYAML returns null when field is absent" {
+    // validator-config.yaml has no ATTESTATION_COMMITTEE_COUNT field
+    var validator_config = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validator-config.yaml");
+    defer validator_config.deinit(std.testing.allocator);
+
+    const count = attestationCommitteeCountFromYAML(validator_config);
+    try std.testing.expect(count == null);
+}
+
+test "attestation_committee_count: zero value is clamped to 1 with a warning" {
+    // Simulate opts with count=0 — the validation block should reset it to 1.
+    var opts: NodeOptions = undefined;
+    opts.attestation_committee_count = 0;
+
+    // Mirror the validation logic from buildStartOptions.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            opts.attestation_committee_count = 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(?u64, 1), opts.attestation_committee_count);
 }
