@@ -781,7 +781,7 @@ fn processBlockStep(
             validator_ids[i] = @intCast(vi);
         }
 
-        ctx.fork_choice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, proof_template, true) catch |err| {
+        ctx.fork_choice.storeAggregatedPayload(&aggregated_attestation.data, proof_template, true) catch |err| {
             std.debug.print(
                 "fixture {s} case {s}{f}: failed to store aggregated payload ({s})\n",
                 .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },

@@ -41,10 +41,37 @@ pub const StoredSignature = struct {
 };
 
 /// Inner map: ValidatorIndex -> StoredSignature for a given AttestationData.
-pub const GossipSignaturesInnerMap = std.AutoHashMap(ValidatorIndex, StoredSignature);
+/// Wraps AutoHashMap to provide put and deinit helpers so callers
+/// don't need to manage the underlying map lifecycle directly.
+pub const GossipSignaturesInnerMap = struct {
+    inner: std.AutoHashMap(ValidatorIndex, StoredSignature),
+
+    pub fn init(allocator: std.mem.Allocator) GossipSignaturesInnerMap {
+        return .{ .inner = std.AutoHashMap(ValidatorIndex, StoredSignature).init(allocator) };
+    }
+
+    pub fn deinit(self: *GossipSignaturesInnerMap) void {
+        self.inner.deinit();
+    }
+
+    pub fn put(self: *GossipSignaturesInnerMap, validator_id: ValidatorIndex, sig: StoredSignature) !void {
+        try self.inner.put(validator_id, sig);
+    }
+
+    pub fn get(self: *const GossipSignaturesInnerMap, validator_id: ValidatorIndex) ?StoredSignature {
+        return self.inner.get(validator_id);
+    }
+
+    pub fn count(self: *const GossipSignaturesInnerMap) usize {
+        return self.inner.count();
+    }
+
+    pub fn iterator(self: *const GossipSignaturesInnerMap) std.AutoHashMap(ValidatorIndex, StoredSignature).Iterator {
+        return self.inner.iterator();
+    }
+};
 
 /// Map type for gossip signatures: AttestationData -> per-validator signatures.
-/// Replaces the old SignatureKey(validator_id, data_root) -> StoredSignature design.
 pub const SignaturesMap = std.AutoHashMap(attestation.AttestationData, GossipSignaturesInnerMap);
 
 /// Stored aggregated payload entry
@@ -57,7 +84,6 @@ pub const StoredAggregatedPayload = struct {
 pub const AggregatedPayloadsList = std.ArrayList(StoredAggregatedPayload);
 
 /// Map type for aggregated payloads: AttestationData -> list of AggregatedSignatureProof.
-/// Replaces the old SignatureKey(validator_id, data_root) -> AggregatedPayloadsList design.
 pub const AggregatedPayloadsMap = std.AutoHashMap(attestation.AttestationData, AggregatedPayloadsList);
 
 // Types
@@ -467,7 +493,6 @@ pub const AggregatedAttestationsResult = struct {
             }
 
             // Phase 2: Fallback to aggregated_payloads using greedy set-cover.
-            // Candidates are now keyed by AttestationData directly (not per-validator).
             if (aggregated_payloads) |agg_payloads| {
                 const candidates_opt = agg_payloads.get(group.data);
 

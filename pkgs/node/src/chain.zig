@@ -937,7 +937,7 @@ pub const BeamChain = struct {
                 for (validator_indices.items, 0..) |vi, i| {
                     validator_ids[i] = @intCast(vi);
                 }
-                self.forkChoice.storeAggregatedPayload(validator_ids, &aggregated_attestation.data, signature_proof.*, true) catch |e| {
+                self.forkChoice.storeAggregatedPayload(&aggregated_attestation.data, signature_proof.*, true) catch |e| {
                     self.logger.warn("failed to store aggregated payload for attestation index={d}: {any}", .{ index, e });
                 };
             }
@@ -1452,7 +1452,7 @@ pub const BeamChain = struct {
             };
         }
 
-        try self.forkChoice.storeAggregatedPayload(validator_ids, &signedAggregation.data, signedAggregation.proof, false);
+        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
     fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {

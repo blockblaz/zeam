@@ -1230,34 +1230,33 @@ pub const ForkChoice = struct {
     /// For gossip attestations, also updates fork choice attestation trackers.
     pub fn storeAggregatedPayload(
         self: *Self,
-        validator_ids: []const types.ValidatorIndex,
         attestation_data: *const types.AttestationData,
         proof: types.AggregatedSignatureProof,
         is_from_block: bool,
     ) !void {
-        _ = validator_ids; // No longer needed: payloads are keyed by AttestationData, not per-validator
-
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
-        const target_map = if (is_from_block)
-            &self.latest_known_aggregated_payloads
-        else
-            &self.latest_new_aggregated_payloads;
-
-        const gop = try target_map.getOrPut(attestation_data.*);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
-        }
-
         var cloned_proof: types.AggregatedSignatureProof = undefined;
         try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
         errdefer cloned_proof.deinit();
 
-        try gop.value_ptr.append(self.allocator, .{
-            .slot = attestation_data.slot,
-            .proof = cloned_proof,
-        });
+        {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
+
+            const target_map = if (is_from_block)
+                &self.latest_known_aggregated_payloads
+            else
+                &self.latest_new_aggregated_payloads;
+
+            const gop = try target_map.getOrPut(attestation_data.*);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+
+            try gop.value_ptr.append(self.allocator, .{
+                .slot = attestation_data.slot,
+                .proof = cloned_proof,
+            });
+        }
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
@@ -2343,8 +2342,7 @@ fn stageAggregatedAttestation(
 
     try types.aggregationBitsSet(&proof.participants, @intCast(signed_attestation.validator_id), true);
 
-    const validator_ids = [_]types.ValidatorIndex{signed_attestation.validator_id};
-    try fork_choice.storeAggregatedPayload(&validator_ids, &signed_attestation.message, proof, false);
+    try fork_choice.storeAggregatedPayload(&signed_attestation.message, proof, false);
 }
 
 // Rebase tests build ForkChoice structs in helper functions that outlive the helper scope.
