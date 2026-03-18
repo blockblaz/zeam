@@ -374,8 +374,6 @@ pub const BeamChain = struct {
         // This ensures the proposer builds on the latest proposal head derived
         // from known aggregated payloads.
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
-        const attestations = try self.forkChoice.getProposalAttestations();
-        defer self.allocator.free(attestations);
 
         const parent_root = proposal_head.root;
 
@@ -416,7 +414,6 @@ pub const BeamChain = struct {
 
             const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
             try aggregation.computeAggregatedSignatures(
-                attestations,
                 &pre_state.validators,
                 &self.forkChoice.gossip_signatures,
                 &self.forkChoice.latest_known_aggregated_payloads,
@@ -1402,10 +1399,6 @@ pub const BeamChain = struct {
         });
     }
 
-    /// Thin wrapper around validateAttestationData for callers that have a full Attestation.
-    pub fn validateAttestation(self: *Self, attestation: types.Attestation, is_from_block: bool) !void {
-        return self.validateAttestationData(attestation.data, is_from_block);
-    }
 
     pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
         // Validation is done upstream in onGossip before this function is called.

@@ -273,7 +273,6 @@ test "computeAggregatedSignatures: all 4 in signatures_map" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -324,7 +323,6 @@ test "computeAggregatedSignatures: 2 signatures_map, 2 in aggregated proof" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -389,7 +387,6 @@ test "computeAggregatedSignatures: full overlap uses stored only" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -447,7 +444,6 @@ test "computeAggregatedSignatures: greedy set-cover" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -514,7 +510,6 @@ test "computeAggregatedSignatures: partial signatures_map overlap maximizes cove
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -566,7 +561,6 @@ test "computeAggregatedSignatures: empty attestations" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -606,7 +600,6 @@ test "computeAggregatedSignatures: no signatures available" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -673,7 +666,6 @@ test "computeAggregatedSignatures: multiple data roots" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -728,7 +720,6 @@ test "computeAggregatedSignatures: single validator" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -954,7 +945,6 @@ test "computeAggregatedSignatures: complex 3 groups" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -1032,7 +1022,6 @@ test "computeAggregatedSignatures: validator without signature excluded" {
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,
@@ -1106,7 +1095,6 @@ test "computeAggregatedSignatures: empty signatures_map with full aggregated pay
     defer agg_ctx.deinit();
 
     try agg_ctx.computeAggregatedSignatures(
-        &attestations_list,
         &ctx.validators,
         &signatures_map,
         &payloads_map,

@@ -316,7 +316,6 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             aggregation.attestation_signatures.deinit();
         };
         try aggregation.computeAggregatedSignatures(
-            attestations.items,
             &beam_state.validators,
             &signatures_map,
             null, // no pre-aggregated payloads in mock

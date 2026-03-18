@@ -1265,27 +1265,12 @@ pub const ForkChoice = struct {
 
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
-        var attestations: std.ArrayList(types.Attestation) = .{};
-        defer attestations.deinit(self.allocator);
-
         // Capture counts for metrics update outside lock scope
         var new_payloads_count: usize = 0;
         var gossip_sigs_count: usize = 0;
 
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
-
-        var sig_it = self.gossip_signatures.iterator();
-        while (sig_it.next()) |entry| {
-            const attestation_data = entry.key_ptr.*;
-            var inner_it = entry.value_ptr.iterator();
-            while (inner_it.next()) |inner_entry| {
-                try attestations.append(self.allocator, .{
-                    .validator_id = inner_entry.key_ptr.*,
-                    .data = attestation_data,
-                });
-            }
-        }
 
         var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
         var agg_att_cleanup = true;
@@ -1304,7 +1289,6 @@ pub const ForkChoice = struct {
         };
 
         try aggregation.computeAggregatedSignatures(
-            attestations.items,
             &state.validators,
             &self.gossip_signatures,
             null,
