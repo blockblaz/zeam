@@ -205,6 +205,7 @@ test "serialize new head event" {
 
     const proto_block = types.ProtoBlock{
         .slot = 123,
+        .proposer_index = 0,
         .blockRoot = [_]u8{1} ** 32,
         .parentRoot = [_]u8{2} ** 32,
         .stateRoot = [_]u8{3} ** 32,
@@ -271,6 +272,7 @@ fn makeSampleChainEvent(allocator: Allocator, tag: ChainEventType) !ChainEvent {
         .new_head => blk: {
             const proto_block = types.ProtoBlock{
                 .slot = 999_999,
+                .proposer_index = 0,
                 .blockRoot = [_]u8{0xab} ** 32,
                 .parentRoot = [_]u8{0xcd} ** 32,
                 .stateRoot = [_]u8{0xef} ** 32,

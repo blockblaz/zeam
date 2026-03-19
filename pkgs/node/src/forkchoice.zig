@@ -23,6 +23,7 @@ const ProtoBlock = types.ProtoBlock;
 pub const ProtoNode = struct {
     // Fields from ProtoBlock
     slot: types.Slot,
+    proposer_index: types.ValidatorIndex,
     blockRoot: Root,
     parentRoot: Root,
     stateRoot: Root,
@@ -109,6 +110,7 @@ pub const ProtoArray = struct {
         // });
         const node = ProtoNode{
             .slot = block.slot,
+            .proposer_index = block.proposer_index,
             .blockRoot = block.blockRoot,
             .parentRoot = block.parentRoot,
             .stateRoot = block.stateRoot,
@@ -337,6 +339,7 @@ pub const ForkChoice = struct {
 
         const anchor_block = ProtoBlock{
             .slot = opts.anchorState.slot,
+            .proposer_index = anchor_block_header.proposer_index,
             .blockRoot = anchor_block_root,
             .parentRoot = anchor_block_header.parent_root,
             .stateRoot = anchor_block_header.state_root,
@@ -424,6 +427,7 @@ pub const ForkChoice = struct {
             // Fallback: create a ProtoNode from ProtoBlock if not found
             const head_node = ProtoNode{
                 .slot = self.head.slot,
+                .proposer_index = self.head.proposer_index,
                 .blockRoot = self.head.blockRoot,
                 .parentRoot = self.head.parentRoot,
                 .stateRoot = self.head.stateRoot,
@@ -1498,6 +1502,7 @@ pub const ForkChoice = struct {
 
             const proto_block = ProtoBlock{
                 .slot = slot,
+                .proposer_index = block.proposer_index,
                 .blockRoot = block_root,
                 .parentRoot = parent_root,
                 .stateRoot = block.state_root,
@@ -1529,6 +1534,7 @@ pub const ForkChoice = struct {
             // const block = utils.Cast(ProtoBlock, node);
             const block = ProtoBlock{
                 .slot = node.slot,
+                .proposer_index = node.proposer_index,
                 .blockRoot = node.blockRoot,
                 .parentRoot = node.parentRoot,
                 .stateRoot = node.stateRoot,
@@ -1915,6 +1921,7 @@ fn createTestRoot(fill_byte: u8) types.Root {
 fn createTestProtoBlock(slot: types.Slot, block_root_byte: u8, parent_root_byte: u8) ProtoBlock {
     return ProtoBlock{
         .slot = slot,
+        .proposer_index = 0,
         .blockRoot = createTestRoot(block_root_byte),
         .parentRoot = createTestRoot(parent_root_byte),
         .stateRoot = createTestRoot(0x00),
