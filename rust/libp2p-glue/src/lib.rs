@@ -143,7 +143,6 @@ enum SwarmCommand {
         channel: PendingResponse,
         channel_id: u64,
         response_message: ResponseMessage,
-        update_timeout: bool,
     },
     SendRpcEndOfStream {
         channel: PendingResponse,
@@ -156,9 +155,14 @@ enum SwarmCommand {
     },
 }
 
+/// Capacity of the bounded command channel per network. Under normal operation the event loop
+/// drains commands faster than FFI produces them. If the queue fills up it signals that the
+/// event loop is stalled — we fail-fast to protect the process from unbounded memory growth.
+const COMMAND_CHANNEL_CAPACITY: usize = 1024;
+
 lazy_static::lazy_static! {
     /// Per-network mpsc senders. FFI functions post commands here; run_eventloop processes them.
-    static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::UnboundedSender<SwarmCommand>>> =
+    static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> =
         Mutex::new(HashMap::new());
 }
 
@@ -168,16 +172,25 @@ lazy_static::lazy_static! {
 fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
     let mut senders = COMMAND_SENDERS.lock().unwrap();
     if let Some(tx) = senders.get(&network_id) {
-        if tx.send(cmd).is_err() {
-            forward_log_by_network(
-                network_id,
-                3,
-                "Command channel closed — event loop may have exited",
-            );
-            senders.remove(&network_id);
-            false
-        } else {
-            true
+        match tx.try_send(cmd) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                forward_log_by_network(
+                    network_id,
+                    3,
+                    "Command channel full — event loop may be stalled",
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                forward_log_by_network(
+                    network_id,
+                    3,
+                    "Command channel closed — event loop may have exited",
+                );
+                senders.remove(&network_id);
+                false
+            }
         }
     } else {
         forward_log_by_network(
@@ -451,8 +464,12 @@ pub unsafe fn send_rpc_response_chunk(
     let response_bytes = response_slice.to_vec();
 
     let channel = {
-        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-        response_map.get(&channel_id).cloned()
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        let channel = response_map.get(&channel_id).cloned();
+        if channel.is_some() {
+            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
+        }
+        channel
     };
 
     if let Some(channel) = channel {
@@ -465,7 +482,6 @@ pub unsafe fn send_rpc_response_chunk(
                 channel,
                 channel_id,
                 response_message,
-                update_timeout: true,
             },
         ) {
             logger::rustLogger.info(
@@ -732,7 +748,7 @@ pub struct Network {
     zig_handler: u64,
     peer_addr_map: HashMap<PeerId, Multiaddr>,
     /// Receiver half of the actor command channel. Populated in start_network.
-    cmd_rx: Option<mpsc::UnboundedReceiver<SwarmCommand>>,
+    cmd_rx: Option<mpsc::Receiver<SwarmCommand>>,
 }
 
 impl Network {
@@ -871,7 +887,7 @@ impl Network {
         }
 
         // Create the actor command channel and register the sender globally.
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(COMMAND_CHANNEL_CAPACITY);
         COMMAND_SENDERS
             .lock()
             .unwrap()
@@ -932,11 +948,7 @@ impl Network {
                     SwarmCommand::SendRpcRequest { peer_id, request_id, protocol_id: _, request_message } => {
                         swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
                     }
-                    SwarmCommand::SendRpcResponseChunk { channel, channel_id, response_message, update_timeout } => {
-                        if update_timeout {
-                            let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-                            let _ = map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-                        }
+                    SwarmCommand::SendRpcResponseChunk { channel, channel_id: _, response_message } => {
                         swarm.behaviour_mut().reqresp.send_response(
                             channel.peer_id,
                             channel.connection_id,
