@@ -222,9 +222,7 @@ pub const GossipTopic = struct {
         return GossipTopic{ .kind = kind };
     }
 
-    pub fn format(self: GossipTopic, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: GossipTopic, writer: anytype) !void {
         switch (self.kind) {
             .block, .aggregation => try writer.writeAll(@tagName(self.kind)),
             .attestation => {
@@ -726,7 +724,7 @@ const MessagePublishWrapper = struct {
     const Self = @This();
 
     pub fn format(self: Self, writer: anytype) !void {
-        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={any}, sender={s} }}", .{
+        try writer.print("MessagePublishWrapper{{ networkId={d}, topic={f}, sender={s} }}", .{
             self.networkId,
             self.data.getGossipTopic(),
             self.sender_peer_id,
@@ -886,11 +884,11 @@ pub const GenericGossipHandler = struct {
         const gossip_topic = data.getGossipTopic();
         const handlerArr = self.onGossipHandlers.get(gossip_topic) orelse {
             const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-            self.logger.debug("network-{d}:: ongossip no handlers for topic={any} from peer={s}{any}", .{ self.networkId, gossip_topic, sender_peer_id, node_name });
+            self.logger.debug("network-{d}:: ongossip no handlers for topic={f} from peer={s}{f}", .{ self.networkId, gossip_topic, sender_peer_id, node_name });
             return;
         };
         const node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-        self.logger.debug("network-{d}:: ongossip handlers={d} topic={any} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic, sender_peer_id, node_name });
+        self.logger.debug("network-{d}:: ongossip handlers={d} topic={f} from peer={s}{f}", .{ self.networkId, handlerArr.items.len, gossip_topic, sender_peer_id, node_name });
         for (handlerArr.items) |handler| {
 
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
@@ -898,7 +896,7 @@ pub const GenericGossipHandler = struct {
             if (scheduleOnLoop) {
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
 
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={any}", .{ self.networkId, publishWrapper, gossip_topic });
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
 
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);

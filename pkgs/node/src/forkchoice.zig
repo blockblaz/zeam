@@ -147,8 +147,10 @@ pub const ProtoArray = struct {
         }
 
         // iterate backwards apply deltas and propagating deltas to parents
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_a = self.nodes.items.len;
+        while (node_idx_a > 0) {
+            node_idx_a -= 1;
+            const node_idx = node_idx_a;
             const node_delta = deltas[node_idx];
             self.nodes.items[node_idx].weight += node_delta;
             if (self.nodes.items[node_idx].parent) |parent_idx| {
@@ -158,8 +160,10 @@ pub const ProtoArray = struct {
 
         // re-iterate backwards and calc best child and descendant
         // there seems to be no filter block tree in the mini3sf fc
-        for (0..self.nodes.items.len) |i| {
-            const node_idx = self.nodes.items.len - 1 - i;
+        var node_idx_b = self.nodes.items.len;
+        while (node_idx_b > 0) {
+            node_idx_b -= 1;
+            const node_idx = node_idx_b;
             const node = self.nodes.items[node_idx];
 
             if (self.nodes.items[node_idx].parent) |parent_idx| {
