@@ -832,13 +832,11 @@ fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const 
 //```
 
 fn nodeKeyIndexFromYaml(node_key: []const u8, validator_config: Yaml) !usize {
-    var index: usize = 0;
-    for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
+    for (validator_config.docs.items[0].map.get("validators").?.list, 0..) |entry, index| {
         const name_value = entry.map.get("name").?;
         if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
             return index;
         }
-        index += 1;
     }
     return error.InvalidNodeKey;
 }
