@@ -386,47 +386,110 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        // Use the two-phase aggregation algorithm:
-        // Phase 1: Collect individual signatures from gossip_signatures
-        // Phase 2: Fallback to latest_known_aggregated_payloads using greedy set-cover
-        var aggregation = try types.AggregatedAttestationsResult.init(self.allocator);
+        // Select pre-aggregated payloads for the block (aggregation is done by aggregators).
+        // Sort attestation data by reverse slot and greedily pick proofs that maximize
+        // coverage of remaining (uncovered) validators.
+        var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
         var agg_att_cleanup = true;
-        var agg_sig_cleanup = true;
         errdefer if (agg_att_cleanup) {
-            for (aggregation.attestations.slice()) |*att| {
-                att.deinit();
-            }
-            aggregation.attestations.deinit();
+            for (agg_attestations.slice()) |*att| att.deinit();
+            agg_attestations.deinit();
         };
-        errdefer if (agg_sig_cleanup) {
-            for (aggregation.attestation_signatures.slice()) |*sig| {
-                sig.deinit();
-            }
-            aggregation.attestation_signatures.deinit();
-        };
-        // Lock mutex only for the duration of computeAggregatedSignatures to avoid deadlock:
-        // forkChoice.onBlock/updateHead acquire forkChoice.mutex, while onSignedAttestation
-        // acquires mutex then signatures_mutex. Holding signatures_mutex across onBlock/updateHead
-        // would allow: (this thread: signatures_mutex -> mutex) vs (gossip: mutex -> signatures_mutex).
-        {
-            self.forkChoice.signatures_mutex.lock();
-            defer self.forkChoice.signatures_mutex.unlock();
 
-            const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
-            try aggregation.computeAggregatedSignatures(
-                &pre_state.validators,
-                &self.forkChoice.gossip_signatures,
-                &self.forkChoice.latest_known_aggregated_payloads,
-            );
-            _ = building_timer.observe();
+        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var agg_sig_cleanup = true;
+        errdefer if (agg_sig_cleanup) {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        };
+
+        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
+
+        // Collect attestation data entries from latest_known_aggregated_payloads
+        // (getProposalHead already migrated new → known via acceptNewAttestations),
+        // filtered by latest justified source.
+        const PayloadEntry = struct {
+            att_data: types.AttestationData,
+            payloads: *types.AggregatedPayloadsList,
+        };
+        var entries: std.ArrayList(PayloadEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        var payload_it = self.forkChoice.latest_known_aggregated_payloads.iterator();
+        while (payload_it.next()) |entry| {
+            // if (!std.mem.eql(u8, &latest_justified.root, &entry.key_ptr.source.root)) continue;
+            try entries.append(self.allocator, .{
+                .att_data = entry.key_ptr.*,
+                .payloads = entry.value_ptr,
+            });
         }
 
+        // Sort by reverse slot (newest attestations first)
+        std.mem.sort(PayloadEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: PayloadEntry, b: PayloadEntry) bool {
+                return a.att_data.slot > b.att_data.slot;
+            }
+        }.lessThan);
+
+        // Greedily select proofs based on remaining uncovered validators
+        var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
+        defer covered.deinit();
+
+        for (entries.items) |pe| {
+            while (true) {
+                // Find the proof covering the most uncovered validators
+                var best_proof: ?*const types.AggregatedSignatureProof = null;
+                var best_new_coverage: usize = 0;
+
+                for (pe.payloads.items) |*stored| {
+                    var new_coverage: usize = 0;
+                    for (0..stored.proof.participants.len()) |i| {
+                        if (stored.proof.participants.get(i) catch false) {
+                            if (i >= covered.capacity() or !covered.isSet(i)) {
+                                new_coverage += 1;
+                            }
+                        }
+                    }
+                    if (new_coverage > best_new_coverage) {
+                        best_new_coverage = new_coverage;
+                        best_proof = &stored.proof;
+                    }
+                }
+
+                if (best_proof == null or best_new_coverage == 0) break;
+
+                // Clone the proof for the block
+                var cloned_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
+                errdefer cloned_proof.deinit();
+
+                // Build attestation bits and mark validators as covered
+                var att_bits = try types.AggregationBits.init(self.allocator);
+                errdefer att_bits.deinit();
+
+                for (0..cloned_proof.participants.len()) |i| {
+                    if (cloned_proof.participants.get(i) catch false) {
+                        try types.aggregationBitsSet(&att_bits, i, true);
+                        if (i >= covered.capacity()) {
+                            try covered.resize(i + 1, false);
+                        }
+                        covered.set(i);
+                    }
+                }
+
+                try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = pe.att_data });
+                try attestation_signatures.append(cloned_proof);
+            }
+        }
+
+        _ = building_timer.observe();
+
         // Record aggregated signature metrics
-        const num_agg_sigs = aggregation.attestation_signatures.len();
+        const num_agg_sigs = attestation_signatures.len();
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(num_agg_sigs);
 
         var total_attestations_in_agg: u64 = 0;
-        for (aggregation.attestations.constSlice()) |agg_att| {
+        for (agg_attestations.constSlice()) |agg_att| {
             const bits_len = agg_att.aggregation_bits.len();
             for (0..bits_len) |i| {
                 if (agg_att.aggregation_bits.get(i) catch false) {
@@ -446,13 +509,12 @@ pub const BeamChain = struct {
             .state_root = undefined,
             .body = types.BeamBlockBody{
                 // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = aggregation.attestations,
+                .attestations = agg_attestations,
             },
         };
         agg_att_cleanup = false; // Ownership moved to block.body.attestations
         errdefer block.deinit();
 
-        var attestation_signatures = aggregation.attestation_signatures;
         agg_sig_cleanup = false; // Ownership moved to attestation_signatures
         errdefer {
             for (attestation_signatures.slice()) |*sig_group| {

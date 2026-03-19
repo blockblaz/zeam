@@ -6,7 +6,6 @@ const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
-const xmss = @import("@zeam/xmss");
 
 const transition = @import("./transition.zig");
 
@@ -279,47 +278,52 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
 
         // Build gossip signatures map from attestations (keyed by AttestationData)
         var signatures_map = types.SignaturesMap.init(allocator);
-        defer {
-            var it = signatures_map.iterator();
-            while (it.next()) |e| e.value_ptr.deinit();
-            signatures_map.deinit();
-        }
+        defer signatures_map.deinit();
 
         for (attestations.items) |attestation| {
             // Get the serialized signature bytes
             const sig_buffer = try key_manager.signAttestation(&attestation, allocator);
 
-            const gop = try signatures_map.getOrPut(attestation.data);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = types.GossipSignaturesInnerMap.init(allocator);
-            }
-            try gop.value_ptr.put(attestation.validator_id, .{
+            try signatures_map.addSignature(attestation.data, attestation.validator_id, .{
                 .slot = attestation.data.slot,
                 .signature = sig_buffer,
             });
         }
 
-        // Compute aggregated signatures using the shared method
-        var aggregation = try types.AggregatedAttestationsResult.init(allocator);
+        // Compute aggregated signatures directly from signatures map
+        var agg_attestations = try types.AggregatedAttestations.init(allocator);
         var agg_att_cleanup = true;
-        var agg_sig_cleanup = true;
         errdefer if (agg_att_cleanup) {
-            for (aggregation.attestations.slice()) |*att| {
-                att.deinit();
-            }
-            aggregation.attestations.deinit();
+            for (agg_attestations.slice()) |*att| att.deinit();
+            agg_attestations.deinit();
         };
+
+        var agg_signatures = try types.AttestationSignatures.init(allocator);
+        var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
-            for (aggregation.attestation_signatures.slice()) |*sig| {
-                sig.deinit();
-            }
-            aggregation.attestation_signatures.deinit();
+            for (agg_signatures.slice()) |*sig| sig.deinit();
+            agg_signatures.deinit();
         };
-        try aggregation.computeAggregatedSignatures(
-            &beam_state.validators,
-            &signatures_map,
-            null, // no pre-aggregated payloads in mock
-        );
+
+        var sig_it = signatures_map.iterator();
+        while (sig_it.next()) |entry| {
+            const att_data = entry.key_ptr.*;
+
+            var proof = try types.aggregateInnerMap(allocator, entry.value_ptr, att_data, &beam_state.validators);
+            errdefer proof.deinit();
+
+            // Clone participants for the attestation entry
+            var att_bits = try types.AggregationBits.init(allocator);
+            errdefer att_bits.deinit();
+            for (0..proof.participants.len()) |i| {
+                if (proof.participants.get(i) catch false) {
+                    try types.aggregationBitsSet(&att_bits, i, true);
+                }
+            }
+
+            try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
+            try agg_signatures.append(proof);
+        }
 
         const proposer_index = slot % genesis_config.numValidators();
         var block = types.BeamBlock{
@@ -328,7 +332,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
             .parent_root = parent_root,
             .state_root = state_root,
             .body = types.BeamBlockBody{
-                .attestations = aggregation.attestations,
+                .attestations = agg_attestations,
             },
         };
         agg_att_cleanup = false;
@@ -364,7 +368,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         );
 
         const block_signatures = types.BlockSignatures{
-            .attestation_signatures = aggregation.attestation_signatures,
+            .attestation_signatures = agg_signatures,
             .proposer_signature = proposer_sig,
         };
         agg_sig_cleanup = false;
