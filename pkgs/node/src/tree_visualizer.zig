@@ -170,9 +170,8 @@ pub fn buildForkChoiceJSON(
     const w = output.writer(allocator);
     try w.writeAll("{");
     try w.print(
-        \\"head":{{"slot":{d},"root":"0x{x}"}},"justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":{{"root":"0x{x}"}},"validator_count":{d},"nodes":[
+        \\"head":"0x{x}","justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":"0x{x}","validator_count":{d},"nodes":[
     , .{
-        snapshot.head.slot,
         &snapshot.head.blockRoot,
         snapshot.latest_justified.slot,
         &snapshot.latest_justified.root,
@@ -185,8 +184,8 @@ pub fn buildForkChoiceJSON(
     for (snapshot.nodes, 0..) |node, i| {
         if (i > 0) try w.writeAll(",");
         try w.print(
-            \\{{"slot":{d},"root":"0x{x}","parent_root":"0x{x}","weight":{d}}}
-        , .{ node.slot, &node.blockRoot, &node.parentRoot, node.weight });
+            \\{{"root":"0x{x}","slot":{d},"parent_root":"0x{x}","proposer_index":{d},"weight":{d}}}
+        , .{ &node.blockRoot, node.slot, &node.parentRoot, node.proposer_index, node.weight });
     }
     try w.writeAll("]}");
 }
@@ -400,6 +399,7 @@ fn createTestProtoNode(
 ) fcFactory.ProtoNode {
     return fcFactory.ProtoNode{
         .slot = slot,
+        .proposer_index = 0,
         .blockRoot = createTestRoot(block_root_byte),
         .parentRoot = createTestRoot(parent_root_byte),
         .stateRoot = createTestRoot(0x00),
