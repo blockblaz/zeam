@@ -1255,13 +1255,9 @@ pub const BeamNode = struct {
     }
 
     fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
-        var i: usize = 0;
-        while (i < aggregations.len) : (i += 1) {
+        for (aggregations, 0..) |_, i| {
             self.publishAggregation(aggregations[i]) catch |err| {
-                var j: usize = i;
-                while (j < aggregations.len) : (j += 1) {
-                    aggregations[j].deinit();
-                }
+                for (aggregations[i..]) |*a| a.deinit();
                 return err;
             };
             aggregations[i].deinit();

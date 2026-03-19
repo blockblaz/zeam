@@ -886,9 +886,8 @@ test "Mock status RPC between peers" {
 
         fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, _: interface.PeerDirection, _: interface.DisconnectionReason) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            var idx: usize = 0;
-            while (idx < self.connections.items.len) : (idx += 1) {
-                if (std.mem.eql(u8, self.connections.items[idx], peer_id)) {
+            for (self.connections.items, 0..) |conn, idx| {
+                if (std.mem.eql(u8, conn, peer_id)) {
                     const removed = self.connections.swapRemove(idx);
                     self.allocator.free(removed);
                     break;
