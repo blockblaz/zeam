@@ -212,7 +212,19 @@ pub const Node = struct {
                 self.anchor_state.* = local_finalized_state;
             }
         } else |_| {
-            self.logger.info("starting fresh & generating genesis as found no saved finalized state in db", .{});
+            self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
+            db.deinit();
+            const rocksdb_path_fresh = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
+            defer allocator.free(rocksdb_path_fresh);
+            std.fs.deleteTreeAbsolute(rocksdb_path_fresh) catch |wipe_err| {
+                // Ignore NotFound — db may not exist yet, that is fine
+                if (wipe_err != error.FileNotFound) {
+                    self.logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path_fresh, wipe_err });
+                    return wipe_err;
+                }
+            };
+            db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+            self.logger.info("starting fresh & generating genesis", .{});
             try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
         }
 
