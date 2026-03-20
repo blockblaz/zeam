@@ -374,7 +374,6 @@ pub const BeamChain = struct {
         // This ensures the proposer builds on the latest proposal head derived
         // from known aggregated payloads.
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
-
         const parent_root = proposal_head.root;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
@@ -386,9 +385,14 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        // Select pre-aggregated payloads for the block (aggregation is done by aggregators).
-        // Sort attestation data by reverse slot and greedily pick proofs that maximize
-        // coverage of remaining (uncovered) validators.
+        // Fixed-point attestation collection with greedy proof selection.
+        //
+        // For the current latest_justified checkpoint, find matching attestation_data
+        // entries in latest_known_aggregated_payloads and greedily select proofs that
+        // maximize new validator coverage. Then apply STF to check if justification
+        // changed. If it did, look for entries matching the new justified checkpoint
+        // and repeat. If no matching entries exist or justification didn't change,
+        // block production is done.
         var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
         var agg_att_cleanup = true;
         errdefer if (agg_att_cleanup) {
@@ -405,81 +409,111 @@ pub const BeamChain = struct {
 
         const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
 
-        // Collect attestation data entries from latest_known_aggregated_payloads
-        // (getProposalHead already migrated new → known via acceptNewAttestations),
-        // filtered by latest justified source.
-        const PayloadEntry = struct {
-            att_data: types.AttestationData,
-            payloads: *types.AggregatedPayloadsList,
-        };
-        var entries: std.ArrayList(PayloadEntry) = .empty;
-        defer entries.deinit(self.allocator);
+        var current_justified_root = pre_state.latest_justified.root;
+        while (true) {
+            // Find all attestation_data entries whose source matches the current justified checkpoint
+            // and greedily select proofs maximizing new validator coverage for each.
+            var found_entries = false;
+            var payload_it = self.forkChoice.latest_known_aggregated_payloads.iterator();
+            while (payload_it.next()) |entry| {
+                if (!std.mem.eql(u8, &current_justified_root, &entry.key_ptr.source.root)) continue;
+                found_entries = true;
 
-        var payload_it = self.forkChoice.latest_known_aggregated_payloads.iterator();
-        while (payload_it.next()) |entry| {
-            // if (!std.mem.eql(u8, &latest_justified.root, &entry.key_ptr.source.root)) continue;
-            try entries.append(self.allocator, .{
-                .att_data = entry.key_ptr.*,
-                .payloads = entry.value_ptr,
-            });
-        }
+                const att_data = entry.key_ptr.*;
+                const payloads = entry.value_ptr;
 
-        // Sort by reverse slot (newest attestations first)
-        std.mem.sort(PayloadEntry, entries.items, {}, struct {
-            fn lessThan(_: void, a: PayloadEntry, b: PayloadEntry) bool {
-                return a.att_data.slot > b.att_data.slot;
-            }
-        }.lessThan);
+                // Greedy proof selection: each iteration picks the proof covering
+                // the most uncovered validators until all are covered.
+                var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
+                defer covered.deinit();
 
-        // Greedily select proofs based on remaining uncovered validators
-        var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
-        defer covered.deinit();
+                while (true) {
+                    var best_proof: ?*const types.AggregatedSignatureProof = null;
+                    var best_new_coverage: usize = 0;
 
-        for (entries.items) |pe| {
-            while (true) {
-                // Find the proof covering the most uncovered validators
-                var best_proof: ?*const types.AggregatedSignatureProof = null;
-                var best_new_coverage: usize = 0;
-
-                for (pe.payloads.items) |*stored| {
-                    var new_coverage: usize = 0;
-                    for (0..stored.proof.participants.len()) |i| {
-                        if (stored.proof.participants.get(i) catch false) {
-                            if (i >= covered.capacity() or !covered.isSet(i)) {
-                                new_coverage += 1;
+                    for (payloads.items) |*stored| {
+                        var new_coverage: usize = 0;
+                        for (0..stored.proof.participants.len()) |i| {
+                            if (stored.proof.participants.get(i) catch false) {
+                                if (i >= covered.capacity() or !covered.isSet(i)) {
+                                    new_coverage += 1;
+                                }
                             }
                         }
-                    }
-                    if (new_coverage > best_new_coverage) {
-                        best_new_coverage = new_coverage;
-                        best_proof = &stored.proof;
-                    }
-                }
-
-                if (best_proof == null or best_new_coverage == 0) break;
-
-                // Clone the proof for the block
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
-                errdefer cloned_proof.deinit();
-
-                // Build attestation bits and mark validators as covered
-                var att_bits = try types.AggregationBits.init(self.allocator);
-                errdefer att_bits.deinit();
-
-                for (0..cloned_proof.participants.len()) |i| {
-                    if (cloned_proof.participants.get(i) catch false) {
-                        try types.aggregationBitsSet(&att_bits, i, true);
-                        if (i >= covered.capacity()) {
-                            try covered.resize(i + 1, false);
+                        if (new_coverage > best_new_coverage) {
+                            best_new_coverage = new_coverage;
+                            best_proof = &stored.proof;
                         }
-                        covered.set(i);
+                    }
+
+                    if (best_proof == null or best_new_coverage == 0) break;
+
+                    var cloned_proof: types.AggregatedSignatureProof = undefined;
+                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
+                    errdefer cloned_proof.deinit();
+
+                    var att_bits = try types.AggregationBits.init(self.allocator);
+                    errdefer att_bits.deinit();
+
+                    for (0..cloned_proof.participants.len()) |i| {
+                        if (cloned_proof.participants.get(i) catch false) {
+                            try types.aggregationBitsSet(&att_bits, i, true);
+                            if (i >= covered.capacity()) {
+                                try covered.resize(i + 1, false);
+                            }
+                            covered.set(i);
+                        }
+                    }
+
+                    try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
+                    try attestation_signatures.append(cloned_proof);
+                }
+            }
+
+            if (!found_entries) break;
+
+            // Build candidate block with all accumulated attestations and apply STF
+            // to check if justification changed.
+            var candidate_atts = try types.AggregatedAttestations.init(self.allocator);
+            defer {
+                for (candidate_atts.slice()) |*att| att.deinit();
+                candidate_atts.deinit();
+            }
+
+            for (agg_attestations.constSlice()) |agg_att| {
+                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                errdefer cloned_bits.deinit();
+                for (0..agg_att.aggregation_bits.len()) |i| {
+                    if (agg_att.aggregation_bits.get(i) catch false) {
+                        try types.aggregationBitsSet(&cloned_bits, i, true);
                     }
                 }
-
-                try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = pe.att_data });
-                try attestation_signatures.append(cloned_proof);
+                try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
             }
+
+            const candidate_block = types.BeamBlock{
+                .slot = opts.slot,
+                .proposer_index = opts.proposer_index,
+                .parent_root = parent_root,
+                .state_root = std.mem.zeroes([32]u8),
+                .body = .{ .attestations = candidate_atts },
+            };
+
+            var candidate_state: types.BeamState = undefined;
+            try types.sszClone(self.allocator, types.BeamState, pre_state.*, &candidate_state);
+            defer candidate_state.deinit();
+
+            try candidate_state.process_slots(self.allocator, opts.slot, self.block_building_logger);
+            try candidate_state.process_block(self.allocator, candidate_block, self.block_building_logger, null);
+
+            if (!std.mem.eql(u8, &candidate_state.latest_justified.root, &current_justified_root)) {
+                // Justification changed - look for entries matching the new checkpoint
+                current_justified_root = candidate_state.latest_justified.root;
+                continue;
+            }
+
+            // Justification unchanged or no new entries - block production done
+            break;
         }
 
         _ = building_timer.observe();
@@ -2474,4 +2508,132 @@ test "attestation processing - valid block attestation" {
 
     // Verify the attestation data was recorded for aggregation
     try std.testing.expect(beam_chain.forkChoice.gossip_signatures.get(valid_attestation.message) != null);
+}
+
+test "produceBlock - greedy selection by latest slot is suboptimal when attestation references unseen block" {
+    // Demonstrates that selecting attestation_data entries by latest slot is not the
+    // best strategy for block production. An attestation_data with a higher slot may
+    // reference a block on a different fork that this node has never seen locally.
+    // The STF will skip such attestations (has_known_root check in process_attestations),
+    // wasting block space. Lower-slot attestations referencing locally-known blocks
+    // are the ones that actually contribute to justification.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .attestation_committee_count = 1,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Process blocks at slots 1 and 2
+    for (1..mock_chain.blocks.len) |i| {
+        const signed_block = mock_chain.blocks[i];
+        const block = signed_block.message.block;
+        try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        allocator.free(missing_roots);
+    }
+
+    // After processing blocks 0-2, latest_justified should be at slot 1.
+    const justified_root = mock_chain.latestJustified[2].root;
+
+    // att_data_unseen: higher slot, but references a block on a fork we haven't seen.
+    // A greedy-by-slot approach would prefer this over lower-slot alternatives.
+    const unknown_root = [_]u8{0xAB} ** 32;
+    const att_data_unseen = types.AttestationData{
+        .slot = 2,
+        .head = .{ .root = unknown_root, .slot = 2 },
+        .target = .{ .root = unknown_root, .slot = 2 },
+        .source = .{ .root = justified_root, .slot = 1 },
+    };
+
+    // att_data_known: references a locally-known block at slot 2.
+    const att_data_known = types.AttestationData{
+        .slot = 1,
+        .head = .{ .root = mock_chain.blockRoots[2], .slot = 2 },
+        .target = .{ .root = mock_chain.blockRoots[2], .slot = 2 },
+        .source = .{ .root = justified_root, .slot = 1 },
+    };
+
+    // Create mock proofs with all 4 validators participating
+    var proof_unseen = try types.AggregatedSignatureProof.init(allocator);
+    for (0..4) |i| {
+        try types.aggregationBitsSet(&proof_unseen.participants, i, true);
+    }
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_unseen, proof_unseen, true);
+
+    var proof_known = try types.AggregatedSignatureProof.init(allocator);
+    for (0..4) |i| {
+        try types.aggregationBitsSet(&proof_known.participants, i, true);
+    }
+    try beam_chain.forkChoice.storeAggregatedPayload(&att_data_known, proof_known, true);
+
+    // Produce block at slot 3 (proposer_index = 3 % 4 = 3)
+    const proposal_slot: types.Slot = 3;
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    var produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    });
+    defer produced.deinit();
+
+    // The block should contain attestation entries for both att_data since both
+    // have source matching the justified checkpoint. The current algorithm does
+    // not filter by known block roots at selection time.
+    const block_attestations = produced.block.body.attestations.constSlice();
+    try std.testing.expect(block_attestations.len >= 2);
+
+    // However, after STF processing, only the attestation referencing the known
+    // block contributes to justification. The unseen-fork attestation is silently
+    // skipped by process_attestations (has_known_root check).
+    //
+    // This demonstrates why greedy-by-latest-slot is suboptimal: if we had only
+    // selected the highest-slot attestation (att_data_unseen at slot=2), the block
+    // would contribute zero attestation weight. The lower-slot attestation
+    // (att_data_known at slot=1) is the one that actually matters.
+    const post_state = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
+    try std.testing.expect(post_state.latest_justified.slot >= 1);
+
+    // Count how many attestation entries reference the unseen vs known block
+    var unseen_count: usize = 0;
+    var known_count: usize = 0;
+    for (block_attestations) |att| {
+        if (std.mem.eql(u8, &att.data.target.root, &unknown_root)) {
+            unseen_count += 1;
+        } else if (std.mem.eql(u8, &att.data.target.root, &mock_chain.blockRoots[2])) {
+            known_count += 1;
+        }
+    }
+    // Both sets of attestations are included in the block
+    try std.testing.expect(unseen_count > 0);
+    try std.testing.expect(known_count > 0);
 }
