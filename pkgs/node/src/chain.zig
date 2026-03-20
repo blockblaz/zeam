@@ -2407,7 +2407,7 @@ test "attestation processing - valid block attestation" {
     try beam_chain.onGossipAttestation(gossip_attestation);
 
     // Verify the attestation data was recorded for aggregation
-    try std.testing.expect(beam_chain.forkChoice.gossip_signatures.get(valid_attestation.message) != null);
+    try std.testing.expect(beam_chain.forkChoice.attestation_signatures.getPtr(valid_attestation.message) != null);
 }
 
 test "produceBlock - greedy selection by latest slot is suboptimal when attestation references unseen block" {
