@@ -447,7 +447,23 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         }
     }
 
+    fn validateBytes(method: LeanSupportedProtocol, bytes: []const u8) !void {
+        switch (method) {
+            .blocks_by_root => {
+                // BlockByRootRequest is a struct with a single variable-size field (roots: List[Root, N]).
+                // SSZ struct encoding: 4 bytes offset (must be 4) + N * 32 bytes of roots.
+                if (bytes.len < 4) return error.InvalidEncoding;
+                const offset = std.mem.readInt(u32, bytes[0..4], .little);
+                if (offset != 4) return error.InvalidEncoding;
+                const list_data_len = bytes.len - 4;
+                if (list_data_len % 32 != 0) return error.InvalidEncoding;
+            },
+            .status => {},
+        }
+    }
+
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
+        try validateBytes(method, bytes);
         return switch (method) {
             inline else => |tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
@@ -500,12 +516,64 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         return serialized.toOwnedSlice(allocator);
     }
 
+    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
+        const PayloadType = std.meta.TagPayload(Self, tag);
+        return switch (tag) {
+            .blocks_by_root => block_payload: {
+                var block: types.BeamBlock = undefined;
+                try block.setToDefault(allocator);
+                errdefer block.deinit();
+
+                var signatures = try types.createBlockSignatures(allocator, 0);
+                errdefer signatures.deinit();
+
+                break :block_payload PayloadType{
+                    .message = .{
+                        .block = block,
+                        .proposer_attestation = undefined,
+                    },
+                    .signature = signatures,
+                };
+            },
+            inline else => @as(PayloadType, undefined),
+        };
+    }
+
+    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
+        switch (tag) {
+            .blocks_by_root => payload.deinit(),
+            inline else => {},
+        }
+    }
+
+    fn validateBytes(method: LeanSupportedProtocol, bytes: []const u8) !void {
+        switch (method) {
+            .blocks_by_root => {
+                // SignedBlockWithAttestation is variable-size with 2 variable fields (message, signature).
+                // Validate minimum size and top-level offsets before deserialization.
+                if (bytes.len < 8) return error.InvalidEncoding;
+
+                const message_offset: usize = @intCast(std.mem.readInt(u32, bytes[0..4], .little));
+                const signature_offset: usize = @intCast(std.mem.readInt(u32, bytes[4..8], .little));
+
+                if (message_offset != 8) return error.InvalidEncoding;
+                if (signature_offset < message_offset) return error.InvalidEncoding;
+                if (signature_offset > bytes.len) return error.InvalidEncoding;
+            },
+            .status => {},
+        }
+    }
+
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
+        try validateBytes(method, bytes);
         return switch (method) {
             inline else => |tag| {
                 const PayloadType = std.meta.TagPayload(Self, tag);
-                var payload: PayloadType = undefined;
+                var payload = try initPayload(tag, allocator);
+                var succeeded = false;
+                defer if (!succeeded) deinitPayload(tag, &payload);
                 try ssz.deserialize(PayloadType, bytes, &payload, allocator);
+                succeeded = true;
                 return @unionInit(Self, @tagName(tag), payload);
             },
         };
@@ -992,4 +1060,89 @@ test LeanNetworkTopic {
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
     try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+}
+
+test "blocks_by_root roundtrip serialize/deserialize" {
+    const allocator = std.testing.allocator;
+    var roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator);
+    try roots.append([_]u8{0x01} ** 32);
+    try roots.append([_]u8{0x02} ** 32);
+    var original = ReqRespRequest{ .blocks_by_root = .{ .roots = roots } };
+    defer original.deinit();
+
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    var deserialized = try ReqRespRequest.deserialize(allocator, .blocks_by_root, serialized);
+    defer deserialized.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), deserialized.blocks_by_root.roots.len());
+    const root0 = try deserialized.blocks_by_root.roots.get(0);
+    const root1 = try deserialized.blocks_by_root.roots.get(1);
+    try std.testing.expect(std.mem.eql(u8, &root0, &([_]u8{0x01} ** 32)));
+    try std.testing.expect(std.mem.eql(u8, &root1, &([_]u8{0x02} ** 32)));
+}
+
+// ReqRespResponse validation tests
+
+test "response status roundtrip serialize/deserialize" {
+    const allocator = std.testing.allocator;
+    const original = ReqRespResponse{ .status = .{
+        .finalized_root = [_]u8{0x01} ** 32,
+        .finalized_slot = 42,
+        .head_root = [_]u8{0x02} ** 32,
+        .head_slot = 100,
+    } };
+
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    try std.testing.expectEqual(@as(usize, 80), serialized.len);
+
+    var deserialized = try ReqRespResponse.deserialize(allocator, .status, serialized);
+    defer deserialized.deinit();
+
+    try std.testing.expectEqual(@as(u64, 42), deserialized.status.finalized_slot);
+    try std.testing.expectEqual(@as(u64, 100), deserialized.status.head_slot);
+}
+
+test "response blocks_by_root roundtrip serialize/deserialize" {
+    const allocator = std.testing.allocator;
+
+    var attestations = try types.AggregatedAttestations.init(allocator);
+    const signatures = try types.createBlockSignatures(allocator, attestations.len());
+
+    var original = ReqRespResponse{ .blocks_by_root = .{
+        .message = .{
+            .block = .{
+                .slot = 7,
+                .proposer_index = 3,
+                .parent_root = [_]u8{0x11} ** 32,
+                .state_root = [_]u8{0x22} ** 32,
+                .body = .{ .attestations = attestations },
+            },
+            .proposer_attestation = .{
+                .validator_id = 3,
+                .data = .{
+                    .slot = 7,
+                    .head = .{ .root = [_]u8{0x11} ** 32, .slot = 6 },
+                    .target = .{ .root = [_]u8{0x11} ** 32, .slot = 6 },
+                    .source = .{ .root = [_]u8{0x00} ** 32, .slot = 0 },
+                },
+            },
+        },
+        .signature = signatures,
+    } };
+    defer original.deinit();
+
+    const serialized = try original.serialize(allocator);
+    defer allocator.free(serialized);
+
+    var decoded = try ReqRespResponse.deserialize(allocator, .blocks_by_root, serialized);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(types.Slot, 7), decoded.blocks_by_root.message.block.slot);
+    try std.testing.expectEqual(@as(types.ValidatorIndex, 3), decoded.blocks_by_root.message.proposer_attestation.validator_id);
+    try std.testing.expect(std.mem.eql(u8, &decoded.blocks_by_root.message.block.parent_root, &([_]u8{0x11} ** 32)));
+    try std.testing.expectEqual(@as(usize, 0), decoded.blocks_by_root.signature.attestation_signatures.len());
 }
