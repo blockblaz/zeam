@@ -19,20 +19,26 @@ const json = std.json;
 pub const Validators = ssz.utils.List(Validator, params.VALIDATOR_REGISTRY_LIMIT);
 
 pub const Validator = struct {
-    pubkey: Bytes52,
+    attestation_pubkey: Bytes52,
+    proposal_pubkey: Bytes52,
     index: ValidatorIndex,
 
     const Self = @This();
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("pubkey", json.Value{ .string = try bytesToHex(allocator, &self.pubkey) });
+        try obj.put("attestation_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.attestation_pubkey) });
+        try obj.put("proposal_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.proposal_pubkey) });
         try obj.put("index", json.Value{ .integer = @as(i64, @intCast(self.index)) });
         return json.Value{ .object = obj };
     }
 
-    pub fn getPubkey(self: *const Self) []const u8 {
-        return &self.pubkey;
+    pub fn getAttestationPubkey(self: *const Self) []const u8 {
+        return &self.attestation_pubkey;
+    }
+
+    pub fn getProposalPubkey(self: *const Self) []const u8 {
+        return &self.proposal_pubkey;
     }
 
     pub fn produceAttestation(self: *const Self, data: AttestationData) Attestation {
@@ -49,7 +55,8 @@ pub const Validator = struct {
     }
 
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
-        allocator.free(val.object.get("pubkey").?.string);
+        allocator.free(val.object.get("attestation_pubkey").?.string);
+        allocator.free(val.object.get("proposal_pubkey").?.string);
         val.object.deinit();
     }
 };

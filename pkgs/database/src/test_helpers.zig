@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 
 /// Helper function to create a dummy block for testing
-pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, attestation_signatures: types.AttestationSignatures) !types.SignedBlockWithAttestation {
+pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, parent_root_fill: u8, state_root_fill: u8, attestation_signatures: types.AttestationSignatures) !types.SignedBlock {
     const attestations_list = try types.AggregatedAttestations.init(allocator);
 
     var test_block = types.BeamBlock{
@@ -18,37 +18,13 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
     @memset(&test_block.parent_root, parent_root_fill);
     @memset(&test_block.state_root, state_root_fill);
 
-    const proposer_attestation = types.Attestation{
-        .validator_id = proposer_index,
-        .data = types.AttestationData{
-            .slot = slot,
-            .head = types.Checkpoint{
-                .slot = slot,
-                .root = undefined,
-            },
-            .source = types.Checkpoint{
-                .slot = 0,
-                .root = undefined,
-            },
-            .target = types.Checkpoint{
-                .slot = slot,
-                .root = undefined,
-            },
-        },
-    };
-
-    const block_with_attestation = types.BlockWithAttestation{
-        .block = test_block,
-        .proposer_attestation = proposer_attestation,
-    };
-
     const block_signatures = types.BlockSignatures{
         .attestation_signatures = attestation_signatures,
         .proposer_signature = types.ZERO_SIGBYTES,
     };
 
-    const signed_block = types.SignedBlockWithAttestation{
-        .message = block_with_attestation,
+    const signed_block = types.SignedBlock{
+        .message = test_block,
         .signature = block_signatures,
     };
 
@@ -60,7 +36,7 @@ pub fn createDummyState(allocator: Allocator, slot: u64, num_validators: u64, ge
     var validators = try types.Validators.init(allocator);
     errdefer validators.deinit();
     for (0..num_validators) |index| {
-        try validators.append(.{ .pubkey = [_]u8{0} ** 52, .index = @as(types.ValidatorIndex, @intCast(index)) });
+        try validators.append(.{ .attestation_pubkey = [_]u8{0} ** 52, .proposal_pubkey = [_]u8{0} ** 52, .index = @as(types.ValidatorIndex, @intCast(index)) });
     }
 
     var test_state = types.BeamState{

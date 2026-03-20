@@ -99,8 +99,9 @@ pub const BeamState = struct {
         errdefer validators.deinit();
 
         // Populate validators from genesis pubkeys
-        for (genesis.validator_pubkeys, 0..) |pubkey, i| {
-            const val = validator.Validator{ .pubkey = pubkey, .index = i };
+        std.debug.assert(genesis.validator_attestation_pubkeys.len == genesis.validator_proposal_pubkeys.len);
+        for (genesis.validator_attestation_pubkeys, genesis.validator_proposal_pubkeys, 0..) |att_pubkey, prop_pubkey, i| {
+            const val = validator.Validator{ .attestation_pubkey = att_pubkey, .proposal_pubkey = prop_pubkey, .index = i };
             try validators.append(val);
         }
 
@@ -738,14 +739,18 @@ test "ssz seralize/deserialize signed beam state" {
 fn makeGenesisState(allocator: Allocator, validator_count: usize) !BeamState {
     const pubkeys = try allocator.alloc(utils.Bytes52, validator_count);
     defer allocator.free(pubkeys);
-    for (pubkeys, 0..) |*pk, i| {
+    const proposal_pubkeys = try allocator.alloc(utils.Bytes52, validator_count);
+    defer allocator.free(proposal_pubkeys);
+    for (pubkeys, proposal_pubkeys, 0..) |*pk, *ppk, i| {
         @memset(pk, @intCast(i + 1));
+        @memset(ppk, @intCast(i + 1));
     }
 
     var state: BeamState = undefined;
     try state.genGenesisState(allocator, .{
         .genesis_time = 0,
-        .validator_pubkeys = pubkeys,
+        .validator_attestation_pubkeys = pubkeys,
+        .validator_proposal_pubkeys = proposal_pubkeys,
     });
     return state;
 }
@@ -1266,16 +1271,20 @@ test "genesis block hash comparison" {
     // Create first genesis state with 3 validators
     var pubkeys1 = try allocator.alloc(utils.Bytes52, 3);
     defer allocator.free(pubkeys1);
+    var proposal_pubkeys1 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(proposal_pubkeys1);
     {
         var i: usize = 0;
         while (i < pubkeys1.len) : (i += 1) {
             @memset(&pubkeys1[i], @intCast(i + 1)); // Fill with different values (1, 2, 3)
+            @memset(&proposal_pubkeys1[i], @intCast(i + 1));
         }
     }
 
     const genesis_spec1 = utils.GenesisSpec{
         .genesis_time = 1000,
-        .validator_pubkeys = pubkeys1,
+        .validator_attestation_pubkeys = pubkeys1,
+        .validator_proposal_pubkeys = proposal_pubkeys1,
     };
 
     var genesis_state1: BeamState = undefined;
@@ -1310,16 +1319,20 @@ test "genesis block hash comparison" {
     // Create second genesis state with different validators
     var pubkeys2 = try allocator.alloc(utils.Bytes52, 3);
     defer allocator.free(pubkeys2);
+    var proposal_pubkeys2 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(proposal_pubkeys2);
     {
         var i: usize = 0;
         while (i < pubkeys2.len) : (i += 1) {
             @memset(&pubkeys2[i], @intCast(i + 10)); // Fill with different values (10, 11, 12)
+            @memset(&proposal_pubkeys2[i], @intCast(i + 10));
         }
     }
 
     const genesis_spec2 = utils.GenesisSpec{
         .genesis_time = 1000, // Same genesis_time but different validators
-        .validator_pubkeys = pubkeys2,
+        .validator_attestation_pubkeys = pubkeys2,
+        .validator_proposal_pubkeys = proposal_pubkeys2,
     };
 
     var genesis_state2: BeamState = undefined;
@@ -1340,16 +1353,20 @@ test "genesis block hash comparison" {
     // Create third genesis state with same validators but different genesis_time
     var pubkeys3 = try allocator.alloc(utils.Bytes52, 3);
     defer allocator.free(pubkeys3);
+    var proposal_pubkeys3 = try allocator.alloc(utils.Bytes52, 3);
+    defer allocator.free(proposal_pubkeys3);
     {
         var i: usize = 0;
         while (i < pubkeys3.len) : (i += 1) {
             @memset(&pubkeys3[i], @intCast(i + 1)); // Same as pubkeys1
+            @memset(&proposal_pubkeys3[i], @intCast(i + 1));
         }
     }
 
     const genesis_spec3 = utils.GenesisSpec{
         .genesis_time = 2000, // Different genesis_time but same validators
-        .validator_pubkeys = pubkeys3,
+        .validator_attestation_pubkeys = pubkeys3,
+        .validator_proposal_pubkeys = proposal_pubkeys3,
     };
 
     var genesis_state3: BeamState = undefined;
@@ -1370,13 +1387,13 @@ test "genesis block hash comparison" {
     // // Compare genesis block hashes with expected hex values
     const hash1_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash1});
     defer allocator.free(hash1_hex);
-    try std.testing.expectEqualStrings(hash1_hex, "0xcc03f11dd80dd79a4add86265fad0a141d0a553812d43b8f2c03aa43e4b002e3");
+    try std.testing.expectEqualStrings(hash1_hex, "0xf84d547a47ca863fac7cda4619d3a93a2d3e7f2afdeeb5e4571b393554e19c0d");
 
     const hash2_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash2});
     defer allocator.free(hash2_hex);
-    try std.testing.expectEqualStrings(hash2_hex, "0x6bd5347aa1397c63ed8558079fdd3042112a5f4258066e3a659a659ff75ba14f");
+    try std.testing.expectEqualStrings(hash2_hex, "0x7b90004279c32942009320f284a92c8ec5914e9c4deb7a9c50e17dc22a7c6ce9");
 
     const hash3_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&genesis_block_hash3});
     defer allocator.free(hash3_hex);
-    try std.testing.expectEqualStrings(hash3_hex, "0xce48a709189aa2b23b6858800996176dc13eb49c0c95d717c39e60042de1ac91");
+    try std.testing.expectEqualStrings(hash3_hex, "0xb66cb6371bde0209ffd63063f89d216feeb1f03328400cb083429d8aead481ff");
 }
