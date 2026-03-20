@@ -448,7 +448,7 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"; then
+          if zig build -Doptimize=ReleaseSafe -Dgit_version="$(git rev-parse --short HEAD)"; then
             echo "Successfully built on attempt $attempt"
             exit 0
           fi
