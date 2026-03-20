@@ -9,8 +9,19 @@ const KeyManagerError = error{
     ValidatorKeyNotFound,
 };
 
+pub const ValidatorKeys = struct {
+    attestation_keypair: xmss.KeyPair,
+    proposal_keypair: xmss.KeyPair,
+
+    pub fn deinit(self: *ValidatorKeys) void {
+        self.attestation_keypair.deinit();
+        self.proposal_keypair.deinit();
+    }
+};
+
 const CachedKeyPair = struct {
-    keypair: xmss.KeyPair,
+    attestation_keypair: xmss.KeyPair,
+    proposal_keypair: xmss.KeyPair,
     num_active_epochs: usize,
 };
 var global_test_key_pair_cache: ?std.AutoHashMap(usize, CachedKeyPair) = null;
@@ -19,7 +30,7 @@ const cache_allocator = std.heap.page_allocator;
 fn getOrCreateCachedKeyPair(
     validator_id: usize,
     num_active_epochs: usize,
-) !xmss.KeyPair {
+) !ValidatorKeys {
     if (global_test_key_pair_cache == null) {
         global_test_key_pair_cache = std.AutoHashMap(usize, CachedKeyPair).init(cache_allocator);
     }
@@ -28,32 +39,51 @@ fn getOrCreateCachedKeyPair(
     if (cache.get(validator_id)) |cached| {
         if (cached.num_active_epochs >= num_active_epochs) {
             std.debug.print("CACHE HIT: validator {d}\n", .{validator_id});
-            return cached.keypair;
+            return ValidatorKeys{
+                .attestation_keypair = cached.attestation_keypair,
+                .proposal_keypair = cached.proposal_keypair,
+            };
         }
         // Not enough epochs, remove old key pair and regenerate
         var old = cache.fetchRemove(validator_id).?.value;
-        old.keypair.deinit();
+        old.attestation_keypair.deinit();
+        old.proposal_keypair.deinit();
     }
     std.debug.print("CACHE MISS: generating validator {d}\n", .{validator_id});
-    const seed = try std.fmt.allocPrint(cache_allocator, "test_validator_{d}", .{validator_id});
-    defer cache_allocator.free(seed);
+    const att_seed = try std.fmt.allocPrint(cache_allocator, "test_validator_{d}_attestation", .{validator_id});
+    defer cache_allocator.free(att_seed);
 
-    const keypair = try xmss.KeyPair.generate(
+    var attestation_keypair = try xmss.KeyPair.generate(
         cache_allocator,
-        seed,
+        att_seed,
+        0,
+        num_active_epochs,
+    );
+    errdefer attestation_keypair.deinit();
+
+    const prop_seed = try std.fmt.allocPrint(cache_allocator, "test_validator_{d}_proposal", .{validator_id});
+    defer cache_allocator.free(prop_seed);
+
+    const proposal_keypair = try xmss.KeyPair.generate(
+        cache_allocator,
+        prop_seed,
         0,
         num_active_epochs,
     );
 
     try cache.put(validator_id, CachedKeyPair{
-        .keypair = keypair,
+        .attestation_keypair = attestation_keypair,
+        .proposal_keypair = proposal_keypair,
         .num_active_epochs = num_active_epochs,
     });
-    return keypair;
+    return ValidatorKeys{
+        .attestation_keypair = attestation_keypair,
+        .proposal_keypair = proposal_keypair,
+    };
 }
 
 pub const KeyManager = struct {
-    keys: std.AutoHashMap(usize, xmss.KeyPair),
+    keys: std.AutoHashMap(usize, ValidatorKeys),
     allocator: Allocator,
     /// Tracks which keypairs are owned (allocated by us) vs borrowed (cached).
     owned_keys: std.AutoHashMap(usize, void),
@@ -62,7 +92,7 @@ pub const KeyManager = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
-            .keys = std.AutoHashMap(usize, xmss.KeyPair).init(allocator),
+            .keys = std.AutoHashMap(usize, ValidatorKeys).init(allocator),
             .allocator = allocator,
             .owned_keys = std.AutoHashMap(usize, void).init(allocator),
         };
@@ -80,14 +110,14 @@ pub const KeyManager = struct {
     }
 
     /// Add an owned keypair that will be freed on deinit.
-    pub fn addKeypair(self: *Self, validator_id: usize, keypair: xmss.KeyPair) !void {
-        try self.keys.put(validator_id, keypair);
+    pub fn addKeypair(self: *Self, validator_id: usize, validator_keys: ValidatorKeys) !void {
+        try self.keys.put(validator_id, validator_keys);
         try self.owned_keys.put(validator_id, {});
     }
 
     /// Add a cached/borrowed keypair that will NOT be freed on deinit.
-    pub fn addCachedKeypair(self: *Self, validator_id: usize, keypair: xmss.KeyPair) !void {
-        try self.keys.put(validator_id, keypair);
+    pub fn addCachedKeypair(self: *Self, validator_id: usize, validator_keys: ValidatorKeys) !void {
+        try self.keys.put(validator_id, validator_keys);
     }
 
     pub fn loadFromKeypairDir(_: *Self, _: []const u8) !void {
@@ -113,40 +143,56 @@ pub const KeyManager = struct {
         return sig_buffer;
     }
 
-    pub fn getPublicKeyBytes(
+    pub fn getAttestationPubkeyBytes(
         self: *const Self,
         validator_index: usize,
         buffer: []u8,
     ) !usize {
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
-        return try keypair.pubkeyToBytes(buffer);
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return try validator_keys.attestation_keypair.pubkeyToBytes(buffer);
     }
 
-    /// Extract all validator public keys into an array
-    /// Caller owns the returned slice and must free it
+    pub fn getProposalPubkeyBytes(
+        self: *const Self,
+        validator_index: usize,
+        buffer: []u8,
+    ) !usize {
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return try validator_keys.proposal_keypair.pubkeyToBytes(buffer);
+    }
+
+    pub const AllPubkeys = struct {
+        attestation_pubkeys: []types.Bytes52,
+        proposal_pubkeys: []types.Bytes52,
+    };
+
+    /// Extract all validator public keys into dual arrays (attestation + proposal)
+    /// Caller owns the returned slices and must free them
     pub fn getAllPubkeys(
         self: *const Self,
         allocator: Allocator,
         num_validators: usize,
-    ) ![]types.Bytes52 {
-        const pubkeys = try allocator.alloc(types.Bytes52, num_validators);
-        errdefer allocator.free(pubkeys);
+    ) !AllPubkeys {
+        const att_pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+        errdefer allocator.free(att_pubkeys);
+        const prop_pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+        errdefer allocator.free(prop_pubkeys);
 
-        // XMSS public keys are always exactly 52 bytes
         for (0..num_validators) |i| {
-            _ = try self.getPublicKeyBytes(i, &pubkeys[i]);
+            _ = try self.getAttestationPubkeyBytes(i, &att_pubkeys[i]);
+            _ = try self.getProposalPubkeyBytes(i, &prop_pubkeys[i]);
         }
 
-        return pubkeys;
+        return AllPubkeys{ .attestation_pubkeys = att_pubkeys, .proposal_pubkeys = prop_pubkeys };
     }
 
-    /// Get the raw public key handle for a validator (for aggregation)
-    pub fn getPublicKeyHandle(
+    /// Get the raw attestation public key handle for a validator (for aggregation)
+    pub fn getAttestationPubkeyHandle(
         self: *const Self,
         validator_index: usize,
     ) !*const xmss.HashSigPublicKey {
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
-        return keypair.public_key;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        return validator_keys.attestation_keypair.public_key;
     }
 
     /// Sign an attestation and return the raw signature handle (for aggregation)
@@ -159,17 +205,34 @@ pub const KeyManager = struct {
         zeam_metrics.metrics.lean_pq_sig_attestation_signatures_total.incr();
 
         const validator_index: usize = @intCast(attestation.validator_id);
-        const keypair = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
 
         const signing_timer = zeam_metrics.lean_pq_sig_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.AttestationData, attestation.data, &message, allocator);
 
         const epoch: u32 = @intCast(attestation.data.slot);
-        const signature = try keypair.sign(&message, epoch);
+        const signature = try validator_keys.attestation_keypair.sign(&message, epoch);
         _ = signing_timer.observe();
 
         return signature;
+    }
+
+    pub fn signBlockRoot(
+        self: *const Self,
+        proposer_index: usize,
+        block_root: *const [32]u8,
+        slot: u32,
+    ) !types.SIGBYTES {
+        const validator_keys = self.keys.get(proposer_index) orelse return KeyManagerError.ValidatorKeyNotFound;
+        var signature = try validator_keys.proposal_keypair.sign(block_root, slot);
+        defer signature.deinit();
+        var sig_buffer: types.SIGBYTES = undefined;
+        const bytes_written = try signature.toBytes(&sig_buffer);
+        if (bytes_written < types.SIGSIZE) {
+            @memset(sig_buffer[bytes_written..], 0);
+        }
+        return sig_buffer;
     }
 };
 
@@ -231,11 +294,13 @@ fn findTestKeysDir() ?[]const u8 {
 }
 
 /// Load a single pre-generated key pair from SSZ files on disk.
+/// For now, loads the same SSZ files for both attestation and proposal keypairs.
+/// TODO: add separate proposal key files.
 fn loadPreGeneratedKey(
     allocator: Allocator,
     keys_dir: []const u8,
     index: usize,
-) !xmss.KeyPair {
+) !ValidatorKeys {
     // Build file paths
     var sk_path_buf: [512]u8 = undefined;
     const sk_path = std.fmt.bufPrint(&sk_path_buf, "{s}/validator_{d}_sk.ssz", .{ keys_dir, index }) catch unreachable;
@@ -243,7 +308,11 @@ fn loadPreGeneratedKey(
     var pk_path_buf: [512]u8 = undefined;
     const pk_path = std.fmt.bufPrint(&pk_path_buf, "{s}/validator_{d}_pk.ssz", .{ keys_dir, index }) catch unreachable;
 
-    return loadKeypairFromFiles(allocator, sk_path, pk_path);
+    // Load same key for both attestation and proposal (TODO: separate key files)
+    var att_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    errdefer att_keypair.deinit();
+    const prop_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    return ValidatorKeys{ .attestation_keypair = att_keypair, .proposal_keypair = prop_keypair };
 }
 
 pub fn getTestKeyManager(
@@ -265,11 +334,11 @@ pub fn getTestKeyManager(
     var actually_loaded: usize = 0;
     if (keys_dir) |dir| {
         for (0..num_preloaded) |i| {
-            const keypair = loadPreGeneratedKey(allocator, dir, i) catch |err| {
+            const validator_keys = loadPreGeneratedKey(allocator, dir, i) catch |err| {
                 std.debug.print("Failed to load pre-generated key {d}: {}\n", .{ i, err });
                 break;
             };
-            key_manager.addKeypair(i, keypair) catch |err| {
+            key_manager.addKeypair(i, validator_keys) catch |err| {
                 std.debug.print("Failed to add pre-generated key {d}: {}\n", .{ i, err });
                 break;
             };
@@ -286,8 +355,8 @@ pub fn getTestKeyManager(
         if (num_active_epochs < 10) num_active_epochs = 10;
 
         for (actually_loaded..num_validators) |i| {
-            const keypair = try getOrCreateCachedKeyPair(i, num_active_epochs);
-            try key_manager.addCachedKeypair(i, keypair);
+            const validator_keys = try getOrCreateCachedKeyPair(i, num_active_epochs);
+            try key_manager.addCachedKeypair(i, validator_keys);
         }
         std.debug.print("Generated {d} additional keys at runtime\n", .{num_validators - actually_loaded});
     }
