@@ -1156,7 +1156,7 @@ pub const ForkChoice = struct {
                 .slot = attestation_slot,
                 .signature = signed_attestation.signature,
             });
-            gossip_signatures_count = self.gossip_signatures.count();
+            gossip_signatures_count = self.attestation_signatures.count();
         }
         // Update metric outside lock scope
         zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_signatures_count));

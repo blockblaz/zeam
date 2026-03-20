@@ -403,7 +403,7 @@ pub const BeamChain = struct {
             attestation_signatures.deinit();
         };
 
-        const building_timer = zeam_metrics.lean_pq_sig_attestation_signatures_building_time_seconds.start();
+        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
 
         // Collect attestation data entries from latest_known_aggregated_payloads
         // (getProposalHead already migrated new → known via acceptNewAttestations),
