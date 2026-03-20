@@ -733,7 +733,9 @@ fn build_zkvm_targets(
     build_options_module: *std.Build.Module,
     use_poseidon: bool,
 ) !void {
-    const optimize = .ReleaseSafe;
+    // zkvm targets (riscv32-freestanding-none) require ReleaseFast; ReleaseSafe
+    // triggers "invalid operand for inline asm constraint 'i'" in LLVM on riscv32.
+    const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
         const target_query = try std.Build.parseTargetQuery(.{ .arch_os_abi = zkvm_target.triplet, .cpu_features = zkvm_target.cpu_features });
