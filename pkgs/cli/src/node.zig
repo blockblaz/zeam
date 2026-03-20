@@ -130,6 +130,33 @@ pub const Node = struct {
 
     const Self = @This();
 
+    /// Closes the current database, wipes the on-disk rocksdb directory, and
+    /// reopens a fresh database at the same path.
+    ///
+    /// If `ignore_not_found` is true, `error.FileNotFound` from the directory
+    /// deletion is silently swallowed (used for first-run installs where the
+    /// db directory has never been created). Set it to false when wiping a db
+    /// that is known to exist (genesis time mismatch case).
+    fn wipeAndReopenDb(
+        db: *database.Db,
+        allocator: std.mem.Allocator,
+        database_path: []const u8,
+        logger_config: *LoggerConfig,
+        logger: zeam_utils.ModuleLogger,
+        ignore_not_found: bool,
+    ) !void {
+        db.deinit();
+        const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{database_path});
+        defer allocator.free(rocksdb_path);
+        std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+            if (!ignore_not_found or wipe_err != error.FileNotFound) {
+                logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                return wipe_err;
+            }
+        };
+        db.* = try database.Db.open(allocator, logger_config.logger(.database), database_path);
+    }
+
     pub fn init(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -201,14 +228,7 @@ pub const Node = struct {
                     local_finalized_state.config.genesis_time,
                     chain_config.genesis.genesis_time,
                 });
-                db.deinit();
-                const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
-                defer allocator.free(rocksdb_path);
-                std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
-                    self.logger.err("failed to delete stale database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
-                    return wipe_err;
-                };
-                db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, false);
                 self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
 
                 local_finalized_state.deinit();
@@ -218,17 +238,8 @@ pub const Node = struct {
             }
         } else |_| {
             self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
-            db.deinit();
-            const rocksdb_path_fresh = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{options.database_path});
-            defer allocator.free(rocksdb_path_fresh);
-            std.fs.deleteTreeAbsolute(rocksdb_path_fresh) catch |wipe_err| {
-                // Ignore NotFound — db may not exist yet, that is fine
-                if (wipe_err != error.FileNotFound) {
-                    self.logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path_fresh, wipe_err });
-                    return wipe_err;
-                }
-            };
-            db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+            // ignore_not_found=true: db dir may not exist yet on a fresh install
+            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, true);
             self.logger.info("starting fresh & generating genesis", .{});
             try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
         }
