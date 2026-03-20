@@ -71,6 +71,7 @@ pub const NodeCommand = struct {
     @"data-dir": []const u8 = constants.DEFAULT_DATA_DIR,
     @"checkpoint-sync-url": ?[]const u8 = null,
     @"is-aggregator": bool = false,
+    @"attestation-committee-count": ?u64 = null,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -91,6 +92,7 @@ pub const NodeCommand = struct {
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
         .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
+        .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .help = "Show help information for the node command",
     };
 };
@@ -484,7 +486,7 @@ fn mainInner() !void {
                 backend1 = network.getNetworkInterface();
                 backend2 = network.getNetworkInterface();
                 backend3 = network.getNetworkInterface();
-                logger1_config.logger(null).debug("--- mock gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
                 network1 = try allocator.create(networks.EthLibp2p);
                 const key_pair1 = enr_lib.KeyPair.generate();
@@ -554,7 +556,7 @@ fn mainInner() !void {
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {any}", .{backend1.gossip});
+                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);

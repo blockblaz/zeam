@@ -659,6 +659,7 @@ pub const BlockByRootRequest = struct {
 /// Canonical lightweight forkchoice proto block used across modules
 pub const ProtoBlock = struct {
     slot: Slot,
+    proposer_index: ValidatorIndex,
     blockRoot: Root,
     parentRoot: Root,
     stateRoot: Root,
