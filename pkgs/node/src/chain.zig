@@ -774,6 +774,9 @@ pub const BeamChain = struct {
 
                 // Import into forkchoice only if this node is configured as an aggregator
                 // and the attestation's subnet matches the configured aggregation subnets (if any).
+                // When no explicit subnet filter is set, trust the p2p subscription layer:
+                // node.zig already subscribes only to validator-derived subnets at libp2p level,
+                // so all received attestations are already on the correct subnets.
                 const should_import = blk: {
                     if (!self.is_aggregator_enabled) break :blk false;
                     if (self.aggregation_subnet_ids) |subnet_ids| {
@@ -786,16 +789,9 @@ pub const BeamChain = struct {
                         }
                         break :blk found;
                     }
-                    // Aggregator with no subnet filter: only import if the attestation's subnet
-                    // matches one of our registered validators' computed subnets.
-                    for (self.registered_validator_ids) |vid| {
-                        const my_subnet = types.computeSubnetId(
-                            @intCast(vid),
-                            self.config.spec.attestation_committee_count,
-                        ) catch continue;
-                        if (@as(u32, @intCast(my_subnet)) == signed_attestation.subnet_id) break :blk true;
-                    }
-                    break :blk false;
+                    // No explicit subnet filter — p2p subscription already ensures we only
+                    // receive attestations on our validator's subnets. Import everything.
+                    break :blk true;
                 };
 
                 if (should_import) {
