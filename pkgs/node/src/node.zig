@@ -126,7 +126,7 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .block => |signed_block| {
-                const block = signed_block.message.block;
+                const block = signed_block.message;
                 const parent_root = block.parent_root;
                 const hasParentBlock = self.chain.forkChoice.hasBlock(parent_root);
 
@@ -142,7 +142,7 @@ pub const BeamNode = struct {
 
                 // Compute block root first - needed for both caching and pending tracking
                 var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator) catch |err| {
+                zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator) catch |err| {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                     return;
                 };
@@ -213,7 +213,7 @@ pub const BeamNode = struct {
                     if (data.* == .block) {
                         const signed_block = data.block;
                         var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator)) |_| {
                             self.logger.info(
                                 "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
                                 .{&block_root},
@@ -227,7 +227,7 @@ pub const BeamNode = struct {
                 // based on whether we're already fetching the parent.
                 error.UnknownParentBlock => {
                     if (data.* == .block) {
-                        const block = data.block.message.block;
+                        const block = data.block.message;
                         const parent_root = block.parent_root;
                         if (self.network.hasPendingBlockRoot(parent_root)) {
                             self.logger.debug("gossip block validation deferred slot={d} parent=0x{x} (parent fetch in progress)", .{
@@ -248,17 +248,17 @@ pub const BeamNode = struct {
                     if (data.* == .block) {
                         const signed_block = data.block;
                         var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator)) |_| {
                             if (self.cacheFutureBlock(block_root, signed_block)) |_| {
                                 self.logger.debug(
                                     "cached future gossip block 0x{s} at slot {d}",
-                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
+                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.slot },
                                 );
                             } else |cache_err| {
                                 if (cache_err == CacheBlockError.PreFinalized) {
                                     self.logger.info(
                                         "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.block.slot },
+                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.message.slot },
                                     );
                                     _ = self.network.pruneCachedBlocks(block_root, null);
                                 } else {
@@ -345,7 +345,7 @@ pub const BeamNode = struct {
 
         var it = self.network.fetched_blocks.iterator();
         while (it.next()) |entry| {
-            const block_slot = entry.value_ptr.*.message.block.slot;
+            const block_slot = entry.value_ptr.*.message.slot;
             if (block_slot <= finalized.slot) {
                 roots_to_prune.append(self.allocator, entry.key_ptr.*) catch continue;
             }
@@ -465,7 +465,7 @@ pub const BeamNode = struct {
 
         var it = self.network.fetched_blocks.iterator();
         while (it.next()) |entry| {
-            const block = entry.value_ptr.*.message.block;
+            const block = entry.value_ptr.*.message;
             if (block.slot <= current_slot) {
                 const parent_root = block.parent_root;
                 if (self.chain.forkChoice.hasBlock(parent_root)) {
@@ -501,11 +501,11 @@ pub const BeamNode = struct {
     fn cacheBlockAndFetchParent(
         self: *Self,
         block_root: types.Root,
-        signed_block: types.SignedBlockWithAttestation,
+        signed_block: types.SignedBlock,
         depth: u32,
     ) CacheBlockError!types.Root {
         const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
-        const block_slot = signed_block.message.block.slot;
+        const block_slot = signed_block.message.slot;
 
         // Early rejection: don't cache blocks at or before finalized slot
         // These blocks will definitely be rejected during processing, so save memory
@@ -529,13 +529,13 @@ pub const BeamNode = struct {
         }
 
         // Allocate and clone the block
-        const block_ptr = self.allocator.create(types.SignedBlockWithAttestation) catch {
+        const block_ptr = self.allocator.create(types.SignedBlock) catch {
             return CacheBlockError.AllocationFailed;
         };
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, block_ptr) catch {
+        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
@@ -547,7 +547,7 @@ pub const BeamNode = struct {
         block_owned = false;
 
         // Fetch the parent block
-        const parent_root = signed_block.message.block.parent_root;
+        const parent_root = signed_block.message.parent_root;
         const roots = [_]types.Root{parent_root};
         self.fetchBlockByRoots(&roots, depth) catch {
             // Parent fetch failed - drop the cached block so we don't keep dangling entries.
@@ -561,10 +561,10 @@ pub const BeamNode = struct {
     fn cacheFutureBlock(
         self: *Self,
         block_root: types.Root,
-        signed_block: types.SignedBlockWithAttestation,
+        signed_block: types.SignedBlock,
     ) CacheBlockError!void {
         const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
-        const block_slot = signed_block.message.block.slot;
+        const block_slot = signed_block.message.slot;
 
         if (block_slot <= finalized_slot) {
             return CacheBlockError.PreFinalized;
@@ -583,13 +583,13 @@ pub const BeamNode = struct {
             return CacheBlockError.CachingFailed;
         }
 
-        const block_ptr = self.allocator.create(types.SignedBlockWithAttestation) catch {
+        const block_ptr = self.allocator.create(types.SignedBlock) catch {
             return CacheBlockError.AllocationFailed;
         };
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, block_ptr) catch {
+        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
@@ -600,9 +600,9 @@ pub const BeamNode = struct {
         block_owned = false;
     }
 
-    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlockWithAttestation) !void {
+    fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
         var block_root: types.Root = undefined;
-        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator)) |_| {
+        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator)) |_| {
             const current_depth = self.network.getPendingBlockRootDepth(block_root) orelse 0;
             const removed = self.network.removePendingBlockRoot(block_root);
             if (!removed) {
@@ -656,7 +656,7 @@ pub const BeamNode = struct {
                                 "block 0x{x} is pre-finalized (slot={d}), pruning cached descendants",
                                 .{
                                     &block_root,
-                                    signed_block.message.block.slot,
+                                    signed_block.message.slot,
                                 },
                             );
                             _ = self.network.pruneCachedBlocks(block_root, null);
@@ -851,7 +851,7 @@ pub const BeamNode = struct {
                         defer signed_block.deinit();
 
                         var response = networks.ReqRespResponse{ .blocks_by_root = undefined };
-                        try types.sszClone(self.allocator, types.SignedBlockWithAttestation, signed_block, &response.blocks_by_root);
+                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_root);
                         defer response.deinit();
 
                         try responder.sendResponse(&response);
@@ -1176,12 +1176,12 @@ pub const BeamNode = struct {
         }
     }
 
-    pub fn publishBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
-        const block = signed_block.message.block;
+    pub fn publishBlock(self: *Self, signed_block: types.SignedBlock) !void {
+        const block = signed_block.message;
 
         // 1. Process locally through chain so the produced block is confirmed and persisted.
         var block_root: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message.block, &block_root, self.allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
 
         // 2. need to add the signed proposer attestation in forkchoice even if block was locally produced
         //    TODO: might not be needed for locally produced block if we totally depend on the agggregators to serve us attestations
@@ -1342,12 +1342,14 @@ test "Node peer tracking on connect/disconnect" {
     var key_manager = try keymanager.getTestKeyManager(allocator, num_validators, 10);
     defer key_manager.deinit();
 
-    const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
-    defer allocator.free(pubkeys);
+    const all_pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+    defer allocator.free(all_pubkeys.attestation_pubkeys);
+    defer allocator.free(all_pubkeys.proposal_pubkeys);
 
     const genesis_config = types.GenesisSpec{
         .genesis_time = @intCast(std.time.timestamp()),
-        .validator_pubkeys = pubkeys,
+        .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
+        .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
     };
 
     var anchor_state: types.BeamState = undefined;
@@ -1482,51 +1484,29 @@ test "Node: fetched blocks cache and deduplication" {
     const root3: types.Root = [_]u8{3} ** 32;
 
     // Create simple blocks with minimal initialization
-    const block1_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    const block1_ptr = try allocator.create(types.SignedBlock);
     block1_ptr.* = .{
         .message = .{
-            .block = .{
-                .slot = 1,
-                .parent_root = ZERO_HASH,
-                .proposer_index = 0,
-                .state_root = ZERO_HASH,
-                .body = .{
-                    .attestations = try types.AggregatedAttestations.init(allocator),
-                },
-            },
-            .proposer_attestation = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = 1,
-                    .head = .{ .root = ZERO_HASH, .slot = 0 },
-                    .target = .{ .root = ZERO_HASH, .slot = 0 },
-                    .source = .{ .root = ZERO_HASH, .slot = 0 },
-                },
+            .slot = 1,
+            .parent_root = ZERO_HASH,
+            .proposer_index = 0,
+            .state_root = ZERO_HASH,
+            .body = .{
+                .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
         .signature = try types.createBlockSignatures(allocator, 0),
     };
 
-    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
+    const block2_ptr = try allocator.create(types.SignedBlock);
     block2_ptr.* = .{
         .message = .{
-            .block = .{
-                .slot = 2,
-                .parent_root = root1,
-                .proposer_index = 0,
-                .state_root = ZERO_HASH,
-                .body = .{
-                    .attestations = try types.AggregatedAttestations.init(allocator),
-                },
-            },
-            .proposer_attestation = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = 2,
-                    .head = .{ .root = ZERO_HASH, .slot = 0 },
-                    .target = .{ .root = ZERO_HASH, .slot = 0 },
-                    .source = .{ .root = ZERO_HASH, .slot = 0 },
-                },
+            .slot = 2,
+            .parent_root = root1,
+            .proposer_index = 0,
+            .state_root = ZERO_HASH,
+            .body = .{
+                .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
         .signature = try types.createBlockSignatures(allocator, 0),
@@ -1601,12 +1581,12 @@ test "Node: processCachedDescendants basic flow" {
     const block2 = mock_chain.blocks[2];
     const block1_root = mock_chain.blockRoots[1];
     const block2_root = mock_chain.blockRoots[2];
-    const block1_slot: usize = @intCast(block1.message.block.slot);
-    const block2_slot: usize = @intCast(block2.message.block.slot);
+    const block1_slot: usize = @intCast(block1.message.slot);
+    const block2_slot: usize = @intCast(block2.message.slot);
 
     // Cache block2 (which will fail to process because block1 is missing)
-    const block2_ptr = try allocator.create(types.SignedBlockWithAttestation);
-    try types.sszClone(allocator, types.SignedBlockWithAttestation, block2, block2_ptr);
+    const block2_ptr = try allocator.create(types.SignedBlock);
+    try types.sszClone(allocator, types.SignedBlock, block2, block2_ptr);
     try node.network.cacheFetchedBlock(block2_root, block2_ptr);
 
     // Verify block2 is cached
@@ -1639,29 +1619,18 @@ fn makeTestSignedBlockWithParent(
     allocator: std.mem.Allocator,
     slot: usize,
     parent_root: types.Root,
-) !*types.SignedBlockWithAttestation {
-    const block_ptr = try allocator.create(types.SignedBlockWithAttestation);
+) !*types.SignedBlock {
+    const block_ptr = try allocator.create(types.SignedBlock);
     errdefer allocator.destroy(block_ptr);
 
     block_ptr.* = .{
         .message = .{
-            .block = .{
-                .slot = slot,
-                .parent_root = parent_root,
-                .proposer_index = 0,
-                .state_root = types.ZERO_HASH,
-                .body = .{
-                    .attestations = try types.AggregatedAttestations.init(allocator),
-                },
-            },
-            .proposer_attestation = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = slot,
-                    .head = .{ .root = ZERO_HASH, .slot = 0 },
-                    .target = .{ .root = ZERO_HASH, .slot = 0 },
-                    .source = .{ .root = ZERO_HASH, .slot = 0 },
-                },
+            .slot = slot,
+            .parent_root = parent_root,
+            .proposer_index = 0,
+            .state_root = types.ZERO_HASH,
+            .body = .{
+                .attestations = try types.AggregatedAttestations.init(allocator),
             },
         },
         .signature = try types.createBlockSignatures(allocator, 0),
@@ -2107,18 +2076,14 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     });
     const produced_root = produced_block.blockRoot;
 
-    const proposer_attestation_data = try node.chain.constructAttestationData(.{ .slot = slot });
-    const proposer_attestation = types.Attestation{
-        .validator_id = validator_ids[0],
-        .data = proposer_attestation_data,
-    };
-    const proposer_signature = try ctx.key_manager.signAttestation(&proposer_attestation, allocator);
+    const proposer_signature = try ctx.key_manager.signBlockRoot(
+        validator_ids[0],
+        &produced_root,
+        @intCast(slot),
+    );
 
-    var signed_block = types.SignedBlockWithAttestation{
-        .message = .{
-            .block = produced_block.block,
-            .proposer_attestation = proposer_attestation,
-        },
+    var signed_block = types.SignedBlock{
+        .message = produced_block.block,
         .signature = .{
             .attestation_signatures = produced_block.attestation_signatures,
             .proposer_signature = proposer_signature,
@@ -2134,7 +2099,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     if (stored_block_opt) |stored_block_value| {
         var stored_block = stored_block_value;
         defer stored_block.deinit();
-        try std.testing.expectEqual(@as(usize, slot), stored_block.message.block.slot);
-        try std.testing.expect(std.mem.eql(u8, &stored_block.message.block.parent_root, &signed_block.message.block.parent_root));
+        try std.testing.expectEqual(@as(usize, slot), stored_block.message.slot);
+        try std.testing.expect(std.mem.eql(u8, &stored_block.message.parent_root, &signed_block.message.parent_root));
     }
 }

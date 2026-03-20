@@ -1677,8 +1677,20 @@ fn buildState(
                 const validator_obj = try expect.expectObjectValue(FixtureError, item, ctx, base_label);
 
                 var label_buf: [96]u8 = undefined;
-                const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
-                const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
+
+                // Support both old format (pubkey) and new devnet4 format (attestationPubkey + proposalPubkey)
+                const attestation_pubkey = if (validator_obj.get("attestationPubkey")) |_| blk: {
+                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
+                } else blk: {
+                    const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
+                };
+
+                const proposal_pubkey = if (validator_obj.get("proposalPubkey")) |_| blk: {
+                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
+                } else attestation_pubkey;
 
                 const validator_index: u64 = blk: {
                     if (validator_obj.get("index")) |index_value| {
@@ -1689,7 +1701,7 @@ fn buildState(
                     break :blk @as(u64, @intCast(idx));
                 };
 
-                validators.append(.{ .pubkey = pubkey, .index = validator_index }) catch |err| {
+                validators.append(.{ .attestation_pubkey = attestation_pubkey, .proposal_pubkey = proposal_pubkey, .index = validator_index }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ fixture_path, case_name, idx, @errorName(err) },
@@ -1770,12 +1782,16 @@ fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.Chai
 
     const validators_slice = state.validators.constSlice();
     const num_validators = validators_slice.len;
-    const pubkeys = try allocator.alloc(types.Bytes52, num_validators);
-    errdefer allocator.free(pubkeys);
+    const att_pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+    errdefer allocator.free(att_pubkeys);
+    const prop_pubkeys = try allocator.alloc(types.Bytes52, num_validators);
+    errdefer allocator.free(prop_pubkeys);
     for (validators_slice, 0..) |validator_info, idx| {
-        pubkeys[idx] = validator_info.pubkey;
+        att_pubkeys[idx] = validator_info.attestation_pubkey;
+        prop_pubkeys[idx] = validator_info.proposal_pubkey;
     }
-    chain_options.validator_pubkeys = pubkeys;
+    chain_options.validator_attestation_pubkeys = att_pubkeys;
+    chain_options.validator_proposal_pubkeys = prop_pubkeys;
 
     return configs.ChainConfig.init(configs.Chain.custom, chain_options) catch |err| {
         std.debug.print("spectest: unable to init chain config: {s}\n", .{@errorName(err)});
