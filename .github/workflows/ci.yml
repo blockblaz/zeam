@@ -379,7 +379,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: leanSpec/fixtures
-        key: ${{ runner.os }}-leanspec-${{ hashFiles('.gitmodules') }}
+        key: ${{ runner.os }}-leanspec-${{ hashFiles('leanSpec/**') }}
 
     - name: Install uv
       if: steps.cache-leanspec.outputs.cache-hit != 'true'
@@ -401,7 +401,6 @@ jobs:
 
   dummy-prove:
     name: Dummy prove
-    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
