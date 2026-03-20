@@ -50,6 +50,10 @@ pub const ChainOpts = struct {
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
     is_aggregator: bool = false,
+    /// Explicit subnet ids to aggregate gossip attestations from.
+    /// If non-null, only attestations on these subnets are imported into forkchoice.
+    /// If null, import is controlled solely by is_aggregator.
+    subnet_ids: ?[]const u32 = null,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -103,6 +107,8 @@ pub const BeamChain = struct {
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
     is_aggregator_enabled: bool,
+    /// Explicit subnet ids for attestation import filtering (null = import all subnets when aggregator).
+    aggregation_subnet_ids: ?[]const u32,
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -164,6 +170,7 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = opts.is_aggregator,
+            .aggregation_subnet_ids = opts.subnet_ids,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
@@ -765,17 +772,43 @@ pub const BeamChain = struct {
                     }
                 };
 
-                // Process validated attestation
-                self.onGossipAttestation(signed_attestation) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    self.logger.err("attestation processing error: {any}", .{err});
-                    return err;
+                // Import into forkchoice only if this node is configured as an aggregator
+                // and the attestation's subnet matches the configured aggregation subnets (if any).
+                const should_import = blk: {
+                    if (!self.is_aggregator_enabled) break :blk false;
+                    if (self.aggregation_subnet_ids) |subnet_ids| {
+                        var found = false;
+                        for (subnet_ids) |sid| {
+                            if (sid == signed_attestation.subnet_id) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        break :blk found;
+                    }
+                    // Aggregator with no subnet filter: import all.
+                    break :blk true;
                 };
-                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
-                    slot,
-                    validator_id,
-                    validator_node_name,
-                });
+
+                if (should_import) {
+                    // Process validated attestation
+                    self.onGossipAttestation(signed_attestation) catch |err| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                        self.logger.err("attestation processing error: {any}", .{err});
+                        return err;
+                    };
+                    self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                        slot,
+                        validator_id,
+                        validator_node_name,
+                    });
+                } else {
+                    self.logger.debug("skipping gossip attestation import (not aggregator or subnet mismatch): subnet={d} slot={d} validator={d}", .{
+                        signed_attestation.subnet_id,
+                        slot,
+                        validator_id,
+                    });
+                }
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },

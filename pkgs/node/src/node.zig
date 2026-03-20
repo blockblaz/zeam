@@ -40,6 +40,9 @@ const NodeOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
     is_aggregator: bool = false,
+    /// Explicit subnet ids to subscribe and aggregate. If non-null, overrides
+    /// automatic computation from validator ids for subscription purposes.
+    subnet_ids: ?[]const u32 = null,
 };
 
 pub const BeamNode = struct {
@@ -52,6 +55,8 @@ pub const BeamNode = struct {
     last_interval: isize,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Explicitly configured subnet ids for attestation subscription (may be null).
+    subnet_ids: ?[]const u32 = null,
 
     const Self = @This();
 
@@ -75,6 +80,7 @@ pub const BeamNode = struct {
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
+                .subnet_ids = opts.subnet_ids,
             },
             network.connected_peers,
         );
@@ -108,6 +114,7 @@ pub const BeamNode = struct {
             .last_interval = -1,
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
+            .subnet_ids = opts.subnet_ids,
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -1286,7 +1293,13 @@ pub const BeamNode = struct {
 
         const committee_count = self.chain.config.spec.attestation_committee_count;
         if (committee_count > 0) {
-            if (self.validator) |validator| {
+            if (self.subnet_ids) |explicit_subnets| {
+                // Explicit --subnet-ids provided: subscribe to exactly those subnets.
+                for (explicit_subnets) |subnet_id| {
+                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = subnet_id });
+                }
+            } else if (self.validator) |validator| {
+                // No explicit subnet list: compute subnets from registered validator ids.
                 var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
                 defer seen_subnets.deinit();
                 for (validator.ids) |validator_id| {
