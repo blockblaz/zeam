@@ -152,8 +152,7 @@ pub fn AggregateInnerMap(
     }
 
     var participants = try attestation.AggregationBits.init(allocator);
-    var participants_cleanup = true;
-    errdefer if (participants_cleanup) participants.deinit();
+    defer participants.deinit();
 
     const ValidatorEntry = struct {
         validator_id: utils.ValidatorIndex,
@@ -213,7 +212,6 @@ pub fn AggregateInnerMap(
         @intCast(att_data.slot),
         &proof,
     );
-    participants_cleanup = false;
 
     return proof;
 }
