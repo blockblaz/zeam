@@ -786,8 +786,16 @@ pub const BeamChain = struct {
                         }
                         break :blk found;
                     }
-                    // Aggregator with no subnet filter: import all.
-                    break :blk true;
+                    // Aggregator with no subnet filter: only import if the attestation's subnet
+                    // matches one of our registered validators' computed subnets.
+                    for (self.registered_validator_ids) |vid| {
+                        const my_subnet = types.computeSubnetId(
+                            @intCast(vid),
+                            self.config.spec.attestation_committee_count,
+                        ) catch continue;
+                        if (@as(u32, @intCast(my_subnet)) == signed_attestation.subnet_id) break :blk true;
+                    }
+                    break :blk false;
                 };
 
                 if (should_import) {
