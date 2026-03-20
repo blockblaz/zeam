@@ -1291,8 +1291,11 @@ pub const BeamNode = struct {
         try topics_list.append(self.allocator, .{ .kind = .block });
         try topics_list.append(self.allocator, .{ .kind = .aggregation });
 
+        // Only subscribe to attestation subnets if this node is an aggregator.
+        // Non-aggregator nodes never import gossip attestations so receiving
+        // them wastes network bandwidth; skip the subscription entirely.
         const committee_count = self.chain.config.spec.attestation_committee_count;
-        if (committee_count > 0) {
+        if (self.chain.is_aggregator_enabled and committee_count > 0) {
             // Both explicit --aggregate-subnet-ids and validator-derived subnets can apply;
             // collect all into a deduplication set first.
             var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
@@ -1317,7 +1320,8 @@ pub const BeamNode = struct {
                 }
             }
 
-            // If no subnets were added, keep parity with leanSpec: subscribe to subnet 0.
+            // If no subnets were added (aggregator but no explicit ids and no validators registered),
+            // fall back to subnet 0 to keep parity with leanSpec.
             if (seen_subnets.count() == 0) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
