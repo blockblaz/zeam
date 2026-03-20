@@ -1293,23 +1293,32 @@ pub const BeamNode = struct {
 
         const committee_count = self.chain.config.spec.attestation_committee_count;
         if (committee_count > 0) {
+            // Both explicit --aggregate-subnet-ids and validator-derived subnets can apply;
+            // collect all into a deduplication set first.
+            var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
+            defer seen_subnets.deinit();
+
+            // Subscribe to explicitly specified aggregate subnet ids (if provided).
             if (self.subnet_ids) |explicit_subnets| {
-                // Explicit --subnet-ids provided: subscribe to exactly those subnets.
                 for (explicit_subnets) |subnet_id| {
+                    if (seen_subnets.contains(subnet_id)) continue;
+                    try seen_subnets.put(subnet_id, {});
                     try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = subnet_id });
                 }
-            } else if (self.validator) |validator| {
-                // No explicit subnet list: compute subnets from registered validator ids.
-                var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
-                defer seen_subnets.deinit();
+            }
+
+            // Also subscribe to subnets derived from registered validator ids.
+            if (self.validator) |validator| {
                 for (validator.ids) |validator_id| {
                     const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                     if (seen_subnets.contains(@intCast(subnet_id))) continue;
                     try seen_subnets.put(@intCast(subnet_id), {});
                     try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
                 }
-            } else {
-                // Keep parity with leanSpec: passive nodes subscribe to subnet 0.
+            }
+
+            // If no subnets were added, keep parity with leanSpec: subscribe to subnet 0.
+            if (seen_subnets.count() == 0) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }

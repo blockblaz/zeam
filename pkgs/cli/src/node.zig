@@ -629,8 +629,8 @@ pub fn buildStartOptions(
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
 
-    // Parse --subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
-    if (node_cmd.@"subnet-ids") |subnet_ids_str| {
+    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
         var list: std.ArrayList(u32) = .empty;
         var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
         while (it.next()) |part| {
