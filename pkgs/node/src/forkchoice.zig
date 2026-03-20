@@ -858,6 +858,10 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn acceptNewAttestationsUnlocked(self: *Self) !ProtoBlock {
+        // Capture counts outside lock scope for metrics update
+        var known_payloads_count: usize = 0;
+        var new_payloads_count: usize = 0;
+        var payloads_updated = false;
         {
             // Keep payload migration synchronized with other signature/payload map writers.
             self.signatures_mutex.lock();
@@ -885,7 +889,16 @@ pub const ForkChoice = struct {
                     source_list.* = .empty;
                 }
                 self.latest_new_aggregated_payloads.clearAndFree();
+                // Capture counts for metrics update outside lock
+                known_payloads_count = self.latest_known_aggregated_payloads.count();
+                new_payloads_count = self.latest_new_aggregated_payloads.count();
+                payloads_updated = true;
             }
+        }
+        // Update fork-choice store gauges after promotion (outside lock scope)
+        if (payloads_updated) {
+            zeam_metrics.metrics.lean_latest_known_aggregated_payloads.set(@intCast(known_payloads_count));
+            zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
         }
 
         // Promote latestNew → latestKnown in attestation tracker.
@@ -1134,7 +1147,7 @@ pub const ForkChoice = struct {
         const validator_id = signed_attestation.validator_id;
         const attestation_slot = attestation_data.slot;
 
-        // Store gossip signature keyed by AttestationData for later aggregation
+        var gossip_signatures_count: usize = 0;
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
@@ -1143,7 +1156,10 @@ pub const ForkChoice = struct {
                 .slot = attestation_slot,
                 .signature = signed_attestation.signature,
             });
+            gossip_signatures_count = self.gossip_signatures.count();
         }
+        // Update metric outside lock scope
+        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_signatures_count));
 
         const attestation = types.Attestation{
             .validator_id = validator_id,
@@ -1233,10 +1249,14 @@ pub const ForkChoice = struct {
     }
 
     fn aggregateCommitteeSignaturesUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+        const aggregation_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = aggregation_timer.observe();
+
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
+        // Capture counts for metrics update outside lock scope
+        var new_payloads_count: usize = 0;
+        var gossip_sigs_count: usize = 0;
 
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
         errdefer {
@@ -1246,53 +1266,66 @@ pub const ForkChoice = struct {
             results.deinit(self.allocator);
         }
 
-        // Collect keys first to avoid modifying map during iteration
-        var att_data_keys: std.ArrayList(types.AttestationData) = .empty;
-        defer att_data_keys.deinit(self.allocator);
-
         {
-            var it = self.gossip_signatures.iterator();
-            while (it.next()) |entry| {
-                try att_data_keys.append(self.allocator, entry.key_ptr.*);
-            }
-        }
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
 
-        for (att_data_keys.items) |att_data| {
-            const inner_map_ptr = self.gossip_signatures.getPtr(att_data) orelse continue;
-
-            var proof = try types.aggregateInnerMap(self.allocator, inner_map_ptr, att_data, &state.validators);
-            errdefer proof.deinit();
-
-            // Store proof keyed by AttestationData
-            const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
-            }
+            // Collect keys first to avoid modifying map during iteration
+            var att_data_keys: std.ArrayList(types.AttestationData) = .empty;
+            defer att_data_keys.deinit(self.allocator);
 
             {
-                var cloned_proof: types.AggregatedSignatureProof = undefined;
-                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-                errdefer cloned_proof.deinit();
-                try gop.value_ptr.append(self.allocator, .{
-                    .slot = att_data.slot,
-                    .proof = cloned_proof,
-                });
+                var it = self.gossip_signatures.iterator();
+                while (it.next()) |entry| {
+                    try att_data_keys.append(self.allocator, entry.key_ptr.*);
+                }
             }
 
-            // Align with leanSpec: once signatures for this data are represented by an
-            // aggregated payload, remove the whole inner map to prevent re-aggregation.
-            self.gossip_signatures.removeAndDeinit(att_data);
+            for (att_data_keys.items) |att_data| {
+                const inner_map_ptr = self.gossip_signatures.getPtr(att_data) orelse continue;
 
-            var output_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
-            errdefer output_proof.deinit();
-            try results.append(self.allocator, .{
-                .data = att_data,
-                .proof = output_proof,
-            });
+                var proof = try types.aggregateInnerMap(self.allocator, inner_map_ptr, att_data, &state.validators);
+                errdefer proof.deinit();
 
-            proof.deinit();
+                // Store proof keyed by AttestationData
+                const gop = try self.latest_new_aggregated_payloads.getOrPut(att_data);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+
+                {
+                    var cloned_proof: types.AggregatedSignatureProof = undefined;
+                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+                    errdefer cloned_proof.deinit();
+                    try gop.value_ptr.append(self.allocator, .{
+                        .slot = att_data.slot,
+                        .proof = cloned_proof,
+                    });
+                }
+
+                // Align with leanSpec: once signatures for this data are represented by an
+                // aggregated payload, remove the whole inner map to prevent re-aggregation.
+                self.gossip_signatures.removeAndDeinit(att_data);
+
+                var output_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
+                errdefer output_proof.deinit();
+                try results.append(self.allocator, .{
+                    .data = att_data,
+                    .proof = output_proof,
+                });
+
+                proof.deinit();
+            }
+
+            // Capture counts before lock is released
+            new_payloads_count = self.latest_new_aggregated_payloads.count();
+            gossip_sigs_count = self.gossip_signatures.count();
         }
+
+        // Update fork-choice store gauges after aggregation (outside lock scope)
+        zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
+        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_sigs_count));
 
         return results.toOwnedSlice(self.allocator);
     }

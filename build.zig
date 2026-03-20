@@ -733,6 +733,8 @@ fn build_zkvm_targets(
     build_options_module: *std.Build.Module,
     use_poseidon: bool,
 ) !void {
+    // zkvm targets (riscv32-freestanding-none) require ReleaseFast; ReleaseSafe
+    // triggers "invalid operand for inline asm constraint 'i'" in LLVM on riscv32.
     const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
