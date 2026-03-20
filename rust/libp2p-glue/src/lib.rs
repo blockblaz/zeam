@@ -464,12 +464,8 @@ pub unsafe fn send_rpc_response_chunk(
     let response_bytes = response_slice.to_vec();
 
     let channel = {
-        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-        let channel = response_map.get(&channel_id).cloned();
-        if channel.is_some() {
-            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-        }
-        channel
+        let response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        response_map.get(&channel_id).cloned()
     };
 
     if let Some(channel) = channel {
@@ -484,6 +480,11 @@ pub unsafe fn send_rpc_response_chunk(
                 response_message,
             },
         ) {
+            // Update the idle timeout only after successful enqueue — updating eagerly
+            // before try_send would refresh the expiry even if the command was dropped
+            // (e.g. channel full), holding resources longer than intended.
+            let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+            _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
             logger::rustLogger.info(
                 network_id,
                 &format!(
