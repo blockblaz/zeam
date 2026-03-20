@@ -44,12 +44,16 @@ const Metrics = struct {
     lean_attestations_valid_total: ForkChoiceAttestationsValidLabeledCounter,
     lean_attestations_invalid_total: ForkChoiceAttestationsInvalidLabeledCounter,
     lean_attestation_validation_time_seconds: ForkChoiceAttestationValidationTimeHistogram,
-    lean_pq_signature_attestation_signing_time_seconds: PQSignatureSigningHistogram,
-    lean_pq_signature_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
+    // Individual attestation signature metrics (renamed to match spec)
+    lean_pq_sig_attestation_signing_time_seconds: PQSignatureSigningHistogram,
+    lean_pq_sig_attestation_verification_time_seconds: PQSignatureVerificationHistogram,
+    lean_pq_sig_attestation_signatures_total: PQSigAttestationSignaturesTotalCounter,
+    lean_pq_sig_attestation_signatures_valid_total: PQSigAttestationSignaturesValidCounter,
+    lean_pq_sig_attestation_signatures_invalid_total: PQSigAttestationSignaturesInvalidCounter,
     // Aggregated attestation signature metrics
     lean_pq_sig_aggregated_signatures_total: PQSigAggregatedSignaturesTotalCounter,
     lean_pq_sig_attestations_in_aggregated_signatures_total: PQSigAttestationsInAggregatedTotalCounter,
-    lean_pq_sig_attestation_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
+    lean_pq_sig_aggregated_signatures_building_time_seconds: PQSigBuildingTimeHistogram,
     lean_pq_sig_aggregated_signatures_verification_time_seconds: PQSigAggregatedVerificationHistogram,
     lean_pq_sig_aggregated_signatures_valid_total: PQSigAggregatedValidCounter,
     lean_pq_sig_aggregated_signatures_invalid_total: PQSigAggregatedInvalidCounter,
@@ -67,6 +71,16 @@ const Metrics = struct {
     lean_fork_choice_reorg_depth: LeanForkChoiceReorgDepthHistogram,
     // Finalization metrics
     lean_finalizations_total: LeanFinalizationsTotalCounter,
+    // Fork-choice store gauges
+    lean_gossip_signatures: LeanGossipSignaturesGauge,
+    lean_latest_new_aggregated_payloads: LeanLatestNewAggregatedPayloadsGauge,
+    lean_latest_known_aggregated_payloads: LeanLatestKnownAggregatedPayloadsGauge,
+    // Committee aggregation histogram
+    lean_committee_signatures_aggregation_time_seconds: CommitteeSignaturesAggregationHistogram,
+    // Validator status gauges
+    lean_is_aggregator: LeanIsAggregatorGauge,
+    lean_attestation_committee_subnet: LeanAttestationCommitteeSubnetGauge,
+    lean_attestation_committee_count: LeanAttestationCommitteeCountGauge,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -82,15 +96,19 @@ const Metrics = struct {
     const SlotsProcessedCounter = metrics_lib.Counter(u64);
     const AttestationsProcessedCounter = metrics_lib.Counter(u64);
     const LeanValidatorsCountGauge = metrics_lib.Gauge(u64);
-    const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1, 1.25, 1.5, 2, 4 });
     const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    // Individual attestation signature metric types
+    const PQSigAttestationSignaturesTotalCounter = metrics_lib.Counter(u64);
+    const PQSigAttestationSignaturesValidCounter = metrics_lib.Counter(u64);
+    const PQSigAttestationSignaturesInvalidCounter = metrics_lib.Counter(u64);
     // Aggregated attestation signature metric types
     const PQSigAggregatedSignaturesTotalCounter = metrics_lib.Counter(u64);
     const PQSigAttestationsInAggregatedTotalCounter = metrics_lib.Counter(u64);
-    const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
-    const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
+    const PQSigBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
+    const PQSigAggregatedVerificationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 });
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
     // Network peer metric types
@@ -107,6 +125,16 @@ const Metrics = struct {
     const LeanForkChoiceReorgDepthHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 });
     // Finalization metric types
     const LeanFinalizationsTotalCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    // Fork-choice store gauge types
+    const LeanGossipSignaturesGauge = metrics_lib.Gauge(u64);
+    const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
+    const LeanLatestKnownAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
+    // Committee aggregation histogram type
+    const CommitteeSignaturesAggregationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
+    // Validator status gauge types
+    const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
+    const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
+    const LeanAttestationCommitteeCountGauge = metrics_lib.Gauge(u64);
 };
 
 /// Timer struct returned to the application.
@@ -215,6 +243,12 @@ fn observePQSigAggregatedVerification(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeCommitteeSignaturesAggregation(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.CommitteeSignaturesAggregationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -250,21 +284,25 @@ pub var lean_attestation_validation_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeFCAttestationValidationTimeHistogram,
 };
-pub var lean_pq_signature_attestation_signing_time_seconds: Histogram = .{
+pub var lean_pq_sig_attestation_signing_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSignatureAttestationSigning,
 };
-pub var lean_pq_signature_attestation_verification_time_seconds: Histogram = .{
+pub var lean_pq_sig_attestation_verification_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSignatureAttestationVerification,
 };
-pub var lean_pq_sig_attestation_signatures_building_time_seconds: Histogram = .{
+pub var lean_pq_sig_aggregated_signatures_building_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSigBuildingTime,
 };
 pub var lean_pq_sig_aggregated_signatures_verification_time_seconds: Histogram = .{
     .context = null,
     .observe = &observePQSigAggregatedVerification,
+};
+pub var lean_committee_signatures_aggregation_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeCommitteeSignaturesAggregation,
 };
 
 /// Initializes the metrics system. Must be called once at startup.
@@ -295,12 +333,16 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip or block)." }, .{}),
         .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip or block)." }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
-        .lean_pq_signature_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_signature_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
-        .lean_pq_signature_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_signature_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
+        // Individual attestation signature metrics (renamed to match spec)
+        .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
+        .lean_pq_sig_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_sig_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
+        .lean_pq_sig_attestation_signatures_total = Metrics.PQSigAttestationSignaturesTotalCounter.init("lean_pq_sig_attestation_signatures_total", .{ .help = "Total number of individual attestation signatures." }, .{}),
+        .lean_pq_sig_attestation_signatures_valid_total = Metrics.PQSigAttestationSignaturesValidCounter.init("lean_pq_sig_attestation_signatures_valid_total", .{ .help = "Total number of valid individual attestation signatures." }, .{}),
+        .lean_pq_sig_attestation_signatures_invalid_total = Metrics.PQSigAttestationSignaturesInvalidCounter.init("lean_pq_sig_attestation_signatures_invalid_total", .{ .help = "Total number of invalid individual attestation signatures." }, .{}),
         // Aggregated attestation signature metrics
         .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures." }, .{}),
         .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures." }, .{}),
-        .lean_pq_sig_attestation_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_attestation_signatures_building_time_seconds", .{ .help = "Time taken to build aggregated attestation signatures." }, .{}),
+        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Time taken to build an aggregated attestation signature." }, .{}),
         .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature." }, .{}),
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures." }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures." }, .{}),
@@ -318,10 +360,28 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_fork_choice_reorg_depth = Metrics.LeanForkChoiceReorgDepthHistogram.init("lean_fork_choice_reorg_depth", .{ .help = "Depth of fork choice reorgs in blocks." }, .{}),
         // Finalization metrics
         .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total finalization attempts by result." }, .{}),
+        // Fork-choice store gauges
+        .lean_gossip_signatures = Metrics.LeanGossipSignaturesGauge.init("lean_gossip_signatures", .{ .help = "Number of gossip signatures in fork-choice store." }, .{}),
+        .lean_latest_new_aggregated_payloads = Metrics.LeanLatestNewAggregatedPayloadsGauge.init("lean_latest_new_aggregated_payloads", .{ .help = "Number of new aggregated payload items." }, .{}),
+        .lean_latest_known_aggregated_payloads = Metrics.LeanLatestKnownAggregatedPayloadsGauge.init("lean_latest_known_aggregated_payloads", .{ .help = "Number of known aggregated payload items." }, .{}),
+        // Committee aggregation histogram
+        .lean_committee_signatures_aggregation_time_seconds = Metrics.CommitteeSignaturesAggregationHistogram.init("lean_committee_signatures_aggregation_time_seconds", .{ .help = "Time taken to aggregate committee signatures." }, .{}),
+        // Validator status gauges
+        .lean_is_aggregator = Metrics.LeanIsAggregatorGauge.init("lean_is_aggregator", .{ .help = "Validator's is_aggregator status. True=1, False=0." }, .{}),
+        .lean_attestation_committee_subnet = Metrics.LeanAttestationCommitteeSubnetGauge.init("lean_attestation_committee_subnet", .{ .help = "Node's attestation committee subnet." }, .{}),
+        .lean_attestation_committee_count = Metrics.LeanAttestationCommitteeCountGauge.init("lean_attestation_committee_count", .{ .help = "Number of attestation committees." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
     metrics.lean_validators_count.set(0);
+    // Initialize committee-related gauges to 0 (placeholder until subnet logic is implemented)
+    metrics.lean_is_aggregator.set(0);
+    metrics.lean_attestation_committee_subnet.set(0);
+    metrics.lean_attestation_committee_count.set(0);
+    // Initialize fork-choice store gauges to 0
+    metrics.lean_gossip_signatures.set(0);
+    metrics.lean_latest_new_aggregated_payloads.set(0);
+    metrics.lean_latest_known_aggregated_payloads.set(0);
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     chain_onblock_duration_seconds.context = @ptrCast(&metrics.chain_onblock_duration_seconds);
@@ -332,10 +392,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_state_transition_attestations_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_attestations_processing_time_seconds);
     lean_fork_choice_block_processing_time_seconds.context = @ptrCast(&metrics.lean_fork_choice_block_processing_time_seconds);
     lean_attestation_validation_time_seconds.context = @ptrCast(&metrics.lean_attestation_validation_time_seconds);
-    lean_pq_signature_attestation_signing_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_signing_time_seconds);
-    lean_pq_signature_attestation_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_signature_attestation_verification_time_seconds);
-    lean_pq_sig_attestation_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_signatures_building_time_seconds);
+    lean_pq_sig_attestation_signing_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_signing_time_seconds);
+    lean_pq_sig_attestation_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_attestation_verification_time_seconds);
+    lean_pq_sig_aggregated_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_building_time_seconds);
     lean_pq_sig_aggregated_signatures_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds);
+    lean_committee_signatures_aggregation_time_seconds.context = @ptrCast(&metrics.lean_committee_signatures_aggregation_time_seconds);
 
     g_initialized = true;
 }
