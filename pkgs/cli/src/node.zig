@@ -88,6 +88,9 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
+    /// Explicitly specified subnet ids to subscribe and aggregate.
+    /// If non-null, overrides automatic computation from validator ids.
+    subnet_ids: ?[]u32 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -98,6 +101,7 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_assignments);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
+        if (self.subnet_ids) |ids| allocator.free(ids);
         self.node_registry.deinit();
         allocator.destroy(self.node_registry);
     }
@@ -298,6 +302,7 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
+            .subnet_ids = options.subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
@@ -634,6 +639,28 @@ pub fn buildStartOptions(
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+
+    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
+    if (node_cmd.@"aggregate-subnet-ids" != null and !node_cmd.@"is-aggregator") {
+        std.log.err("--aggregate-subnet-ids requires --is-aggregator to be set", .{});
+        return error.AggregateSubnetIdsRequiresIsAggregator;
+    }
+    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
+        var list: std.ArrayList(u32) = .empty;
+        var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " ");
+            if (trimmed.len == 0) continue;
+            const id = std.fmt.parseInt(u32, trimmed, 10) catch |err| {
+                std.log.warn("invalid subnet id '{s}': {any}", .{ trimmed, err });
+                list.deinit(allocator);
+                return error.InvalidSubnetId;
+            };
+            try list.append(allocator, id);
+        }
+        opts.subnet_ids = try list.toOwnedSlice(allocator);
+    }
 
     // Resolve attestation_committee_count: CLI flag takes precedence over config.yaml.
     if (node_cmd.@"attestation-committee-count") |count| {
