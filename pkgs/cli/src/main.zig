@@ -307,6 +307,8 @@ fn mainInner() !void {
                     .risc0 => break :blk .{ .risc0 = .{ .program_path = "zig-out/bin/risc0_runtime.elf" } },
                     .powdr => return error.PowdrIsDeprecated,
                     .openvm => break :blk .{ .openvm = .{ .program_path = "zig-out/bin/zeam-stf-openvm", .result_path = "/tmp/openvm-results" } },
+                    .sp1 => break :blk .{ .sp1 = .{ .program_path = "zig-out/bin/zeam-stf-sp1" } },
+                    .ziren => break :blk .{ .ziren = .{ .program_path = "zig-out/bin/zeam-stf-ziren" } },
                     .dummy => break :blk .{ .dummy = .{} },
                 },
                 .logger = logger,
