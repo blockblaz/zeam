@@ -77,7 +77,75 @@ jobs:
     - name: Lint
       run: zig fmt --check .
 
+  deps:
+    name: deps
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.15.2
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
+          ${{ runner.os }}-zig-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        shared-key: ci
+
+    - name: Fetch Zig dependencies
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All fetch attempts failed"
+        exit 1
+
+    - name: Build Rust FFI libraries
+      run: cargo +nightly -C rust -Z unstable-options build --release -p libp2p-glue -p hashsig-glue -p multisig-glue
+
+    - name: Build all (warms Zig cache including RocksDB)
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build all; then
+            echo "Successfully built on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All build attempts failed"
+        exit 1
+
   build:
+    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -222,6 +290,7 @@ jobs:
 
   test:
     name: test
+    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -332,6 +401,7 @@ jobs:
 
   dummy-prove:
     name: Dummy prove
+    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
