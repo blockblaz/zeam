@@ -178,8 +178,9 @@ pub const Node = struct {
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
         chain_options.genesis_time = options.genesis_spec.genesis_time;
 
-        // Set validator_pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
-        chain_options.validator_pubkeys = options.genesis_spec.validator_pubkeys;
+        // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
+        chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
+        chain_options.validator_proposal_pubkeys = options.genesis_spec.validator_proposal_pubkeys;
 
         // Apply attestation_committee_count if provided via CLI flag or config.yaml.
         // ChainConfig.init falls back to 1 when this field is null, so we only override when set.
@@ -517,14 +518,27 @@ pub const Node = struct {
             const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
             defer self.allocator.free(pk_path);
 
-            var keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+            var attestation_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
                 error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
                 error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            errdefer keypair.deinit();
+            errdefer attestation_keypair.deinit();
 
-            try self.key_manager.addKeypair(assignment.index, keypair);
+            // TODO: load separate proposal key files when available
+            var proposal_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            errdefer proposal_keypair.deinit();
+
+            const validator_keys = key_manager_lib.ValidatorKeys{
+                .attestation_keypair = attestation_keypair,
+                .proposal_keypair = proposal_keypair,
+            };
+
+            try self.key_manager.addKeypair(assignment.index, validator_keys);
         }
     }
 };
@@ -770,10 +784,15 @@ fn verifyCheckpointState(
 
     // Verify each validator pubkey matches genesis config
     const state_validators = state.validators.constSlice();
-    for (genesis_spec.validator_pubkeys, 0..) |expected_pubkey, i| {
-        const actual_pubkey = state_validators[i].pubkey;
-        if (!std.mem.eql(u8, &expected_pubkey, &actual_pubkey)) {
-            logger.err("checkpoint state verification failed: validator pubkey mismatch at index {d}", .{i});
+    for (genesis_spec.validator_attestation_pubkeys, genesis_spec.validator_proposal_pubkeys, 0..) |expected_att_pubkey, expected_prop_pubkey, i| {
+        const actual_att_pubkey = state_validators[i].attestation_pubkey;
+        if (!std.mem.eql(u8, &expected_att_pubkey, &actual_att_pubkey)) {
+            logger.err("checkpoint state verification failed: attestation pubkey mismatch at index {d}", .{i});
+            return error.ValidatorPubkeyMismatch;
+        }
+        const actual_prop_pubkey = state_validators[i].proposal_pubkey;
+        if (!std.mem.eql(u8, &expected_prop_pubkey, &actual_prop_pubkey)) {
+            logger.err("checkpoint state verification failed: proposal pubkey mismatch at index {d}", .{i});
             return error.ValidatorPubkeyMismatch;
         }
     }
@@ -1242,7 +1261,8 @@ test "configs yaml parsing" {
     var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
     defer config_file.deinit(std.testing.allocator);
     const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
-    defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
+    defer std.testing.allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer std.testing.allocator.free(genesis_spec.validator_proposal_pubkeys);
     try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
     try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
 
@@ -1346,7 +1366,8 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
 
     // Parse genesis config from YAML
     const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
-    defer allocator.free(genesis_spec.validator_pubkeys);
+    defer allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer allocator.free(genesis_spec.validator_proposal_pubkeys);
 
     // Generate genesis state
     var genesis_state: types.BeamState = undefined;
@@ -1375,7 +1396,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     // Verify the state root matches the expected value
     const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&state_root_from_genesis});
     defer allocator.free(state_root_from_genesis_hex);
-    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0x228ecb2f88891fab88a05a104ccac95f1513e138d53469340b9ce04f70fa1019");
 }
 
 test "populateNodeNameRegistry" {
@@ -1446,9 +1467,11 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     // Create a minimal genesis spec for testing
     const genesis_spec = types.GenesisSpec{
         .genesis_time = 1000,
-        .validator_pubkeys = try allocator.alloc(types.Bytes52, 0),
+        .validator_attestation_pubkeys = try allocator.alloc(types.Bytes52, 0),
+        .validator_proposal_pubkeys = try allocator.alloc(types.Bytes52, 0),
     };
-    defer allocator.free(genesis_spec.validator_pubkeys);
+    defer allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer allocator.free(genesis_spec.validator_proposal_pubkeys);
 
     var node_options = NodeOptions{
         .network_id = 0,

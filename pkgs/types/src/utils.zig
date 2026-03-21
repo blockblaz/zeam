@@ -172,14 +172,16 @@ pub const RootToSlotCache = struct {
 
 pub const GenesisSpec = struct {
     genesis_time: u64,
-    validator_pubkeys: []const Bytes52,
+    validator_attestation_pubkeys: []const Bytes52,
+    validator_proposal_pubkeys: []const Bytes52,
 
     pub fn deinit(self: *GenesisSpec, allocator: Allocator) void {
-        allocator.free(self.validator_pubkeys);
+        allocator.free(self.validator_attestation_pubkeys);
+        allocator.free(self.validator_proposal_pubkeys);
     }
 
     pub fn numValidators(self: *const GenesisSpec) u64 {
-        return @intCast(self.validator_pubkeys.len);
+        return @intCast(self.validator_attestation_pubkeys.len);
     }
 };
 pub const ChainSpec = struct {

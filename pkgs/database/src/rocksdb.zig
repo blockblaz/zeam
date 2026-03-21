@@ -220,7 +220,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 self: *WriteBatch,
                 comptime cn: ColumnNamespace,
                 block_root: types.Root,
-                block: types.SignedBlockWithAttestation,
+                block: types.SignedBlock,
             ) void {
                 const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                     self.logger.err("failed to format block key for putBlock: {any}", .{err});
@@ -229,7 +229,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 defer self.allocator.free(key);
 
                 self.putToBatch(
-                    types.SignedBlockWithAttestation,
+                    types.SignedBlock,
                     key,
                     block,
                     cn,
@@ -477,7 +477,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Save a block to the database
-        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlockWithAttestation) void {
+        pub fn saveBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root, block: types.SignedBlock) void {
             const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                 self.logger.err("failed to format block key for saveBlock: {any}", .{err});
                 return;
@@ -485,7 +485,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             self.saveToDatabase(
-                types.SignedBlockWithAttestation,
+                types.SignedBlock,
                 key,
                 block,
                 cn,
@@ -495,7 +495,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
         }
 
         /// Load a block from the database
-        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlockWithAttestation {
+        pub fn loadBlock(self: *Self, comptime cn: ColumnNamespace, block_root: types.Root) ?types.SignedBlock {
             const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
                 self.logger.err("failed to format block key for loadBlock: {any}", .{err});
                 return null;
@@ -503,7 +503,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             defer self.allocator.free(key);
 
             return self.loadFromDatabase(
-                types.SignedBlockWithAttestation,
+                types.SignedBlock,
                 key,
                 cn,
                 "loaded block from database: root=0x{x}",
@@ -1014,13 +1014,13 @@ test "save and load block" {
     const loaded = loaded_block.?.message;
 
     // Verify all block fields match
-    try std.testing.expect(loaded.block.slot == signed_block.message.block.slot);
-    try std.testing.expect(loaded.block.proposer_index == signed_block.message.block.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded.block.parent_root, &signed_block.message.block.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded.block.state_root, &signed_block.message.block.state_root));
+    try std.testing.expect(loaded.slot == signed_block.message.slot);
+    try std.testing.expect(loaded.proposer_index == signed_block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &signed_block.message.state_root));
 
     // Verify attestations list is empty as expected
-    try std.testing.expect(loaded.block.body.attestations.len() == 0);
+    try std.testing.expect(loaded.body.attestations.len() == 0);
 
     // Verify attestation signatures count matches
     const signature_proofs = loaded_block.?.signature.attestation_signatures;
@@ -1138,10 +1138,10 @@ test "batch write and commit" {
     try std.testing.expect(loaded_block != null);
 
     const loaded_block_data = loaded_block.?.message;
-    try std.testing.expect(loaded_block_data.block.slot == signed_block.message.block.slot);
-    try std.testing.expect(loaded_block_data.block.proposer_index == signed_block.message.block.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.parent_root, &signed_block.message.block.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.block.state_root, &signed_block.message.block.state_root));
+    try std.testing.expect(loaded_block_data.slot == signed_block.message.slot);
+    try std.testing.expect(loaded_block_data.proposer_index == signed_block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.message.state_root));
 
     // Verify attestation signatures count matches
     const batch_signature_proofs = loaded_block.?.signature.attestation_signatures;
