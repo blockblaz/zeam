@@ -1010,7 +1010,8 @@ pub const EthLibp2p = struct {
         self.rpcCallbacks.deinit(self.allocator);
     }
 
-    pub fn run(self: *Self) !void {
+    pub fn run(self: *Self, subscribe_subnet_ids: []u32) !void {
+        _ = subscribe_subnet_ids;
         const listen_addresses_str = try multiaddrsToString(self.allocator, self.params.listen_addresses);
         const connect_peers_str = if (self.params.connect_peers) |peers|
             try multiaddrsToString(self.allocator, peers)

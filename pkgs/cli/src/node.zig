@@ -79,6 +79,8 @@ pub const NodeOptions = struct {
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
     is_aggregator: bool,
+    /// If aggregator, additional subnet ids to import and aggregate
+    aggregation_subnet_ids: ?[]u32 = null,
     api_port: u16,
     metrics_port: u16,
     local_priv_key: []const u8,
@@ -88,9 +90,6 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
-    /// Explicitly specified subnet ids to subscribe and aggregate.
-    /// If non-null, overrides automatic computation from validator ids.
-    subnet_ids: ?[]u32 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -101,7 +100,7 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_assignments);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
-        if (self.subnet_ids) |ids| allocator.free(ids);
+        if (self.aggregation_subnet_ids) |ids| allocator.free(ids);
         self.node_registry.deinit();
         allocator.destroy(self.node_registry);
     }
@@ -131,6 +130,9 @@ pub const Node = struct {
     api_server_handle: ?*api_server.ApiServer,
     metrics_server_handle: ?*metrics_server.MetricsServer,
     anchor_state: *types.BeamState,
+    // all subnets subscribed to including those of validators and aggregation
+    // if node is aggregator it will aggregate across all these subnets
+    subscription_subnet_ids: []u32,
 
     const Self = @This();
 
@@ -272,6 +274,12 @@ pub const Node = struct {
         const validator_ids = try options.getValidatorIndices(allocator);
         errdefer allocator.free(validator_ids);
 
+        var subscription_subnet_list: std.ArrayList(u32) = .empty;
+        // fill this list with unique subnets computed from validator_ids plus aggregation_subnet_ids from options
+
+        // store the subnet ids to subscribe later when network is run
+        self.subscription_subnet_ids = try subscription_subnet_list.toOwnedSlice(allocator);
+
         // Initialize metrics BEFORE beam_node so that metrics set during
         // initialization (like lean_validators_count) are captured on real
         // metrics instead of being discarded by noop metrics.
@@ -291,7 +299,6 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
-            .subnet_ids = options.subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
@@ -363,7 +370,7 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run();
+        try self.network.run(self.subscribe_subnet_ids);
         try self.beam_node.run();
 
         const ascii_art =
@@ -629,13 +636,13 @@ pub fn buildStartOptions(
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
 
-    // Parse --import-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
-    // Require --is-aggregator to be set when --import-subnet-ids is provided.
-    if (node_cmd.@"import-subnet-ids" != null and !node_cmd.@"is-aggregator") {
-        std.log.err("--import-subnet-ids requires --is-aggregator to be set", .{});
+    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
+    if (node_cmd.@"aggregate-subnet-ids" != null and !node_cmd.@"is-aggregator") {
+        std.log.err("--aggregate-subnet-ids requires --is-aggregator to be set", .{});
         return error.AggregateSubnetIdsRequiresIsAggregator;
     }
-    if (node_cmd.@"import-subnet-ids") |subnet_ids_str| {
+    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
         var list: std.ArrayList(u32) = .empty;
         var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
         while (it.next()) |part| {
@@ -648,7 +655,7 @@ pub fn buildStartOptions(
             };
             try list.append(allocator, id);
         }
-        opts.subnet_ids = try list.toOwnedSlice(allocator);
+        opts.aggregation_subnet_ids = try list.toOwnedSlice(allocator);
     }
 
     // Resolve attestation_committee_count: CLI flag takes precedence over config.yaml.
