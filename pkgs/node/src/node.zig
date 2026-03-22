@@ -81,7 +81,6 @@ pub const BeamNode = struct {
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
-                .subnet_ids = opts.subnet_ids,
             },
             network.connected_peers,
         );

@@ -367,10 +367,11 @@ pub const Node = struct {
         event_broadcaster.deinitGlobalBroadcaster();
         self.anchor_state.deinit();
         self.allocator.destroy(self.anchor_state);
+        self.allocator.free(self.subscription_subnet_ids);
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run(self.subscribe_subnet_ids);
+        try self.network.run(self.subscription_subnet_ids);
         try self.beam_node.run();
 
         const ascii_art =
