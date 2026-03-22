@@ -666,7 +666,7 @@ fn mainInner() !void {
 
                     // Start network FIRST so node3 joins fresh without pre-cached gossip blocks
                     if (self.network) |net| {
-                        try net.run();
+                        try net.run(&.{});
                     }
 
                     try self.beam_node.run();
@@ -695,8 +695,8 @@ fn mainInner() !void {
             try clock.subscribeOnSlot(delayed_cb);
 
             if (!mock_network) {
-                try network1.run();
-                try network2.run();
+                try network1.run(&.{});
+                try network2.run(&.{});
                 // network3.run() is called in DelayedNodeRunner.onInterval
                 // to ensure node3 joins fresh without pre-cached gossip blocks
             }
