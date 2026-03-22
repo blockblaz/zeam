@@ -108,7 +108,7 @@ pub const BeamChain = struct {
     force_block_production: bool,
     is_aggregator_enabled: bool,
     /// Explicit subnet ids for attestation import filtering (null = import all subnets when aggregator).
-    aggregation_subnet_ids: ?[]const u32,
+    import_subnet_ids: ?[]const u32,
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -170,7 +170,7 @@ pub const BeamChain = struct {
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
             .is_aggregator_enabled = opts.is_aggregator,
-            .aggregation_subnet_ids = opts.subnet_ids,
+            .import_subnet_ids = opts.subnet_ids,
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
@@ -772,26 +772,21 @@ pub const BeamChain = struct {
                     }
                 };
 
-                // Import into forkchoice only if this node is configured as an aggregator
-                // and the attestation's subnet matches the configured aggregation subnets (if any).
-                // When no explicit subnet filter is set, trust the p2p subscription layer:
-                // node.zig already subscribes only to validator-derived subnets at libp2p level,
-                // so all received attestations are already on the correct subnets.
+                // Determine whether to import this attestation into forkchoice.
+                // If explicit import_subnet_ids are configured, import attestations on those
+                // subnets regardless of the aggregator flag — a proposer node also needs these
+                // attestations to include in blocks.
+                // Without an explicit subnet list, import only when the aggregator flag is set;
+                // in that case the p2p subscription layer already ensures we only receive
+                // attestations on our validator's subnets.
                 const should_import = blk: {
-                    if (!self.is_aggregator_enabled) break :blk false;
-                    if (self.aggregation_subnet_ids) |subnet_ids| {
-                        var found = false;
+                    if (self.import_subnet_ids) |subnet_ids| {
                         for (subnet_ids) |sid| {
-                            if (sid == signed_attestation.subnet_id) {
-                                found = true;
-                                break;
-                            }
+                            if (sid == signed_attestation.subnet_id) break :blk true;
                         }
-                        break :blk found;
+                        break :blk false;
                     }
-                    // No explicit subnet filter — p2p subscription already ensures we only
-                    // receive attestations on our validator's subnets. Import everything.
-                    break :blk true;
+                    break :blk self.is_aggregator_enabled;
                 };
 
                 if (should_import) {

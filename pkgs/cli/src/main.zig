@@ -72,7 +72,7 @@ pub const NodeCommand = struct {
     @"checkpoint-sync-url": ?[]const u8 = null,
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
-    @"aggregate-subnet-ids": ?[]const u8 = null,
+    @"import-subnet-ids": ?[]const u8 = null,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -94,7 +94,7 @@ pub const NodeCommand = struct {
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
         .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
-        .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to subscribe and aggregate (e.g. '0,1,2'); if set, overrides automatic subnet computation from validator ids",
+        .@"import-subnet-ids" = "Comma-separated list of subnet ids to subscribe and import gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .help = "Show help information for the node command",
     };
 };

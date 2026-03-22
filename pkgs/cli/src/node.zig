@@ -629,13 +629,13 @@ pub fn buildStartOptions(
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
 
-    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
-    // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
-    if (node_cmd.@"aggregate-subnet-ids" != null and !node_cmd.@"is-aggregator") {
-        std.log.err("--aggregate-subnet-ids requires --is-aggregator to be set", .{});
+    // Parse --import-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    // Require --is-aggregator to be set when --import-subnet-ids is provided.
+    if (node_cmd.@"import-subnet-ids" != null and !node_cmd.@"is-aggregator") {
+        std.log.err("--import-subnet-ids requires --is-aggregator to be set", .{});
         return error.AggregateSubnetIdsRequiresIsAggregator;
     }
-    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
+    if (node_cmd.@"import-subnet-ids") |subnet_ids_str| {
         var list: std.ArrayList(u32) = .empty;
         var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
         while (it.next()) |part| {
