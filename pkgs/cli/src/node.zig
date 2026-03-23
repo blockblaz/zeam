@@ -130,9 +130,6 @@ pub const Node = struct {
     api_server_handle: ?*api_server.ApiServer,
     metrics_server_handle: ?*metrics_server.MetricsServer,
     anchor_state: *types.BeamState,
-    // all subnets subscribed to including those of validators and aggregation
-    // if node is aggregator it will aggregate across all these subnets
-    subscription_subnet_ids: []u32,
 
     const Self = @This();
 
@@ -310,6 +307,7 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
+            .aggregation_subnet_ids = self.aggregation_subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
@@ -378,7 +376,6 @@ pub const Node = struct {
         event_broadcaster.deinitGlobalBroadcaster();
         self.anchor_state.deinit();
         self.allocator.destroy(self.anchor_state);
-        self.allocator.free(self.subscription_subnet_ids);
     }
 
     pub fn run(self: *Node) !void {

@@ -40,10 +40,8 @@ const NodeOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
     is_aggregator: bool = false,
-    /// Explicit subnet ids to subscribe and import gossip attestations for.
-    /// These add to the automatic computation from validator ids; they are
-    /// subscribed regardless of the is_aggregator flag.
-    subnet_ids: ?[]const u32 = null,
+    /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
+    aggregation_subnet_ids: ?[]const u32 = null,
 };
 
 pub const BeamNode = struct {
@@ -57,7 +55,7 @@ pub const BeamNode = struct {
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
-    subnet_ids: ?[]const u32 = null,
+    aggregation_subnet_ids: ?[]const u32 = null,
 
     const Self = @This();
 
@@ -114,7 +112,7 @@ pub const BeamNode = struct {
             .last_interval = -1,
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
-            .subnet_ids = opts.subnet_ids,
+            .aggregation_subnet_ids = opts.aggregation_subnet_ids,
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -1307,34 +1305,32 @@ pub const BeamNode = struct {
             var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
             defer seen_subnets.deinit();
 
-            // Always subscribe to explicitly specified import subnet ids.
-            // These are needed regardless of the aggregator flag — a proposer also
-            // needs gossip attestations from these subnets to include in blocks.
-            if (self.subnet_ids) |explicit_subnets| {
-                for (explicit_subnets) |subnet_id| {
-                    if (seen_subnets.contains(subnet_id)) continue;
-                    try seen_subnets.put(subnet_id, {});
-                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = subnet_id });
+            // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
+            // validators
+            if (self.chain.is_aggregator_enabled) {
+                if (self.aggregation_subnet_ids) |explicit_subnets| {
+                    for (explicit_subnets) |subnet_id| {
+                        if (seen_subnets.contains(subnet_id)) continue;
+                        try seen_subnets.put(subnet_id, {});
+                        try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = subnet_id });
+                    }
                 }
             }
 
-            // Additionally, when acting as an aggregator, subscribe to subnets derived
-            // from registered validator ids (adds to the explicit list above).
-            if (self.chain.is_aggregator_enabled) {
-                if (self.validator) |validator| {
-                    for (validator.ids) |validator_id| {
-                        const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
-                        if (seen_subnets.contains(@intCast(subnet_id))) continue;
-                        try seen_subnets.put(@intCast(subnet_id), {});
-                        try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
-                    }
+            // Additionally subscribe to these subnets for validators to create mesh network for attestations
+            if (self.validator) |validator| {
+                for (validator.ids) |validator_id| {
+                    const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
+                    if (seen_subnets.contains(@intCast(subnet_id))) continue;
+                    try seen_subnets.put(@intCast(subnet_id), {});
+                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
                 }
+            }
 
-                // If no subnets were added yet (aggregator but no explicit ids and no
-                // validators registered), fall back to subnet 0 to keep parity with leanSpec.
-                if (seen_subnets.count() == 0) {
-                    try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
-                }
+            // If no subnets were added yet (aggregator but no explicit ids and no
+            // validators registered), fall back to subnet 0 to keep parity with leanSpec.
+            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
+                try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
 
