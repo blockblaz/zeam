@@ -931,31 +931,174 @@ pub const ForkChoice = struct {
     }
 
     // Internal unlocked version - assumes caller holds lock
-    fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
-        var included_attestations: std.ArrayList(types.Attestation) = .empty;
+    pub const ProposalAttestationsResult = struct {
+        attestations: types.AggregatedAttestations,
+        signatures: types.AttestationSignatures,
+    };
 
-        const latest_justified = self.fcStore.latest_justified;
+    fn getProposalAttestationsUnlocked(
+        self: *Self,
+        pre_state: *const types.BeamState,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+        parent_root: [32]u8,
+    ) !ProposalAttestationsResult {
+        var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
+        var agg_att_cleanup = true;
+        errdefer if (agg_att_cleanup) {
+            for (agg_attestations.slice()) |*att| att.deinit();
+            agg_attestations.deinit();
+        };
 
-        // TODO naive strategy to include all attestations that are consistent with the latest justified
-        // replace by the other mini 3sf simple strategy to loop and see if justification happens and
-        // till no further attestations can be added
-        var att_iter = self.attestations.iterator();
-        while (att_iter.next()) |entry| {
-            const validator_id = entry.key_ptr.*;
-            const attestation_data = (entry.value_ptr.latestKnown orelse ProtoAttestation{}).attestation_data;
+        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var agg_sig_cleanup = true;
+        errdefer if (agg_sig_cleanup) {
+            for (attestation_signatures.slice()) |*sig| sig.deinit();
+            attestation_signatures.deinit();
+        };
 
-            if (attestation_data) |att_data| {
-                if (std.mem.eql(u8, &latest_justified.root, &att_data.source.root)) {
-                    const attestation = types.Attestation{
-                        .data = att_data,
-                        .validator_id = validator_id,
-                    };
-                    try included_attestations.append(self.allocator, attestation);
+        // Fixed-point attestation collection with greedy proof selection.
+        //
+        // For the current latest_justified checkpoint, find matching attestation_data
+        // entries in latest_known_aggregated_payloads and greedily select proofs that
+        // maximize new validator coverage. Then apply STF to check if justification
+        // changed. If it did, look for entries matching the new justified checkpoint
+        // and repeat. If no matching entries exist or justification did not change,
+        // block production is done.
+        var current_justified_root = pre_state.latest_justified.root;
+        var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
+        defer processed_att_data.deinit();
+
+        while (true) {
+            // Find all attestation_data entries whose source matches the current justified checkpoint
+            // and greedily select proofs maximizing new validator coverage for each.
+            // Collect entries and sort by target slot for deterministic processing order.
+            const MapEntry = struct {
+                att_data: *types.AttestationData,
+                payloads: *types.AggregatedPayloadsList,
+            };
+            var sorted_entries: std.ArrayList(MapEntry) = .empty;
+            defer sorted_entries.deinit(self.allocator);
+
+            var payload_it = self.latest_known_aggregated_payloads.iterator();
+            while (payload_it.next()) |entry| {
+                if (!std.mem.eql(u8, &current_justified_root, &entry.key_ptr.source.root)) continue;
+                if (!self.protoArray.indices.contains(entry.key_ptr.head.root)) continue;
+                if (processed_att_data.contains(entry.key_ptr.*)) continue;
+                try sorted_entries.append(self.allocator, .{ .att_data = entry.key_ptr, .payloads = entry.value_ptr });
+            }
+
+            std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
+                fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
+                    return a.att_data.target.slot < b.att_data.target.slot;
+                }
+            }.lessThan);
+
+            const found_entries = sorted_entries.items.len > 0;
+
+            for (sorted_entries.items) |map_entry| {
+                try processed_att_data.put(map_entry.att_data.*, {});
+
+                const att_data = map_entry.att_data.*;
+                const payloads = map_entry.payloads;
+
+                // Greedy proof selection: each iteration picks the proof covering
+                // the most uncovered validators until all are covered.
+                var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
+                defer covered.deinit();
+
+                while (true) {
+                    var best_proof: ?*const types.AggregatedSignatureProof = null;
+                    var best_new_coverage: usize = 0;
+
+                    for (payloads.items) |*stored| {
+                        var new_coverage: usize = 0;
+                        for (0..stored.proof.participants.len()) |i| {
+                            if (stored.proof.participants.get(i) catch false) {
+                                if (i >= covered.capacity() or !covered.isSet(i)) {
+                                    new_coverage += 1;
+                                }
+                            }
+                        }
+                        if (new_coverage > best_new_coverage) {
+                            best_new_coverage = new_coverage;
+                            best_proof = &stored.proof;
+                        }
+                    }
+
+                    if (best_proof == null or best_new_coverage == 0) break;
+
+                    var cloned_proof: types.AggregatedSignatureProof = undefined;
+                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
+                    errdefer cloned_proof.deinit();
+
+                    var att_bits = try types.AggregationBits.init(self.allocator);
+                    errdefer att_bits.deinit();
+
+                    for (0..cloned_proof.participants.len()) |i| {
+                        if (cloned_proof.participants.get(i) catch false) {
+                            try types.aggregationBitsSet(&att_bits, i, true);
+                            if (i >= covered.capacity()) {
+                                try covered.resize(i + 1, false);
+                            }
+                            covered.set(i);
+                        }
+                    }
+
+                    try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
+                    try attestation_signatures.append(cloned_proof);
                 }
             }
+
+            if (!found_entries) break;
+
+            // Build candidate block with all accumulated attestations and apply STF
+            // to check if justification changed.
+            var candidate_atts = try types.AggregatedAttestations.init(self.allocator);
+            defer {
+                for (candidate_atts.slice()) |*att| att.deinit();
+                candidate_atts.deinit();
+            }
+
+            for (agg_attestations.constSlice()) |agg_att| {
+                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                errdefer cloned_bits.deinit();
+                for (0..agg_att.aggregation_bits.len()) |i| {
+                    if (agg_att.aggregation_bits.get(i) catch false) {
+                        try types.aggregationBitsSet(&cloned_bits, i, true);
+                    }
+                }
+                try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
+            }
+
+            const candidate_block = types.BeamBlock{
+                .slot = slot,
+                .proposer_index = proposer_index,
+                .parent_root = parent_root,
+                .state_root = std.mem.zeroes([32]u8),
+                .body = .{ .attestations = candidate_atts },
+            };
+
+            var candidate_state: types.BeamState = undefined;
+            try types.sszClone(self.allocator, types.BeamState, pre_state.*, &candidate_state);
+            defer candidate_state.deinit();
+
+            try candidate_state.process_slots(self.allocator, slot, self.logger);
+            try candidate_state.process_block(self.allocator, candidate_block, self.logger, null);
+
+            if (!std.mem.eql(u8, &candidate_state.latest_justified.root, &current_justified_root)) {
+                // Justification changed - look for entries matching the new checkpoint
+                current_justified_root = candidate_state.latest_justified.root;
+                continue;
+            }
+
+            // Justification unchanged or no new entries - block production done
+            break;
         }
 
-        return included_attestations.toOwnedSlice(self.allocator);
+        agg_att_cleanup = false;
+        agg_sig_cleanup = false;
+        return .{ .attestations = agg_attestations, .signatures = attestation_signatures };
     }
 
     // Internal unlocked version - assumes caller holds lock
@@ -1542,10 +1685,16 @@ pub const ForkChoice = struct {
 
     //  READ-ONLY API - SHARED LOCK
 
-    pub fn getProposalAttestations(self: *Self) ![]types.Attestation {
+    pub fn getProposalAttestations(
+        self: *Self,
+        pre_state: *const types.BeamState,
+        slot: types.Slot,
+        proposer_index: types.ValidatorIndex,
+        parent_root: [32]u8,
+    ) !ProposalAttestationsResult {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.getProposalAttestationsUnlocked();
+        return self.getProposalAttestationsUnlocked(pre_state, slot, proposer_index, parent_root);
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {

@@ -385,162 +385,23 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        // Fixed-point attestation collection with greedy proof selection.
-        //
-        // For the current latest_justified checkpoint, find matching attestation_data
-        // entries in latest_known_aggregated_payloads and greedily select proofs that
-        // maximize new validator coverage. Then apply STF to check if justification
-        // changed. If it did, look for entries matching the new justified checkpoint
-        // and repeat. If no matching entries exist or justification didn't change,
-        // block production is done.
-        var agg_attestations = try types.AggregatedAttestations.init(self.allocator);
+        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
+        _ = building_timer.observe();
+
+        var agg_attestations = proposal_atts.attestations;
         var agg_att_cleanup = true;
         errdefer if (agg_att_cleanup) {
             for (agg_attestations.slice()) |*att| att.deinit();
             agg_attestations.deinit();
         };
 
-        var attestation_signatures = try types.AttestationSignatures.init(self.allocator);
+        var attestation_signatures = proposal_atts.signatures;
         var agg_sig_cleanup = true;
         errdefer if (agg_sig_cleanup) {
             for (attestation_signatures.slice()) |*sig| sig.deinit();
             attestation_signatures.deinit();
         };
-
-        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
-
-        var current_justified_root = pre_state.latest_justified.root;
-        var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
-        defer processed_att_data.deinit();
-
-        while (true) {
-            // Find all attestation_data entries whose source matches the current justified checkpoint
-            // and greedily select proofs maximizing new validator coverage for each.
-            // Collect entries and sort by target slot for deterministic processing order.
-            const MapEntry = struct {
-                att_data: *types.AttestationData,
-                payloads: *types.AggregatedPayloadsList,
-            };
-            var sorted_entries: std.ArrayList(MapEntry) = .empty;
-            defer sorted_entries.deinit(self.allocator);
-
-            var payload_it = self.forkChoice.latest_known_aggregated_payloads.iterator();
-            while (payload_it.next()) |entry| {
-                if (!std.mem.eql(u8, &current_justified_root, &entry.key_ptr.source.root)) continue;
-                if (!self.forkChoice.protoArray.indices.contains(entry.key_ptr.head.root)) continue;
-                if (processed_att_data.contains(entry.key_ptr.*)) continue;
-                try sorted_entries.append(self.allocator, .{ .att_data = entry.key_ptr, .payloads = entry.value_ptr });
-            }
-
-            std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
-                fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
-                    return a.att_data.target.slot < b.att_data.target.slot;
-                }
-            }.lessThan);
-
-            const found_entries = sorted_entries.items.len > 0;
-
-            for (sorted_entries.items) |map_entry| {
-                try processed_att_data.put(map_entry.att_data.*, {});
-
-                const att_data = map_entry.att_data.*;
-                const payloads = map_entry.payloads;
-
-                // Greedy proof selection: each iteration picks the proof covering
-                // the most uncovered validators until all are covered.
-                var covered = try std.DynamicBitSet.initEmpty(self.allocator, 0);
-                defer covered.deinit();
-
-                while (true) {
-                    var best_proof: ?*const types.AggregatedSignatureProof = null;
-                    var best_new_coverage: usize = 0;
-
-                    for (payloads.items) |*stored| {
-                        var new_coverage: usize = 0;
-                        for (0..stored.proof.participants.len()) |i| {
-                            if (stored.proof.participants.get(i) catch false) {
-                                if (i >= covered.capacity() or !covered.isSet(i)) {
-                                    new_coverage += 1;
-                                }
-                            }
-                        }
-                        if (new_coverage > best_new_coverage) {
-                            best_new_coverage = new_coverage;
-                            best_proof = &stored.proof;
-                        }
-                    }
-
-                    if (best_proof == null or best_new_coverage == 0) break;
-
-                    var cloned_proof: types.AggregatedSignatureProof = undefined;
-                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
-                    errdefer cloned_proof.deinit();
-
-                    var att_bits = try types.AggregationBits.init(self.allocator);
-                    errdefer att_bits.deinit();
-
-                    for (0..cloned_proof.participants.len()) |i| {
-                        if (cloned_proof.participants.get(i) catch false) {
-                            try types.aggregationBitsSet(&att_bits, i, true);
-                            if (i >= covered.capacity()) {
-                                try covered.resize(i + 1, false);
-                            }
-                            covered.set(i);
-                        }
-                    }
-
-                    try agg_attestations.append(.{ .aggregation_bits = att_bits, .data = att_data });
-                    try attestation_signatures.append(cloned_proof);
-                }
-            }
-
-            if (!found_entries) break;
-
-            // Build candidate block with all accumulated attestations and apply STF
-            // to check if justification changed.
-            var candidate_atts = try types.AggregatedAttestations.init(self.allocator);
-            defer {
-                for (candidate_atts.slice()) |*att| att.deinit();
-                candidate_atts.deinit();
-            }
-
-            for (agg_attestations.constSlice()) |agg_att| {
-                var cloned_bits = try types.AggregationBits.init(self.allocator);
-                errdefer cloned_bits.deinit();
-                for (0..agg_att.aggregation_bits.len()) |i| {
-                    if (agg_att.aggregation_bits.get(i) catch false) {
-                        try types.aggregationBitsSet(&cloned_bits, i, true);
-                    }
-                }
-                try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
-            }
-
-            const candidate_block = types.BeamBlock{
-                .slot = opts.slot,
-                .proposer_index = opts.proposer_index,
-                .parent_root = parent_root,
-                .state_root = std.mem.zeroes([32]u8),
-                .body = .{ .attestations = candidate_atts },
-            };
-
-            var candidate_state: types.BeamState = undefined;
-            try types.sszClone(self.allocator, types.BeamState, pre_state.*, &candidate_state);
-            defer candidate_state.deinit();
-
-            try candidate_state.process_slots(self.allocator, opts.slot, self.block_building_logger);
-            try candidate_state.process_block(self.allocator, candidate_block, self.block_building_logger, null);
-
-            if (!std.mem.eql(u8, &candidate_state.latest_justified.root, &current_justified_root)) {
-                // Justification changed - look for entries matching the new checkpoint
-                current_justified_root = candidate_state.latest_justified.root;
-                continue;
-            }
-
-            // Justification unchanged or no new entries - block production done
-            break;
-        }
-
-        _ = building_timer.observe();
 
         // Record aggregated signature metrics
         const num_agg_sigs = attestation_signatures.len();
