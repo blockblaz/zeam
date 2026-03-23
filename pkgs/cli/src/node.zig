@@ -130,6 +130,33 @@ pub const Node = struct {
 
     const Self = @This();
 
+    /// Closes the current database, wipes the on-disk rocksdb directory, and
+    /// reopens a fresh database at the same path.
+    ///
+    /// If `ignore_not_found` is true, `error.FileNotFound` from the directory
+    /// deletion is silently swallowed (used for first-run installs where the
+    /// db directory has never been created). Set it to false when wiping a db
+    /// that is known to exist (genesis time mismatch case).
+    fn wipeAndReopenDb(
+        db: *database.Db,
+        allocator: std.mem.Allocator,
+        database_path: []const u8,
+        logger_config: *LoggerConfig,
+        logger: zeam_utils.ModuleLogger,
+        ignore_not_found: bool,
+    ) !void {
+        db.deinit();
+        const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{database_path});
+        defer allocator.free(rocksdb_path);
+        std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+            if (!ignore_not_found or wipe_err != error.FileNotFound) {
+                logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                return wipe_err;
+            }
+        };
+        db.* = try database.Db.open(allocator, logger_config.logger(.database), database_path);
+    }
+
     pub fn init(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -191,38 +218,57 @@ pub const Node = struct {
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
+        errdefer self.anchor_state.deinit();
 
-        // Initialize anchor state with priority: checkpoint URL > database > genesis
-        var checkpoint_sync_succeeded = false;
+        // load a valid local state available in db else genesis
+        var local_finalized_state: types.BeamState = undefined;
+        if (db.loadLatestFinalizedState(&local_finalized_state)) {
+            if (local_finalized_state.config.genesis_time != chain_config.genesis.genesis_time) {
+                self.logger.warn("database genesis time mismatch (db={d}, config={d}), wiping stale database", .{
+                    local_finalized_state.config.genesis_time,
+                    chain_config.genesis.genesis_time,
+                });
+                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, false);
+                self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
+
+                local_finalized_state.deinit();
+                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+            } else {
+                self.anchor_state.* = local_finalized_state;
+            }
+        } else |_| {
+            self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
+            // ignore_not_found=true: db dir may not exist yet on a fresh install
+            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, true);
+            self.logger.info("starting fresh & generating genesis", .{});
+            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+        }
+
+        // check if a valid and more recent checkpoint finalized state is available
         if (options.checkpoint_sync_url) |checkpoint_url| {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Try checkpoint sync, fall back to database/genesis on failure
-            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
-                self.anchor_state.* = downloaded_state;
-
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
+                var downloaded_state = downloaded_state_const;
                 // Verify state against genesis config
-                if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
-                    self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
-                    checkpoint_sync_succeeded = true;
+                if (verifyCheckpointState(allocator, &downloaded_state, &chain_config.genesis, self.logger)) {
+                    if (downloaded_state.slot > self.anchor_state.slot) {
+                        self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
+                        self.anchor_state.deinit();
+                        self.anchor_state.* = downloaded_state;
+                    } else {
+                        self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
+                        downloaded_state.deinit();
+                    }
                 } else |verify_err| {
                     self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
-                    self.anchor_state.deinit();
+                    downloaded_state.deinit();
                 }
             } else |download_err| {
                 self.logger.warn("checkpoint sync failed: {}, falling back to database/genesis", .{download_err});
             }
         }
-
-        // Fall back to database/genesis if checkpoint sync was not attempted or failed
-        if (!checkpoint_sync_succeeded) {
-            // Try to load the latest finalized state from the database, fallback to genesis
-            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
-                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
-                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-            };
-        }
-        errdefer self.anchor_state.deinit();
 
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
@@ -272,6 +318,20 @@ pub const Node = struct {
             );
             // Clean up metrics server if subsequent init operations fail
             errdefer if (self.metrics_server_handle) |handle| handle.stop();
+
+            // Set validator status gauges on node start
+            zeam_metrics.metrics.lean_is_aggregator.set(if (options.is_aggregator) 1 else 0);
+            // Set committee count from config
+            const committee_count = chain_config.spec.attestation_committee_count;
+            zeam_metrics.metrics.lean_attestation_committee_count.set(committee_count);
+            // Set subnet for the first validator (if any)
+            if (validator_ids.len > 0) {
+                const first_validator_id: types.ValidatorIndex = @intCast(validator_ids[0]);
+                const subnet_id = types.computeSubnetId(first_validator_id, committee_count) catch 0;
+                zeam_metrics.metrics.lean_attestation_committee_subnet.set(subnet_id);
+            } else {
+                zeam_metrics.metrics.lean_attestation_committee_subnet.set(0);
+            }
 
             // Start API server (pass chain pointer for chain-dependent endpoints)
             self.api_server_handle = try api_server.startAPIServer(

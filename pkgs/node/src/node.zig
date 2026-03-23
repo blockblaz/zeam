@@ -445,6 +445,16 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
+                // Run the same post-block followup that processBlockByRootChunk performs:
+                // emits head/justification/finalization events and advances finalization.
+                // Note: onBlockFollowup currently ignores the signedBlock pointer (_ = signedBlock),
+                // so the ordering relative to removeFetchedBlock is not a memory-safety requirement
+                // today — kept here as good practice for when the parameter is wired up.
+                // Note: pruneForkchoice=true means processFinalizationAdvancement may fire on every
+                // iteration of a deep cached-block chain. Correct semantically; a future optimisation
+                // could pass false during catch-up and prune once at the end.
+                self.chain.onBlockFollowup(true, cached_block);
+
                 // Remove from cache now that it's been processed
                 _ = self.network.removeFetchedBlock(descendant_root);
 
