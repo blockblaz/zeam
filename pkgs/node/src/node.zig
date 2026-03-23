@@ -1333,6 +1333,10 @@ pub const BeamNode = struct {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
+        // if no committee count specified and still aggregator, all are in subnet 0
+        else if (self.is_aggregator_enabled) {
+            try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
+        }
 
         const topics_slice = try topics_list.toOwnedSlice(self.allocator);
         defer self.allocator.free(topics_slice);
