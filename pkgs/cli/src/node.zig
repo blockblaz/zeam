@@ -382,7 +382,7 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run(self.subscription_subnet_ids);
+        try self.network.run();
         try self.beam_node.run();
 
         const ascii_art =
