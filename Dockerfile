@@ -93,7 +93,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseFast -Dgit_version="$GIT_VERSION"
+    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION"
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep
