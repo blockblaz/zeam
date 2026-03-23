@@ -301,7 +301,7 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
-            .aggregation_subnet_ids = self.aggregation_subnet_ids,
+            .aggregation_subnet_ids = options.aggregation_subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
