@@ -410,17 +410,41 @@ pub const BeamChain = struct {
         const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
 
         var current_justified_root = pre_state.latest_justified.root;
+        var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
+        defer processed_att_data.deinit();
+
         while (true) {
             // Find all attestation_data entries whose source matches the current justified checkpoint
             // and greedily select proofs maximizing new validator coverage for each.
-            var found_entries = false;
+            // Collect entries and sort by target slot for deterministic processing order.
+            const MapEntry = struct {
+                att_data: *types.AttestationData,
+                payloads: *types.AggregatedPayloadsList,
+            };
+            var sorted_entries: std.ArrayList(MapEntry) = .empty;
+            defer sorted_entries.deinit(self.allocator);
+
             var payload_it = self.forkChoice.latest_known_aggregated_payloads.iterator();
             while (payload_it.next()) |entry| {
                 if (!std.mem.eql(u8, &current_justified_root, &entry.key_ptr.source.root)) continue;
-                found_entries = true;
+                if (!self.forkChoice.protoArray.indices.contains(entry.key_ptr.head.root)) continue;
+                if (processed_att_data.contains(entry.key_ptr.*)) continue;
+                try sorted_entries.append(self.allocator, .{ .att_data = entry.key_ptr, .payloads = entry.value_ptr });
+            }
 
-                const att_data = entry.key_ptr.*;
-                const payloads = entry.value_ptr;
+            std.mem.sort(MapEntry, sorted_entries.items, {}, struct {
+                fn lessThan(_: void, a: MapEntry, b: MapEntry) bool {
+                    return a.att_data.target.slot < b.att_data.target.slot;
+                }
+            }.lessThan);
+
+            const found_entries = sorted_entries.items.len > 0;
+
+            for (sorted_entries.items) |map_entry| {
+                try processed_att_data.put(map_entry.att_data.*, {});
+
+                const att_data = map_entry.att_data.*;
+                const payloads = map_entry.payloads;
 
                 // Greedy proof selection: each iteration picks the proof covering
                 // the most uncovered validators until all are covered.
@@ -2607,10 +2631,8 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     defer produced.deinit();
 
     // The block should contain attestation entries for both att_data since both
-    // have source matching the justified checkpoint. The current algorithm does
-    // not filter by known block roots at selection time.
+    // have source matching the justified checkpoint.
     const block_attestations = produced.block.body.attestations.constSlice();
-    try std.testing.expect(block_attestations.len >= 2);
 
     // However, after STF processing, only the attestation referencing the known
     // block contributes to justification. The unseen-fork attestation is silently
@@ -2633,7 +2655,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
             known_count += 1;
         }
     }
-    // Both sets of attestations are included in the block
-    try std.testing.expect(unseen_count > 0);
+    // Only the known attestation is included in the block
+    try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
 }
