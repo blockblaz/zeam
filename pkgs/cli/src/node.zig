@@ -665,54 +665,36 @@ fn downloadCheckpointState(
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    // Parse URL using std.Uri
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-
-    // Initialize HTTP client
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // Create HTTP request
-    var req = client.request(.GET, uri, .{}) catch |err| {
-        logger.err("failed to create HTTP request: {any}", .{err});
-        return error.ConnectionFailed;
-    };
-    defer req.deinit();
+    // Use an Allocating writer so client.fetch handles both Content-Length and
+    // Transfer-Encoding: chunked transparently. The previous manual readSliceShort
+    // loop panicked when the server switched to chunked encoding for responses
+    // larger than ~3 MB because readSliceShort → readVec → defaultReadVec →
+    // contentLengthStream panics when the body union field is 'ready' (chunked)
+    // rather than 'body_remaining_content_length'.
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
 
-    // Send the request (GET has no body)
-    req.sendBodiless() catch |err| {
-        logger.err("failed to send HTTP request: {any}", .{err});
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+    }) catch |err| {
+        logger.err("checkpoint sync request failed: {any}", .{err});
         return error.RequestFailed;
     };
 
-    // Receive response headers
-    var redirect_buffer: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buffer) catch |err| {
-        logger.err("failed to receive HTTP response: {any}", .{err});
-        return error.ResponseFailed;
-    };
-
-    // Check HTTP status
-    if (response.head.status != .ok) {
-        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(response.head.status)});
+    if (result.status != .ok) {
+        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(result.status)});
         return error.HttpError;
     }
 
-    // Read response body
-    var ssz_data: std.ArrayList(u8) = .empty;
-    errdefer ssz_data.deinit(allocator);
-
-    var transfer_buffer: [8192]u8 = undefined;
-    const body_reader = response.reader(&transfer_buffer);
-    var buffer: [8192]u8 = undefined;
-    while (true) {
-        const bytes_read = body_reader.readSliceShort(&buffer) catch |err| {
-            logger.err("failed to read response body: {any}", .{err});
-            return error.ReadFailed;
-        };
-        if (bytes_read == 0) break;
-        try ssz_data.appendSlice(allocator, buffer[0..bytes_read]);
-    }
+    // Transfer ownership out of the writer (writer buffer becomes empty so the
+    // deferred deinit above is safe to call).
+    var ssz_data = body_writer.toArrayList();
+    defer ssz_data.deinit(allocator);
 
     logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
 
