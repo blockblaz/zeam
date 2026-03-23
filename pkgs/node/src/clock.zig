@@ -85,7 +85,13 @@ pub const Clock = struct {
                         _: *xev.Completion,
                         r: xev.Timer.RunError!void,
                     ) xev.CallbackAction {
-                        _ = r catch unreachable;
+                        r catch |err| {
+                            // Canceled is expected when tickInterval re-arms a still-pending
+                            // completion (the old fire arrives with Canceled).  Swallow it
+                            // silently; the new timer is already scheduled.
+                            if (err != error.Canceled) std.debug.panic("unexpected xev timer error: {}", .{err});
+                            return .disarm;
+                        };
                         if (ud) |cb_wrapper| {
                             _ = cb_wrapper.onInterval() catch void;
                         }

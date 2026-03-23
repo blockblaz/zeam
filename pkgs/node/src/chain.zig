@@ -1295,14 +1295,32 @@ pub const BeamChain = struct {
         defer self.allocator.free(non_finalized_descendants);
         defer self.allocator.free(non_canonical_roots);
 
+        // getCanonicalViewAndAnalysis should always include the new finalized root itself.
+        // If it returns empty the fork choice has already been rebased past this root — bail
+        // out rather than performing an out-of-bounds slice on finalized_roots[1..].
+        if (finalized_roots.len == 0) {
+            self.logger.warn("finalization advancement from slot={d} to slot={d} skipped: canonical analysis returned no roots (fork choice may have already been rebased past this checkpoint)", .{
+                previousFinalized.slot,
+                latestFinalized.slot,
+            });
+            return;
+        }
+
         // finalized_ancestor_roots has the previous finalized included
         const newly_finalized_count = finalized_roots.len - 1;
+        const slot_gap = latestFinalized.slot - previousFinalized.slot;
+        const orphaned_count = if (slot_gap >= newly_finalized_count) slot_gap - newly_finalized_count else blk: {
+            self.logger.debug("finalization: newly_finalized_count={d} exceeds slot_gap={d}; orphaned count clamped to 0 (fork choice may contain more canonical roots than slot distance)", .{
+                newly_finalized_count,
+                slot_gap,
+            });
+            break :blk @as(u64, 0);
+        };
         self.logger.info("finalization canonicality analysis (previousFinalized slot={d} to latestFinalized slot={d}): newly finalized={d}, orphaned/missing={d}, non finalized descendants={d} & finalized non canonical={d}", .{
             previousFinalized.slot,
-            //
             latestFinalized.slot,
             newly_finalized_count,
-            latestFinalized.slot - previousFinalized.slot - newly_finalized_count,
+            orphaned_count,
             non_finalized_descendants.len,
             non_canonical_roots.len,
         });
