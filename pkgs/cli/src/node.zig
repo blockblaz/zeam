@@ -283,10 +283,26 @@ pub const Node = struct {
         errdefer allocator.free(validator_ids);
 
         var subscription_subnet_list: std.ArrayList(u32) = .empty;
-        // fill this list with unique subnets computed from validator_ids plus aggregation_subnet_ids from options
+        var seen_subnets = std.AutoHashMap(u32, void).init(allocator);
+        defer seen_subnets.deinit();
 
-        // store the subnet ids to subscribe later when network is run
-        self.subscription_subnet_ids = try subscription_subnet_list.toOwnedSlice(allocator);
+        const committee_count_for_subnets = chain_config.spec.attestation_committee_count;
+        for (validator_ids) |vid| {
+            const subnet_id = types.computeSubnetId(@intCast(vid), committee_count_for_subnets) catch continue;
+            if (seen_subnets.contains(subnet_id)) continue;
+            try seen_subnets.put(subnet_id, {});
+            try subscription_subnet_list.append(allocator, subnet_id);
+        }
+        if (options.aggregation_subnet_ids) |ids| {
+            for (ids) |subnet_id| {
+                if (seen_subnets.contains(subnet_id)) continue;
+                try seen_subnets.put(subnet_id, {});
+                try subscription_subnet_list.append(allocator, subnet_id);
+            }
+        }
+
+        const subscription_subnet_ids = try subscription_subnet_list.toOwnedSlice(allocator);
+        defer allocator.free(subscription_subnet_ids);
 
         // Initialize metrics BEFORE beam_node so that metrics set during
         // initialization (like lean_validators_count) are captured on real
@@ -307,7 +323,7 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
-            .aggregation_subnet_ids = self.aggregation_subnet_ids,
+            .aggregation_subnet_ids = subscription_subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
