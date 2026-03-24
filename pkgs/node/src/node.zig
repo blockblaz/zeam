@@ -780,7 +780,33 @@ pub const BeamNode = struct {
                                         };
                                     }
                                 },
-                                .synced, .no_peers, .fc_initing => {},
+                                .fc_initing => {
+                                    // Forkchoice is still initializing (checkpoint-sync or DB restore).
+                                    // We need blocks to reach the first justified checkpoint and exit
+                                    // fc_initing. Without this branch the node deadlocks: it stays in
+                                    // fc_initing because no blocks arrive, and no blocks arrive because
+                                    // the sync code skips fc_initing.
+                                    // Treat this exactly like behind_peers: if the peer's head is ahead
+                                    // of our anchor, request their head block to start the parent chain.
+                                    if (status_resp.head_slot > self.chain.forkChoice.head.slot) {
+                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.head_slot,
+                                            self.chain.forkChoice.head.slot,
+                                            &status_resp.head_root,
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
+                                },
+                                .synced, .no_peers => {},
                             }
                         },
                         else => {
@@ -1117,6 +1143,18 @@ pub const BeamNode = struct {
             }
 
             const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
+
+            // Periodically re-send status to all connected peers when not synced.
+            // This recovers from the case where peers were already connected when
+            // the node was in fc_initing and the status-exchange-triggered sync
+            // was skipped (now fixed, but existing connections need a re-probe).
+            if (interval_in_slot == 0 and slot % constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS == 0) {
+                switch (self.chain.getSyncStatus()) {
+                    .fc_initing, .behind_peers => self.refreshSyncFromPeers(),
+                    .synced, .no_peers => {},
+                }
+            }
+
             if (interval_in_slot == 2) {
                 if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
@@ -1132,6 +1170,28 @@ pub const BeamNode = struct {
         }
 
         self.last_interval = itime_intervals;
+    }
+
+    /// Re-send our status to every connected peer.
+    ///
+    /// Called periodically when the node is not yet synced so that peers
+    /// already connected before the sync mechanism became aware of them
+    /// (e.g., after a restart or while stuck in fc_initing) get another
+    /// chance to report their head and trigger block fetching.
+    fn refreshSyncFromPeers(self: *Self) void {
+        const status = self.chain.getStatus();
+        const handler = self.getReqRespResponseHandler();
+        var it = self.network.connected_peers.iterator();
+        while (it.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
+                self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
+                    peer_id,
+                    self.node_registry.getNodeNameFromPeerId(peer_id),
+                    err,
+                });
+            };
+        }
     }
 
     fn sweepTimedOutRequests(self: *Self) void {
