@@ -690,6 +690,7 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    self.flushPendingParentFetches();
                     return;
                 }
 
