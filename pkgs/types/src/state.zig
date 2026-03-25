@@ -430,7 +430,7 @@ pub const BeamState = struct {
             const has_known_root = has_correct_source_root and has_correct_target_root;
 
             const target_not_ahead = target_slot <= source_slot;
-            const is_target_justifiable = try utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot);
+            const is_target_justifiable = utils.IsJustifiableSlot(self.latest_finalized.slot, target_slot) catch false;
 
             if (!is_source_justified or
                 // not present in 3sf mini but once a target is justified no need to run loop
@@ -802,7 +802,7 @@ fn makeBlock(
     };
 }
 
-test "process_attestations invalid justifiable slot returns error without panic" {
+test "process_attestations silently skips pre-finalized target attestations" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     const logger = logger_config.logger(null);
     var state = try makeGenesisState(std.testing.allocator, 3);
@@ -821,7 +821,6 @@ test "process_attestations invalid justifiable slot returns error without panic"
     const slot_0_root = try state.historical_block_hashes.get(0);
     const slot_1_root = try state.historical_block_hashes.get(1);
 
-    // Seed pending justifications so error unwind exercises map cleanup with allocated entries.
     var pending_roots = try JustificationRoots.init(std.testing.allocator);
     errdefer pending_roots.deinit();
     try pending_roots.append(slot_1_root);
@@ -839,6 +838,10 @@ test "process_attestations invalid justifiable slot returns error without panic"
 
     state.latest_finalized = .{ .root = slot_1_root, .slot = 1 };
 
+    // Attestation whose target (slot=0) is before the finalized slot (slot=1).
+    // This is normal during post-checkpoint-sync catchup: a block may carry
+    // attestations referencing epoch boundaries from before the anchor.
+    // Such attestations must be silently skipped, not abort the block import.
     var att = try makeAggregatedAttestation(
         std.testing.allocator,
         &[_]usize{ 0, 1 },
@@ -859,10 +862,8 @@ test "process_attestations invalid justifiable slot returns error without panic"
     try attestations_list.append(att);
     att_transferred = true;
 
-    try std.testing.expectError(
-        StateTransitionError.InvalidJustifiableSlot,
-        state.process_attestations(std.testing.allocator, attestations_list, logger, null),
-    );
+    // Must succeed: the pre-finalized attestation is skipped, not an error.
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
 }
 
 test "justified_slots do not include finalized boundary" {
