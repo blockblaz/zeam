@@ -49,6 +49,7 @@ pub const ChainOpts = struct {
     db: database.Db,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
+    // import and aggregate all subnet ids subscribed to
     is_aggregator: bool = false,
 };
 
@@ -765,17 +766,25 @@ pub const BeamChain = struct {
                     }
                 };
 
-                // Process validated attestation
-                self.onGossipAttestation(signed_attestation) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                    self.logger.err("attestation processing error: {any}", .{err});
-                    return err;
-                };
-                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
-                    slot,
-                    validator_id,
-                    validator_node_name,
-                });
+                if (self.is_aggregator_enabled) {
+                    // Process validated attestation
+                    self.onGossipAttestation(signed_attestation) catch |err| {
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                        self.logger.err("attestation processing error: {any}", .{err});
+                        return err;
+                    };
+                    self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                        slot,
+                        validator_id,
+                        validator_node_name,
+                    });
+                } else {
+                    self.logger.debug("skipping gossip attestation import (not aggregator): subnet={d} slot={d} validator={d}", .{
+                        signed_attestation.subnet_id,
+                        slot,
+                        validator_id,
+                    });
+                }
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
