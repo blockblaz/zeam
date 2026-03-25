@@ -852,7 +852,7 @@ fn build_zkvm_targets(
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("build/risc0.zig"),
                     .target = host_target,
-                    .optimize = .ReleaseSafe,
+                    .optimize = .ReleaseFast,
                 }),
             });
             const run_risc0_postbuild_gen_step = b.addRunArtifact(risc0_postbuild_gen);
