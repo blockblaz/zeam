@@ -31,3 +31,9 @@ pub const MAX_FC_CHAIN_PRINT_DEPTH = 5;
 // with a different peer. 2 slots at 4s/slot is generous for latency while ensuring
 // stuck sync chains recover quickly.
 pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
+
+// How often to re-send status requests to all connected peers when not synced.
+// Ensures that already-connected peers are probed again after a restart, and that
+// a node stuck in fc_initing can recover without waiting for new peer connections.
+// 8 slots = 32 seconds at 4s/slot.
+pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
