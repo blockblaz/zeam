@@ -299,6 +299,9 @@ fn deserializeGossipMessage(
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize, sender_peer_id: [*:0]const u8) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
         zigHandler.logger.err("Ignoring Invalid topic_id={s} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
         return;
@@ -424,6 +427,9 @@ export fn handleRPCRequestFromRustBridge(
     request_ptr: [*]const u8,
     request_len: usize,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const peer_id_slice = std.mem.span(peer_id);
     const protocol_slice = std.mem.span(protocol_id);
 
@@ -572,6 +578,9 @@ export fn handleRPCResponseFromRustBridge(
     response_ptr: [*]const u8,
     response_len: usize,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const protocol_slice = std.mem.span(protocol_id);
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
@@ -703,6 +712,9 @@ export fn handleRPCEndOfStreamFromRustBridge(
     peer_id: [*:0]const u8,
     protocol_id: [*:0]const u8,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const protocol_slice = std.mem.span(protocol_id);
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
@@ -744,6 +756,9 @@ export fn handleRPCErrorFromRustBridge(
     code: u32,
     message_ptr: [*:0]const u8,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const protocol_slice = std.mem.span(protocol_id);
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
@@ -794,6 +809,9 @@ export fn handlePeerConnectedFromRustBridge(
     peer_id: [*:0]const u8,
     direction: u32,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const dir = @as(interface.PeerDirection, @enumFromInt(direction));
@@ -815,6 +833,9 @@ export fn handlePeerDisconnectedFromRustBridge(
     direction: u32,
     reason: u32,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const dir = @as(interface.PeerDirection, @enumFromInt(direction));
@@ -838,6 +859,9 @@ export fn handlePeerConnectionFailedFromRustBridge(
     direction: u32,
     result: u32,
 ) void {
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     const peer_id_slice = if (peer_id) |p| std.mem.span(p) else "unknown";
     const dir = @as(interface.PeerDirection, @enumFromInt(direction));
     const res = @as(interface.ConnectionResult, @enumFromInt(result));
@@ -943,6 +967,13 @@ pub const EthLibp2p = struct {
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Serialises all calls from the Rust networking thread against the main
+    /// libxev event-loop thread.  Both sides must hold this mutex whenever they
+    /// touch any shared node state (fetched_blocks cache, chain, fork-choice,
+    /// allocator metadata, etc.).  Rust callbacks are always short-lived and
+    /// never call back into Zig while holding the lock, so no deadlock is
+    /// possible.
+    state_mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 

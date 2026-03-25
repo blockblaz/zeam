@@ -42,6 +42,11 @@ const NodeOpts = struct {
     is_aggregator: bool = false,
     /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Optional pointer to the network-layer mutex that serialises access to
+    /// shared state between the Rust networking thread and this event-loop
+    /// thread.  Set by production code (points to EthLibp2p.state_mutex).
+    /// Null in unit-tests where there is no Rust thread.
+    state_mutex: ?*std.Thread.Mutex = null,
 };
 
 pub const BeamNode = struct {
@@ -61,6 +66,10 @@ pub const BeamNode = struct {
     /// and flushed as a single batched blocks_by_root request, avoiding the
     /// 300+ individual round-trips caused by sequential parent-chain walking.
     pending_parent_roots: std.AutoHashMap(types.Root, u32),
+    /// Pointer to the network-layer mutex (EthLibp2p.state_mutex) that
+    /// serialises access to all shared state between the Rust networking
+    /// thread and this libxev event-loop thread.  Null in unit-tests.
+    state_mutex: ?*std.Thread.Mutex = null,
 
     const Self = @This();
 
@@ -119,6 +128,7 @@ pub const BeamNode = struct {
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
             .pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
+            .state_mutex = opts.state_mutex,
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -1109,6 +1119,14 @@ pub const BeamNode = struct {
 
     pub fn onInterval(ptr: *anyopaque, itime_intervals: isize) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+
+        // Acquire the network state mutex so that the Rust networking thread
+        // cannot concurrently modify shared structures (fetched_blocks cache,
+        // chain state, allocator metadata) while we are processing them here
+        // on the main libxev event-loop thread.  The mutex is null in
+        // unit-tests where there is no Rust thread.
+        if (self.state_mutex) |m| m.lock();
+        defer if (self.state_mutex) |m| m.unlock();
 
         // TODO check & fix why node-n1 is getting two oninterval fires in beam sim
         if (itime_intervals > 0 and itime_intervals <= self.chain.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
