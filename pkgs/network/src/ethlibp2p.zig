@@ -299,6 +299,8 @@ fn deserializeGossipMessage(
 }
 
 export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const u8, message_ptr: [*]const u8, message_len: usize, sender_peer_id: [*:0]const u8) void {
+    // Decoding, decompression, and deserialisation happen before the lock:
+    // they only use the thread-safe allocator and read-only inputs from Rust.
     const topic = interface.LeanNetworkTopic.decode(zigHandler.allocator, topic_str) catch |err| {
         zigHandler.logger.err("Ignoring Invalid topic_id={s} sent in handleMsgFromRustBridge: {any}", .{ std.mem.span(topic_str), err });
         return;
@@ -410,7 +412,10 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
     );
 
+    // Lock only around the call that dispatches into shared node state.
     // TODO: figure out why scheduling on the loop is not working
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
     zigHandler.gossipHandler.onGossip(&message, sender_peer_id_slice, false) catch |e| {
         zigHandler.logger.err("onGossip handling of message failed with error e={any} from sender_peer_id={s}{f}", .{ e, sender_peer_id_slice, node_name });
     };
@@ -424,6 +429,7 @@ export fn handleRPCRequestFromRustBridge(
     request_ptr: [*]const u8,
     request_len: usize,
 ) void {
+    // Frame parsing, decompression, and deserialisation need no lock.
     const peer_id_slice = std.mem.span(peer_id);
     const protocol_slice = std.mem.span(protocol_id);
 
@@ -526,6 +532,9 @@ export fn handleRPCRequestFromRustBridge(
         .getPeerIdFn = serverStreamGetPeerId,
     };
 
+    // Lock only around the handler that reads shared chain state.
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
     zigHandler.reqrespHandler.onReqRespRequest(&request, stream) catch |e| {
         zigHandler.logger.err(
             "network-{d}:: Error while handling RPC request from peer={s}{f} on channel={d}: {any}",
@@ -572,9 +581,14 @@ export fn handleRPCResponseFromRustBridge(
     response_ptr: [*]const u8,
     response_len: usize,
 ) void {
+    // Protocol / peer metadata is read-only — no lock needed.
     const protocol_slice = std.mem.span(protocol_id);
     const peer_id_slice = std.mem.span(peer_id);
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
+
+    // Lock only around rpcCallbacks access and the downstream callback dispatch.
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
 
     const callback_ptr = zigHandler.rpcCallbacks.getPtr(request_id) orelse {
         zigHandler.logger.warn(
@@ -708,6 +722,10 @@ export fn handleRPCEndOfStreamFromRustBridge(
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(peer_id_slice);
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
 
+    // Lock only around rpcCallbacks mutation and callback dispatch.
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
+
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
         var callback = entry.value;
         const method = callback.method;
@@ -747,6 +765,10 @@ export fn handleRPCErrorFromRustBridge(
     const protocol_slice = std.mem.span(protocol_id);
     const protocol_str = if (LeanSupportedProtocol.fromSlice(protocol_slice)) |proto| proto.protocolId() else protocol_slice;
     const message_slice = std.mem.span(message_ptr);
+
+    // Lock only around rpcCallbacks mutation and callback dispatch.
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
 
     if (zigHandler.rpcCallbacks.fetchRemove(request_id)) |entry| {
         var callback = entry.value;
@@ -804,6 +826,8 @@ export fn handlePeerConnectedFromRustBridge(
         @tagName(dir),
     });
 
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
     zigHandler.peerEventHandler.onPeerConnected(peer_id_slice, dir) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer connected event: {any}", .{ zigHandler.params.networkId, e });
     };
@@ -827,6 +851,8 @@ export fn handlePeerDisconnectedFromRustBridge(
         @tagName(rsn),
     });
 
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
     zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
     };
@@ -848,6 +874,8 @@ export fn handlePeerConnectionFailedFromRustBridge(
         @tagName(res),
     });
 
+    zigHandler.state_mutex.lock();
+    defer zigHandler.state_mutex.unlock();
     zigHandler.peerEventHandler.onPeerConnectionFailed(peer_id_slice, dir, res) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer connection failed event: {any}", .{ zigHandler.params.networkId, e });
     };
@@ -943,6 +971,13 @@ pub const EthLibp2p = struct {
     rpcCallbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Serialises all calls from the Rust networking thread against the main
+    /// libxev event-loop thread.  Both sides must hold this mutex whenever they
+    /// touch any shared node state (fetched_blocks cache, chain, fork-choice,
+    /// allocator metadata, etc.).  Rust callbacks are always short-lived and
+    /// never call back into Zig while holding the lock, so no deadlock is
+    /// possible.
+    state_mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 

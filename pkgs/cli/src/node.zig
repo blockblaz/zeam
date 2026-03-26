@@ -302,6 +302,7 @@ pub const Node = struct {
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
+            .state_mutex = &self.network.state_mutex,
         });
         errdefer self.beam_node.deinit();
 
