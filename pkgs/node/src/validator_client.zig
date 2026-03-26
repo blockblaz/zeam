@@ -36,7 +36,7 @@ pub const ValidatorClientOutput = struct {
         self.gossip_messages.deinit(self.allocator);
     }
 
-    pub fn addBlock(self: *Self, signed_block: types.SignedBlockWithAttestation) !void {
+    pub fn addBlock(self: *Self, signed_block: types.SignedBlock) !void {
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
         try self.gossip_messages.append(self.allocator, gossip_msg);
     }
@@ -132,42 +132,26 @@ pub const ValidatorClient = struct {
                 },
             }
 
-            // 1. construct the block
-            self.logger.debug("constructing block message & proposer attestation data for slot={d} proposer={d}", .{ slot, slot_proposer_id });
+            self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
             const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
             self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
 
-            // 2. construct proposer attestation for the produced block which should already be in forkchoice
-            // including its attestations
-            const proposer_attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
-            const proposer_attestation = types.Attestation{
-                .validator_id = slot_proposer_id,
-                .data = proposer_attestation_data,
-            };
-            const attestation_str = try proposer_attestation_data.toJsonString(self.allocator);
-            defer self.allocator.free(attestation_str);
-            self.logger.info("packing proposer attestation for slot={d} proposer={d}: {s}", .{ slot, slot_proposer_id, attestation_str });
+            // Sign block root with proposer's proposal key
+            const proposer_signature = try self.key_manager.signBlockRoot(
+                slot_proposer_id,
+                &produced_block.blockRoot,
+                @intCast(slot),
+            );
 
-            // 3. construct the message to be signed
-            const block_with_attestation = types.BlockWithAttestation{
+            const signed_block = types.SignedBlock{
                 .block = produced_block.block,
-                .proposer_attestation = proposer_attestation,
+                .signature = .{
+                    .attestation_signatures = produced_block.attestation_signatures,
+                    .proposer_signature = proposer_signature,
+                },
             };
 
-            // 4. Sign proposer attestation and build block signatures from the already-aggregated
-            //    attestation signatures returned by block production.
-            const proposer_signature = try self.key_manager.signAttestation(&proposer_attestation, self.allocator);
-            const signatures = types.BlockSignatures{
-                .attestation_signatures = produced_block.attestation_signatures,
-                .proposer_signature = proposer_signature,
-            };
-
-            const signed_block = types.SignedBlockWithAttestation{
-                .message = block_with_attestation,
-                .signature = signatures,
-            };
-
-            self.logger.info("signed produced block with attestation for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
+            self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
 
             // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);
@@ -203,20 +187,11 @@ pub const ValidatorClient = struct {
             },
         }
 
-        const slot_proposer_id = self.getSlotProposer(slot);
-
         self.logger.info("constructing attestation message for slot={d}", .{slot});
         const attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
 
         var result = ValidatorClientOutput.init(self.allocator);
         for (self.ids) |validator_id| {
-            // if this validator had proposal its vote would have already been casted
-            // with the block proposal
-            if (validator_id == slot_proposer_id) {
-                self.logger.info("skipping separate attestation for proposer slot={d} validator={d}", .{ slot, validator_id });
-                continue;
-            }
-
             const attestation: types.Attestation = .{
                 .validator_id = validator_id,
                 .data = attestation_data,
