@@ -1230,15 +1230,6 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
 
-        // can't regress on safe target
-        if (safe_target.slot < self.safeTarget.slot) {
-            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
-                safe_target.slot,
-                self.safeTarget.slot,
-            });
-            return ForkChoiceError.InvalidSafeTargetCompute;
-        }
-
         self.safeTarget = safe_target;
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);

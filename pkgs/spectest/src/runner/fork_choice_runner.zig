@@ -788,62 +788,22 @@ fn processBlockStep(
             );
             return FixtureError.FixtureMismatch;
         };
-    }
 
-    _ = try ctx.fork_choice.updateHead();
-
-    var proposer_attestation = buildProposerAttestation(block, block_root, parent_state_ptr) catch |err| {
-        std.debug.print(
-            "fixture {s} case {s}{f}: unable to build proposer attestation ({s})\n",
-            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-        );
-        return FixtureError.FixtureMismatch;
-    };
-
-    if (block_wrapper_obj) |wrapper_obj| {
-        if (wrapper_obj.get("proposerAttestation")) |att_value| {
-            proposer_attestation = try parseFixtureProposerAttestation(
-                fixture_path,
-                case_name,
-                step_index,
-                att_value,
-            );
+        // Register each validator's attestation in the fork choice tracker.
+        // This mirrors chain.zig onBlock behavior: block attestations update the
+        // AttestationTracker so computeDeltas produces correct LMD-GHOST weights.
+        for (indices.items) |validator_index| {
+            const attestation = types.Attestation{
+                .validator_id = @intCast(validator_index),
+                .data = aggregated_attestation.data,
+            };
+            ctx.fork_choice.onAttestation(attestation, true) catch {
+                continue;
+            };
         }
     }
 
-    const signed_attestation = types.SignedAttestation{
-        .validator_id = proposer_attestation.validator_id,
-        .message = proposer_attestation.data,
-        .signature = types.ZERO_SIGBYTES,
-    };
-    // Proposer attestation is treated as gossip and queued as a new aggregated payload.
-    try ctx.fork_choice.onSignedAttestation(signed_attestation);
-
-    var proposer_proof = types.AggregatedSignatureProof.init(ctx.allocator) catch |err| {
-        std.debug.print(
-            "fixture {s} case {s}{f}: failed to init proposer proof ({s})\n",
-            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-        );
-        return FixtureError.InvalidFixture;
-    };
-    errdefer proposer_proof.deinit();
-
-    types.aggregationBitsSet(&proposer_proof.participants, proposer_attestation.validator_id, true) catch |err| {
-        std.debug.print(
-            "fixture {s} case {s}{f}: failed to set proposer participant bit ({s})\n",
-            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
-        );
-        return FixtureError.InvalidFixture;
-    };
-
-    const gop = try ctx.fork_choice.latest_new_aggregated_payloads.getOrPut(proposer_attestation.data);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = .empty;
-    }
-    try gop.value_ptr.append(ctx.allocator, .{
-        .slot = proposer_attestation.data.slot,
-        .proof = proposer_proof,
-    });
+    _ = try ctx.fork_choice.updateHead();
 
     if (block_wrapper_obj) |wrapper_obj| {
         if (wrapper_obj.get("blockRootLabel")) |label_value| {
@@ -979,6 +939,50 @@ fn applyChecks(
                     .{ fixture_path, case_name, formatStep(step_index), actual, expected },
                 );
                 return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "latestJustifiedRoot")) {
+            const expected = try expectRootValue(value, fixture_path, case_name, step_index, key);
+            if (!std.mem.eql(u8, &ctx.fork_choice.fcStore.latest_justified.root, &expected)) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: latest justified root mismatch got 0x{x} expected 0x{x}\n",
+                    .{ fixture_path, case_name, formatStep(step_index), &ctx.fork_choice.fcStore.latest_justified.root, &expected },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "latestJustifiedRootLabel")) {
+            const label = switch (value) {
+                .string => |s| s,
+                else => {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: latestJustifiedRootLabel must be string\n",
+                        .{ fixture_path, case_name, formatStep(step_index) },
+                    );
+                    return FixtureError.InvalidFixture;
+                },
+            };
+            const justified_root = ctx.fork_choice.fcStore.latest_justified.root;
+            if (ctx.label_map.get(label)) |expected_root| {
+                if (!std.mem.eql(u8, &justified_root, &expected_root)) {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: latest justified root label {s} mismatch\n",
+                        .{ fixture_path, case_name, formatStep(step_index), label },
+                    );
+                    return FixtureError.FixtureMismatch;
+                }
+            } else {
+                ctx.label_map.put(ctx.allocator, label, justified_root) catch |err| {
+                    std.debug.print(
+                        "fixture {s} case {s}{f}: failed to record label {s} ({s})\n",
+                        .{ fixture_path, case_name, formatStep(step_index), label, @errorName(err) },
+                    );
+                    return FixtureError.InvalidFixture;
+                };
             }
             continue;
         }
@@ -1342,92 +1346,6 @@ fn verifyLexicographicHead(
         );
         return FixtureError.FixtureMismatch;
     }
-}
-
-fn buildProposerAttestation(
-    block: types.BeamBlock,
-    block_root: types.Root,
-    parent_state: *types.BeamState,
-) !types.Attestation {
-    return types.Attestation{
-        .validator_id = block.proposer_index,
-        .data = .{
-            .slot = block.slot,
-            .head = .{ .root = block_root, .slot = block.slot },
-            .target = .{ .root = block_root, .slot = block.slot },
-            .source = .{
-                .root = block.parent_root,
-                .slot = parent_state.latest_block_header.slot,
-            },
-        },
-    };
-}
-
-fn parseFixtureProposerAttestation(
-    fixture_path: []const u8,
-    case_name: []const u8,
-    step_index: usize,
-    value: JsonValue,
-) FixtureError!types.Attestation {
-    const att_obj = switch (value) {
-        .object => |map| map,
-        else => {
-            std.debug.print(
-                "fixture {s} case {s}{f}: proposerAttestation must be object\n",
-                .{ fixture_path, case_name, formatStep(step_index) },
-            );
-            return FixtureError.InvalidFixture;
-        },
-    };
-
-    var validator_label_buf: [96]u8 = undefined;
-    const validator_label = std.fmt.bufPrint(&validator_label_buf, "block.step[{d}].proposerAttestation.validatorId", .{step_index}) catch "proposerAttestation.validatorId";
-    const validator_id = try expectU64Field(att_obj, &.{ "validatorId", "validator_id" }, fixture_path, case_name, step_index, validator_label);
-
-    var data_label_buf: [96]u8 = undefined;
-    const data_label = std.fmt.bufPrint(&data_label_buf, "block.step[{d}].proposerAttestation.data", .{step_index}) catch "proposerAttestation.data";
-    const data_obj = try expectObjectField(att_obj, &.{"data"}, fixture_path, case_name, step_index, data_label);
-
-    var slot_label_buf: [96]u8 = undefined;
-    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{data_label}) catch "proposerAttestation.data.slot";
-    const data_slot = try expectU64Field(data_obj, &.{"slot"}, fixture_path, case_name, step_index, slot_label);
-
-    const head = try parseCheckpointField(data_obj, "head", fixture_path, case_name, step_index, data_label);
-    const target = try parseCheckpointField(data_obj, "target", fixture_path, case_name, step_index, data_label);
-    const source = try parseCheckpointField(data_obj, "source", fixture_path, case_name, step_index, data_label);
-
-    return types.Attestation{
-        .validator_id = validator_id,
-        .data = .{
-            .slot = data_slot,
-            .head = head,
-            .target = target,
-            .source = source,
-        },
-    };
-}
-
-fn parseCheckpointField(
-    parent: std.json.ObjectMap,
-    field: []const u8,
-    fixture_path: []const u8,
-    case_name: []const u8,
-    step_index: usize,
-    label_prefix: []const u8,
-) FixtureError!types.Checkpoint {
-    var context_buf: [160]u8 = undefined;
-    const checkpoint_context = std.fmt.bufPrint(&context_buf, "{s}.{s}", .{ label_prefix, field }) catch field;
-    const checkpoint_obj = try expectObjectField(parent, &.{field}, fixture_path, case_name, step_index, checkpoint_context);
-
-    var root_label_buf: [192]u8 = undefined;
-    const root_label = std.fmt.bufPrint(&root_label_buf, "{s}.root", .{checkpoint_context}) catch "checkpoint.root";
-    var slot_label_buf: [192]u8 = undefined;
-    const slot_label = std.fmt.bufPrint(&slot_label_buf, "{s}.slot", .{checkpoint_context}) catch "checkpoint.slot";
-
-    const root = try expectRootField(checkpoint_obj, &.{"root"}, fixture_path, case_name, step_index, root_label);
-    const slot = try expectU64Field(checkpoint_obj, &.{"slot"}, fixture_path, case_name, step_index, slot_label);
-
-    return .{ .root = root, .slot = slot };
 }
 
 fn buildBlock(
