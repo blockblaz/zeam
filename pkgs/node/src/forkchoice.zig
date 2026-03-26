@@ -1289,7 +1289,7 @@ pub const ForkChoice = struct {
         const validator_id = signed_attestation.validator_id;
         const attestation_slot = attestation_data.slot;
 
-        var gossip_signatures_count: usize = 0;
+        var attestation_sigs_count: usize = 0;
         {
             self.signatures_mutex.lock();
             defer self.signatures_mutex.unlock();
@@ -1298,10 +1298,10 @@ pub const ForkChoice = struct {
                 .slot = attestation_slot,
                 .signature = signed_attestation.signature,
             });
-            gossip_signatures_count = self.attestation_signatures.count();
+            attestation_sigs_count = self.attestation_signatures.count();
         }
         // Update metric outside lock scope
-        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_signatures_count));
+        zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(attestation_sigs_count));
 
         const attestation = types.Attestation{
             .validator_id = validator_id,
@@ -2031,7 +2031,7 @@ pub const ForkChoiceError = error{
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "forkchoice block tree" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();

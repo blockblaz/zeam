@@ -1161,7 +1161,7 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
-                if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
+                if (self.chain.maybeAggregateOnInterval(interval) catch |e| {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
                     return e;
                 }) |aggregations| {
@@ -1258,11 +1258,11 @@ pub const BeamNode = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.message, &block_root, self.allocator);
 
-        // 2. need to add the signed proposer attestation in forkchoice even if block was locally produced
-        //    TODO: might not be needed for locally produced block if we totally depend on the agggregators to serve us attestations
+        // 2. Reprocess locally produced block through chain so forkchoice is updated.
+        //    TODO: might not be needed for locally produced block if we totally depend on the aggregators to serve us attestations
         const hasBlock = self.chain.forkChoice.hasBlock(block_root);
         if (hasBlock) {
-            self.logger.debug("reprocessing locally produced block to add signed proposer attestation: slot={d} proposer={d}", .{
+            self.logger.debug("reprocessing locally produced block: slot={d} proposer={d}", .{
                 block.slot,
                 block.proposer_index,
             });

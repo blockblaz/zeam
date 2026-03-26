@@ -181,7 +181,7 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Clean up forkchoice resources (gossip_signatures, aggregated_payloads)
+        // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
 
         var it = self.states.iterator();
@@ -1501,13 +1501,13 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn aggregateCommitteeSignatures(self: *Self) ![]types.SignedAggregatedAttestation {
+    pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
         const head_root = self.forkChoice.head.blockRoot;
         const state = self.states.get(head_root) orelse return error.MissingState;
         return self.forkChoice.aggregate(state, false);
     }
 
-    pub fn maybeAggregateCommitteeSignaturesOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
+    pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
 
@@ -1533,8 +1533,8 @@ pub const BeamChain = struct {
             },
         }
 
-        const aggregations = self.aggregateCommitteeSignatures() catch |err| {
-            self.logger.warn("failed to aggregate committee signatures for slot={d}: {any}", .{ slot, err });
+        const aggregations = self.aggregate() catch |err| {
+            self.logger.warn("failed to aggregate attestation signatures for slot={d}: {any}", .{ slot, err });
             return null;
         };
 
@@ -1694,7 +1694,7 @@ pub const BlockValidationError = error{
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "process and add mock blocks into a node's chain" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
@@ -1780,7 +1780,7 @@ test "process and add mock blocks into a node's chain" {
 }
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "printSlot output demonstration" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
@@ -1939,7 +1939,7 @@ test "buildTreeVisualization integration test" {
 // These tests align with leanSpec's test_attestation_processing.py
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "attestation validation - comprehensive" {
     // Comprehensive test covering all attestation validation rules
     // This consolidates multiple validation checks into one test to avoid redundant setup
@@ -2213,7 +2213,7 @@ test "attestation validation - comprehensive" {
 }
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "attestation validation - gossip vs block future slot handling" {
     // Test that gossip and block attestations have different future slot tolerances
     // Gossip: must be <= current_slot
@@ -2314,7 +2314,7 @@ test "attestation validation - gossip vs block future slot handling" {
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
-// JSON parsing for chain config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "attestation processing - valid block attestation" {
     // Test that valid attestations from blocks are processed correctly
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2457,7 +2457,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Process blocks at slots 1 and 2
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message.block;
+        const block = signed_block.message;
         try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
         allocator.free(missing_roots);
