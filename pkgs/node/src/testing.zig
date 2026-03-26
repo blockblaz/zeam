@@ -177,7 +177,7 @@ pub const NodeTestContext = struct {
         var attestation_signatures = try types.AttestationSignatures.init(allocator);
         errdefer attestation_signatures.deinit();
 
-        for (block.message.body.attestations.constSlice()) |aggregated_attestation| {
+        for (block.block.body.attestations.constSlice()) |aggregated_attestation| {
             var signature_proof = try types.AggregatedSignatureProof.init(allocator);
             errdefer signature_proof.deinit();
 
@@ -235,8 +235,8 @@ pub const NodeTestContext = struct {
         }
 
         var block_root: types.Root = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, block.message, &block_root, allocator);
-        const proposer_signature = try self.key_manager.signBlockRoot(block.message.proposer_index, &block_root, @intCast(block.message.slot));
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &block_root, allocator);
+        const proposer_signature = try self.key_manager.signBlockRoot(block.block.proposer_index, &block_root, @intCast(block.block.slot));
 
         const signatures = types.BlockSignatures{
             .attestation_signatures = attestation_signatures,

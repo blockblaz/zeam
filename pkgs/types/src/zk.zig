@@ -122,7 +122,7 @@ test "ssz seralize/deserialize signed stf prover input" {
     const attestations = try block.AggregatedAttestations.init(std.testing.allocator);
 
     var test_block = block.SignedBlock{
-        .message = .{
+        .block = .{
             .slot = 9,
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
@@ -133,12 +133,12 @@ test "ssz seralize/deserialize signed stf prover input" {
         },
         .signature = try block.createBlockSignatures(std.testing.allocator, attestations.len()),
     };
-    defer test_block.message.body.attestations.deinit();
+    defer test_block.block.body.attestations.deinit();
     defer test_block.signature.deinit();
 
     const prover_input = BeamSTFProverInput{
         .state = test_state,
-        .block = test_block.message,
+        .block = test_block.block,
     };
 
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);

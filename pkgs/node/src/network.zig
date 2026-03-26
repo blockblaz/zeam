@@ -318,7 +318,7 @@ pub const Network = struct {
             self.allocator.destroy(block);
         }
 
-        const parent_root = block.message.parent_root;
+        const parent_root = block.block.parent_root;
         const gop = try self.fetched_block_children.getOrPut(parent_root);
 
         const created_new_entry = !gop.found_existing;
@@ -337,7 +337,7 @@ pub const Network = struct {
             var block_ptr = entry.value;
 
             // Remove this block from its parent's children list
-            const parent_root = block_ptr.message.parent_root;
+            const parent_root = block_ptr.block.parent_root;
             if (self.fetched_block_children.getPtr(parent_root)) |children_list| {
                 // Find and remove this root from the parent's children list
                 for (children_list.items, 0..) |child_root, i| {
@@ -390,7 +390,7 @@ pub const Network = struct {
         // Walk up: traverse parent chain and add all cached ancestors
         var current = root;
         while (self.getFetchedBlock(current)) |block_ptr| {
-            const parent_root = block_ptr.message.parent_root;
+            const parent_root = block_ptr.block.parent_root;
             if (self.hasFetchedBlock(parent_root)) {
                 to_remove.put(parent_root, {}) catch break;
                 current = parent_root;
@@ -412,7 +412,7 @@ pub const Network = struct {
                 // the finalized chain (matching root at or after finalized slot).
                 if (finalized_checkpoint) |fc| {
                     if (self.getFetchedBlock(child_root)) |child_block| {
-                        if (child_block.message.slot >= fc.slot and
+                        if (child_block.block.slot >= fc.slot and
                             std.mem.eql(u8, &child_root, &fc.root))
                         {
                             // This child is the finalized block — skip it (keep it and its descendants)

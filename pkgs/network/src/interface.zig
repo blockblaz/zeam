@@ -269,8 +269,8 @@ pub const GossipMessage = union(GossipTopicKind) {
     pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
-                blk.message.slot,
-                blk.message.proposer_index,
+                blk.block.slot,
+                blk.block.proposer_index,
             }),
             .attestation => |att| try writer.print("GossipMessage{{ attestation: subnet={d} validator={d}, slot={d} }}", .{
                 att.subnet_id,

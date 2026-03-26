@@ -97,7 +97,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
     try zeam_utils.hashTreeRoot(types.BeamBlock, genesis_block, &block_root, allocator);
 
     const gen_signed_block = types.SignedBlock{
-        .message = genesis_block,
+        .block = genesis_block,
         .signature = blk: {
             var signatures = try types.createBlockSignatures(allocator, genesis_block.body.attestations.len());
             const proposer_sig = try key_manager.signBlockRoot(
@@ -349,7 +349,7 @@ pub fn genMockChain(allocator: Allocator, numBlocks: usize, from_genesis: ?types
         agg_sig_cleanup = false;
 
         const signed_block = types.SignedBlock{
-            .message = block,
+            .block = block,
             .signature = block_signatures,
         };
         try blockList.append(allocator, signed_block);

@@ -964,7 +964,13 @@ pub const ForkChoice = struct {
         // changed. If it did, look for entries matching the new justified checkpoint
         // and repeat. If no matching entries exist or justification did not change,
         // block production is done.
-        var current_justified_root = pre_state.latest_justified.root;
+        // When building on top of genesis (slot 0), process_block_header will
+        // update the justified root to parent_root. Apply the same derivation
+        // here so attestation sources match (leanSpec d0c5030).
+        var current_justified_root = if (pre_state.latest_block_header.slot == 0)
+            parent_root
+        else
+            pre_state.latest_justified.root;
         var processed_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
         defer processed_att_data.deinit();
 
@@ -2063,13 +2069,13 @@ test "forkchoice block tree" {
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &mock_chain.blockRoots[0]));
     try std.testing.expect(fork_choice.protoArray.nodes.items.len == 1);
     try std.testing.expect(std.mem.eql(u8, &fork_choice.fcStore.latest_finalized.root, &fork_choice.protoArray.nodes.items[0].blockRoot));
-    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].block.state_root[0..], &fork_choice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &fork_choice.protoArray.nodes.items[0].blockRoot));
 
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
         // shouldn't accept a future slot

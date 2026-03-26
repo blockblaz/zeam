@@ -1011,13 +1011,13 @@ test "save and load block" {
     const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
     try std.testing.expect(loaded_block != null);
 
-    const loaded = loaded_block.?.message;
+    const loaded = loaded_block.?.block;
 
     // Verify all block fields match
-    try std.testing.expect(loaded.slot == signed_block.message.slot);
-    try std.testing.expect(loaded.proposer_index == signed_block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &signed_block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &signed_block.message.state_root));
+    try std.testing.expect(loaded.slot == signed_block.block.slot);
+    try std.testing.expect(loaded.proposer_index == signed_block.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded.parent_root, &signed_block.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded.state_root, &signed_block.block.state_root));
 
     // Verify attestations list is empty as expected
     try std.testing.expect(loaded.body.attestations.len() == 0);
@@ -1137,11 +1137,11 @@ test "batch write and commit" {
     const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
     try std.testing.expect(loaded_block != null);
 
-    const loaded_block_data = loaded_block.?.message;
-    try std.testing.expect(loaded_block_data.slot == signed_block.message.slot);
-    try std.testing.expect(loaded_block_data.proposer_index == signed_block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.message.state_root));
+    const loaded_block_data = loaded_block.?.block;
+    try std.testing.expect(loaded_block_data.slot == signed_block.block.slot);
+    try std.testing.expect(loaded_block_data.proposer_index == signed_block.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.parent_root, &signed_block.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &loaded_block_data.state_root, &signed_block.block.state_root));
 
     // Verify attestation signatures count matches
     const batch_signature_proofs = loaded_block.?.signature.attestation_signatures;

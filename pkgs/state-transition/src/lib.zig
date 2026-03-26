@@ -50,14 +50,14 @@ test "apply transition on mocked chain" {
         // Pass null for pubkey_cache since tests don't need caching optimization
         try verifySignatures(allocator, &beam_state, &signed_block, null);
 
-        try apply_transition(allocator, &beam_state, signed_block.message, .{ .logger = module_logger });
+        try apply_transition(allocator, &beam_state, signed_block.block, .{ .logger = module_logger });
     }
 
     // check the post state root to be equal to block2's stateroot
     // this is reduant though because apply_transition already checks this for each block's state root
     var post_state_root: [32]u8 = undefined;
     try zeam_utils.hashTreeRoot(types.BeamState, beam_state, &post_state_root, allocator);
-    try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].message.state_root));
+    try std.testing.expect(std.mem.eql(u8, &post_state_root, &mock_chain.blocks[mock_chain.blocks.len - 1].block.state_root));
 }
 
 test "genStateBlockHeader" {
@@ -74,7 +74,7 @@ test "genStateBlockHeader" {
         // get applied block
         const applied_block = mock_chain.blocks[i];
         var applied_block_root: types.Root = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, applied_block.message, &applied_block_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamBlock, applied_block.block, &applied_block_root, allocator);
 
         const state_block_header = try beam_state.genStateBlockHeader(allocator);
         var state_block_header_root: types.Root = undefined;
@@ -85,7 +85,7 @@ test "genStateBlockHeader" {
         if (i < mock_chain.blocks.len - 1) {
             // apply the next block
             const signed_block = mock_chain.blocks[i + 1];
-            try apply_transition(allocator, &beam_state, signed_block.message, .{ .logger = module_logger });
+            try apply_transition(allocator, &beam_state, signed_block.block, .{ .logger = module_logger });
         }
     }
 }

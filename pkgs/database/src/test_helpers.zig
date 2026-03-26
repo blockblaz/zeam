@@ -24,7 +24,7 @@ pub fn createDummyBlock(allocator: Allocator, slot: u64, proposer_index: u64, pa
     };
 
     const signed_block = types.SignedBlock{
-        .message = test_block,
+        .block = test_block,
         .signature = block_signatures,
     };
 

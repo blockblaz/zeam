@@ -400,17 +400,17 @@ pub const BlockSignatures = struct {
 };
 
 pub const SignedBlock = struct {
-    message: BeamBlock,
+    block: BeamBlock,
     signature: BlockSignatures,
 
     pub fn deinit(self: *SignedBlock) void {
-        self.message.deinit();
+        self.block.deinit();
         self.signature.deinit();
     }
 
     pub fn toJson(self: *const SignedBlock, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
-        try obj.put("message", try self.message.toJson(allocator));
+        try obj.put("block", try self.block.toJson(allocator));
         try obj.put("signature", try self.signature.toJson(allocator));
         return json.Value{ .object = obj };
     }
@@ -876,7 +876,7 @@ test "ssz seralize/deserialize signed beam block" {
     errdefer signatures.deinit();
 
     var signed_block = SignedBlock{
-        .message = .{
+        .block = .{
             .slot = 9,
             .proposer_index = 3,
             .parent_root = [_]u8{ 199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237, 99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60 },
@@ -897,11 +897,11 @@ test "ssz seralize/deserialize signed beam block" {
     try ssz.deserialize(SignedBlock, serialized_signed_block.items[0..], &deserialized_signed_block, std.testing.allocator);
     defer deserialized_signed_block.deinit();
 
-    try std.testing.expect(std.mem.eql(u8, &signed_block.message.state_root, &deserialized_signed_block.message.state_root));
-    try std.testing.expect(std.mem.eql(u8, &signed_block.message.parent_root, &deserialized_signed_block.message.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &signed_block.block.state_root, &deserialized_signed_block.block.state_root));
+    try std.testing.expect(std.mem.eql(u8, &signed_block.block.parent_root, &deserialized_signed_block.block.parent_root));
 
     var block_root: [32]u8 = undefined;
-    try zeam_utils.hashTreeRoot(BeamBlock, signed_block.message, &block_root, std.testing.allocator);
+    try zeam_utils.hashTreeRoot(BeamBlock, signed_block.block, &block_root, std.testing.allocator);
 }
 
 test "blockToLatestBlockHeader and blockToHeader" {
@@ -934,7 +934,7 @@ test "encode decode signed block roundtrip" {
     errdefer signatures.deinit();
 
     var signed_block = SignedBlock{
-        .message = .{
+        .block = .{
             .slot = 0,
             .proposer_index = 0,
             .parent_root = ZERO_HASH,
@@ -953,10 +953,10 @@ test "encode decode signed block roundtrip" {
     try ssz.deserialize(SignedBlock, encoded.items[0..], &decoded, std.testing.allocator);
     defer decoded.deinit();
 
-    try std.testing.expect(decoded.message.slot == signed_block.message.slot);
-    try std.testing.expect(decoded.message.proposer_index == signed_block.message.proposer_index);
-    try std.testing.expect(std.mem.eql(u8, &decoded.message.parent_root, &signed_block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &decoded.message.state_root, &signed_block.message.state_root));
+    try std.testing.expect(decoded.block.slot == signed_block.block.slot);
+    try std.testing.expect(decoded.block.proposer_index == signed_block.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &decoded.block.parent_root, &signed_block.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &decoded.block.state_root, &signed_block.block.state_root));
     try std.testing.expect(decoded.signature.attestation_signatures.len() == signed_block.signature.attestation_signatures.len());
 }
 
@@ -977,7 +977,7 @@ test "encode decode signed block with non-empty attestation signatures" {
     try attestation_signatures.append(signature_proof);
 
     var signed_block = SignedBlock{
-        .message = .{
+        .block = .{
             .slot = 1,
             .proposer_index = 0,
             .parent_root = ZERO_HASH,
@@ -999,7 +999,7 @@ test "encode decode signed block with non-empty attestation signatures" {
     try ssz.deserialize(SignedBlock, encoded.items[0..], &decoded, std.testing.allocator);
     defer decoded.deinit();
 
-    try std.testing.expect(decoded.message.slot == signed_block.message.slot);
+    try std.testing.expect(decoded.block.slot == signed_block.block.slot);
     try std.testing.expect(decoded.signature.attestation_signatures.len() == 1);
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
     try std.testing.expect(decoded_group.participants.len() == 2);

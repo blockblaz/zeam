@@ -144,7 +144,7 @@ pub const ValidatorClient = struct {
             );
 
             const signed_block = types.SignedBlock{
-                .message = produced_block.block,
+                .block = produced_block.block,
                 .signature = .{
                     .attestation_signatures = produced_block.attestation_signatures,
                     .proposer_signature = proposer_signature,

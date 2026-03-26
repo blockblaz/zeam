@@ -797,7 +797,7 @@ test "Mock messaging across two subscribers" {
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
     block_message.* = .{ .block = .{
-        .message = .{
+        .block = .{
             .slot = 1,
             .proposer_index = 0,
             .parent_root = [_]u8{1} ** 32,
@@ -831,10 +831,10 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(received2 == .block);
 
     // Verify the block content is identical
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.parent_root, &received2.block.message.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.state_root, &received2.block.message.state_root));
-    try std.testing.expect(received1.block.message.slot == received2.block.message.slot);
-    try std.testing.expect(received1.block.message.proposer_index == received2.block.message.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &received1.block.block.parent_root, &received2.block.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.block.state_root, &received2.block.block.state_root));
+    try std.testing.expect(received1.block.block.slot == received2.block.block.slot);
+    try std.testing.expect(received1.block.block.proposer_index == received2.block.block.proposer_index);
 }
 
 test "Mock status RPC between peers" {

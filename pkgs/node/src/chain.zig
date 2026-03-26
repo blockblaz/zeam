@@ -229,14 +229,14 @@ pub const BeamChain = struct {
         const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
         var i: usize = 0;
         while (i < self.pending_blocks.items.len) {
-            const queued_slot = self.pending_blocks.items[i].message.slot;
+            const queued_slot = self.pending_blocks.items[i].block.slot;
             if (queued_slot * constants.INTERVALS_PER_SLOT <= fc_time) {
                 // Remove from queue (ownership transferred to local var).
                 var queued_block = self.pending_blocks.orderedRemove(i);
                 defer queued_block.deinit();
 
                 var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.message, &block_root, self.allocator) catch |err| {
+                zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
                     self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
                     continue;
                 };
@@ -616,7 +616,7 @@ pub const BeamChain = struct {
     pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
-                const block = signed_block.message;
+                const block = signed_block.block;
                 var block_root: [32]u8 = undefined;
                 try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
@@ -822,7 +822,7 @@ pub const BeamChain = struct {
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
         const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
 
-        const block = signedBlock.message;
+        const block = signedBlock.block;
 
         const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
             var cblock_root: [32]u8 = undefined;
@@ -1740,13 +1740,13 @@ test "process and add mock blocks into a node's chain" {
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &mock_chain.blockRoots[0]));
     try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == 1);
     try std.testing.expect(std.mem.eql(u8, &beam_chain.forkChoice.getLatestFinalized().root, &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
-    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].message.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
+    try std.testing.expect(std.mem.eql(u8, mock_chain.blocks[0].block.state_root[0..], &beam_chain.forkChoice.protoArray.nodes.items[0].stateRoot));
     try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[0], &beam_chain.forkChoice.protoArray.nodes.items[0].blockRoot));
 
     for (1..mock_chain.blocks.len) |i| {
         // get the block post state
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         const block_root = mock_chain.blockRoots[i];
         const current_slot = block.slot;
 
@@ -1823,7 +1823,7 @@ test "printSlot output demonstration" {
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
@@ -1896,7 +1896,7 @@ test "buildTreeVisualization integration test" {
     // Process blocks to build the forkchoice tree
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
@@ -1984,7 +1984,7 @@ test "attestation validation - comprehensive" {
     // Add blocks to chain (slots 1 and 2)
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{});
         allocator.free(missing_roots);
@@ -2258,7 +2258,7 @@ test "attestation validation - gossip vs block future slot handling" {
 
     // Add one block (slot 1)
     const block = mock_chain.blocks[1];
-    try beam_chain.forkChoice.onInterval(block.message.slot * constants.INTERVALS_PER_SLOT, false);
+    try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
     const missing_roots = try beam_chain.onBlock(block, .{});
     allocator.free(missing_roots);
 
@@ -2358,7 +2358,7 @@ test "attestation processing - valid block attestation" {
     // Add blocks to chain
     for (1..mock_chain.blocks.len) |i| {
         const block = mock_chain.blocks[i];
-        try beam_chain.forkChoice.onInterval(block.message.slot * constants.INTERVALS_PER_SLOT, false);
+        try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(block, .{});
         allocator.free(missing_roots);
     }
@@ -2457,7 +2457,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Process blocks at slots 1 and 2
     for (1..mock_chain.blocks.len) |i| {
         const signed_block = mock_chain.blocks[i];
-        const block = signed_block.message;
+        const block = signed_block.block;
         try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
         allocator.free(missing_roots);
