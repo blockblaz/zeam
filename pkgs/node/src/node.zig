@@ -40,6 +40,8 @@ const NodeOpts = struct {
     logger_config: *zeam_utils.ZeamLoggerConfig,
     node_registry: *const NodeNameRegistry,
     is_aggregator: bool = false,
+    /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
+    aggregation_subnet_ids: ?[]const u32 = null,
 };
 
 pub const BeamNode = struct {
@@ -52,6 +54,8 @@ pub const BeamNode = struct {
     last_interval: isize,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
+    aggregation_subnet_ids: ?[]const u32 = null,
 
     const Self = @This();
 
@@ -108,6 +112,7 @@ pub const BeamNode = struct {
             .last_interval = -1,
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
+            .aggregation_subnet_ids = opts.aggregation_subnet_ids,
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -197,7 +202,7 @@ pub const BeamNode = struct {
             },
             .aggregation => |signed_aggregation| {
                 const sender_node_name = self.node_registry.getNodeNameFromPeerId(sender_peer_id);
-                self.logger.info("received gossip aggregation for slot={d} from peer={s}{any}", .{
+                self.logger.info("received gossip aggregation for slot={d} from peer={s}{f}", .{
                     signed_aggregation.data.slot,
                     sender_peer_id,
                     sender_node_name,
@@ -272,29 +277,33 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Attestation validation failed due to missing head/source/target block -
+                // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
-                    if (data.* == .attestation) {
-                        const att = data.attestation;
-                        const att_data = att.message.message;
+                    const att_data: ?@TypeOf(data.attestation.message.message) = switch (data.*) {
+                        .attestation => |att| att.message.message,
+                        .aggregation => |agg| agg.data,
+                        else => null,
+                    };
+                    if (att_data) |ad| {
                         const missing_root = if (err == error.UnknownHeadBlock)
-                            att_data.head.root
+                            ad.head.root
                         else if (err == error.UnknownSourceBlock)
-                            att_data.source.root
+                            ad.source.root
                         else
-                            att_data.target.root;
+                            ad.target.root;
 
+                        const kind: []const u8 = if (data.* == .attestation) "attestation" else "aggregation";
                         if (self.network.hasPendingBlockRoot(missing_root)) {
-                            self.logger.debug("gossip attestation validation deferred slot={d} validator={d} error={any} (block fetch in progress)", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.debug("gossip {s} validation deferred slot={d} error={any} (block fetch in progress)", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         } else {
-                            self.logger.warn("gossip attestation validation failed slot={d} validator={d} error={any}", .{
-                                att_data.slot,
-                                att.message.validator_id,
+                            self.logger.warn("gossip {s} validation failed slot={d} error={any}", .{
+                                kind,
+                                ad.slot,
                                 err,
                             });
                         }
@@ -317,16 +326,15 @@ pub const BeamNode = struct {
             self.processCachedDescendants(processed_root);
         }
 
-        // Fetch any attestation head roots that were missing while processing the block.
-        // We only own the slice when the block was actually processed (onBlock allocates it).
+        // Fetch any block roots that were missing while processing a block or validating attestation/aggregation gossip.
+        // We own the slice whenever it's non-empty (onBlock and onGossip both allocate it).
         const missing_roots = result.missing_attestation_roots;
-        const owns_missing_roots = result.processed_block_root != null;
-        defer if (owns_missing_roots) self.allocator.free(missing_roots);
+        defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
-        if (missing_roots.len > 0 and owns_missing_roots) {
+        if (missing_roots.len > 0) {
             self.fetchBlockByRoots(missing_roots, 0) catch |err| {
                 self.logger.warn(
-                    "failed to fetch {d} missing attestation head block(s) from gossip: {any}",
+                    "failed to fetch {d} missing block root(s) from gossip: {any}",
                     .{ missing_roots.len, err },
                 );
             };
@@ -388,6 +396,17 @@ pub const BeamNode = struct {
         // Try to process each descendant
         for (descendants_to_process.items) |descendant_root| {
             if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+                // Skip if already known to fork choice — same guard as processBlockByRootChunk
+                if (self.chain.forkChoice.hasBlock(descendant_root)) {
+                    self.logger.debug(
+                        "cached block 0x{x} is already known to fork choice, skipping re-processing",
+                        .{&descendant_root},
+                    );
+                    _ = self.network.removeFetchedBlock(descendant_root);
+                    self.processCachedDescendants(descendant_root);
+                    continue;
+                }
+
                 self.logger.debug(
                     "Attempting to process cached block 0x{x}",
                     .{&descendant_root},
@@ -430,6 +449,16 @@ pub const BeamNode = struct {
                     "Successfully processed cached block 0x{x}",
                     .{&descendant_root},
                 );
+
+                // Run the same post-block followup that processBlockByRootChunk performs:
+                // emits head/justification/finalization events and advances finalization.
+                // Note: onBlockFollowup currently ignores the signedBlock pointer (_ = signedBlock),
+                // so the ordering relative to removeFetchedBlock is not a memory-safety requirement
+                // today — kept here as good practice for when the parameter is wired up.
+                // Note: pruneForkchoice=true means processFinalizationAdvancement may fire on every
+                // iteration of a deep cached-block chain. Correct semantically; a future optimisation
+                // could pass false during catch-up and prune once at the end.
+                self.chain.onBlockFollowup(true, cached_block);
 
                 // Remove from cache now that it's been processed
                 _ = self.network.removeFetchedBlock(descendant_root);
@@ -599,6 +628,19 @@ pub const BeamNode = struct {
                 });
             }
 
+            // Skip STF re-processing if the block is already known to fork choice
+            // (e.g. the checkpoint sync anchor block — it is the trust root and does not
+            // need state-transition re-processing; re-processing it would cause an infinite
+            // fetch loop because onBlock would always see it as "already processed").
+            if (self.chain.forkChoice.hasBlock(block_root)) {
+                self.logger.debug(
+                    "block 0x{x} is already known to fork choice, skipping re-processing",
+                    .{&block_root},
+                );
+                self.processCachedDescendants(block_root);
+                return;
+            }
+
             // Try to add the block to the chain
             const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
                 // Check if the error is due to missing parent
@@ -743,7 +785,33 @@ pub const BeamNode = struct {
                                         };
                                     }
                                 },
-                                .synced, .no_peers, .fc_initing => {},
+                                .fc_initing => {
+                                    // Forkchoice is still initializing (checkpoint-sync or DB restore).
+                                    // We need blocks to reach the first justified checkpoint and exit
+                                    // fc_initing. Without this branch the node deadlocks: it stays in
+                                    // fc_initing because no blocks arrive, and no blocks arrive because
+                                    // the sync code skips fc_initing.
+                                    // Treat this exactly like behind_peers: if the peer's head is ahead
+                                    // of our anchor, request their head block to start the parent chain.
+                                    if (status_resp.head_slot > self.chain.forkChoice.head.slot) {
+                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            status_resp.head_slot,
+                                            self.chain.forkChoice.head.slot,
+                                            &status_resp.head_root,
+                                        });
+                                        const roots = [_]types.Root{status_resp.head_root};
+                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                        };
+                                    }
+                                },
+                                .synced, .no_peers => {},
                             }
                         },
                         else => {
@@ -1080,6 +1148,18 @@ pub const BeamNode = struct {
             }
 
             const interval_in_slot = interval % constants.INTERVALS_PER_SLOT;
+
+            // Periodically re-send status to all connected peers when not synced.
+            // This recovers from the case where peers were already connected when
+            // the node was in fc_initing and the status-exchange-triggered sync
+            // was skipped (now fixed, but existing connections need a re-probe).
+            if (interval_in_slot == 0 and slot % constants.SYNC_STATUS_REFRESH_INTERVAL_SLOTS == 0) {
+                switch (self.chain.getSyncStatus()) {
+                    .fc_initing, .behind_peers => self.refreshSyncFromPeers(),
+                    .synced, .no_peers => {},
+                }
+            }
+
             if (interval_in_slot == 2) {
                 if (self.chain.maybeAggregateCommitteeSignaturesOnInterval(interval) catch |e| {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
@@ -1095,6 +1175,28 @@ pub const BeamNode = struct {
         }
 
         self.last_interval = itime_intervals;
+    }
+
+    /// Re-send our status to every connected peer.
+    ///
+    /// Called periodically when the node is not yet synced so that peers
+    /// already connected before the sync mechanism became aware of them
+    /// (e.g., after a restart or while stuck in fc_initing) get another
+    /// chance to report their head and trigger block fetching.
+    fn refreshSyncFromPeers(self: *Self) void {
+        const status = self.chain.getStatus();
+        const handler = self.getReqRespResponseHandler();
+        var it = self.network.connected_peers.iterator();
+        while (it.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
+                self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
+                    peer_id,
+                    self.node_registry.getNodeNameFromPeerId(peer_id),
+                    err,
+                });
+            };
+        }
     }
 
     fn sweepTimedOutRequests(self: *Self) void {
@@ -1228,13 +1330,9 @@ pub const BeamNode = struct {
     }
 
     fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
-        var i: usize = 0;
-        while (i < aggregations.len) : (i += 1) {
+        for (aggregations, 0..) |_, i| {
             self.publishAggregation(aggregations[i]) catch |err| {
-                var j: usize = i;
-                while (j < aggregations.len) : (j += 1) {
-                    aggregations[j].deinit();
-                }
+                for (aggregations[i..]) |*a| a.deinit();
                 return err;
             };
             aggregations[i].deinit();
@@ -1263,19 +1361,41 @@ pub const BeamNode = struct {
 
         const committee_count = self.chain.config.spec.attestation_committee_count;
         if (committee_count > 0) {
+            // Collect all subnets to subscribe into a deduplication set.
+            var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
+            defer seen_subnets.deinit();
+
+            // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
+            // validators
+            if (self.chain.is_aggregator_enabled) {
+                if (self.aggregation_subnet_ids) |explicit_subnets| {
+                    for (explicit_subnets) |subnet_id| {
+                        if (seen_subnets.contains(subnet_id)) continue;
+                        try seen_subnets.put(subnet_id, {});
+                        try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = subnet_id });
+                    }
+                }
+            }
+
+            // Additionally subscribe to these subnets for validators to create mesh network for attestations
             if (self.validator) |validator| {
-                var seen_subnets = std.AutoHashMap(u32, void).init(self.allocator);
-                defer seen_subnets.deinit();
                 for (validator.ids) |validator_id| {
                     const subnet_id = try types.computeSubnetId(@intCast(validator_id), committee_count);
                     if (seen_subnets.contains(@intCast(subnet_id))) continue;
                     try seen_subnets.put(@intCast(subnet_id), {});
                     try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = @intCast(subnet_id) });
                 }
-            } else {
-                // Keep parity with leanSpec: passive nodes subscribe to subnet 0.
+            }
+
+            // If no subnets were added yet (aggregator but no explicit ids and no
+            // validators registered), fall back to subnet 0 to keep parity with leanSpec.
+            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
+        }
+        // if no committee count specified and still aggregator, all are in subnet 0
+        else if (self.chain.is_aggregator_enabled) {
+            try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
         }
 
         const topics_slice = try topics_list.toOwnedSlice(self.allocator);

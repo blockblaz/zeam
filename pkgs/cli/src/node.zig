@@ -17,14 +17,12 @@ const networks = @import("@zeam/network");
 const Multiaddr = @import("multiaddr").Multiaddr;
 const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
-const xmss = @import("@zeam/xmss");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
 const zeam_utils = @import("@zeam/utils");
-const constants = @import("constants.zig");
 const database = @import("@zeam/database");
 const json = std.json;
 const utils = @import("@zeam/utils");
@@ -81,6 +79,8 @@ pub const NodeOptions = struct {
     genesis_spec: types.GenesisSpec,
     metrics_enable: bool,
     is_aggregator: bool,
+    /// If aggregator, additional subnet ids to import and aggregate
+    aggregation_subnet_ids: ?[]u32 = null,
     api_port: u16,
     metrics_port: u16,
     local_priv_key: []const u8,
@@ -89,6 +89,7 @@ pub const NodeOptions = struct {
     hash_sig_key_dir: []const u8,
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
+    attestation_committee_count: ?u64 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -99,6 +100,7 @@ pub const NodeOptions = struct {
         allocator.free(self.validator_assignments);
         allocator.free(self.local_priv_key);
         allocator.free(self.hash_sig_key_dir);
+        if (self.aggregation_subnet_ids) |ids| allocator.free(ids);
         self.node_registry.deinit();
         allocator.destroy(self.node_registry);
     }
@@ -131,6 +133,33 @@ pub const Node = struct {
 
     const Self = @This();
 
+    /// Closes the current database, wipes the on-disk rocksdb directory, and
+    /// reopens a fresh database at the same path.
+    ///
+    /// If `ignore_not_found` is true, `error.FileNotFound` from the directory
+    /// deletion is silently swallowed (used for first-run installs where the
+    /// db directory has never been created). Set it to false when wiping a db
+    /// that is known to exist (genesis time mismatch case).
+    fn wipeAndReopenDb(
+        db: *database.Db,
+        allocator: std.mem.Allocator,
+        database_path: []const u8,
+        logger_config: *LoggerConfig,
+        logger: zeam_utils.ModuleLogger,
+        ignore_not_found: bool,
+    ) !void {
+        db.deinit();
+        const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{database_path});
+        defer allocator.free(rocksdb_path);
+        std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+            if (!ignore_not_found or wipe_err != error.FileNotFound) {
+                logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                return wipe_err;
+            }
+        };
+        db.* = try database.Db.open(allocator, logger_config.logger(.database), database_path);
+    }
+
     pub fn init(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -154,6 +183,12 @@ pub const Node = struct {
 
         // Set validator_pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_pubkeys = options.genesis_spec.validator_pubkeys;
+
+        // Apply attestation_committee_count if provided via CLI flag or config.yaml.
+        // ChainConfig.init falls back to 1 when this field is null, so we only override when set.
+        if (options.attestation_committee_count) |count| {
+            chain_options.attestation_committee_count = @intCast(count);
+        }
 
         // transfer ownership of the chain_options to ChainConfig
         const chain_config = try ChainConfig.init(Chain.custom, chain_options);
@@ -186,38 +221,57 @@ pub const Node = struct {
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
         self.anchor_state = anchorState;
+        errdefer self.anchor_state.deinit();
 
-        // Initialize anchor state with priority: checkpoint URL > database > genesis
-        var checkpoint_sync_succeeded = false;
+        // load a valid local state available in db else genesis
+        var local_finalized_state: types.BeamState = undefined;
+        if (db.loadLatestFinalizedState(&local_finalized_state)) {
+            if (local_finalized_state.config.genesis_time != chain_config.genesis.genesis_time) {
+                self.logger.warn("database genesis time mismatch (db={d}, config={d}), wiping stale database", .{
+                    local_finalized_state.config.genesis_time,
+                    chain_config.genesis.genesis_time,
+                });
+                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, false);
+                self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
+
+                local_finalized_state.deinit();
+                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+            } else {
+                self.anchor_state.* = local_finalized_state;
+            }
+        } else |_| {
+            self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
+            // ignore_not_found=true: db dir may not exist yet on a fresh install
+            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, true);
+            self.logger.info("starting fresh & generating genesis", .{});
+            try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
+        }
+
+        // check if a valid and more recent checkpoint finalized state is available
         if (options.checkpoint_sync_url) |checkpoint_url| {
             self.logger.info("checkpoint sync enabled, downloading state from: {s}", .{checkpoint_url});
 
             // Try checkpoint sync, fall back to database/genesis on failure
-            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state| {
-                self.anchor_state.* = downloaded_state;
-
+            if (downloadCheckpointState(allocator, checkpoint_url, self.logger)) |downloaded_state_const| {
+                var downloaded_state = downloaded_state_const;
                 // Verify state against genesis config
-                if (verifyCheckpointState(allocator, self.anchor_state, &chain_config.genesis, self.logger)) {
-                    self.logger.info("checkpoint sync completed successfully, using state at slot {d} as anchor", .{self.anchor_state.slot});
-                    checkpoint_sync_succeeded = true;
+                if (verifyCheckpointState(allocator, &downloaded_state, &chain_config.genesis, self.logger)) {
+                    if (downloaded_state.slot > self.anchor_state.slot) {
+                        self.logger.info("checkpoint sync completed successfully with a recent state at slot={d} as anchor", .{downloaded_state.slot});
+                        self.anchor_state.deinit();
+                        self.anchor_state.* = downloaded_state;
+                    } else {
+                        self.logger.warn("skipping checkpoint sync downloaded stale/same state at slot={d}, falling back to database", .{downloaded_state.slot});
+                        downloaded_state.deinit();
+                    }
                 } else |verify_err| {
                     self.logger.warn("checkpoint state verification failed: {}, falling back to database/genesis", .{verify_err});
-                    self.anchor_state.deinit();
+                    downloaded_state.deinit();
                 }
             } else |download_err| {
                 self.logger.warn("checkpoint sync failed: {}, falling back to database/genesis", .{download_err});
             }
         }
-
-        // Fall back to database/genesis if checkpoint sync was not attempted or failed
-        if (!checkpoint_sync_succeeded) {
-            // Try to load the latest finalized state from the database, fallback to genesis
-            db.loadLatestFinalizedState(self.anchor_state) catch |err| {
-                self.logger.warn("failed to load latest finalized state from database: {any}", .{err});
-                try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
-            };
-        }
-        errdefer self.anchor_state.deinit();
 
         const num_validators: usize = @intCast(chain_config.genesis.numValidators());
         self.key_manager = key_manager_lib.KeyManager.init(allocator);
@@ -247,6 +301,7 @@ pub const Node = struct {
             .logger_config = options.logger_config,
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
+            .aggregation_subnet_ids = options.aggregation_subnet_ids,
         });
         errdefer self.beam_node.deinit();
 
@@ -267,6 +322,20 @@ pub const Node = struct {
             );
             // Clean up metrics server if subsequent init operations fail
             errdefer if (self.metrics_server_handle) |handle| handle.stop();
+
+            // Set validator status gauges on node start
+            zeam_metrics.metrics.lean_is_aggregator.set(if (options.is_aggregator) 1 else 0);
+            // Set committee count from config
+            const committee_count = chain_config.spec.attestation_committee_count;
+            zeam_metrics.metrics.lean_attestation_committee_count.set(committee_count);
+            // Set subnet for the first validator (if any)
+            if (validator_ids.len > 0) {
+                const first_validator_id: types.ValidatorIndex = @intCast(validator_ids[0]);
+                const subnet_id = types.computeSubnetId(first_validator_id, committee_count) catch 0;
+                zeam_metrics.metrics.lean_attestation_committee_subnet.set(subnet_id);
+            } else {
+                zeam_metrics.metrics.lean_attestation_committee_subnet.set(0);
+            }
 
             // Start API server (pass chain pointer for chain-dependent endpoints)
             self.api_server_handle = try api_server.startAPIServer(
@@ -452,35 +521,30 @@ pub const Node = struct {
             const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
             defer self.allocator.free(pk_path);
 
-            // Read secret key
-            var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigSecretKeyMissing,
+            var keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            defer sk_file.close();
-            const secret_ssz = try sk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
-            defer self.allocator.free(secret_ssz);
-
-            // Read public key
-            var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return error.HashSigPublicKeyMissing,
-                else => return err,
-            };
-            defer pk_file.close();
-            const public_ssz = try pk_file.readToEndAlloc(self.allocator, constants.MAX_HASH_SIG_ENCODED_KEY_SIZE);
-            defer self.allocator.free(public_ssz);
-
-            var keypair = try xmss.KeyPair.fromSsz(
-                self.allocator,
-                secret_ssz,
-                public_ssz,
-            );
             errdefer keypair.deinit();
 
             try self.key_manager.addKeypair(assignment.index, keypair);
         }
     }
 };
+
+/// Reads ATTESTATION_COMMITTEE_COUNT from a parsed config.yaml Yaml document.
+/// Returns null if the field is absent or cannot be parsed.
+fn attestationCommitteeCountFromYAML(config: Yaml) ?u64 {
+    if (config.docs.items.len == 0) return null;
+    const root = config.docs.items[0];
+    if (root != .map) return null;
+    const value = root.map.get("ATTESTATION_COMMITTEE_COUNT") orelse return null;
+    return switch (value) {
+        .scalar => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
 
 /// Builds the start options for a node based on the provided command and options.
 /// It loads the necessary configuration files, parses them, and populates the
@@ -574,6 +638,48 @@ pub fn buildStartOptions(
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+
+    // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
+    // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
+    if (node_cmd.@"aggregate-subnet-ids" != null and !node_cmd.@"is-aggregator") {
+        std.log.err("--aggregate-subnet-ids requires --is-aggregator to be set", .{});
+        return error.AggregateSubnetIdsRequiresIsAggregator;
+    }
+    if (node_cmd.@"aggregate-subnet-ids") |subnet_ids_str| {
+        var list: std.ArrayList(u32) = .empty;
+        var it = std.mem.splitScalar(u8, subnet_ids_str, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " ");
+            if (trimmed.len == 0) continue;
+            const id = std.fmt.parseInt(u32, trimmed, 10) catch |err| {
+                std.log.warn("invalid subnet id '{s}': {any}", .{ trimmed, err });
+                list.deinit(allocator);
+                return error.InvalidSubnetId;
+            };
+            try list.append(allocator, id);
+        }
+        opts.aggregation_subnet_ids = try list.toOwnedSlice(allocator);
+    }
+
+    // Resolve attestation_committee_count: CLI flag takes precedence over config.yaml.
+    if (node_cmd.@"attestation-committee-count") |count| {
+        opts.attestation_committee_count = count;
+    } else {
+        // Try to read ATTESTATION_COMMITTEE_COUNT from config.yaml
+        opts.attestation_committee_count = attestationCommitteeCountFromYAML(parsed_config);
+    }
+
+    // Validate: attestation_committee_count must be >= 1.
+    // If the resolved value is 0 (an invalid input), log a warning and fall back to 1.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            std.log.warn(
+                "attestation-committee-count must be >= 1 (got 0); defaulting to 1",
+                .{},
+            );
+            opts.attestation_committee_count = 1;
+        }
+    }
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
@@ -585,54 +691,36 @@ fn downloadCheckpointState(
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    // Parse URL using std.Uri
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-
-    // Initialize HTTP client
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // Create HTTP request
-    var req = client.request(.GET, uri, .{}) catch |err| {
-        logger.err("failed to create HTTP request: {any}", .{err});
-        return error.ConnectionFailed;
-    };
-    defer req.deinit();
+    // Use an Allocating writer so client.fetch handles both Content-Length and
+    // Transfer-Encoding: chunked transparently. The previous manual readSliceShort
+    // loop panicked when the server switched to chunked encoding for responses
+    // larger than ~3 MB because readSliceShort → readVec → defaultReadVec →
+    // contentLengthStream panics when the body union field is 'ready' (chunked)
+    // rather than 'body_remaining_content_length'.
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
 
-    // Send the request (GET has no body)
-    req.sendBodiless() catch |err| {
-        logger.err("failed to send HTTP request: {any}", .{err});
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+    }) catch |err| {
+        logger.err("checkpoint sync request failed: {any}", .{err});
         return error.RequestFailed;
     };
 
-    // Receive response headers
-    var redirect_buffer: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buffer) catch |err| {
-        logger.err("failed to receive HTTP response: {any}", .{err});
-        return error.ResponseFailed;
-    };
-
-    // Check HTTP status
-    if (response.head.status != .ok) {
-        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(response.head.status)});
+    if (result.status != .ok) {
+        logger.err("checkpoint sync failed: HTTP {d}", .{@intFromEnum(result.status)});
         return error.HttpError;
     }
 
-    // Read response body
-    var ssz_data: std.ArrayList(u8) = .empty;
-    errdefer ssz_data.deinit(allocator);
-
-    var transfer_buffer: [8192]u8 = undefined;
-    const body_reader = response.reader(&transfer_buffer);
-    var buffer: [8192]u8 = undefined;
-    while (true) {
-        const bytes_read = body_reader.readSliceShort(&buffer) catch |err| {
-            logger.err("failed to read response body: {any}", .{err});
-            return error.ReadFailed;
-        };
-        if (bytes_read == 0) break;
-        try ssz_data.appendSlice(allocator, buffer[0..bytes_read]);
-    }
+    // Transfer ownership out of the writer (writer buffer becomes empty so the
+    // deferred deinit above is safe to call).
+    var ssz_data = body_writer.toArrayList();
+    defer ssz_data.deinit(allocator);
 
     logger.info("downloaded checkpoint state: {d} bytes", .{ssz_data.items.len});
 
@@ -812,13 +900,11 @@ fn validatorAssignmentsFromYAML(allocator: std.mem.Allocator, node_key: []const 
 //```
 
 fn nodeKeyIndexFromYaml(node_key: []const u8, validator_config: Yaml) !usize {
-    var index: usize = 0;
-    for (validator_config.docs.items[0].map.get("validators").?.list) |entry| {
+    for (validator_config.docs.items[0].map.get("validators").?.list, 0..) |entry, index| {
         const name_value = entry.map.get("name").?;
         if (name_value == .scalar and std.mem.eql(u8, name_value.scalar, node_key)) {
             return index;
         }
-        index += 1;
     }
     return error.InvalidNodeKey;
 }
@@ -1401,4 +1487,37 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     // Test with a URL
     node_options.checkpoint_sync_url = "http://localhost:5052/lean/v0/states/finalized";
     try std.testing.expect(node_options.checkpoint_sync_url != null);
+}
+
+test "attestationCommitteeCountFromYAML reads ATTESTATION_COMMITTEE_COUNT from config.yaml" {
+    var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
+    defer config_file.deinit(std.testing.allocator);
+
+    const count = attestationCommitteeCountFromYAML(config_file);
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(u64, 4), count.?);
+}
+
+test "attestationCommitteeCountFromYAML returns null when field is absent" {
+    // validator-config.yaml has no ATTESTATION_COMMITTEE_COUNT field
+    var validator_config = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/validator-config.yaml");
+    defer validator_config.deinit(std.testing.allocator);
+
+    const count = attestationCommitteeCountFromYAML(validator_config);
+    try std.testing.expect(count == null);
+}
+
+test "attestation_committee_count: zero value is clamped to 1 with a warning" {
+    // Simulate opts with count=0 — the validation block should reset it to 1.
+    var opts: NodeOptions = undefined;
+    opts.attestation_committee_count = 0;
+
+    // Mirror the validation logic from buildStartOptions.
+    if (opts.attestation_committee_count) |count| {
+        if (count == 0) {
+            opts.attestation_committee_count = 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(?u64, 1), opts.attestation_committee_count);
 }

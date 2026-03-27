@@ -160,6 +160,44 @@ fn createTreeIndent(allocator: Allocator, depth: usize, is_last_child: bool) ![]
     return indent.toOwnedSlice(allocator);
 }
 
+/// Build fork choice JSON for the /lean/v0/fork_choice API endpoint.
+///
+/// Field shapes follow leanSpec (src/lean_spec/subspecs/api/endpoints/fork_choice.py):
+///   - head: bare root string "0x..."  (NOT a {slot, root} object)
+///   - safe_target: bare root string "0x..."  (NOT a {root} object)
+///     safe_target carries no slot because it is a root pointer, not a checkpoint;
+///     the spec models it as Bytes32, distinct from the Checkpoint type used for
+///     justified and finalized.
+///   - justified / finalized: {slot, root} checkpoint objects
+///   - nodes[]: {root, slot, parent_root, proposer_index, weight}
+pub fn buildForkChoiceJSON(
+    snapshot: fcFactory.ForkChoice.Snapshot,
+    output: *std.ArrayList(u8),
+    allocator: Allocator,
+) !void {
+    const w = output.writer(allocator);
+    try w.writeAll("{");
+    try w.print(
+        \\"head":"0x{x}","justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":"0x{x}","validator_count":{d},"nodes":[
+    , .{
+        &snapshot.head.blockRoot,
+        snapshot.latest_justified.slot,
+        &snapshot.latest_justified.root,
+        snapshot.latest_finalized.slot,
+        &snapshot.latest_finalized.root,
+        &snapshot.safe_target_root,
+        snapshot.validator_count,
+    });
+
+    for (snapshot.nodes, 0..) |node, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print(
+            \\{{"root":"0x{x}","slot":{d},"parent_root":"0x{x}","proposer_index":{d},"weight":{d}}}
+        , .{ &node.blockRoot, node.slot, &node.parentRoot, node.proposer_index, node.weight });
+    }
+    try w.writeAll("]}");
+}
+
 /// Build fork choice graph in Grafana node-graph JSON format
 pub fn buildForkChoiceGraphJSON(
     forkchoice: *fcFactory.ForkChoice,
@@ -196,7 +234,7 @@ pub fn buildForkChoiceGraphJSON(
     // Find the finalized node index to check ancestry
     const finalized_idx = blk: {
         for (proto_nodes, 0..) |n, i| {
-            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized_root)) {
+            if (std.mem.eql(u8, &n.blockRoot, &snapshot.latest_finalized.root)) {
                 break :blk i;
             }
         }
@@ -208,14 +246,14 @@ pub fn buildForkChoiceGraphJSON(
 
         // Determine node role and color
         const is_head = std.mem.eql(u8, &pnode.blockRoot, &snapshot.head.blockRoot);
-        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified_root);
+        const is_justified = std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_justified.root);
 
         // A block is finalized if:
         // 1. It equals the finalized checkpoint, OR
         // 2. The finalized block is a descendant of it (block is ancestor of finalized)
         const is_finalized = blk: {
             // Check if this block IS the finalized block
-            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized_root)) {
+            if (std.mem.eql(u8, &pnode.blockRoot, &snapshot.latest_finalized.root)) {
                 break :blk true;
             }
             // Check if this block is an ancestor of the finalized block
@@ -369,6 +407,7 @@ fn createTestProtoNode(
 ) fcFactory.ProtoNode {
     return fcFactory.ProtoNode{
         .slot = slot,
+        .proposer_index = 0,
         .blockRoot = createTestRoot(block_root_byte),
         .parentRoot = createTestRoot(parent_root_byte),
         .stateRoot = createTestRoot(0x00),
@@ -798,4 +837,53 @@ test "buildTreeVisualization: big tree with many branches and depth (max_depth=1
 
     // Verify tree structure characters are used
     try std.testing.expect(std.mem.indexOf(u8, result, "├──") != null);
+}
+
+test "buildForkChoiceJSON: field shapes match leanSpec" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal snapshot with one extra node besides the head.
+    const head_node = createTestProtoNode(5, 0xAA, 0xBB, null, 0, 0, 0, 0, 0, null);
+    const child_node = createTestProtoNode(6, 0xCC, 0xAA, 0, 1, 0, 0, 0, 0, null);
+
+    const nodes = try allocator.dupe(fcFactory.ProtoNode, &.{ head_node, child_node });
+
+    const snapshot = fcFactory.ForkChoice.Snapshot{
+        .head = head_node,
+        .latest_justified = types.Checkpoint{ .slot = 4, .root = createTestRoot(0x11) },
+        .latest_finalized = types.Checkpoint{ .slot = 2, .root = createTestRoot(0x22) },
+        .safe_target_root = createTestRoot(0x33),
+        .validator_count = 128,
+        .nodes = nodes,
+    };
+    defer snapshot.deinit(allocator);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try buildForkChoiceJSON(snapshot, &output, allocator);
+    const json = output.items;
+
+    // head is a flat root string, NOT an object
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"head\":\"0x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"head\":{") == null);
+
+    // safe_target is a flat root string, NOT an object
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"safe_target\":\"0x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"safe_target\":{") == null);
+
+    // justified and finalized remain checkpoint objects with slot + root
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"justified\":{\"slot\":4,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"finalized\":{\"slot\":2,") != null);
+
+    // validator_count is present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"validator_count\":128") != null);
+
+    // each node has proposer_index
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"proposer_index\":") != null);
+
+    // node fields: root, slot, parent_root, proposer_index, weight
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"root\":\"0x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"parent_root\":\"0x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"weight\":") != null);
 }

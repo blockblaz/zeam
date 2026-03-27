@@ -12,6 +12,7 @@ This package provides two HTTP servers for the Zeam node:
 - `/lean/v0/ready` - Readiness check
 - `/lean/v0/states/finalized` - Checkpoint state (for checkpoint sync)
 - `/lean/v0/checkpoints/justified` - Justified checkpoint info
+- `/lean/v0/fork_choice` - Full fork choice snapshot (JSON)
 - `/api/forkchoice/graph` - Fork choice visualization (Grafana compatible)
 - `/events` - SSE stream for real-time chain events
 
@@ -165,6 +166,33 @@ Returns:
 - **Status 503**: Returned if chain is not initialized
 - **Example response**: `{"root":"0x1234...","slot":42}`
 
+### `/lean/v0/fork_choice`
+
+Returns the full fork choice state as JSON, including head, justified/finalized checkpoints, safe target, and all proto nodes in the fork choice tree.
+
+```sh
+curl http://localhost:9667/lean/v0/fork_choice
+```
+
+Returns:
+- **Content-Type**: `application/json`
+- **Status 503**: Returned if chain is not initialized
+- **Example response**:
+
+```json
+{
+  "head": {"slot": 100, "root": "0x1234..."},
+  "justified": {"slot": 96, "root": "0xabcd..."},
+  "finalized": {"slot": 64, "root": "0x5678..."},
+  "safe_target": {"root": "0x9abc..."},
+  "validator_count": 4,
+  "nodes": [
+    {"slot": 64, "root": "0x5678...", "parent_root": "0x0000...", "weight": 4},
+    {"slot": 65, "root": "0xdef0...", "parent_root": "0x5678...", "weight": 4}
+  ]
+}
+```
+
 ## Usage
 
 ### Initialization
@@ -187,13 +215,14 @@ metrics_handle.stop();
 ```
 
 **Metrics Server** (port 9668) - starts immediately:
-- `/metrics` - Prometheus metrics
+- `/metrics` - Prometheus metrics (JSON)
 - `/lean/v0/health` - Liveness check (JSON)
 
 **API Server** (port 9667) - starts after chain init:
 - `/lean/v0/ready` - Readiness check (JSON)
 - `/lean/v0/states/finalized` - Checkpoint state (SSZ)
 - `/lean/v0/checkpoints/justified` - Justified checkpoint (JSON)
+- `/lean/v0/fork_choice` - Full fork choice snapshot (JSON)
 - `/api/forkchoice/graph` - Fork choice visualization (JSON)
 - `/events` - SSE event streaming
 
@@ -262,6 +291,9 @@ curl http://localhost:9667/lean/v0/states/finalized -o state.ssz
 
 # Justified checkpoint (API server - port 9667)
 curl http://localhost:9667/lean/v0/checkpoints/justified
+
+# Fork choice state (API server - port 9667)
+curl http://localhost:9667/lean/v0/fork_choice
 ```
 
 ## Visualization with Prometheus & Grafana

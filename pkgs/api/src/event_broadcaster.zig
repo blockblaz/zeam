@@ -240,6 +240,7 @@ test "event broadcaster basic functionality" {
     // Test broadcasting an event (writes to the socket; read end fds[0] is left open so the write succeeds)
     const proto_block = types.ProtoBlock{
         .slot = 123,
+        .proposer_index = 0,
         .blockRoot = [_]u8{1} ** 32,
         .parentRoot = [_]u8{2} ** 32,
         .stateRoot = [_]u8{3} ** 32,

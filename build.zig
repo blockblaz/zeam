@@ -11,7 +11,10 @@ const zkvmTarget = struct {
 
 const zkvm_targets: []const zkvmTarget = &.{
     .{ .name = "risc0", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "sp1", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
     .{ .name = "zisk", .set_pie = true, .triplet = "riscv64-freestanding-none", .cpu_features = "generic_rv64" },
+    .{ .name = "openvm", .triplet = "riscv32-freestanding-none", .cpu_features = "generic_rv32" },
+    .{ .name = "ziren", .triplet = "mipsel-freestanding-none", .cpu_features = "mips32r2" },
 };
 
 const ProverChoice = enum { dummy, risc0, openvm, all };
@@ -153,6 +156,8 @@ pub fn build(b: *Builder) !void {
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
     const use_poseidon = b.option(bool, "use_poseidon", "Use Poseidon SSZ hasher (default: false)") orelse false;
     build_options.addOption(bool, "use_poseidon", use_poseidon);
+    // Absolute path to test-keys for pre-generated validator keys
+    build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
     const build_options_module = build_options.createModule();
 
     // add zeam-utils
@@ -237,6 +242,7 @@ pub fn build(b: *Builder) !void {
         .target = target,
         .optimize = optimize,
     });
+    zeam_key_manager.addImport("build_options", build_options_module);
     zeam_key_manager.addImport("@zeam/xmss", zeam_xmss);
     zeam_key_manager.addImport("@zeam/types", zeam_types);
     zeam_key_manager.addImport("@zeam/utils", zeam_utils);
@@ -418,6 +424,10 @@ pub fn build(b: *Builder) !void {
     tools_cli_exe.root_module.addImport("enr", enr);
     tools_cli_exe.root_module.addImport("build_options", build_options_module);
     tools_cli_exe.root_module.addImport("simargs", simargs);
+    tools_cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    tools_cli_exe.root_module.addImport("@zeam/types", zeam_types);
+    tools_cli_exe.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, tools_cli_exe, target, prover);
 
     const install_tools_cli = b.addInstallArtifact(tools_cli_exe, .{});
     tools_step.dependOn(&install_tools_cli.step);
@@ -599,6 +609,10 @@ pub fn build(b: *Builder) !void {
         .root_module = tools_cli_exe.root_module,
     });
     tools_cli_tests.root_module.addImport("enr", enr);
+    tools_cli_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
+    tools_cli_tests.root_module.addImport("@zeam/types", zeam_types);
+    tools_cli_tests.step.dependOn(&build_rust_lib_steps.step);
+    addRustGlueLib(b, tools_cli_tests, target, prover);
     const run_tools_cli_test = b.addRunArtifact(tools_cli_tests);
     setTestRunLabelFromCompile(b, run_tools_cli_test, tools_cli_tests);
     tools_test_step.dependOn(&run_tools_cli_test.step);
@@ -719,6 +733,8 @@ fn build_zkvm_targets(
     build_options_module: *std.Build.Module,
     use_poseidon: bool,
 ) !void {
+    // zkvm targets (riscv32-freestanding-none) require ReleaseFast; ReleaseSafe
+    // triggers "invalid operand for inline asm constraint 'i'" in LLVM on riscv32.
     const optimize = .ReleaseFast;
 
     for (zkvm_targets) |zkvm_target| {
@@ -836,7 +852,7 @@ fn build_zkvm_targets(
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("build/risc0.zig"),
                     .target = host_target,
-                    .optimize = .ReleaseSafe,
+                    .optimize = .ReleaseFast,
                 }),
             });
             const run_risc0_postbuild_gen_step = b.addRunArtifact(risc0_postbuild_gen);

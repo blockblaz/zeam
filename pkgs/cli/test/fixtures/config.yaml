@@ -1,6 +1,9 @@
 # Genesis Settings
 GENESIS_TIME: 1704085200
 
+# Chain Settings
+ATTESTATION_COMMITTEE_COUNT: 4
+
 # Validator Settings  
 VALIDATOR_COUNT: 9
 

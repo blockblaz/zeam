@@ -385,7 +385,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         },
         .aggregation => |signed_aggregation| {
             zigHandler.logger.debug(
-                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{any}",
+                "network-{d}:: received gossip aggregation slot={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{
                     zigHandler.params.networkId,
                     signed_aggregation.data.slot,
@@ -400,7 +400,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     // Debug-only JSON dump (conversion happens only if debug is actually emitted).
     zigHandler.logger.debug(
-        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {any}",
+        "network-{d}:: gossip payload json topic={s} from peer={s}{f}: {f}",
         .{
             zigHandler.params.networkId,
             std.mem.span(topic_str),
@@ -1079,7 +1079,7 @@ pub const EthLibp2p = struct {
 
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
-        self.logger.debug("network-{d}:: publishing to rust bridge data={any} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
+        self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
         publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
