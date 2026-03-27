@@ -33,11 +33,10 @@ const StartupStatus = enum(u8) {
 };
 
 /// API server that runs in a background thread
-/// Handles SSE events, health checks, forkchoice graph, and checkpoint state endpoints
-/// chain is optional - if null, chain-dependent endpoints will return 503
-/// (API server starts before chain initialization, so chain may not be available yet)
+/// Handles SSE events, forkchoice graph, and checkpoint state endpoints
+/// Note: Health checks are served by the metrics_server (for early liveness checks)
 /// Note: Metrics are served by the separate metrics_server on a different port
-pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: ?*BeamChain) !*ApiServer {
+pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *LoggerConfig, chain: *BeamChain) !*ApiServer {
     // Initialize the global event broadcaster for SSE events
     // This is idempotent - safe to call even if already initialized elsewhere (e.g., node.zig)
     try event_broadcaster.initGlobalBroadcaster(allocator);
@@ -56,7 +55,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
         .allocator = allocator,
         .port = port,
         .logger = logger,
-        .chain = std.atomic.Value(?*BeamChain).init(chain),
+        .chain = chain,
         .stopped = std.atomic.Value(bool).init(false),
         .startup_status = std.atomic.Value(StartupStatus).init(.pending),
         .sse_active = 0,
@@ -127,8 +126,8 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         defer arena.deinit();
         const request_allocator = arena.allocator();
 
-        if (std.mem.eql(u8, request.head.target, "/lean/v0/health")) {
-            ctx.handleHealth(&request);
+        if (std.mem.eql(u8, request.head.target, "/lean/v0/ready")) {
+            ctx.handleReady(&request);
         } else if (std.mem.eql(u8, request.head.target, "/lean/v0/states/finalized")) {
             ctx.handleFinalizedCheckpointState(&request) catch |err| {
                 ctx.logger.warn("failed to handle finalized checkpoint state request: {}", .{err});
@@ -145,16 +144,11 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
         } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
-            const chain = ctx.getChain() orelse {
-                _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-                connection.stream.close();
-                return;
-            };
             if (!ctx.rate_limiter.allow(connection.address) or !ctx.tryAcquireGraph()) {
                 _ = request.respond("Too Many Requests\n", .{ .status = .too_many_requests }) catch {};
             } else {
                 defer ctx.releaseGraph();
-                handleForkChoiceGraph(&request, request_allocator, chain) catch |err| {
+                handleForkChoiceGraph(&request, request_allocator, ctx.chain) catch |err| {
                     ctx.logger.warn("fork choice graph request failed: {}", .{err});
                     _ = request.respond("Internal Server Error\n", .{}) catch {};
                 };
@@ -171,7 +165,7 @@ pub const ApiServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
     logger: ModuleLogger,
-    chain: std.atomic.Value(?*BeamChain),
+    chain: *BeamChain,
     stopped: std.atomic.Value(bool),
     startup_status: std.atomic.Value(StartupStatus),
     sse_active: usize,
@@ -190,14 +184,6 @@ pub const ApiServer = struct {
         self.thread.join();
         self.rate_limiter.deinit();
         self.allocator.destroy(self);
-    }
-
-    pub fn setChain(self: *Self, chain: *BeamChain) void {
-        self.chain.store(chain, .release);
-    }
-
-    fn getChain(self: *const Self) ?*BeamChain {
-        return self.chain.load(.acquire);
     }
 
     fn run(self: *Self) void {
@@ -241,10 +227,10 @@ pub const ApiServer = struct {
         }
     }
 
-    /// Handle health check endpoint
-    fn handleHealth(_: *const Self, request: *std.http.Server.Request) void {
-        const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
-        _ = request.respond(response, .{
+    /// Handle readiness check endpoint
+    /// Returns 200 when API server is running (chain is always initialized at this point)
+    fn handleReady(_: *const Self, request: *std.http.Server.Request) void {
+        _ = request.respond("{\"ready\":true}", .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
             },
@@ -254,14 +240,8 @@ pub const ApiServer = struct {
     /// Handle finalized checkpoint state endpoint
     /// Serves the finalized checkpoint lean state (BeamState) as SSZ octet-stream at /lean/v0/states/finalized
     fn handleFinalizedCheckpointState(self: *const Self, request: *std.http.Server.Request) !void {
-        // Get the chain (may be null if API server started before chain initialization)
-        const chain = self.getChain() orelse {
-            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-            return;
-        };
-
         // Get finalized state from chain (chain handles its own locking internally)
-        const finalized_lean_state = chain.getFinalizedState() orelse {
+        const finalized_lean_state = self.chain.getFinalizedState() orelse {
             _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
             return;
         };
@@ -296,14 +276,8 @@ pub const ApiServer = struct {
     /// Returns checkpoint info as JSON at /lean/v0/checkpoints/justified
     /// Useful for monitoring consensus progress and fork choice state
     fn handleJustifiedCheckpoint(self: *const Self, request: *std.http.Server.Request) !void {
-        // Get the chain (may be null if API server started before chain initialization)
-        const chain = self.getChain() orelse {
-            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-            return;
-        };
-
         // Get justified checkpoint from chain (chain handles its own locking internally)
-        const justified_checkpoint = chain.getJustifiedCheckpoint();
+        const justified_checkpoint = self.chain.getJustifiedCheckpoint();
 
         // Convert checkpoint to JSON string
         const json_string = justified_checkpoint.toJsonString(self.allocator) catch |err| {
@@ -328,10 +302,7 @@ pub const ApiServer = struct {
     /// Returns full fork choice state as JSON at /lean/v0/fork_choice
     /// Includes head, justified, finalized checkpoints, safe target, and all proto nodes
     fn handleForkChoice(self: *const Self, request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
-        const chain = self.getChain() orelse {
-            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-            return;
-        };
+        const chain = self.chain;
 
         const snapshot = chain.forkChoice.snapshot(allocator) catch |err| {
             self.logger.err("failed to get fork choice snapshot: {}", .{err});
