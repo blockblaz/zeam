@@ -302,10 +302,7 @@ pub const ApiServer = struct {
     /// Returns full fork choice state as JSON at /lean/v0/fork_choice
     /// Includes head, justified, finalized checkpoints, safe target, and all proto nodes
     fn handleForkChoice(self: *const Self, request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
-        const chain = self.getChain() orelse {
-            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-            return;
-        };
+        const chain = self.chain;
 
         const snapshot = chain.forkChoice.snapshot(allocator) catch |err| {
             self.logger.err("failed to get fork choice snapshot: {}", .{err});
