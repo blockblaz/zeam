@@ -724,10 +724,14 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     };
 
     // leanMultisig's backend crate uses compile-time #[cfg(target_feature)] for SIMD
-    // (AVX2/AVX512 on x86_64, NEON on aarch64). It requires target-cpu=native so the
-    // compiler enables the right feature flags. We use CARGO_ENCODED_RUSTFLAGS so we
-    // don't clobber any RUSTFLAGS already set in the environment (e.g. CI's -D warnings).
-    cargo_build.setEnvironmentVariable("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=native");
+    // (AVX2/AVX512 on x86_64, NEON on aarch64). On x86_64, we must set target-cpu=native
+    // so the compiler enables AVX2/AVX512 feature flags. We skip this on aarch64 because
+    // ring 0.17 fails its compile-time feature assertions when target-cpu=native is set
+    // on aarch64-apple-darwin. We use CARGO_ENCODED_RUSTFLAGS (with \x1f separator) so
+    // we don't clobber any RUSTFLAGS already set in the environment (e.g. CI's -D warnings).
+    if (builtin.cpu.arch == .x86_64) {
+        cargo_build.setEnvironmentVariable("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=native\x1f-Dwarnings");
+    }
 
     return cargo_build;
 }
