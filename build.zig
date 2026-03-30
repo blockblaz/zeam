@@ -723,6 +723,12 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         }),
     };
 
+    // leanMultisig's backend crate uses compile-time #[cfg(target_feature)] for SIMD
+    // (AVX2/AVX512 on x86_64, NEON on aarch64). It requires target-cpu=native so the
+    // compiler enables the right feature flags. We use CARGO_ENCODED_RUSTFLAGS so we
+    // don't clobber any RUSTFLAGS already set in the environment (e.g. CI's -D warnings).
+    cargo_build.setEnvironmentVariable("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-cpu=native");
+
     return cargo_build;
 }
 
