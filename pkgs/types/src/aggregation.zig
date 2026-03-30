@@ -74,14 +74,14 @@ pub const AggregatedSignatureProof = struct {
     ///
     /// - `xmss_participants`: bitfield for validators represented by raw_xmss. null if no raw sigs.
     /// - `children`: already-aggregated child proofs to include.
+    /// - `children_pub_keys`: per-child arrays of public key handles (parallel with `children`).
     /// - `raw_xmss_pks`/`raw_xmss_sigs`: raw XMSS public key + signature pairs.
     /// - Validation: at least 1 raw sig or child required; if no raw sigs, need ≥2 children.
-    ///
-    /// Currently uses dummy mode (merges bitfields + placeholder proof bytes).
     pub fn aggregate(
         allocator: Allocator,
         xmss_participants: ?AggregationBits,
         children: []const AggregatedSignatureProof,
+        children_pub_keys: []const []*const xmss.HashSigPublicKey,
         raw_xmss_pks: []*const xmss.HashSigPublicKey,
         raw_xmss_sigs: []*const xmss.HashSigSignature,
         message_hash: *const [32]u8,
@@ -116,12 +116,22 @@ pub const AggregatedSignatureProof = struct {
             }
         }
 
-        // FFI call — only processes raw XMSS signatures (children not passed to Rust yet)
+        // Build per-child proof references for FFI
+        const children_proof_refs = try allocator.alloc(*const ByteListMiB, children.len);
+        defer allocator.free(children_proof_refs);
+        for (children, 0..) |*child, i| {
+            children_proof_refs[i] = &child.proof_data;
+        }
+
+        // FFI call — passes children proofs + their public keys for true recursive aggregation
         try xmss.aggregateSignatures(
             raw_xmss_pks,
             raw_xmss_sigs,
+            children_pub_keys,
+            children_proof_refs,
             message_hash,
             @intCast(epoch),
+            INVERSE_PROOF_SIZE,
             &result.proof_data,
         );
 

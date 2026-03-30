@@ -206,6 +206,7 @@ pub fn AggregateInnerMap(
         allocator,
         participants,
         &.{},
+        &.{},
         pk_handles,
         sig_handles,
         &message_hash,
@@ -692,10 +693,57 @@ pub const AggregatedAttestationsResult = struct {
             var proof = try aggregation.AggregatedSignatureProof.init(allocator);
             errdefer proof.deinit();
 
+            // Build per-child pub key arrays for recursive aggregation
+            // child_pk_allocs stores the original allocations (for correct freeing)
+            // child_pk_slices stores the used portion (for passing to aggregate)
+            var child_pk_allocs: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
+            defer {
+                for (child_pk_allocs.items) |arr| allocator.free(arr);
+                child_pk_allocs.deinit(allocator);
+            }
+            var child_pk_slices: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
+            defer child_pk_slices.deinit(allocator);
+
+            // Track child pub key wrappers so we can free the Rust handles after aggregation
+            var child_pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+            defer {
+                for (child_pk_wrappers.items) |*pw| pw.deinit();
+                child_pk_wrappers.deinit(allocator);
+            }
+
+            for (selected_children.items) |*child| {
+                // Count participants for this child
+                var n_participants: usize = 0;
+                for (0..child.participants.len()) |i| {
+                    if (child.participants.get(i) catch false) {
+                        n_participants += 1;
+                    }
+                }
+
+                const cpks = try allocator.alloc(*const xmss.HashSigPublicKey, n_participants);
+                errdefer allocator.free(cpks);
+
+                var cpk_idx: usize = 0;
+                for (0..child.participants.len()) |i| {
+                    if (child.participants.get(i) catch false) {
+                        if (i >= validators.len()) continue;
+                        const val = validators.get(@intCast(i)) catch continue;
+                        const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
+                        try child_pk_wrappers.append(allocator, pk);
+                        cpks[cpk_idx] = pk.handle;
+                        cpk_idx += 1;
+                    }
+                }
+
+                try child_pk_allocs.append(allocator, cpks);
+                try child_pk_slices.append(allocator, cpks[0..cpk_idx]);
+            }
+
             try aggregation.AggregatedSignatureProof.aggregate(
                 allocator,
                 xmss_participants,
                 selected_children.items,
+                child_pk_slices.items,
                 pk_handles,
                 sig_handles,
                 &message_hash,

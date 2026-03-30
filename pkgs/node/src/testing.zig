@@ -227,8 +227,10 @@ pub const NodeTestContext = struct {
 
                 const epoch: u32 = @intCast(aggregated_attestation.data.slot);
 
-                // Perform the actual aggregation
-                try xmss.aggregateSignatures(pub_keys, sig_ptrs, &message_hash, epoch, &signature_proof.proof_data);
+                // Perform the actual aggregation (no children in testing mode)
+                const empty_children_pks: [][]*const xmss.HashSigPublicKey = &.{};
+                const empty_children_proofs: []*const xmss.ByteListMiB = &.{};
+                try xmss.aggregateSignatures(pub_keys, sig_ptrs, empty_children_pks, empty_children_proofs, &message_hash, epoch, 2, &signature_proof.proof_data);
             }
 
             try attestation_signatures.append(signature_proof);
