@@ -86,6 +86,8 @@ pub fn build(b: *Builder) !void {
     // LTO option (disabled by default for faster builds)
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization (slower builds, smaller binaries)") orelse false;
 
+    // xev backend override is no longer needed — Dynamic API handles runtime detection.
+
     // add ssz
     const ssz = b.dependency("ssz", .{
         .target = target,
