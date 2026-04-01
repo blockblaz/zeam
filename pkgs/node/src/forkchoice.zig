@@ -936,11 +936,18 @@ pub const ForkChoice = struct {
         };
     }
 
-    // Internal unlocked version - assumes caller holds lock
-    fn getProposalAttestationsUnlocked(self: *Self) ![]types.Attestation {
+    // Internal unlocked version - assumes caller holds lock.
+    // head_state_justified: when provided, filter attestations against the head state's justified
+    // checkpoint (aligning with block building). Falls back to fcStore.latest_justified if null.
+    // See leanEthereum/leanSpec#506: attestation source must use head_state.latest_justified, not
+    // the store-wide global max, to avoid 0-attestation blocks when forks diverge justification.
+    fn getProposalAttestationsUnlocked(self: *Self, head_state_justified: ?types.Checkpoint) ![]types.Attestation {
         var included_attestations: std.ArrayList(types.Attestation) = .empty;
 
-        const latest_justified = self.fcStore.latest_justified;
+        // Use head state justified when available; fall back to store-wide max otherwise.
+        // block building filters attestations by head_state.latest_justified, so we must
+        // produce and filter attestations using the same checkpoint to avoid mismatches.
+        const filter_justified = head_state_justified orelse self.fcStore.latest_justified;
 
         // TODO naive strategy to include all attestations that are consistent with the latest justified
         // replace by the other mini 3sf simple strategy to loop and see if justification happens and
@@ -951,7 +958,7 @@ pub const ForkChoice = struct {
             const attestation_data = (entry.value_ptr.latestKnown orelse ProtoAttestation{}).attestation_data;
 
             if (attestation_data) |att_data| {
-                if (std.mem.eql(u8, &latest_justified.root, &att_data.source.root)) {
+                if (std.mem.eql(u8, &filter_justified.root, &att_data.source.root)) {
                     const attestation = types.Attestation{
                         .data = att_data,
                         .validator_id = validator_id,
@@ -1630,7 +1637,16 @@ pub const ForkChoice = struct {
     pub fn getProposalAttestations(self: *Self) ![]types.Attestation {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
-        return self.getProposalAttestationsUnlocked();
+        return self.getProposalAttestationsUnlocked(null);
+    }
+
+    /// Like getProposalAttestations but filters attestations against the given head state justified
+    /// checkpoint rather than the store-wide global max. Use this when building a block so that
+    /// attestation source selection aligns with block validation (leanEthereum/leanSpec#506).
+    pub fn getProposalAttestationsForHead(self: *Self, head_state_justified: types.Checkpoint) ![]types.Attestation {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.getProposalAttestationsUnlocked(head_state_justified);
     }
 
     pub fn getAttestationTarget(self: *Self) !types.Checkpoint {

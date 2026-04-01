@@ -375,12 +375,15 @@ pub const BeamChain = struct {
         // This ensures the proposer builds on the latest proposal head derived
         // from known aggregated payloads.
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
-        const attestations = try self.forkChoice.getProposalAttestations();
-        defer self.allocator.free(attestations);
-
         const parent_root = proposal_head.root;
 
         const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+
+        // Filter proposal attestations against the head state's justified checkpoint
+        // (leanEthereum/leanSpec#506): block validation accepts attestations whose source
+        // matches head_state.latest_justified, not the store-wide global max.
+        const attestations = try self.forkChoice.getProposalAttestationsForHead(pre_state.latest_justified);
+        defer self.allocator.free(attestations);
         var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
@@ -550,11 +553,37 @@ pub const BeamChain = struct {
 
         self.logger.info("calculated target for attestations at slot={d}: {s}", .{ slot, target_str });
 
+        // Use the head state's latest_justified as the attestation source (leanEthereum/leanSpec#506).
+        //
+        // The store-wide fcStore.latest_justified is the global max across all forks. A non-head
+        // fork can push it ahead of what the head chain has seen. If we vote with that higher
+        // checkpoint as source, block building (which filters by head_state.latest_justified) will
+        // reject every attestation, producing 0-attestation blocks and stalling justification.
+        //
+        // Fix: always derive source from the head state, not the store-wide max.
+        //
+        // Genesis correction: at genesis the head state stores a zero-hash as latest_justified.root
+        // because no real block has been justified yet. Block validation requires the source root
+        // to be present in the block registry, so substitute the actual genesis block root.
+        const head_state = self.states.get(head_proto.blockRoot) orelse return error.MissingHeadState;
+        const source: types.Checkpoint = blk: {
+            const zeros = [_]u8{0} ** 32;
+            if (std.mem.eql(u8, &head_state.latest_justified.root, &zeros)) {
+                // Genesis: replace zero-hash with the actual genesis block root
+                break :blk .{
+                    .root = head_proto.blockRoot,
+                    .slot = head_state.latest_justified.slot,
+                };
+            } else {
+                break :blk head_state.latest_justified;
+            }
+        };
+
         const attestation_data = types.AttestationData{
             .slot = slot,
             .head = head,
             .target = target,
-            .source = self.forkChoice.getLatestJustified(),
+            .source = source,
         };
 
         return attestation_data;
