@@ -32,3 +32,6 @@ lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols 
 opt-level = "z"      # Optimize for size instead of speed
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary
+
+[patch.crates-io]
+quinn-udp = { path = "patch/quinn-udp" }

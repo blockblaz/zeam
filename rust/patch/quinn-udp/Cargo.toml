@@ -1,0 +1,21 @@
+[package]
+name = "quinn-udp"
+version = "0.5.14"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "UDP sockets for QUIC — Shadow-compatible fallback-only build"
+
+[features]
+default = ["tracing", "log"]
+log = ["tracing/log"]
+direct-log = ["dep:log"]
+
+[dependencies]
+log = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+socket2 = { version = "0.6" }
+
+[lib]
+bench = false
