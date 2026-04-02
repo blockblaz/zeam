@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const zeam_utils = @import("@zeam/utils");
 
 const interface = @import("./interface.zig");
@@ -774,6 +774,7 @@ test "Mock messaging across two subscribers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
+    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
@@ -954,6 +955,7 @@ test "Mock status RPC between peers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
+    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
