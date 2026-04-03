@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 
 const constants = @import("./constants.zig");
 
