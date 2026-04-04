@@ -522,27 +522,12 @@ pub const Node = struct {
             const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
             defer self.allocator.free(pk_path);
 
-            var attestation_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+            var validator_keys = key_manager_lib.loadValidatorKeysFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
                 error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
                 error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            errdefer attestation_keypair.deinit();
-
-            // Load same files for proposal key — a second FFI handle is needed because
-            // KeyPair wraps a C resource with no clone API.
-            // TODO: load separate proposal key files when available.
-            var proposal_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
-                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
-                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
-                else => return err,
-            };
-            errdefer proposal_keypair.deinit();
-
-            const validator_keys = key_manager_lib.ValidatorKeys{
-                .attestation_keypair = attestation_keypair,
-                .proposal_keypair = proposal_keypair,
-            };
+            errdefer validator_keys.deinit();
 
             try self.key_manager.addKeypair(assignment.index, validator_keys);
         }

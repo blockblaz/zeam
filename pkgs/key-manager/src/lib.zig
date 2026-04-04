@@ -293,26 +293,33 @@ fn findTestKeysDir() ?[]const u8 {
     return null;
 }
 
-/// Load a single pre-generated key pair from SSZ files on disk.
-/// For now, loads the same SSZ files for both attestation and proposal keypairs.
-/// TODO: add separate proposal key files.
+/// Load a ValidatorKeys pair from SSZ files on disk.
+/// Currently loads the same key files for both attestation and proposal roles
+/// (each call to loadKeypairFromFiles allocates an independent C resource).
+/// TODO: load separate proposal key files when available.
+pub fn loadValidatorKeysFromFiles(
+    allocator: Allocator,
+    sk_path: []const u8,
+    pk_path: []const u8,
+) !ValidatorKeys {
+    var att_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    errdefer att_keypair.deinit();
+    const prop_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    return ValidatorKeys{ .attestation_keypair = att_keypair, .proposal_keypair = prop_keypair };
+}
+
 fn loadPreGeneratedKey(
     allocator: Allocator,
     keys_dir: []const u8,
     index: usize,
 ) !ValidatorKeys {
-    // Build file paths
     var sk_path_buf: [512]u8 = undefined;
     const sk_path = std.fmt.bufPrint(&sk_path_buf, "{s}/validator_{d}_sk.ssz", .{ keys_dir, index }) catch unreachable;
 
     var pk_path_buf: [512]u8 = undefined;
     const pk_path = std.fmt.bufPrint(&pk_path_buf, "{s}/validator_{d}_pk.ssz", .{ keys_dir, index }) catch unreachable;
 
-    // Load same key for both attestation and proposal (TODO: separate key files)
-    var att_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
-    errdefer att_keypair.deinit();
-    const prop_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
-    return ValidatorKeys{ .attestation_keypair = att_keypair, .proposal_keypair = prop_keypair };
+    return loadValidatorKeysFromFiles(allocator, sk_path, pk_path);
 }
 
 pub fn getTestKeyManager(
