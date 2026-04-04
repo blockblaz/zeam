@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.9"
-leansig_wrapper = { git = "https://github.com/anshalshukla/leanMultisig.git", rev = "4ed0b0e58ec203d656d3bb15f1605153cb9850a2" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "1b3cd7465ac38e4b4951c70c99ec693f768fa6c9" }
 rand = "0.10.0"
 thiserror = "2.0.17"
 ssz = { package = "ethereum_ssz", version = "0.10" }
