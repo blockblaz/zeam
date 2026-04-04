@@ -1504,7 +1504,7 @@ pub const BeamChain = struct {
     pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
         const head_root = self.forkChoice.head.blockRoot;
         const state = self.states.get(head_root) orelse return error.MissingState;
-        return self.forkChoice.aggregate(state, false);
+        return self.forkChoice.aggregate(state);
     }
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {

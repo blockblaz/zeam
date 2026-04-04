@@ -1230,6 +1230,15 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
 
+        // Can't regress on safe target
+        if (safe_target.slot < self.safeTarget.slot) {
+            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
+                safe_target.slot,
+                self.safeTarget.slot,
+            });
+            return ForkChoiceError.InvalidSafeTargetCompute;
+        }
+
         self.safeTarget = safe_target;
         // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
@@ -1386,14 +1395,11 @@ pub const ForkChoice = struct {
         }
     }
 
-    /// Aggregate attestation signatures, optionally using recursive child proofs.
+    /// Aggregate attestation signatures using recursive child proofs.
     ///
-    /// - `recursive=false` (current default): only raw attestation_signatures are aggregated.
-    ///   Existing new_payloads are carried forward and new results are appended.
-    ///   Remove this path once XMSS bindings support recursive aggregation.
-    /// - `recursive=true`: extends aggregation with child proofs from new/known payloads
-    ///   via two-pass greedy selection. Replaces new_payloads with fresh results.
-    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState, recursive: bool) ![]types.SignedAggregatedAttestation {
+    /// Extends aggregation with child proofs from new/known payloads
+    /// via two-pass greedy selection. Replaces new_payloads with fresh results.
+    fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
 
         // Capture counts for metrics update outside lock scope
@@ -1403,11 +1409,8 @@ pub const ForkChoice = struct {
         self.signatures_mutex.lock();
         defer self.signatures_mutex.unlock();
 
-        // Build attestation list — recursive includes new payloads, plain does not
-        var attestations = if (recursive)
-            try self.attestationsFromGossipAndNewPayloads()
-        else
-            try self.attestationsFromAttestationSignatures();
+        // Build attestation list from gossip signatures and new payloads
+        var attestations = try self.attestationsFromGossipAndNewPayloads();
         defer attestations.deinit(self.allocator);
 
         var agg = try types.AggregatedAttestationsResult.init(self.allocator);
@@ -1426,25 +1429,14 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
-        if (recursive) {
-            // Recursive: pass new and known payloads for two-pass greedy child selection
-            try agg.computeAggregatedSignatures(
-                attestations.items,
-                &state.validators,
-                &self.attestation_signatures,
-                &self.latest_new_aggregated_payloads,
-                &self.latest_known_aggregated_payloads,
-            );
-        } else {
-            // Plain: only raw attestation_signatures, no child proofs
-            try agg.computeAggregatedSignatures(
-                attestations.items,
-                &state.validators,
-                &self.attestation_signatures,
-                null,
-                null,
-            );
-        }
+        // Pass new and known payloads for two-pass greedy child selection
+        try agg.computeAggregatedSignatures(
+            attestations.items,
+            &state.validators,
+            &self.attestation_signatures,
+            &self.latest_new_aggregated_payloads,
+            &self.latest_known_aggregated_payloads,
+        );
 
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
         errdefer {
@@ -1457,27 +1449,6 @@ pub const ForkChoice = struct {
         // Build new payloads map from aggregation results
         var new_payloads = AggregatedPayloadsMap.init(self.allocator);
         errdefer deinitAggregatedPayloadsMap(self.allocator, &new_payloads);
-
-        if (!recursive) {
-            // Plain: carry forward existing new_payloads
-            var existing_it = self.latest_new_aggregated_payloads.iterator();
-            while (existing_it.next()) |entry| {
-                const att_data = entry.key_ptr.*;
-                const gop = try new_payloads.getOrPut(att_data);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = .empty;
-                }
-                for (entry.value_ptr.items) |stored| {
-                    var cloned: types.AggregatedSignatureProof = undefined;
-                    try types.sszClone(self.allocator, types.AggregatedSignatureProof, stored.proof, &cloned);
-                    errdefer cloned.deinit();
-                    try gop.value_ptr.append(self.allocator, .{
-                        .slot = stored.slot,
-                        .proof = cloned,
-                    });
-                }
-            }
-        }
 
         const agg_attestations = agg.attestations.constSlice();
         const agg_signatures = agg.attestation_signatures.constSlice();
@@ -1544,27 +1515,6 @@ pub const ForkChoice = struct {
         zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_sigs_count));
 
         return results.toOwnedSlice(self.allocator);
-    }
-
-    /// Build attestation list from attestation signatures only (plain aggregation).
-    /// Caller must hold signatures_mutex.
-    fn attestationsFromAttestationSignatures(self: *Self) !std.ArrayList(types.Attestation) {
-        var attestation_list: std.ArrayList(types.Attestation) = .{};
-        errdefer attestation_list.deinit(self.allocator);
-
-        var outer_it = self.attestation_signatures.iterator();
-        while (outer_it.next()) |outer_entry| {
-            const att_data = outer_entry.key_ptr.*;
-            var inner_it = outer_entry.value_ptr.iterator();
-            while (inner_it.next()) |inner_entry| {
-                try attestation_list.append(self.allocator, .{
-                    .validator_id = inner_entry.key_ptr.*,
-                    .data = att_data,
-                });
-            }
-        }
-
-        return attestation_list;
     }
 
     /// Build attestation list from attestation signatures and new payloads (recursive aggregation).
@@ -1636,10 +1586,10 @@ pub const ForkChoice = struct {
         return attestation_list;
     }
 
-    pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState, recursive: bool) ![]types.SignedAggregatedAttestation {
+    pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.aggregateUnlocked(state_opt, recursive);
+        return self.aggregateUnlocked(state_opt);
     }
 
     /// Remove attestation data that can no longer influence fork choice.
@@ -2156,7 +2106,7 @@ test "aggregate prunes attestation signatures" {
         .signature = signature,
     });
 
-    const aggregations = try fork_choice.aggregate(&mock_chain.genesis_state, false);
+    const aggregations = try fork_choice.aggregate(&mock_chain.genesis_state);
     defer {
         for (aggregations) |*signed_aggregation| {
             signed_aggregation.deinit();

@@ -529,7 +529,9 @@ pub const Node = struct {
             };
             errdefer attestation_keypair.deinit();
 
-            // TODO: load separate proposal key files when available
+            // Load same files for proposal key — a second FFI handle is needed because
+            // KeyPair wraps a C resource with no clone API.
+            // TODO: load separate proposal key files when available.
             var proposal_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
                 error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
                 error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,

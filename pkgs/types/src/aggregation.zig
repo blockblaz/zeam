@@ -21,9 +21,6 @@ pub const INVERSE_PROOF_SIZE: usize = 2;
 pub const AggregatedSignatureProof = struct {
     participants: attestation.AggregationBits,
     proof_data: ByteListMiB,
-    // TODO: Add bytecode_point field when leanSpec activates it.
-    // See leanSpec PR #449: bytecode_point: ByteListMiB | None = None
-    // Will be used for recursive aggregation claim data.
 
     const Self = @This();
 
