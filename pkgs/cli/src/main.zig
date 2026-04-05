@@ -522,7 +522,6 @@ fn mainInner() !void {
                     .networkId = 0,
                     .network_name = network_name1,
                     .local_peer_id = local_peer_id1,
-                    .quic_listen_port = 0,
                     .node_registry = test_registry1,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger1_config.logger(.network));
@@ -551,7 +550,6 @@ fn mainInner() !void {
                     .networkId = 1,
                     .network_name = network_name2,
                     .local_peer_id = local_peer_id2,
-                    .quic_listen_port = 0,
                     .node_registry = test_registry2,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger2_config.logger(.network));
@@ -580,7 +578,6 @@ fn mainInner() !void {
                     .networkId = 2,
                     .network_name = network_name3,
                     .local_peer_id = local_peer_id3,
-                    .quic_listen_port = 0,
                     .node_registry = test_registry3,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
@@ -697,9 +694,10 @@ fn mainInner() !void {
                     // Start discovery + messaging FIRST so node3 joins fresh without pre-cached gossip blocks
                     if (self.disc) |d| {
                         try d.start();
-                    }
-                    if (self.ethp2p) |ep| {
-                        try ep.start();
+                        if (self.ethp2p) |ep| {
+                            try ep.start(d.sharedSocketFd(), d.sharedLocalAddr());
+                            if (ep.quicListenerPtr()) |ql| d.setQuicListener(ql);
+                        }
                     }
 
                     try self.beam_node.run();
@@ -730,11 +728,13 @@ fn mainInner() !void {
 
             if (!mock_network) {
                 try disc1.start();
-                try ethp2p1.start();
+                try ethp2p1.start(disc1.sharedSocketFd(), disc1.sharedLocalAddr());
+                if (ethp2p1.quicListenerPtr()) |ql| disc1.setQuicListener(ql);
+
                 try disc2.start();
-                try ethp2p2.start();
-                // disc3.start() and ethp2p3.start() are called in DelayedNodeRunner.onInterval
-                // to ensure node3 joins fresh without pre-cached gossip blocks
+                try ethp2p2.start(disc2.sharedSocketFd(), disc2.sharedLocalAddr());
+                if (ethp2p2.quicListenerPtr()) |ql| disc2.setQuicListener(ql);
+                // disc3/ethp2p3 are started in DelayedNodeRunner.onInterval
             }
 
             try clock.run();

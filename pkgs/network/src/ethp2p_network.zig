@@ -13,7 +13,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
 
 const zig_ethp2p = @import("zig_ethp2p");
 const broadcast_engine = zig_ethp2p.broadcast.engine;
@@ -36,7 +35,6 @@ const NodeNameRegistry = node_registry.NodeNameRegistry;
 
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
-const POLL_INTERVAL_MS: u32 = 1;
 
 const FrameDecodeError = error{
     EmptyFrame,
@@ -110,8 +108,6 @@ pub const EthP2PNetworkParams = struct {
     network_name: []const u8,
     /// Hex-encoded local NodeId (64 chars), derived from the discv5 identity.
     local_peer_id: []const u8,
-    /// UDP port for zig-ethp2p QUIC listener (0 = OS-assigned).
-    quic_listen_port: u16,
     node_registry: *const NodeNameRegistry,
     attestation_committee_count: types.SubnetId,
 };
@@ -126,10 +122,9 @@ pub const EthP2PNetwork = struct {
     reqresp_callbacks: std.AutoHashMapUnmanaged(u64, interface.ReqRespRequestCallback),
     next_request_id: u64,
 
-    /// QUIC listener; null when QUIC is not compiled in.
+    /// QUIC listener bound to the shared UDP socket; null before `start`.
+    /// I/O is driven by `EthP2PDiscovery.pollLoop`; no separate thread here.
     quic_listener: ?eth_ec_quic.EthEcQuicListener,
-    poll_thread: ?Thread,
-    poll_running: std.atomic.Value(bool),
 
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
@@ -173,8 +168,6 @@ pub const EthP2PNetwork = struct {
             .reqresp_callbacks = .empty,
             .next_request_id = 1,
             .quic_listener = null,
-            .poll_thread = null,
-            .poll_running = std.atomic.Value(bool).init(false),
             .logger = logger,
             .node_registry = params.node_registry,
         };
@@ -212,8 +205,6 @@ pub const EthP2PNetwork = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.stopPollThread();
-
         if (self.quic_listener) |*listener| {
             listener.deinit();
         }
@@ -229,56 +220,39 @@ pub const EthP2PNetwork = struct {
         self.reqresp_callbacks.deinit(self.allocator);
     }
 
-    /// Bind the QUIC listener and start the poll thread.
-    /// Uses port 0 for OS-assigned random port when `quic_listen_port` is 0.
-    pub fn start(self: *Self) !void {
+    /// Attach the QUIC listener to the shared UDP socket provided by `EthP2PDiscovery`.
+    /// `shared_fd` and `shared_local_addr` come from `EthP2PDiscovery` after it has
+    /// called `start()` and bound the socket.
+    /// I/O is driven by `EthP2PDiscovery.pollLoop`; no poll thread is started here.
+    pub fn start(
+        self: *Self,
+        shared_fd: std.posix.fd_t,
+        shared_local_addr: std.net.Address,
+    ) !void {
         var allocator_ref = self.allocator;
         const config = eth_ec_quic.EthEcQuicConfig{
             .tls_insecure_skip_verify = true,
         };
-        const addr = eth_ec_quic.ListenAddress{
-            .host = "0.0.0.0",
-            .port = self.params.quic_listen_port,
-        };
 
-        self.quic_listener = try eth_ec_quic.listen(&allocator_ref, config, addr);
-
-        self.logger.info(
-            "network-{d}:: zig-ethp2p QUIC listener started on port {d}",
-            .{ self.params.networkId, self.params.quic_listen_port },
+        self.quic_listener = try eth_ec_quic.listenOnFd(
+            &allocator_ref,
+            shared_fd,
+            shared_local_addr,
+            config,
         );
 
-        self.poll_running.store(true, .release);
-        self.poll_thread = try Thread.spawn(.{}, pollLoop, .{self});
+        self.logger.info(
+            "network-{d}:: zig-ethp2p QUIC listener attached to shared socket on port {d}",
+            .{ self.params.networkId, shared_local_addr.getPort() },
+        );
     }
 
-    fn stopPollThread(self: *Self) void {
-        self.poll_running.store(false, .release);
-        if (self.poll_thread) |t| {
-            t.join();
-            self.poll_thread = null;
-        }
-    }
-
-    /// Background thread: drives the QUIC endpoint and RS engine.
-    fn pollLoop(self: *Self) void {
-        while (self.poll_running.load(.acquire)) {
-            if (self.quic_listener) |*listener| {
-                eth_ec_quic.pollListener(listener, POLL_INTERVAL_MS) catch |err| {
-                    self.logger.err(
-                        "network-{d}:: QUIC poll error: {any}",
-                        .{ self.params.networkId, err },
-                    );
-                };
-                // TODO(zig-ethp2p #27): accept new connections via PeerConn, complete BCAST
-                // handshake, and route incoming SESS/CHUNK UNI streams to the RS engine:
-                //   channel.attachRelaySession(message_id, &preamble) for SESS streams
-                //   channel.relayIngestChunk(message_id, chunk_idx, chunk_bytes) for CHUNK streams
-                //   when enough chunks received: channel.sessionDecode(message_id) → dispatch gossip
-            } else {
-                std.Thread.sleep(1_000_000); // 1 ms: no listener yet, avoid busy-loop
-            }
-        }
+    /// Return a pointer to the QUIC listener.  Valid after `start()`.
+    /// Pass to `EthP2PDiscovery.setQuicListener` so the discovery poll loop
+    /// can route inbound QUIC packets.
+    pub fn quicListenerPtr(self: *Self) ?*eth_ec_quic.EthEcQuicListener {
+        if (self.quic_listener == null) return null;
+        return &self.quic_listener.?;
     }
 
     /// Called by EthP2PDiscovery when a peer is successfully dialed via discv5.

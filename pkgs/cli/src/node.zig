@@ -89,9 +89,7 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
-    /// UDP port for zig-ethp2p QUIC listener. 0 means OS-assigned random port.
-    ethp2p_quic_port: u16 = 0,
-    /// UDP port for the discv5 listener. 0 means OS-assigned random port.
+    /// Shared UDP port for both discv5 and QUIC (derived from enrFields.quic). 0 = OS-assigned.
     discv5_listen_port: u16 = 0,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
@@ -231,7 +229,6 @@ pub const Node = struct {
             .networkId = options.network_id,
             .network_name = chain_config.spec.name,
             .local_peer_id = local_node_id,
-            .quic_listen_port = options.ethp2p_quic_port,
             .node_registry = options.node_registry,
             .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
@@ -412,8 +409,21 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
+        // Start discovery first: binds the shared UDP socket and starts discv5.
         try self.discovery.start();
-        try self.ethp2p_network.start();
+
+        // Start the QUIC listener on the same shared socket fd so both protocols
+        // use the same port.  I/O is driven by discovery's poll loop.
+        try self.ethp2p_network.start(
+            self.discovery.sharedSocketFd(),
+            self.discovery.sharedLocalAddr(),
+        );
+
+        // Wire the QUIC listener into the discovery poll loop so it can route
+        // inbound QUIC packets and run QUIC engine timers.
+        if (self.ethp2p_network.quicListenerPtr()) |ql| {
+            self.discovery.setQuicListener(ql);
+        }
         try self.beam_node.run();
 
         const ascii_art =
@@ -730,14 +740,12 @@ pub fn buildStartOptions(
         }
     }
 
-    // Derive QUIC and discv5 listen ports from enrFields in validator-config.yaml.
-    // enrFields.quic  → QUIC transport port  (zig-ethp2p wire layer)
-    // enrFields.udp   → discv5 UDP port      (zig-ethp2p discovery layer)
-    // Both default to 0 (OS-assigned) when the field is absent.
+    // Derive the shared UDP port from enrFields.quic in validator-config.yaml.
+    // discv5 and QUIC share one UDP socket on this port — no separate udp field needed.
+    // Defaults to 0 (OS-assigned) when the field is absent.
     var enr_fields_for_ports = try getEnrFieldsFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
     defer enr_fields_for_ports.deinit(allocator);
-    opts.ethp2p_quic_port = enr_fields_for_ports.quic orelse 0;
-    opts.discv5_listen_port = enr_fields_for_ports.udp orelse 0;
+    opts.discv5_listen_port = enr_fields_for_ports.quic orelse 0;
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
