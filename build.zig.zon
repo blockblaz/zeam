@@ -2,7 +2,7 @@
     .name = .zeam,
     .fingerprint = 0x243fd12cc5f554a5,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .ssz = .{
             .url = "git+https://github.com/blockblaz/ssz.zig#c5394395dd7d0f8eda685c4723ad25ebbf550570",
@@ -51,6 +51,9 @@
         .multiaddr = .{
             .url = "git+https://github.com/zen-eth/multiaddr-zig#ba57f18bb375acb3313a3017aaf9fa517f598f37",
             .hash = "multiaddr-0.1.0-CjaydtK5AABS9kkN9a3c7UBKSsweNV66ZIV86oO1yf3V",
+        },
+        .zig_ethp2p = .{
+            .path = "../zig-ethp2p",
         },
     },
     .paths = .{""},

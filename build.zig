@@ -39,26 +39,22 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
         .dummy => {
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
         .risc0 => {
             comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
         },
         .openvm => {
             comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
         },
         .all => {
             comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
             comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
         },
     }
     comp.linkLibC();
@@ -120,11 +116,6 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("multiformats-zig");
 
-    const multiaddr_mod = enr_dep.builder.dependency("multiaddr", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("multiaddr");
-
     const yaml = b.dependency("zig_yaml", .{
         .target = target,
         .optimize = optimize,
@@ -147,6 +138,14 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     const snappyframesz = snappyframesz_dep.module("snappyframesz.zig");
+
+    // add zig-ethp2p (zig-native p2p for gossip and req/resp over QUIC RS broadcast)
+    const zig_ethp2p_dep = b.dependency("zig_ethp2p", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zig_ethp2p_mod = zig_ethp2p_dep.module("zig_ethp2p");
+    const zig_ethp2p_lib = zig_ethp2p_dep.artifact("zig_ethp2p");
 
     // Create build options early so modules can use them
     const build_options = b.addOptions();
@@ -311,9 +310,9 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("xev", xev);
     zeam_network.addImport("ssz", ssz);
     zeam_network.addImport("multiformats", multiformats);
-    zeam_network.addImport("multiaddr", multiaddr_mod);
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
+    zeam_network.addImport("zig_ethp2p", zig_ethp2p_mod);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
@@ -385,8 +384,6 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/api", zeam_api);
     cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
     cli_exe.root_module.addImport("metrics", metrics);
-    cli_exe.root_module.addImport("multiformats", multiformats);
-    cli_exe.root_module.addImport("multiaddr", multiaddr_mod);
     cli_exe.root_module.addImport("enr", enr);
     cli_exe.root_module.addImport("yaml", yaml);
     cli_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
@@ -396,6 +393,13 @@ pub fn build(b: *Builder) !void {
     cli_exe.linkLibC(); // for rust static libs to link
     cli_exe.linkLibCpp(); // for rocksdb C++ library to link
     cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
+    cli_exe.linkLibrary(zig_ethp2p_lib);
+    // zig_ethp2p always links lsquic + BoringSSL — these system libs are required.
+    cli_exe.linkSystemLibrary("z");
+    if (target.result.os.tag != .windows) {
+        cli_exe.linkSystemLibrary("pthread");
+        cli_exe.linkSystemLibrary("m");
+    }
 
     b.installArtifact(cli_exe);
 
@@ -533,6 +537,7 @@ pub fn build(b: *Builder) !void {
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
+    network_tests.linkLibrary(zig_ethp2p_lib);
     addRustGlueLib(b, network_tests, target, prover);
     const run_network_tests = b.addRunArtifact(network_tests);
     setTestRunLabelFromCompile(b, run_network_tests, network_tests);
@@ -703,19 +708,18 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // Use optimized profiles for single-prover builds to reduce binary size
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "cargo", "+nightly",      "-C", path,          "-Z", "unstable-options",
-            "build", "--release",     "-p", "libp2p-glue", "-p", "hashsig-glue",
-            "-p",    "multisig-glue",
+            "cargo", "+nightly",  "-C", path,           "-Z", "unstable-options",
+            "build", "--release", "-p", "hashsig-glue", "-p", "multisig-glue",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo",      "+nightly",  "-C",            path, "-Z",            "unstable-options",
-            "build",      "--profile", "risc0-release", "-p", "libp2p-glue",   "-p",
-            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
+            "cargo",        "+nightly",  "-C",            path, "-Z",         "unstable-options",
+            "build",        "--profile", "risc0-release", "-p", "risc0-glue", "-p",
+            "hashsig-glue", "-p",        "multisig-glue",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
-            "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
-            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
+            "cargo",        "+nightly",  "-C",             path, "-Z",          "unstable-options",
+            "build",        "--profile", "openvm-release", "-p", "openvm-glue", "-p",
+            "hashsig-glue", "-p",        "multisig-glue",
         }),
         .all => b.addSystemCommand(&.{
             "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",

@@ -32,9 +32,15 @@ pub const OnReqRespRequestCbHandler = interfaceFactory.OnReqRespRequestCbHandler
 const mockFactory = @import("./mock.zig");
 pub const Mock = mockFactory.Mock;
 
-const ethlibp2pFactory = @import("./ethlibp2p.zig");
-pub const EthLibp2pParams = ethlibp2pFactory.EthLibp2pParams;
-pub const EthLibp2p = ethlibp2pFactory.EthLibp2p;
+const ethp2pDiscoveryFactory = @import("./ethp2p_discovery.zig");
+pub const EthP2PDiscovery = ethp2pDiscoveryFactory.EthP2PDiscovery;
+pub const EthP2PDiscoveryParams = ethp2pDiscoveryFactory.EthP2PDiscoveryParams;
+pub const DiscoveryBootstrapEntry = ethp2pDiscoveryFactory.DiscoveryBootstrapEntry;
+pub const nodeIdFromCompressedPubkey = ethp2pDiscoveryFactory.nodeIdFromCompressedPubkey;
+
+const ethp2pNetworkFactory = @import("./ethp2p_network.zig");
+pub const EthP2PNetwork = ethp2pNetworkFactory.EthP2PNetwork;
+pub const EthP2PNetworkParams = ethp2pNetworkFactory.EthP2PNetworkParams;
 
 const node_registryFactory = @import("./node_registry.zig");
 pub const NodeNameRegistry = node_registryFactory.NodeNameRegistry;

@@ -14,7 +14,6 @@ const ChainOptions = configs.ChainOptions;
 const sft = @import("@zeam/state-transition");
 const xev = @import("xev");
 const networks = @import("@zeam/network");
-const Multiaddr = @import("multiaddr").Multiaddr;
 const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
@@ -90,6 +89,10 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
+    /// UDP port for zig-ethp2p QUIC listener. 0 means OS-assigned random port.
+    ethp2p_quic_port: u16 = 0,
+    /// UDP port for the discv5 listener. 0 means OS-assigned random port.
+    discv5_listen_port: u16 = 0,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -118,7 +121,8 @@ pub const NodeOptions = struct {
 /// It manages the event loop, network interface, clock, and beam node.
 pub const Node = struct {
     loop: xev.Loop,
-    network: networks.EthLibp2p,
+    discovery: networks.EthP2PDiscovery,
+    ethp2p_network: networks.EthP2PNetwork,
     beam_node: BeamNode,
     clock: Clock,
     enr: ENR,
@@ -198,18 +202,43 @@ pub const Node = struct {
         // behavior of this further needs to be investigated but for now we will share the same loop
         self.loop = try xev.Loop.init(.{});
 
-        const addresses = try self.constructMultiaddrs();
+        // Build ENR and parse bootnode ENRs into discv5 bootstrap entries.
+        const bootstrap_entries = try self.buildDiscoveryBootstrapEntries();
+        defer allocator.free(bootstrap_entries);
 
-        self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
+        // Parse local private key (hex string → 32 raw bytes) for discv5 identity.
+        var local_privkey: [32]u8 = undefined;
+        const key_str = if (std.mem.startsWith(u8, options.local_priv_key, "0x"))
+            options.local_priv_key[2..]
+        else
+            options.local_priv_key;
+        _ = try std.fmt.hexToBytes(&local_privkey, key_str);
+
+        self.discovery = try networks.EthP2PDiscovery.init(allocator, .{
+            .networkId = options.network_id,
+            .local_privkey = local_privkey,
+            .listen_port = options.discv5_listen_port,
+            .bootstrap_entries = bootstrap_entries,
+            .node_registry = options.node_registry,
+        }, options.logger_config.logger(.network));
+        errdefer self.discovery.deinit();
+
+        // Derive the hex NodeId for EthP2PNetwork's local_peer_id.
+        var local_node_id_buf: [64]u8 = undefined;
+        const local_node_id = self.discovery.localNodeIdHex(&local_node_id_buf);
+
+        self.ethp2p_network = try networks.EthP2PNetwork.init(allocator, &self.loop, .{
             .networkId = options.network_id,
             .network_name = chain_config.spec.name,
-            .listen_addresses = addresses.listen_addresses,
-            .connect_peers = addresses.connect_peers,
-            .local_private_key = options.local_priv_key,
+            .local_peer_id = local_node_id,
+            .quic_listen_port = options.ethp2p_quic_port,
             .node_registry = options.node_registry,
             .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
-        errdefer self.network.deinit();
+        errdefer self.ethp2p_network.deinit();
+
+        // Forward discovery peer events into zig-ethp2p for RS channel membership.
+        try self.discovery.getPeerEvents().subscribe(self.ethp2p_network.getPeerEventHandler());
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
         errdefer self.clock.deinit(allocator);
 
@@ -289,11 +318,20 @@ pub const Node = struct {
             try api.init(allocator);
         }
 
+        // Compose the NetworkInterface: gossip + req/resp from EthP2PNetwork,
+        // peer events from EthP2PDiscovery.
+        const eth_net_iface = self.ethp2p_network.getNetworkInterface();
+        const composed_interface = networks.NetworkInterface{
+            .gossip = eth_net_iface.gossip,
+            .reqresp = eth_net_iface.reqresp,
+            .peers = self.discovery.getPeerEvents(),
+        };
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
             .anchorState = self.anchor_state,
-            .backend = self.network.getNetworkInterface(),
+            .backend = composed_interface,
             .clock = &self.clock,
             .validator_ids = validator_ids,
             .key_manager = &self.key_manager,
@@ -363,7 +401,8 @@ pub const Node = struct {
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
         self.key_manager.deinit();
-        self.network.deinit();
+        self.ethp2p_network.deinit();
+        self.discovery.deinit();
         self.enr.deinit();
         self.db.deinit();
         self.loop.deinit();
@@ -373,7 +412,8 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run();
+        try self.discovery.start();
+        try self.ethp2p_network.start();
         try self.beam_node.run();
 
         const ascii_art =
@@ -430,11 +470,13 @@ pub const Node = struct {
         try self.clock.run();
     }
 
-    fn constructMultiaddrs(self: *Self) !struct { listen_addresses: []const Multiaddr, connect_peers: []const Multiaddr } {
+    /// Build and store the local ENR (for logging), then derive discv5 bootstrap
+    /// entries from all bootnode ENR text strings.
+    fn buildDiscoveryBootstrapEntries(self: *Self) ![]networks.DiscoveryBootstrapEntry {
+        // Build or decode the local node's ENR (used only for logging in run()).
         if (std.mem.eql(u8, self.options.validator_config, "genesis_bootnode")) {
             try ENR.decodeTxtInto(&self.enr, self.options.bootnodes[self.options.node_key_index]);
         } else {
-            // Parse validator config to get ENR fields
             const validator_config_filepath = try std.mem.concat(self.allocator, u8, &[_][]const u8{
                 self.options.validator_config,
                 "/validator-config.yaml",
@@ -444,11 +486,9 @@ pub const Node = struct {
             var parsed_validator_config = try utils_lib.loadFromYAMLFile(self.allocator, validator_config_filepath);
             defer parsed_validator_config.deinit(self.allocator);
 
-            // Get ENR fields from validator config
             var enr_fields = try getEnrFieldsFromValidatorConfig(self.allocator, self.options.node_key, parsed_validator_config);
             defer enr_fields.deinit(self.allocator);
 
-            // Construct ENR from fields and private key
             self.enr = try constructENRFromFields(
                 self.allocator,
                 self.options.local_priv_key,
@@ -457,41 +497,50 @@ pub const Node = struct {
             );
         }
 
-        // Overriding the IP to 0.0.0.0 to listen on all interfaces
-        try self.enr.kvs.put("ip", "\x00\x00\x00\x00");
+        // Convert bootnode ENR texts to discv5 bootstrap entries.
+        var entries: std.ArrayList(networks.DiscoveryBootstrapEntry) = .empty;
+        defer entries.deinit(self.allocator);
 
-        var node_multiaddrs = try self.enr.multiaddrP2PQUIC(self.allocator);
-        defer node_multiaddrs.deinit(self.allocator);
-        // move the ownership to the `EthLibp2p`, will be freed in its deinit
-        const listen_addresses = try node_multiaddrs.toOwnedSlice(self.allocator);
-        errdefer {
-            for (listen_addresses) |addr| addr.deinit();
-            self.allocator.free(listen_addresses);
-        }
-        var connect_peer_list: std.ArrayList(Multiaddr) = .empty;
-        defer connect_peer_list.deinit(self.allocator);
+        for (self.options.bootnodes, 0..) |enr_text, i| {
+            // Skip our own entry when this is a genesis bootnode node.
+            if (i == self.options.node_key_index and
+                std.mem.eql(u8, self.options.validator_config, "genesis_bootnode")) continue;
 
-        for (self.options.bootnodes, 0..) |n, i| {
-            // don't exclude any entry from nodes.yaml if this is not a genesis bootnode
-            if (i != self.options.node_key_index or !std.mem.eql(u8, self.options.validator_config, "genesis_bootnode")) {
-                var n_enr: ENR = undefined;
-                try ENR.decodeTxtInto(&n_enr, n);
-                var peer_multiaddr_list = try n_enr.multiaddrP2PQUIC(self.allocator);
-                defer peer_multiaddr_list.deinit(self.allocator);
-                const peer_multiaddrs = try peer_multiaddr_list.toOwnedSlice(self.allocator);
-                defer self.allocator.free(peer_multiaddrs);
-                try connect_peer_list.appendSlice(self.allocator, peer_multiaddrs);
-            }
+            const entry = enrTextToBootstrapEntry(enr_text) catch |err| {
+                self.logger.warn(
+                    "skipping bootnode ENR (index {d}): {any}",
+                    .{ i, err },
+                );
+                continue;
+            };
+            try entries.append(self.allocator, entry);
         }
 
-        // move the ownership to the `EthLibp2p`, will be freed in its deinit
-        const connect_peers = try connect_peer_list.toOwnedSlice(self.allocator);
-        errdefer {
-            for (connect_peers) |addr| addr.deinit();
-            self.allocator.free(connect_peers);
-        }
+        return entries.toOwnedSlice(self.allocator);
+    }
 
-        return .{ .listen_addresses = listen_addresses, .connect_peers = connect_peers };
+    /// Decode a single ENR text string and extract the discv5 bootstrap entry
+    /// (NodeId + UDP address).
+    fn enrTextToBootstrapEntry(enr_text: []const u8) !networks.DiscoveryBootstrapEntry {
+        var rec: ENR = undefined;
+        try ENR.decodeTxtInto(&rec, enr_text);
+
+        // Secp256k1 compressed public key (33 bytes) — used to derive NodeId.
+        const pubkey_raw = rec.get("secp256k1") orelse return error.NoSecp256k1Key;
+        if (pubkey_raw.len != 33) return error.BadSecp256k1KeyLength;
+        const pubkey: [33]u8 = pubkey_raw[0..33].*;
+
+        // NodeId = keccak256(uncompressed_pubkey[1..]) per discv5 spec §4.1.
+        const node_id = try networks.nodeIdFromCompressedPubkey(pubkey);
+
+        // IP and UDP port from ENR.
+        const ip4 = (try rec.getIP()) orelse return error.NoIPField;
+        const udp_port = (try rec.getUDP()) orelse return error.NoUDPField;
+
+        const ip_bytes: [4]u8 = @bitCast(ip4.sa.addr);
+        const udp_addr = std.net.Address.initIp4(ip_bytes, udp_port);
+
+        return .{ .node_id = node_id, .udp_addr = udp_addr };
     }
 
     fn loadValidatorKeypairs(
@@ -680,6 +729,9 @@ pub fn buildStartOptions(
             opts.attestation_committee_count = 1;
         }
     }
+
+    opts.ethp2p_quic_port = node_cmd.@"ethp2p-quic-port";
+    opts.discv5_listen_port = node_cmd.@"discv5-port";
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it

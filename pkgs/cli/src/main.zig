@@ -20,7 +20,6 @@ const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
 const xev = @import("xev");
-const Multiaddr = @import("multiaddr").Multiaddr;
 
 const configs = @import("@zeam/configs");
 const ChainConfig = configs.ChainConfig;
@@ -73,6 +72,10 @@ pub const NodeCommand = struct {
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
+    /// UDP port for zig-ethp2p QUIC listener. 0 means OS-assigned random port.
+    @"ethp2p-quic-port": u16 = 0,
+    /// UDP port for the discv5 discovery listener. 0 means OS-assigned random port.
+    @"discv5-port": u16 = 0,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -80,7 +83,7 @@ pub const NodeCommand = struct {
 
     pub const __messages__ = .{
         .custom_genesis = "Custom genesis directory path",
-        .network_id = "Internal libp2p network id relevant when running nodes in same process",
+        .network_id = "Internal network id relevant when running nodes in same process",
         .@"node-id" = "The node id in the genesis config for this lean node",
         .@"node-key" = "Path to the node key file",
         .validator_config = "Path to the validator config directory or 'genesis_bootnode'",
@@ -95,6 +98,8 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
+        .@"ethp2p-quic-port" = "UDP port for zig-ethp2p QUIC listener (0 = OS-assigned random port)",
+        .@"discv5-port" = "UDP port for discv5 peer discovery listener (0 = OS-assigned random port)",
         .help = "Show help information for the node command",
     };
 };
@@ -443,29 +448,13 @@ fn mainInner() !void {
             var backend2: networks.NetworkInterface = undefined;
             var backend3: networks.NetworkInterface = undefined;
 
-            // These are owned by the network implementations and will be freed in their deinit functions
-            // We will run network1, network2, and network3 after the nodes are running to avoid race conditions
-            var network1: *networks.EthLibp2p = undefined;
-            var network2: *networks.EthLibp2p = undefined;
-            var network3: *networks.EthLibp2p = undefined;
-            // Initialize to empty slices to avoid undefined behavior in defer when mock_network=true
-            var listen_addresses1: []Multiaddr = &.{};
-            var listen_addresses2: []Multiaddr = &.{};
-            var listen_addresses3: []Multiaddr = &.{};
-            var connect_peers: []Multiaddr = &.{};
-            var connect_peers3: []Multiaddr = &.{};
-            defer {
-                for (listen_addresses1) |addr| addr.deinit();
-                if (listen_addresses1.len > 0) allocator.free(listen_addresses1);
-                for (listen_addresses2) |addr| addr.deinit();
-                if (listen_addresses2.len > 0) allocator.free(listen_addresses2);
-                for (listen_addresses3) |addr| addr.deinit();
-                if (listen_addresses3.len > 0) allocator.free(listen_addresses3);
-                for (connect_peers) |addr| addr.deinit();
-                if (connect_peers.len > 0) allocator.free(connect_peers);
-                for (connect_peers3) |addr| addr.deinit();
-                if (connect_peers3.len > 0) allocator.free(connect_peers3);
-            }
+            // These are owned by their heap allocations and freed in the defer below.
+            var disc1: *networks.EthP2PDiscovery = undefined;
+            var disc2: *networks.EthP2PDiscovery = undefined;
+            var disc3: *networks.EthP2PDiscovery = undefined;
+            var ethp2p1: *networks.EthP2PNetwork = undefined;
+            var ethp2p2: *networks.EthP2PNetwork = undefined;
+            var ethp2p3: *networks.EthP2PNetwork = undefined;
 
             // Create shared registry for beam simulation with validator ID mappings
             // This registry will be used by both the mock network (if enabled) and the beam nodes
@@ -490,75 +479,121 @@ fn mainInner() !void {
                 backend3 = network.getNetworkInterface();
                 logger1_config.logger(null).debug("--- mock gossip {f}", .{backend1.gossip});
             } else {
-                network1 = try allocator.create(networks.EthLibp2p);
+                // Generate secp256k1 key pairs for all three nodes.
                 const key_pair1 = enr_lib.KeyPair.generate();
-                const priv_key1 = key_pair1.v4.toString();
-                listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
+                const key_pair2 = enr_lib.KeyPair.generate();
+                const key_pair3 = enr_lib.KeyPair.generate();
+
+                // Derive each node's discv5 NodeId from its compressed public key.
+                const node_id1 = try networks.nodeIdFromCompressedPubkey(key_pair1.publicKey().v4.serialize());
+                const node_id2 = try networks.nodeIdFromCompressedPubkey(key_pair2.publicKey().v4.serialize());
+
+                // Node 2 and 3 bootstrap from node 1; node 1 bootstraps from node 2.
+                const bootstrap1 = [_]networks.DiscoveryBootstrapEntry{
+                    .{ .node_id = node_id2, .udp_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 19102) },
+                };
+                const bootstrap2 = [_]networks.DiscoveryBootstrapEntry{
+                    .{ .node_id = node_id1, .udp_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 19101) },
+                };
+                const bootstrap3 = [_]networks.DiscoveryBootstrapEntry{
+                    .{ .node_id = node_id1, .udp_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 19101) },
+                };
+
+                // Derive raw 32-byte private keys from key pairs.
+                var privkey1: [32]u8 = undefined;
+                var privkey2: [32]u8 = undefined;
+                var privkey3: [32]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&privkey1, &key_pair1.v4.toString());
+                _ = try std.fmt.hexToBytes(&privkey2, &key_pair2.v4.toString());
+                _ = try std.fmt.hexToBytes(&privkey3, &key_pair3.v4.toString());
+
                 const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name1);
-                // Create empty registry for test network
                 const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry1);
 
-                network1.* = try networks.EthLibp2p.init(allocator, loop, .{
+                disc1 = try allocator.create(networks.EthP2PDiscovery);
+                disc1.* = try networks.EthP2PDiscovery.init(allocator, .{
+                    .networkId = 0,
+                    .local_privkey = privkey1,
+                    .listen_port = 19101,
+                    .bootstrap_entries = &bootstrap1,
+                    .node_registry = test_registry1,
+                }, logger1_config.logger(.network));
+                var node_id_buf1: [64]u8 = undefined;
+                const local_peer_id1 = disc1.localNodeIdHex(&node_id_buf1);
+                ethp2p1 = try allocator.create(networks.EthP2PNetwork);
+                ethp2p1.* = try networks.EthP2PNetwork.init(allocator, loop, .{
                     .networkId = 0,
                     .network_name = network_name1,
-                    .local_private_key = &priv_key1,
-                    .listen_addresses = listen_addresses1,
-                    .connect_peers = null,
+                    .local_peer_id = local_peer_id1,
+                    .quic_listen_port = 0,
                     .node_registry = test_registry1,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger1_config.logger(.network));
-                backend1 = network1.getNetworkInterface();
+                try disc1.getPeerEvents().subscribe(ethp2p1.getPeerEventHandler());
+                const iface1 = ethp2p1.getNetworkInterface();
+                backend1 = .{ .gossip = iface1.gossip, .reqresp = iface1.reqresp, .peers = disc1.getPeerEvents() };
 
-                // init a new lib2p network here to connect with network1
-                network2 = try allocator.create(networks.EthLibp2p);
-                const key_pair2 = enr_lib.KeyPair.generate();
-                const priv_key2 = key_pair2.v4.toString();
-                listen_addresses2 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")});
-                connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name2);
-                // Create empty registry for test network
                 const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry2);
 
-                network2.* = try networks.EthLibp2p.init(allocator, loop, .{
+                disc2 = try allocator.create(networks.EthP2PDiscovery);
+                disc2.* = try networks.EthP2PDiscovery.init(allocator, .{
+                    .networkId = 1,
+                    .local_privkey = privkey2,
+                    .listen_port = 19102,
+                    .bootstrap_entries = &bootstrap2,
+                    .node_registry = test_registry2,
+                }, logger2_config.logger(.network));
+                var node_id_buf2: [64]u8 = undefined;
+                const local_peer_id2 = disc2.localNodeIdHex(&node_id_buf2);
+                ethp2p2 = try allocator.create(networks.EthP2PNetwork);
+                ethp2p2.* = try networks.EthP2PNetwork.init(allocator, loop, .{
                     .networkId = 1,
                     .network_name = network_name2,
-                    .local_private_key = &priv_key2,
-                    .listen_addresses = listen_addresses2,
-                    .connect_peers = connect_peers,
+                    .local_peer_id = local_peer_id2,
+                    .quic_listen_port = 0,
                     .node_registry = test_registry2,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger2_config.logger(.network));
-                backend2 = network2.getNetworkInterface();
+                try disc2.getPeerEvents().subscribe(ethp2p2.getPeerEventHandler());
+                const iface2 = ethp2p2.getNetworkInterface();
+                backend2 = .{ .gossip = iface2.gossip, .reqresp = iface2.reqresp, .peers = disc2.getPeerEvents() };
 
-                // init network3 for node 3 (delayed sync node)
-                network3 = try allocator.create(networks.EthLibp2p);
-                const key_pair3 = enr_lib.KeyPair.generate();
-                const priv_key3 = key_pair3.v4.toString();
-                listen_addresses3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9003")});
-                connect_peers3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
                 const network_name3 = try allocator.dupe(u8, chain_config.spec.name);
                 errdefer allocator.free(network_name3);
                 const test_registry3 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry3);
 
-                network3.* = try networks.EthLibp2p.init(allocator, loop, .{
+                disc3 = try allocator.create(networks.EthP2PDiscovery);
+                disc3.* = try networks.EthP2PDiscovery.init(allocator, .{
+                    .networkId = 2,
+                    .local_privkey = privkey3,
+                    .listen_port = 19103,
+                    .bootstrap_entries = &bootstrap3,
+                    .node_registry = test_registry3,
+                }, logger3_config.logger(.network));
+                var node_id_buf3: [64]u8 = undefined;
+                const local_peer_id3 = disc3.localNodeIdHex(&node_id_buf3);
+                ethp2p3 = try allocator.create(networks.EthP2PNetwork);
+                ethp2p3.* = try networks.EthP2PNetwork.init(allocator, loop, .{
                     .networkId = 2,
                     .network_name = network_name3,
-                    .local_private_key = &priv_key3,
-                    .listen_addresses = listen_addresses3,
-                    .connect_peers = connect_peers3,
+                    .local_peer_id = local_peer_id3,
+                    .quic_listen_port = 0,
                     .node_registry = test_registry3,
                     .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
-                backend3 = network3.getNetworkInterface();
-                logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
+                try disc3.getPeerEvents().subscribe(ethp2p3.getPeerEventHandler());
+                const iface3 = ethp2p3.getNetworkInterface();
+                backend3 = .{ .gossip = iface3.gossip, .reqresp = iface3.reqresp, .peers = disc3.getPeerEvents() };
+                logger1_config.logger(null).debug("--- zig-ethp2p gossip {f}", .{backend1.gossip});
             }
 
             var clock = try allocator.create(Clock);
@@ -649,7 +684,8 @@ fn mainInner() !void {
                 beam_node: *BeamNode,
                 /// Reference node whose finalization status determines when node 3 starts
                 reference_node: *BeamNode,
-                network: ?*networks.EthLibp2p = null,
+                disc: ?*networks.EthP2PDiscovery = null,
+                ethp2p: ?*networks.EthP2PNetwork = null,
                 started: bool = false,
 
                 pub fn onInterval(ptr: *anyopaque, interval: isize) !void {
@@ -664,9 +700,12 @@ fn mainInner() !void {
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start network FIRST so node3 joins fresh without pre-cached gossip blocks
-                    if (self.network) |net| {
-                        try net.run();
+                    // Start discovery + messaging FIRST so node3 joins fresh without pre-cached gossip blocks
+                    if (self.disc) |d| {
+                        try d.start();
+                    }
+                    if (self.ethp2p) |ep| {
+                        try ep.start();
                     }
 
                     try self.beam_node.run();
@@ -679,7 +718,8 @@ fn mainInner() !void {
             var delayed_runner = DelayedNodeRunner{
                 .beam_node = &beam_node_3,
                 .reference_node = &beam_node_1,
-                .network = if (!mock_network) network3 else null,
+                .disc = if (!mock_network) disc3 else null,
+                .ethp2p = if (!mock_network) ethp2p3 else null,
             };
             const delayed_cb = try allocator.create(node_lib.utils.OnIntervalCbWrapper);
             delayed_cb.* = .{
@@ -695,9 +735,11 @@ fn mainInner() !void {
             try clock.subscribeOnSlot(delayed_cb);
 
             if (!mock_network) {
-                try network1.run();
-                try network2.run();
-                // network3.run() is called in DelayedNodeRunner.onInterval
+                try disc1.start();
+                try ethp2p1.start();
+                try disc2.start();
+                try ethp2p2.start();
+                // disc3.start() and ethp2p3.start() are called in DelayedNodeRunner.onInterval
                 // to ensure node3 joins fresh without pre-cached gossip blocks
             }
 
