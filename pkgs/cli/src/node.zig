@@ -730,8 +730,14 @@ pub fn buildStartOptions(
         }
     }
 
-    opts.ethp2p_quic_port = node_cmd.@"ethp2p-quic-port";
-    opts.discv5_listen_port = node_cmd.@"discv5-port";
+    // Derive QUIC and discv5 listen ports from enrFields in validator-config.yaml.
+    // enrFields.quic  → QUIC transport port  (zig-ethp2p wire layer)
+    // enrFields.udp   → discv5 UDP port      (zig-ethp2p discovery layer)
+    // Both default to 0 (OS-assigned) when the field is absent.
+    var enr_fields_for_ports = try getEnrFieldsFromValidatorConfig(allocator, opts.node_key, parsed_validator_config);
+    defer enr_fields_for_ports.deinit(allocator);
+    opts.ethp2p_quic_port = enr_fields_for_ports.quic orelse 0;
+    opts.discv5_listen_port = enr_fields_for_ports.udp orelse 0;
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it

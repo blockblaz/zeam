@@ -72,10 +72,6 @@ pub const NodeCommand = struct {
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
-    /// UDP port for zig-ethp2p QUIC listener. 0 means OS-assigned random port.
-    @"ethp2p-quic-port": u16 = 0,
-    /// UDP port for the discv5 discovery listener. 0 means OS-assigned random port.
-    @"discv5-port": u16 = 0,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -98,8 +94,6 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
-        .@"ethp2p-quic-port" = "UDP port for zig-ethp2p QUIC listener (0 = OS-assigned random port)",
-        .@"discv5-port" = "UDP port for discv5 peer discovery listener (0 = OS-assigned random port)",
         .help = "Show help information for the node command",
     };
 };
