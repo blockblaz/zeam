@@ -53,7 +53,8 @@
             .hash = "multiaddr-0.1.0-CjaydtK5AABS9kkN9a3c7UBKSsweNV66ZIV86oO1yf3V",
         },
         .zig_ethp2p = .{
-            .path = "../zig-ethp2p",
+            .url = "git+https://github.com/blockblaz/zig-ethp2p#f3a401ebdac95b26596599e49fed739b54846937",
+            .hash = "zig_ethp2p-0.0.0-TcaWEpa7BwB86lKpsg1zFfoFxUYSu5b_XdhRu3nU10GO",
         },
     },
     .paths = .{""},
