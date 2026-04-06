@@ -1514,7 +1514,6 @@ pub const ForkChoice = struct {
         return results.toOwnedSlice(self.allocator);
     }
 
-
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         self.mutex.lock();
         defer self.mutex.unlock();
