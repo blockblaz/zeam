@@ -3,8 +3,8 @@
 mod config {
     // From leansig (verification + types)
     pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
-        SchemeAbortingTargetSumLifetime32Dim46Base8 as LeanSigScheme,
         PubKeyAbortingTargetSumLifetime32Dim46Base8 as XmssPublicKey,
+        SchemeAbortingTargetSumLifetime32Dim46Base8 as LeanSigScheme,
         SigAbortingTargetSumLifetime32Dim46Base8 as XmssSignature,
     };
     // From leansig_fast_keygen (keygen + signing)
@@ -95,11 +95,8 @@ impl PrivateKey {
         activation_epoch: u32,
         num_active_epochs: u32,
     ) -> (PublicKey, Self) {
-        let (pk, sk) = FastKeyGenScheme::key_gen(
-            rng,
-            activation_epoch as usize,
-            num_active_epochs as usize,
-        );
+        let (pk, sk) =
+            FastKeyGenScheme::key_gen(rng, activation_epoch as usize, num_active_epochs as usize);
         // Transmute fast_keygen PubKey to leansig PubKey (identical layout, different crate types)
         let pk: HashSigPublicKey = unsafe { std::mem::transmute(pk) };
 
