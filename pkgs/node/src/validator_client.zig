@@ -153,7 +153,6 @@ pub const ValidatorClient = struct {
 
             self.logger.info("signed produced block for slot={d} root={x}", .{ slot, &produced_block.blockRoot });
 
-            // 6. Create ValidatorOutput
             var result = ValidatorClientOutput.init(self.allocator);
             try result.addBlock(signed_block);
             return result;

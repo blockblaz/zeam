@@ -1596,19 +1596,15 @@ fn buildState(
 
                 var label_buf: [96]u8 = undefined;
 
-                // Support both old format (pubkey) and new devnet4 format (attestationPubkey + proposalPubkey)
-                const attestation_pubkey = if (validator_obj.get("attestationPubkey")) |_| blk: {
+                const attestation_pubkey = blk: {
                     const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
                     break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
-                } else blk: {
-                    const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
-                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
                 };
 
-                const proposal_pubkey = if (validator_obj.get("proposalPubkey")) |_| blk: {
+                const proposal_pubkey = blk: {
                     const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
                     break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
-                } else attestation_pubkey;
+                };
 
                 const validator_index: u64 = blk: {
                     if (validator_obj.get("index")) |index_value| {

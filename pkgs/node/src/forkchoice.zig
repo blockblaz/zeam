@@ -1406,13 +1406,6 @@ pub const ForkChoice = struct {
         var new_payloads_count: usize = 0;
         var gossip_sigs_count: usize = 0;
 
-        self.signatures_mutex.lock();
-        defer self.signatures_mutex.unlock();
-
-        // Build attestation list from gossip signatures and new payloads
-        var attestations = try self.attestationsFromGossipAndNewPayloads();
-        defer attestations.deinit(self.allocator);
-
         var agg = try types.AggregatedAttestationsResult.init(self.allocator);
         var agg_att_cleanup = true;
         var agg_sig_cleanup = true;
@@ -1429,15 +1422,6 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
-        // Pass new and known payloads for two-pass greedy child selection
-        try agg.computeAggregatedSignatures(
-            attestations.items,
-            &state.validators,
-            &self.attestation_signatures,
-            &self.latest_new_aggregated_payloads,
-            &self.latest_known_aggregated_payloads,
-        );
-
         var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
         errdefer {
             for (results.items) |*signed| {
@@ -1450,49 +1434,66 @@ pub const ForkChoice = struct {
         var new_payloads = AggregatedPayloadsMap.init(self.allocator);
         errdefer deinitAggregatedPayloadsMap(self.allocator, &new_payloads);
 
-        const agg_attestations = agg.attestations.constSlice();
-        const agg_signatures = agg.attestation_signatures.constSlice();
-
         // Track which AttestationData keys were successfully aggregated
         var aggregated_att_data_keys: std.ArrayList(types.AttestationData) = .empty;
         defer aggregated_att_data_keys.deinit(self.allocator);
 
-        for (agg_attestations, 0..) |agg_att, index| {
-            const proof = agg_signatures[index];
+        {
+            self.signatures_mutex.lock();
+            defer self.signatures_mutex.unlock();
 
-            try aggregated_att_data_keys.append(self.allocator, agg_att.data);
+            // Pass new and known payloads for two-pass greedy child selection
+            try agg.computeAggregatedSignatures(
+                &state.validators,
+                &self.attestation_signatures,
+                &self.latest_new_aggregated_payloads,
+                &self.latest_known_aggregated_payloads,
+            );
 
-            // Store proof into new payloads map
-            const gop = try new_payloads.getOrPut(agg_att.data);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
+            const agg_attestations = agg.attestations.constSlice();
+            const agg_signatures = agg.attestation_signatures.constSlice();
+
+            for (agg_attestations, 0..) |agg_att, index| {
+                const proof = agg_signatures[index];
+
+                try aggregated_att_data_keys.append(self.allocator, agg_att.data);
+
+                // Store proof into new payloads map
+                const gop = try new_payloads.getOrPut(agg_att.data);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .empty;
+                }
+
+                var cloned_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
+                errdefer cloned_proof.deinit();
+                try gop.value_ptr.append(self.allocator, .{
+                    .slot = agg_att.data.slot,
+                    .proof = cloned_proof,
+                });
+
+                var output_proof: types.AggregatedSignatureProof = undefined;
+                try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
+                errdefer output_proof.deinit();
+                try results.append(self.allocator, .{
+                    .data = agg_att.data,
+                    .proof = output_proof,
+                });
             }
 
-            var cloned_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &cloned_proof);
-            errdefer cloned_proof.deinit();
-            try gop.value_ptr.append(self.allocator, .{
-                .slot = agg_att.data.slot,
-                .proof = cloned_proof,
-            });
+            // Replace latest_new_aggregated_payloads
+            deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
+            self.latest_new_aggregated_payloads = new_payloads;
 
-            var output_proof: types.AggregatedSignatureProof = undefined;
-            try types.sszClone(self.allocator, types.AggregatedSignatureProof, proof, &output_proof);
-            errdefer output_proof.deinit();
-            try results.append(self.allocator, .{
-                .data = agg_att.data,
-                .proof = output_proof,
-            });
-        }
+            // Remove only signatures whose AttestationData was successfully aggregated
+            // (leanSpec #449: per-attestation_data key removal, not a full clear)
+            for (aggregated_att_data_keys.items) |att_data| {
+                self.attestation_signatures.removeAndDeinit(att_data);
+            }
 
-        // Replace latest_new_aggregated_payloads
-        deinitAggregatedPayloadsMap(self.allocator, &self.latest_new_aggregated_payloads);
-        self.latest_new_aggregated_payloads = new_payloads;
-
-        // Remove only signatures whose AttestationData was successfully aggregated
-        // (leanSpec #449: per-attestation_data key removal, not a full clear)
-        for (aggregated_att_data_keys.items) |att_data| {
-            self.attestation_signatures.removeAndDeinit(att_data);
+            // Capture counts before lock is released
+            new_payloads_count = self.latest_new_aggregated_payloads.count();
+            gossip_sigs_count = self.attestation_signatures.count();
         }
 
         agg_att_cleanup = false;
@@ -1506,10 +1507,6 @@ pub const ForkChoice = struct {
         }
         agg.attestation_signatures.deinit();
 
-        // Capture counts before lock is released
-        new_payloads_count = self.latest_new_aggregated_payloads.count();
-        gossip_sigs_count = self.attestation_signatures.count();
-
         // Update fork-choice store gauges after aggregation (outside lock scope)
         zeam_metrics.metrics.lean_latest_new_aggregated_payloads.set(@intCast(new_payloads_count));
         zeam_metrics.metrics.lean_gossip_signatures.set(@intCast(gossip_sigs_count));
@@ -1517,74 +1514,6 @@ pub const ForkChoice = struct {
         return results.toOwnedSlice(self.allocator);
     }
 
-    /// Build attestation list from attestation signatures and new payloads (recursive aggregation).
-    /// Known payloads are NOT included — they serve only as greedy selection helpers.
-    /// Caller must hold signatures_mutex.
-    fn attestationsFromGossipAndNewPayloads(self: *Self) !std.ArrayList(types.Attestation) {
-        var attestation_list: std.ArrayList(types.Attestation) = .{};
-        errdefer attestation_list.deinit(self.allocator);
-
-        // Collect all unique AttestationData from both sources
-        var all_att_data = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
-        defer all_att_data.deinit();
-
-        {
-            var it = self.attestation_signatures.iterator();
-            while (it.next()) |entry| {
-                try all_att_data.put(entry.key_ptr.*, {});
-            }
-        }
-        {
-            var it = self.latest_new_aggregated_payloads.iterator();
-            while (it.next()) |entry| {
-                try all_att_data.put(entry.key_ptr.*, {});
-            }
-        }
-
-        // For each AttestationData, collect unique validator IDs from both sources
-        var att_data_it = all_att_data.iterator();
-        while (att_data_it.next()) |att_entry| {
-            const att_data = att_entry.key_ptr.*;
-
-            var seen_vids = std.AutoHashMap(types.ValidatorIndex, void).init(self.allocator);
-            defer seen_vids.deinit();
-
-            // From attestation_signatures
-            if (self.attestation_signatures.getPtr(att_data)) |inner_map| {
-                var it = inner_map.iterator();
-                while (it.next()) |entry| {
-                    const vid = entry.key_ptr.*;
-                    if (!seen_vids.contains(vid)) {
-                        try seen_vids.put(vid, {});
-                        try attestation_list.append(self.allocator, .{
-                            .validator_id = vid,
-                            .data = att_data,
-                        });
-                    }
-                }
-            }
-
-            // From new payloads (participants bitset)
-            if (self.latest_new_aggregated_payloads.get(att_data)) |payloads| {
-                for (payloads.items) |*stored| {
-                    for (0..stored.proof.participants.len()) |i| {
-                        if (stored.proof.participants.get(i) catch false) {
-                            const vid: types.ValidatorIndex = @intCast(i);
-                            if (!seen_vids.contains(vid)) {
-                                try seen_vids.put(vid, {});
-                                try attestation_list.append(self.allocator, .{
-                                    .validator_id = vid,
-                                    .data = att_data,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return attestation_list;
-    }
 
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         self.mutex.lock();

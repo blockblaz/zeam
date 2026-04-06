@@ -963,7 +963,7 @@ pub const BeamChain = struct {
 
         const processing_time = onblock_timer.observe();
 
-        // 7. Save block and state to database and confirm the block in forkchoice
+        // 6. Save block and state to database and confirm the block in forkchoice
         self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
             self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
@@ -984,7 +984,7 @@ pub const BeamChain = struct {
 
     pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
         _ = signedBlock;
-        // 8. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
+        // 7. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
         const new_head = self.forkChoice.getHead();
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
@@ -999,7 +999,7 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
-        // 9. Asap emit justification/finalization events based on forkchoice store
+        // 8. Asap emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified.slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {

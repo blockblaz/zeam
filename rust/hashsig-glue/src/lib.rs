@@ -1,8 +1,44 @@
-use leansig_wrapper::{
-    xmss_keygen_fast, xmss_public_key_from_ssz, xmss_public_key_to_ssz, xmss_sign_fast,
-    xmss_signature_from_ssz, xmss_signature_to_ssz, xmss_verify, FastKeyGenSecretKey,
-    XmssPublicKey, XmssSignature, MESSAGE_LENGTH,
-};
+// Production config (default)
+#[cfg(not(feature = "test-config"))]
+mod config {
+    // From leansig (verification + types)
+    pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
+        SchemeAbortingTargetSumLifetime32Dim46Base8 as LeanSigScheme,
+        PubKeyAbortingTargetSumLifetime32Dim46Base8 as XmssPublicKey,
+        SigAbortingTargetSumLifetime32Dim46Base8 as XmssSignature,
+    };
+    // From leansig_fast_keygen (keygen + signing)
+    pub use leansig_fast_keygen::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
+        SchemeAbortingTargetSumLifetime32Dim46Base8 as FastKeyGenScheme,
+        SecretKeyAbortingTargetSumLifetime32Dim46Base8 as FastKeyGenSecretKey,
+    };
+}
+
+// Test config
+#[cfg(feature = "test-config")]
+mod config {
+    pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
+        SchemeAbortingTargetSumLifetime8Dim46Base8 as LeanSigScheme,
+        PubKeyAbortingTargetSumLifetime8Dim46Base8 as XmssPublicKey,
+        SigAbortingTargetSumLifetime8Dim46Base8 as XmssSignature,
+    };
+    pub use leansig_fast_keygen::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
+        SchemeAbortingTargetSumLifetime8Dim46Base8 as FastKeyGenScheme,
+        SecretKeyAbortingTargetSumLifetime8Dim46Base8 as FastKeyGenSecretKey,
+    };
+}
+
+use config::*;
+
+use leansig::serialization::Serializable;
+use leansig::signature::SignatureScheme;
+use leansig::MESSAGE_LENGTH;
+
+// Import the fast_keygen traits separately — these are distinct from leansig's traits
+// because the crates are separate forks with identical type layouts.
+use leansig_fast_keygen::serialization::Serializable as FastKeyGenSerializable;
+use leansig_fast_keygen::signature::SignatureScheme as FastKeyGenSignatureScheme;
+
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
@@ -59,9 +95,15 @@ impl PrivateKey {
         activation_epoch: u32,
         num_active_epochs: u32,
     ) -> (PublicKey, Self) {
-        let (private_key, public_key) = xmss_keygen_fast(rng, activation_epoch, num_active_epochs);
+        let (pk, sk) = FastKeyGenScheme::key_gen(
+            rng,
+            activation_epoch as usize,
+            num_active_epochs as usize,
+        );
+        // Transmute fast_keygen PubKey to leansig PubKey (identical layout, different crate types)
+        let pk: HashSigPublicKey = unsafe { std::mem::transmute(pk) };
 
-        (PublicKey::new(public_key), Self::new(private_key))
+        (PublicKey::new(pk), Self::new(sk))
     }
 
     pub fn sign(
@@ -69,8 +111,10 @@ impl PrivateKey {
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
     ) -> Result<Signature, SigningError> {
-        let sig =
-            xmss_sign_fast(&self.inner, message, epoch).map_err(|_| SigningError::SigningFailed)?;
+        let sig = FastKeyGenScheme::sign(&self.inner, epoch, message)
+            .map_err(|_| SigningError::SigningFailed)?;
+        // Transmute fast_keygen Signature to leansig Signature (identical layout)
+        let sig: HashSigSignature = unsafe { std::mem::transmute(sig) };
         Ok(Signature::new(sig))
     }
 }
@@ -92,8 +136,34 @@ impl Signature {
         public_key: &PublicKey,
         epoch: u32,
     ) -> bool {
-        xmss_verify(&public_key.inner, epoch, message, &self.inner).is_ok()
+        LeanSigScheme::verify(&public_key.inner, epoch, message, &self.inner)
     }
+}
+
+// SSZ serialization helpers (using leansig's Serializable trait)
+
+fn xmss_public_key_from_ssz(bytes: &[u8]) -> Result<HashSigPublicKey, ()> {
+    HashSigPublicKey::from_bytes(bytes).map_err(|_| ())
+}
+
+fn xmss_public_key_to_ssz(pk: &HashSigPublicKey) -> Vec<u8> {
+    pk.to_bytes()
+}
+
+fn xmss_signature_from_ssz(bytes: &[u8]) -> Result<HashSigSignature, ()> {
+    HashSigSignature::from_bytes(bytes).map_err(|_| ())
+}
+
+fn xmss_signature_to_ssz(sig: &HashSigSignature) -> Vec<u8> {
+    sig.to_bytes()
+}
+
+fn fast_keygen_secret_key_from_ssz(bytes: &[u8]) -> Result<HashSigPrivateKey, ()> {
+    HashSigPrivateKey::from_bytes(bytes).map_err(|_| ())
+}
+
+fn fast_keygen_secret_key_to_ssz(sk: &HashSigPrivateKey) -> Vec<u8> {
+    sk.to_bytes()
 }
 
 // FFI Functions for Zig interop
@@ -148,7 +218,7 @@ pub unsafe extern "C" fn hashsig_keypair_from_ssz(
         let sk_slice = slice::from_raw_parts(private_key_ptr, private_key_len);
         let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
 
-        let private_key: HashSigPrivateKey = match postcard::from_bytes(sk_slice) {
+        let private_key: HashSigPrivateKey = match fast_keygen_secret_key_from_ssz(sk_slice) {
             Ok(key) => key,
             Err(_) => {
                 return ptr::null_mut();
@@ -446,11 +516,7 @@ pub unsafe extern "C" fn hashsig_private_key_to_bytes(
     unsafe {
         let private_key_ref = &*private_key;
 
-        // Serialize secret key using postcard (serde-based)
-        let sk_bytes = match postcard::to_allocvec(&private_key_ref.inner) {
-            Ok(bytes) => bytes,
-            Err(_) => return 0,
-        };
+        let sk_bytes = fast_keygen_secret_key_to_ssz(&private_key_ref.inner);
 
         if sk_bytes.len() > buffer_len {
             return 0;
@@ -499,7 +565,7 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
             Err(_) => return -1,
         };
 
-        let is_valid = xmss_verify(&pk, epoch, message_array, &sig).is_ok();
+        let is_valid = LeanSigScheme::verify(&pk, epoch, message_array, &sig);
 
         if is_valid {
             1

@@ -74,7 +74,7 @@ pub fn aggregateSignatures(
     public_keys: []*const hashsig.HashSigPublicKey,
     signatures: []*const hashsig.HashSigSignature,
     children_pub_keys: []const []*const hashsig.HashSigPublicKey,
-    children_proofs: []const *const ByteListMiB,
+    children_proofs: []const ByteListMiB,
     message_hash: *const [32]u8,
     epoch: u32,
     log_inv_rate: usize,
@@ -188,7 +188,7 @@ test "aggregateSignatures returns PublicKeysSignatureLengthMismatch for mismatch
     var multisig_aggregated_signature = try ByteListMiB.init(std.testing.allocator);
     defer multisig_aggregated_signature.deinit();
     const empty_children_pks: [][]*const hashsig.HashSigPublicKey = &.{};
-    const empty_children_proofs: []*const ByteListMiB = &.{};
+    const empty_children_proofs: []const ByteListMiB = &.{};
     const result = aggregateSignatures(&public_keys, &signatures, empty_children_pks, empty_children_proofs, &message_hash, 0, 2, &multisig_aggregated_signature);
     try std.testing.expectError(AggregationError.PublicKeysSignatureLengthMismatch, result);
 }
@@ -214,7 +214,7 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     var multisig_aggregated_signature = try ByteListMiB.init(allocator);
     defer multisig_aggregated_signature.deinit();
     const empty_children_pks: [][]*const hashsig.HashSigPublicKey = &.{};
-    const empty_children_proofs: []*const ByteListMiB = &.{};
+    const empty_children_proofs: []const ByteListMiB = &.{};
     try aggregateSignatures(&public_keys, &signatures, empty_children_pks, empty_children_proofs, &message_hash, epoch, 2, &multisig_aggregated_signature);
 
     // Verify

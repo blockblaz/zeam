@@ -14,8 +14,9 @@ const ByteListMiB = xmss.ByteListMiB;
 
 const freeJsonValue = utils.freeJsonValue;
 
-/// Protocol-level inverse proof size parameter for aggregation (range 1-4).
-pub const INVERSE_PROOF_SIZE: usize = 2;
+/// Protocol-level log inverse rate parameters for aggregation.
+pub const LOG_INV_RATE_TEST: usize = 1;
+pub const LOG_INV_RATE_PROD: usize = 2;
 
 // Types
 pub const AggregatedSignatureProof = struct {
@@ -113,11 +114,11 @@ pub const AggregatedSignatureProof = struct {
             }
         }
 
-        // Build per-child proof references for FFI
-        const children_proof_refs = try allocator.alloc(*const ByteListMiB, children.len);
-        defer allocator.free(children_proof_refs);
-        for (children, 0..) |*child, i| {
-            children_proof_refs[i] = &child.proof_data;
+        // Build per-child proof data for FFI
+        const children_proof_data = try allocator.alloc(ByteListMiB, children.len);
+        defer allocator.free(children_proof_data);
+        for (children, 0..) |child, i| {
+            children_proof_data[i] = child.proof_data;
         }
 
         // FFI call — passes children proofs + their public keys for true recursive aggregation
@@ -125,10 +126,10 @@ pub const AggregatedSignatureProof = struct {
             raw_xmss_pks,
             raw_xmss_sigs,
             children_pub_keys,
-            children_proof_refs,
+            children_proof_data,
             message_hash,
             @intCast(epoch),
-            INVERSE_PROOF_SIZE,
+            LOG_INV_RATE_PROD,
             &result.proof_data,
         );
 

@@ -1,5 +1,7 @@
 const aggregation = @import("./aggregation.zig");
 pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
+pub const LOG_INV_RATE_TEST = aggregation.LOG_INV_RATE_TEST;
+pub const LOG_INV_RATE_PROD = aggregation.LOG_INV_RATE_PROD;
 
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;

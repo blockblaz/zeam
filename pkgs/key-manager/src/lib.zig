@@ -294,17 +294,35 @@ fn findTestKeysDir() ?[]const u8 {
 }
 
 /// Load a ValidatorKeys pair from SSZ files on disk.
-/// Currently loads the same key files for both attestation and proposal roles
-/// (each call to loadKeypairFromFiles allocates an independent C resource).
+/// Reads the key files once and constructs two independent keypairs
+/// (attestation + proposal) from the same SSZ bytes.
 /// TODO: load separate proposal key files when available.
 pub fn loadValidatorKeysFromFiles(
     allocator: Allocator,
     sk_path: []const u8,
     pk_path: []const u8,
 ) !ValidatorKeys {
-    var att_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    // Read files once
+    var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SecretKeyFileNotFound,
+        else => return err,
+    };
+    defer sk_file.close();
+    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
+    defer allocator.free(sk_data);
+
+    var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.PublicKeyFileNotFound,
+        else => return err,
+    };
+    defer pk_file.close();
+    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
+    defer allocator.free(pk_data);
+
+    // Construct two independent keypairs from the same bytes
+    var att_keypair = try xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
     errdefer att_keypair.deinit();
-    const prop_keypair = try loadKeypairFromFiles(allocator, sk_path, pk_path);
+    const prop_keypair = try xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
     return ValidatorKeys{ .attestation_keypair = att_keypair, .proposal_keypair = prop_keypair };
 }
 
