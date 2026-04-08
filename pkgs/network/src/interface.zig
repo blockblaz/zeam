@@ -4,7 +4,7 @@ const json = std.json;
 
 const types = @import("@zeam/types");
 const ssz = @import("ssz");
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const zeam_utils = @import("@zeam/utils");
 const consensus_params = @import("@zeam/params");
 

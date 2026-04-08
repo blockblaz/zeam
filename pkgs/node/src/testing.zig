@@ -7,7 +7,7 @@ const key_manager = @import("@zeam/key-manager");
 const params = @import("@zeam/params");
 const types = @import("@zeam/types");
 const zeam_utils = @import("@zeam/utils");
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const networks = @import("@zeam/network");
 const xmss = @import("@zeam/xmss");
 const clockFactory = @import("./clock.zig");
@@ -48,6 +48,12 @@ pub const NodeTestContext = struct {
     spec_name_owned: bool = true,
 
     pub fn init(allocator: Allocator, opts: NodeTestOptions) !NodeTestContext {
+        const utils = @import("./utils.zig");
+        utils.detectBackend() catch |err| {
+            std.log.err("failed to detect I/O backend: {s}", .{@errorName(err)});
+            return err;
+        };
+
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 

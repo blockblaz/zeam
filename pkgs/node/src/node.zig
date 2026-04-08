@@ -1413,7 +1413,7 @@ pub const BeamNode = struct {
     }
 };
 
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 
 test "Node peer tracking on connect/disconnect" {
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
