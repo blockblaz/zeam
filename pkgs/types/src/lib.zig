@@ -33,6 +33,7 @@ pub const aggregateInnerMap = block.AggregateInnerMap;
 pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
 pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
+pub const compactAttestations = block.compactAttestations;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

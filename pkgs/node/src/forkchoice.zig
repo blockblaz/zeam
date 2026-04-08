@@ -1057,6 +1057,18 @@ pub const ForkChoice = struct {
 
             if (!found_entries) break;
 
+            // Compact: merge proofs sharing the same AttestationData into one
+            // using recursive children aggregation, so each AttestationData
+            // appears at most once.
+            const compacted = try types.compactAttestations(
+                self.allocator,
+                &agg_attestations,
+                &attestation_signatures,
+                &pre_state.validators,
+            );
+            agg_attestations = compacted.attestations;
+            attestation_signatures = compacted.signatures;
+
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
             var candidate_atts = try types.AggregatedAttestations.init(self.allocator);

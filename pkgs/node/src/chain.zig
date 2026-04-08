@@ -895,6 +895,22 @@ pub const BeamChain = struct {
                 return BlockProcessingError.InvalidSignatureGroups;
             }
 
+            // Each unique AttestationData must appear at most once per block.
+            {
+                var att_data_set = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
+                defer att_data_set.deinit();
+                for (aggregated_attestations) |agg_att| {
+                    const result = try att_data_set.getOrPut(agg_att.data);
+                    if (result.found_existing) {
+                        self.logger.err(
+                            "block contains duplicate AttestationData entries for block root=0x{x}",
+                            .{&freshFcBlock.blockRoot},
+                        );
+                        return BlockProcessingError.InvalidSignatureGroups;
+                    }
+                }
+            }
+
             for (aggregated_attestations, 0..) |aggregated_attestation, index| {
                 var validator_indices = try types.aggregationBitsToValidatorIndices(&aggregated_attestation.aggregation_bits, self.allocator);
                 defer validator_indices.deinit(self.allocator);
