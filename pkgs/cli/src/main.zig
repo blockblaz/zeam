@@ -19,7 +19,7 @@ const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const Multiaddr = @import("multiaddr").Multiaddr;
 
 const configs = @import("@zeam/configs");
@@ -280,6 +280,12 @@ fn mainInner() !void {
     const console_log_level = opts.args.console_log_level;
 
     std.debug.print("opts={any} genesis={d}\n", .{ opts.args, genesis });
+
+    // Detect the best available I/O backend (io_uring or epoll on Linux).
+    node_lib.detectBackend() catch |err| {
+        ErrorHandler.logErrorWithOperation(err, "detect I/O backend");
+        return err;
+    };
 
     switch (opts.args.__commands__) {
         .clock => {

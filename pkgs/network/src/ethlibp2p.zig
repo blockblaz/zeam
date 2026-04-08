@@ -4,7 +4,7 @@ const Thread = std.Thread;
 
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const multiformats = @import("multiformats");
 const multiaddr_mod = @import("multiaddr");
 const Multiaddr = multiaddr_mod.Multiaddr;
