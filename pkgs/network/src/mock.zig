@@ -751,6 +751,14 @@ pub const Mock = struct {
     }
 };
 
+/// Detect the best available I/O backend at runtime.
+/// Factored out to avoid duplicating the detection snippet in every test.
+fn detectBackendOrFail() !void {
+    if (@hasDecl(xev, "detect")) {
+        try xev.detect();
+    }
+}
+
 test "Mock messaging across two subscribers" {
     const TestSubscriber = struct {
         calls: u32 = 0,
@@ -774,7 +782,7 @@ test "Mock messaging across two subscribers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
+    try detectBackendOrFail();
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
@@ -955,7 +963,7 @@ test "Mock status RPC between peers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
+    try detectBackendOrFail();
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 

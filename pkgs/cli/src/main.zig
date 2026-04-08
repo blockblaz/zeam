@@ -282,7 +282,10 @@ fn mainInner() !void {
     std.debug.print("opts={any} genesis={d}\n", .{ opts.args, genesis });
 
     // Detect the best available I/O backend (io_uring or epoll on Linux).
-    node_lib.detectBackend();
+    node_lib.detectBackend() catch |err| {
+        ErrorHandler.logErrorWithOperation(err, "detect I/O backend");
+        return err;
+    };
 
     switch (opts.args.__commands__) {
         .clock => {

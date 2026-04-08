@@ -8,9 +8,9 @@ const types = @import("@zeam/types");
 /// Detect the best available I/O backend at runtime.
 /// On Linux this probes io_uring, falling back to epoll (needed for Shadow).
 /// On single-backend platforms (macOS/kqueue) this is a no-op.
-pub fn detectBackend() void {
+pub fn detectBackend() !void {
     if (@hasDecl(xev, "detect")) {
-        xev.detect() catch @panic("no available xev backend");
+        try xev.detect();
     }
 }
 

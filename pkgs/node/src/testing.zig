@@ -48,7 +48,10 @@ pub const NodeTestContext = struct {
 
     pub fn init(allocator: Allocator, opts: NodeTestOptions) !NodeTestContext {
         const utils = @import("./utils.zig");
-        utils.detectBackend();
+        utils.detectBackend() catch |err| {
+            std.log.err("failed to detect I/O backend: {s}", .{@errorName(err)});
+            return err;
+        };
 
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
