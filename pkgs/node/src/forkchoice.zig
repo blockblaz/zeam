@@ -1002,6 +1002,9 @@ pub const ForkChoice = struct {
             const found_entries = sorted_entries.items.len > 0;
 
             for (sorted_entries.items) |map_entry| {
+                // Limit the number of distinct AttestationData entries per block (leanSpec #536).
+                if (processed_att_data.count() >= constants.MAX_ATTESTATIONS_DATA) break;
+
                 try processed_att_data.put(map_entry.att_data.*, {});
 
                 const att_data = map_entry.att_data.*;

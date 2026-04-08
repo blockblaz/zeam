@@ -909,6 +909,13 @@ pub const BeamChain = struct {
                         return BlockProcessingError.InvalidSignatureGroups;
                     }
                 }
+                if (att_data_set.count() > constants.MAX_ATTESTATIONS_DATA) {
+                    self.logger.err(
+                        "block contains {d} distinct AttestationData entries (max {d}) for block root=0x{x}",
+                        .{ att_data_set.count(), constants.MAX_ATTESTATIONS_DATA, &freshFcBlock.blockRoot },
+                    );
+                    return BlockProcessingError.InvalidSignatureGroups;
+                }
             }
 
             for (aggregated_attestations, 0..) |aggregated_attestation, index| {
