@@ -14,6 +14,10 @@ const ByteListMiB = xmss.ByteListMiB;
 
 const freeJsonValue = utils.freeJsonValue;
 
+/// Protocol-level log inverse rate parameters for aggregation.
+pub const LOG_INV_RATE_TEST: usize = 1;
+pub const LOG_INV_RATE_PROD: usize = 2;
+
 // Types
 pub const AggregatedSignatureProof = struct {
     participants: attestation.AggregationBits,
@@ -64,20 +68,78 @@ pub const AggregatedSignatureProof = struct {
         return utils.jsonToString(allocator, json_value);
     }
 
+    /// Recursively aggregate child proofs and raw XMSS signatures into a single proof.
+    ///
+    /// - `xmss_participants`: bitfield for validators represented by raw_xmss. null if no raw sigs.
+    /// - `children`: already-aggregated child proofs to include.
+    /// - `children_pub_keys`: per-child arrays of public key handles (parallel with `children`).
+    /// - `raw_xmss_pks`/`raw_xmss_sigs`: raw XMSS public key + signature pairs.
+    /// - Validation: at least 1 raw sig or child required; if no raw sigs, need ≥2 children.
     pub fn aggregate(
-        participants: AggregationBits,
-        public_keys: []*const xmss.HashSigPublicKey,
-        signatures: []*const xmss.HashSigSignature,
+        allocator: Allocator,
+        xmss_participants: ?AggregationBits,
+        children: []const AggregatedSignatureProof,
+        children_pub_keys: []const []*const xmss.HashSigPublicKey,
+        raw_xmss_pks: []*const xmss.HashSigPublicKey,
+        raw_xmss_sigs: []*const xmss.HashSigSignature,
         message_hash: *const [32]u8,
         epoch: u64,
-        aggregated_signature_proof: *Self,
+        result: *Self,
     ) !void {
-        try xmss.aggregateSignatures(public_keys, signatures, message_hash, @intCast(epoch), &aggregated_signature_proof.proof_data);
+        const has_raw = xmss_participants != null;
+        const has_children = children.len > 0;
 
-        // Transfer ownership only after aggregation succeeds
-        aggregated_signature_proof.participants = participants;
+        if (!has_raw and !has_children) return error.AggregationInvalidInput;
+        if (!has_raw and children.len < 2) return error.AggregationInvalidInput;
+
+        // Merge participant bitfields
+        var merged = try attestation.AggregationBits.init(allocator);
+        errdefer merged.deinit();
+
+        // Add gossip participants
+        if (xmss_participants) |gp| {
+            for (0..gp.len()) |i| {
+                if (gp.get(i) catch false) {
+                    try attestation.aggregationBitsSet(&merged, i, true);
+                }
+            }
+        }
+
+        // Add all children participants
+        for (children) |child| {
+            for (0..child.participants.len()) |i| {
+                if (child.participants.get(i) catch false) {
+                    try attestation.aggregationBitsSet(&merged, i, true);
+                }
+            }
+        }
+
+        // Build per-child proof data for FFI
+        const children_proof_data = try allocator.alloc(ByteListMiB, children.len);
+        defer allocator.free(children_proof_data);
+        for (children, 0..) |child, i| {
+            children_proof_data[i] = child.proof_data;
+        }
+
+        // FFI call — passes children proofs + their public keys for true recursive aggregation
+        try xmss.aggregateSignatures(
+            raw_xmss_pks,
+            raw_xmss_sigs,
+            children_pub_keys,
+            children_proof_data,
+            message_hash,
+            @intCast(epoch),
+            LOG_INV_RATE_PROD,
+            &result.proof_data,
+        );
+
+        // Clean up old result data before overwriting
+        result.participants.deinit();
+
+        result.participants = merged;
     }
 
+    /// Verify this aggregated signature proof.
     pub fn verify(self: *const Self, public_keys: []*const xmss.HashSigPublicKey, message_hash: *const [32]u8, epoch: u64) !void {
         try xmss.verifyAggregatedPayload(public_keys, message_hash, @intCast(epoch), &self.proof_data);
     }

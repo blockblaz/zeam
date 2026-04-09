@@ -1,5 +1,7 @@
 const aggregation = @import("./aggregation.zig");
 pub const AggregatedSignatureProof = aggregation.AggregatedSignatureProof;
+pub const LOG_INV_RATE_TEST = aggregation.LOG_INV_RATE_TEST;
+pub const LOG_INV_RATE_PROD = aggregation.LOG_INV_RATE_PROD;
 
 const attestation = @import("./attestation.zig");
 pub const AggregationBits = attestation.AggregationBits;
@@ -19,18 +21,19 @@ pub const BeamBlock = block.BeamBlock;
 pub const ExecutionPayloadHeader = block.ExecutionPayloadHeader;
 pub const BeamBlockHeader = block.BeamBlockHeader;
 pub const BeamBlockBody = block.BeamBlockBody;
-pub const BlockWithAttestation = block.BlockWithAttestation;
-pub const SignedBlockWithAttestation = block.SignedBlockWithAttestation;
+pub const SignedBlock = block.SignedBlock;
 pub const AggregatedAttestations = block.AggregatedAttestations;
+pub const AggregatedAttestationsResult = block.AggregatedAttestationsResult;
 pub const AttestationSignatures = block.AttestationSignatures;
 pub const BlockSignatures = block.BlockSignatures;
 pub const createBlockSignatures = block.createBlockSignatures;
-pub const aggregateInnerMap = block.AggregateInnerMap;
 pub const StoredSignature = block.StoredSignature;
 pub const SignaturesMap = block.SignaturesMap;
+pub const aggregateInnerMap = block.AggregateInnerMap;
 pub const StoredAggregatedPayload = block.StoredAggregatedPayload;
 pub const AggregatedPayloadsList = block.AggregatedPayloadsList;
 pub const AggregatedPayloadsMap = block.AggregatedPayloadsMap;
+pub const compactAttestations = block.compactAttestations;
 
 const state = @import("./state.zig");
 pub const BeamStateConfig = state.BeamStateConfig;

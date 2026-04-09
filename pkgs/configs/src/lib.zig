@@ -66,8 +66,11 @@ const GenesisConfigError = error{
 ///
 /// Required fields:
 /// - `GENESIS_TIME`: integer >= 0
-/// - `GENESIS_VALIDATORS`: list of 52-byte public keys encoded as 104-char hex strings
-///   (legacy configs using `genesis_validators` are still accepted)
+/// - `GENESIS_VALIDATORS`: list of validator entries, each with:
+///   - `attestation_pubkey`: 52-byte public key as 104-char hex string
+///   - `proposal_pubkey`: 52-byte public key as 104-char hex string
+///
+/// This matches the cross-client genesis YAML convention defined by leanSpec.
 ///
 /// Returns `GenesisSpec` with genesis time and validator pubkeys.
 /// Errors: `InvalidYamlShape`, `MissingGenesisTime`, `InvalidGenesisTime`, `MissingValidatorConfig`, `InvalidValidatorPubkeys`.
@@ -89,33 +92,57 @@ pub fn genesisConfigFromYAML(
     };
     if (override_genesis_time) |override| genesis_time = override;
 
-    const pubkeys_node = root.get("GENESIS_VALIDATORS") orelse root.get("genesis_validators") orelse return GenesisConfigError.MissingValidatorConfig;
-    const pubkeys = try parsePubkeysFromYaml(allocator, pubkeys_node);
+    const validators_node = root.get("GENESIS_VALIDATORS") orelse root.get("genesis_validators") orelse return GenesisConfigError.MissingValidatorConfig;
+    const result = try parseValidatorEntriesFromYaml(allocator, validators_node);
+
     return types.GenesisSpec{
         .genesis_time = genesis_time,
-        .validator_pubkeys = pubkeys,
+        .validator_attestation_pubkeys = result.attestation_pubkeys,
+        .validator_proposal_pubkeys = result.proposal_pubkeys,
     };
 }
 
-fn parsePubkeysFromYaml(
+const ValidatorEntries = struct {
+    attestation_pubkeys: []types.Bytes52,
+    proposal_pubkeys: []types.Bytes52,
+};
+
+/// Parses GENESIS_VALIDATORS as a list of structured entries.
+/// Each entry must be a map with `attestation_pubkey` and `proposal_pubkey` fields.
+/// This matches the cross-client genesis YAML convention defined by leanSpec.
+fn parseValidatorEntriesFromYaml(
     allocator: Allocator,
     node: Yaml.Value,
-) ![]types.Bytes52 {
+) !ValidatorEntries {
     if (node != .list) return GenesisConfigError.InvalidValidatorPubkeys;
     const list = node.list;
     if (list.len == 0) return GenesisConfigError.InvalidValidatorPubkeys;
 
-    var pubkeys = try allocator.alloc(types.Bytes52, list.len);
-    errdefer allocator.free(pubkeys);
+    var attestation_pubkeys = try allocator.alloc(types.Bytes52, list.len);
+    errdefer allocator.free(attestation_pubkeys);
+
+    var proposal_pubkeys = try allocator.alloc(types.Bytes52, list.len);
+    errdefer allocator.free(proposal_pubkeys);
 
     for (list, 0..) |item, idx| {
-        // The Zig YAML library has a bug where it parses quoted "0x..." as float
-        // If any item is not a scalar, return an error as the YAML is malformed
-        if (item != .scalar) return GenesisConfigError.InvalidValidatorPubkeys;
-        pubkeys[idx] = try hexToBytes52(item.scalar);
+        if (item != .map) return GenesisConfigError.InvalidValidatorPubkeys;
+        const entry_map = item.map;
+
+        const att_node = entry_map.get("attestation_pubkey") orelse
+            return GenesisConfigError.InvalidValidatorPubkeys;
+        if (att_node != .scalar) return GenesisConfigError.InvalidValidatorPubkeys;
+        attestation_pubkeys[idx] = try hexToBytes52(att_node.scalar);
+
+        const prop_node = entry_map.get("proposal_pubkey") orelse
+            return GenesisConfigError.InvalidValidatorPubkeys;
+        if (prop_node != .scalar) return GenesisConfigError.InvalidValidatorPubkeys;
+        proposal_pubkeys[idx] = try hexToBytes52(prop_node.scalar);
     }
 
-    return pubkeys;
+    return ValidatorEntries{
+        .attestation_pubkeys = attestation_pubkeys,
+        .proposal_pubkeys = proposal_pubkeys,
+    };
 }
 
 fn hexToBytes52(input: []const u8) !types.Bytes52 {
@@ -133,7 +160,7 @@ fn hexToBytes52(input: []const u8) !types.Bytes52 {
     return bytes;
 }
 
-// TODO: Enable and update the this test once the YAML parsing for public keys PR is added
+// TODO: Enable and update this test once the YAML parsing for public keys PR is added
 // test "load genesis config from yaml" {
 //     const yaml_content =
 //         \\# Genesis Settings
@@ -141,8 +168,10 @@ fn hexToBytes52(input: []const u8) !types.Bytes52 {
 //         \\
 //         \\# Validator Settings
 //         \\GENESIS_VALIDATORS:
-//         \\  - "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
-//         \\  - "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334"
+//         \\  - attestation_pubkey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+//         \\    proposal_pubkey: "a00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+//         \\  - attestation_pubkey: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334"
+//         \\    proposal_pubkey: "a102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334"
 //     ;
 //
 //     var yaml: Yaml = .{ .source = yaml_content };
@@ -160,7 +189,7 @@ fn hexToBytes52(input: []const u8) !types.Bytes52 {
 // }
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added (followup PR)
-// JSON parsing for genesis config needs to support validator_pubkeys instead of num_validators
+// JSON parsing for genesis config needs to support validator_attestation_pubkeys instead of num_validators
 // test "custom dev chain" {
 //     const dev_spec =
 //         \\{"preset": "mainnet", "name": "devchain1", "genesis_time": 1244, "num_validators": 4}

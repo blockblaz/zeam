@@ -60,10 +60,10 @@ pub fn apply_raw_block(allocator: Allocator, state: *types.BeamState, block: *ty
 pub fn verifySignatures(
     allocator: Allocator,
     state: *const types.BeamState,
-    signed_block: *const types.SignedBlockWithAttestation,
+    signed_block: *const types.SignedBlock,
     pubkey_cache: ?*xmss.PublicKeyCache,
 ) !void {
-    const attestations = signed_block.message.block.body.attestations.constSlice();
+    const attestations = signed_block.block.body.attestations.constSlice();
     const signature_proofs = signed_block.signature.attestation_signatures.constSlice();
 
     if (attestations.len != signature_proofs.len) {
@@ -116,7 +116,7 @@ pub fn verifySignatures(
                 return StateTransitionError.InvalidValidatorId;
             }
             const validator = &validators[validator_index];
-            const pubkey_bytes = validator.getPubkey();
+            const pubkey_bytes = validator.getAttestationPubkey();
 
             if (pubkey_cache) |cache| {
                 // Use cached public key (deserialize on first access, reuse on subsequent)
@@ -151,15 +151,19 @@ pub fn verifySignatures(
         zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
     }
 
-    // Verify proposer signature (still individual)
-    const proposer_attestation = signed_block.message.proposer_attestation;
-    try verifySingleAttestation(
-        allocator,
-        state,
-        @intCast(proposer_attestation.validator_id),
-        &proposer_attestation.data,
-        &signed_block.signature.proposer_signature,
-    );
+    // Verify proposer signature over hash_tree_root(block) using proposal key
+    const proposer_index: usize = @intCast(signed_block.block.proposer_index);
+    if (proposer_index >= validators.len) {
+        return StateTransitionError.InvalidValidatorId;
+    }
+    const proposer = &validators[proposer_index];
+    const proposal_pubkey = proposer.getProposalPubkey();
+
+    var block_root: [32]u8 = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, allocator);
+
+    const block_epoch: u32 = @intCast(signed_block.block.slot);
+    try xmss.verifySsz(proposal_pubkey, &block_root, block_epoch, &signed_block.signature.proposer_signature);
 }
 
 pub fn verifySingleAttestation(
@@ -176,7 +180,7 @@ pub fn verifySingleAttestation(
     }
 
     const validator = &validators[validatorIndex];
-    const pubkey = validator.getPubkey();
+    const pubkey = validator.getAttestationPubkey();
 
     const verification_timer = zeam_metrics.lean_pq_sig_attestation_verification_time_seconds.start();
     var message: [32]u8 = undefined;

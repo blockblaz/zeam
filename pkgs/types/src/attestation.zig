@@ -204,8 +204,8 @@ test "encode decode signed attestation roundtrip" {
     try std.testing.expect(encoded.items.len > 0);
 
     // Convert to hex and compare with expected value.
-    // Expected value is "0" * 6496 (6496 hex characters = 3248 bytes).
-    const expected_hex_len = 6496;
+    // Expected value is "0" * 5344 (5344 hex characters = 2672 bytes).
+    const expected_hex_len = 5344;
     const expected_value = try std.testing.allocator.alloc(u8, expected_hex_len);
     defer std.testing.allocator.free(expected_value);
     @memset(expected_value, '0');
