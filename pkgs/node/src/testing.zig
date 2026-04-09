@@ -100,6 +100,7 @@ pub const NodeTestContext = struct {
                 .preset = opts.preset,
                 .name = spec_name,
                 .attestation_committee_count = 1,
+                .max_attestations_data = 16,
             },
         };
 
