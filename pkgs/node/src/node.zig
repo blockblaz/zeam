@@ -1471,6 +1471,7 @@ test "Node peer tracking on connect/disconnect" {
             .preset = params.Preset.minimal,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
 
