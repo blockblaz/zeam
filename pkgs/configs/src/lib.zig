@@ -29,6 +29,9 @@ pub const ChainConfig = struct {
                     if (chainOpts.attestation_committee_count == null) {
                         chainOpts.attestation_committee_count = 1;
                     }
+                    if (chainOpts.max_attestations_data == null) {
+                        chainOpts.max_attestations_data = 16;
+                    }
                     const genesis = utils.Cast(types.GenesisSpec, chainOpts);
                     // transfer ownership of any allocated memory in chainOpts to spec
                     const spec = utils.Cast(types.ChainSpec, chainOpts);
