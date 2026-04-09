@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-leansig = { git = "https://github.com/leanEthereum/leanSig.git", branch = "devnet4" }
-leansig_fast_keygen = { git = "https://github.com/TomWambsgans/leanSig.git", branch = "devnet4-fast-keygen" }
+leansig = { git = "https://github.com/leanEthereum/leanSig", branch = "devnet4" }
 sha2 = "0.9"
 rand = "0.10.0"
 thiserror = "2.0.17"

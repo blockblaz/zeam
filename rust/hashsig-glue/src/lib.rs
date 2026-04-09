@@ -1,16 +1,11 @@
 // Production config (default)
 #[cfg(not(feature = "test-config"))]
 mod config {
-    // From leansig (verification + types)
     pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
         PubKeyAbortingTargetSumLifetime32Dim46Base8 as XmssPublicKey,
-        SchemeAbortingTargetSumLifetime32Dim46Base8 as LeanSigScheme,
+        SchemeAbortingTargetSumLifetime32Dim46Base8 as XmssScheme,
+        SecretKeyAbortingTargetSumLifetime32Dim46Base8 as XmssSecretKey,
         SigAbortingTargetSumLifetime32Dim46Base8 as XmssSignature,
-    };
-    // From leansig_fast_keygen (keygen + signing)
-    pub use leansig_fast_keygen::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
-        SchemeAbortingTargetSumLifetime32Dim46Base8 as FastKeyGenScheme,
-        SecretKeyAbortingTargetSumLifetime32Dim46Base8 as FastKeyGenSecretKey,
     };
 }
 
@@ -18,13 +13,10 @@ mod config {
 #[cfg(feature = "test-config")]
 mod config {
     pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
-        SchemeAbortingTargetSumLifetime8Dim46Base8 as LeanSigScheme,
         PubKeyAbortingTargetSumLifetime8Dim46Base8 as XmssPublicKey,
+        SchemeAbortingTargetSumLifetime8Dim46Base8 as XmssScheme,
+        SecretKeyAbortingTargetSumLifetime8Dim46Base8 as XmssSecretKey,
         SigAbortingTargetSumLifetime8Dim46Base8 as XmssSignature,
-    };
-    pub use leansig_fast_keygen::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
-        SchemeAbortingTargetSumLifetime8Dim46Base8 as FastKeyGenScheme,
-        SecretKeyAbortingTargetSumLifetime8Dim46Base8 as FastKeyGenSecretKey,
     };
 }
 
@@ -33,11 +25,6 @@ use config::*;
 use leansig::serialization::Serializable;
 use leansig::signature::SignatureScheme;
 use leansig::MESSAGE_LENGTH;
-
-// Import the fast_keygen traits separately — these are distinct from leansig's traits
-// because the crates are separate forks with identical type layouts.
-use leansig_fast_keygen::serialization::Serializable as FastKeyGenSerializable;
-use leansig_fast_keygen::signature::SignatureScheme as FastKeyGenSignatureScheme;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -49,7 +36,7 @@ use std::slice;
 
 pub type HashSigPublicKey = XmssPublicKey;
 pub type HashSigSignature = XmssSignature;
-pub type HashSigPrivateKey = FastKeyGenSecretKey;
+pub type HashSigPrivateKey = XmssSecretKey;
 
 #[repr(C)]
 pub struct PrivateKey {
@@ -96,9 +83,7 @@ impl PrivateKey {
         num_active_epochs: u32,
     ) -> (PublicKey, Self) {
         let (pk, sk) =
-            FastKeyGenScheme::key_gen(rng, activation_epoch as usize, num_active_epochs as usize);
-        // Transmute fast_keygen PubKey to leansig PubKey (identical layout, different crate types)
-        let pk: HashSigPublicKey = unsafe { std::mem::transmute(pk) };
+            XmssScheme::key_gen(rng, activation_epoch as usize, num_active_epochs as usize);
 
         (PublicKey::new(pk), Self::new(sk))
     }
@@ -108,10 +93,8 @@ impl PrivateKey {
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
     ) -> Result<Signature, SigningError> {
-        let sig = FastKeyGenScheme::sign(&self.inner, epoch, message)
+        let sig = XmssScheme::sign(&self.inner, epoch, message)
             .map_err(|_| SigningError::SigningFailed)?;
-        // Transmute fast_keygen Signature to leansig Signature (identical layout)
-        let sig: HashSigSignature = unsafe { std::mem::transmute(sig) };
         Ok(Signature::new(sig))
     }
 }
@@ -133,7 +116,7 @@ impl Signature {
         public_key: &PublicKey,
         epoch: u32,
     ) -> bool {
-        LeanSigScheme::verify(&public_key.inner, epoch, message, &self.inner)
+        XmssScheme::verify(&public_key.inner, epoch, message, &self.inner)
     }
 }
 
@@ -155,11 +138,11 @@ fn xmss_signature_to_ssz(sig: &HashSigSignature) -> Vec<u8> {
     sig.to_bytes()
 }
 
-fn fast_keygen_secret_key_from_ssz(bytes: &[u8]) -> Result<HashSigPrivateKey, ()> {
+fn xmss_secret_key_from_ssz(bytes: &[u8]) -> Result<HashSigPrivateKey, ()> {
     HashSigPrivateKey::from_bytes(bytes).map_err(|_| ())
 }
 
-fn fast_keygen_secret_key_to_ssz(sk: &HashSigPrivateKey) -> Vec<u8> {
+fn xmss_secret_key_to_ssz(sk: &HashSigPrivateKey) -> Vec<u8> {
     sk.to_bytes()
 }
 
@@ -215,7 +198,7 @@ pub unsafe extern "C" fn hashsig_keypair_from_ssz(
         let sk_slice = slice::from_raw_parts(private_key_ptr, private_key_len);
         let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
 
-        let private_key: HashSigPrivateKey = match fast_keygen_secret_key_from_ssz(sk_slice) {
+        let private_key: HashSigPrivateKey = match xmss_secret_key_from_ssz(sk_slice) {
             Ok(key) => key,
             Err(_) => {
                 return ptr::null_mut();
@@ -513,7 +496,7 @@ pub unsafe extern "C" fn hashsig_private_key_to_bytes(
     unsafe {
         let private_key_ref = &*private_key;
 
-        let sk_bytes = fast_keygen_secret_key_to_ssz(&private_key_ref.inner);
+        let sk_bytes = xmss_secret_key_to_ssz(&private_key_ref.inner);
 
         if sk_bytes.len() > buffer_len {
             return 0;
@@ -562,7 +545,7 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
             Err(_) => return -1,
         };
 
-        let is_valid = LeanSigScheme::verify(&pk, epoch, message_array, &sig);
+        let is_valid = XmssScheme::verify(&pk, epoch, message_array, &sig);
 
         if is_valid {
             1
