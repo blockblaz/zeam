@@ -322,7 +322,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(
-            types.SignedBlockWithAttestation,
+            types.SignedBlock,
             "block",
             uncompressed_message,
             zigHandler.allocator,
@@ -356,7 +356,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
     switch (message) {
         .block => |signed_block| {
-            const block = signed_block.message.block;
+            const block = signed_block.block;
             zigHandler.logger.debug(
                 "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{

@@ -335,7 +335,7 @@ fn mainInner() !void {
             defer allocator.free(output);
             // block 0 is genesis so we have to apply block 1 onwards
             for (mock_chain.blocks[1..]) |signed_block| {
-                const block = signed_block.message.block;
+                const block = signed_block.block;
                 std.debug.print("\nprestate slot blockslot={d} stateslot={d}\n", .{ block.slot, beam_state.slot });
                 var proof = state_proving_manager.prove_transition(beam_state, block, options, allocator, output[0..]) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "generate proof", .{ .slot = block.slot });
@@ -414,12 +414,16 @@ fn mainInner() !void {
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager
-            const pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
+            const all_pubkeys = try key_manager.getAllPubkeys(allocator, num_validators);
             var owns_pubkeys = true;
-            defer if (owns_pubkeys) allocator.free(pubkeys);
+            defer if (owns_pubkeys) {
+                allocator.free(all_pubkeys.attestation_pubkeys);
+                allocator.free(all_pubkeys.proposal_pubkeys);
+            };
 
-            // Set validator_pubkeys in chain_options
-            chain_options.validator_pubkeys = pubkeys;
+            // Set validator pubkeys in chain_options
+            chain_options.validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys;
+            chain_options.validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys;
             owns_pubkeys = false; // ownership moved into genesis spec
 
             const time_now_ms: usize = @intCast(std.time.milliTimestamp());
