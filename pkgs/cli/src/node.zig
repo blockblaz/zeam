@@ -783,12 +783,12 @@ fn verifyCheckpointState(
         const actual_att_pubkey = state_validators[i].attestation_pubkey;
         if (!std.mem.eql(u8, &expected_att_pubkey, &actual_att_pubkey)) {
             logger.err("checkpoint state verification failed: attestation pubkey mismatch at index {d}", .{i});
-            return error.ValidatorPubkeyMismatch;
+            return error.ValidatorAttestationPubkeyMismatch;
         }
         const actual_prop_pubkey = state_validators[i].proposal_pubkey;
         if (!std.mem.eql(u8, &expected_prop_pubkey, &actual_prop_pubkey)) {
             logger.err("checkpoint state verification failed: proposal pubkey mismatch at index {d}", .{i});
-            return error.ValidatorPubkeyMismatch;
+            return error.ValidatorProposalPubkeyMismatch;
         }
     }
 

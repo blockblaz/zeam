@@ -737,19 +737,19 @@ test "ssz seralize/deserialize signed beam state" {
 }
 
 fn makeGenesisState(allocator: Allocator, validator_count: usize) !BeamState {
-    const pubkeys = try allocator.alloc(utils.Bytes52, validator_count);
-    defer allocator.free(pubkeys);
+    const attestation_pubkeys = try allocator.alloc(utils.Bytes52, validator_count);
+    defer allocator.free(attestation_pubkeys);
     const proposal_pubkeys = try allocator.alloc(utils.Bytes52, validator_count);
     defer allocator.free(proposal_pubkeys);
-    for (pubkeys, proposal_pubkeys, 0..) |*pk, *ppk, i| {
-        @memset(pk, @intCast(i + 1));
+    for (attestation_pubkeys, proposal_pubkeys, 0..) |*apk, *ppk, i| {
+        @memset(apk, @intCast(i + 1));
         @memset(ppk, @intCast(i + 1));
     }
 
     var state: BeamState = undefined;
     try state.genGenesisState(allocator, .{
         .genesis_time = 0,
-        .validator_attestation_pubkeys = pubkeys,
+        .validator_attestation_pubkeys = attestation_pubkeys,
         .validator_proposal_pubkeys = proposal_pubkeys,
     });
     return state;

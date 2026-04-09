@@ -237,3 +237,144 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     result = verifyAggregatedPayload(&public_keys, &message_hash, wrong_epoch, &multisig_aggregated_signature);
     try std.testing.expectError(AggregationError.InvalidAggregateSignature, result);
 }
+
+test "aggregateSignatures recursively aggregates child payloads and verifies with combined public keys" {
+    const allocator = std.testing.allocator;
+    const message_hash = [_]u8{7} ** 32;
+    const epoch: u32 = 3;
+
+    // Build two independent child proofs (each child has one raw signer).
+    var child1_kp = try hashsig.KeyPair.generate(allocator, "child1_keypair", 0, 10);
+    defer child1_kp.deinit();
+    var child1_sig = try child1_kp.sign(&message_hash, epoch);
+    defer child1_sig.deinit();
+
+    var child2_kp = try hashsig.KeyPair.generate(allocator, "child2_keypair", 0, 10);
+    defer child2_kp.deinit();
+    var child2_sig = try child2_kp.sign(&message_hash, epoch);
+    defer child2_sig.deinit();
+
+    var child1_proof = try ByteListMiB.init(allocator);
+    defer child1_proof.deinit();
+    var child2_proof = try ByteListMiB.init(allocator);
+    defer child2_proof.deinit();
+
+    var child1_pks = [_]*const hashsig.HashSigPublicKey{child1_kp.public_key};
+    var child1_sigs = [_]*const hashsig.HashSigSignature{child1_sig.handle};
+    const no_children_pks: [][]*const hashsig.HashSigPublicKey = &.{};
+    const no_children_proofs: []const ByteListMiB = &.{};
+    try aggregateSignatures(&child1_pks, &child1_sigs, no_children_pks, no_children_proofs, &message_hash, epoch, 2, &child1_proof);
+
+    var child2_pks = [_]*const hashsig.HashSigPublicKey{child2_kp.public_key};
+    var child2_sigs = [_]*const hashsig.HashSigSignature{child2_sig.handle};
+    try aggregateSignatures(&child2_pks, &child2_sigs, no_children_pks, no_children_proofs, &message_hash, epoch, 2, &child2_proof);
+
+    // Parent proof aggregates children only (no direct raw signatures).
+    var parent_proof = try ByteListMiB.init(allocator);
+    defer parent_proof.deinit();
+    const parent_raw_pks: []*const hashsig.HashSigPublicKey = &.{};
+    const parent_raw_sigs: []*const hashsig.HashSigSignature = &.{};
+    var children_pub_keys = [_][]*const hashsig.HashSigPublicKey{
+        &child1_pks,
+        &child2_pks,
+    };
+    const children_proofs = [_]ByteListMiB{ child1_proof, child2_proof };
+    try aggregateSignatures(
+        parent_raw_pks,
+        parent_raw_sigs,
+        &children_pub_keys,
+        &children_proofs,
+        &message_hash,
+        epoch,
+        2,
+        &parent_proof,
+    );
+
+    var combined_public_keys = [_]*const hashsig.HashSigPublicKey{
+        child1_kp.public_key,
+        child2_kp.public_key,
+    };
+    try verifyAggregatedPayload(&combined_public_keys, &message_hash, epoch, &parent_proof);
+}
+
+test "aggregateSignatures returns AggregationFailed when child payload arrays are mismatched" {
+    const message_hash = [_]u8{1} ** 32;
+    var output = try ByteListMiB.init(std.testing.allocator);
+    defer output.deinit();
+
+    const raw_pks: []*const hashsig.HashSigPublicKey = &.{};
+    const raw_sigs: []*const hashsig.HashSigSignature = &.{};
+    const empty_child_pks = [_][]*const hashsig.HashSigPublicKey{};
+    var one_child_proof = try ByteListMiB.init(std.testing.allocator);
+    defer one_child_proof.deinit();
+    const one_child_proofs = [_]ByteListMiB{one_child_proof};
+
+    const result = aggregateSignatures(
+        raw_pks,
+        raw_sigs,
+        &empty_child_pks,
+        &one_child_proofs,
+        &message_hash,
+        0,
+        2,
+        &output,
+    );
+    try std.testing.expectError(AggregationError.AggregationFailed, result);
+}
+
+test "verifyAggregatedPayload fails for recursively aggregated payload with missing child key" {
+    const allocator = std.testing.allocator;
+    const message_hash = [_]u8{11} ** 32;
+    const epoch: u32 = 5;
+
+    var child1_kp = try hashsig.KeyPair.generate(allocator, "verify_child1_keypair", 0, 10);
+    defer child1_kp.deinit();
+    var child1_sig = try child1_kp.sign(&message_hash, epoch);
+    defer child1_sig.deinit();
+
+    var child2_kp = try hashsig.KeyPair.generate(allocator, "verify_child2_keypair", 0, 10);
+    defer child2_kp.deinit();
+    var child2_sig = try child2_kp.sign(&message_hash, epoch);
+    defer child2_sig.deinit();
+
+    var child1_proof = try ByteListMiB.init(allocator);
+    defer child1_proof.deinit();
+    var child2_proof = try ByteListMiB.init(allocator);
+    defer child2_proof.deinit();
+
+    var child1_pks = [_]*const hashsig.HashSigPublicKey{child1_kp.public_key};
+    var child1_sigs = [_]*const hashsig.HashSigSignature{child1_sig.handle};
+    const no_children_pks: [][]*const hashsig.HashSigPublicKey = &.{};
+    const no_children_proofs: []const ByteListMiB = &.{};
+    try aggregateSignatures(&child1_pks, &child1_sigs, no_children_pks, no_children_proofs, &message_hash, epoch, 2, &child1_proof);
+
+    var child2_pks = [_]*const hashsig.HashSigPublicKey{child2_kp.public_key};
+    var child2_sigs = [_]*const hashsig.HashSigSignature{child2_sig.handle};
+    try aggregateSignatures(&child2_pks, &child2_sigs, no_children_pks, no_children_proofs, &message_hash, epoch, 2, &child2_proof);
+
+    var parent_proof = try ByteListMiB.init(allocator);
+    defer parent_proof.deinit();
+    const parent_raw_pks: []*const hashsig.HashSigPublicKey = &.{};
+    const parent_raw_sigs: []*const hashsig.HashSigSignature = &.{};
+    var children_pub_keys = [_][]*const hashsig.HashSigPublicKey{
+        &child1_pks,
+        &child2_pks,
+    };
+    const children_proofs = [_]ByteListMiB{ child1_proof, child2_proof };
+    try aggregateSignatures(
+        parent_raw_pks,
+        parent_raw_sigs,
+        &children_pub_keys,
+        &children_proofs,
+        &message_hash,
+        epoch,
+        2,
+        &parent_proof,
+    );
+
+    var incomplete_public_keys = [_]*const hashsig.HashSigPublicKey{
+        child1_kp.public_key,
+    };
+    const result = verifyAggregatedPayload(&incomplete_public_keys, &message_hash, epoch, &parent_proof);
+    try std.testing.expectError(AggregationError.InvalidAggregateSignature, result);
+}

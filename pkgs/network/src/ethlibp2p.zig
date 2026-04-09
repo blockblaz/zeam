@@ -309,7 +309,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
 
-    const uncompressed_message = snappyz.decode(zigHandler.allocator, message_bytes) catch |e| {
+    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
         if (writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) |filename| {
             zigHandler.logger.err("Snappyz decode failed - debug file created: {s}", .{filename});
@@ -319,14 +319,6 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
-
-    if (uncompressed_message.len > MAX_RPC_MESSAGE_SIZE) {
-        zigHandler.logger.err(
-            "Gossip message decompressed size {d} exceeds limit {d} for topic={s}",
-            .{ uncompressed_message.len, MAX_RPC_MESSAGE_SIZE, std.mem.span(topic_str) },
-        );
-        return;
-    }
 
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(

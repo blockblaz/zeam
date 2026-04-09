@@ -906,7 +906,7 @@ pub const BeamChain = struct {
                             "block contains duplicate AttestationData entries for block root=0x{x}",
                             .{&freshFcBlock.blockRoot},
                         );
-                        return BlockProcessingError.InvalidSignatureGroups;
+                        return BlockProcessingError.DuplicateAttestationData;
                     }
                 }
                 if (att_data_set.count() > constants.MAX_ATTESTATIONS_DATA) {
@@ -914,7 +914,7 @@ pub const BeamChain = struct {
                         "block contains {d} distinct AttestationData entries (max {d}) for block root=0x{x}",
                         .{ att_data_set.count(), constants.MAX_ATTESTATIONS_DATA, &freshFcBlock.blockRoot },
                     );
-                    return BlockProcessingError.InvalidSignatureGroups;
+                    return BlockProcessingError.TooManyAttestationData;
                 }
             }
 
@@ -1691,6 +1691,8 @@ pub const BeamChain = struct {
 pub const BlockProcessingError = error{
     MissingPreState,
     InvalidSignatureGroups,
+    DuplicateAttestationData,
+    TooManyAttestationData,
 };
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
