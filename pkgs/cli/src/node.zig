@@ -512,31 +512,77 @@ pub const Node = struct {
 
         const hash_sig_key_dir = self.options.hash_sig_key_dir;
 
+        // First pass: group assignments by validator index, routing by filename.
+        // If the filename contains "attester" it goes to att_base; "proposer" to prop_base.
+        // A filename with neither is treated as a single key used for both roles.
+        // Slices point into validator_assignments memory which outlives this function.
+        const FileSlots = struct {
+            att_base: ?[]const u8 = null,
+            prop_base: ?[]const u8 = null,
+        };
+        var file_map = std.AutoHashMap(usize, FileSlots).init(self.allocator);
+        defer file_map.deinit();
+
         for (self.options.validator_assignments) |assignment| {
             if (assignment.index >= num_validators) {
                 return error.HashSigValidatorIndexOutOfRange;
             }
-
             const privkey_file = assignment.privkey_file;
-
             if (!std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
                 return error.InvalidPrivkeyFileFormat;
             }
-
             const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, base });
-            defer self.allocator.free(sk_path);
-            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
-            defer self.allocator.free(pk_path);
+            const slots = try file_map.getOrPutValue(assignment.index, .{});
+            if (std.mem.indexOf(u8, privkey_file, "attester") != null) {
+                slots.value_ptr.att_base = base;
+            } else if (std.mem.indexOf(u8, privkey_file, "proposer") != null) {
+                slots.value_ptr.prop_base = base;
+            } else {
+                // Single-key format: same file for both roles.
+                slots.value_ptr.att_base = base;
+                slots.value_ptr.prop_base = base;
+            }
+        }
 
-            var validator_keys = key_manager_lib.loadValidatorKeysFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+        // Second pass: load each keypair from disk and register with the key manager.
+        // If only one role's file was provided, fall back to using it for both roles.
+        var map_it = file_map.iterator();
+        while (map_it.next()) |entry| {
+            const index = entry.key_ptr.*;
+            const slots = entry.value_ptr.*;
+
+            const att_base = slots.att_base orelse slots.prop_base orelse return error.HashSigSecretKeyMissing;
+            const prop_base = slots.prop_base orelse slots.att_base orelse return error.HashSigSecretKeyMissing;
+
+            const att_sk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, att_base });
+            defer self.allocator.free(att_sk);
+            const att_pk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, att_base });
+            defer self.allocator.free(att_pk);
+
+            var att_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, att_sk, att_pk) catch |err| switch (err) {
                 error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
                 error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            errdefer validator_keys.deinit();
+            errdefer att_keypair.deinit();
 
-            try self.key_manager.addKeypair(assignment.index, validator_keys);
+            const prop_sk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, prop_base });
+            defer self.allocator.free(prop_sk);
+            const prop_pk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, prop_base });
+            defer self.allocator.free(prop_pk);
+
+            var prop_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, prop_sk, prop_pk) catch |err| switch (err) {
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            errdefer prop_keypair.deinit();
+
+            const validator_keys = key_manager_lib.ValidatorKeys{
+                .attestation_keypair = att_keypair,
+                .proposal_keypair = prop_keypair,
+            };
+            try self.key_manager.addKeypair(index, validator_keys);
         }
     }
 };
