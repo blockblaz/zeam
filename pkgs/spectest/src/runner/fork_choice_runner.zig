@@ -420,10 +420,12 @@ fn runStep(
             break :blk processBlockStep(ctx, json_ctx.fixture_label, json_ctx.case_name, step_index, step_obj);
         } else if (std.mem.eql(u8, step_type, "tick")) {
             break :blk processTickStep(ctx, json_ctx.fixture_label, json_ctx.case_name, step_index, step_obj);
-        } else if (std.mem.eql(u8, step_type, "attestation")) {
+        } else if (std.mem.eql(u8, step_type, "attestation") or
+            std.mem.eql(u8, step_type, "gossipAggregatedAttestation"))
+        {
             std.debug.print(
-                "fixture {s} case {s}{f}: attestation steps unsupported\n",
-                .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep() },
+                "fixture {s} case {s}{f}: {s} steps unsupported\n",
+                .{ json_ctx.fixture_label, json_ctx.case_name, json_ctx.formatStep(), step_type },
             );
             return FixtureError.UnsupportedFixture;
         } else {
