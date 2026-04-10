@@ -906,15 +906,15 @@ pub const BeamChain = struct {
                             "block contains duplicate AttestationData entries for block root=0x{x}",
                             .{&freshFcBlock.blockRoot},
                         );
-                        return BlockProcessingError.InvalidSignatureGroups;
+                        return BlockProcessingError.DuplicateAttestationData;
                     }
                 }
-                if (att_data_set.count() > constants.MAX_ATTESTATIONS_DATA) {
+                if (att_data_set.count() > self.config.spec.max_attestations_data) {
                     self.logger.err(
                         "block contains {d} distinct AttestationData entries (max {d}) for block root=0x{x}",
-                        .{ att_data_set.count(), constants.MAX_ATTESTATIONS_DATA, &freshFcBlock.blockRoot },
+                        .{ att_data_set.count(), self.config.spec.max_attestations_data, &freshFcBlock.blockRoot },
                     );
-                    return BlockProcessingError.InvalidSignatureGroups;
+                    return BlockProcessingError.TooManyAttestationData;
                 }
             }
 
@@ -1691,6 +1691,8 @@ pub const BeamChain = struct {
 pub const BlockProcessingError = error{
     MissingPreState,
     InvalidSignatureGroups,
+    DuplicateAttestationData,
+    TooManyAttestationData,
 };
 const BlockProductionError = error{ NotImplemented, MissingPreState };
 const AttestationValidationError = error{
@@ -1733,6 +1735,7 @@ test "process and add mock blocks into a node's chain" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -1819,6 +1822,7 @@ test "printSlot output demonstration" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -1893,6 +1897,7 @@ test "buildTreeVisualization integration test" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -1979,6 +1984,7 @@ test "attestation validation - comprehensive" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2254,6 +2260,7 @@ test "attestation validation - gossip vs block future slot handling" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2353,6 +2360,7 @@ test "attestation processing - valid block attestation" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2453,6 +2461,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
