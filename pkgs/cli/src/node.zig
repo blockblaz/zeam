@@ -90,6 +90,7 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
+    max_attestations_data: ?u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -189,6 +190,12 @@ pub const Node = struct {
         // ChainConfig.init falls back to 1 when this field is null, so we only override when set.
         if (options.attestation_committee_count) |count| {
             chain_options.attestation_committee_count = @intCast(count);
+        }
+
+        // Apply max_attestations_data if provided via config.yaml.
+        // ChainConfig.init falls back to 16 (leanSpec default) when this field is null.
+        if (options.max_attestations_data) |max| {
+            chain_options.max_attestations_data = max;
         }
 
         // transfer ownership of the chain_options to ChainConfig
@@ -547,6 +554,19 @@ fn attestationCommitteeCountFromYAML(config: Yaml) ?u64 {
     };
 }
 
+/// Reads MAX_ATTESTATIONS_DATA from a parsed config.yaml Yaml document.
+/// Returns null if the field is absent or cannot be parsed.
+fn maxAttestationsDataFromYAML(config: Yaml) ?u8 {
+    if (config.docs.items.len == 0) return null;
+    const root = config.docs.items[0];
+    if (root != .map) return null;
+    const value = root.map.get("MAX_ATTESTATIONS_DATA") orelse return null;
+    return switch (value) {
+        .scalar => |s| std.fmt.parseInt(u8, s, 10) catch null,
+        else => null,
+    };
+}
+
 /// Builds the start options for a node based on the provided command and options.
 /// It loads the necessary configuration files, parses them, and populates the
 /// `StartNodeOptions` structure.
@@ -681,6 +701,9 @@ pub fn buildStartOptions(
             opts.attestation_committee_count = 1;
         }
     }
+
+    // Resolve max_attestations_data from config.yaml (no CLI flag; defaults to 16 in ChainConfig).
+    opts.max_attestations_data = maxAttestationsDataFromYAML(parsed_config);
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it

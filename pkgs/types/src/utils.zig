@@ -188,6 +188,7 @@ pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
     attestation_committee_count: SubnetId,
+    max_attestations_data: u8,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -198,6 +199,7 @@ pub const ChainSpec = struct {
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
         try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
+        try obj.put("max_attestations_data", json.Value{ .integer = self.max_attestations_data });
         return json.Value{ .object = obj };
     }
 

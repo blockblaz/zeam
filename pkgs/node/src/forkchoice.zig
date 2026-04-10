@@ -1003,7 +1003,7 @@ pub const ForkChoice = struct {
 
             for (sorted_entries.items) |map_entry| {
                 // Limit the number of distinct AttestationData entries per block (leanSpec #536).
-                if (processed_att_data.count() >= constants.MAX_ATTESTATIONS_DATA) break;
+                if (processed_att_data.count() >= self.config.spec.max_attestations_data) break;
 
                 try processed_att_data.put(map_entry.att_data.*, {});
 
@@ -1939,6 +1939,7 @@ test "forkchoice block tree" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
     var beam_state = mock_chain.genesis_state;
@@ -2011,6 +2012,7 @@ test "aggregate prunes attestation signatures" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
 
@@ -2161,6 +2163,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
 
@@ -2530,6 +2533,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
 
@@ -3511,6 +3515,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
             .preset = params.Preset.mainnet,
             .name = spec_name,
             .attestation_committee_count = 1,
+            .max_attestations_data = 16,
         },
     };
 

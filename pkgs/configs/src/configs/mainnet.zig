@@ -5,4 +5,5 @@ pub const mainnet = types.ChainSpec{
     .preset = types.Preset.mainnet,
     .name = "mainnet",
     .attestation_committee_count = 1,
+    .max_attestations_data = 16,
 };
