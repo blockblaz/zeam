@@ -1360,7 +1360,11 @@ pub const ForkChoice = struct {
                 }
             }
         } else {
-            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic)) {
+            // leanSpec allows attestations up to 1 slot in the future:
+            //   assert data.slot <= current_slot + Slot(1)
+            // In production, chain.validateAttestationData enforces the stricter gossip
+            // check (data.slot <= current_slot) upstream.
+            if (attestation_slot > self.fcStore.slot_clock.timeSlots.load(.monotonic) + 1) {
                 return ForkChoiceError.InvalidFutureAttestation;
             }
             // just update latest new attested head of the validator

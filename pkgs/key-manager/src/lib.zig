@@ -6,8 +6,7 @@ const zeam_metrics = @import("@zeam/metrics");
 const Allocator = std.mem.Allocator;
 
 const KeyManagerError = error{
-    AttestationKeyNotFound,
-    ProposalKeyNotFound,
+    ValidatorKeyNotFound,
 };
 
 pub const ValidatorKeys = struct {
@@ -149,7 +148,7 @@ pub const KeyManager = struct {
         validator_index: usize,
         buffer: []u8,
     ) !usize {
-        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.AttestationKeyNotFound;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
         return try validator_keys.attestation_keypair.pubkeyToBytes(buffer);
     }
 
@@ -158,7 +157,7 @@ pub const KeyManager = struct {
         validator_index: usize,
         buffer: []u8,
     ) !usize {
-        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ProposalKeyNotFound;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
         return try validator_keys.proposal_keypair.pubkeyToBytes(buffer);
     }
 
@@ -192,7 +191,7 @@ pub const KeyManager = struct {
         self: *const Self,
         validator_index: usize,
     ) !*const xmss.HashSigPublicKey {
-        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.AttestationKeyNotFound;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
         return validator_keys.attestation_keypair.public_key;
     }
 
@@ -206,7 +205,7 @@ pub const KeyManager = struct {
         zeam_metrics.metrics.lean_pq_sig_attestation_signatures_total.incr();
 
         const validator_index: usize = @intCast(attestation.validator_id);
-        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.AttestationKeyNotFound;
+        const validator_keys = self.keys.get(validator_index) orelse return KeyManagerError.ValidatorKeyNotFound;
 
         const signing_timer = zeam_metrics.lean_pq_sig_attestation_signing_time_seconds.start();
         var message: [32]u8 = undefined;
@@ -225,7 +224,7 @@ pub const KeyManager = struct {
         block_root: *const [32]u8,
         slot: u32,
     ) !types.SIGBYTES {
-        const validator_keys = self.keys.get(proposer_index) orelse return KeyManagerError.ProposalKeyNotFound;
+        const validator_keys = self.keys.get(proposer_index) orelse return KeyManagerError.ValidatorKeyNotFound;
         var signature = try validator_keys.proposal_keypair.sign(block_root, slot);
         defer signature.deinit();
         var sig_buffer: types.SIGBYTES = undefined;
