@@ -111,14 +111,10 @@ pub fn compTimeLog(comptime scope: LoggerScope, activeLevel: std.log.Level, comp
                 ) catch return;
             }
 
-            var file_write_buf: [4096]u8 = undefined;
-            var file_writer = fileLogParams.?.file.writer(&file_write_buf);
-            nosuspend file_writer.interface.writeAll(print_str) catch |err| {
+            // Use unbuffered write; buffered writers created per-call cause corruption
+            fileLogParams.?.file.writeAll(print_str) catch |err| {
                 std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to write to log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
                 return;
-            };
-            nosuspend file_writer.interface.flush() catch |err| {
-                std.debug.print("{s}{s}{s} {s}[ERROR]{s} {s}{s}{s}Failed to flush log file: {any}\n", .{ timestamp_color, timestamp_str, reset_color, Colors.err, reset_color, scope_color, scope_prefix, reset_color, err });
             };
         }
     }
