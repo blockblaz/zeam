@@ -514,7 +514,7 @@ pub const Node = struct {
 
         // First pass: group assignments by validator index, routing by filename.
         // If the filename contains "attester" it goes to att_base; "proposer" to prop_base.
-        // A filename with neither is treated as a single key used for both roles.
+        // A filename with neither is rejected with error.InvalidPrivkeyFileFormat.
         // Slices point into validator_assignments memory which outlives this function.
         const FileSlots = struct {
             att_base: ?[]const u8 = null,
@@ -538,9 +538,9 @@ pub const Node = struct {
             } else if (std.mem.indexOf(u8, privkey_file, "proposer") != null) {
                 slots.value_ptr.prop_base = base;
             } else {
-                // Single-key format: same file for both roles.
-                slots.value_ptr.att_base = base;
-                slots.value_ptr.prop_base = base;
+                // Filename must contain "attester" or "proposer" to unambiguously
+                // assign the key to a role. A file with neither is an error.
+                return error.InvalidPrivkeyFileFormat;
             }
         }
 
