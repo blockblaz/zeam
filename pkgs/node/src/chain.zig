@@ -858,25 +858,78 @@ pub const BeamChain = struct {
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
 
-            // 2. verify XMSS signatures — parallel task A (issue #719)
-            //    Currently sequential; TODO: dispatch to a spawned thread concurrently with task B below.
-            //    Inputs:  pre_state (read-only), signedBlock (read-only), public_key_cache (read-only)
-            //    Output:  error | void
-            //    Barrier: both tasks A and B must succeed before forkchoice import proceeds.
-            // Use public key cache to avoid repeated SSZ deserialization of validator public keys
-            try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            // 2+3. verify XMSS signatures (task A) and apply state transition (task B) in parallel (issue #719)
 
-            // 3. apply state transition — parallel task B (issue #719)
-            //    Currently sequential (runs after task A); TODO: dispatch concurrently with task A above.
-            //    Inputs:  pre_state (read-only clone → cpost_state), block (read-only)
-            //    Output:  error | cpost_state mutated in place
-            //    Barrier: forkchoice import is gated on tasks A + B both completing successfully.
-            //    Note: STF runs with validSignatures=true; actual sig verification is task A's responsibility.
-            try stf.apply_transition(self.allocator, cpost_state, block, .{
-                .logger = self.stf_logger,
-                .validSignatures = true,
-                .rootToSlotCache = &self.root_to_slot_cache,
-            });
+            // Wrap allocator in thread-safe adapter so both threads can allocate concurrently.
+            var ts_alloc = std.heap.ThreadSafeAllocator{ .child_allocator = self.allocator };
+            const thread_alloc = ts_alloc.allocator();
+
+            // Task A: verify XMSS signatures
+            const SigVerifyTask = struct {
+                allocator: Allocator,
+                pre_state: *const types.BeamState,
+                signed_block: *const types.SignedBlock,
+                pubkey_cache: *xmss.PublicKeyCache,
+                err: ?anyerror = null,
+
+                fn run(task: *@This()) void {
+                    stf.verifySignatures(task.allocator, task.pre_state, task.signed_block, task.pubkey_cache) catch |e| {
+                        task.err = e;
+                    };
+                }
+            };
+            var sig_task = SigVerifyTask{
+                .allocator = thread_alloc,
+                .pre_state = pre_state,
+                .signed_block = &signedBlock,
+                .pubkey_cache = &self.public_key_cache,
+            };
+
+            // Task B: apply state transition
+            const StfTask = struct {
+                allocator: Allocator,
+                post_state: *types.BeamState,
+                block: types.BeamBlock,
+                stf_logger: zeam_utils.ModuleLogger,
+                root_to_slot_cache: *types.RootToSlotCache,
+                err: ?anyerror = null,
+
+                fn run(task: *@This()) void {
+                    stf.apply_transition(task.allocator, task.post_state, task.block, .{
+                        .logger = task.stf_logger,
+                        .validSignatures = true,
+                        .rootToSlotCache = task.root_to_slot_cache,
+                    }) catch |e| {
+                        task.err = e;
+                    };
+                }
+            };
+            var stf_task = StfTask{
+                .allocator = thread_alloc,
+                .post_state = cpost_state,
+                .block = block,
+                .stf_logger = self.stf_logger,
+                .root_to_slot_cache = &self.root_to_slot_cache,
+            };
+
+            // Spawn threads; fall back to inline execution if spawn fails.
+            const sig_thread = std.Thread.spawn(.{}, SigVerifyTask.run, .{&sig_task}) catch null_thread: {
+                SigVerifyTask.run(&sig_task);
+                break :null_thread null;
+            };
+            const stf_thread = std.Thread.spawn(.{}, StfTask.run, .{&stf_task}) catch null_thread: {
+                StfTask.run(&stf_task);
+                break :null_thread null;
+            };
+
+            // Join successfully spawned threads (barrier).
+            if (sig_thread) |t| t.join();
+            if (stf_thread) |t| t.join();
+
+            // Propagate any errors from parallel tasks.
+            if (sig_task.err) |e| return e;
+            if (stf_task.err) |e| return e;
+
             break :computedstate cpost_state;
         };
         // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
@@ -891,10 +944,6 @@ pub const BeamChain = struct {
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
-
-        // Barrier point (issue #719): tasks A (sig verification) and B (state transition) must both
-        // have completed successfully before reaching forkchoice import below.
-        // Once parallelised, a std.Thread.WaitGroup (or equivalent) will be joined here.
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
