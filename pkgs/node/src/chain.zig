@@ -744,25 +744,16 @@ pub const BeamChain = struct {
                     }
                 };
 
-                if (self.is_aggregator_enabled) {
-                    // Process validated attestation
-                    self.onGossipAttestation(signed_attestation) catch |err| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                        self.logger.err("attestation processing error: {any}", .{err});
-                        return err;
-                    };
-                    self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
-                        slot,
-                        validator_id,
-                        validator_node_name,
-                    });
-                } else {
-                    self.logger.debug("skipping gossip attestation import (not aggregator): subnet={d} slot={d} validator={d}", .{
-                        signed_attestation.subnet_id,
-                        slot,
-                        validator_id,
-                    });
-                }
+                self.onGossipAttestation(signed_attestation) catch |err| {
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                    self.logger.err("attestation processing error: {any}", .{err});
+                    return err;
+                };
+                self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
+                    slot,
+                    validator_id,
+                    validator_node_name,
+                });
                 zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
