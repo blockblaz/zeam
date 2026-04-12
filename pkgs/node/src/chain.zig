@@ -860,9 +860,11 @@ pub const BeamChain = struct {
 
             // 2+3. verify XMSS signatures (task A) and apply state transition (task B) in parallel (issue #719)
 
-            // Wrap allocator in thread-safe adapter so both threads can allocate concurrently.
-            var ts_alloc = std.heap.ThreadSafeAllocator{ .child_allocator = self.allocator };
-            const thread_alloc = ts_alloc.allocator();
+            // Task A gets its own temporary arena so its allocations are freed after it completes,
+            // keeping peak memory equivalent to the sequential baseline (avoids OOM on CI).
+            // Task B uses the chain allocator directly since its output (cpost_state) must outlive the task.
+            var sig_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer sig_arena.deinit();
 
             // Task A: verify XMSS signatures
             const SigVerifyTask = struct {
@@ -879,7 +881,7 @@ pub const BeamChain = struct {
                 }
             };
             var sig_task = SigVerifyTask{
-                .allocator = thread_alloc,
+                .allocator = sig_arena.allocator(),
                 .pre_state = pre_state,
                 .signed_block = &signedBlock,
                 .pubkey_cache = &self.public_key_cache,
@@ -905,7 +907,7 @@ pub const BeamChain = struct {
                 }
             };
             var stf_task = StfTask{
-                .allocator = thread_alloc,
+                .allocator = self.allocator,
                 .post_state = cpost_state,
                 .block = block,
                 .stf_logger = self.stf_logger,
