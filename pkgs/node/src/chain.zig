@@ -817,7 +817,22 @@ pub const BeamChain = struct {
 
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
-    // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
+    // our implemented forkchoice's onblock.
+    //
+    // Parallelization plan (tracked in https://github.com/blockblaz/zeam/issues/719):
+    //
+    //   Phase 1 – Parallel validations (this PR scaffolds; full impl in follow-up):
+    //     a) verifySignatures      — CPU-bound XMSS sig verification, independent of STF
+    //     b) apply_transition      — state transition, independent of sig verification result
+    //     Both are dispatched to spawned threads; forkchoice import is gated on both completing
+    //     successfully.
+    //
+    //   Phase 2 – Parallel post-state compute:
+    //     Independent segments of state computation identified and parallelised.
+    //
+    //   Phase 3 – Execution / proof verification (future):
+    //     Will be parallelised once Phase 1/2 are stable.
+    //
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
         const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
@@ -843,11 +858,20 @@ pub const BeamChain = struct {
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
 
-            // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
+            // 2. verify XMSS signatures — parallel task A (issue #719)
+            //    Currently sequential; TODO: dispatch to a spawned thread concurrently with task B below.
+            //    Inputs:  pre_state (read-only), signedBlock (read-only), public_key_cache (read-only)
+            //    Output:  error | void
+            //    Barrier: both tasks A and B must succeed before forkchoice import proceeds.
             // Use public key cache to avoid repeated SSZ deserialization of validator public keys
             try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
 
-            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
+            // 3. apply state transition — parallel task B (issue #719)
+            //    Currently sequential (runs after task A); TODO: dispatch concurrently with task A above.
+            //    Inputs:  pre_state (read-only clone → cpost_state), block (read-only)
+            //    Output:  error | cpost_state mutated in place
+            //    Barrier: forkchoice import is gated on tasks A + B both completing successfully.
+            //    Note: STF runs with validSignatures=true; actual sig verification is task A's responsibility.
             try stf.apply_transition(self.allocator, cpost_state, block, .{
                 .logger = self.stf_logger,
                 .validSignatures = true,
@@ -867,6 +891,10 @@ pub const BeamChain = struct {
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
+
+        // Barrier point (issue #719): tasks A (sig verification) and B (state transition) must both
+        // have completed successfully before reaching forkchoice import below.
+        // Once parallelised, a std.Thread.WaitGroup (or equivalent) will be joined here.
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
