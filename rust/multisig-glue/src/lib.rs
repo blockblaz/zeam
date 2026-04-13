@@ -5,7 +5,6 @@ use rec_aggregation::{
 };
 use std::slice;
 
-
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
 #[repr(C)]
@@ -44,7 +43,11 @@ pub extern "C" fn xmss_setup_prover() -> i32 {
         })
         .is_ok()
     });
-    if *ready { 0 } else { -1 }
+    if *ready {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Initialize the verifier (idempotent - only runs once).
@@ -59,7 +62,11 @@ pub extern "C" fn xmss_setup_verifier() -> i32 {
         })
         .is_ok()
     });
-    if *ready { 0 } else { -1 }
+    if *ready {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Aggregate signatures with recursive child proof support.
