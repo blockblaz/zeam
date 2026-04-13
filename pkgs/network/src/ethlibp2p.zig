@@ -236,16 +236,20 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
     return ctx.finished;
 }
 
-/// Writes failed deserialization bytes to disk for debugging purposes
-/// Returns the filename if the file was successfully created, null otherwise
-/// If timestamp is null, generates a new timestamp automatically
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) ?[]const u8 {
+/// Writes failed deserialization bytes to disk for debugging purposes.
+/// Logs the outcome (success or failure) itself; returns true on success.
+///
+/// Previously returned `?[]const u8` (the allocated filename) while also doing
+/// `defer allocator.free(filename)` — so callers received a dangling pointer and
+/// segfaulted when logging it.  The fix: log from inside this function and return
+/// a plain bool; callers no longer touch the filename string at all (#725).
+fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
         error.PathAlreadyExists => {}, // Directory already exists, continue
         else => {
             logger.err("Failed to create deserialization dumps directory: {any}", .{e});
-            return null;
+            return false;
         },
     };
 
@@ -253,14 +257,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     const actual_timestamp = timestamp orelse std.time.timestamp();
     const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
         logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
-        return null;
+        return false;
     };
     defer allocator.free(filename);
 
     // Write bytes to file
     const file = std.fs.cwd().createFile(filename, .{ .truncate = true }) catch |e| {
         logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
     defer file.close();
 
@@ -268,15 +272,16 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     var writer = file.writer(&write_buf);
     writer.interface.writeAll(message_bytes) catch |e| {
         logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
-        return null;
+        return false;
     };
     writer.interface.flush() catch |e| {
         logger.err("Failed to flush file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
 
+    // Log while filename is still live (before defer free runs).
     logger.warn("SSZ deserialization failed for {s} message - written {d} bytes to debug file: {s}", .{ message_type, message_bytes.len, filename });
-    return filename;
+    return true;
 }
 
 /// Generic SSZ deserializer for gossip messages. Returns null on failure (with
@@ -291,9 +296,7 @@ fn deserializeGossipMessage(
     var message_data: T = undefined;
     ssz.deserialize(T, data, &message_data, allocator) catch |e| {
         logger.err("Error in deserializing the signed {s} message: {any}", .{ label, e });
-        if (writeFailedBytes(data, label, allocator, null, logger)) |filename| {
-            logger.err("{s} deserialization failed - debug file created: {s}", .{ label, filename });
-        } else {
+        if (!writeFailedBytes(data, label, allocator, null, logger)) {
             logger.err("{s} deserialization failed - could not create debug file", .{label});
         }
         return null;
@@ -311,9 +314,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
-        if (writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("Snappyz decode failed - debug file created: {s}", .{filename});
-        } else {
+        if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
         }
         return;
@@ -484,9 +485,7 @@ export fn handleRPCRequestFromRustBridge(
             "Error in deserializing the {s} RPC request from peer={s}{f}: {any}",
             .{ label, peer_id_slice, node_name, err },
         );
-        if (writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s} from peer={s}{f}", .{ label, filename, peer_id_slice, node_name });
-        } else {
+        if (!writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
         }
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
