@@ -23,7 +23,22 @@ const ServerStreamError = error{
     InvalidResponseVariant,
 };
 
+/// General RPC message size limit (4 MB). Used for req/resp protocol messages
+/// (BlocksByRoot, Status, etc.) and as a baseline gossip limit for small messages
+/// such as attestations and aggregations.
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Gossip block message size limit.
+///
+/// XMSS/post-quantum signatures are substantially larger than BLS: a single
+/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
+/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
+/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
+/// triggering error.TooLarge (issue #723).
+///
+/// Set to 50 MB to accommodate current devnet block sizes with room to grow.
+/// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.
+const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
 const FrameDecodeError = error{
@@ -312,7 +327,16 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
 
-    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| {
+    // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
+    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
+    // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
+    // small messages (attestations, aggregations) to bound memory use.
+    const decode_limit: usize = switch (topic.gossip_topic.kind) {
+        .block => MAX_GOSSIP_BLOCK_SIZE,
+        else => MAX_RPC_MESSAGE_SIZE,
+    };
+
+    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
         if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
