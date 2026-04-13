@@ -4,7 +4,7 @@ use rec_aggregation::{
     AggregatedXMSS,
 };
 use std::slice;
-use std::sync::Once;
+
 
 // Mirror hashsig-glue's struct layout with #[repr(C)]
 // These must match hashsig-glue/src/lib.rs exactly
@@ -18,28 +18,48 @@ pub struct Signature {
     pub inner: XmssSignature,
 }
 
-// Static Once guards for idempotent initialization
-// Avoids redundant heavy computation on repeated calls
-static PROVER_INIT: Once = Once::new();
-static VERIFIER_INIT: Once = Once::new();
+// Cached init results: true = succeeded, false = failed.
+// Using OnceLock<bool> instead of Once so we can distinguish "succeeded" from "panicked"
+// without poisoning the guard. The closure is called exactly once; subsequent calls return
+// the cached result without any computation.
+static PROVER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static VERIFIER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Initialize the prover (idempotent - only runs once)
-/// This is safe to call multiple times; heavy computation only happens on first call.
+/// Initialize the prover (idempotent - only runs once).
+///
+/// Returns 0 on success, -1 on failure.
+///
+/// Previously used `Once::call_once` which allowed `init_aggregation_bytecode()` to panic
+/// (e.g. when the compiled prover bytecode file is missing — ENOENT). A Rust panic through
+/// an `extern "C"` boundary is undefined behaviour and aborted the process.
+///
+/// Fix: wrap the init body in `catch_unwind` and cache the boolean result in a `OnceLock`.
+/// The caller (Zig) checks the return code and skips aggregation gracefully instead of crashing.
 #[no_mangle]
-pub extern "C" fn xmss_setup_prover() {
-    PROVER_INIT.call_once(|| {
-        init_aggregation_bytecode();
-        backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
+pub extern "C" fn xmss_setup_prover() -> i32 {
+    let ready = PROVER_READY.get_or_init(|| {
+        std::panic::catch_unwind(|| {
+            init_aggregation_bytecode();
+            backend::precompute_dft_twiddles::<backend::KoalaBear>(1 << 24);
+        })
+        .is_ok()
     });
+    if *ready { 0 } else { -1 }
 }
 
-/// Initialize the verifier (idempotent - only runs once)
-/// This is safe to call multiple times; setup only happens on first call.
+/// Initialize the verifier (idempotent - only runs once).
+///
+/// Returns 0 on success, -1 on failure.
+/// Same panic-safety rationale as `xmss_setup_prover`.
 #[no_mangle]
-pub extern "C" fn xmss_setup_verifier() {
-    VERIFIER_INIT.call_once(|| {
-        init_aggregation_bytecode();
+pub extern "C" fn xmss_setup_verifier() -> i32 {
+    let ready = VERIFIER_READY.get_or_init(|| {
+        std::panic::catch_unwind(|| {
+            init_aggregation_bytecode();
+        })
+        .is_ok()
     });
+    if *ready { 0 } else { -1 }
 }
 
 /// Aggregate signatures with recursive child proof support.
