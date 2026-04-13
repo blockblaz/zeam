@@ -13,8 +13,11 @@ pub const ByteListMiB = ssz.utils.List(u8, MAX_AGGREGATE_SIGNATURE_SIZE);
 pub const AggregatedXMSS = opaque {};
 
 // External C functions from multisig-glue (uses leanMultisig devnet4 with recursive aggregation)
-extern fn xmss_setup_prover() void;
-extern fn xmss_setup_verifier() void;
+/// Returns 0 on success, -1 if the prover bytecode file is missing or initialisation failed.
+/// Never panics — the Rust side wraps the body in catch_unwind (fix for #722).
+extern fn xmss_setup_prover() c_int;
+/// Returns 0 on success, -1 on failure.
+extern fn xmss_setup_verifier() c_int;
 
 extern fn xmss_aggregate(
     // Raw XMSS signatures
@@ -56,12 +59,17 @@ extern fn xmss_aggregate_signature_from_bytes(
     bytes_len: usize,
 ) ?*AggregatedXMSS;
 
-pub fn setupProver() void {
-    xmss_setup_prover();
+/// Initialize the XMSS prover (idempotent — only runs once).
+/// Returns error.ProverSetupFailed when the prover bytecode file is missing or the
+/// underlying Rust initialisation failed. Callers should log a warning and skip
+/// aggregation rather than propagating the error as a fatal failure.
+pub fn setupProver() error{ProverSetupFailed}!void {
+    if (xmss_setup_prover() != 0) return error.ProverSetupFailed;
 }
 
-pub fn setupVerifier() void {
-    xmss_setup_verifier();
+/// Initialize the XMSS verifier (idempotent — only runs once).
+pub fn setupVerifier() error{VerifierSetupFailed}!void {
+    if (xmss_setup_verifier() != 0) return error.VerifierSetupFailed;
 }
 
 /// Aggregate raw XMSS signatures with optional recursive children.
@@ -87,7 +95,7 @@ pub fn aggregateSignatures(
         return AggregationError.AggregationFailed;
     }
 
-    setupProver();
+    try setupProver();
 
     const num_children = children_pub_keys.len;
     const allocator = std.heap.c_allocator;
@@ -163,7 +171,7 @@ pub fn verifyAggregatedPayload(public_keys: []*const hashsig.HashSigPublicKey, m
     // Get bytes from aggregated signature
     const sig_bytes = agg_sig.constSlice();
 
-    setupVerifier();
+    try setupVerifier();
 
     // Verify directly from bytes (Rust deserializes internally)
     const result = xmss_verify_aggregated(
@@ -205,7 +213,7 @@ test "aggregateSignatures and verifyAggregatedPayload with valid and invalid pub
     var signature = try keypair.sign(&message_hash, epoch);
     defer signature.deinit();
 
-    setupProver();
+    try setupProver();
 
     var public_keys = [_]*const hashsig.HashSigPublicKey{keypair.public_key};
     var signatures = [_]*const hashsig.HashSigSignature{signature.handle};
