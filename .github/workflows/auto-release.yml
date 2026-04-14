@@ -184,7 +184,7 @@ jobs:
     - name: Build zeam natively
       run: |
         if [ "${{ matrix.arch }}" = "amd64" ]; then
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3 -Dgit_version="$(git rev-parse --short HEAD)"
         else
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
         fi
