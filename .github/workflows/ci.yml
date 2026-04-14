@@ -276,7 +276,8 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build test -Drust-target-cpu=x86-64-v3 --summary all; then
+          RUST_CPU_FLAG=""; if [ "$(uname -m)" = "x86_64" ]; then RUST_CPU_FLAG="-Drust-target-cpu=x86-64-v3"; fi
+          if zig build test $RUST_CPU_FLAG --summary all; then
             echo "Successfully ran unit tests on attempt $attempt"
             exit 0
           fi
@@ -290,7 +291,8 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build simtest -Drust-target-cpu=x86-64-v3 --summary all; then
+          RUST_CPU_FLAG=""; if [ "$(uname -m)" = "x86_64" ]; then RUST_CPU_FLAG="-Drust-target-cpu=x86-64-v3"; fi
+          if zig build simtest $RUST_CPU_FLAG --summary all; then
             echo "Successfully ran sim tests on attempt $attempt"
             exit 0
           fi
@@ -376,7 +378,8 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build run -Dprover=dummy -Drust-target-cpu=x86-64-v3 -- prove --zkvm dummy; then
+          RUST_CPU_FLAG=""; if [ "$(uname -m)" = "x86_64" ]; then RUST_CPU_FLAG="-Drust-target-cpu=x86-64-v3"; fi
+          if zig build run -Dprover=dummy $RUST_CPU_FLAG -- prove --zkvm dummy; then
             echo "Successfully ran dummy prover on attempt $attempt"
             exit 0
           fi
@@ -448,7 +451,8 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build -Doptimize=ReleaseSafe -Drust-target-cpu=x86-64-v3 -Dgit_version="$(git rev-parse --short HEAD)"; then
+          RUST_CPU_FLAG=""; if [ "$(uname -m)" = "x86_64" ]; then RUST_CPU_FLAG="-Drust-target-cpu=x86-64-v3"; fi
+          if zig build -Doptimize=ReleaseSafe $RUST_CPU_FLAG -Dgit_version="$(git rev-parse --short HEAD)"; then
             echo "Successfully built on attempt $attempt"
             exit 0
           fi
