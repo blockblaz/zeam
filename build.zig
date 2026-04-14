@@ -729,12 +729,14 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
     // local builds; Docker images should pass -Drust-target-cpu=x86-64-v3 (AVX2, no AVX512)
     // to produce portable binaries. We skip this on aarch64 because ring 0.17 fails its
     // compile-time feature assertions when target-cpu=native is set on aarch64-apple-darwin.
-    // We use CARGO_ENCODED_RUSTFLAGS (with \x1f separator) so we don't clobber any RUSTFLAGS
-    // already set in the environment (e.g. CI's -D warnings).
+    //
+    // We set RUSTFLAGS directly (not CARGO_ENCODED_RUSTFLAGS) because Cargo ignores
+    // CARGO_ENCODED_RUSTFLAGS when RUSTFLAGS is already set in the environment — which
+    // happens in CI via actions-rust-lang/setup-rust-toolchain setting RUSTFLAGS=-Dwarnings.
     if (builtin.cpu.arch == .x86_64) {
         const rust_target_cpu = b.option([]const u8, "rust-target-cpu", "Target CPU for Rust libs (default: native, use x86-64-v3 for portable Docker images)") orelse "native";
-        const flags = b.fmt("-Ctarget-cpu={s}\x1f-Dwarnings", .{rust_target_cpu});
-        cargo_build.setEnvironmentVariable("CARGO_ENCODED_RUSTFLAGS", flags);
+        const flags = b.fmt("-Ctarget-cpu={s} -Dwarnings", .{rust_target_cpu});
+        cargo_build.setEnvironmentVariable("RUSTFLAGS", flags);
     }
 
     return cargo_build;
