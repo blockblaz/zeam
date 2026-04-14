@@ -182,16 +182,22 @@ pub unsafe extern "C" fn xmss_aggregate(
         .map(|(pks, proof)| (pks.as_slice(), proof))
         .collect();
 
-    // Call rec_aggregation
-    let (_pub_keys, agg_sig) = rec_xmss_aggregate(
-        &children_with_keys,
-        raw_xmss,
-        message_hash,
-        slot,
-        log_inv_rate,
-    );
+    // Wrap rec_xmss_aggregate in catch_unwind — a panic through extern "C" is UB and
+    // causes GPE/abort (same class of bug as #722 for the setup functions).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rec_xmss_aggregate(
+            &children_with_keys,
+            raw_xmss,
+            message_hash,
+            slot,
+            log_inv_rate,
+        )
+    }));
 
-    Box::into_raw(Box::new(agg_sig))
+    match result {
+        Ok((_pub_keys, agg_sig)) => Box::into_raw(Box::new(agg_sig)),
+        Err(_) => std::ptr::null(),
+    }
 }
 
 /// Verify aggregated signatures.
@@ -236,7 +242,10 @@ pub unsafe extern "C" fn xmss_verify_aggregated(
         pub_keys.push((*pk_ptr).inner.clone());
     }
 
-    xmss_verify_aggregation(pub_keys, &agg_sig, message_hash, slot).is_ok()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        xmss_verify_aggregation(pub_keys, &agg_sig, message_hash, slot).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 /// Serialize an AggregatedXMSS to bytes (postcard + lz4).
