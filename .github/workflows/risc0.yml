@@ -53,4 +53,4 @@ jobs:
         /home/runner/.risc0/bin/rzup install r0vm 3.0.3
 
     - name: run prover
-      run: zig build run -Dprover=risc0 -- prove -z risc0
+      run: zig build run -Dprover=risc0 -Drust-target-cpu=x86-64-v3 -- prove -z risc0
