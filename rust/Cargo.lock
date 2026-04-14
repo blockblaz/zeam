@@ -713,7 +713,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "backend"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -834,9 +834,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.0"
+version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "bitvec"
@@ -3330,7 +3330,7 @@ dependencies = [
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "lean_vm",
@@ -3345,7 +3345,7 @@ dependencies = [
 [[package]]
 name = "lean_prover"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3362,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3418,7 +3418,7 @@ dependencies = [
 [[package]]
 name = "leansig_wrapper"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "ethereum_ssz",
@@ -4008,7 +4008,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ecfd3296f8c56b7c1f6fbac3c71cefa9d78ce009850c45000015f206dc7fa21"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "block",
  "core-graphics-types",
  "foreign-types",
@@ -4109,7 +4109,7 @@ dependencies = [
 [[package]]
 name = "mt-air"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "mt-field",
  "mt-poly",
@@ -4118,7 +4118,7 @@ dependencies = [
 [[package]]
 name = "mt-fiat-shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4131,7 +4131,7 @@ dependencies = [
 [[package]]
 name = "mt-field"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "itertools 0.14.0",
  "mt-utils",
@@ -4146,7 +4146,7 @@ dependencies = [
 [[package]]
 name = "mt-koala-bear"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4162,7 +4162,7 @@ dependencies = [
 [[package]]
 name = "mt-poly"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4175,7 +4175,7 @@ dependencies = [
 [[package]]
 name = "mt-sumcheck"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -4188,7 +4188,7 @@ dependencies = [
 [[package]]
 name = "mt-symetric"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
@@ -4198,7 +4198,7 @@ dependencies = [
 [[package]]
 name = "mt-utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "serde",
 ]
@@ -4206,7 +4206,7 @@ dependencies = [
 [[package]]
 name = "mt-whir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "itertools 0.14.0",
  "mt-fiat-shamir",
@@ -4300,7 +4300,7 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ce3636fa715e988114552619582b530481fd5ef176a1e5c1bf024077c2c9445"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "libc",
  "log",
  "netlink-packet-core",
@@ -4348,7 +4348,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "cfg-if",
  "cfg_aliases",
  "libc",
@@ -6399,7 +6399,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set",
  "bit-vec",
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "num-traits",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
@@ -6671,7 +6671,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
 ]
 
 [[package]]
@@ -6710,7 +6710,7 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "lean_compiler",
@@ -6733,7 +6733,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
 ]
 
 [[package]]
@@ -7235,7 +7235,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -7268,9 +7268,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.11"
+version = "0.103.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a6af516fea4b20eccceaf166e8aa666ac996208e8a644ce3ef5aa783bc7cd4"
+checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -7784,7 +7784,7 @@ dependencies = [
 [[package]]
 name = "sub_protocols"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "lean_vm",
@@ -7846,7 +7846,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "core-foundation",
  "system-configuration-sys",
 ]
@@ -8175,7 +8175,7 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "bytes",
  "futures-util",
  "http 1.4.0",
@@ -8439,7 +8439,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2dc786778965742117927d0492e4771dec9c5d5d#2dc786778965742117927d0492e4771dec9c5d5d"
+source = "git+https://github.com/leanEthereum/leanMultisig.git?rev=2eb4b9d983171139af36749f127dd9890c9109e6#2eb4b9d983171139af36749f127dd9890c9109e6"
 dependencies = [
  "backend",
  "tracing",
@@ -8608,7 +8608,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver 1.0.28",
@@ -9024,7 +9024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "indexmap 2.14.0",
  "log",
  "serde",
