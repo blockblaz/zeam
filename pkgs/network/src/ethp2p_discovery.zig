@@ -228,13 +228,15 @@ pub const EthP2PDiscovery = struct {
             const ql = @atomicLoad(?*eth_ec_quic.EthEcQuicListener, &self.quic_listener, .acquire);
             self.shared_socket.routePackets(&self.discv5, ql);
 
-            // Advance discv5 timers (inbound recv was already handled above).
-            _ = self.discv5.poll(now_ns);
-
             // Drive QUIC engine timers (PTO, idle-close, etc.).
             if (ql) |listener| eth_ec_quic.processEngineOnly(listener);
 
-            // Advance peer warmup scheduling and QUIC dial flushes.
+            // Advance discv5 timers + peer warmup scheduling + QUIC dial flushes.
+            // PeerManager.poll internally calls discv5.Node.poll, which runs
+            // expireRequests and refreshBuckets.  Calling discv5.poll separately
+            // here as well would double-drive expireRequests on the same pending
+            // list within one tick, causing an integer-overflow panic in swapRemove
+            // when the list length is corrupted mid-iteration.
             self.manager.poll(now_ns, peering_warmup_mod.phase_idle_start_ms);
 
             // Wait up to POLL_INTERVAL_MS for the next batch of datagrams.
