@@ -27,8 +27,8 @@ name: hive
 
 on:
   schedule:
-    # 10:00 UTC daily.
-    - cron: '0 10 * * *'
+    # 03:00 UTC daily.
+    - cron: '0 3 * * *'
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
@@ -63,6 +63,7 @@ permissions:
   contents: read
   pull-requests: write
   actions: read
+  issues: write
 
 jobs:
   hive:
@@ -152,3 +153,21 @@ jobs:
               issue_number: context.issue.number,
               body,
             });
+
+      - name: Open (or update) tracking issue on scheduled failure
+        if: github.event_name == 'schedule' && failure()
+        uses: JasonEtco/create-an-issue@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIMULATOR: ${{ steps.cfg.outputs.simulator }}
+          DEVNET: ${{ steps.cfg.outputs.devnet }}
+          HIVE_REPOSITORY: ${{ steps.cfg.outputs.hive_repository }}
+          HIVE_VERSION: ${{ steps.cfg.outputs.hive_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_DATE: ${{ github.event.schedule }}
+        with:
+          filename: .github/ISSUE_TEMPLATE/hive-scheduled-failure.md
+          update_existing: true
+          search_existing: open
