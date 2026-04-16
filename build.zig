@@ -725,16 +725,23 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
 
     // leanMultisig's backend crate uses compile-time #[cfg(target_feature)] for SIMD
     // (AVX2/AVX512 on x86_64, NEON on aarch64). On x86_64, we set the Rust target-cpu
-    // so the compiler enables the appropriate feature flags. Defaults to "native" for
-    // local builds; Docker images should pass -Drust-target-cpu=x86-64-v3 (AVX2, no AVX512)
-    // to produce portable binaries. We skip this on aarch64 because ring 0.17 fails its
-    // compile-time feature assertions when target-cpu=native is set on aarch64-apple-darwin.
+    // so the compiler enables the appropriate feature flags.
+    //
+    // The default is x86-64-v3 (AVX2, no AVX-512) because enabling AVX-512 via
+    // target-cpu=native has triggered hard-to-diagnose runtime faults in the deeper
+    // Rust dependency graph on AVX-512-capable CPUs (LLVM codegen issues, clobber-list
+    // bugs, and kernel/microcode XSAVE quirks). Capping at AVX2 produces portable and
+    // reliable binaries across all x86_64 Linux hosts. Users who want machine-specific
+    // performance can opt in with -Drust-target-cpu=native (or x86-64-v4 for AVX-512).
+    //
+    // We skip this on aarch64 because ring 0.17 fails its compile-time feature
+    // assertions when target-cpu=native is set on aarch64-apple-darwin.
     //
     // We set RUSTFLAGS directly (not CARGO_ENCODED_RUSTFLAGS) because Cargo ignores
     // CARGO_ENCODED_RUSTFLAGS when RUSTFLAGS is already set in the environment — which
     // happens in CI via actions-rust-lang/setup-rust-toolchain setting RUSTFLAGS=-Dwarnings.
     if (builtin.cpu.arch == .x86_64) {
-        const rust_target_cpu = b.option([]const u8, "rust-target-cpu", "Target CPU for Rust libs (default: native, use x86-64-v3 for portable Docker images)") orelse "native";
+        const rust_target_cpu = b.option([]const u8, "rust-target-cpu", "Target CPU for Rust libs (default: x86-64-v3 for portable AVX2 builds; use 'native' or 'x86-64-v4' to opt into AVX-512)") orelse "x86-64-v3";
         const flags = b.fmt("-Ctarget-cpu={s} -Dwarnings", .{rust_target_cpu});
         cargo_build.setEnvironmentVariable("RUSTFLAGS", flags);
     }
