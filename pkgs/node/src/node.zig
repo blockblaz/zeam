@@ -412,7 +412,8 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
+                const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
+                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
                         self.logger.debug(
@@ -604,15 +605,27 @@ pub const BeamNode = struct {
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
+        // Clone the block and capture its SSZ bytes in one pass.
+        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
+        // then deserializes into the clone. The returned bytes are stored alongside the cached
+        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
+        // observed to cause memory corruption on the next cached block's processing.
+        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
+        errdefer self.allocator.free(ssz_bytes);
 
         self.network.cacheFetchedBlock(block_root, block_ptr) catch {
             return CacheBlockError.CachingFailed;
         };
         block_owned = false;
+
+        // Store the SSZ bytes after caching; ignore store failure (block is already cached,
+        // onBlock will fall back to fresh serialization if bytes are unavailable).
+        self.network.storeFetchedBlockSsz(block_root, ssz_bytes) catch {
+            self.allocator.free(ssz_bytes);
+        };
     }
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
