@@ -174,18 +174,37 @@ pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64
     }
 }
 
+/// C-ABI parameters for [`create_and_run_network`].
+///
+/// `network_id` is followed by explicit padding so `zig_handler` is 8-byte aligned, matching Zig `extern struct`.
+#[repr(C)]
+pub struct CreateNetworkParams {
+    pub network_id: u32,
+    pub _padding: u32,
+    pub zig_handler: u64,
+    pub local_private_key: *const c_char,
+    pub listen_addresses: *const c_char,
+    pub connect_addresses: *const c_char,
+    pub topics_str: *const c_char,
+}
+
 /// # Safety
 ///
-/// The caller must ensure that `listen_addresses` and `connect_addresses` point to valid null-terminated C strings.
+/// `params` must be non-null and valid until this function returns. String pointers must point to valid
+/// null-terminated C strings for `listen_addresses`, `connect_addresses`, `topics_str`, and `local_private_key`.
 #[no_mangle]
-pub unsafe extern "C" fn create_and_run_network(
-    network_id: u32,
-    zig_handler: u64,
-    local_private_key: *const c_char,
-    listen_addresses: *const c_char,
-    connect_addresses: *const c_char,
-    topics_str: *const c_char,
-) {
+pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkParams) {
+    if params.is_null() {
+        return;
+    }
+    let p = &*params;
+    let network_id = p.network_id;
+    let zig_handler = p.zig_handler;
+    let local_private_key = p.local_private_key;
+    let listen_addresses = p.listen_addresses;
+    let connect_addresses = p.connect_addresses;
+    let topics_str = p.topics_str;
+
     let listen_multiaddrs = CStr::from_ptr(listen_addresses)
         .to_string_lossy()
         .split(",")
