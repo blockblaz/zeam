@@ -104,7 +104,7 @@ jobs:
 
       - name: Run Hive
         id: hive
-        uses: ethpandaops/hive-github-action@v0.6.3
+        uses: ethpandaops/hive-github-action@09050fc75bae8a10b1876a0826ca4114ea9ed6e8 # v0.6.3
         with:
           client: zeam
           simulator: ${{ steps.cfg.outputs.simulator }}
@@ -128,9 +128,9 @@ jobs:
             const devnet = '${{ steps.cfg.outputs.devnet }}';
             const conclusion = '${{ steps.hive.outcome }}';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const icon = conclusion === 'success' ? 'success' : (conclusion === 'skipped' ? 'skipped' : 'failure');
+            const icon = conclusion === 'success' ? '✅' : (conclusion === 'skipped' ? '⏭️' : '❌');
             const body = [
-              `### Hive results: ${icon}`,
+              `### Hive results: ${icon} \`${conclusion}\``,
               ``,
               `| Field | Value |`,
               `|---|---|`,
@@ -156,7 +156,7 @@ jobs:
 
       - name: Open (or update) tracking issue on scheduled failure
         if: github.event_name == 'schedule' && failure()
-        uses: JasonEtco/create-an-issue@v2
+        uses: JasonEtco/create-an-issue@1b14a70e4d8dc185e5cc76d3bec9eab20257b2c5 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SIMULATOR: ${{ steps.cfg.outputs.simulator }}
@@ -166,7 +166,6 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          RUN_DATE: ${{ github.event.schedule }}
         with:
           filename: .github/ISSUE_TEMPLATE/hive-scheduled-failure.md
           update_existing: true
