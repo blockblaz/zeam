@@ -90,6 +90,7 @@ pub const NodeOptions = struct {
     node_registry: *node_lib.NodeNameRegistry,
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
+    max_attestations_data: ?u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -181,13 +182,20 @@ pub const Node = struct {
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
         chain_options.genesis_time = options.genesis_spec.genesis_time;
 
-        // Set validator_pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
-        chain_options.validator_pubkeys = options.genesis_spec.validator_pubkeys;
+        // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
+        chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
+        chain_options.validator_proposal_pubkeys = options.genesis_spec.validator_proposal_pubkeys;
 
         // Apply attestation_committee_count if provided via CLI flag or config.yaml.
         // ChainConfig.init falls back to 1 when this field is null, so we only override when set.
         if (options.attestation_committee_count) |count| {
             chain_options.attestation_committee_count = @intCast(count);
+        }
+
+        // Apply max_attestations_data if provided via config.yaml.
+        // ChainConfig.init falls back to 16 (leanSpec default) when this field is null.
+        if (options.max_attestations_data) |max| {
+            chain_options.max_attestations_data = max;
         }
 
         // transfer ownership of the chain_options to ChainConfig
@@ -504,31 +512,77 @@ pub const Node = struct {
 
         const hash_sig_key_dir = self.options.hash_sig_key_dir;
 
+        // First pass: group assignments by validator index, routing by filename.
+        // If the filename contains "attester" it goes to att_base; "proposer" to prop_base.
+        // A filename with neither is rejected with error.InvalidPrivkeyFileFormat.
+        // Slices point into validator_assignments memory which outlives this function.
+        const FileSlots = struct {
+            att_base: ?[]const u8 = null,
+            prop_base: ?[]const u8 = null,
+        };
+        var file_map = std.AutoHashMap(usize, FileSlots).init(self.allocator);
+        defer file_map.deinit();
+
         for (self.options.validator_assignments) |assignment| {
             if (assignment.index >= num_validators) {
                 return error.HashSigValidatorIndexOutOfRange;
             }
-
             const privkey_file = assignment.privkey_file;
-
             if (!std.mem.endsWith(u8, privkey_file, "_sk.ssz")) {
                 return error.InvalidPrivkeyFileFormat;
             }
-
             const base = privkey_file[0 .. privkey_file.len - 7]; // Remove "_sk.ssz"
-            const sk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, base });
-            defer self.allocator.free(sk_path);
-            const pk_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, base });
-            defer self.allocator.free(pk_path);
+            const slots = try file_map.getOrPutValue(assignment.index, .{});
+            if (std.mem.indexOf(u8, privkey_file, "attester") != null) {
+                slots.value_ptr.att_base = base;
+            } else if (std.mem.indexOf(u8, privkey_file, "proposer") != null) {
+                slots.value_ptr.prop_base = base;
+            } else {
+                // Filename must contain "attester" or "proposer" to unambiguously
+                // assign the key to a role. A file with neither is an error.
+                return error.InvalidPrivkeyFileFormat;
+            }
+        }
 
-            var keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, sk_path, pk_path) catch |err| switch (err) {
+        // Second pass: load each keypair from disk and register with the key manager.
+        // If only one role's file was provided, fall back to using it for both roles.
+        var map_it = file_map.iterator();
+        while (map_it.next()) |entry| {
+            const index = entry.key_ptr.*;
+            const slots = entry.value_ptr.*;
+
+            const att_base = slots.att_base orelse slots.prop_base orelse return error.HashSigSecretKeyMissing;
+            const prop_base = slots.prop_base orelse slots.att_base orelse return error.HashSigSecretKeyMissing;
+
+            const att_sk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, att_base });
+            defer self.allocator.free(att_sk);
+            const att_pk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, att_base });
+            defer self.allocator.free(att_pk);
+
+            var att_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, att_sk, att_pk) catch |err| switch (err) {
                 error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
                 error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
                 else => return err,
             };
-            errdefer keypair.deinit();
+            errdefer att_keypair.deinit();
 
-            try self.key_manager.addKeypair(assignment.index, keypair);
+            const prop_sk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_sk.ssz", .{ hash_sig_key_dir, prop_base });
+            defer self.allocator.free(prop_sk);
+            const prop_pk = try std.fmt.allocPrint(self.allocator, "{s}/{s}_pk.ssz", .{ hash_sig_key_dir, prop_base });
+            defer self.allocator.free(prop_pk);
+
+            var prop_keypair = key_manager_lib.loadKeypairFromFiles(self.allocator, prop_sk, prop_pk) catch |err| switch (err) {
+                error.SecretKeyFileNotFound => return error.HashSigSecretKeyMissing,
+                error.PublicKeyFileNotFound => return error.HashSigPublicKeyMissing,
+                else => return err,
+            };
+            errdefer prop_keypair.deinit();
+
+            const validator_keys = key_manager_lib.ValidatorKeys{
+                .attestation_keypair = att_keypair,
+                .proposal_keypair = prop_keypair,
+            };
+            try self.key_manager.addKeypair(index, validator_keys);
         }
     }
 };
@@ -542,6 +596,19 @@ fn attestationCommitteeCountFromYAML(config: Yaml) ?u64 {
     const value = root.map.get("ATTESTATION_COMMITTEE_COUNT") orelse return null;
     return switch (value) {
         .scalar => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
+
+/// Reads MAX_ATTESTATIONS_DATA from a parsed config.yaml Yaml document.
+/// Returns null if the field is absent or cannot be parsed.
+fn maxAttestationsDataFromYAML(config: Yaml) ?u8 {
+    if (config.docs.items.len == 0) return null;
+    const root = config.docs.items[0];
+    if (root != .map) return null;
+    const value = root.map.get("MAX_ATTESTATIONS_DATA") orelse return null;
+    return switch (value) {
+        .scalar => |s| std.fmt.parseInt(u8, s, 10) catch null,
         else => null,
     };
 }
@@ -680,6 +747,9 @@ pub fn buildStartOptions(
             opts.attestation_committee_count = 1;
         }
     }
+
+    // Resolve max_attestations_data from config.yaml (no CLI flag; defaults to 16 in ChainConfig).
+    opts.max_attestations_data = maxAttestationsDataFromYAML(parsed_config);
 }
 
 /// Downloads finalized checkpoint state from the given URL and deserializes it
@@ -778,11 +848,16 @@ fn verifyCheckpointState(
 
     // Verify each validator pubkey matches genesis config
     const state_validators = state.validators.constSlice();
-    for (genesis_spec.validator_pubkeys, 0..) |expected_pubkey, i| {
-        const actual_pubkey = state_validators[i].pubkey;
-        if (!std.mem.eql(u8, &expected_pubkey, &actual_pubkey)) {
-            logger.err("checkpoint state verification failed: validator pubkey mismatch at index {d}", .{i});
-            return error.ValidatorPubkeyMismatch;
+    for (genesis_spec.validator_attestation_pubkeys, genesis_spec.validator_proposal_pubkeys, 0..) |expected_att_pubkey, expected_prop_pubkey, i| {
+        const actual_att_pubkey = state_validators[i].attestation_pubkey;
+        if (!std.mem.eql(u8, &expected_att_pubkey, &actual_att_pubkey)) {
+            logger.err("checkpoint state verification failed: attestation pubkey mismatch at index {d}", .{i});
+            return error.ValidatorAttestationPubkeyMismatch;
+        }
+        const actual_prop_pubkey = state_validators[i].proposal_pubkey;
+        if (!std.mem.eql(u8, &expected_prop_pubkey, &actual_prop_pubkey)) {
+            logger.err("checkpoint state verification failed: proposal pubkey mismatch at index {d}", .{i});
+            return error.ValidatorProposalPubkeyMismatch;
         }
     }
 
@@ -1250,7 +1325,8 @@ test "configs yaml parsing" {
     var config_file = try utils_lib.loadFromYAMLFile(std.testing.allocator, "pkgs/cli/test/fixtures/config.yaml");
     defer config_file.deinit(std.testing.allocator);
     const genesis_spec = try configs.genesisConfigFromYAML(std.testing.allocator, config_file, null);
-    defer std.testing.allocator.free(genesis_spec.validator_pubkeys);
+    defer std.testing.allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer std.testing.allocator.free(genesis_spec.validator_proposal_pubkeys);
     try std.testing.expectEqual(@as(u64, 9), genesis_spec.numValidators());
     try std.testing.expectEqual(@as(u64, 1704085200), genesis_spec.genesis_time);
 
@@ -1354,7 +1430,8 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
 
     // Parse genesis config from YAML
     const genesis_spec = try configs.genesisConfigFromYAML(allocator, parsed_config, null);
-    defer allocator.free(genesis_spec.validator_pubkeys);
+    defer allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer allocator.free(genesis_spec.validator_proposal_pubkeys);
 
     // Generate genesis state
     var genesis_state: types.BeamState = undefined;
@@ -1383,7 +1460,7 @@ test "compare roots from genGensisBlock and genGenesisState and genStateBlockHea
     // Verify the state root matches the expected value
     const state_root_from_genesis_hex = try std.fmt.allocPrint(allocator, "0x{x}", .{&state_root_from_genesis});
     defer allocator.free(state_root_from_genesis_hex);
-    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0xdda67dde8a468b0087881f6d8f1cd159ca4c2e82f780156744dc920049515cb1");
+    try std.testing.expectEqualStrings(state_root_from_genesis_hex, "0x228ecb2f88891fab88a05a104ccac95f1513e138d53469340b9ce04f70fa1019");
 }
 
 test "populateNodeNameRegistry" {
@@ -1454,9 +1531,11 @@ test "NodeOptions checkpoint_sync_url field is optional" {
     // Create a minimal genesis spec for testing
     const genesis_spec = types.GenesisSpec{
         .genesis_time = 1000,
-        .validator_pubkeys = try allocator.alloc(types.Bytes52, 0),
+        .validator_attestation_pubkeys = try allocator.alloc(types.Bytes52, 0),
+        .validator_proposal_pubkeys = try allocator.alloc(types.Bytes52, 0),
     };
-    defer allocator.free(genesis_spec.validator_pubkeys);
+    defer allocator.free(genesis_spec.validator_attestation_pubkeys);
+    defer allocator.free(genesis_spec.validator_proposal_pubkeys);
 
     var node_options = NodeOptions{
         .network_id = 0,

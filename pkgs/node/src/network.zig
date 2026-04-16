@@ -56,7 +56,7 @@ pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPCEntry);
 // key: block root, value: depth
 pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
-pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlockWithAttestation);
+pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlock);
 // key: parent root, value: list of child roots (for O(1) child lookup)
 pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayList(types.Root));
 
@@ -297,11 +297,11 @@ pub const Network = struct {
         return self.fetched_blocks.get(root) != null;
     }
 
-    pub fn getFetchedBlock(self: *Self, root: types.Root) ?*types.SignedBlockWithAttestation {
+    pub fn getFetchedBlock(self: *Self, root: types.Root) ?*types.SignedBlock {
         return self.fetched_blocks.get(root);
     }
 
-    pub fn cacheFetchedBlock(self: *Self, root: types.Root, block: *types.SignedBlockWithAttestation) !void {
+    pub fn cacheFetchedBlock(self: *Self, root: types.Root, block: *types.SignedBlock) !void {
         const block_gop = try self.fetched_blocks.getOrPut(root);
 
         // If we already have this block cached, free the duplicate and return early
@@ -318,7 +318,7 @@ pub const Network = struct {
             self.allocator.destroy(block);
         }
 
-        const parent_root = block.message.block.parent_root;
+        const parent_root = block.block.parent_root;
         const gop = try self.fetched_block_children.getOrPut(parent_root);
 
         const created_new_entry = !gop.found_existing;
@@ -337,7 +337,7 @@ pub const Network = struct {
             var block_ptr = entry.value;
 
             // Remove this block from its parent's children list
-            const parent_root = block_ptr.message.block.parent_root;
+            const parent_root = block_ptr.block.parent_root;
             if (self.fetched_block_children.getPtr(parent_root)) |children_list| {
                 // Find and remove this root from the parent's children list
                 for (children_list.items, 0..) |child_root, i| {
@@ -390,7 +390,7 @@ pub const Network = struct {
         // Walk up: traverse parent chain and add all cached ancestors
         var current = root;
         while (self.getFetchedBlock(current)) |block_ptr| {
-            const parent_root = block_ptr.message.block.parent_root;
+            const parent_root = block_ptr.block.parent_root;
             if (self.hasFetchedBlock(parent_root)) {
                 to_remove.put(parent_root, {}) catch break;
                 current = parent_root;
@@ -412,7 +412,7 @@ pub const Network = struct {
                 // the finalized chain (matching root at or after finalized slot).
                 if (finalized_checkpoint) |fc| {
                     if (self.getFetchedBlock(child_root)) |child_block| {
-                        if (child_block.message.block.slot >= fc.slot and
+                        if (child_block.block.slot >= fc.slot and
                             std.mem.eql(u8, &child_root, &fc.root))
                         {
                             // This child is the finalized block — skip it (keep it and its descendants)

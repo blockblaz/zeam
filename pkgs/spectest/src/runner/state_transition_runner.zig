@@ -414,8 +414,16 @@ fn parseValidators(
                 const validator_obj = try expect.expectObjectValue(FixtureError, item, ctx, base_label);
 
                 var label_buf: [96]u8 = undefined;
-                const pubkey_label = std.fmt.bufPrint(&label_buf, "{s}.pubkey", .{base_label}) catch "validator.pubkey";
-                const pubkey = try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"pubkey"}, ctx, pubkey_label);
+
+                const attestation_pubkey = blk: {
+                    const att_label = std.fmt.bufPrint(&label_buf, "{s}.attestationPubkey", .{base_label}) catch "validator.attestationPubkey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"attestationPubkey"}, ctx, att_label);
+                };
+
+                const proposal_pubkey = blk: {
+                    const prop_label = std.fmt.bufPrint(&label_buf, "{s}.proposalPubkey", .{base_label}) catch "validator.proposalPubkey";
+                    break :blk try expect.expectBytesField(FixtureError, types.Bytes52, validator_obj, &.{"proposalPubkey"}, ctx, prop_label);
+                };
 
                 const validator_index: u64 = blk: {
                     if (validator_obj.get("index")) |index_value| {
@@ -426,7 +434,7 @@ fn parseValidators(
                     break :blk @as(u64, @intCast(idx));
                 };
 
-                validators.append(.{ .pubkey = pubkey, .index = validator_index }) catch |err| {
+                validators.append(.{ .attestation_pubkey = attestation_pubkey, .proposal_pubkey = proposal_pubkey, .index = validator_index }) catch |err| {
                     std.debug.print(
                         "fixture {s} case {s}: validator #{} append failed: {s}\n",
                         .{ ctx.fixture_label, ctx.case_name, idx, @errorName(err) },

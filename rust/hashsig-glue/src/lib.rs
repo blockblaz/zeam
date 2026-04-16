@@ -1,18 +1,42 @@
-use leansig::{signature::SignatureScheme, MESSAGE_LENGTH};
-use rand::Rng;
+// Production config (default)
+#[cfg(not(feature = "test-config"))]
+mod config {
+    pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::{
+        PubKeyAbortingTargetSumLifetime32Dim46Base8 as XmssPublicKey,
+        SchemeAbortingTargetSumLifetime32Dim46Base8 as XmssScheme,
+        SecretKeyAbortingTargetSumLifetime32Dim46Base8 as XmssSecretKey,
+        SigAbortingTargetSumLifetime32Dim46Base8 as XmssSignature,
+    };
+}
+
+// Test config
+#[cfg(feature = "test-config")]
+mod config {
+    pub use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
+        PubKeyAbortingTargetSumLifetime8Dim46Base8 as XmssPublicKey,
+        SchemeAbortingTargetSumLifetime8Dim46Base8 as XmssScheme,
+        SecretKeyAbortingTargetSumLifetime8Dim46Base8 as XmssSecretKey,
+        SigAbortingTargetSumLifetime8Dim46Base8 as XmssSignature,
+    };
+}
+
+use config::*;
+
+use leansig::serialization::Serializable;
+use leansig::signature::SignatureScheme;
+use leansig::MESSAGE_LENGTH;
+
+use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 
-pub type HashSigScheme =
-    leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
-pub type HashSigPrivateKey = <HashSigScheme as SignatureScheme>::SecretKey;
-pub type HashSigPublicKey = <HashSigScheme as SignatureScheme>::PublicKey;
-pub type HashSigSignature = <HashSigScheme as SignatureScheme>::Signature;
+pub type HashSigPublicKey = XmssPublicKey;
+pub type HashSigSignature = XmssSignature;
+pub type HashSigPrivateKey = XmssSecretKey;
 
 #[repr(C)]
 pub struct PrivateKey {
@@ -38,8 +62,8 @@ pub struct KeyPair {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
-    #[error("Signing failed: {0:?}")]
-    SigningFailed(leansig::signature::SigningError),
+    #[error("Signing failed")]
+    SigningFailed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,15 +77,15 @@ impl PrivateKey {
         Self { inner }
     }
 
-    pub fn generate<R: Rng>(
+    pub fn generate<R: rand::CryptoRng>(
         rng: &mut R,
-        activation_epoch: usize,
-        num_active_epochs: usize,
+        activation_epoch: u32,
+        num_active_epochs: u32,
     ) -> (PublicKey, Self) {
-        let (public_key, private_key) =
-            <HashSigScheme as SignatureScheme>::key_gen(rng, activation_epoch, num_active_epochs);
+        let (pk, sk) =
+            XmssScheme::key_gen(rng, activation_epoch as usize, num_active_epochs as usize);
 
-        (PublicKey::new(public_key), Self::new(private_key))
+        (PublicKey::new(pk), Self::new(sk))
     }
 
     pub fn sign(
@@ -69,10 +93,9 @@ impl PrivateKey {
         message: &[u8; MESSAGE_LENGTH],
         epoch: u32,
     ) -> Result<Signature, SigningError> {
-        Ok(Signature::new(
-            <HashSigScheme as SignatureScheme>::sign(&self.inner, epoch, message)
-                .map_err(SigningError::SigningFailed)?,
-        ))
+        let sig = XmssScheme::sign(&self.inner, epoch, message)
+            .map_err(|_| SigningError::SigningFailed)?;
+        Ok(Signature::new(sig))
     }
 }
 
@@ -93,8 +116,34 @@ impl Signature {
         public_key: &PublicKey,
         epoch: u32,
     ) -> bool {
-        <HashSigScheme as SignatureScheme>::verify(&public_key.inner, epoch, message, &self.inner)
+        XmssScheme::verify(&public_key.inner, epoch, message, &self.inner)
     }
+}
+
+// SSZ serialization helpers (using leansig's Serializable trait)
+
+fn xmss_public_key_from_ssz(bytes: &[u8]) -> Result<HashSigPublicKey, ()> {
+    HashSigPublicKey::from_bytes(bytes).map_err(|_| ())
+}
+
+fn xmss_public_key_to_ssz(pk: &HashSigPublicKey) -> Vec<u8> {
+    pk.to_bytes()
+}
+
+fn xmss_signature_from_ssz(bytes: &[u8]) -> Result<HashSigSignature, ()> {
+    HashSigSignature::from_bytes(bytes).map_err(|_| ())
+}
+
+fn xmss_signature_to_ssz(sig: &HashSigSignature) -> Vec<u8> {
+    sig.to_bytes()
+}
+
+fn xmss_secret_key_from_ssz(bytes: &[u8]) -> Result<HashSigPrivateKey, ()> {
+    HashSigPrivateKey::from_bytes(bytes).map_err(|_| ())
+}
+
+fn xmss_secret_key_to_ssz(sk: &HashSigPrivateKey) -> Vec<u8> {
+    sk.to_bytes()
 }
 
 // FFI Functions for Zig interop
@@ -117,9 +166,9 @@ pub unsafe extern "C" fn hashsig_keypair_generate(
     let seed = hasher.finalize().into();
 
     let (public_key, private_key) = PrivateKey::generate(
-        &mut <ChaCha20Rng as SeedableRng>::from_seed(seed),
-        activation_epoch,
-        num_active_epochs,
+        &mut StdRng::from_seed(seed),
+        activation_epoch as u32,
+        num_active_epochs as u32,
     );
 
     let keypair = Box::new(KeyPair {
@@ -149,14 +198,14 @@ pub unsafe extern "C" fn hashsig_keypair_from_ssz(
         let sk_slice = slice::from_raw_parts(private_key_ptr, private_key_len);
         let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
 
-        let private_key: HashSigPrivateKey = match HashSigPrivateKey::from_ssz_bytes(sk_slice) {
+        let private_key: HashSigPrivateKey = match xmss_secret_key_from_ssz(sk_slice) {
             Ok(key) => key,
             Err(_) => {
                 return ptr::null_mut();
             }
         };
 
-        let public_key: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_slice) {
+        let public_key: HashSigPublicKey = match xmss_public_key_from_ssz(pk_slice) {
             Ok(key) => key,
             Err(_) => {
                 return ptr::null_mut();
@@ -231,7 +280,7 @@ pub unsafe extern "C" fn hashsig_public_key_from_ssz(
 
     unsafe {
         let pk_slice = slice::from_raw_parts(public_key_ptr, public_key_len);
-        let public_key: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_slice) {
+        let public_key: HashSigPublicKey = match xmss_public_key_from_ssz(pk_slice) {
             Ok(key) => key,
             Err(_) => {
                 return ptr::null_mut();
@@ -318,7 +367,7 @@ pub unsafe extern "C" fn hashsig_signature_from_ssz(
 
     unsafe {
         let sig_slice = slice::from_raw_parts(signature_ptr, signature_len);
-        let signature: HashSigSignature = match HashSigSignature::from_ssz_bytes(sig_slice) {
+        let signature: HashSigSignature = match xmss_signature_from_ssz(sig_slice) {
             Ok(sig) => sig,
             Err(_) => {
                 return ptr::null_mut();
@@ -372,8 +421,6 @@ pub extern "C" fn hashsig_message_length() -> usize {
     MESSAGE_LENGTH
 }
 
-use ssz::{Decode, Encode};
-
 /// Serialize a signature to bytes using SSZ encoding
 /// Returns number of bytes written, or 0 on error
 /// # Safety
@@ -391,8 +438,7 @@ pub unsafe extern "C" fn hashsig_signature_to_bytes(
     unsafe {
         let sig_ref = &*signature;
 
-        // Directly SSZ encode the signature (leansig has SSZ support built-in)
-        let ssz_bytes = sig_ref.inner.as_ssz_bytes();
+        let ssz_bytes = xmss_signature_to_ssz(&sig_ref.inner);
 
         if ssz_bytes.len() > buffer_len {
             return 0;
@@ -421,8 +467,7 @@ pub unsafe extern "C" fn hashsig_public_key_to_bytes(
     unsafe {
         let public_key_ref = &*public_key;
 
-        // Directly SSZ encode the public key (leansig has SSZ support built-in)
-        let ssz_bytes = public_key_ref.inner.as_ssz_bytes();
+        let ssz_bytes = xmss_public_key_to_ssz(&public_key_ref.inner);
 
         if ssz_bytes.len() > buffer_len {
             return 0;
@@ -451,16 +496,15 @@ pub unsafe extern "C" fn hashsig_private_key_to_bytes(
     unsafe {
         let private_key_ref = &*private_key;
 
-        // Directly SSZ encode the private key (leansig has SSZ support built-in)
-        let ssz_bytes = private_key_ref.inner.as_ssz_bytes();
+        let sk_bytes = xmss_secret_key_to_ssz(&private_key_ref.inner);
 
-        if ssz_bytes.len() > buffer_len {
+        if sk_bytes.len() > buffer_len {
             return 0;
         }
 
         let output_slice = slice::from_raw_parts_mut(buffer, buffer_len);
-        output_slice[..ssz_bytes.len()].copy_from_slice(&ssz_bytes);
-        ssz_bytes.len()
+        output_slice[..sk_bytes.len()].copy_from_slice(&sk_bytes);
+        sk_bytes.len()
     }
 }
 
@@ -491,18 +535,17 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
             Err(_) => return -1,
         };
 
-        // Directly SSZ decode (leansig has SSZ support built-in)
-        let pk: HashSigPublicKey = match HashSigPublicKey::from_ssz_bytes(pk_data) {
+        let pk: HashSigPublicKey = match xmss_public_key_from_ssz(pk_data) {
             Ok(pk) => pk,
             Err(_) => return -1,
         };
 
-        let sig: HashSigSignature = match HashSigSignature::from_ssz_bytes(sig_data) {
+        let sig: HashSigSignature = match xmss_signature_from_ssz(sig_data) {
             Ok(sig) => sig,
             Err(_) => return -1,
         };
 
-        let is_valid = <HashSigScheme as SignatureScheme>::verify(&pk, epoch, message_array, &sig);
+        let is_valid = XmssScheme::verify(&pk, epoch, message_array, &sig);
 
         if is_valid {
             1

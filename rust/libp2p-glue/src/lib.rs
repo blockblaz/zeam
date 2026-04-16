@@ -1439,7 +1439,7 @@ impl Behaviour {
             .validation_mode(gossipsub::ValidationMode::Anonymous)
             .history_length(6)
             .duplicate_cache_time(Duration::from_secs(3 * 4 * 2))
-            .max_transmit_size(2 * 1024 * 1024) // 2 MiB for blocks/ aggregated payloads
+            .max_transmit_size(crate::req_resp::configurations::max_message_size())
             .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
             .build()
             .unwrap();

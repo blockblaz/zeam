@@ -723,6 +723,22 @@ fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Buil
         }),
     };
 
+    // leanMultisig's backend crate uses compile-time #[cfg(target_feature)] for SIMD
+    // (AVX2/AVX512 on x86_64, NEON on aarch64). On x86_64, we set the Rust target-cpu
+    // so the compiler enables the appropriate feature flags. Defaults to "native" for
+    // local builds; Docker images should pass -Drust-target-cpu=x86-64-v3 (AVX2, no AVX512)
+    // to produce portable binaries. We skip this on aarch64 because ring 0.17 fails its
+    // compile-time feature assertions when target-cpu=native is set on aarch64-apple-darwin.
+    //
+    // We set RUSTFLAGS directly (not CARGO_ENCODED_RUSTFLAGS) because Cargo ignores
+    // CARGO_ENCODED_RUSTFLAGS when RUSTFLAGS is already set in the environment — which
+    // happens in CI via actions-rust-lang/setup-rust-toolchain setting RUSTFLAGS=-Dwarnings.
+    if (builtin.cpu.arch == .x86_64) {
+        const rust_target_cpu = b.option([]const u8, "rust-target-cpu", "Target CPU for Rust libs (default: native, use x86-64-v3 for portable Docker images)") orelse "native";
+        const flags = b.fmt("-Ctarget-cpu={s} -Dwarnings", .{rust_target_cpu});
+        cargo_build.setEnvironmentVariable("RUSTFLAGS", flags);
+    }
+
     return cargo_build;
 }
 

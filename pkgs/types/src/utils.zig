@@ -18,7 +18,7 @@ pub const SubnetId = u32;
 pub const Bytes48 = [48]u8;
 pub const Bytes52 = [52]u8;
 
-pub const SIGSIZE = 3112;
+pub const SIGSIZE = 2536;
 pub const SIGBYTES = [SIGSIZE]u8;
 
 pub const Root = Bytes32;
@@ -172,20 +172,23 @@ pub const RootToSlotCache = struct {
 
 pub const GenesisSpec = struct {
     genesis_time: u64,
-    validator_pubkeys: []const Bytes52,
+    validator_attestation_pubkeys: []const Bytes52,
+    validator_proposal_pubkeys: []const Bytes52,
 
     pub fn deinit(self: *GenesisSpec, allocator: Allocator) void {
-        allocator.free(self.validator_pubkeys);
+        allocator.free(self.validator_attestation_pubkeys);
+        allocator.free(self.validator_proposal_pubkeys);
     }
 
     pub fn numValidators(self: *const GenesisSpec) u64 {
-        return @intCast(self.validator_pubkeys.len);
+        return @intCast(self.validator_attestation_pubkeys.len);
     }
 };
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
     attestation_committee_count: SubnetId,
+    max_attestations_data: u8,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
@@ -196,6 +199,7 @@ pub const ChainSpec = struct {
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
         try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
+        try obj.put("max_attestations_data", json.Value{ .integer = self.max_attestations_data });
         return json.Value{ .object = obj };
     }
 

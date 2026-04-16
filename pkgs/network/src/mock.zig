@@ -438,8 +438,8 @@ pub const Mock = struct {
         return switch (response.*) {
             .status => |status_resp| interface.ReqRespResponse{ .status = status_resp },
             .blocks_by_root => |block_resp| blk: {
-                var cloned_block: types.SignedBlockWithAttestation = undefined;
-                try types.sszClone(self.allocator, types.SignedBlockWithAttestation, block_resp, &cloned_block);
+                var cloned_block: types.SignedBlock = undefined;
+                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
         };
@@ -751,6 +751,14 @@ pub const Mock = struct {
     }
 };
 
+/// Detect the best available I/O backend at runtime.
+/// Factored out to avoid duplicating the detection snippet in every test.
+fn detectBackendOrFail() !void {
+    if (@hasDecl(xev, "detect")) {
+        try xev.detect();
+    }
+}
+
 test "Mock messaging across two subscribers" {
     const TestSubscriber = struct {
         calls: u32 = 0,
@@ -774,7 +782,7 @@ test "Mock messaging across two subscribers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
+    try detectBackendOrFail();
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
@@ -798,33 +806,13 @@ test "Mock messaging across two subscribers" {
     const block_message = try allocator.create(interface.GossipMessage);
     defer allocator.destroy(block_message);
     block_message.* = .{ .block = .{
-        .message = .{
-            .block = .{
-                .slot = 1,
-                .proposer_index = 0,
-                .parent_root = [_]u8{1} ** 32,
-                .state_root = [_]u8{2} ** 32,
-                .body = .{
-                    .attestations = attestations,
-                },
-            },
-            .proposer_attestation = .{
-                .validator_id = 0,
-                .data = .{
-                    .slot = 1,
-                    .head = .{
-                        .slot = 1,
-                        .root = [_]u8{1} ** 32,
-                    },
-                    .source = .{
-                        .slot = 0,
-                        .root = ZERO_HASH,
-                    },
-                    .target = .{
-                        .slot = 1,
-                        .root = [_]u8{1} ** 32,
-                    },
-                },
+        .block = .{
+            .slot = 1,
+            .proposer_index = 0,
+            .parent_root = [_]u8{1} ** 32,
+            .state_root = [_]u8{2} ** 32,
+            .body = .{
+                .attestations = attestations,
             },
         },
         .signature = try types.createBlockSignatures(allocator, attestations.len()),
@@ -852,10 +840,10 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(received2 == .block);
 
     // Verify the block content is identical
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.parent_root, &received2.block.message.block.parent_root));
-    try std.testing.expect(std.mem.eql(u8, &received1.block.message.block.state_root, &received2.block.message.block.state_root));
-    try std.testing.expect(received1.block.message.block.slot == received2.block.message.block.slot);
-    try std.testing.expect(received1.block.message.block.proposer_index == received2.block.message.block.proposer_index);
+    try std.testing.expect(std.mem.eql(u8, &received1.block.block.parent_root, &received2.block.block.parent_root));
+    try std.testing.expect(std.mem.eql(u8, &received1.block.block.state_root, &received2.block.block.state_root));
+    try std.testing.expect(received1.block.block.slot == received2.block.block.slot);
+    try std.testing.expect(received1.block.block.proposer_index == received2.block.block.proposer_index);
 }
 
 test "Mock status RPC between peers" {
@@ -955,7 +943,7 @@ test "Mock status RPC between peers" {
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
 
-    if (@hasDecl(xev, "detect")) xev.detect() catch @panic("no available xev backend");
+    try detectBackendOrFail();
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 

@@ -242,7 +242,7 @@ pub const AttestationGossip = struct {
 };
 
 pub const GossipMessage = union(GossipTopicKind) {
-    block: types.SignedBlockWithAttestation,
+    block: types.SignedBlock,
     attestation: AttestationGossip,
     aggregation: types.SignedAggregatedAttestation,
 
@@ -269,8 +269,8 @@ pub const GossipMessage = union(GossipTopicKind) {
     pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .block => |blk| try writer.print("GossipMessage{{ block: slot={d}, proposer={d} }}", .{
-                blk.message.block.slot,
-                blk.message.block.proposer_index,
+                blk.block.slot,
+                blk.block.proposer_index,
             }),
             .attestation => |att| try writer.print("GossipMessage{{ attestation: subnet={d} validator={d}, slot={d} }}", .{
                 att.subnet_id,
@@ -306,7 +306,7 @@ pub const GossipMessage = union(GossipTopicKind) {
         switch (self.*) {
             .block => {
                 cloned_data.* = .{ .block = undefined };
-                try types.sszClone(allocator, types.SignedBlockWithAttestation, self.block, &cloned_data.block);
+                try types.sszClone(allocator, types.SignedBlock, self.block, &cloned_data.block);
             },
             .attestation => {
                 cloned_data.* = .{ .attestation = undefined };
@@ -468,7 +468,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     }
 };
 pub const ReqRespResponse = union(LeanSupportedProtocol) {
-    blocks_by_root: types.SignedBlockWithAttestation,
+    blocks_by_root: types.SignedBlock,
     status: types.Status,
 
     const Self = @This();

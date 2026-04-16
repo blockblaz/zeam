@@ -184,7 +184,7 @@ jobs:
     - name: Build zeam natively
       run: |
         if [ "${{ matrix.arch }}" = "amd64" ]; then
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3 -Dgit_version="$(git rev-parse --short HEAD)"
         else
           zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Dgit_version="$(git rev-parse --short HEAD)"
         fi
@@ -365,14 +365,17 @@ jobs:
         DEVNET_BRANCH="$DOCKER_TAG"  # branch = devnetX
 
         echo "✅ GitHub tag: $GITHUB_TAG, Docker tag/branch: $DOCKER_TAG"
-        if git ls-remote --heads origin "$DEVNET_BRANCH" | grep -q "$DEVNET_BRANCH"; then
+        # Fetch all remotes first - ensures origin/main and all branches are available
+        git fetch origin
+
+        if git ls-remote --heads origin | grep -q "refs/heads/$DEVNET_BRANCH$"; then
           echo "✅ $DEVNET_BRANCH branch exists, updating it"
-          git fetch origin "$DEVNET_BRANCH"
+
           git checkout "$DEVNET_BRANCH"
-          git merge main --no-edit
+          git merge origin/main --no-edit
         else
           echo "✅ $DEVNET_BRANCH branch doesn't exist, creating it from main"
-          git checkout -b "$DEVNET_BRANCH"
+          git checkout -b "$DEVNET_BRANCH" origin/main
         fi
 
         git push origin "$DEVNET_BRANCH"

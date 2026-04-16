@@ -34,7 +34,8 @@ pub const NodeTestContext = struct {
     loop: xev.Loop,
     logger_config: *zeam_utils.ZeamLoggerConfig,
     key_manager: key_manager.KeyManager,
-    validator_pubkeys: []const types.Bytes52,
+    validator_attestation_pubkeys: []const types.Bytes52,
+    validator_proposal_pubkeys: []const types.Bytes52,
     genesis_config: types.GenesisSpec,
     anchor_state: types.BeamState,
     tmp_dir: std.testing.TmpDir,
@@ -48,7 +49,10 @@ pub const NodeTestContext = struct {
 
     pub fn init(allocator: Allocator, opts: NodeTestOptions) !NodeTestContext {
         const utils = @import("./utils.zig");
-        utils.detectBackend();
+        utils.detectBackend() catch |err| {
+            std.log.err("failed to detect I/O backend: {s}", .{@errorName(err)});
+            return err;
+        };
 
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
@@ -60,13 +64,17 @@ pub const NodeTestContext = struct {
         var km = try key_manager.getTestKeyManager(allocator, opts.num_validators, opts.key_manager_slots);
         errdefer km.deinit();
 
-        const pubkeys = try km.getAllPubkeys(allocator, opts.num_validators);
-        errdefer allocator.free(pubkeys);
+        const all_pubkeys = try km.getAllPubkeys(allocator, opts.num_validators);
+        errdefer {
+            allocator.free(all_pubkeys.attestation_pubkeys);
+            allocator.free(all_pubkeys.proposal_pubkeys);
+        }
 
         const effective_genesis_time = opts.getEffectiveGenesisTime();
         const genesis_config = types.GenesisSpec{
             .genesis_time = effective_genesis_time,
-            .validator_pubkeys = pubkeys,
+            .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
+            .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
         };
 
         var anchor_state: types.BeamState = undefined;
@@ -92,6 +100,7 @@ pub const NodeTestContext = struct {
                 .preset = opts.preset,
                 .name = spec_name,
                 .attestation_committee_count = 1,
+                .max_attestations_data = 16,
             },
         };
 
@@ -103,7 +112,8 @@ pub const NodeTestContext = struct {
             .loop = loop,
             .logger_config = logger_config,
             .key_manager = km,
-            .validator_pubkeys = pubkeys,
+            .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
+            .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
             .genesis_config = genesis_config,
             .anchor_state = anchor_state,
             .tmp_dir = tmp_dir,
@@ -123,7 +133,8 @@ pub const NodeTestContext = struct {
         if (self.anchor_state_owned) {
             self.anchor_state.deinit();
         }
-        self.allocator.free(self.validator_pubkeys);
+        self.allocator.free(self.validator_attestation_pubkeys);
+        self.allocator.free(self.validator_proposal_pubkeys);
         self.key_manager.deinit();
         self.loop.deinit();
         if (self.spec_name_owned) {
@@ -168,12 +179,12 @@ pub const NodeTestContext = struct {
     pub fn signBlockWithValidatorKeys(
         self: *const NodeTestContext,
         allocator: Allocator,
-        block: *types.SignedBlockWithAttestation,
+        block: *types.SignedBlock,
     ) !void {
         var attestation_signatures = try types.AttestationSignatures.init(allocator);
         errdefer attestation_signatures.deinit();
 
-        for (block.message.block.body.attestations.constSlice()) |aggregated_attestation| {
+        for (block.block.body.attestations.constSlice()) |aggregated_attestation| {
             var signature_proof = try types.AggregatedSignatureProof.init(allocator);
             errdefer signature_proof.deinit();
 
@@ -213,7 +224,7 @@ pub const NodeTestContext = struct {
                 defer allocator.free(sig_ptrs);
 
                 for (indices.items, 0..) |val_idx, i| {
-                    pub_keys[i] = try self.key_manager.getPublicKeyHandle(val_idx);
+                    pub_keys[i] = try self.key_manager.getAttestationPubkeyHandle(val_idx);
                     sig_ptrs[i] = signature_handles.items[i].handle;
                 }
 
@@ -223,14 +234,18 @@ pub const NodeTestContext = struct {
 
                 const epoch: u32 = @intCast(aggregated_attestation.data.slot);
 
-                // Perform the actual aggregation
-                try xmss.aggregateSignatures(pub_keys, sig_ptrs, &message_hash, epoch, &signature_proof.proof_data);
+                // Perform the actual aggregation (no children in testing mode)
+                const empty_children_pks: [][]*const xmss.HashSigPublicKey = &.{};
+                const empty_children_proofs: []const xmss.ByteListMiB = &.{};
+                try xmss.aggregateSignatures(pub_keys, sig_ptrs, empty_children_pks, empty_children_proofs, &message_hash, epoch, types.LOG_INV_RATE_TEST, &signature_proof.proof_data);
             }
 
             try attestation_signatures.append(signature_proof);
         }
 
-        const proposer_signature = try self.key_manager.signAttestation(&block.message.proposer_attestation, allocator);
+        var block_root: types.Root = undefined;
+        try zeam_utils.hashTreeRoot(types.BeamBlock, block.block, &block_root, allocator);
+        const proposer_signature = try self.key_manager.signBlockRoot(block.block.proposer_index, &block_root, @intCast(block.block.slot));
 
         const signatures = types.BlockSignatures{
             .attestation_signatures = attestation_signatures,

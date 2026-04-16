@@ -23,7 +23,22 @@ const ServerStreamError = error{
     InvalidResponseVariant,
 };
 
+/// General RPC message size limit (4 MB). Used for req/resp protocol messages
+/// (BlocksByRoot, Status, etc.) and as a baseline gossip limit for small messages
+/// such as attestations and aggregations.
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Gossip block message size limit.
+///
+/// XMSS/post-quantum signatures are substantially larger than BLS: a single
+/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
+/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
+/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
+/// triggering error.TooLarge (issue #723).
+///
+/// Set to 50 MB to accommodate current devnet block sizes with room to grow.
+/// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.
+const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
 const FrameDecodeError = error{
@@ -45,6 +60,17 @@ fn decodeVarint(bytes: []const u8) uvarint.VarintParseError!struct { value: usiz
     return .{
         .value = result.value,
         .length = bytes.len - result.remaining.len,
+    };
+}
+
+fn validateGossipSnappyHeader(message_bytes: []const u8) (uvarint.VarintParseError || error{PayloadTooLarge})!struct { value: usize, length: usize } {
+    const decoded = try decodeVarint(message_bytes);
+    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
+        return error.PayloadTooLarge;
+    }
+    return .{
+        .value = decoded.value,
+        .length = decoded.length,
     };
 }
 
@@ -87,11 +113,7 @@ fn parseRequestFrame(bytes: []const u8) FrameDecodeError!struct {
         return error.EmptyFrame;
     }
 
-    const decoded = try decodeVarint(bytes);
-
-    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
+    const decoded = try validateGossipSnappyHeader(bytes);
 
     return .{
         .declared_len = decoded.value,
@@ -111,11 +133,7 @@ fn parseResponseFrame(bytes: []const u8) FrameDecodeError!struct {
         return error.Incomplete;
     }
 
-    const decoded = try decodeVarint(bytes[1..]);
-
-    if (decoded.value > MAX_RPC_MESSAGE_SIZE) {
-        return error.PayloadTooLarge;
-    }
+    const decoded = try validateGossipSnappyHeader(bytes[1..]);
 
     return .{
         .code = bytes[0],
@@ -233,16 +251,20 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
     return ctx.finished;
 }
 
-/// Writes failed deserialization bytes to disk for debugging purposes
-/// Returns the filename if the file was successfully created, null otherwise
-/// If timestamp is null, generates a new timestamp automatically
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) ?[]const u8 {
+/// Writes failed deserialization bytes to disk for debugging purposes.
+/// Logs the outcome (success or failure) itself; returns true on success.
+///
+/// Previously returned `?[]const u8` (the allocated filename) while also doing
+/// `defer allocator.free(filename)` — so callers received a dangling pointer and
+/// segfaulted when logging it.  The fix: log from inside this function and return
+/// a plain bool; callers no longer touch the filename string at all (#725).
+fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
         error.PathAlreadyExists => {}, // Directory already exists, continue
         else => {
             logger.err("Failed to create deserialization dumps directory: {any}", .{e});
-            return null;
+            return false;
         },
     };
 
@@ -250,14 +272,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     const actual_timestamp = timestamp orelse std.time.timestamp();
     const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
         logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
-        return null;
+        return false;
     };
     defer allocator.free(filename);
 
     // Write bytes to file
     const file = std.fs.cwd().createFile(filename, .{ .truncate = true }) catch |e| {
         logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
     defer file.close();
 
@@ -265,15 +287,16 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     var writer = file.writer(&write_buf);
     writer.interface.writeAll(message_bytes) catch |e| {
         logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
-        return null;
+        return false;
     };
     writer.interface.flush() catch |e| {
         logger.err("Failed to flush file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
 
+    // Log while filename is still live (before defer free runs).
     logger.warn("SSZ deserialization failed for {s} message - written {d} bytes to debug file: {s}", .{ message_type, message_bytes.len, filename });
-    return filename;
+    return true;
 }
 
 /// Generic SSZ deserializer for gossip messages. Returns null on failure (with
@@ -288,9 +311,7 @@ fn deserializeGossipMessage(
     var message_data: T = undefined;
     ssz.deserialize(T, data, &message_data, allocator) catch |e| {
         logger.err("Error in deserializing the signed {s} message: {any}", .{ label, e });
-        if (writeFailedBytes(data, label, allocator, null, logger)) |filename| {
-            logger.err("{s} deserialization failed - debug file created: {s}", .{ label, filename });
-        } else {
+        if (!writeFailedBytes(data, label, allocator, null, logger)) {
             logger.err("{s} deserialization failed - could not create debug file", .{label});
         }
         return null;
@@ -306,19 +327,27 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
 
-    const uncompressed_message = snappyz.decode(zigHandler.allocator, message_bytes) catch |e| {
+    // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
+    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
+    // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
+    // small messages (attestations, aggregations) to bound memory use.
+    const decode_limit: usize = switch (topic.gossip_topic.kind) {
+        .block => MAX_GOSSIP_BLOCK_SIZE,
+        else => MAX_RPC_MESSAGE_SIZE,
+    };
+
+    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
-        if (writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("Snappyz decode failed - debug file created: {s}", .{filename});
-        } else {
+        if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
         }
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
+
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(
-            types.SignedBlockWithAttestation,
+            types.SignedBlock,
             "block",
             uncompressed_message,
             zigHandler.allocator,
@@ -352,7 +381,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     const node_name = zigHandler.node_registry.getNodeNameFromPeerId(sender_peer_id_slice);
     switch (message) {
         .block => |signed_block| {
-            const block = signed_block.message.block;
+            const block = signed_block.block;
             zigHandler.logger.debug(
                 "network-{d}:: received gossip block slot={d} proposer={d} (compressed={d}B, raw={d}B) from peer={s}{f}",
                 .{
@@ -480,9 +509,7 @@ export fn handleRPCRequestFromRustBridge(
             "Error in deserializing the {s} RPC request from peer={s}{f}: {any}",
             .{ label, peer_id_slice, node_name, err },
         );
-        if (writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s} from peer={s}{f}", .{ label, filename, peer_id_slice, node_name });
-        } else {
+        if (!writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
         }
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
@@ -1283,3 +1310,9 @@ pub const EthLibp2p = struct {
         return result;
     }
 };
+
+test "validateGossipSnappyHeader rejects oversized declared size" {
+    var scratch: [MAX_VARINT_BYTES]u8 = undefined;
+    const encoded = uvarint.encode(usize, MAX_RPC_MESSAGE_SIZE + 1, &scratch);
+    try std.testing.expectError(error.PayloadTooLarge, validateGossipSnappyHeader(encoded));
+}
