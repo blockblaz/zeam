@@ -865,6 +865,13 @@ pub const BeamChain = struct {
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
         try self.root_to_slot_cache.put(block_root, block.slot);
 
+        // Serialize for RocksDB now. Fork-choice follow-up (e.g. storeAggregatedPayload) clones signature
+        // proofs with sszClone; doing that after STF must not be assumed to leave the original
+        // SignedBlock's SSZ List interiors unchanged for a second serialize at persistence time.
+        var block_ssz_for_db: std.ArrayList(u8) = .empty;
+        defer block_ssz_for_db.deinit(self.allocator);
+        try ssz.serialize(types.SignedBlock, signedBlock, &block_ssz_for_db, self.allocator);
+
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
 
@@ -987,7 +994,7 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 6. Save block and state to database and confirm the block in forkchoice
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
+        self.updateBlockDb(block_ssz_for_db.items, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
             self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
                 err,
@@ -1092,13 +1099,14 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
     }
 
-    /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
+    /// Update block database with block, state, and slot indices.
+    /// `signed_block_ssz` must be the SSZ encoding of `SignedBlock` (see onBlock).
+    fn updateBlockDb(self: *Self, signed_block_ssz: []const u8, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
         // Store block and state
-        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putBlockSerialized(database.DbBlocksNamespace, blockRoot, signed_block_ssz);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
