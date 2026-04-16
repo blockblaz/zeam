@@ -107,11 +107,20 @@ pub const NodeOptions = struct {
     }
 
     pub fn getValidatorIndices(self: *const NodeOptions, allocator: std.mem.Allocator) ![]usize {
-        var indices = try allocator.alloc(usize, self.validator_assignments.len);
-        for (self.validator_assignments, 0..) |assignment, i| {
-            indices[i] = assignment.index;
+        // Deduplicate: each validator index may appear multiple times in
+        // assignments (e.g. once for the attester key, once for the proposer
+        // key). The validator only needs to attest/propose once per slot.
+        var seen = std.AutoHashMap(usize, void).init(allocator);
+        defer seen.deinit();
+        var unique: std.ArrayList(usize) = .empty;
+        errdefer unique.deinit(allocator);
+        for (self.validator_assignments) |assignment| {
+            const result = try seen.getOrPut(assignment.index);
+            if (!result.found_existing) {
+                try unique.append(allocator, assignment.index);
+            }
         }
-        return indices;
+        return try unique.toOwnedSlice(allocator);
     }
 };
 
