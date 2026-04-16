@@ -27,8 +27,8 @@ name: hive
 
 on:
   schedule:
-    # 03:17 UTC daily — off-peak, avoids clashing with other nightly jobs.
-    - cron: '17 3 * * *'
+    # 10:00 UTC daily.
+    - cron: '0 10 * * *'
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
