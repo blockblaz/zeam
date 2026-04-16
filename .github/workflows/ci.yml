@@ -206,7 +206,7 @@ jobs:
       run: |
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build -Dprover=all; then
+          if zig build -Dprover=all -Drust-target-cpu=x86-64-v3; then
             echo "Successfully built on attempt $attempt"
             exit 0
           fi
