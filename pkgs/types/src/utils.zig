@@ -221,6 +221,20 @@ pub fn sszClone(allocator: Allocator, comptime T: type, data: T, cloned: *T) !vo
     try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
 }
 
+// Like sszClone but also returns the serialized bytes (caller owns the slice).
+// Using the same ssz.serialize pass for both clone and bytes avoids a second
+// serialize call on the same value, which has been observed to corrupt in-memory
+// List/Bitlist state when the value is later reused (e.g. cached blocks).
+pub fn sszCloneAndGetBytes(allocator: Allocator, comptime T: type, data: T, cloned: *T) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    // Do NOT defer deinit — caller takes ownership of the buffer.
+    errdefer bytes.deinit(allocator);
+
+    try ssz.serialize(T, data, &bytes, allocator);
+    try ssz.deserialize(T, bytes.items[0..], cloned, allocator);
+    return bytes.toOwnedSlice(allocator);
+}
+
 test "isSlotJustified treats finalized boundary as implicit" {
     var justified_slots = try types.JustifiedSlots.init(std.testing.allocator);
     defer justified_slots.deinit();
