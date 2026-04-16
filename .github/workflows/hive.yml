@@ -1,0 +1,152 @@
+# Hive integration tests for zeam.
+#
+# Triggers:
+#   - schedule: daily run against the default branch (main) to catch regressions
+#     early without paying the cost on every PR.
+#   - pull_request (labeled): only runs when the `run-hive` label is applied to
+#     a PR. Mirrors the `stf` label pattern used by risc0.yml.
+#   - workflow_dispatch: manual trigger with overridable simulator / hive repo.
+#
+# Prerequisites (external, tracked in issue #740):
+#   1. A Hive fork that ships a `clients/zeam/Dockerfile` capable of building
+#      zeam from a `{github, tag}` source (matching hive's dockerfile:git
+#      convention). Default repo is `ethpandaops/hive`, overridable via the
+#      HIVE_REPOSITORY repository variable or workflow_dispatch input.
+#   2. A Lean-consensus simulator under the same Hive fork, default
+#      `leanconsensus/sync`, overridable via HIVE_SIMULATOR repository variable
+#      or workflow_dispatch input.
+#
+# Until those land, scheduled and label-triggered runs will fail fast at the
+# hive build step — this is intentional so that the integration becomes usable
+# the moment the upstream pieces are in place, without a second zeam PR.
+
+name: hive
+
+on:
+  schedule:
+    # 03:17 UTC daily — off-peak, avoids clashing with other nightly jobs.
+    - cron: '17 3 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      simulator:
+        description: 'Hive simulator to run (e.g. leanconsensus/sync)'
+        required: false
+        default: ''
+      hive_repository:
+        description: 'Hive repo (owner/name) hosting the Lean simulator + zeam client definition'
+        required: false
+        default: ''
+      hive_version:
+        description: 'Hive branch or tag'
+        required: false
+        default: ''
+
+concurrency:
+  # Cancel previous PR runs, but keep scheduled runs independent (run_id fallback).
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  hive:
+    name: hive (${{ github.event.inputs.simulator || vars.HIVE_SIMULATOR || 'leanconsensus/sync' }})
+    runs-on: ubuntu-latest
+    # Gate PR runs behind the `run-hive` label. Scheduled and manual runs always pass this check.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-hive')
+
+    steps:
+      - name: Checkout zeam
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          SIMULATOR="${{ github.event.inputs.simulator }}"
+          [ -z "$SIMULATOR" ] && SIMULATOR="${{ vars.HIVE_SIMULATOR }}"
+          [ -z "$SIMULATOR" ] && SIMULATOR="leanconsensus/sync"
+
+          HIVE_REPOSITORY="${{ github.event.inputs.hive_repository }}"
+          [ -z "$HIVE_REPOSITORY" ] && HIVE_REPOSITORY="${{ vars.HIVE_REPOSITORY }}"
+          [ -z "$HIVE_REPOSITORY" ] && HIVE_REPOSITORY="ethpandaops/hive"
+
+          HIVE_VERSION="${{ github.event.inputs.hive_version }}"
+          [ -z "$HIVE_VERSION" ] && HIVE_VERSION="${{ vars.HIVE_VERSION }}"
+          [ -z "$HIVE_VERSION" ] && HIVE_VERSION="master"
+
+          echo "simulator=$SIMULATOR" >> "$GITHUB_OUTPUT"
+          echo "hive_repository=$HIVE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "hive_version=$HIVE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve client source
+        id: src
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SHA="${{ github.event.pull_request.head.sha }}"
+            REPO="${{ github.event.pull_request.head.repo.full_name }}"
+            NAMETAG="pr-${{ github.event.pull_request.number }}-$(echo $SHA | cut -c1-7)"
+          else
+            SHA="${{ github.sha }}"
+            REPO="${{ github.repository }}"
+            NAMETAG="$(echo ${{ github.ref_name }} | tr '/' '-')-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "nametag=$NAMETAG" >> "$GITHUB_OUTPUT"
+
+      - name: Run Hive
+        id: hive
+        uses: ethpandaops/hive-github-action@v0.6.3
+        with:
+          client: zeam
+          simulator: ${{ steps.cfg.outputs.simulator }}
+          hive_repository: ${{ steps.cfg.outputs.hive_repository }}
+          hive_version: ${{ steps.cfg.outputs.hive_version }}
+          client_config: |
+            - client: zeam
+              nametag: ${{ steps.src.outputs.nametag }}
+              dockerfile: git
+              build_args:
+                github: ${{ steps.src.outputs.repo }}
+                tag: ${{ steps.src.outputs.sha }}
+          workflow_artifact_upload: 'true'
+          workflow_artifact_prefix: hive-zeam-${{ steps.src.outputs.nametag }}
+
+      - name: Post summary comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const simulator = '${{ steps.cfg.outputs.simulator }}';
+            const nametag = '${{ steps.src.outputs.nametag }}';
+            const conclusion = '${{ steps.hive.outcome }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const icon = conclusion === 'success' ? 'success' : (conclusion === 'skipped' ? 'skipped' : 'failure');
+            const body = [
+              `### Hive results: ${icon}`,
+              ``,
+              `| Field | Value |`,
+              `|---|---|`,
+              `| Simulator | \`${simulator}\` |`,
+              `| Client tag | \`${nametag}\` |`,
+              `| Outcome | \`${conclusion}\` |`,
+              `| Run | [#${context.runId}](${runUrl}) |`,
+              ``,
+              `Artifacts (logs, test results) are attached to the workflow run.`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
