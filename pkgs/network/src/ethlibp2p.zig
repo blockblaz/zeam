@@ -919,17 +919,17 @@ pub extern fn create_and_run_network(
     listen_addresses: [*:0]const u8,
     connect_addresses: [*:0]const u8,
     topics: [*:0]const u8,
-) void;
+) callconv(.c) void;
 pub extern fn wait_for_network_ready(
     network_id: u32,
     timeout_ms: u64,
-) bool;
+) callconv(.c) bool;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
     message_ptr: [*]const u8,
     message_len: usize,
-) void;
+) callconv(.c) void;
 pub extern fn send_rpc_request(
     networkId: u32,
     peer_id: [*:0]const u8,
@@ -949,6 +949,29 @@ pub extern fn send_rpc_error_response(
     channel_id: u64,
     message_ptr: [*:0]const u8,
 ) callconv(.c) void;
+
+/// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
+/// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
+/// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
+const CreateNetworkThreadArgs = struct {
+    network_id: u32,
+    handle: *EthLibp2p,
+    local_private_key: [*:0]const u8,
+    listen_addresses: [*:0]const u8,
+    connect_addresses: [*:0]const u8,
+    topics: [*:0]const u8,
+};
+
+fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
+    create_and_run_network(
+        args.network_id,
+        args.handle,
+        args.local_private_key,
+        args.listen_addresses,
+        args.connect_addresses,
+        args.topics,
+    );
+}
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -1077,7 +1100,14 @@ pub const EthLibp2p = struct {
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
+        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
+            .network_id = self.params.networkId,
+            .handle = self,
+            .local_private_key = local_private_key.ptr,
+            .listen_addresses = listen_addresses_str.ptr,
+            .connect_addresses = connect_peers_str.ptr,
+            .topics = topics_str.ptr,
+        }});
 
         // Wait for the network to be fully initialized before returning
         // Use a 10 second timeout to avoid hanging indefinitely
