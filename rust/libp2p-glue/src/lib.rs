@@ -142,7 +142,7 @@ struct PendingResponse {
 ///
 /// This function is thread-safe and can be called from any thread.
 #[no_mangle]
-pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
+pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = std::time::Instant::now() + timeout;
 
@@ -178,7 +178,7 @@ pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
 ///
 /// The caller must ensure that `listen_addresses` and `connect_addresses` point to valid null-terminated C strings.
 #[no_mangle]
-pub unsafe fn create_and_run_network(
+pub unsafe extern "C" fn create_and_run_network(
     network_id: u32,
     zig_handler: u64,
     local_private_key: *const c_char,
@@ -255,7 +255,7 @@ pub unsafe fn create_and_run_network(
 /// The caller must ensure that `topic` points to valid null-terminated C string.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe fn publish_msg_to_rust_bridge(
+pub unsafe extern "C" fn publish_msg_to_rust_bridge(
     network_id: u32,
     topic: *const c_char,
     message_str: *const u8,
@@ -307,7 +307,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
 /// The caller must ensure that `peer_id` points to a valid null-terminated C string.
 /// The caller must ensure that `request_data` points to valid memory of `request_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_request(
+pub unsafe extern "C" fn send_rpc_request(
     network_id: u32,
     peer_id: *const c_char,
     protocol_tag: u32,
@@ -382,7 +382,7 @@ pub unsafe fn send_rpc_request(
 /// # Safety
 /// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_response_chunk(
+pub unsafe extern "C" fn send_rpc_response_chunk(
     network_id: u32,
     channel_id: u64,
     response_data: *const u8,
@@ -438,7 +438,7 @@ pub unsafe fn send_rpc_response_chunk(
 /// # Safety
 /// The caller must ensure the channel id is valid for a pending response.
 #[no_mangle]
-pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
+pub unsafe extern "C" fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     let channel = {
         let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
         response_map.remove(&channel_id)
@@ -479,7 +479,7 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
 /// # Safety
 /// The caller must ensure `message_ptr` points to a valid null-terminated C string.
 #[no_mangle]
-pub unsafe fn send_rpc_error_response(
+pub unsafe extern "C" fn send_rpc_error_response(
     network_id: u32,
     channel_id: u64,
     message_ptr: *const c_char,
