@@ -411,6 +411,13 @@ fn mainInner() !void {
             // Nodes 1,2 start immediately; Node 3 starts after finalization to test sync
             const num_validators: usize = 3;
             var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
+            // Defer order (LIFO): key_manager.deinit() runs first so it can drop its
+            // map entries while the cached XMSS handles are still valid, then the
+            // process-global cache itself is freed. key_manager.deinit() only
+            // deinits keys it owns (addKeypair), not borrowed ones (addCachedKeypair);
+            // the cache is the real owner of those handles and would otherwise
+            // leak until process exit since it uses the page allocator.
+            defer key_manager_lib.deinitGlobalKeyCache();
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager
