@@ -960,7 +960,7 @@ pub extern fn send_rpc_error_response(
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
-    network_name: []const u8,
+    fork_digest: []const u8,
     local_private_key: []const u8,
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
@@ -992,8 +992,8 @@ pub const EthLibp2p = struct {
         params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
     ) !Self {
-        const owned_network_name = try allocator.dupe(u8, params.network_name);
-        errdefer allocator.free(owned_network_name);
+        const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
+        errdefer allocator.free(owned_fork_digest);
 
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
         errdefer gossip_handler.deinit();
@@ -1008,7 +1008,7 @@ pub const EthLibp2p = struct {
             .allocator = allocator,
             .params = .{
                 .networkId = params.networkId,
-                .network_name = owned_network_name,
+                .fork_digest = owned_fork_digest,
                 .local_private_key = params.local_private_key,
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
@@ -1036,7 +1036,7 @@ pub const EthLibp2p = struct {
             self.allocator.free(peers);
         }
 
-        self.allocator.free(self.params.network_name);
+        self.allocator.free(self.params.fork_digest);
 
         var it = self.rpcCallbacks.iterator();
         while (it.next()) |entry| {
@@ -1068,7 +1068,7 @@ pub const EthLibp2p = struct {
                     for (0..subnet_count) |i| {
                         const subnet_id: types.SubnetId = @intCast(i);
                         const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
-                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
                         defer topic.deinit();
                         const topic_str = try topic.encode();
                         try topics_list.append(self.allocator, topic_str);
@@ -1076,7 +1076,7 @@ pub const EthLibp2p = struct {
                 },
                 else => {
                     const gossip_topic = interface.GossipTopic{ .kind = kind };
-                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
                     defer topic.deinit();
                     const topic_str = try topic.encode();
                     try topics_list.append(self.allocator, topic_str);
@@ -1103,7 +1103,7 @@ pub const EthLibp2p = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
-        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
+        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.fork_digest);
         defer topic.deinit();
         const topic_str = try topic.encodeZ();
         defer self.allocator.free(topic_str);

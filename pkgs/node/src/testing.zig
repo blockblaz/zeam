@@ -42,6 +42,7 @@ pub const NodeTestContext = struct {
     data_dir: []u8,
     db: database.Db,
     spec_name: []u8,
+    fork_digest: []u8,
     chain_config: configs.ChainConfig,
     clock: clockFactory.Clock,
     anchor_state_owned: bool = true,
@@ -92,6 +93,8 @@ pub const NodeTestContext = struct {
 
         const spec_name = try allocator.dupe(u8, opts.spec_name);
         errdefer allocator.free(spec_name);
+        const fork_digest = try allocator.dupe(u8, "12345678");
+        errdefer allocator.free(fork_digest);
 
         const chain_config = configs.ChainConfig{
             .id = configs.Chain.custom,
@@ -99,6 +102,7 @@ pub const NodeTestContext = struct {
             .spec = .{
                 .preset = opts.preset,
                 .name = spec_name,
+                .fork_digest = fork_digest,
                 .attestation_committee_count = 1,
                 .max_attestations_data = 16,
             },
@@ -120,6 +124,7 @@ pub const NodeTestContext = struct {
             .data_dir = data_dir,
             .db = db,
             .spec_name = spec_name,
+            .fork_digest = fork_digest,
             .chain_config = chain_config,
             .clock = clock,
         };
@@ -139,6 +144,7 @@ pub const NodeTestContext = struct {
         self.loop.deinit();
         if (self.spec_name_owned) {
             self.allocator.free(self.spec_name);
+            self.allocator.free(self.fork_digest);
         }
         self.logger_config.deinit();
         self.allocator.destroy(self.logger_config);

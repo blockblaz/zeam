@@ -4,6 +4,7 @@ pub const mainnet = types.ChainSpec{
     // 10 minutes slot for proving purposes
     .preset = types.Preset.mainnet,
     .name = "mainnet",
+    .fork_digest = "00000000",
     .attestation_committee_count = 1,
     .max_attestations_data = 16,
 };

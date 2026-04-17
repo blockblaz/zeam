@@ -398,7 +398,7 @@ fn mainInner() !void {
 
             // some base mainnet spec would be loaded to build this up
             const chain_spec =
-                \\{"preset": "mainnet", "name": "beamdev"}
+                \\{"preset": "mainnet", "name": "beamdev", "fork_digest": "12345678"}
             ;
             const options = json.ParseOptions{
                 .ignore_unknown_fields = true,
@@ -504,8 +504,8 @@ fn mainInner() !void {
                 const key_pair1 = enr_lib.KeyPair.generate();
                 const priv_key1 = key_pair1.v4.toString();
                 listen_addresses1 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9001")});
-                const network_name1 = try allocator.dupe(u8, chain_config.spec.name);
-                errdefer allocator.free(network_name1);
+                const fork_digest1 = try allocator.dupe(u8, chain_config.spec.fork_digest);
+                errdefer allocator.free(fork_digest1);
                 // Create empty registry for test network
                 const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
@@ -513,7 +513,7 @@ fn mainInner() !void {
 
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
-                    .network_name = network_name1,
+                    .fork_digest = fork_digest1,
                     .local_private_key = &priv_key1,
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
@@ -528,8 +528,8 @@ fn mainInner() !void {
                 const priv_key2 = key_pair2.v4.toString();
                 listen_addresses2 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9002")});
                 connect_peers = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
-                const network_name2 = try allocator.dupe(u8, chain_config.spec.name);
-                errdefer allocator.free(network_name2);
+                const fork_digest2 = try allocator.dupe(u8, chain_config.spec.fork_digest);
+                errdefer allocator.free(fork_digest2);
                 // Create empty registry for test network
                 const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
@@ -537,7 +537,7 @@ fn mainInner() !void {
 
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
-                    .network_name = network_name2,
+                    .fork_digest = fork_digest2,
                     .local_private_key = &priv_key2,
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
@@ -552,15 +552,15 @@ fn mainInner() !void {
                 const priv_key3 = key_pair3.v4.toString();
                 listen_addresses3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/tcp/9003")});
                 connect_peers3 = try allocator.dupe(Multiaddr, &[_]Multiaddr{try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/9001")});
-                const network_name3 = try allocator.dupe(u8, chain_config.spec.name);
-                errdefer allocator.free(network_name3);
+                const fork_digest3 = try allocator.dupe(u8, chain_config.spec.fork_digest);
+                errdefer allocator.free(fork_digest3);
                 const test_registry3 = try allocator.create(node_lib.NodeNameRegistry);
                 test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry3);
 
                 network3.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 2,
-                    .network_name = network_name3,
+                    .fork_digest = fork_digest3,
                     .local_private_key = &priv_key3,
                     .listen_addresses = listen_addresses3,
                     .connect_peers = connect_peers3,
