@@ -187,17 +187,20 @@ pub const GenesisSpec = struct {
 pub const ChainSpec = struct {
     preset: params.Preset,
     name: []u8,
+    fork_digest: []u8,
     attestation_committee_count: SubnetId,
     max_attestations_data: u8,
 
     pub fn deinit(self: *ChainSpec, allocator: Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.fork_digest);
     }
 
     pub fn toJson(self: *const ChainSpec, allocator: Allocator) !json.Value {
         var obj = json.ObjectMap.init(allocator);
         try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
         try obj.put("name", json.Value{ .string = self.name });
+        try obj.put("fork_digest", json.Value{ .string = self.fork_digest });
         try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
         try obj.put("max_attestations_data", json.Value{ .integer = self.max_attestations_data });
         return json.Value{ .object = obj };

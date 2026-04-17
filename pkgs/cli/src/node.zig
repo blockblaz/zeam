@@ -182,7 +182,7 @@ pub const Node = struct {
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
-            \\{"preset": "mainnet", "name": "devnet0"}
+            \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
@@ -219,7 +219,7 @@ pub const Node = struct {
 
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
             .networkId = options.network_id,
-            .network_name = chain_config.spec.name,
+            .fork_digest = chain_config.spec.fork_digest,
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,

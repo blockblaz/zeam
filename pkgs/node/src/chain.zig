@@ -1757,12 +1757,14 @@ test "process and add mock blocks into a node's chain" {
     // Generate a mock chain with validator pubkeys baked into the genesis spec.
     const mock_chain = try stf.genMockChain(allocator, 5, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -1844,12 +1846,14 @@ test "printSlot output demonstration" {
     // Create a mock chain with some blocks
     const mock_chain = try stf.genMockChain(allocator, 3, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -1919,12 +1923,14 @@ test "buildTreeVisualization integration test" {
     // Create a mock chain with some blocks
     const mock_chain = try stf.genMockChain(allocator, 3, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2006,12 +2012,14 @@ test "attestation validation - comprehensive" {
 
     const mock_chain = try stf.genMockChain(allocator, 3, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2282,12 +2290,14 @@ test "attestation validation - gossip vs block future slot handling" {
 
     const mock_chain = try stf.genMockChain(allocator, 2, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2382,12 +2392,14 @@ test "attestation processing - valid block attestation" {
 
     const mock_chain = try stf.genMockChain(allocator, 3, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2483,12 +2495,14 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
 
     const mock_chain = try stf.genMockChain(allocator, 3, null);
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
