@@ -230,10 +230,7 @@ pub unsafe fn create_and_run_network(
         Err(e) => {
             logger::rustLogger.error(
                 network_id,
-                &format!(
-                    "invalid connect multiaddress in \"{}\": {}",
-                    connect_str, e
-                ),
+                &format!("invalid connect multiaddress in \"{}\": {}", connect_str, e),
             );
             release_params();
             return;
