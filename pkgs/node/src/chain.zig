@@ -1418,14 +1418,10 @@ pub const BeamChain = struct {
 
         // 4. Validate attestation is not too far in the future
         //
-        //    Gossip attestations must be for current or past slots only. Validators attest
-        //    in interval 1 of the current slot, so they cannot attest for future slots.
-        //    Block attestations can be more lenient since the block itself was validated.
+        //    Per leanSpec: allow current_slot + 1 for clock disparity tolerance,
+        //    regardless of whether the attestation is from gossip or a block.
         const current_slot = self.forkChoice.getCurrentSlot();
-        const max_allowed_slot = if (is_from_block)
-            current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
-        else
-            current_slot; // Gossip attestations: no future slots allowed
+        const max_allowed_slot = current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE;
 
         if (data.slot > max_allowed_slot) {
             self.logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
@@ -2313,12 +2309,9 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
 
-    // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
-
-    // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    // Per leanSpec store.py:320: assert data.slot <= current_slot + Slot(1)
+    // Both gossip and block attestations allow current_slot + 1
+    try beam_chain.validateAttestationData(next_slot_attestation.message, false);
     try beam_chain.validateAttestationData(next_slot_attestation.message, true);
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
