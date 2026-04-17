@@ -51,6 +51,21 @@ jobs:
       run: |
         curl -L https://risczero.com/install | bash
         /home/runner/.risc0/bin/rzup install r0vm 3.0.3
+        # rzup writes to ~/.bashrc and ~/.profile, neither of which is sourced
+        # by GitHub Actions `run:` steps (they execute as non-interactive,
+        # non-login bash). Without this, `r0vm` is not on PATH in the next
+        # step, and risc0-zkvm 3.x's `default_prover()` hangs indefinitely
+        # trying to IPC with a daemon it cannot spawn.
+        echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+
+    - name: Verify r0vm on PATH
+      run: |
+        which r0vm
+        r0vm --version
 
     - name: run prover
+      # Cap runaway prover invocations (e.g. PATH regressions that make
+      # `default_prover()` block on IPC setup) so they surface as a clean
+      # timeout rather than eating the default 6h job budget.
+      timeout-minutes: 30
       run: zig build run -Dprover=risc0 -- prove -z risc0
