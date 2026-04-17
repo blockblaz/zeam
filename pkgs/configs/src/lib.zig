@@ -32,6 +32,9 @@ pub const ChainConfig = struct {
                     if (chainOpts.max_attestations_data == null) {
                         chainOpts.max_attestations_data = 16;
                     }
+                    if (chainOpts.fork_digest == null) {
+                        return ChainConfigError.InvalidChainSpec;
+                    }
                     const genesis = utils.Cast(types.GenesisSpec, chainOpts);
                     // transfer ownership of any allocated memory in chainOpts to spec
                     const spec = utils.Cast(types.ChainSpec, chainOpts);
