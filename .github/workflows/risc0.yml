@@ -64,8 +64,9 @@ jobs:
         r0vm --version
 
     - name: run prover
-      # Cap runaway prover invocations (e.g. PATH regressions that make
-      # `default_prover()` block on IPC setup) so they surface as a clean
-      # timeout rather than eating the default 6h job budget.
-      timeout-minutes: 30
+      # Historically this step takes ~2h on GitHub's 2-core Ubuntu runners
+      # (last green main run: 2h 3m in `run prover`). Cap it at 180 min so
+      # a genuine slow run still passes while true hangs surface as a clean
+      # timeout well before the default 6h job budget is exhausted.
+      timeout-minutes: 180
       run: zig build run -Dprover=risc0 -- prove -z risc0
