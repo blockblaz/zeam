@@ -81,6 +81,18 @@ const Metrics = struct {
     lean_is_aggregator: LeanIsAggregatorGauge,
     lean_attestation_committee_subnet: LeanAttestationCommitteeSubnetGauge,
     lean_attestation_committee_count: LeanAttestationCommitteeCountGauge,
+    // Block production metrics (leanMetrics#29)
+    lean_block_building_time_seconds: BlockBuildingTimeHistogram,
+    lean_block_building_payload_aggregation_time_seconds: BlockPayloadAggregationTimeHistogram,
+    lean_block_aggregated_payloads: BlockAggregatedPayloadsHistogram,
+    lean_block_building_success_total: BlockBuildingSuccessCounter,
+    lean_block_building_failures_total: BlockBuildingFailuresCounter,
+    // Sync status gauge (leanMetrics#29)
+    lean_node_sync_status: LeanNodeSyncStatusGauge,
+    // Gossip message size histograms (leanMetrics#29)
+    lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
+    lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
+    lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -130,7 +142,20 @@ const Metrics = struct {
     const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
     const LeanLatestKnownAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
     // Committee aggregation histogram type
-    const CommitteeSignaturesAggregationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
+    // Buckets widened for Devnet-4 (leanMetrics#29): was [0.005..1], now [0.05..4]
+    const CommitteeSignaturesAggregationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
+    // Block production metric types (leanMetrics#29)
+    const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
+    const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
+    const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
+    const BlockBuildingSuccessCounter = metrics_lib.Counter(u64);
+    const BlockBuildingFailuresCounter = metrics_lib.Counter(u64);
+    // Sync status gauge type (leanMetrics#29): 0=idle, 1=syncing, 2=synced
+    const LeanNodeSyncStatusGauge = metrics_lib.Gauge(u64);
+    // Gossip message size histogram types (leanMetrics#29)
+    const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
+    const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
+    const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -168,6 +193,11 @@ pub const Histogram = struct {
             .context = self.context,
             .observe_impl = self.observe,
         };
+    }
+
+    /// Record a value directly without starting a timer.
+    pub fn record(self: *const Histogram, value: f32) void {
+        self.observe(self.context, value);
     }
 };
 
@@ -243,6 +273,42 @@ fn observePQSigAggregatedVerification(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeBlockBuildingTime(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockBuildingTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeBlockPayloadAggregationTime(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockPayloadAggregationTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeBlockAggregatedPayloads(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.BlockAggregatedPayloadsHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeGossipBlockSizeBytes(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.GossipBlockSizeBytesHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeGossipAttestationSizeBytes(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.GossipAttestationSizeBytesHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeGossipAggregationSizeBytes(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.GossipAggregationSizeBytesHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeCommitteeSignaturesAggregation(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return; // No-op if not initialized
     const histogram: *Metrics.CommitteeSignaturesAggregationHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -303,6 +369,31 @@ pub var lean_pq_sig_aggregated_signatures_verification_time_seconds: Histogram =
 pub var lean_committee_signatures_aggregation_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeCommitteeSignaturesAggregation,
+};
+
+pub var lean_block_building_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeBlockBuildingTime,
+};
+pub var lean_block_building_payload_aggregation_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeBlockPayloadAggregationTime,
+};
+pub var lean_block_aggregated_payloads: Histogram = .{
+    .context = null,
+    .observe = &observeBlockAggregatedPayloads,
+};
+pub var lean_gossip_block_size_bytes: Histogram = .{
+    .context = null,
+    .observe = &observeGossipBlockSizeBytes,
+};
+pub var lean_gossip_attestation_size_bytes: Histogram = .{
+    .context = null,
+    .observe = &observeGossipAttestationSizeBytes,
+};
+pub var lean_gossip_aggregation_size_bytes: Histogram = .{
+    .context = null,
+    .observe = &observeGossipAggregationSizeBytes,
 };
 
 /// Initializes the metrics system. Must be called once at startup.
@@ -370,6 +461,18 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_is_aggregator = Metrics.LeanIsAggregatorGauge.init("lean_is_aggregator", .{ .help = "Validator's is_aggregator status. True=1, False=0." }, .{}),
         .lean_attestation_committee_subnet = Metrics.LeanAttestationCommitteeSubnetGauge.init("lean_attestation_committee_subnet", .{ .help = "Node's attestation committee subnet." }, .{}),
         .lean_attestation_committee_count = Metrics.LeanAttestationCommitteeCountGauge.init("lean_attestation_committee_count", .{ .help = "Number of attestation committees." }, .{}),
+        // Block production metrics (leanMetrics#29)
+        .lean_block_building_time_seconds = Metrics.BlockBuildingTimeHistogram.init("lean_block_building_time_seconds", .{ .help = "Total time to build a block (propose_block)." }, .{}),
+        .lean_block_building_payload_aggregation_time_seconds = Metrics.BlockPayloadAggregationTimeHistogram.init("lean_block_building_payload_aggregation_time_seconds", .{ .help = "Time to aggregate attestation payloads during block building." }, .{}),
+        .lean_block_aggregated_payloads = Metrics.BlockAggregatedPayloadsHistogram.init("lean_block_aggregated_payloads", .{ .help = "Number of aggregated attestation payloads included in a block." }, .{}),
+        .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Total number of successfully produced blocks." }, .{}),
+        .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Total number of block production failures." }, .{}),
+        // Sync status (leanMetrics#29): 0=idle, 1=syncing, 2=synced
+        .lean_node_sync_status = Metrics.LeanNodeSyncStatusGauge.init("lean_node_sync_status", .{ .help = "Node sync status: 0=idle, 1=syncing (behind peers), 2=synced." }, .{}),
+        // Gossip message size histograms (leanMetrics#29)
+        .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Uncompressed size of received gossip block messages in bytes." }, .{}),
+        .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Uncompressed size of received gossip attestation messages in bytes." }, .{}),
+        .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Uncompressed size of received gossip aggregation messages in bytes." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -397,6 +500,16 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_pq_sig_aggregated_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_building_time_seconds);
     lean_pq_sig_aggregated_signatures_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds);
     lean_committee_signatures_aggregation_time_seconds.context = @ptrCast(&metrics.lean_committee_signatures_aggregation_time_seconds);
+    // Block production histogram contexts (leanMetrics#29)
+    lean_block_building_time_seconds.context = @ptrCast(&metrics.lean_block_building_time_seconds);
+    lean_block_building_payload_aggregation_time_seconds.context = @ptrCast(&metrics.lean_block_building_payload_aggregation_time_seconds);
+    lean_block_aggregated_payloads.context = @ptrCast(&metrics.lean_block_aggregated_payloads);
+    // Gossip size histogram contexts (leanMetrics#29)
+    lean_gossip_block_size_bytes.context = @ptrCast(&metrics.lean_gossip_block_size_bytes);
+    lean_gossip_attestation_size_bytes.context = @ptrCast(&metrics.lean_gossip_attestation_size_bytes);
+    lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
+    // Initialize sync status to idle at startup (leanMetrics#29)
+    metrics.lean_node_sync_status.set(0);
 
     g_initialized = true;
 }

@@ -273,6 +273,15 @@ pub const BeamChain = struct {
 
         // Update current slot metric (wall-clock time slot)
         zeam_metrics.metrics.lean_current_slot.set(slot);
+        // Update sync status metric (leanMetrics#29): 0=idle, 1=syncing, 2=synced
+        {
+            const sync_val: u64 = switch (self.getSyncStatus()) {
+                .synced => 2,
+                .no_peers, .fc_initing => 0,
+                .behind_peers => 1,
+            };
+            zeam_metrics.metrics.lean_node_sync_status.set(sync_val);
+        }
 
         var has_proposal = false;
         if (interval == 0) {
@@ -355,6 +364,12 @@ pub const BeamChain = struct {
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
+        // Block building total time timer (leanMetrics#29)
+        const block_building_timer = zeam_metrics.lean_block_building_time_seconds.start();
+        errdefer {
+            _ = block_building_timer.observe();
+            zeam_metrics.metrics.lean_block_building_failures_total.incr();
+        }
         // dump the vote tracker, letting this stay here commented for handy debugging activation
         // var iterator = self.forkChoice.attestations.iterator();
         // while (iterator.next()) |entry| {
@@ -386,9 +401,11 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
+        const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
+        const pq_building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
         const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
-        _ = building_timer.observe();
+        _ = pq_building_timer.observe();
+        _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
         var agg_att_cleanup = true;
@@ -489,6 +506,11 @@ pub const BeamChain = struct {
         });
         forkchoice_added = true;
         _ = try self.forkChoice.updateHead();
+
+        // Record block production success metrics (leanMetrics#29)
+        _ = block_building_timer.observe();
+        zeam_metrics.metrics.lean_block_building_success_total.incr();
+        zeam_metrics.lean_block_aggregated_payloads.record(@floatFromInt(attestation_signatures.len()));
 
         return .{
             .block = block,

@@ -10,6 +10,7 @@ const multiaddr_mod = @import("multiaddr");
 const Multiaddr = multiaddr_mod.Multiaddr;
 const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -344,6 +345,13 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
+
+    // Record gossip message size metrics (leanMetrics#29) — observed on uncompressed bytes
+    switch (topic.gossip_topic.kind) {
+        .block => zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .attestation => zeam_metrics.lean_gossip_attestation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .aggregation => zeam_metrics.lean_gossip_aggregation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+    }
 
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(
