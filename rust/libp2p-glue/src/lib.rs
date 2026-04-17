@@ -186,18 +186,59 @@ pub unsafe fn create_and_run_network(
     connect_addresses: *const c_char,
     topics_str: *const c_char,
 ) {
-    let listen_multiaddrs = CStr::from_ptr(listen_addresses)
-        .to_string_lossy()
-        .split(",")
-        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
-        .collect::<Vec<_>>();
+    // Register the handler early so any logs emitted from the parse/validation
+    // path below are routed through the Zig logger.
+    set_zig_handler(network_id, zig_handler);
 
-    let connect_multiaddrs = CStr::from_ptr(connect_addresses)
-        .to_string_lossy()
+    // Release the Zig-allocated parameter strings on every exit path from here on,
+    // including parse failures, so the Zig side never leaks the buffers it handed us.
+    let release_params = || {
+        releaseStartNetworkParams(
+            zig_handler,
+            local_private_key,
+            listen_addresses,
+            connect_addresses,
+            topics_str,
+        );
+    };
+
+    let listen_str = CStr::from_ptr(listen_addresses).to_string_lossy();
+    let listen_multiaddrs: Vec<Multiaddr> = match listen_str
         .split(",")
-        .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
-        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
-        .collect::<Vec<_>>();
+        .map(|addr| addr.parse::<Multiaddr>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid listen multiaddress in \"{}\": {}", listen_str, e),
+            );
+            release_params();
+            return;
+        }
+    };
+
+    let connect_str = CStr::from_ptr(connect_addresses).to_string_lossy();
+    let connect_multiaddrs: Vec<Multiaddr> = match connect_str
+        .split(",")
+        .filter(|s| !s.trim().is_empty()) // connect_addresses can be empty
+        .map(|addr| addr.parse::<Multiaddr>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!(
+                    "invalid connect multiaddress in \"{}\": {}",
+                    connect_str, e
+                ),
+            );
+            release_params();
+            return;
+        }
+    };
 
     let topics = CStr::from_ptr(topics_str)
         .to_string_lossy()
@@ -214,24 +255,32 @@ pub unsafe fn create_and_run_network(
         .strip_prefix("0x")
         .unwrap_or(&local_private_key_hex);
 
-    let mut private_key_bytes =
-        hex::decode(private_key_hex).expect("Invalid hex string for private key");
+    let mut private_key_bytes = match hex::decode(private_key_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid hex string for private key: {}", e),
+            );
+            release_params();
+            return;
+        }
+    };
 
-    let local_key_pair = Keypair::from(secp256k1::Keypair::from(
-        secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes)
-            .expect("Invalid private key bytes"),
-    ));
+    let secret_key = match secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid secp256k1 private key bytes: {}", e),
+            );
+            release_params();
+            return;
+        }
+    };
+    let local_key_pair = Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    // Store zig_handler for this network id for use by free functions
-    set_zig_handler(network_id, zig_handler);
-
-    releaseStartNetworkParams(
-        zig_handler,
-        local_private_key,
-        listen_addresses,
-        connect_addresses,
-        topics_str,
-    );
+    release_params();
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
