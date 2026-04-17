@@ -17,18 +17,26 @@ lto = false  # Set to true for single-prover builds to reduce binary size from 1
 strip = "symbols"
 codegen-units = 16  # Multiple units keep risc0 and openvm code separate
 
-# Optimized profile for OpenVM-only builds (maximum size reduction)
+# Optimized profile for OpenVM-only builds (size reduction, but see opt-level note).
 [profile.openvm-release]
 inherits = "release"
 lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
-opt-level = "z"      # Optimize for size instead of speed
+# opt-level = "z" triggers a codegen interaction with leanMultisig's prover
+# (rec_aggregation / lean_prover / backend) that produces a runtime General
+# Protection Exception inside xmss_aggregate on x86_64 Linux. Bisected against
+# `zig build run -Dprover=risc0 -- prove -z risc0`: "z" crashes deterministically,
+# "s" and numeric levels are clean. Using "s" keeps the size-optimization focus
+# without the aggressive inlining/outlining passes that expose the issue.
+# Tracked in #734. risc0-release mirrors this setting.
+opt-level = "s"      # "s" rather than "z": see comment above and #734
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary
 
-# Optimized profile for RISC0-only builds (maximum size reduction)
+# Optimized profile for RISC0-only builds (size reduction, but see opt-level note).
 [profile.risc0-release]
 inherits = "release"
 lto = "off"          # Disable LTO on macOS due to linker issues, keeps symbols separate
-opt-level = "z"      # Optimize for size instead of speed
+# See openvm-release above for why opt-level is "s" and not "z" (#734).
+opt-level = "s"
 codegen-units = 1    # Better optimization (slower compilation)
 panic = "abort"      # Remove unwinding code for smaller binary
