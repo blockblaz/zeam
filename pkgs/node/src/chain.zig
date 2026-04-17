@@ -1436,16 +1436,12 @@ pub const BeamChain = struct {
         defer _ = timer.observe();
 
         // 1. Validate that source, target, and head blocks exist in proto array (thread-safe)
-        //    Source blocks that have been finalized and pruned from the protoarray are still valid —
-        //    they were canonical at one point and are now below the finalization horizon.
-        const finalized_checkpoint = self.forkChoice.getLatestFinalized();
-        const source_block = self.forkChoice.getProtoNode(data.source.root);
-        if (source_block == null and data.source.slot > finalized_checkpoint.slot) {
+        const source_block = self.forkChoice.getProtoNode(data.source.root) orelse {
             self.logger.debug("Attestation validation failed: unknown source block root=0x{x}", .{
                 &data.source.root,
             });
             return AttestationValidationError.UnknownSourceBlock;
-        }
+        };
 
         const target_block = self.forkChoice.getProtoNode(data.target.root) orelse {
             self.logger.debug("attestation validation failed: unknown target block slot={d} root=0x{x}", .{
@@ -1465,12 +1461,9 @@ pub const BeamChain = struct {
         _ = head_block; // Will be used in future validations
 
         // 2. Validate slot relationships
-        //    Use proto node slot when available, fall back to checkpoint slot for pruned sources
-        const source_slot = if (source_block) |sb| sb.slot else data.source.slot;
-
-        if (source_slot > target_block.slot) {
+        if (source_block.slot > target_block.slot) {
             self.logger.debug("attestation validation failed: source slot {d} > target slot {d}", .{
-                source_slot,
+                source_block.slot,
                 target_block.slot,
             });
             return AttestationValidationError.SourceSlotExceedsTarget;
@@ -1485,15 +1478,13 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceCheckpointExceedsTarget;
         }
 
-        // 3. Validate checkpoint slots match block slots (skip for pruned source blocks)
-        if (source_block) |sb| {
-            if (sb.slot != data.source.slot) {
-                self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
-                    sb.slot,
-                    data.source.slot,
-                });
-                return AttestationValidationError.SourceCheckpointSlotMismatch;
-            }
+        // 3. Validate checkpoint slots match block slots
+        if (source_block.slot != data.source.slot) {
+            self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
+                source_block.slot,
+                data.source.slot,
+            });
+            return AttestationValidationError.SourceCheckpointSlotMismatch;
         }
 
         //    This corresponds to leanSpec's: assert target_block.slot == attestation.target.slot
@@ -1546,8 +1537,9 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate the attestation data first (same rules as individual gossip attestations)
-        try self.validateAttestationData(signedAggregation.data, false);
+        // Per leanSpec: on_gossip_aggregated_attestation does NOT call validate_attestation.
+        // Attestation data was already validated when individual gossip attestations arrived.
+        // Re-validating here would fail after finalization prunes the source block from protoarray.
 
         try self.verifyAggregatedAttestation(signedAggregation);
 
