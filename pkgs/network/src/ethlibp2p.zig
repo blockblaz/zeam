@@ -537,7 +537,20 @@ export fn handleRPCRequestFromRustBridge(
 
     const request_method = std.meta.activeTag(request);
 
-    var stream_context = ServerStreamContext{
+    // Heap-allocate the stream context so its address remains valid even if
+    // a handler (now or in the future) retains the stream for work that
+    // outlives this function call. A stack-allocated context would leave
+    // stream.ptr dangling the moment handleRPCRequestFromRustBridge returns.
+    const stream_context = zigHandler.allocator.create(ServerStreamContext) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to allocate RPC stream context for peer={s}{f} channel={d}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, err },
+        );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Internal error allocating stream context");
+        return;
+    };
+    defer zigHandler.allocator.destroy(stream_context);
+    stream_context.* = ServerStreamContext{
         .zigHandler = zigHandler,
         .channel_id = channel_id,
         .peer_id = peer_id_slice,
@@ -545,7 +558,7 @@ export fn handleRPCRequestFromRustBridge(
     };
 
     var stream = interface.ReqRespServerStream{
-        .ptr = &stream_context,
+        .ptr = stream_context,
         .sendResponseFn = serverStreamSendResponse,
         .sendErrorFn = serverStreamSendError,
         .finishFn = serverStreamFinish,
@@ -1017,6 +1030,20 @@ pub const EthLibp2p = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Release the Thread handle so the OS can reclaim the join-state slot.
+        // The Rust-side libp2p loop has no shutdown signal yet, so the OS
+        // thread itself keeps running until the process exits; joining here
+        // would hang forever. Detaching is the best we can do until a proper
+        // stop_network FFI hook is added (tracked as a follow-up).
+        //
+        // NOTE: callers must treat EthLibp2p.deinit as a process-shutdown
+        // operation. Freeing the struct while the Rust thread is still issuing
+        // callbacks into it would be a use-after-free.
+        if (self.rustBridgeThread) |thread| {
+            thread.detach();
+            self.rustBridgeThread = null;
+        }
+
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
 
