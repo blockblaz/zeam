@@ -483,12 +483,9 @@ pub const ApiServer = struct {
             },
         };
 
+        self.logger.info("admin API: POST /lean/v0/admin/aggregator enabled={any}", .{enabled});
         const previous = chain.setAggregator(enabled);
         zeam_metrics.metrics.lean_is_aggregator.set(if (enabled) 1 else 0);
-
-        if (previous != enabled) {
-            self.logger.info("aggregator role toggled via API: {} -> {}", .{ previous, enabled });
-        }
 
         var buf: [128]u8 = undefined;
         const body = try std.fmt.bufPrint(

@@ -232,8 +232,18 @@ pub const BeamChain = struct {
     /// Atomically flips the aggregator role and returns the previous value.
     /// Both the gossip import path and the tick-driven aggregation path pick
     /// up the new value on their next read, so no restart is required.
+    ///
+    /// Logs transitions at info and no-op writes at debug so operators can
+    /// trace toggles (from the admin API or any other caller) in the node
+    /// logs without needing to cross-reference request logs.
     pub fn setAggregator(self: *Self, enabled: bool) bool {
-        return self.is_aggregator_enabled.swap(enabled, .acq_rel);
+        const previous = self.is_aggregator_enabled.swap(enabled, .acq_rel);
+        if (previous != enabled) {
+            self.logger.info("aggregator role changed: {any} -> {any}", .{ previous, enabled });
+        } else {
+            self.logger.debug("aggregator role set to {any} (no change)", .{enabled});
+        }
+        return previous;
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
