@@ -1482,6 +1482,8 @@ test "Node peer tracking on connect/disconnect" {
 
     const spec_name = try allocator.dupe(u8, "zeamdev");
     defer allocator.free(spec_name);
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    defer allocator.free(fork_digest);
 
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
@@ -1489,6 +1491,7 @@ test "Node peer tracking on connect/disconnect" {
         .spec = .{
             .preset = params.Preset.minimal,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },

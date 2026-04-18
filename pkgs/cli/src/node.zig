@@ -107,11 +107,20 @@ pub const NodeOptions = struct {
     }
 
     pub fn getValidatorIndices(self: *const NodeOptions, allocator: std.mem.Allocator) ![]usize {
-        var indices = try allocator.alloc(usize, self.validator_assignments.len);
-        for (self.validator_assignments, 0..) |assignment, i| {
-            indices[i] = assignment.index;
+        // Deduplicate: each validator index may appear multiple times in
+        // assignments (e.g. once for the attester key, once for the proposer
+        // key). The validator only needs to attest/propose once per slot.
+        var seen = std.AutoHashMap(usize, void).init(allocator);
+        defer seen.deinit();
+        var unique: std.ArrayList(usize) = .empty;
+        errdefer unique.deinit(allocator);
+        for (self.validator_assignments) |assignment| {
+            const result = try seen.getOrPut(assignment.index);
+            if (!result.found_existing) {
+                try unique.append(allocator, assignment.index);
+            }
         }
-        return indices;
+        return try unique.toOwnedSlice(allocator);
     }
 };
 
@@ -173,7 +182,7 @@ pub const Node = struct {
 
         // some base mainnet spec would be loaded to build this up
         const chain_spec =
-            \\{"preset": "mainnet", "name": "devnet0"}
+            \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
@@ -210,7 +219,7 @@ pub const Node = struct {
 
         self.network = try networks.EthLibp2p.init(allocator, &self.loop, .{
             .networkId = options.network_id,
-            .network_name = chain_config.spec.name,
+            .fork_digest = chain_config.spec.fork_digest,
             .listen_addresses = addresses.listen_addresses,
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
