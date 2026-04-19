@@ -207,6 +207,25 @@ jobs:
             exit 1
           fi
 
+      - name: Summarize hive results
+        id: summary
+        if: always()
+        shell: bash
+        env:
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
+          HIVE_SIMULATOR_LABEL: ${{ steps.cfg.outputs.simulator }}
+        run: |
+          set -euo pipefail
+          # Aggregate pass/fail counts across every suite hive wrote and
+          # render a markdown summary to (a) the workflow's Step Summary
+          # tab and (b) a fragment file the PR-comment step re-reads so we
+          # don't have to keep two copies of the markdown logic.
+          summary_file="$GITHUB_WORKSPACE/hive-summary.md"
+          : > "$summary_file"
+          "$GITHUB_WORKSPACE/.github/scripts/hive-summary.sh" src/results "$summary_file"
+          cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
+          echo "summary_file=$summary_file" >> "$GITHUB_OUTPUT"
+
       - name: Upload hive results as workflow artifact
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -217,14 +236,27 @@ jobs:
       - name: Post summary comment on PR
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
+        env:
+          HIVE_SUMMARY_FILE: ${{ steps.summary.outputs.summary_file }}
         with:
           script: |
+            const fs = require('fs');
             const simulator = '${{ steps.cfg.outputs.simulator }}';
             const devnet = '${{ steps.cfg.outputs.devnet }}';
             const conclusion = '${{ steps.hive.outcome }}';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const icon = conclusion === 'success' ? '✅' : (conclusion === 'skipped' ? '⏭️' : '❌');
-            const body = [
+
+            // The "Summarize hive results" step writes a markdown fragment
+            // with pass/fail counts and failing-test excerpts; splice it
+            // in verbatim so the comment stays a single source of truth.
+            let summaryMd = '';
+            const summaryPath = process.env.HIVE_SUMMARY_FILE;
+            if (summaryPath && fs.existsSync(summaryPath)) {
+              summaryMd = fs.readFileSync(summaryPath, 'utf8').trim();
+            }
+
+            const parts = [
               `### Hive results: ${icon} \`${conclusion}\``,
               ``,
               `| Field | Value |`,
@@ -234,6 +266,11 @@ jobs:
               `| Outcome | \`${conclusion}\` |`,
               `| Run | [#${context.runId}](${runUrl}) |`,
               ``,
+            ];
+            if (summaryMd) {
+              parts.push(summaryMd, ``);
+            }
+            parts.push(
               `Artifacts (logs, test results) are attached to the workflow run.`,
               ``,
               `> **Note:** the upstream \`clients/zeam\` Dockerfile pulls the devnet4 binary`,
@@ -241,7 +278,8 @@ jobs:
               `> binary from a pinned source revision, so this run does not exercise the`,
               `> exact PR HEAD binary. Per-PR binary coverage requires an upstream hive change`,
               `> (see the note at the top of the workflow file).`,
-            ].join('\n');
+            );
+            const body = parts.join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
