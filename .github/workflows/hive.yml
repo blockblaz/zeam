@@ -191,20 +191,24 @@ jobs:
           # to hive's own stderr. Without it, hive only prints a one-line summary on
           # build failure (e.g. "returned a non-zero code: 101") which is useless for
           # diagnosing cargo/compiler errors in CI.
-          (./hive \
+          #
+          # `tee` is only for preserving the hive output as a run artifact; we
+          # must not let its exit status mask hive's, so we read the hive exit
+          # code out of PIPESTATUS rather than pipefail-ing the whole chain
+          # (tee itself should never fail here, but PIPESTATUS makes the intent
+          # explicit: trust hive's own exit code, don't infer success from a
+          # log-line grep).
+          ./hive \
             --sim "${{ steps.cfg.outputs.simulator }}" \
             --client "zeam" \
             --results-root results \
             --client-file simulators/lean/clients/${{ steps.cfg.outputs.devnet }}.yaml \
             --docker.output \
-             2>&1 || true ) | tee hive.log
-
-          if tail -n 10 hive.log | grep -q "simulation .* finished"; then
-            echo "RUN_SUCCESS=true" >> "$GITHUB_ENV"
-            exit 0
-          else
-            echo "RUN_SUCCESS=false" >> "$GITHUB_ENV"
-            exit 1
+            2>&1 | tee hive.log
+          hive_rc="${PIPESTATUS[0]}"
+          if [ "$hive_rc" -ne 0 ]; then
+            echo "hive exited with status $hive_rc" >&2
+            exit "$hive_rc"
           fi
 
       - name: Summarize hive results

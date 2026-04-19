@@ -68,8 +68,16 @@ total=0
 passed=0
 failed=0
 timeouts=0
-# Failures list: one record per line, tab-separated fields:
-#   <suite>\t<test>\t<timeout?>\t<details_log>\t<begin>\t<end>\t<inline_details>
+# Failures list: one record per line, tab-separated fields.
+#
+# Only single-line fields are carried through the TSV: this avoids the
+# well-known jq @tsv pitfall where an embedded newline in a string would
+# round-trip as the literal two-char sequence "\n" and ruin the rendered
+# excerpt. In particular the `details` string (which can be multi-line)
+# is NOT in the TSV; when we need it we re-read it from the source suite
+# file with a targeted jq keyed by the test's entry key.
+#
+#   <suite_name>\t<suite_file>\t<test_key>\t<test_name>\t<timeout?>\t<details_log>\t<begin>\t<end>
 failures_tsv=""
 
 for suite in "${suites[@]}"; do
@@ -94,18 +102,22 @@ for suite in "${suites[@]}"; do
   failed=$((failed + f))
   timeouts=$((timeouts + to))
 
-  suite_failures="$(jq -r --arg suite "$suite_name" --arg log "$details_log_abs" '
+  suite_failures="$(jq -r \
+    --arg suite "$suite_name" \
+    --arg suite_file "$suite" \
+    --arg log "$details_log_abs" '
     .testCases
     | to_entries
     | map(select(.value.summaryResult.pass == false))
     | .[]
     | [$suite,
+       $suite_file,
+       .key,
        .value.name,
        (.value.summaryResult.timeout // false | tostring),
        $log,
        (.value.summaryResult.log.begin // ""),
-       (.value.summaryResult.log.end   // ""),
-       (.value.summaryResult.details   // "")]
+       (.value.summaryResult.log.end   // "")]
     | @tsv
   ' "$suite")"
   if [ -n "$suite_failures" ]; then
@@ -145,9 +157,7 @@ snippet_bytes=1024
   echo
 } >> "$tmp"
 
-# Read the TSV line-by-line. Using a file descriptor to avoid subshell
-# scoping of the loop variables.
-while IFS=$'\t' read -r suite name timeout log_path begin end inline; do
+while IFS=$'\t' read -r suite suite_file test_key name timeout log_path begin end; do
   [ -z "$name" ] && continue
 
   badge=""
@@ -160,27 +170,36 @@ while IFS=$'\t' read -r suite name timeout log_path begin end inline; do
     echo
   } >> "$tmp"
 
-  # Prefer the inline `details` string if the suite recorded one;
-  # otherwise slice the log file using the byte offsets hive wrote.
+  # Resolve the failure excerpt. Priority order:
+  #   1. The suite's testDetailsLog file, sliced with the {begin,end}
+  #      byte offsets hive recorded (normal case: tests emit details via
+  #      the hive API, which hive appends to the shared log file).
+  #   2. The testCase's inline `details` field, fetched on demand with a
+  #      targeted jq keyed by the test's entry key. We go back to the
+  #      source JSON rather than carry the string through TSV so embedded
+  #      newlines survive intact.
   excerpt=""
-  if [ -n "$inline" ]; then
-    excerpt="$inline"
-  elif [ -n "$begin" ] && [ -n "$end" ] && [ -n "$log_path" ] && [ -f "$log_path" ]; then
+  if [ -n "$begin" ] && [ -n "$end" ] && [ -n "$log_path" ] && [ -f "$log_path" ]; then
     count=$((end - begin))
     if [ "$count" -gt 0 ]; then
-      # `dd` skips `begin` bytes then reads `count` bytes. Cap at
-      # snippet_bytes so a runaway test log doesn't blow the summary.
+      # Cap at snippet_bytes so a runaway test log doesn't blow the summary.
       if [ "$count" -gt "$snippet_bytes" ]; then
         count="$snippet_bytes"
       fi
-      excerpt="$(dd if="$log_path" bs=1 skip="$begin" count="$count" 2>/dev/null || true)"
+      # `tail -c +N` is 1-indexed; `begin` is 0-indexed. Uses buffered I/O
+      # (vs `dd bs=1`'s one-syscall-per-byte), so large offsets stay cheap.
+      excerpt="$(tail -c "+$((begin + 1))" "$log_path" 2>/dev/null | head -c "$count" || true)"
     fi
+  fi
+  if [ -z "$excerpt" ] && [ -n "$test_key" ] && [ -f "$suite_file" ]; then
+    excerpt="$(jq -r --arg k "$test_key" '
+      .testCases[$k].summaryResult.details // ""
+    ' "$suite_file")"
   fi
 
   if [ -n "$excerpt" ]; then
     {
       echo '```'
-      # Strip trailing whitespace and cap length as a defence in depth.
       printf '%s\n' "$excerpt" | head -c "$snippet_bytes"
       echo
       echo '```'
