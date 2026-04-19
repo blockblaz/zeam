@@ -9,26 +9,48 @@
 # summary can show why the test failed without forcing the reader to
 # download the artifact.
 #
-# Usage: hive-summary.sh <results-dir> [output-file]
+# Usage: hive-summary.sh <results-dir> [output-file] [counts-file]
 #
 #   <results-dir>   directory hive wrote with `--results-root`
 #   [output-file]   file to append the markdown summary to; defaults to
 #                   stdout. Intended to be pointed at $GITHUB_STEP_SUMMARY
 #                   and/or a PR-comment fragment.
+#   [counts-file]   optional file to write a key=value tally to
+#                   (suites=, total=, passed=, failed=, timeouts=). When
+#                   pointed at $GITHUB_OUTPUT this exposes the counts to
+#                   subsequent workflow steps; see the "Summarize hive
+#                   results" step in .github/workflows/hive.yml.
 #
 # Output is markdown. If the directory has no suite files (e.g. hive
 # failed before running any tests) the script still emits a summary
-# block noting that no results were produced.
+# block noting that no results were produced and writes zeros to the
+# counts file.
 
 set -euo pipefail
 
 results_dir="${1:-}"
 output="${2:-/dev/stdout}"
+counts_file="${3:-}"
 
 if [ -z "$results_dir" ]; then
-  echo "usage: $0 <results-dir> [output-file]" >&2
+  echo "usage: $0 <results-dir> [output-file] [counts-file]" >&2
   exit 2
 fi
+
+emit_counts() {
+  # Always emit a complete key set so callers that `cat` this into
+  # $GITHUB_OUTPUT don't end up with some keys unset when hive failed
+  # before writing any suite.
+  [ -z "$counts_file" ] && return 0
+  local s="$1" t="$2" p="$3" f="$4" to="$5"
+  {
+    echo "suites=$s"
+    echo "total=$t"
+    echo "passed=$p"
+    echo "failed=$f"
+    echo "timeouts=$to"
+  } >> "$counts_file"
+}
 
 if [ ! -d "$results_dir" ]; then
   echo "results directory not found: $results_dir" >&2
@@ -58,6 +80,7 @@ if [ "${#suites[@]}" -eq 0 ]; then
     echo "No suite result files were produced in \`$results_dir\`. This usually means hive failed before any test suite finished (e.g. during client or simulator image build)."
   } >> "$tmp"
   cat "$tmp" >> "$output"
+  emit_counts 0 0 0 0 0
   exit 0
 fi
 
@@ -143,6 +166,7 @@ simulator_label="${HIVE_SIMULATOR_LABEL:-unknown}"
 if [ "$failed" -eq 0 ]; then
   echo "All $total tests passed." >> "$tmp"
   cat "$tmp" >> "$output"
+  emit_counts "${#suites[@]}" "$total" "$passed" 0 0
   exit 0
 fi
 
@@ -213,3 +237,4 @@ done <<<"$failures_tsv"
 echo "</details>" >> "$tmp"
 
 cat "$tmp" >> "$output"
+emit_counts "${#suites[@]}" "$total" "$passed" "$failed" "$timeouts"

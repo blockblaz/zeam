@@ -192,23 +192,49 @@ jobs:
           # build failure (e.g. "returned a non-zero code: 101") which is useless for
           # diagnosing cargo/compiler errors in CI.
           #
-          # `tee` is only for preserving the hive output as a run artifact; we
-          # must not let its exit status mask hive's, so we read the hive exit
-          # code out of PIPESTATUS rather than pipefail-ing the whole chain
-          # (tee itself should never fail here, but PIPESTATUS makes the intent
-          # explicit: trust hive's own exit code, don't infer success from a
-          # log-line grep).
+          # `|| true` suppresses pipefail/`set -e` so we can inspect hive's
+          # real exit code deliberately; it is read from PIPESTATUS[0] on
+          # the next line before any other command can clobber it.
           ./hive \
             --sim "${{ steps.cfg.outputs.simulator }}" \
             --client "zeam" \
             --results-root results \
             --client-file simulators/lean/clients/${{ steps.cfg.outputs.devnet }}.yaml \
             --docker.output \
-            2>&1 | tee hive.log
+            2>&1 | tee hive.log || true
           hive_rc="${PIPESTATUS[0]}"
+
+          # hive's exit code conflates two very different failure modes
+          # (see ethereum/hive hive.go, which calls fatal() for both):
+          # infrastructure errors (image build failure, simulator crash,
+          # bad flag, Docker client unavailable) and plain test failures.
+          # Both reach os.Exit(1) indistinguishably.
+          #
+          # This step should only go red on the former. Failing tests
+          # are already surfaced by the Summarize hive results step and
+          # the uploaded artifact; turning the whole step red on them
+          # would mask the number and identity of failures behind a
+          # single X and force reviewers into the job log.
+          #
+          # Disambiguate by checking whether hive got far enough to
+          # write any per-suite result file. libhive writes each suite
+          # as <unix>-<hex>.json in the results dir at suite-end (see
+          # libhive/testmanager.go::writeSuiteFile), so "non-zero exit
+          # with >=1 suite file" unambiguously means "tests ran to
+          # completion, some failed".
+          shopt -s nullglob
+          suite_results=()
+          for f in results/*.json; do
+            [ "$(basename "$f")" = "hive.json" ] && continue
+            suite_results+=("$f")
+          done
+
           if [ "$hive_rc" -ne 0 ]; then
-            echo "hive exited with status $hive_rc" >&2
-            exit "$hive_rc"
+            if [ "${#suite_results[@]}" -eq 0 ]; then
+              echo "hive exited $hive_rc before any suite finished; treating as infrastructure failure" >&2
+              exit "$hive_rc"
+            fi
+            echo "hive exited $hive_rc after running ${#suite_results[@]} suite(s); treating non-zero as test failures and continuing -- see the Summarize hive results step for details" >&2
           fi
 
       - name: Summarize hive results
@@ -223,10 +249,14 @@ jobs:
           # Aggregate pass/fail counts across every suite hive wrote and
           # render a markdown summary to (a) the workflow's Step Summary
           # tab and (b) a fragment file the PR-comment step re-reads so we
-          # don't have to keep two copies of the markdown logic.
+          # don't have to keep two copies of the markdown logic. Counts
+          # are also exported as step outputs so the PR-comment step can
+          # pick an accurate icon (the Run Hive step may succeed even
+          # when tests failed -- see the disambiguation comment there).
           summary_file="$GITHUB_WORKSPACE/hive-summary.md"
           : > "$summary_file"
-          "$GITHUB_WORKSPACE/.github/scripts/hive-summary.sh" src/results "$summary_file"
+          "$GITHUB_WORKSPACE/.github/scripts/hive-summary.sh" \
+            src/results "$summary_file" "$GITHUB_OUTPUT"
           cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
           echo "summary_file=$summary_file" >> "$GITHUB_OUTPUT"
 
@@ -247,9 +277,31 @@ jobs:
             const fs = require('fs');
             const simulator = '${{ steps.cfg.outputs.simulator }}';
             const devnet = '${{ steps.cfg.outputs.devnet }}';
-            const conclusion = '${{ steps.hive.outcome }}';
+            const hiveOutcome = '${{ steps.hive.outcome }}';
+            const failedCount = parseInt('${{ steps.summary.outputs.failed || '0' }}', 10) || 0;
+            const totalCount  = parseInt('${{ steps.summary.outputs.total  || '0' }}', 10) || 0;
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const icon = conclusion === 'success' ? '✅' : (conclusion === 'skipped' ? '⏭️' : '❌');
+
+            // Run Hive now succeeds when tests run to completion but some
+            // fail (see the disambiguation in the "Run Hive" step). That
+            // means `steps.hive.outcome == success` is NOT sufficient to
+            // claim green here; consult the summary counts before picking
+            // the icon and conclusion label.
+            let icon;
+            let conclusion;
+            if (hiveOutcome === 'skipped') {
+              icon = '⏭️';
+              conclusion = 'skipped';
+            } else if (hiveOutcome !== 'success') {
+              icon = '❌';
+              conclusion = 'infrastructure failure';
+            } else if (failedCount > 0) {
+              icon = '❌';
+              conclusion = `${failedCount}/${totalCount} tests failed`;
+            } else {
+              icon = '✅';
+              conclusion = totalCount > 0 ? `all ${totalCount} tests passed` : 'success';
+            }
 
             // The "Summarize hive results" step writes a markdown fragment
             // with pass/fail counts and failing-test excerpts; splice it
