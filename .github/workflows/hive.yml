@@ -107,19 +107,26 @@ jobs:
       #
       # Upstream bug (ethereum/hive master, present since #1422 "Add Lean RPC
       # compatibility tests", 2026-04-14): simulators/lean/Dockerfile is built
-      # with hive repo root as its docker build context (via
-      # simulators/lean/hive_context.txt = `../..`) and tries to
-      # `COPY ./Cargo.lock ./Cargo.lock` from that root. But `/Cargo.lock` is
-      # gitignored at hive root, so the file does not exist in the build
-      # context and the docker build fails with:
-      #   COPY failed: file not found in build context ...: stat Cargo.lock:
-      #   file does not exist
-      # The Cargo workspace at hive root declares `hivesim-rs` and
-      # `simulators/lean` as members, and `simulators/lean/Cargo.lock` is
-      # committed and resolves that same workspace, so hoisting it to
-      # `./Cargo.lock` is a safe, deterministic workaround until upstream
-      # either commits a root lockfile or fixes the Dockerfile to copy from
-      # `simulators/lean/Cargo.lock`.
+      # with the hive repo root as its docker build context (via
+      # simulators/lean/hive_context.txt = `../..`) and runs
+      # `cargo build -p lean-sim --release --locked` against a root-level
+      # `Cargo.lock`. Two problems stack:
+      #
+      #   1. `/Cargo.lock` is gitignored at hive root, so there is no lockfile
+      #      in the build context at all -- docker build fails with
+      #      `COPY failed: ... stat Cargo.lock: file does not exist`.
+      #   2. The committed `simulators/lean/Cargo.lock` predates lean-sim being
+      #      absorbed into the root `Cargo.toml` workspace (which adds the
+      #      `[patch."https://github.com/ethereum/hive"] hivesim = { path = ... }`
+      #      patch). Naively hoisting it produces a lockfile that no longer
+      #      matches the current manifests, so `cargo build --locked` aborts
+      #      with: `cannot update the lock file ... because --locked was
+      #      passed`.
+      #
+      # So we regenerate a fresh workspace-consistent lockfile with
+      # `cargo generate-lockfile` before running hive. If upstream ever commits
+      # a root `Cargo.lock` we respect it and skip; if the manifests are
+      # missing we fail loudly rather than silently hand docker a bad context.
       - name: Install Go
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
@@ -151,12 +158,16 @@ jobs:
             echo "Cargo.lock already present at hive root; upstream fix landed, nothing to do."
             exit 0
           fi
-          if [ ! -f simulators/lean/Cargo.lock ]; then
-            echo "simulators/lean/Cargo.lock missing; cannot work around missing root Cargo.lock." >&2
+          if [ ! -f Cargo.toml ]; then
+            echo "Cargo.toml missing at hive root; nothing to generate a lockfile from." >&2
             exit 1
           fi
-          cp simulators/lean/Cargo.lock Cargo.lock
-          echo "Hoisted simulators/lean/Cargo.lock -> Cargo.lock (workspace lockfile is shared)."
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "cargo not found on runner; required to regenerate the missing root Cargo.lock." >&2
+            exit 1
+          fi
+          cargo generate-lockfile --manifest-path Cargo.toml
+          echo "Generated fresh root Cargo.lock resolving the current workspace manifests."
 
       - name: Build hive and hiveview
         working-directory: ./src
@@ -176,11 +187,16 @@ jobs:
         shell: bash
         run: |
           set -x
+          # `--docker.output` streams the client/simulator docker build stdout+stderr
+          # to hive's own stderr. Without it, hive only prints a one-line summary on
+          # build failure (e.g. "returned a non-zero code: 101") which is useless for
+          # diagnosing cargo/compiler errors in CI.
           (./hive \
             --sim "${{ steps.cfg.outputs.simulator }}" \
             --client "zeam" \
             --results-root results \
             --client-file simulators/lean/clients/${{ steps.cfg.outputs.devnet }}.yaml \
+            --docker.output \
              2>&1 || true ) | tee hive.log
 
           if tail -n 10 hive.log | grep -q "simulation .* finished"; then
