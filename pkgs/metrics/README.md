@@ -4,8 +4,9 @@
 
 The `@zeam/metrics` package provides the core metrics infrastructure for the Zeam node. It defines all application metrics (Histograms, Gauges, Counters) and provides a Timer API for time-based measurements.
 
+Zeam follows the [Lean Ethereum metrics specification](https://github.com/leanEthereum/leanMetrics). All metrics prefixed with `lean_` are defined in that spec. Any Zeam-specific metrics that are not part of the spec use the `zeam_` prefix instead.
+
 **Key Features:**
-- Comprehensive metrics definitions for monitoring node performance
 - Timer API for convenient time-based measurements
 - Automatic ZKVM/freestanding target detection with no-op behavior
 - Compile-time checks to avoid compiling unsupported code for freestanding targets
@@ -57,129 +58,6 @@ For freestanding targets (ZKVM):
 - Zero runtime overhead
 - Metrics are initialized as no-op by default
 
-## Metrics Definitions
-
-All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. The following metrics are available:
-
-### Chain Metrics
-
-#### `chain_onblock_duration_seconds` (Histogram)
-- **Description**: Measures the time taken to process a block within the `chain.onBlock` function (end-to-end block processing).
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-- **Labels**: None
-- **Sample Collection Event**: On every block processed by the chain
-
-#### `block_processing_duration_seconds` (Histogram)
-- **Description**: Measures the time taken to process a block in the state transition function.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-- **Labels**: None
-- **Sample Collection Event**: During state transition block processing
-
-### Fork Choice Metrics
-
-#### `lean_head_slot` (Gauge)
-- **Description**: Latest slot of the lean chain (canonical chain head as determined by fork choice).
-- **Type**: Gauge
-- **Unit**: Slot number (u64)
-- **Labels**: None
-- **Sample Collection Event**: Updated on every fork choice head update
-
-#### `lean_latest_justified_slot` (Gauge)
-- **Description**: Latest justified slot.
-- **Type**: Gauge
-- **Unit**: Slot number (u64)
-- **Labels**: None
-- **Sample Collection Event**: Updated on state transition completion
-
-#### `lean_latest_finalized_slot` (Gauge)
-- **Description**: Latest finalized slot.
-- **Type**: Gauge
-- **Unit**: Slot number (u64)
-- **Labels**: None
-- **Sample Collection Event**: Updated on state transition completion
-
-#### `lean_fork_choice_block_processing_time_seconds` (Histogram)
-- **Description**: Time taken to process block in fork choice.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
-- **Labels**: None
-- **Sample Collection Event**: On fork choice block processing
-
-#### `lean_attestations_valid_total` (Counter)
-- **Description**: Total number of valid attestations processed by fork choice.
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: source ("gossip", "block")
-- **Sample Collection Event**: On successful attestation validation and processing
-
-#### `lean_attestations_invalid_total` (Counter)
-- **Description**: Total number of invalid attestations rejected by fork choice.
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: source ("gossip", "block")
-- **Sample Collection Event**: On attestation validation failure
-
-#### `lean_attestation_validation_time_seconds` (Histogram)
-- **Description**: Time taken to validate attestations in fork choice.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
-- **Labels**: None
-- **Sample Collection Event**: On attestation validation and processing
-
-### State Transition Metrics
-
-#### `lean_state_transition_time_seconds` (Histogram)
-- **Description**: Time to process state transition.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4
-- **Labels**: None
-- **Sample Collection Event**: On state transition
-
-#### `lean_state_transition_slots_processed_total` (Counter)
-- **Description**: Total number of processed slots (including empty slots).
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: None
-- **Sample Collection Event**: On state transition process slots
-
-#### `lean_state_transition_slots_processing_time_seconds` (Histogram)
-- **Description**: Time taken to process slots.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
-- **Labels**: None
-- **Sample Collection Event**: On state transition process slots
-
-#### `lean_state_transition_block_processing_time_seconds` (Histogram)
-- **Description**: Time taken to process block.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
-- **Labels**: None
-- **Sample Collection Event**: On state transition process block
-
-#### `lean_state_transition_attestations_processed_total` (Counter)
-- **Description**: Total number of processed attestations.
-- **Type**: Counter
-- **Unit**: Count (u64)
-- **Labels**: None
-- **Sample Collection Event**: On state transition process attestations
-
-#### `lean_state_transition_attestations_processing_time_seconds` (Histogram)
-- **Description**: Time taken to process attestations.
-- **Type**: Histogram
-- **Unit**: Seconds
-- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
-- **Labels**: None
-- **Sample Collection Event**: On state transition process attestations
-
 ## Usage
 
 ### Importing the Package
@@ -224,6 +102,20 @@ For point-in-time measurements:
 zeam_metrics.metrics.lean_head_slot.set(slot_number);
 ```
 
+### Using GaugeVec
+
+For labeled gauges, pass a label struct to `set`. Labels represent fixed dimensions — the set of possible label values is known upfront and should always be present (with value 0 when nothing is active):
+
+```zig
+zeam_metrics.metrics.lean_connected_peers.set(.{ .client = "zeam_1", .client_type = "zeam" }, 1) catch {};
+```
+
+GaugeVec and CounterVec must be initialized with an allocator:
+
+```zig
+.my_gauge_vec = try Metrics.MyGaugeVec.init(allocator, "my_gauge_vec", .{ .help = "..." }, .{}),
+```
+
 ### Using Counters
 
 For cumulative counts:
@@ -232,12 +124,20 @@ For cumulative counts:
 zeam_metrics.metrics.lean_state_transition_slots_processed_total.incrBy(slots_processed);
 ```
 
-### Direct Histogram Observations
+### Using CounterVec
 
-If you need to record a pre-calculated duration:
+For labeled counters, pass a label struct to `incr`:
 
 ```zig
-zeam_metrics.metrics.block_processing_duration_seconds.observe(duration_seconds);
+zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = "inbound", .result = "success" }) catch {};
+```
+
+### Direct Histogram Observations
+
+If you need to record a pre-calculated value without starting a timer:
+
+```zig
+zeam_metrics.block_processing_duration_seconds.record(duration_seconds);
 ```
 
 ## Adding New Metrics
@@ -267,8 +167,14 @@ my_histogram: metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.1, 1.0 }),
 // Gauge (for point-in-time values)
 my_gauge: metrics_lib.Gauge(u64),
 
+// GaugeVec (gauge with labels — requires allocator in init)
+my_gauge_vec: metrics_lib.GaugeVec(u64, struct { status: []const u8 }),
+
 // Counter (for cumulative counts)
 my_counter: metrics_lib.Counter(u64),
+
+// CounterVec (counter with labels — requires allocator in init)
+my_counter_vec: metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 }),
 ```
 
 ### Step 2: Initialize the Metric
@@ -276,28 +182,15 @@ my_counter: metrics_lib.Counter(u64),
 In the `init()` function in `pkgs/metrics/src/lib.zig`, add initialization:
 
 ```zig
-pub fn init(allocator: std.mem.Allocator) !void {
-    _ = allocator;
-    if (g_initialized) return;
-
-    if (isZKVM()) {
-        std.log.info("Using no-op metrics for ZKVM target", .{});
-        g_initialized = true;
-        return;
-    }
-
-    metrics = .{
-        // ... existing metrics ...
-        
-        .my_new_metric = Metrics.MyNewMetricHistogram.init(
-            "my_new_metric",
-            .{ .help = "Description of what this metric measures." },
-            .{}
-        ),
-    };
+metrics = .{
+    // ... existing metrics ...
     
-    // ... existing context assignments ...
-}
+    .my_new_metric = Metrics.MyNewMetricHistogram.init(
+        "my_new_metric",
+        .{ .help = "Description of what this metric measures." },
+        .{}
+    ),
+};
 ```
 
 ### Step 3: Create Wrapper for Timer API (Histograms Only)
@@ -343,17 +236,6 @@ zeam_metrics.metrics.my_gauge.set(42);
 zeam_metrics.metrics.my_counter.incrBy(1);
 ```
 
-### Step 5: Document the Metric
-
-Add the metric to this README in the appropriate section with:
-- Name
-- Description
-- Type
-- Unit
-- Buckets (for histograms)
-- Labels (if any)
-- Sample collection event
-
 ## Best Practices
 
 ### 1. Always Use Timer API for Time Measurements
@@ -391,9 +273,10 @@ For histograms, choose buckets that capture the expected range of values:
 &[_]f32{ 0.5, 1, 2, 5, 10, 30, 60 }
 ```
 
-### 4. Use Descriptive Names
+### 4. Follow the Naming Convention
 
-Follow Prometheus naming conventions:
+- `lean_` prefix: metric is defined in the [Lean metrics specification](https://github.com/leanEthereum/leanMetrics) — name, labels, buckets, and help text must match the spec exactly
+- `zeam_` prefix: metric is Zeam-specific and not part of the shared spec
 - Use `_total` suffix for counters: `requests_total`
 - Use `_seconds` suffix for time measurements: `processing_time_seconds`
 - Use base units (seconds, bytes, not milliseconds or megabytes)
@@ -465,4 +348,3 @@ See `pkgs/api/README.md` for information about the HTTP API and metrics serving.
 ## Visualization
 
 For information about visualizing metrics with Prometheus and Grafana, see the [zeam-dashboards repository](https://github.com/blockblaz/zeam-dashboards) and the API package documentation.
-

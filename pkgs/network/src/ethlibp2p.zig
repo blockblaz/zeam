@@ -346,7 +346,7 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
     defer zigHandler.allocator.free(uncompressed_message);
 
-    // Record gossip message size metrics (leanMetrics#29) — observed on uncompressed bytes
+    // Record gossip message size metrics — observed on uncompressed bytes
     switch (topic.gossip_topic.kind) {
         .block => zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(uncompressed_message.len)),
         .attestation => zeam_metrics.lean_gossip_attestation_size_bytes.record(@floatFromInt(uncompressed_message.len)),

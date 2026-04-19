@@ -1530,6 +1530,8 @@ pub const ForkChoice = struct {
     }
 
     pub fn aggregate(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
+        const timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = timer.observe();
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.aggregateUnlocked(state_opt);

@@ -81,18 +81,20 @@ const Metrics = struct {
     lean_is_aggregator: LeanIsAggregatorGauge,
     lean_attestation_committee_subnet: LeanAttestationCommitteeSubnetGauge,
     lean_attestation_committee_count: LeanAttestationCommitteeCountGauge,
-    // Block production metrics (leanMetrics#29)
+    // Block production metrics
     lean_block_building_time_seconds: BlockBuildingTimeHistogram,
     lean_block_building_payload_aggregation_time_seconds: BlockPayloadAggregationTimeHistogram,
     lean_block_aggregated_payloads: BlockAggregatedPayloadsHistogram,
     lean_block_building_success_total: BlockBuildingSuccessCounter,
     lean_block_building_failures_total: BlockBuildingFailuresCounter,
-    // Sync status gauge (leanMetrics#29)
+    // Sync status gauge
     lean_node_sync_status: LeanNodeSyncStatusGauge,
-    // Gossip message size histograms (leanMetrics#29)
+    // Gossip message size histograms
     lean_gossip_block_size_bytes: GossipBlockSizeBytesHistogram,
     lean_gossip_attestation_size_bytes: GossipAttestationSizeBytesHistogram,
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
+    // Attestation production time histogram
+    lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -109,8 +111,8 @@ const Metrics = struct {
     const AttestationsProcessedCounter = metrics_lib.Counter(u64);
     const LeanValidatorsCountGauge = metrics_lib.Gauge(u64);
     const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1, 1.25, 1.5, 2, 4 });
-    const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
-    const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
+    const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.Counter(u64);
+    const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.Counter(u64);
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     // Individual attestation signature metric types
     const PQSigAttestationSignaturesTotalCounter = metrics_lib.Counter(u64);
@@ -124,7 +126,7 @@ const Metrics = struct {
     const PQSigAggregatedValidCounter = metrics_lib.Counter(u64);
     const PQSigAggregatedInvalidCounter = metrics_lib.Counter(u64);
     // Network peer metric types
-    const LeanConnectedPeersGauge = metrics_lib.Gauge(u64);
+    const LeanConnectedPeersGauge = metrics_lib.GaugeVec(u64, struct { client: []const u8, client_type: []const u8 });
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
     // Node lifecycle metric types
@@ -142,20 +144,22 @@ const Metrics = struct {
     const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
     const LeanLatestKnownAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
     // Committee aggregation histogram type
-    // Buckets widened for Devnet-4 (leanMetrics#29): was [0.005..1], now [0.05..4]
+    // Buckets widened for Devnet-4: was [0.005..1], now [0.05..4]
     const CommitteeSignaturesAggregationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
-    // Block production metric types (leanMetrics#29)
+    // Block production metric types
     const BlockBuildingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     const BlockPayloadAggregationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 });
     const BlockAggregatedPayloadsHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128 });
     const BlockBuildingSuccessCounter = metrics_lib.Counter(u64);
     const BlockBuildingFailuresCounter = metrics_lib.Counter(u64);
-    // Sync status gauge type (leanMetrics#29): 0=idle, 1=syncing, 2=synced
-    const LeanNodeSyncStatusGauge = metrics_lib.Gauge(u64);
-    // Gossip message size histogram types (leanMetrics#29)
+    // Sync status gauge type: 0=idle, 1=syncing, 2=synced
+    const LeanNodeSyncStatusGauge = metrics_lib.GaugeVec(u64, struct { status: []const u8 });
+    // Gossip message size histogram types
     const GossipBlockSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000 });
     const GossipAttestationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 512, 1_024, 2_048, 4_096, 8_192, 16_384 });
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
+    // Attestation production time histogram type
+    const AttestationProductionTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -315,6 +319,12 @@ fn observeCommitteeSignaturesAggregation(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeAttestationProduction(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.AttestationProductionTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var chain_onblock_duration_seconds: Histogram = .{
@@ -395,6 +405,10 @@ pub var lean_gossip_aggregation_size_bytes: Histogram = .{
     .context = null,
     .observe = &observeGossipAggregationSizeBytes,
 };
+pub var lean_attestations_production_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeAttestationProduction,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -410,69 +424,70 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics = .{
         .chain_onblock_duration_seconds = Metrics.ChainHistogram.init("chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .block_processing_duration_seconds = Metrics.BlockProcessingHistogram.init("block_processing_duration_seconds", .{ .help = "Time taken to process a block in the state transition function." }, .{}),
-        .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain." }, .{}),
-        .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot." }, .{}),
-        .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot." }, .{}),
-        .lean_state_transition_time_seconds = Metrics.StateTransitionHistogram.init("lean_state_transition_time_seconds", .{ .help = "Time to process state transition." }, .{}),
-        .lean_state_transition_slots_processed_total = Metrics.SlotsProcessedCounter.init("lean_state_transition_slots_processed_total", .{ .help = "Total number of processed slots." }, .{}),
-        .lean_state_transition_slots_processing_time_seconds = Metrics.SlotsProcessingHistogram.init("lean_state_transition_slots_processing_time_seconds", .{ .help = "Time taken to process slots." }, .{}),
-        .lean_state_transition_block_processing_time_seconds = Metrics.BlockProcessingTimeHistogram.init("lean_state_transition_block_processing_time_seconds", .{ .help = "Time taken to process block." }, .{}),
-        .lean_state_transition_attestations_processed_total = Metrics.AttestationsProcessedCounter.init("lean_state_transition_attestations_processed_total", .{ .help = "Total number of processed attestations." }, .{}),
-        .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations." }, .{}),
-        .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of connected validators." }, .{}),
-        .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block in fork choice." }, .{}),
-        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations labeled by source (gossip or block)." }, .{}),
-        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations labeled by source (gossip or block)." }, .{}),
-        .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation." }, .{}),
-        // Individual attestation signature metrics (renamed to match spec)
-        .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation." }, .{}),
-        .lean_pq_sig_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_sig_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature." }, .{}),
-        .lean_pq_sig_attestation_signatures_total = Metrics.PQSigAttestationSignaturesTotalCounter.init("lean_pq_sig_attestation_signatures_total", .{ .help = "Total number of individual attestation signatures." }, .{}),
-        .lean_pq_sig_attestation_signatures_valid_total = Metrics.PQSigAttestationSignaturesValidCounter.init("lean_pq_sig_attestation_signatures_valid_total", .{ .help = "Total number of valid individual attestation signatures." }, .{}),
-        .lean_pq_sig_attestation_signatures_invalid_total = Metrics.PQSigAttestationSignaturesInvalidCounter.init("lean_pq_sig_attestation_signatures_invalid_total", .{ .help = "Total number of invalid individual attestation signatures." }, .{}),
+        .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
+        .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
+        .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),
+        .lean_state_transition_time_seconds = Metrics.StateTransitionHistogram.init("lean_state_transition_time_seconds", .{ .help = "Time to process state transition" }, .{}),
+        .lean_state_transition_slots_processed_total = Metrics.SlotsProcessedCounter.init("lean_state_transition_slots_processed_total", .{ .help = "Total number of processed slots" }, .{}),
+        .lean_state_transition_slots_processing_time_seconds = Metrics.SlotsProcessingHistogram.init("lean_state_transition_slots_processing_time_seconds", .{ .help = "Time taken to process slots" }, .{}),
+        .lean_state_transition_block_processing_time_seconds = Metrics.BlockProcessingTimeHistogram.init("lean_state_transition_block_processing_time_seconds", .{ .help = "Time taken to process block" }, .{}),
+        .lean_state_transition_attestations_processed_total = Metrics.AttestationsProcessedCounter.init("lean_state_transition_attestations_processed_total", .{ .help = "Total number of processed attestations" }, .{}),
+        .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations" }, .{}),
+        .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of validators managed by a node" }, .{}),
+        .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block" }, .{}),
+        .lean_attestations_valid_total = Metrics.ForkChoiceAttestationsValidLabeledCounter.init("lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
+        .lean_attestations_invalid_total = Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init("lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
+        .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation" }, .{}),
+        // Individual attestation signature metrics
+        .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation" }, .{}),
+        .lean_pq_sig_attestation_verification_time_seconds = Metrics.PQSignatureVerificationHistogram.init("lean_pq_sig_attestation_verification_time_seconds", .{ .help = "Time taken to verify an attestation signature" }, .{}),
+        .lean_pq_sig_attestation_signatures_total = Metrics.PQSigAttestationSignaturesTotalCounter.init("lean_pq_sig_attestation_signatures_total", .{ .help = "Total number of individual attestation signatures" }, .{}),
+        .lean_pq_sig_attestation_signatures_valid_total = Metrics.PQSigAttestationSignaturesValidCounter.init("lean_pq_sig_attestation_signatures_valid_total", .{ .help = "Total number of valid individual attestation signatures" }, .{}),
+        .lean_pq_sig_attestation_signatures_invalid_total = Metrics.PQSigAttestationSignaturesInvalidCounter.init("lean_pq_sig_attestation_signatures_invalid_total", .{ .help = "Total number of invalid individual attestation signatures" }, .{}),
         // Aggregated attestation signature metrics
-        .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures." }, .{}),
-        .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures." }, .{}),
-        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Time taken to build an aggregated attestation signature." }, .{}),
-        .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature." }, .{}),
-        .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures." }, .{}),
-        .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures." }, .{}),
+        .lean_pq_sig_aggregated_signatures_total = Metrics.PQSigAggregatedSignaturesTotalCounter.init("lean_pq_sig_aggregated_signatures_total", .{ .help = "Total number of aggregated signatures" }, .{}),
+        .lean_pq_sig_attestations_in_aggregated_signatures_total = Metrics.PQSigAttestationsInAggregatedTotalCounter.init("lean_pq_sig_attestations_in_aggregated_signatures_total", .{ .help = "Total number of attestations included into aggregated signatures" }, .{}),
+        .lean_pq_sig_aggregated_signatures_building_time_seconds = Metrics.PQSigBuildingTimeHistogram.init("lean_pq_sig_aggregated_signatures_building_time_seconds", .{ .help = "Time taken to build an aggregated attestation signature" }, .{}),
+        .lean_pq_sig_aggregated_signatures_verification_time_seconds = Metrics.PQSigAggregatedVerificationHistogram.init("lean_pq_sig_aggregated_signatures_verification_time_seconds", .{ .help = "Time taken to verify an aggregated attestation signature" }, .{}),
+        .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
+        .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
         // Network peer metrics
-        .lean_connected_peers = Metrics.LeanConnectedPeersGauge.init("lean_connected_peers", .{ .help = "Number of currently connected peers." }, .{}),
-        .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total peer connection events by direction and result." }, .{}),
-        .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total peer disconnection events by direction and reason." }, .{}),
+        .lean_connected_peers = try Metrics.LeanConnectedPeersGauge.init(allocator, "lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
+        .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
+        .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
         // Node lifecycle metrics
-        .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)." }, .{}),
-        .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Unix timestamp when the node started." }, .{}),
-        .lean_current_slot = Metrics.LeanCurrentSlotGauge.init("lean_current_slot", .{ .help = "Current slot of the lean chain based on wall clock." }, .{}),
-        .lean_safe_target_slot = Metrics.LeanSafeTargetSlotGauge.init("lean_safe_target_slot", .{ .help = "Safe target slot with 2/3 weight threshold." }, .{}),
+        .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
+        .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
+        .lean_current_slot = Metrics.LeanCurrentSlotGauge.init("lean_current_slot", .{ .help = "Current slot of the lean chain" }, .{}),
+        .lean_safe_target_slot = Metrics.LeanSafeTargetSlotGauge.init("lean_safe_target_slot", .{ .help = "Safe target slot" }, .{}),
         // Fork choice reorg metrics
-        .lean_fork_choice_reorgs_total = Metrics.LeanForkChoiceReorgsTotalCounter.init("lean_fork_choice_reorgs_total", .{ .help = "Total number of fork choice reorganizations." }, .{}),
-        .lean_fork_choice_reorg_depth = Metrics.LeanForkChoiceReorgDepthHistogram.init("lean_fork_choice_reorg_depth", .{ .help = "Depth of fork choice reorgs in blocks." }, .{}),
+        .lean_fork_choice_reorgs_total = Metrics.LeanForkChoiceReorgsTotalCounter.init("lean_fork_choice_reorgs_total", .{ .help = "Total number of fork choice reorgs" }, .{}),
+        .lean_fork_choice_reorg_depth = Metrics.LeanForkChoiceReorgDepthHistogram.init("lean_fork_choice_reorg_depth", .{ .help = "Depth of fork choice reorgs (in blocks)" }, .{}),
         // Finalization metrics
-        .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total finalization attempts by result." }, .{}),
+        .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total number of finalization attempts" }, .{}),
         // Fork-choice store gauges
-        .lean_gossip_signatures = Metrics.LeanGossipSignaturesGauge.init("lean_gossip_signatures", .{ .help = "Number of gossip signatures in fork-choice store." }, .{}),
-        .lean_latest_new_aggregated_payloads = Metrics.LeanLatestNewAggregatedPayloadsGauge.init("lean_latest_new_aggregated_payloads", .{ .help = "Number of new aggregated payload items." }, .{}),
-        .lean_latest_known_aggregated_payloads = Metrics.LeanLatestKnownAggregatedPayloadsGauge.init("lean_latest_known_aggregated_payloads", .{ .help = "Number of known aggregated payload items." }, .{}),
+        .lean_gossip_signatures = Metrics.LeanGossipSignaturesGauge.init("lean_gossip_signatures", .{ .help = "Number of gossip signatures in fork-choice store" }, .{}),
+        .lean_latest_new_aggregated_payloads = Metrics.LeanLatestNewAggregatedPayloadsGauge.init("lean_latest_new_aggregated_payloads", .{ .help = "Number of new aggregated payload items" }, .{}),
+        .lean_latest_known_aggregated_payloads = Metrics.LeanLatestKnownAggregatedPayloadsGauge.init("lean_latest_known_aggregated_payloads", .{ .help = "Number of known aggregated payload items" }, .{}),
         // Committee aggregation histogram
-        .lean_committee_signatures_aggregation_time_seconds = Metrics.CommitteeSignaturesAggregationHistogram.init("lean_committee_signatures_aggregation_time_seconds", .{ .help = "Time taken to aggregate committee signatures." }, .{}),
+        .lean_committee_signatures_aggregation_time_seconds = Metrics.CommitteeSignaturesAggregationHistogram.init("lean_committee_signatures_aggregation_time_seconds", .{ .help = "Time taken to aggregate committee signatures" }, .{}),
         // Validator status gauges
-        .lean_is_aggregator = Metrics.LeanIsAggregatorGauge.init("lean_is_aggregator", .{ .help = "Validator's is_aggregator status. True=1, False=0." }, .{}),
-        .lean_attestation_committee_subnet = Metrics.LeanAttestationCommitteeSubnetGauge.init("lean_attestation_committee_subnet", .{ .help = "Node's attestation committee subnet." }, .{}),
-        .lean_attestation_committee_count = Metrics.LeanAttestationCommitteeCountGauge.init("lean_attestation_committee_count", .{ .help = "Number of attestation committees." }, .{}),
-        // Block production metrics (leanMetrics#29)
-        .lean_block_building_time_seconds = Metrics.BlockBuildingTimeHistogram.init("lean_block_building_time_seconds", .{ .help = "Total time to build a block (propose_block)." }, .{}),
-        .lean_block_building_payload_aggregation_time_seconds = Metrics.BlockPayloadAggregationTimeHistogram.init("lean_block_building_payload_aggregation_time_seconds", .{ .help = "Time to aggregate attestation payloads during block building." }, .{}),
-        .lean_block_aggregated_payloads = Metrics.BlockAggregatedPayloadsHistogram.init("lean_block_aggregated_payloads", .{ .help = "Number of aggregated attestation payloads included in a block." }, .{}),
-        .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Total number of successfully produced blocks." }, .{}),
-        .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Total number of block production failures." }, .{}),
-        // Sync status (leanMetrics#29): 0=idle, 1=syncing, 2=synced
-        .lean_node_sync_status = Metrics.LeanNodeSyncStatusGauge.init("lean_node_sync_status", .{ .help = "Node sync status: 0=idle, 1=syncing (behind peers), 2=synced." }, .{}),
-        // Gossip message size histograms (leanMetrics#29)
-        .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Uncompressed size of received gossip block messages in bytes." }, .{}),
-        .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Uncompressed size of received gossip attestation messages in bytes." }, .{}),
-        .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Uncompressed size of received gossip aggregation messages in bytes." }, .{}),
+        .lean_is_aggregator = Metrics.LeanIsAggregatorGauge.init("lean_is_aggregator", .{ .help = "Validator's is_aggregator status. True=1, False=0" }, .{}),
+        .lean_attestation_committee_subnet = Metrics.LeanAttestationCommitteeSubnetGauge.init("lean_attestation_committee_subnet", .{ .help = "Node's attestation committee subnet" }, .{}),
+        .lean_attestation_committee_count = Metrics.LeanAttestationCommitteeCountGauge.init("lean_attestation_committee_count", .{ .help = "Number of attestation committees (ATTESTATION_COMMITTEE_COUNT)" }, .{}),
+        // Block production metrics
+        .lean_block_building_time_seconds = Metrics.BlockBuildingTimeHistogram.init("lean_block_building_time_seconds", .{ .help = "Time taken to build a block" }, .{}),
+        .lean_block_building_payload_aggregation_time_seconds = Metrics.BlockPayloadAggregationTimeHistogram.init("lean_block_building_payload_aggregation_time_seconds", .{ .help = "Time taken to build aggregated_payloads during block building" }, .{}),
+        .lean_block_aggregated_payloads = Metrics.BlockAggregatedPayloadsHistogram.init("lean_block_aggregated_payloads", .{ .help = "Number of aggregated_payloads in a block" }, .{}),
+        .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Successful block builds" }, .{}),
+        .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Failed block builds (exception in build_block)" }, .{}),
+        // Sync status: labeled gauge with status in {idle, syncing, synced}
+        .lean_node_sync_status = try Metrics.LeanNodeSyncStatusGauge.init(allocator, "lean_node_sync_status", .{ .help = "Node sync status" }, .{}),
+        // Gossip message size histograms
+        .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
+        .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
+        .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
+        .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -500,16 +515,19 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_pq_sig_aggregated_signatures_building_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_building_time_seconds);
     lean_pq_sig_aggregated_signatures_verification_time_seconds.context = @ptrCast(&metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds);
     lean_committee_signatures_aggregation_time_seconds.context = @ptrCast(&metrics.lean_committee_signatures_aggregation_time_seconds);
-    // Block production histogram contexts (leanMetrics#29)
+    // Block production histogram contexts
     lean_block_building_time_seconds.context = @ptrCast(&metrics.lean_block_building_time_seconds);
     lean_block_building_payload_aggregation_time_seconds.context = @ptrCast(&metrics.lean_block_building_payload_aggregation_time_seconds);
     lean_block_aggregated_payloads.context = @ptrCast(&metrics.lean_block_aggregated_payloads);
-    // Gossip size histogram contexts (leanMetrics#29)
+    // Gossip size histogram contexts
     lean_gossip_block_size_bytes.context = @ptrCast(&metrics.lean_gossip_block_size_bytes);
     lean_gossip_attestation_size_bytes.context = @ptrCast(&metrics.lean_gossip_attestation_size_bytes);
     lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
-    // Initialize sync status to idle at startup (leanMetrics#29)
-    metrics.lean_node_sync_status.set(0);
+    lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
+    // Initialize sync status to idle at startup
+    try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
+    try metrics.lean_node_sync_status.set(.{ .status = "syncing" }, 0);
+    try metrics.lean_node_sync_status.set(.{ .status = "synced" }, 0);
 
     g_initialized = true;
 }

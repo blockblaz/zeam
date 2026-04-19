@@ -10,6 +10,7 @@ const key_manager_lib = @import("@zeam/key-manager");
 const chains = @import("./chain.zig");
 const networkFactory = @import("./network.zig");
 const networks = @import("@zeam/network");
+const zeam_metrics = @import("@zeam/metrics");
 
 const constants = @import("./constants.zig");
 
@@ -186,6 +187,8 @@ pub const ValidatorClient = struct {
             },
         }
 
+        const _attest_timer = zeam_metrics.lean_attestations_production_time_seconds.start();
+        defer _ = _attest_timer.observe();
         self.logger.info("constructing attestation message for slot={d}", .{slot});
         const attestation_data = try self.chain.constructAttestationData(.{ .slot = slot });
 
