@@ -28,8 +28,7 @@ pub var metrics = metrics_lib.initializeNoop(Metrics);
 var g_initialized: bool = false;
 
 const Metrics = struct {
-    chain_onblock_duration_seconds: ChainHistogram,
-    block_processing_duration_seconds: BlockProcessingHistogram,
+    zeam_chain_onblock_duration_seconds: ChainHistogram,
     lean_head_slot: LeanHeadSlotGauge,
     lean_latest_justified_slot: LeanLatestJustifiedSlotGauge,
     lean_latest_finalized_slot: LeanLatestFinalizedSlotGauge,
@@ -97,7 +96,6 @@ const Metrics = struct {
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
-    const BlockProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
     const SlotsProcessingHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     const BlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
@@ -211,12 +209,6 @@ fn observeChainOnblock(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
-fn observeBlockProcessing(ctx: ?*anyopaque, value: f32) void {
-    const histogram_ptr = ctx orelse return; // No-op if not initialized
-    const histogram: *Metrics.BlockProcessingHistogram = @ptrCast(@alignCast(histogram_ptr));
-    histogram.observe(value);
-}
-
 fn observeStateTransition(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return; // No-op if not initialized
     const histogram: *Metrics.StateTransitionHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -327,13 +319,9 @@ fn observeAttestationProduction(ctx: ?*anyopaque, value: f32) void {
 
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
-pub var chain_onblock_duration_seconds: Histogram = .{
+pub var zeam_chain_onblock_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeChainOnblock,
-};
-pub var block_processing_duration_seconds: Histogram = .{
-    .context = null,
-    .observe = &observeBlockProcessing,
 };
 pub var lean_state_transition_time_seconds: Histogram = .{
     .context = null,
@@ -422,8 +410,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     }
 
     metrics = .{
-        .chain_onblock_duration_seconds = Metrics.ChainHistogram.init("chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
-        .block_processing_duration_seconds = Metrics.BlockProcessingHistogram.init("block_processing_duration_seconds", .{ .help = "Time taken to process a block in the state transition function." }, .{}),
+        .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
         .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
         .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),
@@ -502,8 +489,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     metrics.lean_latest_known_aggregated_payloads.set(0);
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
-    chain_onblock_duration_seconds.context = @ptrCast(&metrics.chain_onblock_duration_seconds);
-    block_processing_duration_seconds.context = @ptrCast(&metrics.block_processing_duration_seconds);
+    zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
     lean_state_transition_time_seconds.context = @ptrCast(&metrics.lean_state_transition_time_seconds);
     lean_state_transition_slots_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_slots_processing_time_seconds);
     lean_state_transition_block_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_processing_time_seconds);

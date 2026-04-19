@@ -840,7 +840,7 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
-        const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
+        const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 
         const block = signedBlock.block;
 
