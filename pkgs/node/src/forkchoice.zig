@@ -19,6 +19,23 @@ const Root = types.Root;
 const ValidatorIndex = types.ValidatorIndex;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
 
+/// Maximum number of distinct AttestationData entries a single block may
+/// include, matching leanSpec's chain.config.MAX_ATTESTATIONS_DATA.
+pub const MAX_ATTESTATIONS_DATA: usize = 16;
+
+fn validateAttestationDataLimits(
+    allocator: Allocator,
+    aggregated_attestations: []const types.AggregatedAttestation,
+) ForkChoiceError!void {
+    var seen = std.AutoHashMap(types.AttestationData, void).init(allocator);
+    defer seen.deinit();
+    for (aggregated_attestations) |agg_att| {
+        const gop = seen.getOrPut(agg_att.data) catch return ForkChoiceError.InvalidForkchoiceBlock;
+        if (gop.found_existing) return ForkChoiceError.DuplicateAttestationData;
+    }
+    if (seen.count() > MAX_ATTESTATIONS_DATA) return ForkChoiceError.TooManyAttestationData;
+}
+
 const ProtoBlock = types.ProtoBlock;
 pub const ProtoNode = struct {
     // Fields from ProtoBlock
@@ -494,7 +511,7 @@ pub const ForkChoice = struct {
         return true;
     }
 
-    fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
+    pub fn isFinalizedDescendant(self: *Self, blockRoot: types.Root) bool {
         const finalized_slot = self.fcStore.latest_finalized.slot;
         const finalized_root = self.fcStore.latest_finalized.root;
 
@@ -1629,10 +1646,20 @@ pub const ForkChoice = struct {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
-            const is_finalized_descendant = self.isFinalizedDescendant(parent_root);
-            if (is_finalized_descendant != true) {
-                return ForkChoiceError.NotFinalizedDesendant;
-            }
+            // Per leanSpec store.process_block: a block may include at most
+            // MAX_ATTESTATIONS_DATA (16) distinct AttestationData entries, and
+            // each distinct entry must appear exactly once. Enforce this before
+            // registering the block in protoArray so rejected blocks leave no
+            // residue in fork choice state.
+            try validateAttestationDataLimits(self.allocator, block.body.attestations.constSlice());
+
+            // onBlock is a pure store operation aligned with leanSpec's
+            // store.on_block: any block whose parent is in protoArray is stored,
+            // and head selection naturally ignores forks that do not descend
+            // from the finalized root (get_head walks best descendants from
+            // latest_justified). The gossip-level DoS defense against forks
+            // branching off pre-finalization ancestors lives in
+            // chain.validateBlock, not here.
 
             const justified = state.latest_justified;
             const finalized = state.latest_finalized;
@@ -1910,7 +1937,6 @@ pub const ForkChoiceError = error{
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
-    NotFinalizedDesendant,
     InvalidAttestation,
     InvalidDeltas,
     InvalidJustifiedRoot,
@@ -1922,6 +1948,8 @@ pub const ForkChoiceError = error{
     InvalidCanonicalTraversal,
     InvalidForkchoiceBlock,
     InvalidSafeTargetCompute,
+    DuplicateAttestationData,
+    TooManyAttestationData,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added

@@ -454,6 +454,7 @@ fn buildBlock(
     index: usize,
     obj: std.json.ObjectMap,
 ) FixtureError!types.BeamBlock {
+    _ = index;
     const slot = try expect.expectU64Field(FixtureError, obj, &.{"slot"}, ctx, "slot");
     const proposer_index = try expect.expectU64Field(FixtureError, obj, &.{ "proposer_index", "proposerIndex" }, ctx, "proposer_index");
     const parent_root = try expect.expectBytesField(FixtureError, types.Root, obj, &.{ "parent_root", "parentRoot" }, ctx, "parent_root");
@@ -461,24 +462,104 @@ fn buildBlock(
 
     const body_obj = try expect.expectObject(FixtureError, obj, &.{"body"}, ctx, "body");
     const attestations_obj = try expect.expectObject(FixtureError, body_obj, &.{"attestations"}, ctx, "body.attestations");
+
+    var attestations = try types.AggregatedAttestations.init(allocator);
+    errdefer {
+        for (attestations.slice()) |*agg| agg.deinit();
+        attestations.deinit();
+    }
+
     if (attestations_obj.get("data")) |data_val| {
         const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "body.attestations.data");
-        if (arr.items.len != 0) {
-            std.debug.print(
-                "fixture {s} case {s}: attestations unsupported (block #{})\n",
-                .{ ctx.fixture_label, ctx.case_name, index },
-            );
-            return FixtureError.UnsupportedFixture;
+        for (arr.items) |agg_value| {
+            const agg_obj = try expect.expectObjectValue(FixtureError, agg_value, ctx, "body.attestations[].");
+            const bits_value = agg_obj.get("aggregationBits") orelse agg_obj.get("aggregation_bits") orelse {
+                std.debug.print(
+                    "fixture {s} case {s}: aggregated attestation missing aggregationBits\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            };
+            var aggregation_bits = try parseAggregationBits(allocator, ctx, bits_value);
+            errdefer aggregation_bits.deinit();
+
+            const data_obj = try expect.expectObject(FixtureError, agg_obj, &.{"data"}, ctx, "body.attestations[].data");
+            const att_data = try parseAttestationData(ctx, data_obj);
+
+            attestations.append(types.AggregatedAttestation{
+                .aggregation_bits = aggregation_bits,
+                .data = att_data,
+            }) catch {
+                std.debug.print(
+                    "fixture {s} case {s}: failed to append aggregated attestation\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            };
         }
     }
 
-    const attestations = try types.AggregatedAttestations.init(allocator);
     return types.BeamBlock{
         .slot = slot,
         .proposer_index = proposer_index,
         .parent_root = parent_root,
         .state_root = state_root,
         .body = .{ .attestations = attestations },
+    };
+}
+
+fn parseAggregationBits(
+    allocator: std.mem.Allocator,
+    ctx: Context,
+    value: JsonValue,
+) FixtureError!types.AggregationBits {
+    const bits_obj = try expect.expectObjectValue(FixtureError, value, ctx, "aggregationBits");
+    const data_val = bits_obj.get("data") orelse {
+        std.debug.print(
+            "fixture {s} case {s}: aggregationBits missing data\n",
+            .{ ctx.fixture_label, ctx.case_name },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    const arr = try expect.expectArrayValue(FixtureError, data_val, ctx, "aggregationBits.data");
+
+    var bits = types.AggregationBits.init(allocator) catch return FixtureError.InvalidFixture;
+    errdefer bits.deinit();
+
+    for (arr.items) |item| {
+        const flag = switch (item) {
+            .bool => |b| b,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}: aggregationBits entries must be bool\n",
+                    .{ ctx.fixture_label, ctx.case_name },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        bits.append(flag) catch return FixtureError.InvalidFixture;
+    }
+    return bits;
+}
+
+fn parseAttestationData(ctx: Context, data_obj: std.json.ObjectMap) FixtureError!types.AttestationData {
+    const att_slot = try expect.expectU64Field(FixtureError, data_obj, &.{"slot"}, ctx, "data.slot");
+    const head_obj = try expect.expectObject(FixtureError, data_obj, &.{"head"}, ctx, "data.head");
+    const target_obj = try expect.expectObject(FixtureError, data_obj, &.{"target"}, ctx, "data.target");
+    const source_obj = try expect.expectObject(FixtureError, data_obj, &.{"source"}, ctx, "data.source");
+
+    const head_root = try expect.expectBytesField(FixtureError, types.Root, head_obj, &.{"root"}, ctx, "data.head.root");
+    const head_slot = try expect.expectU64Field(FixtureError, head_obj, &.{"slot"}, ctx, "data.head.slot");
+    const target_root = try expect.expectBytesField(FixtureError, types.Root, target_obj, &.{"root"}, ctx, "data.target.root");
+    const target_slot = try expect.expectU64Field(FixtureError, target_obj, &.{"slot"}, ctx, "data.target.slot");
+    const source_root = try expect.expectBytesField(FixtureError, types.Root, source_obj, &.{"root"}, ctx, "data.source.root");
+    const source_slot = try expect.expectU64Field(FixtureError, source_obj, &.{"slot"}, ctx, "data.source.slot");
+
+    return types.AttestationData{
+        .slot = att_slot,
+        .head = .{ .root = head_root, .slot = head_slot },
+        .target = .{ .root = target_root, .slot = target_slot },
+        .source = .{ .root = source_root, .slot = source_slot },
     };
 }
 

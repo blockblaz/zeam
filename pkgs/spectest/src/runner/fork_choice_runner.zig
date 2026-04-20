@@ -186,6 +186,11 @@ const StepContext = struct {
     block_attestations: *BlockAttestationList,
     fork_logger: zeam_utils.ModuleLogger,
     base_context: Context,
+    // Reorg tracking: processBlockStep records the head root observed before
+    // calling onBlock here, and applyChecks for a block step reads/clears it
+    // to validate the reorgDepth check against the ancestry walk.
+    last_block_root: ?types.Root = null,
+    last_pre_block_head_root: ?types.Root = null,
 };
 
 const StateMap = std.AutoHashMapUnmanaged(types.Root, *types.BeamState);
@@ -680,6 +685,10 @@ fn processBlockStep(
         return FixtureError.InvalidFixture;
     };
 
+    // Record the head before onBlock so the reorgDepth check can walk from it.
+    ctx.last_pre_block_head_root = ctx.fork_choice.head.blockRoot;
+    ctx.last_block_root = block_root;
+
     const parent_state_ptr = ctx.state_map.get(block.parent_root) orelse {
         std.debug.print(
             "fixture {s} case {s}{f}: parent root 0x{x} unknown\n",
@@ -706,6 +715,8 @@ fn processBlockStep(
         return FixtureError.FixtureMismatch;
     };
 
+    const finalized_slot_before = ctx.fork_choice.fcStore.latest_finalized.slot;
+
     _ = ctx.fork_choice.onBlock(block, new_state_ptr, .{
         .currentSlot = block.slot,
         .blockDelayMs = 0,
@@ -718,6 +729,22 @@ fn processBlockStep(
         );
         return FixtureError.FixtureMismatch;
     };
+
+    // leanSpec's store.on_block prunes stale gossip signatures and aggregated
+    // payloads whose target slot falls at or below the finalized checkpoint
+    // as soon as finalization advances. Mirror that here so fixture checks on
+    // the pruned maps observe the same state. (chain.zig does this
+    // implicitly via its finalization advancement pipeline — the runner
+    // bypasses chain so we trigger it directly.)
+    if (ctx.fork_choice.fcStore.latest_finalized.slot > finalized_slot_before) {
+        ctx.fork_choice.pruneStaleAttestationData(ctx.fork_choice.fcStore.latest_finalized.slot) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: prune stale attestation data failed ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+    }
 
     ctx.state_map.put(ctx.allocator, block_root, new_state_ptr) catch |err| {
         std.debug.print(
@@ -833,9 +860,23 @@ fn processTickStep(
     step_index: usize,
     step_obj: std.json.ObjectMap,
 ) !void {
-    const time_value = try expectU64Field(step_obj, &.{"time"}, fixture_path, case_name, step_index, "time");
+    const has_proposal = blk: {
+        const value = step_obj.get("hasProposal") orelse step_obj.get("has_proposal") orelse break :blk false;
+        break :blk switch (value) {
+            .bool => |b| b,
+            else => false,
+        };
+    };
 
     const anchor_genesis_time = ctx.fork_choice.anchorState.config.genesis_time;
+
+    if (step_obj.get("interval")) |_| {
+        const target_intervals = try expectU64Field(step_obj, &.{"interval"}, fixture_path, case_name, step_index, "interval");
+        try advanceForkchoiceIntervals(ctx, target_intervals, has_proposal);
+        return;
+    }
+
+    const time_value = try expectU64Field(step_obj, &.{"time"}, fixture_path, case_name, step_index, "time");
     if (time_value < anchor_genesis_time) {
         std.debug.print(
             "fixture {s} case {s}{f}: tick time before genesis\n",
@@ -845,7 +886,7 @@ fn processTickStep(
     }
 
     const target_intervals = timeToIntervals(anchor_genesis_time, time_value);
-    try advanceForkchoiceIntervals(ctx, target_intervals, false);
+    try advanceForkchoiceIntervals(ctx, target_intervals, has_proposal);
 }
 
 fn processAttestationStep(
@@ -898,6 +939,23 @@ fn processAttestationStep(
             else => {},
         }
     }
+
+    // leanSpec's store receives a SignedAttestation here; it inserts into
+    // attestation_signatures (keyed by AttestationData) and updates the
+    // validator tracker. Since fixtures don't carry signatures, use a
+    // zero-bytes placeholder — the signature itself isn't verified in the
+    // runner, but the attestation_signatures map is observable via
+    // `attestationSignatureTargetSlots` checks.
+    ctx.fork_choice.attestation_signatures.addSignature(attestation_data, validator_id, .{
+        .slot = attestation_data.slot,
+        .signature = types.ZERO_SIGBYTES,
+    }) catch |err| {
+        std.debug.print(
+            "fixture {s} case {s}{f}: failed to record attestation signature ({s})\n",
+            .{ fixture_path, case_name, formatStep(step_index), @errorName(err) },
+        );
+        return FixtureError.InvalidFixture;
+    };
 
     const attestation = types.Attestation{
         .validator_id = validator_id,
@@ -1350,11 +1408,299 @@ fn applyChecks(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "safeTargetSlot")) {
+            const expected = try expectU64Value(value, fixture_path, case_name, step_index, key);
+            if (ctx.fork_choice.safeTarget.slot != expected) {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: safe target slot mismatch got {d} expected {d}\n",
+                    .{ fixture_path, case_name, formatStep(step_index), ctx.fork_choice.safeTarget.slot, expected },
+                );
+                return FixtureError.FixtureMismatch;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "safeTargetRootLabel")) {
+            try verifyOrRegisterLabel(ctx, fixture_path, case_name, step_index, value, ctx.fork_choice.safeTarget.blockRoot, "safeTargetRootLabel");
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "latestFinalizedRootLabel")) {
+            try verifyOrRegisterLabel(ctx, fixture_path, case_name, step_index, value, ctx.fork_choice.fcStore.latest_finalized.root, "latestFinalizedRootLabel");
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "filledBlockRootLabel")) {
+            const block_root = ctx.last_block_root orelse {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: filledBlockRootLabel requires a preceding block step\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            };
+            try verifyOrRegisterLabel(ctx, fixture_path, case_name, step_index, value, block_root, "filledBlockRootLabel");
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "labelsInStore")) {
+            try verifyLabelsInStore(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "reorgDepth")) {
+            try verifyReorgDepth(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "attestationSignatureTargetSlots")) {
+            try verifySignatureTargetSlots(ctx, fixture_path, case_name, step_index, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "latestNewAggregatedTargetSlots")) {
+            try verifyPayloadTargetSlots(ctx, fixture_path, case_name, step_index, value, &ctx.fork_choice.latest_new_aggregated_payloads, "latestNewAggregatedTargetSlots");
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "latestKnownAggregatedTargetSlots")) {
+            try verifyPayloadTargetSlots(ctx, fixture_path, case_name, step_index, value, &ctx.fork_choice.latest_known_aggregated_payloads, "latestKnownAggregatedTargetSlots");
+            continue;
+        }
+
         std.debug.print(
             "fixture {s} case {s}{f}: unsupported check {s}\n",
             .{ fixture_path, case_name, formatStep(step_index), key },
         );
         return FixtureError.UnsupportedFixture;
+    }
+}
+
+fn verifyOrRegisterLabel(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+    actual_root: types.Root,
+    label_name: []const u8,
+) FixtureError!void {
+    const label = switch (value) {
+        .string => |s| s,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{f}: {s} must be string\n",
+                .{ fixture_path, case_name, formatStep(step_index), label_name },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+    if (ctx.label_map.get(label)) |expected_root| {
+        if (!std.mem.eql(u8, &actual_root, &expected_root)) {
+            std.debug.print(
+                "fixture {s} case {s}{f}: {s} {s} root mismatch\n",
+                .{ fixture_path, case_name, formatStep(step_index), label_name, label },
+            );
+            return FixtureError.FixtureMismatch;
+        }
+    } else {
+        ctx.label_map.put(ctx.allocator, label, actual_root) catch |err| {
+            std.debug.print(
+                "fixture {s} case {s}{f}: failed to record label {s} ({s})\n",
+                .{ fixture_path, case_name, formatStep(step_index), label, @errorName(err) },
+            );
+            return FixtureError.InvalidFixture;
+        };
+    }
+}
+
+fn verifyLabelsInStore(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    const arr = switch (value) {
+        .array => |a| a,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{f}: labelsInStore must be array\n",
+                .{ fixture_path, case_name, formatStep(step_index) },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+    for (arr.items) |entry| {
+        const label = switch (entry) {
+            .string => |s| s,
+            else => {
+                std.debug.print(
+                    "fixture {s} case {s}{f}: labelsInStore entries must be strings\n",
+                    .{ fixture_path, case_name, formatStep(step_index) },
+                );
+                return FixtureError.InvalidFixture;
+            },
+        };
+        const root = ctx.label_map.get(label) orelse {
+            std.debug.print(
+                "fixture {s} case {s}{f}: labelsInStore label {s} was never recorded\n",
+                .{ fixture_path, case_name, formatStep(step_index), label },
+            );
+            return FixtureError.FixtureMismatch;
+        };
+        if (ctx.fork_choice.protoArray.indices.get(root) == null) {
+            std.debug.print(
+                "fixture {s} case {s}{f}: labelsInStore label {s} no longer in protoArray\n",
+                .{ fixture_path, case_name, formatStep(step_index), label },
+            );
+            return FixtureError.FixtureMismatch;
+        }
+    }
+}
+
+fn verifyReorgDepth(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    const expected = try expectU64Value(value, fixture_path, case_name, step_index, "reorgDepth");
+    const old_head = ctx.last_pre_block_head_root orelse {
+        std.debug.print(
+            "fixture {s} case {s}{f}: reorgDepth requires a preceding block step\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    const new_head = ctx.fork_choice.head.blockRoot;
+
+    // Walk the ancestry of new_head into a set, then walk old_head until hit.
+    var new_ancestors = std.AutoHashMap(types.Root, void).init(ctx.allocator);
+    defer new_ancestors.deinit();
+    var maybe_idx: ?usize = ctx.fork_choice.protoArray.indices.get(new_head);
+    while (maybe_idx) |idx| {
+        const proto_node = ctx.fork_choice.protoArray.nodes.items[idx];
+        new_ancestors.put(proto_node.blockRoot, {}) catch return FixtureError.InvalidFixture;
+        maybe_idx = proto_node.parent;
+    }
+
+    var depth: u64 = 0;
+    var maybe_old_idx: ?usize = ctx.fork_choice.protoArray.indices.get(old_head);
+    while (maybe_old_idx) |idx| {
+        const proto_node = ctx.fork_choice.protoArray.nodes.items[idx];
+        if (new_ancestors.contains(proto_node.blockRoot)) break;
+        depth += 1;
+        maybe_old_idx = proto_node.parent;
+    }
+
+    if (depth != expected) {
+        std.debug.print(
+            "fixture {s} case {s}{f}: reorgDepth mismatch got {d} expected {d}\n",
+            .{ fixture_path, case_name, formatStep(step_index), depth, expected },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+}
+
+fn collectSortedUniqueSlots(allocator: Allocator, slots: []const u64) ![]u64 {
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+    var unique = std.ArrayList(u64){};
+    errdefer unique.deinit(allocator);
+    for (slots) |s| {
+        const gop = try seen.getOrPut(s);
+        if (!gop.found_existing) {
+            try unique.append(allocator, s);
+        }
+    }
+    const out = try unique.toOwnedSlice(allocator);
+    std.sort.heap(u64, out, {}, std.sort.asc(u64));
+    return out;
+}
+
+fn parseExpectedTargetSlotsArray(
+    allocator: Allocator,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+    label: []const u8,
+) FixtureError![]u64 {
+    const arr = switch (value) {
+        .array => |a| a,
+        else => {
+            std.debug.print(
+                "fixture {s} case {s}{f}: {s} must be array\n",
+                .{ fixture_path, case_name, formatStep(step_index), label },
+            );
+            return FixtureError.InvalidFixture;
+        },
+    };
+    const buf = allocator.alloc(u64, arr.items.len) catch return FixtureError.InvalidFixture;
+    errdefer allocator.free(buf);
+    for (arr.items, 0..) |entry, i| {
+        buf[i] = try expectU64Value(entry, fixture_path, case_name, step_index, label);
+    }
+    std.sort.heap(u64, buf, {}, std.sort.asc(u64));
+    return buf;
+}
+
+fn verifySignatureTargetSlots(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+) FixtureError!void {
+    var actual_list = std.ArrayList(u64){};
+    defer actual_list.deinit(ctx.allocator);
+    var it = ctx.fork_choice.attestation_signatures.iterator();
+    while (it.next()) |entry| {
+        actual_list.append(ctx.allocator, entry.key_ptr.*.target.slot) catch return FixtureError.InvalidFixture;
+    }
+    const actual = collectSortedUniqueSlots(ctx.allocator, actual_list.items) catch return FixtureError.InvalidFixture;
+    defer ctx.allocator.free(actual);
+
+    const expected = try parseExpectedTargetSlotsArray(ctx.allocator, fixture_path, case_name, step_index, value, "attestationSignatureTargetSlots");
+    defer ctx.allocator.free(expected);
+
+    if (!std.mem.eql(u64, actual, expected)) {
+        std.debug.print(
+            "fixture {s} case {s}{f}: attestationSignatureTargetSlots mismatch\n",
+            .{ fixture_path, case_name, formatStep(step_index) },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+}
+
+fn verifyPayloadTargetSlots(
+    ctx: *StepContext,
+    fixture_path: []const u8,
+    case_name: []const u8,
+    step_index: usize,
+    value: JsonValue,
+    payloads_map: *const types.AggregatedPayloadsMap,
+    label: []const u8,
+) FixtureError!void {
+    var actual_list = std.ArrayList(u64){};
+    defer actual_list.deinit(ctx.allocator);
+    var it = payloads_map.iterator();
+    while (it.next()) |entry| {
+        actual_list.append(ctx.allocator, entry.key_ptr.*.target.slot) catch return FixtureError.InvalidFixture;
+    }
+    const actual = collectSortedUniqueSlots(ctx.allocator, actual_list.items) catch return FixtureError.InvalidFixture;
+    defer ctx.allocator.free(actual);
+
+    const expected = try parseExpectedTargetSlotsArray(ctx.allocator, fixture_path, case_name, step_index, value, label);
+    defer ctx.allocator.free(expected);
+
+    if (!std.mem.eql(u64, actual, expected)) {
+        std.debug.print(
+            "fixture {s} case {s}{f}: {s} mismatch\n",
+            .{ fixture_path, case_name, formatStep(step_index), label },
+        );
+        return FixtureError.FixtureMismatch;
     }
 }
 
@@ -1436,14 +1782,24 @@ fn verifyBlockAttestations(
         }
         std.sort.heap(u64, expected_participants, {}, std.sort.asc(u64));
 
-        const expected_attestation_slot = try expectU64Field(obj, &.{"attestationSlot"}, fixture_path, case_name, step_index, "attestationSlot");
-        const expected_target_slot = try expectU64Field(obj, &.{"targetSlot"}, fixture_path, case_name, step_index, "targetSlot");
+        const expected_attestation_slot: ?u64 = if (obj.get("attestationSlot") != null)
+            try expectU64Field(obj, &.{"attestationSlot"}, fixture_path, case_name, step_index, "attestationSlot")
+        else
+            null;
+        const expected_target_slot: ?u64 = if (obj.get("targetSlot") != null)
+            try expectU64Field(obj, &.{"targetSlot"}, fixture_path, case_name, step_index, "targetSlot")
+        else
+            null;
 
         var found = false;
         for (ctx.block_attestations.items, 0..) |actual, actual_idx| {
             if (matched[actual_idx]) continue;
-            if (actual.attestation_slot != expected_attestation_slot) continue;
-            if (actual.target_slot != expected_target_slot) continue;
+            if (expected_attestation_slot) |slot| {
+                if (actual.attestation_slot != slot) continue;
+            }
+            if (expected_target_slot) |slot| {
+                if (actual.target_slot != slot) continue;
+            }
             if (actual.participants.len != expected_participants.len) continue;
 
             var equal = true;
@@ -1503,33 +1859,49 @@ fn verifyAttestationChecks(
         const validator = try expectU64Field(obj, &.{"validator"}, fixture_path, case_name, step_index, "validator");
         const location = try expectStringField(obj, &.{"location"}, fixture_path, case_name, step_index, "location");
 
-        const tracker = ctx.fork_choice.attestations.get(validator) orelse {
+        // leanSpec store_checks.extract_attestations_from_aggregated_payloads iterates
+        // the target payload map and picks, for each participating validator, the
+        // AttestationData with the largest slot. Mirror that here against
+        // latest_new_aggregated_payloads or latest_known_aggregated_payloads.
+        const payloads_map = if (std.mem.eql(u8, location, "new"))
+            &ctx.fork_choice.latest_new_aggregated_payloads
+        else if (std.mem.eql(u8, location, "known"))
+            &ctx.fork_choice.latest_known_aggregated_payloads
+        else {
             std.debug.print(
-                "fixture {s} case {s}{f}: attestation tracker missing for validator {d}\n",
-                .{ fixture_path, case_name, formatStep(step_index), validator },
+                "fixture {s} case {s}{f}: unknown attestationCheck location {s}\n",
+                .{ fixture_path, case_name, formatStep(step_index), location },
             );
-            return FixtureError.FixtureMismatch;
+            return FixtureError.InvalidFixture;
         };
 
-        const proto = if (std.mem.eql(u8, location, "new"))
-            tracker.latestNew
-        else if (std.mem.eql(u8, location, "known"))
-            tracker.latestKnown
-        else
-            null;
-
-        if (proto == null) {
-            std.debug.print(
-                "fixture {s} case {s}{f}: validator {d} missing {s} attestation\n",
-                .{ fixture_path, case_name, formatStep(step_index), validator, location },
-            );
-            return FixtureError.FixtureMismatch;
+        var best_att_data: ?types.AttestationData = null;
+        {
+            var map_it = payloads_map.iterator();
+            while (map_it.next()) |payload_entry| {
+                const att_data = payload_entry.key_ptr.*;
+                const proof_list = payload_entry.value_ptr.*;
+                for (proof_list.items) |stored| {
+                    const bits = &stored.proof.participants;
+                    if (validator >= bits.len()) continue;
+                    const has_bit = bits.get(@intCast(validator)) catch false;
+                    if (!has_bit) continue;
+                    if (best_att_data) |existing| {
+                        if (existing.slot < att_data.slot) {
+                            best_att_data = att_data;
+                        }
+                    } else {
+                        best_att_data = att_data;
+                    }
+                    break;
+                }
+            }
         }
 
-        const attestation_data = proto.?.attestation_data orelse {
+        const attestation_data = best_att_data orelse {
             std.debug.print(
-                "fixture {s} case {s}{f}: validator {d} has no attestation payload\n",
-                .{ fixture_path, case_name, formatStep(step_index), validator },
+                "fixture {s} case {s}{f}: validator {d} not found in latest_{s}_aggregated_payloads\n",
+                .{ fixture_path, case_name, formatStep(step_index), validator, location },
             );
             return FixtureError.FixtureMismatch;
         };

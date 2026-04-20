@@ -1288,6 +1288,9 @@ pub const BeamChain = struct {
     /// 3. Proposer index bounds check: proposer_index must be < validator_count
     /// 4. Parent existence check: parent_root must be known
     /// 5. Slot ordering check: block.slot must be > parent.slot
+    /// 6. Finalized-descendant check: parent chain must reach the finalized
+    ///    checkpoint (DoS defense — forks off pre-finalization ancestors are
+    ///    rejected here so they never enter the fork choice store).
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
         _ = is_from_gossip;
 
@@ -1341,6 +1344,20 @@ pub const BeamChain = struct {
                 parent_block.?.slot,
             });
             return BlockValidationError.SlotNotAfterParent;
+        }
+
+        // 6. Finalized-descendant check - reject forks that branch off from
+        // pre-finalization ancestors. This is the gossip-level DoS defense that
+        // prevents malicious peers from flooding the fork choice store with
+        // blocks whose parent chain cannot reach the finalized checkpoint.
+        // forkchoice.onBlock is intentionally permissive here (matching
+        // leanSpec store.on_block semantics), so the check must live at this
+        // attack surface.
+        if (!self.forkChoice.isFinalizedDescendant(block.parent_root)) {
+            self.logger.debug("block validation failed: parent 0x{x} does not descend from finalized root", .{
+                &block.parent_root,
+            });
+            return BlockValidationError.NotFinalizedDescendant;
         }
     }
 
@@ -1716,6 +1733,8 @@ pub const BlockValidationError = error{
     InvalidProposerIndex,
     /// Block slot is not greater than parent slot
     SlotNotAfterParent,
+    /// Block's parent chain does not descend from the finalized checkpoint
+    NotFinalizedDescendant,
 };
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
