@@ -932,28 +932,32 @@ export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: 
     zig_handler.allocator.free(private_key_slice);
 }
 
-pub extern fn create_and_run_network(
+/// Must match `CreateNetworkParams` in `rust/libp2p-glue/src/lib.rs` (repr(C)).
+pub const CreateNetworkParams = extern struct {
     network_id: u32,
-    handle: *EthLibp2p,
+    padding: u32,
+    zig_handler: u64,
     local_private_key: [*:0]const u8,
     listen_addresses: [*:0]const u8,
     connect_addresses: [*:0]const u8,
     topics: [*:0]const u8,
-) void;
+};
+
+pub extern fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c) void;
 pub extern fn wait_for_network_ready(
     network_id: u32,
     timeout_ms: u64,
-) bool;
+) callconv(.c) bool;
 /// Signal the Rust-side libp2p event loop to exit. After returning, the hosting
 /// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
 /// on a network that was never started or is already stopped (no-op).
-pub extern fn stop_network(network_id: u32) void;
+pub extern fn stop_network(network_id: u32) callconv(.c) void;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
     message_ptr: [*]const u8,
     message_len: usize,
-) void;
+) callconv(.c) void;
 pub extern fn send_rpc_request(
     networkId: u32,
     peer_id: [*:0]const u8,
@@ -973,6 +977,31 @@ pub extern fn send_rpc_error_response(
     channel_id: u64,
     message_ptr: [*:0]const u8,
 ) callconv(.c) void;
+
+/// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
+/// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
+/// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
+const CreateNetworkThreadArgs = struct {
+    network_id: u32,
+    handle: *EthLibp2p,
+    local_private_key: [*:0]const u8,
+    listen_addresses: [*:0]const u8,
+    connect_addresses: [*:0]const u8,
+    topics: [*:0]const u8,
+};
+
+fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
+    var c_params: CreateNetworkParams = .{
+        .network_id = args.network_id,
+        .padding = 0,
+        .zig_handler = @intFromPtr(args.handle),
+        .local_private_key = args.local_private_key,
+        .listen_addresses = args.listen_addresses,
+        .connect_addresses = args.connect_addresses,
+        .topics = args.topics,
+    };
+    create_and_run_network(&c_params);
+}
 
 pub const EthLibp2pParams = struct {
     networkId: u32,
@@ -1118,7 +1147,14 @@ pub const EthLibp2p = struct {
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
+        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
+            .network_id = self.params.networkId,
+            .handle = self,
+            .local_private_key = local_private_key.ptr,
+            .listen_addresses = listen_addresses_str.ptr,
+            .connect_addresses = connect_peers_str.ptr,
+            .topics = topics_str.ptr,
+        }});
 
         // Wait for the network to be fully initialized before returning
         // Use a 10 second timeout to avoid hanging indefinitely

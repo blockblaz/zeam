@@ -251,7 +251,7 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
 ///
 /// This function is thread-safe and can be called from any thread.
 #[no_mangle]
-pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
+pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = std::time::Instant::now() + timeout;
 
@@ -283,18 +283,37 @@ pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
     }
 }
 
+/// C-ABI parameters for [`create_and_run_network`].
+///
+/// `network_id` is followed by explicit padding so `zig_handler` is 8-byte aligned, matching Zig `extern struct`.
+#[repr(C)]
+pub struct CreateNetworkParams {
+    pub network_id: u32,
+    pub _padding: u32,
+    pub zig_handler: u64,
+    pub local_private_key: *const c_char,
+    pub listen_addresses: *const c_char,
+    pub connect_addresses: *const c_char,
+    pub topics_str: *const c_char,
+}
+
 /// # Safety
 ///
-/// The caller must ensure that `listen_addresses` and `connect_addresses` point to valid null-terminated C strings.
+/// `params` must be non-null and valid until this function returns. String pointers must point to valid
+/// null-terminated C strings for `listen_addresses`, `connect_addresses`, `topics_str`, and `local_private_key`.
 #[no_mangle]
-pub unsafe fn create_and_run_network(
-    network_id: u32,
-    zig_handler: u64,
-    local_private_key: *const c_char,
-    listen_addresses: *const c_char,
-    connect_addresses: *const c_char,
-    topics_str: *const c_char,
-) {
+pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkParams) {
+    if params.is_null() {
+        return;
+    }
+    let p = &*params;
+    let network_id = p.network_id;
+    let zig_handler = p.zig_handler;
+    let local_private_key = p.local_private_key;
+    let listen_addresses = p.listen_addresses;
+    let connect_addresses = p.connect_addresses;
+    let topics_str = p.topics_str;
+
     // Register the handler early so any logs emitted from the parse/validation
     // path below are routed through the Zig logger.
     set_zig_handler(network_id, zig_handler);
@@ -410,7 +429,7 @@ pub unsafe fn create_and_run_network(
 /// The caller must ensure that `topic` points to valid null-terminated C string.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe fn publish_msg_to_rust_bridge(
+pub unsafe extern "C" fn publish_msg_to_rust_bridge(
     network_id: u32,
     topic: *const c_char,
     message_str: *const u8,
@@ -462,7 +481,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
 /// The caller must ensure that `peer_id` points to a valid null-terminated C string.
 /// The caller must ensure that `request_data` points to valid memory of `request_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_request(
+pub unsafe extern "C" fn send_rpc_request(
     network_id: u32,
     peer_id: *const c_char,
     protocol_tag: u32,
@@ -537,7 +556,7 @@ pub unsafe fn send_rpc_request(
 /// # Safety
 /// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_response_chunk(
+pub unsafe extern "C" fn send_rpc_response_chunk(
     network_id: u32,
     channel_id: u64,
     response_data: *const u8,
@@ -593,7 +612,7 @@ pub unsafe fn send_rpc_response_chunk(
 /// # Safety
 /// The caller must ensure the channel id is valid for a pending response.
 #[no_mangle]
-pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
+pub unsafe extern "C" fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     let channel = {
         let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
         response_map.remove(&channel_id)
@@ -634,7 +653,7 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
 /// # Safety
 /// The caller must ensure `message_ptr` points to a valid null-terminated C string.
 #[no_mangle]
-pub unsafe fn send_rpc_error_response(
+pub unsafe extern "C" fn send_rpc_error_response(
     network_id: u32,
     channel_id: u64,
     message_ptr: *const c_char,
