@@ -181,10 +181,29 @@ jobs:
         shell: bash
         run: mkdir -p results
 
-      - name: Run Hive
-        id: hive
+      # The upstream `clients/zeam` Dockerfile in ethereum/hive does an
+      # `apt-get update && apt-get install` over the public Ubuntu mirrors and
+      # a `docker pull blockblaz/zeam:devnet4` before any zeam-specific code
+      # runs. Both are transient-failure prone on shared GitHub runners and
+      # produce a build-time failure (exit 100) that does not indicate a
+      # regression in-tree. Retry the hive invocation once with a small
+      # backoff so those transients do not spuriously fail the scheduled
+      # run and auto-open a tracking issue.
+      #
+      # The retry only fires when the primary step's outcome is `failure`,
+      # and by construction (see the disambiguation block inside the run
+      # script) that only happens on infrastructure failures -- real test
+      # failures write at least one suite file, which flips the step's
+      # outcome back to `success` so failing tests still surface via the
+      # Summarize step rather than being silently retried.
+      - name: Run Hive (primary attempt)
+        id: hive_primary
+        continue-on-error: true
         working-directory: ./src
         shell: bash
+        env:
+          HIVE_SIMULATOR_NAME: ${{ steps.cfg.outputs.simulator }}
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
         run: |
           set -x
           # `--docker.output` streams the client/simulator docker build stdout+stderr
@@ -196,10 +215,10 @@ jobs:
           # real exit code deliberately; it is read from PIPESTATUS[0] on
           # the next line before any other command can clobber it.
           ./hive \
-            --sim "${{ steps.cfg.outputs.simulator }}" \
+            --sim "$HIVE_SIMULATOR_NAME" \
             --client "zeam" \
             --results-root results \
-            --client-file simulators/lean/clients/${{ steps.cfg.outputs.devnet }}.yaml \
+            --client-file "simulators/lean/clients/${HIVE_DEVNET_LABEL}.yaml" \
             --docker.output \
             2>&1 | tee hive.log || true
           hive_rc="${PIPESTATUS[0]}"
@@ -236,6 +255,76 @@ jobs:
             fi
             echo "hive exited $hive_rc after running ${#suite_results[@]} suite(s); treating non-zero as test failures and continuing -- see the Summarize hive results step for details" >&2
           fi
+
+      - name: Back off before retry
+        if: steps.hive_primary.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+
+      # Retry the same inline bash body as the primary attempt. Only fires
+      # when the primary exited with an infrastructure failure (no suite
+      # file was written); test failures leave the primary step's outcome
+      # at `success`, so this step is skipped on the happy-path-with-red-
+      # tests case. The primary's results dir is guaranteed empty in this
+      # branch, so we reuse it rather than introducing a second results
+      # root.
+      - name: Run Hive (retry)
+        if: steps.hive_primary.outcome == 'failure'
+        id: hive_retry
+        continue-on-error: true
+        working-directory: ./src
+        shell: bash
+        env:
+          HIVE_SIMULATOR_NAME: ${{ steps.cfg.outputs.simulator }}
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
+        run: |
+          set -x
+          ./hive \
+            --sim "$HIVE_SIMULATOR_NAME" \
+            --client "zeam" \
+            --results-root results \
+            --client-file "simulators/lean/clients/${HIVE_DEVNET_LABEL}.yaml" \
+            --docker.output \
+            2>&1 | tee hive.log || true
+          hive_rc="${PIPESTATUS[0]}"
+
+          shopt -s nullglob
+          suite_results=()
+          for f in results/*.json; do
+            [ "$(basename "$f")" = "hive.json" ] && continue
+            suite_results+=("$f")
+          done
+
+          if [ "$hive_rc" -ne 0 ]; then
+            if [ "${#suite_results[@]}" -eq 0 ]; then
+              echo "hive exited $hive_rc before any suite finished; treating as infrastructure failure" >&2
+              exit "$hive_rc"
+            fi
+            echo "hive exited $hive_rc after running ${#suite_results[@]} suite(s); treating non-zero as test failures and continuing -- see the Summarize hive results step for details" >&2
+          fi
+
+      # Single authoritative outcome used by every downstream step (PR
+      # comment, scheduled-failure issue creator, job status). Exits 0 iff
+      # either attempt succeeded; otherwise fails the job. Kept as
+      # `id: hive` so existing downstream references (`steps.hive.outcome`)
+      # don't need to change.
+      - name: Consolidate Hive outcome
+        id: hive
+        if: always()
+        shell: bash
+        run: |
+          primary='${{ steps.hive_primary.outcome }}'
+          retry='${{ steps.hive_retry.outcome }}'
+          if [ "$primary" = "success" ]; then
+            echo "Hive succeeded on primary attempt"
+            exit 0
+          fi
+          if [ "$retry" = "success" ]; then
+            echo "Hive succeeded on retry (primary: $primary)"
+            exit 0
+          fi
+          echo "Hive failed on both attempts (primary: $primary, retry: $retry)"
+          exit 1
 
       - name: Summarize hive results
         id: summary

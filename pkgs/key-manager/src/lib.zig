@@ -28,6 +28,30 @@ const CachedKeyPair = struct {
 var global_test_key_pair_cache: ?std.AutoHashMap(usize, CachedKeyPair) = null;
 const cache_allocator = std.heap.page_allocator;
 
+/// Free every cached XMSS keypair and drop the backing hashmap.
+///
+/// The cache is intentionally long-lived — regenerating XMSS keypairs is
+/// expensive so callers of `getTestKeyManager` share the same set across
+/// invocations. That means on process exit the cache (and all secret key
+/// material it holds) otherwise leaks. Call this from a graceful shutdown
+/// path (e.g. CLI main after the KeyManager itself is deinit'd) so the OS
+/// doesn't have to reclaim it and, more importantly, so any future
+/// xmss-side zeroization of secret material actually runs.
+///
+/// Safe to call even if the cache was never populated. Not thread-safe;
+/// callers must ensure no other thread is touching the cache.
+pub fn deinitGlobalKeyCache() void {
+    if (global_test_key_pair_cache) |*cache| {
+        var it = cache.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.attestation_keypair.deinit();
+            entry.value_ptr.proposal_keypair.deinit();
+        }
+        cache.deinit();
+        global_test_key_pair_cache = null;
+    }
+}
+
 fn getOrCreateCachedKeyPair(
     validator_id: usize,
     num_active_epochs: usize,
