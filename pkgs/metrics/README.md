@@ -262,7 +262,7 @@ The recommended way to measure durations is using the Timer API:
 
 ```zig
 // Start a timer
-const timer = zeam_metrics.chain_onblock_duration_seconds.start();
+const timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 defer _ = timer.observe(); // Automatically records when scope exits
 
 // ... do work ...
@@ -317,7 +317,7 @@ zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = "inb
 If you need to record a pre-calculated value without starting a timer:
 
 ```zig
-zeam_metrics.block_processing_duration_seconds.record(duration_seconds);
+zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(block_size_bytes));
 ```
 
 ## Adding New Metrics

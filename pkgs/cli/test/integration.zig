@@ -565,8 +565,7 @@ test "CLI beam command with mock network - complete integration test" {
     try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200") != null or std.mem.indexOf(u8, response, "HTTP/1.0 200") != null);
 
     // Verify response contains actual metric names from the metrics system
-    try std.testing.expect(std.mem.indexOf(u8, response, "chain_onblock_duration_seconds") != null or
-        std.mem.indexOf(u8, response, "block_processing_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zeam_chain_onblock_duration_seconds") != null);
 
     // Verify response is not empty
     try std.testing.expect(response.len > 100);
