@@ -1897,6 +1897,15 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Get a ProtoNode's index in the underlying nodes array. Callers use
+    /// this to measure how many nodes precede a given block (e.g. to gate
+    /// proto-array rebase on a grace-window threshold).
+    pub fn getProtoNodeIndex(self: *Self, blockRoot: types.Root) ?usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.indices.get(blockRoot);
+    }
+
     /// Get the current number of nodes in the forkchoice tree
     pub fn getNodeCount(self: *Self) usize {
         self.mutex.lockShared();

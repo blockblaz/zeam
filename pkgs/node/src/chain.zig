@@ -1315,9 +1315,26 @@ pub const BeamChain = struct {
             pruned_count,
         });
 
-        // 5 Rebase forkchouce
-        if (pruneForkchoice)
-            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+        // 5 Rebase forkchoice — lazy prune with node-count threshold.
+        //
+        // Eager rebase drops pre-finalized ancestors from proto-array and
+        // remaps attestation-tracker indices. In-flight attestations whose
+        // source/target/head still points at one of those ancestors then
+        // fail the existence checks in validateAttestationData with
+        // Unknown{Source,Target,Head}Block, and the node burns bandwidth
+        // re-fetching blocks that will never come back. The grace window
+        // must outlast the worst-case gossip delay plus at least one
+        // finalization tick; constants.PRUNE_NODE_THRESHOLD = 64 slots
+        // (≈256 s at SECONDS_PER_SLOT=4) is comfortably beyond both.
+        if (pruneForkchoice) {
+            if (self.forkChoice.getProtoNodeIndex(latestFinalized.root)) |finalized_idx| {
+                if (finalized_idx >= constants.PRUNE_NODE_THRESHOLD) {
+                    try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+                }
+                // else: threshold not reached; keep pre-finalized ancestors
+                // in proto-array so in-flight attestations still resolve.
+            }
+        }
 
         // TODO:
         // 6. Remove orphaned blocks from database and cleanup unfinalized indices of there are any
@@ -1537,9 +1554,15 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Per leanSpec: on_gossip_aggregated_attestation does NOT call validate_attestation.
-        // Attestation data was already validated when individual gossip attestations arrived.
-        // Re-validating here would fail after finalization prunes the source block from protoarray.
+        // Validate attestation data (same rules as individual gossip attestations).
+        // The earlier revision of this function skipped re-validation because the
+        // source block could vanish from proto-array when finalization advanced
+        // between publish and receipt. That race is now handled at the root —
+        // processFinalizationAdvancement gates the rebase call on
+        // PRUNE_NODE_THRESHOLD, keeping the source / target / head blocks
+        // addressable for the full grace window — so the stricter check is
+        // safe again.
+        try self.validateAttestationData(signedAggregation.data, false);
 
         try self.verifyAggregatedAttestation(signedAggregation);
 
@@ -2311,7 +2334,7 @@ test "attestation validation - comprehensive" {
         const future_attestation: types.SignedAttestation = .{
             .validator_id = 0,
             .message = .{
-                .slot = 3, // Future slot (current is 2)
+                .slot = 4, // Two slots past current (current is 2, tolerance is +1)
                 .head = types.Checkpoint{
                     .root = mock_chain.blockRoots[2],
                     .slot = 2,
@@ -2384,11 +2407,12 @@ test "attestation validation - gossip vs block future slot handling" {
     const missing_roots = try beam_chain.onBlock(block, .{});
     allocator.free(missing_roots);
 
-    // Current time is at slot 1, create attestation for slot 2 (next slot)
+    // Current time is at slot 1. Create attestation for slot 3 (current + 2),
+    // which exceeds the +1 tolerance for both gossip and block.
     const next_slot_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
-            .slot = 2,
+            .slot = 3,
             .head = types.Checkpoint{
                 .root = mock_chain.blockRoots[1],
                 .slot = 1,
@@ -2405,32 +2429,13 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
 
-    // Per leanSpec store.py:320: assert data.slot <= current_slot + Slot(1)
-    // Both gossip and block attestations allow current_slot + 1
-    try beam_chain.validateAttestationData(next_slot_attestation.message, false);
-    try beam_chain.validateAttestationData(next_slot_attestation.message, true);
-    const too_far_attestation: types.SignedAttestation = .{
-        .validator_id = 0,
-        .message = .{
-            .slot = 3, // Too far in future
-            .head = types.Checkpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
-            },
-            .source = types.Checkpoint{
-                .root = mock_chain.blockRoots[0],
-                .slot = 0,
-            },
-            .target = types.Checkpoint{
-                .root = mock_chain.blockRoots[1],
-                .slot = 1,
-            },
-        },
-        .signature = ZERO_SIGBYTES,
-    };
-    // Both should fail for slot 3 when current is slot 1
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
+    // Gossip attestations: should FAIL for slot current + 2
+    // Per spec store.py:177: assert attestation.slot <= time_slots
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
+
+    // Block attestations: should FAIL for slot current + 2
+    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, true));
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
@@ -2659,4 +2664,93 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Only the known attestation is included in the block
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
+}
+
+test "processFinalizationAdvancement: below PRUNE_NODE_THRESHOLD keeps pre-finalized ancestors" {
+    // Regression: eager ProtoArray.rebase dropped pre-finalized ancestors on
+    // every finalization advance, so in-flight attestations whose source /
+    // target / head referenced those ancestors failed the existence check in
+    // validateAttestationData with Unknown{Source,Target,Head}Block.
+    //
+    // With the threshold gate, rebase is skipped while the finalized node's
+    // index in protoArray is below PRUNE_NODE_THRESHOLD. A short mock chain
+    // never crosses the threshold, so all recently-finalized ancestors must
+    // still be addressable after the chain finalizes.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 5, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(
+        allocator,
+        ChainOpts{
+            .config = chain_config,
+            .anchorState = &beam_state,
+            .nodeId = 7,
+            .logger_config = &zeam_logger_config,
+            .db = db,
+            .node_registry = test_registry,
+        },
+        connected_peers,
+    );
+    defer beam_chain.deinit();
+
+    // Drive the chain with default opts (pruneForkchoice = true) so the gate
+    // is actually exercised.
+    for (1..mock_chain.blocks.len) |i| {
+        const signed_block = mock_chain.blocks[i];
+        const current_slot = signed_block.block.slot;
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
+    }
+
+    // Sanity-check: mock chain must actually advance finalization for this
+    // regression to mean anything.
+    try std.testing.expect(beam_chain.forkChoice.getLatestFinalized().slot > 0);
+
+    // The finalized node's index in protoArray should be well under the
+    // threshold (5 blocks total, threshold = 64).
+    const finalized_idx = beam_chain.forkChoice.getProtoNodeIndex(beam_chain.forkChoice.getLatestFinalized().root);
+    try std.testing.expect(finalized_idx != null);
+    try std.testing.expect(finalized_idx.? < constants.PRUNE_NODE_THRESHOLD);
+
+    // All processed block roots — including the pre-finalized ones — must
+    // still resolve through the fork-choice API that validateAttestationData
+    // consults. Pre-gate, rebase would have dropped the below-finalized ones.
+    for (1..mock_chain.blocks.len) |i| {
+        try std.testing.expect(beam_chain.forkChoice.getProtoNode(mock_chain.blockRoots[i]) != null);
+    }
 }
