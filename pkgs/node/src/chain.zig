@@ -57,6 +57,10 @@ pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
     blockRoot: ?types.Root = null,
     pruneForkchoice: bool = true,
+    // Pre-serialized SSZ bytes for the block.  When set, onBlock uses them directly
+    // for database persistence and skips re-serializing the live SignedBlock, which
+    // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
+    sszBytes: ?[]const u8 = null,
 };
 
 pub const GossipProcessingResult = struct {
@@ -865,6 +869,30 @@ pub const BeamChain = struct {
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
         try self.root_to_slot_cache.put(block_root, block.slot);
 
+        // Obtain SSZ bytes for RocksDB persistence.
+        //
+        // Prefer the pre-serialized bytes captured at cache time (blockInfo.sszBytes).
+        // Using those bytes avoids calling ssz.serialize on the live `signedBlock` here,
+        // which has been observed to corrupt in-memory List/Bitlist state (aggregation_bits,
+        // proof_data) and cause segfaults on the next cached block's processing.
+        //
+        // If no pre-serialized bytes are available (e.g. locally produced blocks), fall back
+        // to serializing a disposable deep clone so the live block is never passed to serialize.
+        var fallback_ssz: std.ArrayList(u8) = .empty;
+        defer fallback_ssz.deinit(self.allocator);
+
+        var fallback_clone: types.SignedBlock = undefined;
+        var fallback_clone_initialized = false;
+        defer if (fallback_clone_initialized) fallback_clone.deinit();
+
+        const block_ssz_for_db: []const u8 = if (blockInfo.sszBytes) |precomputed| precomputed else blk: {
+            // No pre-serialized bytes: clone the block and serialize the clone only.
+            try types.sszClone(self.allocator, types.SignedBlock, signedBlock, &fallback_clone);
+            fallback_clone_initialized = true;
+            try ssz.serialize(types.SignedBlock, fallback_clone, &fallback_ssz, self.allocator);
+            break :blk fallback_ssz.items;
+        };
+
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
 
@@ -987,7 +1015,7 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 6. Save block and state to database and confirm the block in forkchoice
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
+        self.updateBlockDb(block_ssz_for_db, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
             self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
                 err,
@@ -1092,13 +1120,14 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
     }
 
-    /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
+    /// Update block database with block, state, and slot indices.
+    /// `signed_block_ssz` must be the SSZ encoding of `SignedBlock` (see onBlock).
+    fn updateBlockDb(self: *Self, signed_block_ssz: []const u8, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
         // Store block and state
-        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putBlockSerialized(database.DbBlocksNamespace, blockRoot, signed_block_ssz);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
