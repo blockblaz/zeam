@@ -215,7 +215,7 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 
 ### compactAttestations Metrics
 
-#### `lean_compact_attestations_time_seconds` (Histogram)
+#### `zeam_compact_attestations_time_seconds` (Histogram)
 - **Description**: Time taken by `compactAttestations` to merge payloads sharing the same `AttestationData`.
 - **Type**: Histogram
 - **Unit**: Seconds
@@ -223,14 +223,14 @@ All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. T
 - **Labels**: None
 - **Sample Collection Event**: On each invocation of `compactAttestations` during payload aggregation
 
-#### `lean_compact_attestations_input_total` (Counter)
+#### `zeam_compact_attestations_input_total` (Counter)
 - **Description**: Total number of attestations fed into `compactAttestations` before merging.
 - **Type**: Counter
 - **Unit**: Count (u64)
 - **Labels**: None
 - **Sample Collection Event**: On each invocation of `compactAttestations`
 
-#### `lean_compact_attestations_output_total` (Counter)
+#### `zeam_compact_attestations_output_total` (Counter)
 - **Description**: Total number of attestations produced by `compactAttestations` after merging.
 - **Type**: Counter
 - **Unit**: Count (u64)

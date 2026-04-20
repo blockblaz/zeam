@@ -95,9 +95,9 @@ const Metrics = struct {
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
     // compactAttestations metrics
-    lean_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
-    lean_compact_attestations_input_total: CompactAttestationsInputCounter,
-    lean_compact_attestations_output_total: CompactAttestationsOutputCounter,
+    zeam_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
+    zeam_compact_attestations_input_total: CompactAttestationsInputCounter,
+    zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -411,7 +411,7 @@ pub var lean_attestations_production_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeAttestationProduction,
 };
-pub var lean_compact_attestations_time_seconds: Histogram = .{
+pub var zeam_compact_attestations_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeCompactAttestations,
 };
@@ -494,9 +494,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
         // compactAttestations metrics
-        .lean_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("lean_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
-        .lean_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("lean_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
-        .lean_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("lean_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
+        .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
+        .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
+        .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -532,7 +532,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_gossip_attestation_size_bytes.context = @ptrCast(&metrics.lean_gossip_attestation_size_bytes);
     lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
-    lean_compact_attestations_time_seconds.context = @ptrCast(&metrics.lean_compact_attestations_time_seconds);
+    zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
     try metrics.lean_node_sync_status.set(.{ .status = "syncing" }, 0);

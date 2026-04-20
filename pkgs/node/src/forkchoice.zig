@@ -1063,7 +1063,7 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
-            const compact_timer = zeam_metrics.lean_compact_attestations_time_seconds.start();
+            const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
                 &agg_attestations,
@@ -1071,10 +1071,10 @@ pub const ForkChoice = struct {
                 &pre_state.validators,
             );
             _ = compact_timer.observe();
-            zeam_metrics.metrics.lean_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
-            zeam_metrics.metrics.lean_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
+            zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
