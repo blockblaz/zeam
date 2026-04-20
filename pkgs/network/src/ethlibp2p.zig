@@ -937,6 +937,10 @@ pub extern fn wait_for_network_ready(
     network_id: u32,
     timeout_ms: u64,
 ) bool;
+/// Signal the Rust-side libp2p event loop to exit. After returning, the hosting
+/// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
+/// on a network that was never started or is already stopped (no-op).
+pub extern fn stop_network(network_id: u32) void;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
@@ -1030,17 +1034,20 @@ pub const EthLibp2p = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Release the Thread handle so the OS can reclaim the join-state slot.
-        // The Rust-side libp2p loop has no shutdown signal yet, so the OS
-        // thread itself keeps running until the process exits; joining here
-        // would hang forever. Detaching is the best we can do until a proper
-        // stop_network FFI hook is added (tracked as a follow-up).
+        // Signal the Rust libp2p event loop to exit and then wait for the OS
+        // thread to actually unwind before we start tearing down the fields it
+        // might still touch. After `stop_network` the event loop takes its
+        // shutdown arm, drops the swarm, clears the per-network handler
+        // pointer, and returns from `run_eventloop`, which lets the hosting
+        // thread exit; `thread.join` then completes deterministically.
         //
-        // NOTE: callers must treat EthLibp2p.deinit as a process-shutdown
-        // operation. Freeing the struct while the Rust thread is still issuing
-        // callbacks into it would be a use-after-free.
+        // Ordering matters: we must join before freeing anything reachable
+        // from `zigHandler` (gossip/peer-event/reqresp handlers, param
+        // strings, rpcCallbacks), otherwise an in-flight callback could
+        // dereference already-freed memory.
         if (self.rustBridgeThread) |thread| {
-            thread.detach();
+            stop_network(self.params.networkId);
+            thread.join();
             self.rustBridgeThread = null;
         }
 

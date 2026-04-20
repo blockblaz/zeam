@@ -26,7 +26,8 @@ use delay_map::HashMapDelay;
 use futures::future::poll_fn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
@@ -54,6 +55,17 @@ static mut ZIG_HANDLER0: Option<u64> = None;
 static mut ZIG_HANDLER1: Option<u64> = None;
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER2: Option<u64> = None;
+
+// Per-network shutdown signal. The event loop polls a `.notified()` future on
+// the matching slot; `stop_network` calls `notify_one` to wake it. `notify_one`
+// stores a permit if no waiter is parked yet, so a `stop_network` call that
+// races the first `.notified().await` is not lost.
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY0: Option<Arc<Notify>> = None;
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY1: Option<Arc<Notify>> = None;
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY2: Option<Arc<Notify>> = None;
 
 /// Get a mutable reference to the swarm for the given network id.
 ///
@@ -108,6 +120,81 @@ unsafe fn get_zig_handler(network_id: u32) -> Option<u64> {
     }
 }
 
+/// Install a fresh shutdown signal for the given network and return a handle
+/// to it. Called by the event loop owner so a subsequent `stop_network` call
+/// has somewhere to post its wake-up permit.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+#[allow(static_mut_refs)]
+unsafe fn install_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+    let notify = Arc::new(Notify::new());
+    match network_id {
+        0 => SHUTDOWN_NOTIFY0 = Some(notify.clone()),
+        1 => SHUTDOWN_NOTIFY1 = Some(notify.clone()),
+        2 => SHUTDOWN_NOTIFY2 = Some(notify.clone()),
+        _ => return None,
+    }
+    Some(notify)
+}
+
+/// Get a handle to the shutdown signal for the given network, if one is
+/// installed.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+#[allow(static_mut_refs)]
+unsafe fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+    match network_id {
+        0 => SHUTDOWN_NOTIFY0.clone(),
+        1 => SHUTDOWN_NOTIFY1.clone(),
+        2 => SHUTDOWN_NOTIFY2.clone(),
+        _ => None,
+    }
+}
+
+/// Tear down per-network state after the event loop has exited. Drops the
+/// swarm (closing sockets), clears the Zig handler pointer so any in-flight
+/// attempts to dispatch into Zig become no-ops, and releases the shutdown
+/// notify.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing these slots.
+unsafe fn clear_network_state(network_id: u32) {
+    match network_id {
+        0 => {
+            SWARM_STATE = None;
+            ZIG_HANDLER0 = None;
+            SHUTDOWN_NOTIFY0 = None;
+        }
+        1 => {
+            SWARM_STATE1 = None;
+            ZIG_HANDLER1 = None;
+            SHUTDOWN_NOTIFY1 = None;
+        }
+        2 => {
+            SWARM_STATE2 = None;
+            ZIG_HANDLER2 = None;
+            SHUTDOWN_NOTIFY2 = None;
+        }
+        _ => {}
+    }
+
+    // Clear the ready flag so a post-stop `wait_for_network_ready` does not
+    // return a stale `true` left over from the previous session. Wake any
+    // current waiters so they re-check the (now-false) flag and return
+    // `false` on the next deadline instead of parking indefinitely.
+    let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
+    match network_id {
+        0 => ready.0 = false,
+        1 => ready.1 = false,
+        2 => ready.2 = false,
+        _ => {}
+    }
+    drop(ready);
+    NETWORK_READY_CONDVAR.notify_all();
+}
+
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
@@ -133,6 +220,28 @@ struct PendingResponse {
     connection_id: ConnectionId,
     stream_id: u64,
     protocol: ProtocolId,
+}
+
+/// Signal the event loop for `network_id` to exit.
+///
+/// Posts a shutdown notification on the per-network `Notify`. The event loop's
+/// shutdown arm wakes up, breaks out of the select loop, clears the per-network
+/// static state (swarm, handler, notify), and returns from `run_eventloop`,
+/// which in turn lets `create_and_run_network` return and the hosting OS
+/// thread exit. After calling this, the Zig side is expected to `join` the
+/// rust-bridge thread.
+///
+/// Idempotent: a `stop_network` call for a network that was never started,
+/// or that has already been torn down, is a no-op.
+///
+/// # Safety
+///
+/// This function is thread-safe and can be called from any thread.
+#[no_mangle]
+pub unsafe extern "C" fn stop_network(network_id: u32) {
+    if let Some(notify) = get_shutdown_notify(network_id) {
+        notify.notify_one();
+    }
 }
 
 /// Wait for a network to be fully initialized and ready to accept messages.
@@ -829,8 +938,24 @@ impl Network {
         let swarm = unsafe { get_swarm_mut(self.network_id) }
             .expect("run_eventloop called before start_network stored the swarm");
 
-        loop {
+        // Install the shutdown signal before entering the loop so `stop_network`
+        // calls issued between here and the first `.notified().await` land on
+        // this slot. `notify_one` stores a permit if no waiter is parked yet,
+        // so the first iteration's shutdown arm will see the permit and break.
+        let shutdown = unsafe { install_shutdown_notify(self.network_id) }
+            .expect("unsupported network_id for shutdown signal");
+
+        'eventloop: loop {
             tokio::select! {
+            biased;
+
+            _ = shutdown.notified() => {
+                logger::rustLogger.info(
+                    self.network_id,
+                    "stop_network signaled; exiting libp2p event loop",
+                );
+                break 'eventloop;
+            }
 
             Some(timeout_result) = poll_fn(|cx| {
                 let mut map = REQUEST_ID_MAP.lock().unwrap();
@@ -1379,6 +1504,11 @@ impl Network {
                 }
             }
         }
+
+        // Clean up per-network state so any later `stop_network`/`start_network`
+        // calls start from a blank slate and any in-flight dispatchers into Zig
+        // see an absent handler rather than a pointer to a freed EthLibp2p.
+        unsafe { clear_network_state(self.network_id) };
     }
 }
 
