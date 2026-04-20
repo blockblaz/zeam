@@ -180,14 +180,81 @@ const ZeamRequest = struct {
         return self.makeRequestToPort("/lean/v0/health", constants.DEFAULT_API_PORT);
     }
 
-    /// Internal helper to make HTTP requests to any endpoint on the specified port
+    /// Parsed HTTP response returned by the aggregator helpers. Use `std.http.Client`
+    /// under the hood so tests assert against structured status/body instead of
+    /// regexing a hand-crafted wire string.
+    const HttpResponse = struct {
+        allocator: std.mem.Allocator,
+        status: std.http.Status,
+        body: []u8,
+
+        fn deinit(self: *HttpResponse) void {
+            self.allocator.free(self.body);
+        }
+    };
+
+    /// Make a GET request to /lean/v0/admin/aggregator.
+    fn getAggregator(self: ZeamRequest) !HttpResponse {
+        return self.fetchAdmin(.GET, "/lean/v0/admin/aggregator", null);
+    }
+
+    /// Make a POST request to /lean/v0/admin/aggregator with the given JSON body.
+    fn postAggregator(self: ZeamRequest, body: []const u8) !HttpResponse {
+        return self.fetchAdmin(.POST, "/lean/v0/admin/aggregator", body);
+    }
+
+    /// One-shot HTTP request against the admin API using `std.http.Client`. The
+    /// client takes care of request-line, Host, Content-Length and framing so we
+    /// don't have to hand-roll them here.
+    fn fetchAdmin(
+        self: ZeamRequest,
+        method: std.http.Method,
+        path: []const u8,
+        payload: ?[]const u8,
+    ) !HttpResponse {
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "http://{s}:{d}{s}",
+            .{ constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT, path },
+        );
+        defer self.allocator.free(url);
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+        errdefer body_writer.deinit();
+
+        const headers: std.http.Client.Request.Headers = if (payload != null)
+            .{ .content_type = .{ .override = "application/json" } }
+        else
+            .{};
+
+        const result = try client.fetch(.{
+            .location = .{ .url = url },
+            .method = method,
+            .payload = payload,
+            .headers = headers,
+            .response_writer = &body_writer.writer,
+        });
+
+        var body_list = body_writer.toArrayList();
+        const body = try body_list.toOwnedSlice(self.allocator);
+        return .{
+            .allocator = self.allocator,
+            .status = result.status,
+            .body = body,
+        };
+    }
+
+    /// Make a request to the plain GET endpoints (metrics, health). These still
+    /// use a raw TCP writer because the metrics/health callers predate the
+    /// aggregator work and aren't in scope here.
     fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
-        // Create connection to the server
         const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, port);
         var connection = try net.tcpConnectToAddress(address);
         defer connection.close();
 
-        // Create HTTP request
         var request_buffer: [4096]u8 = undefined;
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
@@ -199,7 +266,10 @@ const ZeamRequest = struct {
         try conn_writer.interface.writeAll(request);
         try conn_writer.interface.flush();
 
-        // Read response until connection closes
+        return try self.readFullResponse(&connection);
+    }
+
+    fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
         var response_buffer: [8192]u8 = undefined;
         var total_bytes: usize = 0;
         while (total_bytes < response_buffer.len) {
@@ -207,17 +277,13 @@ const ZeamRequest = struct {
                 error.ConnectionResetByPeer => break,
                 else => return err,
             };
-            if (bytes_read == 0) break; // Connection closed
+            if (bytes_read == 0) break;
             total_bytes += bytes_read;
         }
-        const bytes_read = total_bytes;
-
-        // Allocate and return a copy of the response
-        const response = try self.allocator.dupe(u8, response_buffer[0..bytes_read]);
-        return response;
+        return try self.allocator.dupe(u8, response_buffer[0..total_bytes]);
     }
 
-    /// Free a response returned by getMetrics() or getHealth()
+    /// Free a response returned by getMetrics() / getHealth() / aggregator helpers
     fn freeResponse(self: ZeamRequest, response: []u8) void {
         self.allocator.free(response);
     }
@@ -506,6 +572,76 @@ test "CLI beam command with mock network - complete integration test" {
     try std.testing.expect(response.len > 100);
 
     std.debug.print("SUCCESS: All integration test checks passed\n", .{});
+}
+
+test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
+    const allocator = std.testing.allocator;
+
+    const exe_path = try getZeamExecutable();
+    const cli_process = try spinBeamSimNode(allocator, exe_path);
+    defer cleanupProcess(allocator, cli_process);
+
+    waitForNodeStart();
+
+    var zeam_request = ZeamRequest.init(allocator);
+
+    // The API server comes up before the chain is wired in (503 until
+    // `setChain` is called inside main.zig after validator key generation).
+    // Poll until the chain is ready, then assert the baseline.
+    const chain_ready_deadline_ms: i64 = 60_000;
+    const poll_start = std.time.milliTimestamp();
+    var get_before = try zeam_request.getAggregator();
+    while (get_before.status != .ok) {
+        get_before.deinit();
+        if (std.time.milliTimestamp() - poll_start > chain_ready_deadline_ms) {
+            std.debug.print("timed out waiting for chain to be ready\n", .{});
+            return error.ChainNotReady;
+        }
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        get_before = try zeam_request.getAggregator();
+    }
+    defer get_before.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, get_before.body, "\"is_aggregator\":true") != null);
+
+    // Flip off.
+    var post_off = try zeam_request.postAggregator("{\"enabled\":false}");
+    defer post_off.deinit();
+    std.debug.print("POST /lean/v0/admin/aggregator (off): {d} {s}\n", .{ @intFromEnum(post_off.status), post_off.body });
+    try std.testing.expectEqual(std.http.Status.ok, post_off.status);
+    try std.testing.expect(std.mem.indexOf(u8, post_off.body, "\"is_aggregator\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_off.body, "\"previous\":true") != null);
+
+    // GET reflects the new state.
+    var get_after_off = try zeam_request.getAggregator();
+    defer get_after_off.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, get_after_off.status);
+    try std.testing.expect(std.mem.indexOf(u8, get_after_off.body, "\"is_aggregator\":false") != null);
+
+    // Flip back on.
+    var post_on = try zeam_request.postAggregator("{\"enabled\":true}");
+    defer post_on.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, post_on.status);
+    try std.testing.expect(std.mem.indexOf(u8, post_on.body, "\"is_aggregator\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_on.body, "\"previous\":false") != null);
+
+    // Idempotent toggle: previous == new.
+    var post_idem = try zeam_request.postAggregator("{\"enabled\":true}");
+    defer post_idem.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, post_idem.status);
+    try std.testing.expect(std.mem.indexOf(u8, post_idem.body, "\"is_aggregator\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_idem.body, "\"previous\":true") != null);
+
+    // Bad body: missing `enabled` field -> 400.
+    var bad_missing = try zeam_request.postAggregator("{}");
+    defer bad_missing.deinit();
+    try std.testing.expectEqual(std.http.Status.bad_request, bad_missing.status);
+
+    // Bad body: wrong type -> 400.
+    var bad_type = try zeam_request.postAggregator("{\"enabled\":\"yes\"}");
+    defer bad_type.deinit();
+    try std.testing.expectEqual(std.http.Status.bad_request, bad_type.status);
+
+    std.debug.print("SUCCESS: admin aggregator endpoint toggled cleanly\n", .{});
 }
 
 test "SSE events integration test - wait for justification and finalization" {

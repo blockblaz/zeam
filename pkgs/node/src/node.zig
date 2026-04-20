@@ -1398,8 +1398,15 @@ pub const BeamNode = struct {
             defer seen_subnets.deinit();
 
             // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
-            // validators
-            if (self.chain.is_aggregator_enabled) {
+            // validators.
+            //
+            // Note: this subscription decision is only taken once at startup,
+            // using the initial aggregator flag. Toggling the role at runtime
+            // via the admin API does not add or remove gossip subscriptions;
+            // a node that wants to serve as a hot-standby aggregator should
+            // start with `--is-aggregator true` and turn the role off via the
+            // API until it's needed.
+            if (self.chain.isAggregator()) {
                 if (self.aggregation_subnet_ids) |explicit_subnets| {
                     for (explicit_subnets) |subnet_id| {
                         if (seen_subnets.contains(subnet_id)) continue;
@@ -1421,12 +1428,12 @@ pub const BeamNode = struct {
 
             // If no subnets were added yet (aggregator but no explicit ids and no
             // validators registered), fall back to subnet 0 to keep parity with leanSpec.
-            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
+            if (seen_subnets.count() == 0 and self.chain.isAggregator()) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
         // if no committee count specified and still aggregator, all are in subnet 0
-        else if (self.chain.is_aggregator_enabled) {
+        else if (self.chain.isAggregator()) {
             try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
         }
 
