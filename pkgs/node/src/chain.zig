@@ -437,9 +437,7 @@ pub const BeamChain = struct {
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        const pq_building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
         const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
-        _ = pq_building_timer.observe();
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
