@@ -58,6 +58,186 @@ For freestanding targets (ZKVM):
 - Zero runtime overhead
 - Metrics are initialized as no-op by default
 
+## Metrics Definitions
+
+All metrics are defined in the `Metrics` struct in `pkgs/metrics/src/lib.zig`. The following metrics are available:
+
+### Chain Metrics
+
+#### `zeam_chain_onblock_duration_seconds` (Histogram)
+- **Description**: Measures the time taken to process a block within the `chain.onBlock` function (end-to-end block processing).
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
+- **Labels**: None
+- **Sample Collection Event**: On every block processed by the chain
+
+### Fork Choice Metrics
+
+#### `lean_head_slot` (Gauge)
+- **Description**: Latest slot of the lean chain (canonical chain head as determined by fork choice).
+- **Type**: Gauge
+- **Unit**: Slot number (u64)
+- **Labels**: None
+- **Sample Collection Event**: Updated on every fork choice head update
+
+#### `lean_latest_justified_slot` (Gauge)
+- **Description**: Latest justified slot.
+- **Type**: Gauge
+- **Unit**: Slot number (u64)
+- **Labels**: None
+- **Sample Collection Event**: Updated on state transition completion
+
+#### `lean_latest_finalized_slot` (Gauge)
+- **Description**: Latest finalized slot.
+- **Type**: Gauge
+- **Unit**: Slot number (u64)
+- **Labels**: None
+- **Sample Collection Event**: Updated on state transition completion
+
+#### `lean_fork_choice_block_processing_time_seconds` (Histogram)
+- **Description**: Time taken to process block in fork choice.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On fork choice block processing
+
+#### `lean_attestations_valid_total` (Counter)
+- **Description**: Total number of valid attestations processed by fork choice.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: source ("gossip", "aggregation", "block")
+- **Sample Collection Event**: On successful attestation validation and processing
+
+#### `lean_attestations_invalid_total` (Counter)
+- **Description**: Total number of invalid attestations rejected by fork choice.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: source ("gossip", "aggregation", "block")
+- **Sample Collection Event**: On attestation validation failure
+
+#### `lean_attestation_validation_time_seconds` (Histogram)
+- **Description**: Time taken to validate attestations in fork choice.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On attestation validation and processing
+
+### State Transition Metrics
+
+#### `lean_state_transition_time_seconds` (Histogram)
+- **Description**: Time to process state transition.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4
+- **Labels**: None
+- **Sample Collection Event**: On state transition
+
+#### `lean_state_transition_slots_processed_total` (Counter)
+- **Description**: Total number of processed slots (including empty slots).
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On state transition process slots
+
+#### `lean_state_transition_slots_processing_time_seconds` (Histogram)
+- **Description**: Time taken to process slots.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On state transition process slots
+
+#### `lean_state_transition_block_processing_time_seconds` (Histogram)
+- **Description**: Time taken to process block.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On state transition process block
+
+#### `lean_state_transition_attestations_processed_total` (Counter)
+- **Description**: Total number of processed attestations.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On state transition process attestations
+
+#### `lean_state_transition_attestations_processing_time_seconds` (Histogram)
+- **Description**: Time taken to process attestations.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.005, 0.01, 0.025, 0.05, 0.1, 1
+- **Labels**: None
+- **Sample Collection Event**: On state transition process attestations
+
+### Block Production Metrics
+
+#### `lean_block_building_time_seconds` (Histogram)
+- **Description**: Total time taken to build a block.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1
+- **Labels**: None
+- **Sample Collection Event**: On each block proposal attempt
+
+#### `lean_block_building_payload_aggregation_time_seconds` (Histogram)
+- **Description**: Time taken to aggregate attestation payloads during block building.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4
+- **Labels**: None
+- **Sample Collection Event**: On each block proposal attempt
+
+#### `lean_block_aggregated_payloads` (Histogram)
+- **Description**: Number of aggregated payloads included in a produced block.
+- **Type**: Histogram
+- **Unit**: Count
+- **Buckets**: 1, 2, 4, 8, 16, 32, 64, 128
+- **Labels**: None
+- **Sample Collection Event**: On each successful block proposal
+
+#### `lean_block_building_success_total` (Counter)
+- **Description**: Total number of successfully built blocks.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On each successful block build
+
+#### `lean_block_building_failures_total` (Counter)
+- **Description**: Total number of failed block build attempts.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On each failed block build
+
+### compactAttestations Metrics
+
+#### `lean_compact_attestations_time_seconds` (Histogram)
+- **Description**: Time taken by `compactAttestations` to merge payloads sharing the same `AttestationData`.
+- **Type**: Histogram
+- **Unit**: Seconds
+- **Buckets**: 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+- **Labels**: None
+- **Sample Collection Event**: On each invocation of `compactAttestations` during payload aggregation
+
+#### `lean_compact_attestations_input_total` (Counter)
+- **Description**: Total number of attestations fed into `compactAttestations` before merging.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On each invocation of `compactAttestations`
+
+#### `lean_compact_attestations_output_total` (Counter)
+- **Description**: Total number of attestations produced by `compactAttestations` after merging.
+- **Type**: Counter
+- **Unit**: Count (u64)
+- **Labels**: None
+- **Sample Collection Event**: On each invocation of `compactAttestations`
+
+
 ## Usage
 
 ### Importing the Package
@@ -182,15 +362,27 @@ my_counter_vec: metrics_lib.CounterVec(u64, struct { direction: []const u8, resu
 In the `init()` function in `pkgs/metrics/src/lib.zig`, add initialization:
 
 ```zig
-metrics = .{
-    // ... existing metrics ...
-    
-    .my_new_metric = Metrics.MyNewMetricHistogram.init(
-        "my_new_metric",
-        .{ .help = "Description of what this metric measures." },
-        .{}
-    ),
-};
+pub fn init(allocator: std.mem.Allocator) !void {
+    if (g_initialized) return;
+
+    if (isZKVM()) {
+        std.log.info("Using no-op metrics for ZKVM target", .{});
+        g_initialized = true;
+        return;
+    }
+
+    metrics = .{
+        // ... existing metrics ...
+        
+        .my_new_metric = Metrics.MyNewMetricHistogram.init(
+            "my_new_metric",
+            .{ .help = "Description of what this metric measures." },
+            .{}
+        ),
+    };
+
+    // ... existing context assignments ...
+}
 ```
 
 ### Step 3: Create Wrapper for Timer API (Histograms Only)

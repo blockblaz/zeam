@@ -94,6 +94,10 @@ const Metrics = struct {
     lean_gossip_aggregation_size_bytes: GossipAggregationSizeBytesHistogram,
     // Attestation production time histogram
     lean_attestations_production_time_seconds: AttestationProductionTimeHistogram,
+    // compactAttestations metrics
+    lean_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
+    lean_compact_attestations_input_total: CompactAttestationsInputCounter,
+    lean_compact_attestations_output_total: CompactAttestationsOutputCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -109,8 +113,8 @@ const Metrics = struct {
     const AttestationsProcessedCounter = metrics_lib.Counter(u64);
     const LeanValidatorsCountGauge = metrics_lib.Gauge(u64);
     const ForkChoiceBlockProcessingTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1, 1.25, 1.5, 2, 4 });
-    const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.Counter(u64);
-    const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.Counter(u64);
+    const ForkChoiceAttestationsValidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
+    const ForkChoiceAttestationsInvalidLabeledCounter = metrics_lib.CounterVec(u64, struct { source: []const u8 });
     const ForkChoiceAttestationValidationTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 1 });
     // Individual attestation signature metric types
     const PQSigAttestationSignaturesTotalCounter = metrics_lib.Counter(u64);
@@ -158,6 +162,10 @@ const Metrics = struct {
     const GossipAggregationSizeBytesHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1_024, 4_096, 16_384, 65_536, 131_072, 262_144, 524_288, 1_048_576 });
     // Attestation production time histogram type
     const AttestationProductionTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
+    // compactAttestations metric types
+    const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
+    const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
+    const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -317,6 +325,12 @@ fn observeAttestationProduction(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeCompactAttestations(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.CompactAttestationsTimeHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var zeam_chain_onblock_duration_seconds: Histogram = .{
@@ -397,6 +411,10 @@ pub var lean_attestations_production_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeAttestationProduction,
 };
+pub var lean_compact_attestations_time_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeCompactAttestations,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -422,8 +440,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations" }, .{}),
         .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of validators managed by a node" }, .{}),
         .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block" }, .{}),
-        .lean_attestations_valid_total = Metrics.ForkChoiceAttestationsValidLabeledCounter.init("lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
-        .lean_attestations_invalid_total = Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init("lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
+        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
+        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation" }, .{}),
         // Individual attestation signature metrics
         .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation" }, .{}),
@@ -475,6 +493,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
         .lean_gossip_aggregation_size_bytes = Metrics.GossipAggregationSizeBytesHistogram.init("lean_gossip_aggregation_size_bytes", .{ .help = "Bytes size of a gossip aggregated attestation message" }, .{}),
         .lean_attestations_production_time_seconds = Metrics.AttestationProductionTimeHistogram.init("lean_attestations_production_time_seconds", .{ .help = "Time taken to produce attestation" }, .{}),
+        // compactAttestations metrics
+        .lean_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("lean_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
+        .lean_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("lean_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
+        .lean_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("lean_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -510,6 +532,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_gossip_attestation_size_bytes.context = @ptrCast(&metrics.lean_gossip_attestation_size_bytes);
     lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
+    lean_compact_attestations_time_seconds.context = @ptrCast(&metrics.lean_compact_attestations_time_seconds);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
     try metrics.lean_node_sync_status.set(.{ .status = "syncing" }, 0);

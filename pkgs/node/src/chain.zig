@@ -778,7 +778,7 @@ pub const BeamChain = struct {
 
                 // Validate attestation before processing (gossip = not from block)
                 self.validateAttestationData(signed_attestation.message.message, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     switch (err) {
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
                             // Add the missing root to the result so node's onGossip can enqueue it for fetching
@@ -804,7 +804,7 @@ pub const BeamChain = struct {
                 if (self.is_aggregator_enabled.load(.acquire)) {
                     // Process validated attestation
                     self.onGossipAttestation(signed_attestation) catch |err| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                         self.logger.err("attestation processing error: {any}", .{err});
                         return err;
                     };
@@ -820,7 +820,7 @@ pub const BeamChain = struct {
                         validator_id,
                     });
                 }
-                zeam_metrics.metrics.lean_attestations_valid_total.incr();
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "gossip" }) catch {};
                 return .{};
             },
             .aggregation => |signed_aggregation| {
@@ -832,7 +832,7 @@ pub const BeamChain = struct {
 
                 // Validate attestation data before processing (same rules as individual gossip attestations)
                 self.validateAttestationData(signed_aggregation.data, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     switch (err) {
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
                             // Add the missing root to the result so node's onGossip can enqueue it for fetching
@@ -856,7 +856,7 @@ pub const BeamChain = struct {
                 };
 
                 self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
                         // Propagate unknown block errors to node.zig for context-aware logging
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => return err,
@@ -866,7 +866,7 @@ pub const BeamChain = struct {
                         },
                     }
                 };
-                zeam_metrics.metrics.lean_attestations_valid_total.incr();
+                zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "aggregation" }) catch {};
                 return .{};
             },
         }
@@ -1010,7 +1010,7 @@ pub const BeamChain = struct {
                 defer participant_indices.deinit(self.allocator);
 
                 if (validator_indices.items.len != participant_indices.items.len) {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     self.logger.err(
                         "attestation signature mismatch index={d} validators={d} participants={d}",
                         .{ index, validator_indices.items.len, participant_indices.items.len },
@@ -1020,7 +1020,7 @@ pub const BeamChain = struct {
 
                 // Validate aggregated attestation data once before processing individual validators
                 self.validateAttestationData(aggregated_attestation.data, true) catch |e| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                     if (e == AttestationValidationError.UnknownHeadBlock) {
                         try missing_roots.append(self.allocator, aggregated_attestation.data.head.root);
                     }
@@ -1036,7 +1036,7 @@ pub const BeamChain = struct {
                     };
 
                     self.forkChoice.onAttestation(attestation, true) catch |e| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr();
+                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "block" }) catch {};
                         self.logger.err(
                             "failed to apply block attestation to forkchoice tracker: validator={d} slot={d} error={any}",
                             .{ validator_index, attestation.data.slot, e },
@@ -1044,7 +1044,7 @@ pub const BeamChain = struct {
                         continue;
                     };
 
-                    zeam_metrics.metrics.lean_attestations_valid_total.incr();
+                    zeam_metrics.metrics.lean_attestations_valid_total.incr(.{ .source = "block" }) catch {};
                 }
 
                 // store the aggregated payloads in known
