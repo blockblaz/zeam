@@ -349,6 +349,7 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("@zeam/xmss", zeam_xmss);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
