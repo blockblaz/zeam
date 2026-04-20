@@ -1625,9 +1625,14 @@ pub const BeamChain = struct {
             return state;
         }
 
-        // Check if we already have a cached state from DB
+        // Check if we already have a cached state. Invalidate if it's behind the
+        // current finalized checkpoint (can happen if the cache was seeded from the
+        // DB at startup before any in-memory finalization happened).
         if (self.cached_finalized_state) |cached_state| {
-            return cached_state;
+            if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
+                return cached_state;
+            }
+            // Stale — fall through to DB load below.
         }
 
         // Fallback: try to load from database

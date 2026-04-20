@@ -253,7 +253,7 @@ pub const ApiServer = struct {
 
     /// Handle health check endpoint
     fn handleHealth(_: *const Self, request: *std.http.Server.Request) void {
-        const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
+        const response = "{\"status\":\"healthy\",\"service\":\"lean-rpc-api\"}";
         _ = request.respond(response, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
