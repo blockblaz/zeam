@@ -854,6 +854,13 @@ export fn handlePeerDisconnectedFromRustBridge(
         @tagName(rsn),
     });
 
+    zigHandler.failInflightRpcsForPeer(peer_id_slice) catch |e| {
+        zigHandler.logger.err(
+            "network-{d}:: Error failing in-flight RPCs for disconnected peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, node_name, e },
+        );
+    };
+
     zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
     };
@@ -1282,6 +1289,46 @@ pub const EthLibp2p = struct {
         };
 
         self.notifyRpcErrorWithOwnedMessage(request_id, method, code, owned_message);
+    }
+
+    /// Fail every in-flight RPC whose callback is waiting on the given peer.
+    ///
+    /// The Rust bridge already times requests out via REQUEST_TIMEOUT, but that
+    /// window is seconds-to-minutes. When a peer disconnects we know the
+    /// response will never arrive, so notify all matching callbacks with a
+    /// PeerDisconnected failure and drop them from the map immediately. This
+    /// gives callers fast feedback and prevents the callback entries (plus
+    /// their owned peer_id strings) from sitting around until the Rust-side
+    /// timeout fires. `ReqRespRequestCallback.deinit` frees the peer_id buffer.
+    fn failInflightRpcsForPeer(self: *Self, peer_id: []const u8) !void {
+        // Collect request_ids first so we can mutate the map without iterator
+        // invalidation while also holding a reference to each callback's peer_id.
+        var matching: std.ArrayList(u64) = .empty;
+        defer matching.deinit(self.allocator);
+
+        var it = self.rpcCallbacks.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
+                try matching.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        // 499 = "Client Closed Request" (nginx-style); closest well-known code
+        // for "peer went away before responding". Distinct from 408 used by the
+        // Rust-side REQUEST_TIMEOUT so callers can tell them apart.
+        const PEER_DISCONNECTED_CODE: u32 = 499;
+
+        for (matching.items) |request_id| {
+            const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse continue;
+            const method = callback_ptr.method;
+            self.notifyRpcErrorFmt(
+                request_id,
+                method,
+                PEER_DISCONNECTED_CODE,
+                "peer disconnected before responding (peer={s})",
+                .{peer_id},
+            );
+        }
     }
 
     pub fn onRPCRequest(ptr: *anyopaque, data: *interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
