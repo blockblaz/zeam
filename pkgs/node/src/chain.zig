@@ -1222,6 +1222,30 @@ pub const BeamChain = struct {
         // 3. commit all batch ops for finalized indices before we prune
         self.db.commit(&batch);
 
+        // 3b. Update cached_finalized_state so /lean/v0/states/finalized returns the
+        // freshest finalized state. We do this before pruning so the state at
+        // latestFinalized.root is still in self.states. The previous cache entry (if
+        // any) is freed and replaced by a clone of the new finalized state.
+        if (self.states.get(latestFinalized.root)) |new_finalized_state| {
+            if (self.cached_finalized_state) |old| {
+                old.deinit();
+                self.allocator.destroy(old);
+            }
+            self.cached_finalized_state = null;
+            const cloned = self.allocator.create(types.BeamState) catch |err| blk: {
+                self.logger.warn("could not allocate cached_finalized_state clone at slot {d}: {any}", .{ latestFinalized.slot, err });
+                break :blk null;
+            };
+            if (cloned) |ptr| {
+                types.sszClone(self.allocator, types.BeamState, new_finalized_state.*, ptr) catch |err| {
+                    self.logger.warn("could not clone finalized state at slot {d}: {any}", .{ latestFinalized.slot, err });
+                    self.allocator.destroy(ptr);
+                };
+                self.cached_finalized_state = ptr;
+                self.logger.debug("cached_finalized_state updated to slot {d}", .{latestFinalized.slot});
+            }
+        }
+
         // 4. Prunestates from memory
         // Get all canonical blocks from finalized to head (not just newly finalized)
         const states_count_before: isize = self.states.count();
@@ -1592,9 +1616,14 @@ pub const BeamChain = struct {
             return state;
         }
 
-        // Check if we already have a cached state from DB
+        // Check if we already have a cached state. Invalidate if it's behind the
+        // current finalized checkpoint (can happen if the cache was seeded from the
+        // DB at startup before any in-memory finalization happened).
         if (self.cached_finalized_state) |cached_state| {
-            return cached_state;
+            if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
+                return cached_state;
+            }
+            // Stale — fall through to DB load below.
         }
 
         // Fallback: try to load from database
