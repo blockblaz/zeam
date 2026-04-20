@@ -80,10 +80,15 @@ COPY .git/refs .git/refs
 
 # Get git commit hash and build the project with optimizations
 # Use cache mount for Zig build cache as well
-# Set RUSTFLAGS for ARM64 to use generic CPU (QEMU-compatible)
+# CPU targeting per architecture:
+#   amd64: x86-64-v3 (AVX2, no AVX512) — portable across modern x86_64 servers
+#   arm64: generic CPU — QEMU-compatible when cross-building
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/zig \
-    if [ "$TARGETARCH" = "arm64" ]; then \
+    EXTRA_ZIG_FLAGS="" && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        EXTRA_ZIG_FLAGS="-Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
         export RUSTFLAGS="-C target-cpu=generic"; \
     fi && \
     GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
@@ -93,7 +98,14 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION"
+    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
+
+# rec_aggregation's compilation.rs reads .py source files at runtime to verify
+# a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at compile time).
+# Stage the crate source so we can recreate the path in the runtime image.
+RUN REC_AGG_DIR=$(find /root/.cargo/git/checkouts -path "*/rec_aggregation" -type d | head -1) \
+    && cp -r "$REC_AGG_DIR" /tmp/rec_aggregation_src \
+    && echo "$REC_AGG_DIR" > /tmp/rec_aggregation_path
 
 # Intermediate stage to prepare runtime libraries
 FROM ubuntu:24.04 AS runtime-prep
@@ -103,6 +115,13 @@ ARG TARGETARCH
 COPY --from=builder /app/zig-out/ /app/zig-out/
 COPY --from=builder /app/resources/ /app/resources/
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Recreate rec_aggregation .py files at the baked-in CARGO_MANIFEST_DIR path
+COPY --from=builder /tmp/rec_aggregation_src /tmp/rec_aggregation_src
+COPY --from=builder /tmp/rec_aggregation_path /tmp/rec_aggregation_path
+RUN mkdir -p "$(cat /tmp/rec_aggregation_path)" \
+    && cp -r /tmp/rec_aggregation_src/* "$(cat /tmp/rec_aggregation_path)/" \
+    && rm -rf /tmp/rec_aggregation_src /tmp/rec_aggregation_path
 
 # Create a script to copy the right libraries based on architecture
 RUN mkdir -p /runtime-libs && \
@@ -162,6 +181,9 @@ COPY --from=builder /app/zig-out/ /app/zig-out/
 
 # Copy runtime resources
 COPY --from=builder /app/resources/ /app/resources/
+
+# Copy rec_aggregation .py files at baked-in CARGO_MANIFEST_DIR path
+COPY --from=runtime-prep /root/.cargo/ /root/.cargo/
 
 # Set the zeam binary as the entrypoint with beam parameter by default
 ENTRYPOINT ["/app/zig-out/bin/zeam"]

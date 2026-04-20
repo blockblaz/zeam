@@ -204,9 +204,19 @@ jobs:
 
     - name: Build with all provers
       run: |
+        # On x86_64 Linux runners, cap the Rust target CPU at x86-64-v3 (AVX2, no AVX-512).
+        # GitHub Actions runners lack AVX-512, so target-cpu=native would leave zmm registers
+        # unavailable and cause "couldn't allocate output register for constraint 'v'" errors
+        # in leanMultisig's SIMD inline assembly. The -Drust-target-cpu option is only declared
+        # in build.zig on x86_64, so we must not pass it on aarch64 macOS runners.
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          CPU_FLAG="-Drust-target-cpu=x86-64-v3"
+        else
+          CPU_FLAG=""
+        fi
         max_attempts=3
         for attempt in $(seq 1 $max_attempts); do
-          if zig build -Dprover=all; then
+          if zig build -Dprover=all $CPU_FLAG; then
             echo "Successfully built on attempt $attempt"
             exit 0
           fi

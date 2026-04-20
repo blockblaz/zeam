@@ -2356,7 +2356,7 @@ fn parseCheckpoint(
 
 fn buildChainConfig(allocator: Allocator, state: *types.BeamState) !configs.ChainConfig {
     const chain_spec =
-        \\{"preset":"mainnet","name":"devnet0"}
+        \\{"preset":"mainnet","name":"devnet0","fork_digest":"00000000"}
     ;
     const parse_options = json.ParseOptions{
         .ignore_unknown_fields = true,

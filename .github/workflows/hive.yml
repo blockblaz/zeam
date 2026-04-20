@@ -1,0 +1,450 @@
+# Hive integration tests for zeam.
+#
+# Triggers:
+#   - schedule: daily run against the default branch (main) to catch regressions
+#     early without paying the cost on every PR.
+#   - pull_request (labeled): only runs when the `run-hive` label is applied to
+#     a PR. Mirrors the `stf` label pattern used by risc0.yml.
+#   - workflow_dispatch: manual trigger with overridable simulator / devnet /
+#     hive repo / hive version.
+#
+# Hive side (upstream ethereum/hive):
+#   - Client definition:  clients/zeam/
+#   - Simulator:          simulators/lean
+#   - Client profiles:    simulators/lean/clients/{devnet3,devnet4}.yaml
+#
+# Known limitation (tracked for follow-up, not this PR):
+#   The upstream zeam Dockerfile in ethereum/hive selects the devnet3 binary
+#   from a pinned source revision (build arg `zeam_devnet3_revision`) and the
+#   devnet4 binary from the pre-published `blockblaz/zeam:devnet4` Docker Hub
+#   image (no tag build arg). As a result, PR-label-triggered runs currently
+#   exercise the published devnet4 image rather than the exact PR HEAD binary.
+#   To test an arbitrary PR commit, we will need an upstream hive change that
+#   exposes a `zeam_devnet4_tag` build arg (or equivalent) and a per-PR image
+#   push to Docker Hub/GHCR. Tracked separately.
+
+name: hive
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: '0 3 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      simulator:
+        description: 'Hive simulator (upstream name, e.g. `lean`)'
+        required: false
+        default: 'lean'
+      devnet:
+        description: 'Lean devnet profile to select from simulators/lean/clients/'
+        required: false
+        type: choice
+        default: 'devnet4'
+        options:
+          - devnet3
+          - devnet4
+      hive_repository:
+        description: 'Hive repo hosting the Lean simulator + zeam client definition'
+        required: false
+        default: 'ethereum/hive'
+      hive_version:
+        description: 'Hive branch or tag'
+        required: false
+        default: 'master'
+
+concurrency:
+  # Cancel previous PR runs, but keep scheduled runs independent (run_id fallback).
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  issues: write
+
+jobs:
+  hive:
+    name: hive (lean / ${{ github.event.inputs.devnet || vars.HIVE_DEVNET || 'devnet4' }})
+    runs-on: ubuntu-latest
+    # Gate PR runs behind the `run-hive` label. Scheduled and manual runs always pass this check.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-hive')
+
+    steps:
+      - name: Checkout zeam
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          SIMULATOR="${{ github.event.inputs.simulator }}"
+          [ -z "$SIMULATOR" ] && SIMULATOR="${{ vars.HIVE_SIMULATOR }}"
+          [ -z "$SIMULATOR" ] && SIMULATOR="lean"
+
+          DEVNET="${{ github.event.inputs.devnet }}"
+          [ -z "$DEVNET" ] && DEVNET="${{ vars.HIVE_DEVNET }}"
+          [ -z "$DEVNET" ] && DEVNET="devnet4"
+
+          HIVE_REPOSITORY="${{ github.event.inputs.hive_repository }}"
+          [ -z "$HIVE_REPOSITORY" ] && HIVE_REPOSITORY="${{ vars.HIVE_REPOSITORY }}"
+          [ -z "$HIVE_REPOSITORY" ] && HIVE_REPOSITORY="ethereum/hive"
+
+          HIVE_VERSION="${{ github.event.inputs.hive_version }}"
+          [ -z "$HIVE_VERSION" ] && HIVE_VERSION="${{ vars.HIVE_VERSION }}"
+          [ -z "$HIVE_VERSION" ] && HIVE_VERSION="master"
+
+          echo "simulator=$SIMULATOR" >> "$GITHUB_OUTPUT"
+          echo "devnet=$DEVNET" >> "$GITHUB_OUTPUT"
+          echo "hive_repository=$HIVE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "hive_version=$HIVE_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Inlined from ethpandaops/hive-github-action@v0.6.3 so we can interpose
+      # a workaround between the upstream hive checkout and `./hive` invocation.
+      #
+      # Upstream bug (ethereum/hive master, present since #1422 "Add Lean RPC
+      # compatibility tests", 2026-04-14): simulators/lean/Dockerfile is built
+      # with the hive repo root as its docker build context (via
+      # simulators/lean/hive_context.txt = `../..`) and runs
+      # `cargo build -p lean-sim --release --locked` against a root-level
+      # `Cargo.lock`. Two problems stack:
+      #
+      #   1. `/Cargo.lock` is gitignored at hive root, so there is no lockfile
+      #      in the build context at all -- docker build fails with
+      #      `COPY failed: ... stat Cargo.lock: file does not exist`.
+      #   2. The committed `simulators/lean/Cargo.lock` predates lean-sim being
+      #      absorbed into the root `Cargo.toml` workspace (which adds the
+      #      `[patch."https://github.com/ethereum/hive"] hivesim = { path = ... }`
+      #      patch). Naively hoisting it produces a lockfile that no longer
+      #      matches the current manifests, so `cargo build --locked` aborts
+      #      with: `cannot update the lock file ... because --locked was
+      #      passed`.
+      #
+      # So we regenerate a fresh workspace-consistent lockfile with
+      # `cargo generate-lockfile` before running hive. If upstream ever commits
+      # a root `Cargo.lock` we respect it and skip; if the manifests are
+      # missing we fail loudly rather than silently hand docker a bad context.
+      - name: Install Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install Docker
+        uses: docker/setup-docker-action@e61617a16c407a86262fb923c35a616ddbe070b3 # v4.6.0
+        with:
+          version: latest
+
+      - name: Restart docker (iptables bug)
+        shell: bash
+        run: sudo systemctl restart docker
+
+      - name: Checkout hive
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          repository: ${{ steps.cfg.outputs.hive_repository }}
+          ref: ${{ steps.cfg.outputs.hive_version }}
+          path: ./src
+
+      - name: Workaround upstream missing Cargo.lock at hive root
+        working-directory: ./src
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then
+            echo "Cargo.lock already present at hive root; upstream fix landed, nothing to do."
+            exit 0
+          fi
+          if [ ! -f Cargo.toml ]; then
+            echo "Cargo.toml missing at hive root; nothing to generate a lockfile from." >&2
+            exit 1
+          fi
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "cargo not found on runner; required to regenerate the missing root Cargo.lock." >&2
+            exit 1
+          fi
+          cargo generate-lockfile --manifest-path Cargo.toml
+          echo "Generated fresh root Cargo.lock resolving the current workspace manifests."
+
+      - name: Build hive and hiveview
+        working-directory: ./src
+        shell: bash
+        run: |
+          go build -o hive .
+          go build -o hiveview ./cmd/hiveview
+
+      - name: Create results directory
+        working-directory: ./src
+        shell: bash
+        run: mkdir -p results
+
+      # The upstream `clients/zeam` Dockerfile in ethereum/hive does an
+      # `apt-get update && apt-get install` over the public Ubuntu mirrors and
+      # a `docker pull blockblaz/zeam:devnet4` before any zeam-specific code
+      # runs. Both are transient-failure prone on shared GitHub runners and
+      # produce a build-time failure (exit 100) that does not indicate a
+      # regression in-tree. Retry the hive invocation once with a small
+      # backoff so those transients do not spuriously fail the scheduled
+      # run and auto-open a tracking issue.
+      #
+      # The retry only fires when the primary step's outcome is `failure`,
+      # and by construction (see the disambiguation block inside the run
+      # script) that only happens on infrastructure failures -- real test
+      # failures write at least one suite file, which flips the step's
+      # outcome back to `success` so failing tests still surface via the
+      # Summarize step rather than being silently retried.
+      - name: Run Hive (primary attempt)
+        id: hive_primary
+        continue-on-error: true
+        working-directory: ./src
+        shell: bash
+        env:
+          HIVE_SIMULATOR_NAME: ${{ steps.cfg.outputs.simulator }}
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
+        run: |
+          set -x
+          # `--docker.output` streams the client/simulator docker build stdout+stderr
+          # to hive's own stderr. Without it, hive only prints a one-line summary on
+          # build failure (e.g. "returned a non-zero code: 101") which is useless for
+          # diagnosing cargo/compiler errors in CI.
+          #
+          # `|| true` suppresses pipefail/`set -e` so we can inspect hive's
+          # real exit code deliberately; it is read from PIPESTATUS[0] on
+          # the next line before any other command can clobber it.
+          ./hive \
+            --sim "$HIVE_SIMULATOR_NAME" \
+            --client "zeam" \
+            --results-root results \
+            --client-file "simulators/lean/clients/${HIVE_DEVNET_LABEL}.yaml" \
+            --docker.output \
+            2>&1 | tee hive.log || true
+          hive_rc="${PIPESTATUS[0]}"
+
+          # hive's exit code conflates two very different failure modes
+          # (see ethereum/hive hive.go, which calls fatal() for both):
+          # infrastructure errors (image build failure, simulator crash,
+          # bad flag, Docker client unavailable) and plain test failures.
+          # Both reach os.Exit(1) indistinguishably.
+          #
+          # This step should only go red on the former. Failing tests
+          # are already surfaced by the Summarize hive results step and
+          # the uploaded artifact; turning the whole step red on them
+          # would mask the number and identity of failures behind a
+          # single X and force reviewers into the job log.
+          #
+          # Disambiguate by checking whether hive got far enough to
+          # write any per-suite result file. libhive writes each suite
+          # as <unix>-<hex>.json in the results dir at suite-end (see
+          # libhive/testmanager.go::writeSuiteFile), so "non-zero exit
+          # with >=1 suite file" unambiguously means "tests ran to
+          # completion, some failed".
+          shopt -s nullglob
+          suite_results=()
+          for f in results/*.json; do
+            [ "$(basename "$f")" = "hive.json" ] && continue
+            suite_results+=("$f")
+          done
+
+          if [ "$hive_rc" -ne 0 ]; then
+            if [ "${#suite_results[@]}" -eq 0 ]; then
+              echo "hive exited $hive_rc before any suite finished; treating as infrastructure failure" >&2
+              exit "$hive_rc"
+            fi
+            echo "hive exited $hive_rc after running ${#suite_results[@]} suite(s); treating non-zero as test failures and continuing -- see the Summarize hive results step for details" >&2
+          fi
+
+      - name: Back off before retry
+        if: steps.hive_primary.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+
+      # Retry the same inline bash body as the primary attempt. Only fires
+      # when the primary exited with an infrastructure failure (no suite
+      # file was written); test failures leave the primary step's outcome
+      # at `success`, so this step is skipped on the happy-path-with-red-
+      # tests case. The primary's results dir is guaranteed empty in this
+      # branch, so we reuse it rather than introducing a second results
+      # root.
+      - name: Run Hive (retry)
+        if: steps.hive_primary.outcome == 'failure'
+        id: hive_retry
+        continue-on-error: true
+        working-directory: ./src
+        shell: bash
+        env:
+          HIVE_SIMULATOR_NAME: ${{ steps.cfg.outputs.simulator }}
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
+        run: |
+          set -x
+          ./hive \
+            --sim "$HIVE_SIMULATOR_NAME" \
+            --client "zeam" \
+            --results-root results \
+            --client-file "simulators/lean/clients/${HIVE_DEVNET_LABEL}.yaml" \
+            --docker.output \
+            2>&1 | tee hive.log || true
+          hive_rc="${PIPESTATUS[0]}"
+
+          shopt -s nullglob
+          suite_results=()
+          for f in results/*.json; do
+            [ "$(basename "$f")" = "hive.json" ] && continue
+            suite_results+=("$f")
+          done
+
+          if [ "$hive_rc" -ne 0 ]; then
+            if [ "${#suite_results[@]}" -eq 0 ]; then
+              echo "hive exited $hive_rc before any suite finished; treating as infrastructure failure" >&2
+              exit "$hive_rc"
+            fi
+            echo "hive exited $hive_rc after running ${#suite_results[@]} suite(s); treating non-zero as test failures and continuing -- see the Summarize hive results step for details" >&2
+          fi
+
+      # Single authoritative outcome used by every downstream step (PR
+      # comment, scheduled-failure issue creator, job status). Exits 0 iff
+      # either attempt succeeded; otherwise fails the job. Kept as
+      # `id: hive` so existing downstream references (`steps.hive.outcome`)
+      # don't need to change.
+      - name: Consolidate Hive outcome
+        id: hive
+        if: always()
+        shell: bash
+        run: |
+          primary='${{ steps.hive_primary.outcome }}'
+          retry='${{ steps.hive_retry.outcome }}'
+          if [ "$primary" = "success" ]; then
+            echo "Hive succeeded on primary attempt"
+            exit 0
+          fi
+          if [ "$retry" = "success" ]; then
+            echo "Hive succeeded on retry (primary: $primary)"
+            exit 0
+          fi
+          echo "Hive failed on both attempts (primary: $primary, retry: $retry)"
+          exit 1
+
+      - name: Summarize hive results
+        id: summary
+        if: always()
+        shell: bash
+        env:
+          HIVE_DEVNET_LABEL: ${{ steps.cfg.outputs.devnet }}
+          HIVE_SIMULATOR_LABEL: ${{ steps.cfg.outputs.simulator }}
+        run: |
+          set -euo pipefail
+          # Aggregate pass/fail counts across every suite hive wrote and
+          # render a markdown summary to (a) the workflow's Step Summary
+          # tab and (b) a fragment file the PR-comment step re-reads so we
+          # don't have to keep two copies of the markdown logic. Counts
+          # are also exported as step outputs so the PR-comment step can
+          # pick an accurate icon (the Run Hive step may succeed even
+          # when tests failed -- see the disambiguation comment there).
+          summary_file="$GITHUB_WORKSPACE/hive-summary.md"
+          : > "$summary_file"
+          "$GITHUB_WORKSPACE/.github/scripts/hive-summary.sh" \
+            src/results "$summary_file" "$GITHUB_OUTPUT"
+          cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
+          echo "summary_file=$summary_file" >> "$GITHUB_OUTPUT"
+
+      - name: Upload hive results as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: hive-zeam-${{ steps.cfg.outputs.devnet }}-results.zip
+          path: src/results
+
+      - name: Post summary comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        env:
+          HIVE_SUMMARY_FILE: ${{ steps.summary.outputs.summary_file }}
+        with:
+          script: |
+            const fs = require('fs');
+            const simulator = '${{ steps.cfg.outputs.simulator }}';
+            const devnet = '${{ steps.cfg.outputs.devnet }}';
+            const hiveOutcome = '${{ steps.hive.outcome }}';
+            const failedCount = parseInt('${{ steps.summary.outputs.failed || '0' }}', 10) || 0;
+            const totalCount  = parseInt('${{ steps.summary.outputs.total  || '0' }}', 10) || 0;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Run Hive now succeeds when tests run to completion but some
+            // fail (see the disambiguation in the "Run Hive" step). That
+            // means `steps.hive.outcome == success` is NOT sufficient to
+            // claim green here; consult the summary counts before picking
+            // the icon and conclusion label.
+            let icon;
+            let conclusion;
+            if (hiveOutcome === 'skipped') {
+              icon = '⏭️';
+              conclusion = 'skipped';
+            } else if (hiveOutcome !== 'success') {
+              icon = '❌';
+              conclusion = 'infrastructure failure';
+            } else if (failedCount > 0) {
+              icon = '❌';
+              conclusion = `${failedCount}/${totalCount} tests failed`;
+            } else {
+              icon = '✅';
+              conclusion = totalCount > 0 ? `all ${totalCount} tests passed` : 'success';
+            }
+
+            // The "Summarize hive results" step writes a markdown fragment
+            // with pass/fail counts and failing-test excerpts; splice it
+            // in verbatim so the comment stays a single source of truth.
+            let summaryMd = '';
+            const summaryPath = process.env.HIVE_SUMMARY_FILE;
+            if (summaryPath && fs.existsSync(summaryPath)) {
+              summaryMd = fs.readFileSync(summaryPath, 'utf8').trim();
+            }
+
+            const parts = [
+              `### Hive results: ${icon} \`${conclusion}\``,
+              ``,
+              `| Field | Value |`,
+              `|---|---|`,
+              `| Simulator | \`${simulator}\` |`,
+              `| Devnet profile | \`${devnet}\` |`,
+              `| Outcome | \`${conclusion}\` |`,
+              `| Run | [#${context.runId}](${runUrl}) |`,
+              ``,
+            ];
+            if (summaryMd) {
+              parts.push(summaryMd, ``);
+            }
+            parts.push(
+              `Artifacts (logs, test results) are attached to the workflow run.`,
+              ``,
+              `> **Note:** the upstream \`clients/zeam\` Dockerfile pulls the devnet4 binary`,
+              `> from the pre-published \`blockblaz/zeam:devnet4\` image and the devnet3`,
+              `> binary from a pinned source revision, so this run does not exercise the`,
+              `> exact PR HEAD binary. Per-PR binary coverage requires an upstream hive change`,
+              `> (see the note at the top of the workflow file).`,
+            );
+            const body = parts.join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Open (or update) tracking issue on scheduled failure
+        if: github.event_name == 'schedule' && failure()
+        uses: JasonEtco/create-an-issue@1b14a70e4d8dc185e5cc76d3bec9eab20257b2c5 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIMULATOR: ${{ steps.cfg.outputs.simulator }}
+          DEVNET: ${{ steps.cfg.outputs.devnet }}
+          HIVE_REPOSITORY: ${{ steps.cfg.outputs.hive_repository }}
+          HIVE_VERSION: ${{ steps.cfg.outputs.hive_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        with:
+          filename: .github/ISSUE_TEMPLATE/hive-scheduled-failure.md
+          update_existing: true
+          search_existing: open
