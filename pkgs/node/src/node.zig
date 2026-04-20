@@ -56,6 +56,9 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Serializes BeamNode work between the libxev main thread (onInterval) and
+    /// the libp2p worker thread (onGossip / onReqRespResponse / onReqRespRequest).
+    mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 
@@ -129,6 +132,9 @@ pub const BeamNode = struct {
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
@@ -151,6 +157,7 @@ pub const BeamNode = struct {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                     return;
                 };
+
                 _ = self.network.removePendingBlockRoot(block_root);
 
                 if (!hasParentBlock) {
@@ -412,7 +419,8 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
+                const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
+                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
                         self.logger.debug(
@@ -604,15 +612,27 @@ pub const BeamNode = struct {
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
+        // Clone the block and capture its SSZ bytes in one pass.
+        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
+        // then deserializes into the clone. The returned bytes are stored alongside the cached
+        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
+        // observed to cause memory corruption on the next cached block's processing.
+        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
+        errdefer self.allocator.free(ssz_bytes);
 
         self.network.cacheFetchedBlock(block_root, block_ptr) catch {
             return CacheBlockError.CachingFailed;
         };
         block_owned = false;
+
+        // Store the SSZ bytes after caching; ignore store failure (block is already cached,
+        // onBlock will fall back to fresh serialization if bytes are unavailable).
+        self.network.storeFetchedBlockSsz(block_root, ssz_bytes) catch {
+            self.allocator.free(ssz_bytes);
+        };
     }
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
@@ -864,6 +884,8 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.handleReqRespResponse(event);
     }
 
@@ -879,6 +901,9 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
@@ -1102,30 +1127,37 @@ pub const BeamNode = struct {
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {
             const interval: usize = @intCast(current_interval);
-            self.chain.onInterval(interval) catch |e| {
-                self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-                // no point going further if chain is not ticked properly
-                return e;
-            };
+            const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
-            // Replay blocks that were queued waiting for the forkchoice clock to advance,
-            // then fetch any attestation head roots that were missing during replay.
-            const pending_missing_roots = self.chain.processPendingBlocks();
-            defer self.allocator.free(pending_missing_roots);
-            if (pending_missing_roots.len > 0) {
-                self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                    self.logger.warn(
-                        "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                        .{ pending_missing_roots.len, err },
-                    );
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                self.chain.onInterval(interval) catch |e| {
+                    self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+                    // no point going further if chain is not ticked properly
+                    return e;
                 };
+
+                // Replay blocks that were queued waiting for the forkchoice clock to advance,
+                // then fetch any attestation head roots that were missing during replay.
+                const pending_missing_roots = self.chain.processPendingBlocks();
+                defer self.allocator.free(pending_missing_roots);
+                if (pending_missing_roots.len > 0) {
+                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
+                        self.logger.warn(
+                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
+                            .{ pending_missing_roots.len, err },
+                        );
+                    };
+                }
+
+                // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
+                self.sweepTimedOutRequests();
+
+                self.processReadyCachedBlocks(slot);
             }
 
-            // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
-            self.sweepTimedOutRequests();
-
-            const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
-            self.processReadyCachedBlocks(slot);
             if (self.validator) |*validator| {
                 // we also tick validator per interval in case it would
                 // need to sync its future duties when its an independent validator
@@ -1381,8 +1413,15 @@ pub const BeamNode = struct {
             defer seen_subnets.deinit();
 
             // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
-            // validators
-            if (self.chain.is_aggregator_enabled) {
+            // validators.
+            //
+            // Note: this subscription decision is only taken once at startup,
+            // using the initial aggregator flag. Toggling the role at runtime
+            // via the admin API does not add or remove gossip subscriptions;
+            // a node that wants to serve as a hot-standby aggregator should
+            // start with `--is-aggregator true` and turn the role off via the
+            // API until it's needed.
+            if (self.chain.isAggregator()) {
                 if (self.aggregation_subnet_ids) |explicit_subnets| {
                     for (explicit_subnets) |subnet_id| {
                         if (seen_subnets.contains(subnet_id)) continue;
@@ -1404,12 +1443,12 @@ pub const BeamNode = struct {
 
             // If no subnets were added yet (aggregator but no explicit ids and no
             // validators registered), fall back to subnet 0 to keep parity with leanSpec.
-            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
+            if (seen_subnets.count() == 0 and self.chain.isAggregator()) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
         // if no committee count specified and still aggregator, all are in subnet 0
-        else if (self.chain.is_aggregator_enabled) {
+        else if (self.chain.isAggregator()) {
             try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
         }
 

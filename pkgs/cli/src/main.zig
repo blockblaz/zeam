@@ -92,7 +92,7 @@ pub const NodeCommand = struct {
         .@"sig-keys-dir" = "Relative path of custom genesis to signature key directory",
         .@"data-dir" = "Path to the data directory",
         .@"checkpoint-sync-url" = "URL to fetch finalized checkpoint state from for checkpoint sync (e.g., http://localhost:5052/lean/v0/states/finalized)",
-        .@"is-aggregator" = "Enable aggregator mode for committee signature aggregation",
+        .@"is-aggregator" = "Seed the node's aggregator role on startup. The role can be toggled at runtime via POST /lean/v0/admin/aggregator.",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .help = "Show help information for the node command",
@@ -411,6 +411,13 @@ fn mainInner() !void {
             // Nodes 1,2 start immediately; Node 3 starts after finalization to test sync
             const num_validators: usize = 3;
             var key_manager = try key_manager_lib.getTestKeyManager(allocator, num_validators, 1000);
+            // Defer order (LIFO): key_manager.deinit() runs first so it can drop its
+            // map entries while the cached XMSS handles are still valid, then the
+            // process-global cache itself is freed. key_manager.deinit() only
+            // deinits keys it owns (addKeypair), not borrowed ones (addCachedKeypair);
+            // the cache is the real owner of those handles and would otherwise
+            // leak until process exit since it uses the page allocator.
+            defer key_manager_lib.deinitGlobalKeyCache();
             defer key_manager.deinit();
 
             // Get validator pubkeys from keymanager
@@ -508,8 +515,9 @@ fn mainInner() !void {
                 errdefer allocator.free(fork_digest1);
                 // Create empty registry for test network
                 const test_registry1 = try allocator.create(node_lib.NodeNameRegistry);
-                test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry1);
+                test_registry1.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer test_registry1.deinit();
 
                 network1.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 0,
@@ -532,8 +540,9 @@ fn mainInner() !void {
                 errdefer allocator.free(fork_digest2);
                 // Create empty registry for test network
                 const test_registry2 = try allocator.create(node_lib.NodeNameRegistry);
-                test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry2);
+                test_registry2.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer test_registry2.deinit();
 
                 network2.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 1,
@@ -555,8 +564,9 @@ fn mainInner() !void {
                 const fork_digest3 = try allocator.dupe(u8, chain_config.spec.fork_digest);
                 errdefer allocator.free(fork_digest3);
                 const test_registry3 = try allocator.create(node_lib.NodeNameRegistry);
-                test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
                 errdefer allocator.destroy(test_registry3);
+                test_registry3.* = node_lib.NodeNameRegistry.init(allocator);
+                errdefer test_registry3.deinit();
 
                 network3.* = try networks.EthLibp2p.init(allocator, loop, .{
                     .networkId = 2,

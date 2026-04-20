@@ -49,7 +49,9 @@ pub const ChainOpts = struct {
     db: database.Db,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
-    // import and aggregate all subnet ids subscribed to
+    // Seeds the runtime aggregator role. The role can be toggled at runtime
+    // via `setAggregator`; the CLI `--is-aggregator` flag only supplies the
+    // initial value. See `BeamChain.is_aggregator_enabled`.
     is_aggregator: bool = false,
 };
 
@@ -57,6 +59,10 @@ pub const CachedProcessedBlockInfo = struct {
     postState: ?*types.BeamState = null,
     blockRoot: ?types.Root = null,
     pruneForkchoice: bool = true,
+    // Pre-serialized SSZ bytes for the block.  When set, onBlock uses them directly
+    // for database persistence and skips re-serializing the live SignedBlock, which
+    // has been observed to corrupt in-memory List/Bitlist state on subsequent access.
+    sszBytes: ?[]const u8 = null,
 };
 
 pub const GossipProcessingResult = struct {
@@ -103,7 +109,16 @@ pub const BeamChain = struct {
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
-    is_aggregator_enabled: bool,
+    // Aggregator role flag, toggleable at runtime via `setAggregator`.
+    // Read from gossip handlers, the tick loop, and the network subscribe
+    // phase, so it is stored as an atomic to permit lock-free reads while
+    // the admin API flips the flag.
+    //
+    // Note: network subnet subscriptions are decided once at startup based
+    // on the initial value. Flipping this at runtime affects gossip import
+    // and aggregation duties for subnets the node is already subscribed to,
+    // matching the hot-standby model documented in leanEthereum/leanSpec#636.
+    is_aggregator_enabled: std.atomic.Value(bool),
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -164,7 +179,7 @@ pub const BeamChain = struct {
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
-            .is_aggregator_enabled = opts.is_aggregator,
+            .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
@@ -211,6 +226,28 @@ pub const BeamChain = struct {
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         // self.anchor_state.deinit();
+    }
+
+    /// Returns the current aggregator role flag.
+    pub fn isAggregator(self: *const Self) bool {
+        return self.is_aggregator_enabled.load(.acquire);
+    }
+
+    /// Atomically flips the aggregator role and returns the previous value.
+    /// Both the gossip import path and the tick-driven aggregation path pick
+    /// up the new value on their next read, so no restart is required.
+    ///
+    /// Logs transitions at info and no-op writes at debug so operators can
+    /// trace toggles (from the admin API or any other caller) in the node
+    /// logs without needing to cross-reference request logs.
+    pub fn setAggregator(self: *Self, enabled: bool) bool {
+        const previous = self.is_aggregator_enabled.swap(enabled, .acq_rel);
+        if (previous != enabled) {
+            self.logger.info("aggregator role changed: {any} -> {any}", .{ previous, enabled });
+        } else {
+            self.logger.debug("aggregator role set to {any} (no change)", .{enabled});
+        }
+        return previous;
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -764,7 +801,7 @@ pub const BeamChain = struct {
                     }
                 };
 
-                if (self.is_aggregator_enabled) {
+                if (self.is_aggregator_enabled.load(.acquire)) {
                     // Process validated attestation
                     self.onGossipAttestation(signed_attestation) catch |err| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr();
@@ -884,6 +921,30 @@ pub const BeamChain = struct {
 
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
         try self.root_to_slot_cache.put(block_root, block.slot);
+
+        // Obtain SSZ bytes for RocksDB persistence.
+        //
+        // Prefer the pre-serialized bytes captured at cache time (blockInfo.sszBytes).
+        // Using those bytes avoids calling ssz.serialize on the live `signedBlock` here,
+        // which has been observed to corrupt in-memory List/Bitlist state (aggregation_bits,
+        // proof_data) and cause segfaults on the next cached block's processing.
+        //
+        // If no pre-serialized bytes are available (e.g. locally produced blocks), fall back
+        // to serializing a disposable deep clone so the live block is never passed to serialize.
+        var fallback_ssz: std.ArrayList(u8) = .empty;
+        defer fallback_ssz.deinit(self.allocator);
+
+        var fallback_clone: types.SignedBlock = undefined;
+        var fallback_clone_initialized = false;
+        defer if (fallback_clone_initialized) fallback_clone.deinit();
+
+        const block_ssz_for_db: []const u8 = if (blockInfo.sszBytes) |precomputed| precomputed else blk: {
+            // No pre-serialized bytes: clone the block and serialize the clone only.
+            try types.sszClone(self.allocator, types.SignedBlock, signedBlock, &fallback_clone);
+            fallback_clone_initialized = true;
+            try ssz.serialize(types.SignedBlock, fallback_clone, &fallback_ssz, self.allocator);
+            break :blk fallback_ssz.items;
+        };
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
@@ -1007,7 +1068,7 @@ pub const BeamChain = struct {
         const processing_time = onblock_timer.observe();
 
         // 6. Save block and state to database and confirm the block in forkchoice
-        self.updateBlockDb(signedBlock, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
+        self.updateBlockDb(block_ssz_for_db, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
             self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
                 err,
@@ -1112,13 +1173,14 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
     }
 
-    /// Update block database with block, state, and slot indices
-    fn updateBlockDb(self: *Self, signedBlock: types.SignedBlock, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
+    /// Update block database with block, state, and slot indices.
+    /// `signed_block_ssz` must be the SSZ encoding of `SignedBlock` (see onBlock).
+    fn updateBlockDb(self: *Self, signed_block_ssz: []const u8, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
         var batch = self.db.initWriteBatch();
         defer batch.deinit();
 
         // Store block and state
-        batch.putBlock(database.DbBlocksNamespace, blockRoot, signedBlock);
+        batch.putBlockSerialized(database.DbBlocksNamespace, blockRoot, signed_block_ssz);
         batch.putState(database.DbStatesNamespace, blockRoot, postState);
 
         // TODO: uncomment this code if there is a need of slot to unfinalized index
@@ -1552,7 +1614,7 @@ pub const BeamChain = struct {
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) return null;
 
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
@@ -1612,9 +1674,14 @@ pub const BeamChain = struct {
             return state;
         }
 
-        // Check if we already have a cached state from DB
+        // Check if we already have a cached state. Invalidate if it's behind the
+        // current finalized checkpoint (can happen if the cache was seeded from the
+        // DB at startup before any in-memory finalization happened).
         if (self.cached_finalized_state) |cached_state| {
-            return cached_state;
+            if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
+                return cached_state;
+            }
+            // Stale — fall through to DB load below.
         }
 
         // Fallback: try to load from database

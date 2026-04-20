@@ -72,6 +72,7 @@ pub const Bytes52 = utils.Bytes52;
 pub const GenesisSpec = utils.GenesisSpec;
 pub const ChainSpec = utils.ChainSpec;
 pub const sszClone = utils.sszClone;
+pub const sszCloneAndGetBytes = utils.sszCloneAndGetBytes;
 pub const IsJustifiableSlot = utils.IsJustifiableSlot;
 pub const RootToSlotCache = utils.RootToSlotCache;
 
