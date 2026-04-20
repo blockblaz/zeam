@@ -49,7 +49,9 @@ pub const ChainOpts = struct {
     db: database.Db,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
-    // import and aggregate all subnet ids subscribed to
+    // Seeds the runtime aggregator role. The role can be toggled at runtime
+    // via `setAggregator`; the CLI `--is-aggregator` flag only supplies the
+    // initial value. See `BeamChain.is_aggregator_enabled`.
     is_aggregator: bool = false,
 };
 
@@ -107,7 +109,16 @@ pub const BeamChain = struct {
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
-    is_aggregator_enabled: bool,
+    // Aggregator role flag, toggleable at runtime via `setAggregator`.
+    // Read from gossip handlers, the tick loop, and the network subscribe
+    // phase, so it is stored as an atomic to permit lock-free reads while
+    // the admin API flips the flag.
+    //
+    // Note: network subnet subscriptions are decided once at startup based
+    // on the initial value. Flipping this at runtime affects gossip import
+    // and aggregation duties for subnets the node is already subscribed to,
+    // matching the hot-standby model documented in leanEthereum/leanSpec#636.
+    is_aggregator_enabled: std.atomic.Value(bool),
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -168,7 +179,7 @@ pub const BeamChain = struct {
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
-            .is_aggregator_enabled = opts.is_aggregator,
+            .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
@@ -215,6 +226,28 @@ pub const BeamChain = struct {
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         // self.anchor_state.deinit();
+    }
+
+    /// Returns the current aggregator role flag.
+    pub fn isAggregator(self: *const Self) bool {
+        return self.is_aggregator_enabled.load(.acquire);
+    }
+
+    /// Atomically flips the aggregator role and returns the previous value.
+    /// Both the gossip import path and the tick-driven aggregation path pick
+    /// up the new value on their next read, so no restart is required.
+    ///
+    /// Logs transitions at info and no-op writes at debug so operators can
+    /// trace toggles (from the admin API or any other caller) in the node
+    /// logs without needing to cross-reference request logs.
+    pub fn setAggregator(self: *Self, enabled: bool) bool {
+        const previous = self.is_aggregator_enabled.swap(enabled, .acq_rel);
+        if (previous != enabled) {
+            self.logger.info("aggregator role changed: {any} -> {any}", .{ previous, enabled });
+        } else {
+            self.logger.debug("aggregator role set to {any} (no change)", .{enabled});
+        }
+        return previous;
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -748,7 +781,7 @@ pub const BeamChain = struct {
                     }
                 };
 
-                if (self.is_aggregator_enabled) {
+                if (self.is_aggregator_enabled.load(.acquire)) {
                     // Process validated attestation
                     self.onGossipAttestation(signed_attestation) catch |err| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
@@ -1561,7 +1594,7 @@ pub const BeamChain = struct {
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) return null;
 
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
