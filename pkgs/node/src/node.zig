@@ -993,6 +993,15 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Extract client type prefix from a node name like "zeam_0" -> "zeam", fallback "unknown".
+    fn clientTypeFromName(name: ?[]const u8) []const u8 {
+        const n = name orelse return "unknown";
+        if (std.mem.indexOfScalar(u8, n, '_')) |sep| {
+            if (sep > 0) return n[0..sep];
+        }
+        return if (n.len > 0) n else "unknown";
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -1007,7 +1016,9 @@ pub const BeamNode = struct {
 
         // Record metrics
         zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
-        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+        const client_name = node_name.name orelse "unknown";
+        const client_type = clientTypeFromName(node_name.name);
+        zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 1) catch {};
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -1033,10 +1044,12 @@ pub const BeamNode = struct {
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+
         if (self.network.disconnectPeer(peer_id)) {
             self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
-                self.node_registry.getNodeNameFromPeerId(peer_id),
+                node_name,
                 @tagName(direction),
                 @tagName(reason),
                 self.network.getPeerCount(),
@@ -1044,7 +1057,9 @@ pub const BeamNode = struct {
 
             // Record metrics
             zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
-            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+            const client_name = node_name.name orelse "unknown";
+            const client_type = clientTypeFromName(node_name.name);
+            zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
     }
 
