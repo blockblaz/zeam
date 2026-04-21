@@ -13,6 +13,25 @@
 #   - Simulator:          simulators/lean
 #   - Client profiles:    simulators/lean/clients/{devnet3,devnet4}.yaml
 #
+# Shared-client scenarios (upstream ethereum/hive#1435, merged 2026-04-21):
+#   The lean simulator's 13 finalized-state `rpc_compat: state ssz decodes *`
+#   scenarios now share a single zeam container via `SharedClientTestSpec`
+#   instead of booting one container per scenario. We inherit this for free
+#   by tracking `hive_version: master` (see `Checkout hive` step below) --
+#   no zeam-side flag toggles it; the reuse is a per-scenario decision made
+#   inside `simulators/lean/src/scenarios/rpc_compat.rs`. Per-scenario
+#   pass/fail is still reported individually in hiveview and in the summary
+#   comment, so the reduction shows up only as fewer `client zeam started`
+#   events in `hive.log`, not as a smaller test count.
+#
+#   Scenarios that need a fresh client (e.g. the `slot == 0` assertions)
+#   deliberately keep their own container via `NClientTestSpec`, so the
+#   total zeam boots per suite is (# non-shared scenarios) + 1, not 1.
+#
+#   If upstream ever regresses this we'll see it as a jump in wall-clock
+#   time on the scheduled run (zeam devnet4 boots take ~30-60s each); pin
+#   `hive_version` to `dc78759` or later in that case.
+#
 # Known limitation (tracked for follow-up, not this PR):
 #   The upstream zeam Dockerfile in ethereum/hive selects the devnet3 binary
 #   from a pinned source revision (build arg `zeam_devnet3_revision`) and the
