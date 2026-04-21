@@ -720,6 +720,8 @@ const MessagePublishWrapper = struct {
     sender_peer_id: []const u8,
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
+    completion: *xev.Completion,
+    gossipHandler: *GenericGossipHandler,
 
     const Self = @This();
 
@@ -731,7 +733,7 @@ const MessagePublishWrapper = struct {
         });
     }
 
-    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger) !*Self {
+    fn init(allocator: Allocator, handler: OnGossipCbHandler, data: *const GossipMessage, sender_peer_id: []const u8, networkId: u32, logger: zeam_utils.ModuleLogger, completion: *xev.Completion, gossipHandler: *GenericGossipHandler) !*Self {
         const cloned_data = try data.clone(allocator);
         const sender_peer_id_copy = try allocator.dupe(u8, sender_peer_id);
 
@@ -743,6 +745,8 @@ const MessagePublishWrapper = struct {
             .sender_peer_id = sender_peer_id_copy,
             .networkId = networkId,
             .logger = logger,
+            .completion = completion,
+            .gossipHandler = gossipHandler,
         };
         return self;
     }
@@ -845,6 +849,7 @@ pub const GenericGossipHandler = struct {
     networkId: u32,
     logger: zeam_utils.ModuleLogger,
     node_registry: *const NodeNameRegistry,
+    inflightWrappers: std.AutoHashMapUnmanaged(*MessagePublishWrapper, void),
 
     const Self = @This();
     pub fn init(allocator: Allocator, loop: *xev.Loop, networkId: u32, logger: zeam_utils.ModuleLogger, registry: *const NodeNameRegistry) !Self {
@@ -868,16 +873,24 @@ pub const GenericGossipHandler = struct {
             .networkId = networkId,
             .logger = logger,
             .node_registry = registry,
+            .inflightWrappers = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.timer.deinit();
-        var it = self.onGossipHandlers.iterator();
-        while (it.next()) |entry| {
+        var handler_it = self.onGossipHandlers.iterator();
+        while (handler_it.next()) |entry| {
             entry.value_ptr.deinit(self.allocator);
         }
         self.onGossipHandlers.deinit(self.allocator);
+        var inflight_it = self.inflightWrappers.keyIterator();
+        while (inflight_it.next()) |wrapper_ptr| {
+            const wrapper = wrapper_ptr.*;
+            self.allocator.destroy(wrapper.completion);
+            wrapper.deinit();
+        }
+        self.inflightWrappers.deinit(self.allocator);
     }
 
     pub fn onGossip(self: *Self, data: *const GossipMessage, sender_peer_id: []const u8, scheduleOnLoop: bool) anyerror!void {
@@ -894,13 +907,17 @@ pub const GenericGossipHandler = struct {
             // TODO: figure out why scheduling on the loop is not working for libp2p separate net instance
             // remove this option once resolved
             if (scheduleOnLoop) {
-                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger);
-
-                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
-
                 // Create a separate completion object for each handler to avoid conflicts
                 const completion = try self.allocator.create(xev.Completion);
                 completion.* = undefined;
+
+                errdefer self.allocator.destroy(completion);
+
+                const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger, completion, self);
+
+                try self.inflightWrappers.put(self.allocator, publishWrapper, {});
+
+                self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
 
                 self.timer.run(
                     self.loop,
@@ -921,6 +938,7 @@ pub const GenericGossipHandler = struct {
                                 _ = pwrap.handler.onGossip(pwrap.data, pwrap.sender_peer_id) catch void;
                                 defer pwrap.deinit();
                                 // Clean up the completion object
+                                _ = pwrap.gossipHandler.inflightWrappers.remove(pwrap);
                                 pwrap.allocator.destroy(c);
                             }
                             return .disarm;
