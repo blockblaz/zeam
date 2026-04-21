@@ -2,6 +2,7 @@ const std = @import("std");
 const ssz = @import("ssz");
 
 const params = @import("@zeam/params");
+const zeam_metrics = @import("@zeam/metrics");
 const xmss = @import("@zeam/xmss");
 const zeam_utils = @import("@zeam/utils");
 
@@ -698,6 +699,7 @@ pub const AggregatedAttestationsResult = struct {
                 try child_pk_slices.append(allocator, cpks[0..cpk_idx]);
             }
 
+            const pq_sig_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
             try aggregation.AggregatedSignatureProof.aggregate(
                 allocator,
                 xmss_participants,
@@ -709,6 +711,7 @@ pub const AggregatedAttestationsResult = struct {
                 epoch,
                 &proof,
             );
+            _ = pq_sig_timer.observe();
             if (xmss_participants) |*gp| gp.deinit();
             xmss_participants = null;
 

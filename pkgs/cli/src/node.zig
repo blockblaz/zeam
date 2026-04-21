@@ -304,6 +304,7 @@ pub const Node = struct {
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
             try api.init(allocator);
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
         }
 
         try self.beam_node.init(allocator, .{
@@ -364,7 +365,6 @@ pub const Node = struct {
 
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
-            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
         }
 
         self.logger = options.logger_config.logger(.node);
