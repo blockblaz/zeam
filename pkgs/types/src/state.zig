@@ -517,20 +517,29 @@ pub const BeamState = struct {
                         while (iter.next()) |entry| {
                             const root = entry.key_ptr.*;
                             // A miss in `block_cache` for a root that's still in
-                            // `state.justifications` is not an error — it's the
-                            // expected outcome once finalization has advanced past
-                            // the root's slot. `RootToSlotCache.prune` removes
-                            // entries with `slot <= (some prior finalized_slot)`
-                            // and finalization is monotonic, so a miss always
-                            // implies `slot <= finalized_slot` now. Treat it
-                            // identically to the explicit `<=` branch and drop
-                            // the root. Returning `InvalidJustificationRoot` here
-                            // wedges both the block-import path and the slot-tick
-                            // path until checkpoint-sync restart (see #771).
+                            // `state.justifications` has two possible causes:
+                            //   1. `RootToSlotCache.prune` evicted it. That only
+                            //      removes entries with `slot <= (some prior
+                            //      finalized_slot)` and finalization advances
+                            //      monotonically, so `slot <= finalized_slot` now.
+                            //   2. The block was re-orged or never fully imported,
+                            //      so we have no slot info at all. `slot` could be
+                            //      anything, but the drop is still correct — we
+                            //      can't finalize a root we don't have.
+                            // Either way, treat the miss identically to the
+                            // explicit `<=` branch and drop the root. Returning
+                            // `InvalidJustificationRoot` here wedges both the
+                            // block-import path and the slot-tick path until
+                            // checkpoint-sync restart (see #771).
                             const is_stale = if (block_cache.get(root)) |slot|
                                 slot <= finalized_slot
-                            else
-                                true;
+                            else blk: {
+                                logger.debug(
+                                    "dropping stale justification root=0x{x}: not in block_cache (finalized_slot={d})",
+                                    .{ &root, finalized_slot },
+                                );
+                                break :blk true;
+                            };
                             if (is_stale) {
                                 try roots_to_remove.append(allocator, root);
                             }
