@@ -13,10 +13,12 @@ concurrency:
 
 name: CI
 
-# NOTE: Rust nightly is pinned to 2026-04-20 across all jobs as a workaround for
-# a regression introduced in nightly-2026-04-21 that causes duplicate-symbol link
-# errors for `__rustc*__rust_{alloc,dealloc,realloc,alloc_zeroed}` when Zig links
+# NOTE: Rust nightly is pinned to nightly-2026-04-21 (which publishes the
+# 2026-04-20 build) across all jobs as a workaround for a regression that
+# causes duplicate-symbol link errors for
+# `__rustc*__rust_{alloc,dealloc,realloc,alloc_zeroed}` when Zig links
 # multiple Rust static libraries together (build-all-provers on macos-latest).
+# `nightly-2026-04-20` resolves to the 2026-04-19 build, which also fails.
 # Track removal in the linked tracking issue; revert to `nightly` once upstream
 # nightly no longer emits conflicting allocator shims in static-lib output.
 
@@ -107,7 +109,7 @@ jobs:
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -178,7 +180,7 @@ jobs:
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
         components: clippy, rustfmt
 
     - name: Cache Zig packages
@@ -259,7 +261,7 @@ jobs:
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -359,7 +361,7 @@ jobs:
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -431,7 +433,7 @@ jobs:
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
 
     - name: Cache Zig packages
       uses: actions/cache@v4

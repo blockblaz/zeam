@@ -166,7 +166,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         # Pinned to match ci.yml — see workaround note there.
-        toolchain: nightly-2026-04-20
+        toolchain: nightly-2026-04-21
 
     - name: Cache Zig packages
       uses: actions/cache@v4
