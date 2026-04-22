@@ -1348,8 +1348,20 @@ pub const BeamChain = struct {
         //     }
         // }
 
-        // Prune root-to-slot cache up to finalized slot
-        try self.root_to_slot_cache.prune(latestFinalized.slot);
+        // Prune root-to-slot cache up to the PREVIOUS finalized slot, not the
+        // new one. Cached post-states retained in `self.states` (block.slot >
+        // latestFinalized.slot survived `pruneStates` above) can still hold
+        // `justifications_roots` whose slots lie in
+        // (state.latest_finalized.slot, state.slot]. When a later block is
+        // imported on top of such a state and its STF advances finality, the
+        // post-finalization cleanup loop in `BeamState.processAttestations`
+        // looks those roots up in this cache — so the cache must keep them
+        // reachable across one finalization boundary. Pruning on
+        // `latestFinalized.slot` drops exactly the roots in
+        // (previousFinalized.slot, latestFinalized.slot] that such states can
+        // reference, which wedged zeam_0 on devnet-4 via a cross-fork reorg
+        // (see issue #771 and the complementary STF hotfix in #772).
+        try self.root_to_slot_cache.prune(previousFinalized.slot);
 
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
