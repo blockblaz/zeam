@@ -1625,9 +1625,18 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
-                return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            // The future-slot gate (slot * INTERVALS_PER_SLOT > fcStore.time)
+            // used to live here but duplicated the gossip-level check in
+            // chain.validateBlock and disagreed with every other leanSpec
+            // consumer (ream, qlean-mini, ethlambda, nlean — none of which
+            // key block admission on the local clock). Rejecting here also
+            // caused chain.zig to keep a parallel pending-block queue just
+            // to replay these blocks on the next interval, which meant the
+            // block / its body attestations couldn't contribute to fork
+            // choice weight until the clock caught up. Now we mirror
+            // leanSpec store.on_block: if parent is known and the slot is
+            // not pre-finalized, just process it.
+            if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -1917,7 +1926,6 @@ pub const ForkChoice = struct {
 pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
-    FutureSlot,
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
@@ -1980,11 +1988,11 @@ test "forkchoice block tree" {
         const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
-        // shouldn't accept a future slot
-        const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
-
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        // forkchoice no longer gates block admission on the local clock —
+        // gossip-level future-slot rejection happens earlier in chain.validateBlock,
+        // matching leanSpec store.on_block semantics. Onblock only requires a
+        // known parent and a non-pre-finalized slot.
+        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
