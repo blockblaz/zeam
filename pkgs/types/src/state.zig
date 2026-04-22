@@ -516,8 +516,22 @@ pub const BeamState = struct {
                         var iter = justifications.iterator();
                         while (iter.next()) |entry| {
                             const root = entry.key_ptr.*;
-                            const slot = block_cache.get(root) orelse return StateTransitionError.InvalidJustificationRoot;
-                            if (slot <= finalized_slot) {
+                            // A miss in `block_cache` for a root that's still in
+                            // `state.justifications` is not an error — it's the
+                            // expected outcome once finalization has advanced past
+                            // the root's slot. `RootToSlotCache.prune` removes
+                            // entries with `slot <= (some prior finalized_slot)`
+                            // and finalization is monotonic, so a miss always
+                            // implies `slot <= finalized_slot` now. Treat it
+                            // identically to the explicit `<=` branch and drop
+                            // the root. Returning `InvalidJustificationRoot` here
+                            // wedges both the block-import path and the slot-tick
+                            // path until checkpoint-sync restart (see #771).
+                            const is_stale = if (block_cache.get(root)) |slot|
+                                slot <= finalized_slot
+                            else
+                                true;
+                            if (is_stale) {
                                 try roots_to_remove.append(allocator, root);
                             }
                         }
@@ -1064,6 +1078,127 @@ test "pruning keeps pending justifications" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "process_attestations drops pending justifications missing from block_cache" {
+    // Regression for #771. State carries a pending-justification root whose
+    // block lives at a slot not covered by `block_cache`. Finalization
+    // advances during this call and the cleanup loop must drop the root,
+    // not abort the whole STF with InvalidJustificationRoot.
+    //
+    // Production trigger: the chain-owned RootToSlotCache has been pruned to
+    // some earlier finalized slot, so the lookup misses for any
+    // state.justifications root at or before that slot. Pre-fix behaviour
+    // wedged the node because the same pre-state -> same miss -> same error
+    // on every retry and every slot-tick-driven STF run.
+    //
+    // Test repro: use the null-cache fallback, which populates
+    // owned_cache only from latest_finalized.slot+1 onwards. Seeding
+    // state.justifications_roots with the genesis root (slot 0) puts it
+    // outside that window, so the cache lookup misses during cleanup.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    const logger = logger_config.logger(null);
+    var state = try makeGenesisState(std.testing.allocator, 3);
+    defer state.deinit();
+
+    // Phase 1: justify slot 1 so the later src=slot 1 attestation is accepted.
+    try state.process_slots(std.testing.allocator, 1, logger);
+    var block_1 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_1.deinit();
+    try state.process_block(std.testing.allocator, block_1, logger, null);
+
+    try state.process_slots(std.testing.allocator, 2, logger);
+    var block_2_parent_root: Root = undefined;
+    try zeam_utils.hashTreeRoot(block.BeamBlockHeader, state.latest_block_header, &block_2_parent_root, std.testing.allocator);
+
+    var att_0_to_1 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = block_1.parent_root, .slot = 0 },
+        .{ .root = block_2_parent_root, .slot = 1 },
+    );
+    var att_0_to_1_transferred = false;
+    defer if (!att_0_to_1_transferred) att_0_to_1.deinit();
+
+    var block_2 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{att_0_to_1});
+    att_0_to_1_transferred = true;
+    defer block_2.deinit();
+    try state.process_block(std.testing.allocator, block_2, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 0), state.latest_finalized.slot);
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_justified.slot);
+
+    // Phase 2: extend the chain so historical_block_hashes and justified_slots
+    // are long enough for the forthcoming src=1 tgt=2 attestation.
+    try state.process_slots(std.testing.allocator, 3, logger);
+    var block_3 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_3.deinit();
+    try state.process_block(std.testing.allocator, block_3, logger, null);
+
+    try state.process_slots(std.testing.allocator, 4, logger);
+    var block_4 = try makeBlock(std.testing.allocator, &state, state.slot, &[_]attestation.AggregatedAttestation{});
+    defer block_4.deinit();
+    try state.process_block_header(std.testing.allocator, block_4, logger);
+
+    // Phase 3: seed state.justifications_roots with the genesis root. Its
+    // slot (0) is <= latest_finalized.slot (also 0), which is the range
+    // initRootToSlotCache explicitly skips, so the STF's owned cache does
+    // not contain it.
+    const genesis_root = try state.historical_block_hashes.get(0);
+
+    var pending_roots = try JustificationRoots.init(std.testing.allocator);
+    errdefer pending_roots.deinit();
+    try pending_roots.append(genesis_root);
+
+    var pending_validators = try JustificationValidators.init(std.testing.allocator);
+    errdefer pending_validators.deinit();
+    try pending_validators.append(true);
+    try pending_validators.append(false);
+    try pending_validators.append(false);
+
+    state.justifications_roots.deinit();
+    state.justifications_roots = pending_roots;
+    state.justifications_validators.deinit();
+    state.justifications_validators = pending_validators;
+
+    // Phase 4: drive finalization from slot 0 to slot 1. src=slot 1, tgt=slot
+    // 2, empty [src+1, tgt) window => can_target_finalize holds, so
+    // latest_finalized advances and the cleanup loop runs.
+    const source_1_root = try state.historical_block_hashes.get(1);
+    const slot_2_root = try state.historical_block_hashes.get(2);
+    var att_1_to_2 = try makeAggregatedAttestation(
+        std.testing.allocator,
+        &[_]usize{ 0, 1 },
+        state.slot,
+        .{ .root = source_1_root, .slot = 1 },
+        .{ .root = slot_2_root, .slot = 2 },
+    );
+    var att_1_to_2_transferred = false;
+    defer if (!att_1_to_2_transferred) att_1_to_2.deinit();
+
+    var attestations_list = try block.AggregatedAttestations.init(std.testing.allocator);
+    defer {
+        for (attestations_list.slice()) |*att| {
+            att.deinit();
+        }
+        attestations_list.deinit();
+    }
+    try attestations_list.append(att_1_to_2);
+    att_1_to_2_transferred = true;
+
+    // Pre-fix: returned StateTransitionError.InvalidJustificationRoot because
+    // the cleanup loop looked up genesis_root in a cache that only covers
+    // slot > latest_finalized. Post-fix: the miss is treated as "stale, drop"
+    // and the STF completes normally.
+    try state.process_attestations(std.testing.allocator, attestations_list, logger, null);
+
+    try std.testing.expectEqual(@as(Slot, 1), state.latest_finalized.slot);
+    try std.testing.expectEqual(@as(Slot, 2), state.latest_justified.slot);
+
+    for (state.justifications_roots.constSlice()) |root| {
+        try std.testing.expect(!std.mem.eql(u8, &root, &genesis_root));
+    }
 }
 
 test "root_to_slot_cache lifecycle" {
