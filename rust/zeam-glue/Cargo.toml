@@ -1,0 +1,36 @@
+[package]
+name = "zeam-glue"
+version = "0.1.0"
+edition = "2021"
+
+# Unified FFI shim that re-exports the `#[no_mangle] pub extern "C"` symbols from
+# every per-prover glue crate. The shim is the only crate in the workspace that
+# produces a `staticlib`; the underlying glue crates are plain `rlib`s, pulled
+# in as dependencies under feature flags.
+#
+# Why: each `staticlib` Rust produces bundles its own copy of Rust's allocator
+# shim (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`).
+# On macOS, `ld64` refuses to coalesce the duplicates when Zig links multiple
+# such staticlibs into a single executable, breaking `build-all-provers`.
+# Funnelling every glue rlib through a single staticlib emits the shim once.
+# See blockblaz/zeam#773.
+
+[dependencies]
+libp2p-glue   = { path = "../libp2p-glue",   optional = true }
+hashsig-glue  = { path = "../hashsig-glue",  optional = true }
+multisig-glue = { path = "../multisig-glue", optional = true }
+risc0-glue    = { path = "../risc0-glue",    optional = true }
+openvm-glue   = { path = "../openvm-glue",   optional = true }
+
+[features]
+# Features are intentionally additive and have no defaults so `build.zig`
+# can opt into exactly the set that matches the requested `-Dprover=...`.
+libp2p   = ["dep:libp2p-glue"]
+hashsig  = ["dep:hashsig-glue"]
+multisig = ["dep:multisig-glue"]
+risc0    = ["dep:risc0-glue"]
+openvm   = ["dep:openvm-glue"]
+
+[lib]
+name = "zeam_glue"
+crate-type = ["staticlib"]
