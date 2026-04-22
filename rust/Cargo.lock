@@ -9188,6 +9188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeam-glue"
+version = "0.1.0"
+dependencies = [
+ "hashsig-glue",
+ "libp2p-glue",
+ "multisig-glue",
+ "openvm-glue",
+ "risc0-glue",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"

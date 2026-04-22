@@ -31,36 +31,22 @@ fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compil
     setTestRunLabel(b, run_step, source_name);
 }
 
-// Add the glue libs to a compile target
+// Add the glue libs to a compile target.
+//
+// Every per-prover Rust crate is funnelled through a single `zeam-glue`
+// `staticlib` shim so that Rust's allocator shim
+// (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`)
+// is emitted exactly once. When multiple Rust staticlibs were linked together
+// directly, `ld64` on macOS rejected the duplicate strong definitions and the
+// `build-all-provers` job broke on any fresh (cache-miss) rebuild.
+// See blockblaz/zeam#773.
 fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.ResolvedTarget, prover: ProverChoice) void {
-    // Conditionally include prover libraries based on selection
-    // Use profile-specific directories for single-prover builds
-    switch (prover) {
-        .dummy => {
-            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
-        },
-        .risc0 => {
-            comp.addObjectFile(b.path("rust/target/risc0-release/librisc0_glue.a"));
-            comp.addObjectFile(b.path("rust/target/risc0-release/libhashsig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/risc0-release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/risc0-release/liblibp2p_glue.a"));
-        },
-        .openvm => {
-            comp.addObjectFile(b.path("rust/target/openvm-release/libopenvm_glue.a"));
-            comp.addObjectFile(b.path("rust/target/openvm-release/libhashsig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/openvm-release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/openvm-release/liblibp2p_glue.a"));
-        },
-        .all => {
-            comp.addObjectFile(b.path("rust/target/release/librisc0_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/libopenvm_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/libhashsig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/libmultisig_glue.a"));
-            comp.addObjectFile(b.path("rust/target/release/liblibp2p_glue.a"));
-        },
-    }
+    const glue_path = switch (prover) {
+        .dummy, .all => "rust/target/release/libzeam_glue.a",
+        .risc0 => "rust/target/risc0-release/libzeam_glue.a",
+        .openvm => "rust/target/openvm-release/libzeam_glue.a",
+    };
+    comp.addObjectFile(b.path(glue_path));
     comp.linkLibC();
     comp.linkSystemLibrary("unwind");
     if (target.result.os.tag == .macos) {
@@ -314,6 +300,7 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("multiaddr", multiaddr_mod);
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
+    zeam_network.addImport("@zeam/metrics", zeam_metrics);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
@@ -699,27 +686,33 @@ fn setSpectestArgsAndEnv(
 }
 
 fn build_rust_project(b: *Builder, path: []const u8, prover: ProverChoice) *Builder.Step.Run {
-    // Build only the selected prover crates
-    // Use optimized profiles for single-prover builds to reduce binary size
+    // Every Rust glue crate is routed through the `zeam-glue` staticlib shim;
+    // feature flags control which per-prover rlibs get linked in. See the
+    // comment on `addRustGlueLib` and blockblaz/zeam#773.
     const cargo_build = switch (prover) {
         .dummy => b.addSystemCommand(&.{
-            "cargo", "+nightly",      "-C", path,          "-Z", "unstable-options",
-            "build", "--release",     "-p", "libp2p-glue", "-p", "hashsig-glue",
-            "-p",    "multisig-glue",
+            "cargo",                   "+nightly",         "-C",                    path,
+            "-Z",                      "unstable-options", "build",                 "--release",
+            "-p",                      "zeam-glue",        "--no-default-features", "--features",
+            "libp2p,hashsig,multisig",
         }),
         .risc0 => b.addSystemCommand(&.{
-            "cargo",      "+nightly",  "-C",            path, "-Z",            "unstable-options",
-            "build",      "--profile", "risc0-release", "-p", "libp2p-glue",   "-p",
-            "risc0-glue", "-p",        "hashsig-glue",  "-p", "multisig-glue",
+            "cargo",         "+nightly",                      "-C",        path,
+            "-Z",            "unstable-options",              "build",     "--profile",
+            "risc0-release", "-p",                            "zeam-glue", "--no-default-features",
+            "--features",    "libp2p,hashsig,multisig,risc0",
         }),
         .openvm => b.addSystemCommand(&.{
-            "cargo",       "+nightly",  "-C",             path, "-Z",            "unstable-options",
-            "build",       "--profile", "openvm-release", "-p", "libp2p-glue",   "-p",
-            "openvm-glue", "-p",        "hashsig-glue",   "-p", "multisig-glue",
+            "cargo",          "+nightly",                       "-C",        path,
+            "-Z",             "unstable-options",               "build",     "--profile",
+            "openvm-release", "-p",                             "zeam-glue", "--no-default-features",
+            "--features",     "libp2p,hashsig,multisig,openvm",
         }),
         .all => b.addSystemCommand(&.{
-            "cargo", "+nightly",  "-C",    path, "-Z", "unstable-options",
-            "build", "--release", "--all",
+            "cargo",                                "+nightly",         "-C",                    path,
+            "-Z",                                   "unstable-options", "build",                 "--release",
+            "-p",                                   "zeam-glue",        "--no-default-features", "--features",
+            "libp2p,hashsig,multisig,risc0,openvm",
         }),
     };
 

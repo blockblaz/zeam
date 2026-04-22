@@ -310,6 +310,13 @@ pub const BeamChain = struct {
 
         // Update current slot metric (wall-clock time slot)
         zeam_metrics.metrics.lean_current_slot.set(slot);
+        // Update sync status metric: labeled gauge, 1 for active state
+        {
+            const sync_status = self.getSyncStatus();
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "idle" }, if (sync_status == .no_peers or sync_status == .fc_initing) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .behind_peers) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "synced" }, if (sync_status == .synced) 1 else 0) catch {};
+        }
 
         var has_proposal = false;
         if (interval == 0) {
@@ -392,6 +399,12 @@ pub const BeamChain = struct {
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
+        // Block building total time timer
+        const block_building_timer = zeam_metrics.lean_block_building_time_seconds.start();
+        errdefer {
+            _ = block_building_timer.observe();
+            zeam_metrics.metrics.lean_block_building_failures_total.incr();
+        }
         // dump the vote tracker, letting this stay here commented for handy debugging activation
         // var iterator = self.forkChoice.attestations.iterator();
         // while (iterator.next()) |entry| {
@@ -423,9 +436,9 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
+        const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
-        _ = building_timer.observe();
+        _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
         var agg_att_cleanup = true;
@@ -526,6 +539,11 @@ pub const BeamChain = struct {
         });
         forkchoice_added = true;
         _ = try self.forkChoice.updateHead();
+
+        // Record block production success metrics
+        _ = block_building_timer.observe();
+        zeam_metrics.metrics.lean_block_building_success_total.incr();
+        zeam_metrics.lean_block_aggregated_payloads.record(@floatFromInt(attestation_signatures.len()));
 
         return .{
             .block = block,
@@ -812,7 +830,7 @@ pub const BeamChain = struct {
 
                 // Validate attestation data before processing (same rules as individual gossip attestations)
                 self.validateAttestationData(signed_aggregation.data, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     switch (err) {
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
                             // Add the missing root to the result so node's onGossip can enqueue it for fetching
@@ -857,7 +875,7 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
-        const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
+        const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 
         const block = signedBlock.block;
 

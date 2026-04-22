@@ -28,4 +28,6 @@ default-features = false
 features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa", "metrics", "quic", "upnp", "ping", "gossipsub"]
 
 [lib]
-crate-type = ["staticlib"]
+# Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
+# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+crate-type = ["rlib"]

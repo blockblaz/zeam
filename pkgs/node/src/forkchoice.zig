@@ -1063,14 +1063,18 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
                 &agg_attestations,
                 &attestation_signatures,
                 &pre_state.validators,
             );
+            _ = compact_timer.observe();
+            zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
+            zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1416,6 +1420,8 @@ pub const ForkChoice = struct {
     /// via two-pass greedy selection. Replaces new_payloads with fresh results.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+        const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = agg_timer.observe();
 
         // Capture counts for metrics update outside lock scope
         var new_payloads_count: usize = 0;
