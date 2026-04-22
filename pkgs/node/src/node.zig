@@ -121,7 +121,7 @@ pub const BeamNode = struct {
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
-            .pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
+            .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -130,7 +130,7 @@ pub const BeamNode = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.pending_parent_roots.deinit();
+        self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
         self.allocator.destroy(self.chain);
@@ -585,7 +585,7 @@ pub const BeamNode = struct {
         // request at the flush point, avoiding 300+ sequential round-trips when a
         // syncing peer walks a long parent chain one block at a time.
         const parent_root = signed_block.block.parent_root;
-        self.pending_parent_roots.put(parent_root, depth) catch {
+        self.batch_pending_parent_roots.put(parent_root, depth) catch {
             // Evict the cached block if we can't enqueue — otherwise it dangles forever.
             _ = self.network.removeFetchedBlock(block_root);
             return CacheBlockError.CachingFailed;
@@ -972,7 +972,7 @@ pub const BeamNode = struct {
     /// Collecting roots here and flushing them in one request reduces that to a single
     /// round-trip for the same burst of missing parents.
     fn flushPendingParentFetches(self: *Self) void {
-        const count = self.pending_parent_roots.count();
+        const count = self.batch_pending_parent_roots.count();
         if (count == 0) return;
 
         var roots = std.ArrayList(types.Root).initCapacity(self.allocator, count) catch {
@@ -982,12 +982,12 @@ pub const BeamNode = struct {
         defer roots.deinit(self.allocator);
 
         var max_depth: u32 = 0;
-        var it = self.pending_parent_roots.iterator();
+        var it = self.batch_pending_parent_roots.iterator();
         while (it.next()) |entry| {
             roots.appendAssumeCapacity(entry.key_ptr.*);
             if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
         }
-        self.pending_parent_roots.clearRetainingCapacity();
+        self.batch_pending_parent_roots.clearRetainingCapacity();
 
         self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
 
