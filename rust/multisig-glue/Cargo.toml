@@ -9,5 +9,7 @@ leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", re
 backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
 
 [lib]
-crate-type = ["staticlib"]
+# Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
+# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+crate-type = ["rlib"]
 name = "multisig_glue"
