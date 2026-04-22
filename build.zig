@@ -314,6 +314,7 @@ pub fn build(b: *Builder) !void {
     zeam_network.addImport("multiaddr", multiaddr_mod);
     zeam_network.addImport("snappyframesz", snappyframesz);
     zeam_network.addImport("snappyz", snappyz);
+    zeam_network.addImport("@zeam/metrics", zeam_metrics);
 
     // add beam node
     const zeam_beam_node = b.addModule("@zeam/node", .{
