@@ -63,7 +63,7 @@ pub const BeamNode = struct {
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
     /// 300+ individual round-trips caused by sequential parent-chain walking.
-    pending_parent_roots: std.AutoHashMap(types.Root, u32),
+    batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
 
     const Self = @This();
 
