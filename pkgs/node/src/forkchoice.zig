@@ -11,6 +11,7 @@ const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
 const params = @import("@zeam/params");
 const keymanager = @import("@zeam/key-manager");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
@@ -261,6 +262,7 @@ pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
+    thread_pool: ?*ThreadPool = null,
 };
 
 // Use shared signature map types from types package
@@ -307,6 +309,8 @@ pub const ForkChoice = struct {
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
+    // Optional shared worker pool used for CPU-heavy attestation compaction.
+    thread_pool: ?*ThreadPool = null,
 
     const Self = @This();
 
@@ -379,6 +383,7 @@ pub const ForkChoice = struct {
             // (slot > 0) start in `initing` and become `ready` once the first real justified
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
+            .thread_pool = opts.thread_pool,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -1068,6 +1073,7 @@ pub const ForkChoice = struct {
                 &agg_attestations,
                 &attestation_signatures,
                 &pre_state.validators,
+                self.thread_pool,
             );
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;

@@ -11,6 +11,7 @@ const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -42,6 +43,9 @@ const NodeOpts = struct {
     is_aggregator: bool = false,
     /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
+    /// When non-null it is shared across all nodes in the same process.
+    thread_pool: ?*ThreadPool = null,
 };
 
 pub const BeamNode = struct {
@@ -79,6 +83,7 @@ pub const BeamNode = struct {
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
+                .thread_pool = opts.thread_pool,
             },
             network.connected_peers,
         );

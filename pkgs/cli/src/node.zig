@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
@@ -131,6 +132,8 @@ pub const Node = struct {
     api_server_handle: ?*api_server.ApiServer,
     metrics_server_handle: ?*metrics_server.MetricsServer,
     anchor_state: *types.BeamState,
+    /// Shared worker pool for CPU-bound chain work (attestation signature verification).
+    thread_pool: *ThreadPool,
 
     const Self = @This();
 
@@ -297,6 +300,16 @@ pub const Node = struct {
             try api.init(allocator);
         }
 
+        const cpu_count = std.Thread.getCpuCount() catch 2;
+        const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
+        const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
+        const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+        self.thread_pool = try ThreadPool.init(.{
+            .allocator = allocator,
+            .thread_count = @intCast(worker_count),
+        });
+        errdefer self.thread_pool.deinit();
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -310,6 +323,7 @@ pub const Node = struct {
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
+            .thread_pool = self.thread_pool,
         });
         errdefer self.beam_node.deinit();
 
@@ -370,6 +384,7 @@ pub const Node = struct {
         }
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
+        self.thread_pool.deinit();
         self.key_manager.deinit();
         self.network.deinit();
         self.enr.deinit();
