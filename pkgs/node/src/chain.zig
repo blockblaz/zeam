@@ -1400,7 +1400,6 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.UnknownHeadBlock;
         };
-        _ = head_block; // Will be used in future validations
 
         // 2. Validate slot relationships
         if (source_block.slot > target_block.slot) {
@@ -1420,6 +1419,15 @@ pub const BeamChain = struct {
             return AttestationValidationError.SourceCheckpointExceedsTarget;
         }
 
+        //    This corresponds to leanSpec's: assert data.head.slot >= data.target.slot
+        if (data.head.slot < data.target.slot) {
+            self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
+                data.head.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.HeadOlderThanTarget;
+        }
+
         // 3. Validate checkpoint slots match block slots
         if (source_block.slot != data.source.slot) {
             self.logger.debug("attestation validation failed: source block slot {d} != source checkpoint slot {d}", .{
@@ -1436,6 +1444,15 @@ pub const BeamChain = struct {
                 data.target.slot,
             });
             return AttestationValidationError.TargetCheckpointSlotMismatch;
+        }
+
+        //    This corresponds to leanSpec's: assert head_block.slot == attestation.head.slot
+        if (head_block.slot != data.head.slot) {
+            self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
+                head_block.slot,
+                data.head.slot,
+            });
+            return AttestationValidationError.HeadCheckpointSlotMismatch;
         }
 
         // 4. Validate attestation is not too far in the future
@@ -1734,6 +1751,8 @@ const AttestationValidationError = error{
     SourceCheckpointExceedsTarget,
     SourceCheckpointSlotMismatch,
     TargetCheckpointSlotMismatch,
+    HeadCheckpointSlotMismatch,
+    HeadOlderThanTarget,
     AttestationTooFarInFuture,
 };
 pub const BlockValidationError = error{
