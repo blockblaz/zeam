@@ -1496,14 +1496,6 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate attestation data (same rules as individual gossip attestations).
-        // The earlier revision of this function skipped re-validation because the
-        // source block could vanish from proto-array when finalization advanced
-        // between publish and receipt. That race is now handled at the root —
-        // processFinalizationAdvancement gates the rebase call on
-        // PRUNE_NODE_THRESHOLD, keeping the source / target / head blocks
-        // addressable for the full grace window — so the stricter check is
-        // safe again.
         try self.validateAttestationData(signedAggregation.data, false);
 
         try self.verifyAggregatedAttestation(signedAggregation);
