@@ -26,7 +26,8 @@ use delay_map::HashMapDelay;
 use futures::future::poll_fn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use crate::req_resp::{
     configurations::REQUEST_TIMEOUT,
@@ -54,6 +55,17 @@ static mut ZIG_HANDLER0: Option<u64> = None;
 static mut ZIG_HANDLER1: Option<u64> = None;
 #[allow(static_mut_refs)]
 static mut ZIG_HANDLER2: Option<u64> = None;
+
+// Per-network shutdown signal. The event loop polls a `.notified()` future on
+// the matching slot; `stop_network` calls `notify_one` to wake it. `notify_one`
+// stores a permit if no waiter is parked yet, so a `stop_network` call that
+// races the first `.notified().await` is not lost.
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY0: Option<Arc<Notify>> = None;
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY1: Option<Arc<Notify>> = None;
+#[allow(static_mut_refs)]
+static mut SHUTDOWN_NOTIFY2: Option<Arc<Notify>> = None;
 
 /// Get a mutable reference to the swarm for the given network id.
 ///
@@ -108,6 +120,81 @@ unsafe fn get_zig_handler(network_id: u32) -> Option<u64> {
     }
 }
 
+/// Install a fresh shutdown signal for the given network and return a handle
+/// to it. Called by the event loop owner so a subsequent `stop_network` call
+/// has somewhere to post its wake-up permit.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing the same slot.
+#[allow(static_mut_refs)]
+unsafe fn install_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+    let notify = Arc::new(Notify::new());
+    match network_id {
+        0 => SHUTDOWN_NOTIFY0 = Some(notify.clone()),
+        1 => SHUTDOWN_NOTIFY1 = Some(notify.clone()),
+        2 => SHUTDOWN_NOTIFY2 = Some(notify.clone()),
+        _ => return None,
+    }
+    Some(notify)
+}
+
+/// Get a handle to the shutdown signal for the given network, if one is
+/// installed.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently writing to the same slot.
+#[allow(static_mut_refs)]
+unsafe fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+    match network_id {
+        0 => SHUTDOWN_NOTIFY0.clone(),
+        1 => SHUTDOWN_NOTIFY1.clone(),
+        2 => SHUTDOWN_NOTIFY2.clone(),
+        _ => None,
+    }
+}
+
+/// Tear down per-network state after the event loop has exited. Drops the
+/// swarm (closing sockets), clears the Zig handler pointer so any in-flight
+/// attempts to dispatch into Zig become no-ops, and releases the shutdown
+/// notify.
+///
+/// # Safety
+/// The caller must ensure no other thread is concurrently accessing these slots.
+unsafe fn clear_network_state(network_id: u32) {
+    match network_id {
+        0 => {
+            SWARM_STATE = None;
+            ZIG_HANDLER0 = None;
+            SHUTDOWN_NOTIFY0 = None;
+        }
+        1 => {
+            SWARM_STATE1 = None;
+            ZIG_HANDLER1 = None;
+            SHUTDOWN_NOTIFY1 = None;
+        }
+        2 => {
+            SWARM_STATE2 = None;
+            ZIG_HANDLER2 = None;
+            SHUTDOWN_NOTIFY2 = None;
+        }
+        _ => {}
+    }
+
+    // Clear the ready flag so a post-stop `wait_for_network_ready` does not
+    // return a stale `true` left over from the previous session. Wake any
+    // current waiters so they re-check the (now-false) flag and return
+    // `false` on the next deadline instead of parking indefinitely.
+    let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
+    match network_id {
+        0 => ready.0 = false,
+        1 => ready.1 = false,
+        2 => ready.2 = false,
+        _ => {}
+    }
+    drop(ready);
+    NETWORK_READY_CONDVAR.notify_all();
+}
+
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
@@ -135,6 +222,28 @@ struct PendingResponse {
     protocol: ProtocolId,
 }
 
+/// Signal the event loop for `network_id` to exit.
+///
+/// Posts a shutdown notification on the per-network `Notify`. The event loop's
+/// shutdown arm wakes up, breaks out of the select loop, clears the per-network
+/// static state (swarm, handler, notify), and returns from `run_eventloop`,
+/// which in turn lets `create_and_run_network` return and the hosting OS
+/// thread exit. After calling this, the Zig side is expected to `join` the
+/// rust-bridge thread.
+///
+/// Idempotent: a `stop_network` call for a network that was never started,
+/// or that has already been torn down, is a no-op.
+///
+/// # Safety
+///
+/// This function is thread-safe and can be called from any thread.
+#[no_mangle]
+pub unsafe extern "C" fn stop_network(network_id: u32) {
+    if let Some(notify) = get_shutdown_notify(network_id) {
+        notify.notify_one();
+    }
+}
+
 /// Wait for a network to be fully initialized and ready to accept messages.
 /// Returns true if the network is ready, false on timeout.
 ///
@@ -142,7 +251,7 @@ struct PendingResponse {
 ///
 /// This function is thread-safe and can be called from any thread.
 #[no_mangle]
-pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
+pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = std::time::Instant::now() + timeout;
 
@@ -174,30 +283,87 @@ pub unsafe fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
     }
 }
 
+/// C-ABI parameters for [`create_and_run_network`].
+///
+/// `network_id` is followed by explicit padding so `zig_handler` is 8-byte aligned, matching Zig `extern struct`.
+#[repr(C)]
+pub struct CreateNetworkParams {
+    pub network_id: u32,
+    pub _padding: u32,
+    pub zig_handler: u64,
+    pub local_private_key: *const c_char,
+    pub listen_addresses: *const c_char,
+    pub connect_addresses: *const c_char,
+    pub topics_str: *const c_char,
+}
+
 /// # Safety
 ///
-/// The caller must ensure that `listen_addresses` and `connect_addresses` point to valid null-terminated C strings.
+/// `params` must be non-null and valid until this function returns. String pointers must point to valid
+/// null-terminated C strings for `listen_addresses`, `connect_addresses`, `topics_str`, and `local_private_key`.
 #[no_mangle]
-pub unsafe fn create_and_run_network(
-    network_id: u32,
-    zig_handler: u64,
-    local_private_key: *const c_char,
-    listen_addresses: *const c_char,
-    connect_addresses: *const c_char,
-    topics_str: *const c_char,
-) {
-    let listen_multiaddrs = CStr::from_ptr(listen_addresses)
-        .to_string_lossy()
-        .split(",")
-        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
-        .collect::<Vec<_>>();
+pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkParams) {
+    if params.is_null() {
+        return;
+    }
+    let p = &*params;
+    let network_id = p.network_id;
+    let zig_handler = p.zig_handler;
+    let local_private_key = p.local_private_key;
+    let listen_addresses = p.listen_addresses;
+    let connect_addresses = p.connect_addresses;
+    let topics_str = p.topics_str;
 
-    let connect_multiaddrs = CStr::from_ptr(connect_addresses)
-        .to_string_lossy()
+    // Register the handler early so any logs emitted from the parse/validation
+    // path below are routed through the Zig logger.
+    set_zig_handler(network_id, zig_handler);
+
+    // Release the Zig-allocated parameter strings on every exit path from here on,
+    // including parse failures, so the Zig side never leaks the buffers it handed us.
+    let release_params = || {
+        releaseStartNetworkParams(
+            zig_handler,
+            local_private_key,
+            listen_addresses,
+            connect_addresses,
+            topics_str,
+        );
+    };
+
+    let listen_str = CStr::from_ptr(listen_addresses).to_string_lossy();
+    let listen_multiaddrs: Vec<Multiaddr> = match listen_str
         .split(",")
-        .filter(|s| !s.trim().is_empty()) // filter out empty strings because connect_addresses can be empty
-        .map(|addr| addr.parse::<Multiaddr>().expect("Invalid multiaddress"))
-        .collect::<Vec<_>>();
+        .map(|addr| addr.parse::<Multiaddr>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid listen multiaddress in \"{}\": {}", listen_str, e),
+            );
+            release_params();
+            return;
+        }
+    };
+
+    let connect_str = CStr::from_ptr(connect_addresses).to_string_lossy();
+    let connect_multiaddrs: Vec<Multiaddr> = match connect_str
+        .split(",")
+        .filter(|s| !s.trim().is_empty()) // connect_addresses can be empty
+        .map(|addr| addr.parse::<Multiaddr>())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid connect multiaddress in \"{}\": {}", connect_str, e),
+            );
+            release_params();
+            return;
+        }
+    };
 
     let topics = CStr::from_ptr(topics_str)
         .to_string_lossy()
@@ -214,24 +380,32 @@ pub unsafe fn create_and_run_network(
         .strip_prefix("0x")
         .unwrap_or(&local_private_key_hex);
 
-    let mut private_key_bytes =
-        hex::decode(private_key_hex).expect("Invalid hex string for private key");
+    let mut private_key_bytes = match hex::decode(private_key_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid hex string for private key: {}", e),
+            );
+            release_params();
+            return;
+        }
+    };
 
-    let local_key_pair = Keypair::from(secp256k1::Keypair::from(
-        secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes)
-            .expect("Invalid private key bytes"),
-    ));
+    let secret_key = match secp256k1::SecretKey::try_from_bytes(&mut private_key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            logger::rustLogger.error(
+                network_id,
+                &format!("invalid secp256k1 private key bytes: {}", e),
+            );
+            release_params();
+            return;
+        }
+    };
+    let local_key_pair = Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    // Store zig_handler for this network id for use by free functions
-    set_zig_handler(network_id, zig_handler);
-
-    releaseStartNetworkParams(
-        zig_handler,
-        local_private_key,
-        listen_addresses,
-        connect_addresses,
-        topics_str,
-    );
+    release_params();
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -255,7 +429,7 @@ pub unsafe fn create_and_run_network(
 /// The caller must ensure that `topic` points to valid null-terminated C string.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe fn publish_msg_to_rust_bridge(
+pub unsafe extern "C" fn publish_msg_to_rust_bridge(
     network_id: u32,
     topic: *const c_char,
     message_str: *const u8,
@@ -307,7 +481,7 @@ pub unsafe fn publish_msg_to_rust_bridge(
 /// The caller must ensure that `peer_id` points to a valid null-terminated C string.
 /// The caller must ensure that `request_data` points to valid memory of `request_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_request(
+pub unsafe extern "C" fn send_rpc_request(
     network_id: u32,
     peer_id: *const c_char,
     protocol_tag: u32,
@@ -382,7 +556,7 @@ pub unsafe fn send_rpc_request(
 /// # Safety
 /// The caller must ensure that `response_data` points to valid memory of `response_len` bytes.
 #[no_mangle]
-pub unsafe fn send_rpc_response_chunk(
+pub unsafe extern "C" fn send_rpc_response_chunk(
     network_id: u32,
     channel_id: u64,
     response_data: *const u8,
@@ -438,7 +612,7 @@ pub unsafe fn send_rpc_response_chunk(
 /// # Safety
 /// The caller must ensure the channel id is valid for a pending response.
 #[no_mangle]
-pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
+pub unsafe extern "C" fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
     let channel = {
         let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
         response_map.remove(&channel_id)
@@ -479,7 +653,7 @@ pub unsafe fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
 /// # Safety
 /// The caller must ensure `message_ptr` points to a valid null-terminated C string.
 #[no_mangle]
-pub unsafe fn send_rpc_error_response(
+pub unsafe extern "C" fn send_rpc_error_response(
     network_id: u32,
     channel_id: u64,
     message_ptr: *const c_char,
@@ -829,8 +1003,24 @@ impl Network {
         let swarm = unsafe { get_swarm_mut(self.network_id) }
             .expect("run_eventloop called before start_network stored the swarm");
 
-        loop {
+        // Install the shutdown signal before entering the loop so `stop_network`
+        // calls issued between here and the first `.notified().await` land on
+        // this slot. `notify_one` stores a permit if no waiter is parked yet,
+        // so the first iteration's shutdown arm will see the permit and break.
+        let shutdown = unsafe { install_shutdown_notify(self.network_id) }
+            .expect("unsupported network_id for shutdown signal");
+
+        'eventloop: loop {
             tokio::select! {
+            biased;
+
+            _ = shutdown.notified() => {
+                logger::rustLogger.info(
+                    self.network_id,
+                    "stop_network signaled; exiting libp2p event loop",
+                );
+                break 'eventloop;
+            }
 
             Some(timeout_result) = poll_fn(|cx| {
                 let mut map = REQUEST_ID_MAP.lock().unwrap();
@@ -1379,6 +1569,11 @@ impl Network {
                 }
             }
         }
+
+        // Clean up per-network state so any later `stop_network`/`start_network`
+        // calls start from a blank slate and any in-flight dispatchers into Zig
+        // see an absent handler rather than a pointer to a freed EthLibp2p.
+        unsafe { clear_network_state(self.network_id) };
     }
 }
 

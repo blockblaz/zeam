@@ -238,6 +238,26 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
                 );
             }
 
+            /// Same as `putBlock` but stores already-serialized SSZ (must match `types.SignedBlock` encoding).
+            pub fn putBlockSerialized(
+                self: *WriteBatch,
+                comptime cn: ColumnNamespace,
+                block_root: types.Root,
+                serialized_block: []const u8,
+            ) void {
+                const key = interface.formatBlockKey(self.allocator, &block_root) catch |err| {
+                    self.logger.err("failed to format block key for putBlockSerialized: {any}", .{err});
+                    return;
+                };
+                defer self.allocator.free(key);
+
+                self.put(cn, key, serialized_block);
+                self.logger.debug("added pre-serialized block to batch: root=0x{x} len={d}", .{
+                    &block_root,
+                    serialized_block.len,
+                });
+            }
+
             /// Put a state to this write batch
             pub fn putState(
                 self: *WriteBatch,

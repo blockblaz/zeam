@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "fd8814045deb0ef8fcad4c9f4b1250ee33f7dd01" }
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "fd8814045deb0ef8fcad4c9f4b1250ee33f7dd01" }
-backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "fd8814045deb0ef8fcad4c9f4b1250ee33f7dd01" }
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
+backend = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "2eb4b9d983171139af36749f127dd9890c9109e6" }
 
 [lib]
-crate-type = ["staticlib"]
+# Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
+# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+crate-type = ["rlib"]
 name = "multisig_glue"

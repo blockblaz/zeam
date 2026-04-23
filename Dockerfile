@@ -80,10 +80,15 @@ COPY .git/refs .git/refs
 
 # Get git commit hash and build the project with optimizations
 # Use cache mount for Zig build cache as well
-# Set RUSTFLAGS for ARM64 to use generic CPU (QEMU-compatible)
+# CPU targeting per architecture:
+#   amd64: x86-64-v3 (AVX2, no AVX512) — portable across modern x86_64 servers
+#   arm64: generic CPU — QEMU-compatible when cross-building
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/zig \
-    if [ "$TARGETARCH" = "arm64" ]; then \
+    EXTRA_ZIG_FLAGS="" && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        EXTRA_ZIG_FLAGS="-Dcpu=x86_64_v3 -Drust-target-cpu=x86-64-v3"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
         export RUSTFLAGS="-C target-cpu=generic"; \
     fi && \
     GIT_VERSION=$(cat .git/HEAD | grep -o '[0-9a-f]\{40\}' || echo "unknown") && \
@@ -93,7 +98,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION"
+    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
 
 # rec_aggregation's compilation.rs reads .py source files at runtime to verify
 # a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at compile time).

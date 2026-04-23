@@ -1068,6 +1068,7 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
                 &agg_attestations,
@@ -1075,8 +1076,11 @@ pub const ForkChoice = struct {
                 &pre_state.validators,
                 self.thread_pool,
             );
+            _ = compact_timer.observe();
+            zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
+            zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1422,6 +1426,8 @@ pub const ForkChoice = struct {
     /// via two-pass greedy selection. Replaces new_payloads with fresh results.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+        const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = agg_timer.observe();
 
         // Capture counts for metrics update outside lock scope
         var new_payloads_count: usize = 0;
@@ -1938,12 +1944,14 @@ test "forkchoice block tree" {
 
     // Create chain config from mock chain genesis
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2010,13 +2018,16 @@ test "aggregate prunes attestation signatures" {
     defer mock_chain.genesis_state.justifications_validators.deinit();
 
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2161,13 +2172,16 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
     defer mock_chain.deinit(allocator);
 
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2530,14 +2544,17 @@ fn deinitAggregatedPayloadsMap(allocator: Allocator, map: *AggregatedPayloadsMap
 fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct {
     fork_choice: ForkChoice,
     spec_name: []u8,
+    fork_digest: []u8,
 } {
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },
@@ -2590,6 +2607,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
     return .{
         .fork_choice = fork_choice,
         .spec_name = spec_name,
+        .fork_digest = fork_digest,
     };
 }
 
@@ -2599,6 +2617,7 @@ const RebaseTestContext = struct {
     mock_chain: stf.MockChainData,
     fork_choice: ForkChoice,
     spec_name: []u8,
+    fork_digest: []u8,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, num_validators: usize) !RebaseTestContext {
@@ -2612,6 +2631,7 @@ const RebaseTestContext = struct {
 
         var test_data = try buildTestTreeWithMockChain(allocator, &mock_chain);
         errdefer allocator.free(test_data.spec_name);
+        errdefer allocator.free(test_data.fork_digest);
         errdefer test_data.fork_choice.protoArray.nodes.deinit(test_data.fork_choice.allocator);
         errdefer test_data.fork_choice.protoArray.indices.deinit();
         errdefer test_data.fork_choice.attestations.deinit();
@@ -2624,6 +2644,7 @@ const RebaseTestContext = struct {
             .mock_chain = mock_chain,
             .fork_choice = test_data.fork_choice,
             .spec_name = test_data.spec_name,
+            .fork_digest = test_data.fork_digest,
             .allocator = allocator,
         };
     }
@@ -2654,6 +2675,7 @@ const RebaseTestContext = struct {
         }
         self.fork_choice.latest_new_aggregated_payloads.deinit();
         self.allocator.free(self.spec_name);
+        self.allocator.free(self.fork_digest);
 
         // Cleanup mock_chain genesis_state components
         self.mock_chain.genesis_state.validators.deinit();
@@ -3513,13 +3535,16 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
     defer mock_chain.genesis_state.justifications_validators.deinit();
 
     const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
     defer allocator.free(spec_name);
+    defer allocator.free(fork_digest);
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
         .genesis = mock_chain.genesis_config,
         .spec = .{
             .preset = params.Preset.mainnet,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },

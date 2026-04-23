@@ -60,6 +60,14 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Serializes BeamNode work between the libxev main thread (onInterval) and
+    /// the libp2p worker thread (onGossip / onReqRespResponse / onReqRespRequest).
+    mutex: std.Thread.Mutex = .{},
+    /// Pending parent roots deferred for batched fetching.
+    /// Maps block root → fetch depth. Collected during gossip/RPC processing
+    /// and flushed as a single batched blocks_by_root request, avoiding the
+    /// 300+ individual round-trips caused by sequential parent-chain walking.
+    batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
 
     const Self = @This();
 
@@ -118,6 +126,7 @@ pub const BeamNode = struct {
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
+            .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -126,6 +135,7 @@ pub const BeamNode = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
         self.allocator.destroy(self.chain);
@@ -133,6 +143,9 @@ pub const BeamNode = struct {
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         switch (data.*) {
             .block => |signed_block| {
@@ -156,6 +169,7 @@ pub const BeamNode = struct {
                     self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
                     return;
                 };
+
                 _ = self.network.removePendingBlockRoot(block_root);
 
                 if (!hasParentBlock) {
@@ -187,6 +201,8 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    // Flush any pending parent root fetches accumulated during caching.
+                    self.flushPendingParentFetches();
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
@@ -344,6 +360,9 @@ pub const BeamNode = struct {
                 );
             };
         }
+
+        // Flush any parent roots accumulated during block/descendant processing.
+        self.flushPendingParentFetches();
     }
 
     fn pruneCachedBlocksCallback(ptr: *anyopaque, finalized: types.Checkpoint) usize {
@@ -417,7 +436,8 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                const missing_roots = self.chain.onBlock(cached_block.*, .{}) catch |err| {
+                const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
+                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
                         self.logger.debug(
@@ -507,7 +527,6 @@ pub const BeamNode = struct {
         AllocationFailed,
         CloneFailed,
         CachingFailed,
-        FetchFailed,
     };
 
     /// Cache a block and fetch its parent. Common logic used by both gossip and req-resp handlers.
@@ -566,13 +585,15 @@ pub const BeamNode = struct {
         // Ownership transferred to the network cache — disable errdefers
         block_owned = false;
 
-        // Fetch the parent block
+        // Enqueue the parent root for batched fetching rather than firing an individual
+        // request immediately. All accumulated roots are sent as one blocks_by_root
+        // request at the flush point, avoiding 300+ sequential round-trips when a
+        // syncing peer walks a long parent chain one block at a time.
         const parent_root = signed_block.block.parent_root;
-        const roots = [_]types.Root{parent_root};
-        self.fetchBlockByRoots(&roots, depth) catch {
-            // Parent fetch failed - drop the cached block so we don't keep dangling entries.
+        self.batch_pending_parent_roots.put(parent_root, depth) catch {
+            // Evict the cached block if we can't enqueue — otherwise it dangles forever.
             _ = self.network.removeFetchedBlock(block_root);
-            return CacheBlockError.FetchFailed;
+            return CacheBlockError.CachingFailed;
         };
 
         return parent_root;
@@ -609,15 +630,27 @@ pub const BeamNode = struct {
         var block_owned = true;
         errdefer if (block_owned) self.allocator.destroy(block_ptr);
 
-        types.sszClone(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
+        // Clone the block and capture its SSZ bytes in one pass.
+        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
+        // then deserializes into the clone. The returned bytes are stored alongside the cached
+        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
+        // observed to cause memory corruption on the next cached block's processing.
+        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
             return CacheBlockError.CloneFailed;
         };
         errdefer if (block_owned) block_ptr.deinit();
+        errdefer self.allocator.free(ssz_bytes);
 
         self.network.cacheFetchedBlock(block_root, block_ptr) catch {
             return CacheBlockError.CachingFailed;
         };
         block_owned = false;
+
+        // Store the SSZ bytes after caching; ignore store failure (block is already cached,
+        // onBlock will fall back to fresh serialization if bytes are unavailable).
+        self.network.storeFetchedBlockSsz(block_root, ssz_bytes) catch {
+            self.allocator.free(ssz_bytes);
+        };
     }
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
@@ -687,6 +720,7 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    self.flushPendingParentFetches();
                     return;
                 }
 
@@ -732,6 +766,11 @@ pub const BeamNode = struct {
         } else |err| {
             self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
+
+        // Flush any parent roots queued during this RPC block's processing. When a syncing peer
+        // walks a long parent chain one block at a time, each response triggers one more parent
+        // fetch. Batching them here consolidates concurrent parent requests into one round-trip.
+        self.flushPendingParentFetches();
     }
 
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
@@ -869,6 +908,8 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.handleReqRespResponse(event);
     }
 
@@ -884,6 +925,9 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
@@ -922,6 +966,38 @@ pub const BeamNode = struct {
         return .{
             .ptr = self,
             .onReqRespRequestCb = onReqRespRequest,
+        };
+    }
+
+    /// Send all accumulated pending parent roots as a single batched blocks_by_root request.
+    ///
+    /// Multiple gossip blocks or RPC responses received close together may each need a
+    /// different parent block fetched. Without batching, each one opens its own libp2p
+    /// stream, causing 300+ sequential round-trips when a peer walks a long parent chain.
+    /// Collecting roots here and flushing them in one request reduces that to a single
+    /// round-trip for the same burst of missing parents.
+    fn flushPendingParentFetches(self: *Self) void {
+        const count = self.batch_pending_parent_roots.count();
+        if (count == 0) return;
+
+        var roots = std.ArrayList(types.Root).initCapacity(self.allocator, count) catch {
+            self.logger.warn("failed to allocate roots list for pending parent fetch flush", .{});
+            return;
+        };
+        defer roots.deinit(self.allocator);
+
+        var max_depth: u32 = 0;
+        var it = self.batch_pending_parent_roots.iterator();
+        while (it.next()) |entry| {
+            roots.appendAssumeCapacity(entry.key_ptr.*);
+            if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
+        }
+        self.batch_pending_parent_roots.clearRetainingCapacity();
+
+        self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
+
+        self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
+            self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
         };
     }
 
@@ -973,6 +1049,15 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Extract client type prefix from a node name like "zeam_0" -> "zeam", fallback "unknown".
+    fn clientTypeFromName(name: ?[]const u8) []const u8 {
+        const n = name orelse return "unknown";
+        if (std.mem.indexOfScalar(u8, n, '_')) |sep| {
+            if (sep > 0) return n[0..sep];
+        }
+        return if (n.len > 0) n else "unknown";
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -987,7 +1072,9 @@ pub const BeamNode = struct {
 
         // Record metrics
         zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
-        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+        const client_name = node_name.name orelse "unknown";
+        const client_type = clientTypeFromName(node_name.name);
+        zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 1) catch {};
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -1013,10 +1100,12 @@ pub const BeamNode = struct {
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+
         if (self.network.disconnectPeer(peer_id)) {
             self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
-                self.node_registry.getNodeNameFromPeerId(peer_id),
+                node_name,
                 @tagName(direction),
                 @tagName(reason),
                 self.network.getPeerCount(),
@@ -1024,7 +1113,9 @@ pub const BeamNode = struct {
 
             // Record metrics
             zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
-            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+            const client_name = node_name.name orelse "unknown";
+            const client_type = clientTypeFromName(node_name.name);
+            zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
     }
 
@@ -1092,30 +1183,37 @@ pub const BeamNode = struct {
         var current_interval: isize = start_interval;
         while (current_interval <= itime_intervals) : (current_interval += 1) {
             const interval: usize = @intCast(current_interval);
-            self.chain.onInterval(interval) catch |e| {
-                self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-                // no point going further if chain is not ticked properly
-                return e;
-            };
+            const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
-            // Replay blocks that were queued waiting for the forkchoice clock to advance,
-            // then fetch any attestation head roots that were missing during replay.
-            const pending_missing_roots = self.chain.processPendingBlocks();
-            defer self.allocator.free(pending_missing_roots);
-            if (pending_missing_roots.len > 0) {
-                self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                    self.logger.warn(
-                        "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                        .{ pending_missing_roots.len, err },
-                    );
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                self.chain.onInterval(interval) catch |e| {
+                    self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
+                    // no point going further if chain is not ticked properly
+                    return e;
                 };
+
+                // Replay blocks that were queued waiting for the forkchoice clock to advance,
+                // then fetch any attestation head roots that were missing during replay.
+                const pending_missing_roots = self.chain.processPendingBlocks();
+                defer self.allocator.free(pending_missing_roots);
+                if (pending_missing_roots.len > 0) {
+                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
+                        self.logger.warn(
+                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
+                            .{ pending_missing_roots.len, err },
+                        );
+                    };
+                }
+
+                // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
+                self.sweepTimedOutRequests();
+
+                self.processReadyCachedBlocks(slot);
             }
 
-            // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
-            self.sweepTimedOutRequests();
-
-            const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
-            self.processReadyCachedBlocks(slot);
             if (self.validator) |*validator| {
                 // we also tick validator per interval in case it would
                 // need to sync its future duties when its an independent validator
@@ -1371,8 +1469,15 @@ pub const BeamNode = struct {
             defer seen_subnets.deinit();
 
             // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
-            // validators
-            if (self.chain.is_aggregator_enabled) {
+            // validators.
+            //
+            // Note: this subscription decision is only taken once at startup,
+            // using the initial aggregator flag. Toggling the role at runtime
+            // via the admin API does not add or remove gossip subscriptions;
+            // a node that wants to serve as a hot-standby aggregator should
+            // start with `--is-aggregator true` and turn the role off via the
+            // API until it's needed.
+            if (self.chain.isAggregator()) {
                 if (self.aggregation_subnet_ids) |explicit_subnets| {
                     for (explicit_subnets) |subnet_id| {
                         if (seen_subnets.contains(subnet_id)) continue;
@@ -1394,12 +1499,12 @@ pub const BeamNode = struct {
 
             // If no subnets were added yet (aggregator but no explicit ids and no
             // validators registered), fall back to subnet 0 to keep parity with leanSpec.
-            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
+            if (seen_subnets.count() == 0 and self.chain.isAggregator()) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
         // if no committee count specified and still aggregator, all are in subnet 0
-        else if (self.chain.is_aggregator_enabled) {
+        else if (self.chain.isAggregator()) {
             try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
         }
 
@@ -1468,6 +1573,8 @@ test "Node peer tracking on connect/disconnect" {
 
     const spec_name = try allocator.dupe(u8, "zeamdev");
     defer allocator.free(spec_name);
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    defer allocator.free(fork_digest);
 
     const chain_config = configs.ChainConfig{
         .id = configs.Chain.custom,
@@ -1475,6 +1582,7 @@ test "Node peer tracking on connect/disconnect" {
         .spec = .{
             .preset = params.Preset.minimal,
             .name = spec_name,
+            .fork_digest = fork_digest,
             .attestation_committee_count = 1,
             .max_attestations_data = 16,
         },

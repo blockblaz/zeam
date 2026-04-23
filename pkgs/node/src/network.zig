@@ -57,6 +57,8 @@ pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPCEntry);
 pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
 // key: block root, value: pointer to block
 pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlock);
+// key: block root, value: pre-serialized SSZ bytes (captured at cache time)
+pub const FetchedBlockSszMap = std.AutoHashMap(types.Root, []u8);
 // key: parent root, value: list of child roots (for O(1) child lookup)
 pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayList(types.Root));
 
@@ -72,6 +74,7 @@ pub const Network = struct {
     pending_rpc_requests: PendingRPCMap,
     pending_block_roots: PendingBlockRootMap,
     fetched_blocks: FetchedBlockMap,
+    fetched_block_ssz: FetchedBlockSszMap,
     fetched_block_children: ChildrenMap,
     timed_out_requests: std.ArrayList(u64),
 
@@ -93,6 +96,9 @@ pub const Network = struct {
         var fetched_blocks = FetchedBlockMap.init(allocator);
         errdefer fetched_blocks.deinit();
 
+        var fetched_block_ssz = FetchedBlockSszMap.init(allocator);
+        errdefer fetched_block_ssz.deinit();
+
         var fetched_block_children = ChildrenMap.init(allocator);
         errdefer fetched_block_children.deinit();
 
@@ -103,6 +109,7 @@ pub const Network = struct {
             .pending_rpc_requests = pending_rpc_requests,
             .pending_block_roots = pending_block_roots,
             .fetched_blocks = fetched_blocks,
+            .fetched_block_ssz = fetched_block_ssz,
             .fetched_block_children = fetched_block_children,
             .timed_out_requests = .empty,
         };
@@ -126,6 +133,12 @@ pub const Network = struct {
             self.allocator.destroy(block_ptr);
         }
         self.fetched_blocks.deinit();
+
+        var ssz_it = self.fetched_block_ssz.iterator();
+        while (ssz_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.fetched_block_ssz.deinit();
 
         var children_it = self.fetched_block_children.iterator();
         while (children_it.next()) |entry| {
@@ -332,7 +345,26 @@ pub const Network = struct {
         try gop.value_ptr.append(self.allocator, root);
     }
 
+    /// Returns the pre-serialized SSZ bytes for a cached block, if stored.
+    pub fn getFetchedBlockSsz(self: *Self, root: types.Root) ?[]const u8 {
+        return self.fetched_block_ssz.get(root);
+    }
+
+    /// Store pre-serialized SSZ bytes alongside a cached block.
+    /// Caller transfers ownership of `ssz_bytes` to the map.
+    pub fn storeFetchedBlockSsz(self: *Self, root: types.Root, ssz_bytes: []u8) !void {
+        const gop = try self.fetched_block_ssz.getOrPut(root);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = ssz_bytes;
+    }
+
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
+        if (self.fetched_block_ssz.fetchRemove(root)) |ssz_entry| {
+            self.allocator.free(ssz_entry.value);
+        }
+
         if (self.fetched_blocks.fetchRemove(root)) |entry| {
             var block_ptr = entry.value;
 

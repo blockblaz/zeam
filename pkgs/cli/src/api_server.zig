@@ -9,6 +9,11 @@ const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const ModuleLogger = utils_lib.ModuleLogger;
 const node_lib = @import("@zeam/node");
 const BeamChain = node_lib.BeamChain;
+const zeam_metrics = @import("@zeam/metrics");
+
+// Max bytes accepted for an admin POST body. The only body we currently
+// parse is `{"enabled": true|false}`, which is well under this limit.
+const ADMIN_BODY_MAX_BYTES: usize = 1024;
 
 const QUERY_SLOTS_PREFIX = "?slots=";
 const DEFAULT_MAX_SLOTS: usize = 50;
@@ -144,6 +149,11 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
                 ctx.logger.warn("failed to handle fork choice request: {}", .{err});
                 _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
             };
+        } else if (std.mem.eql(u8, request.head.target, "/lean/v0/admin/aggregator")) {
+            ctx.handleAggregatorAdmin(&request, request_allocator) catch |err| {
+                ctx.logger.warn("failed to handle aggregator admin request: {}", .{err});
+                _ = request.respond("Internal Server Error\n", .{ .status = .internal_server_error }) catch {};
+            };
         } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
             const chain = ctx.getChain() orelse {
                 _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
@@ -243,7 +253,7 @@ pub const ApiServer = struct {
 
     /// Handle health check endpoint
     fn handleHealth(_: *const Self, request: *std.http.Server.Request) void {
-        const response = "{\"status\":\"healthy\",\"service\":\"zeam-api\"}";
+        const response = "{\"status\":\"healthy\",\"service\":\"lean-rpc-api\"}";
         _ = request.respond(response, .{
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json; charset=utf-8" },
@@ -357,6 +367,137 @@ pub const ApiServer = struct {
             self.logger.warn("failed to respond with fork choice: {}", .{err});
             return err;
         };
+    }
+
+    /// Handle aggregator role admin endpoint at /lean/v0/admin/aggregator.
+    ///
+    /// GET returns `{"is_aggregator": <bool>}` with the node's current role.
+    ///
+    /// POST expects `{"enabled": <bool>}` and returns
+    /// `{"is_aggregator": <new>, "previous": <old>}`. The flag is flipped
+    /// atomically on the chain; the gossip import path and the tick-driven
+    /// aggregator path pick up the new value on their next read.
+    ///
+    /// Scope matches leanEthereum/leanSpec#636: this toggle does not change
+    /// gossip subnet subscriptions (those are decided once at startup) and
+    /// is not persisted across restarts. Use the CLI `--is-aggregator` flag
+    /// to seed the value on each start.
+    fn handleAggregatorAdmin(self: *const Self, request: *std.http.Server.Request, allocator: std.mem.Allocator) !void {
+        const chain = self.getChain() orelse {
+            _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
+            return;
+        };
+
+        switch (request.head.method) {
+            .GET => {
+                var buf: [64]u8 = undefined;
+                const body = try std.fmt.bufPrint(&buf, "{{\"is_aggregator\":{s}}}", .{boolToJson(chain.isAggregator())});
+                _ = request.respond(body, .{
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+                    },
+                }) catch {};
+            },
+            .POST => try self.handleAggregatorPost(request, allocator, chain),
+            else => {
+                _ = request.respond("Method Not Allowed\n", .{
+                    .status = .method_not_allowed,
+                    .extra_headers = &.{
+                        .{ .name = "allow", .value = "GET, POST" },
+                    },
+                }) catch {};
+            },
+        }
+    }
+
+    fn handleAggregatorPost(
+        self: *const Self,
+        request: *std.http.Server.Request,
+        allocator: std.mem.Allocator,
+        chain: *BeamChain,
+    ) !void {
+        // Require a content-length header and bound it; admin toggle bodies
+        // are tiny (roughly `{"enabled":false}` = 17 bytes). Reading past the
+        // declared length trips a state-machine assertion in std.http once
+        // the reader has transitioned to `.ready`.
+        const content_length = request.head.content_length orelse {
+            _ = request.respond("Bad Request: content-length required\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+        if (content_length == 0) {
+            _ = request.respond("Bad Request: missing body\n", .{ .status = .bad_request }) catch {};
+            return;
+        }
+        if (content_length > ADMIN_BODY_MAX_BYTES) {
+            _ = request.respond("Payload Too Large\n", .{ .status = .payload_too_large }) catch {};
+            return;
+        }
+
+        var body_buf: [ADMIN_BODY_MAX_BYTES]u8 = undefined;
+        const reader = request.readerExpectContinue(&body_buf) catch {
+            _ = request.respond("Bad Request: could not read body\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+
+        const len: usize = @intCast(content_length);
+        const body_bytes = try allocator.alloc(u8, len);
+        defer allocator.free(body_bytes);
+        var read_total: usize = 0;
+        while (read_total < len) {
+            const n = reader.readSliceShort(body_bytes[read_total..]) catch {
+                _ = request.respond("Bad Request: body read failed\n", .{ .status = .bad_request }) catch {};
+                return;
+            };
+            if (n == 0) break;
+            read_total += n;
+        }
+        if (read_total != len) {
+            _ = request.respond("Bad Request: short body\n", .{ .status = .bad_request }) catch {};
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body_bytes, .{}) catch {
+            _ = request.respond("Bad Request: invalid JSON\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => {
+                _ = request.respond("Bad Request: expected JSON object\n", .{ .status = .bad_request }) catch {};
+                return;
+            },
+        };
+
+        const enabled_field = obj.get("enabled") orelse {
+            _ = request.respond("Bad Request: missing 'enabled' field\n", .{ .status = .bad_request }) catch {};
+            return;
+        };
+
+        const enabled = switch (enabled_field) {
+            .bool => |b| b,
+            else => {
+                _ = request.respond("Bad Request: 'enabled' must be a boolean\n", .{ .status = .bad_request }) catch {};
+                return;
+            },
+        };
+
+        self.logger.info("admin API: POST /lean/v0/admin/aggregator enabled={any}", .{enabled});
+        const previous = chain.setAggregator(enabled);
+        zeam_metrics.metrics.lean_is_aggregator.set(if (enabled) 1 else 0);
+
+        var buf: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(
+            &buf,
+            "{{\"is_aggregator\":{s},\"previous\":{s}}}",
+            .{ boolToJson(enabled), boolToJson(previous) },
+        );
+        _ = request.respond(body, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+            },
+        }) catch {};
     }
 
     /// Handle SSE events endpoint
@@ -554,6 +695,10 @@ const RateLimiter = struct {
         self.last_cleanup_ns = now;
     }
 };
+
+inline fn boolToJson(b: bool) []const u8 {
+    return if (b) "true" else "false";
+}
 
 fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
     return switch (addr.any.family) {

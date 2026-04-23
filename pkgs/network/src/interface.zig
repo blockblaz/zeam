@@ -141,31 +141,31 @@ pub const GossipEncoding = enum {
 pub const LeanNetworkTopic = struct {
     gossip_topic: GossipTopic,
     encoding: GossipEncoding,
-    network: []const u8,
+    fork_digest: []const u8,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, gossip_topic: GossipTopic, encoding: GossipEncoding, network: []const u8) !LeanNetworkTopic {
+    pub fn init(allocator: Allocator, gossip_topic: GossipTopic, encoding: GossipEncoding, fork_digest: []const u8) !LeanNetworkTopic {
         return LeanNetworkTopic{
             .allocator = allocator,
             .gossip_topic = gossip_topic,
             .encoding = encoding,
-            .network = try allocator.dupe(u8, network),
+            .fork_digest = try allocator.dupe(u8, fork_digest),
         };
     }
 
     pub fn encodeZ(self: *const LeanNetworkTopic) ![:0]u8 {
         const gossip_part = try self.gossip_topic.encode(self.allocator);
         defer self.allocator.free(gossip_part);
-        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, gossip_part, self.encoding.encode() }, 0);
+        return try std.fmt.allocPrintSentinel(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.fork_digest, gossip_part, self.encoding.encode() }, 0);
     }
 
     pub fn encode(self: *const LeanNetworkTopic) ![]u8 {
         const topic_name = try self.gossip_topic.encode(self.allocator);
         defer self.allocator.free(topic_name);
-        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.network, topic_name, self.encoding.encode() });
+        return try std.fmt.allocPrint(self.allocator, "/{s}/{s}/{s}/{s}", .{ topic_prefix, self.fork_digest, topic_name, self.encoding.encode() });
     }
 
-    // topic format: /leanconsensus/<network>/<name>/<encoding>
+    // topic format: /leanconsensus/<fork_digest>/<name>/<encoding>
     pub fn decode(allocator: Allocator, topic_str: [*:0]const u8) !LeanNetworkTopic {
         const topic = std.mem.span(topic_str);
         var iter = std.mem.splitSequence(u8, topic, "/");
@@ -174,7 +174,7 @@ pub const LeanNetworkTopic = struct {
         if (!std.mem.eql(u8, prefix, topic_prefix)) {
             return error.InvalidTopic;
         }
-        const network_slice = iter.next() orelse return error.InvalidTopic;
+        const fork_digest_slice = iter.next() orelse return error.InvalidTopic;
         const gossip_topic_slice = iter.next() orelse return error.InvalidTopic;
         const encoding_slice = iter.next() orelse return error.InvalidTopic;
 
@@ -185,12 +185,12 @@ pub const LeanNetworkTopic = struct {
             .allocator = allocator,
             .gossip_topic = gossip_topic,
             .encoding = encoding,
-            .network = try allocator.dupe(u8, network_slice),
+            .fork_digest = try allocator.dupe(u8, fork_digest_slice),
         };
     }
 
     pub fn deinit(self: *LeanNetworkTopic) void {
-        self.allocator.free(self.network);
+        self.allocator.free(self.fork_digest);
     }
 };
 
@@ -248,14 +248,14 @@ pub const GossipMessage = union(GossipTopicKind) {
 
     const Self = @This();
 
-    pub fn getLeanNetworkTopic(self: *const Self, allocator: Allocator, network_name: []const u8) !LeanNetworkTopic {
+    pub fn getLeanNetworkTopic(self: *const Self, allocator: Allocator, fork_digest: []const u8) !LeanNetworkTopic {
         const gossip_kind = std.meta.activeTag(self.*);
         const gossip_topic = switch (gossip_kind) {
             .block => GossipTopic{ .kind = .block },
             .aggregation => GossipTopic{ .kind = .aggregation },
             .attestation => GossipTopic{ .kind = .attestation, .subnet_id = self.attestation.subnet_id },
         };
-        return try LeanNetworkTopic.init(allocator, gossip_topic, .ssz_snappy, network_name);
+        return try LeanNetworkTopic.init(allocator, gossip_topic, .ssz_snappy, fork_digest);
     }
 
     pub fn getGossipTopic(self: *const Self) GossipTopic {
@@ -978,18 +978,18 @@ test GossipTopic {
 test LeanNetworkTopic {
     const allocator = std.testing.allocator;
 
-    var topic = try LeanNetworkTopic.init(allocator, .{ .kind = .block }, .ssz_snappy, "devnet0");
+    var topic = try LeanNetworkTopic.init(allocator, .{ .kind = .block }, .ssz_snappy, "12345678");
     defer topic.deinit();
 
     const topic_str = try topic.encodeZ();
     defer allocator.free(topic_str);
 
-    try std.testing.expect(std.mem.eql(u8, topic_str, "/leanconsensus/devnet0/block/ssz_snappy"));
+    try std.testing.expect(std.mem.eql(u8, topic_str, "/leanconsensus/12345678/block/ssz_snappy"));
 
     var decoded_topic = try LeanNetworkTopic.decode(allocator, topic_str.ptr);
     defer decoded_topic.deinit();
 
     try std.testing.expectEqual(topic.gossip_topic, decoded_topic.gossip_topic);
     try std.testing.expectEqual(topic.encoding, decoded_topic.encoding);
-    try std.testing.expect(std.mem.eql(u8, topic.network, decoded_topic.network));
+    try std.testing.expect(std.mem.eql(u8, topic.fork_digest, decoded_topic.fork_digest));
 }

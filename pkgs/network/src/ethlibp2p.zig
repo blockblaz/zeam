@@ -10,6 +10,7 @@ const multiaddr_mod = @import("multiaddr");
 const Multiaddr = multiaddr_mod.Multiaddr;
 const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -23,7 +24,22 @@ const ServerStreamError = error{
     InvalidResponseVariant,
 };
 
+/// General RPC message size limit (4 MB). Used for req/resp protocol messages
+/// (BlocksByRoot, Status, etc.) and as a baseline gossip limit for small messages
+/// such as attestations and aggregations.
 const MAX_RPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Gossip block message size limit.
+///
+/// XMSS/post-quantum signatures are substantially larger than BLS: a single
+/// AggregatedSignatureProof can be hundreds of KB, and blocks carry up to
+/// MAX_ATTESTATIONS_DATA (16) attestations each with such a proof.  On devnet4
+/// a legitimate block reached ~9.37 MB, exceeding the 4 MB RPC limit and
+/// triggering error.TooLarge (issue #723).
+///
+/// Set to 50 MB to accommodate current devnet block sizes with room to grow.
+/// Revisit once the leanSpec formalises a MAX_GOSSIP_BLOCK_SIZE constant.
+const MAX_GOSSIP_BLOCK_SIZE: usize = 50 * 1024 * 1024;
 const MAX_VARINT_BYTES: usize = uvarint.bufferSize(usize);
 
 const FrameDecodeError = error{
@@ -236,16 +252,20 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
     return ctx.finished;
 }
 
-/// Writes failed deserialization bytes to disk for debugging purposes
-/// Returns the filename if the file was successfully created, null otherwise
-/// If timestamp is null, generates a new timestamp automatically
-fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) ?[]const u8 {
+/// Writes failed deserialization bytes to disk for debugging purposes.
+/// Logs the outcome (success or failure) itself; returns true on success.
+///
+/// Previously returned `?[]const u8` (the allocated filename) while also doing
+/// `defer allocator.free(filename)` — so callers received a dangling pointer and
+/// segfaulted when logging it.  The fix: log from inside this function and return
+/// a plain bool; callers no longer touch the filename string at all (#725).
+fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
     // Create dumps directory if it doesn't exist
     std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
         error.PathAlreadyExists => {}, // Directory already exists, continue
         else => {
             logger.err("Failed to create deserialization dumps directory: {any}", .{e});
-            return null;
+            return false;
         },
     };
 
@@ -253,14 +273,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     const actual_timestamp = timestamp orelse std.time.timestamp();
     const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
         logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
-        return null;
+        return false;
     };
     defer allocator.free(filename);
 
     // Write bytes to file
     const file = std.fs.cwd().createFile(filename, .{ .truncate = true }) catch |e| {
         logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
     defer file.close();
 
@@ -268,15 +288,16 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     var writer = file.writer(&write_buf);
     writer.interface.writeAll(message_bytes) catch |e| {
         logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
-        return null;
+        return false;
     };
     writer.interface.flush() catch |e| {
         logger.err("Failed to flush file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
-        return null;
+        return false;
     };
 
+    // Log while filename is still live (before defer free runs).
     logger.warn("SSZ deserialization failed for {s} message - written {d} bytes to debug file: {s}", .{ message_type, message_bytes.len, filename });
-    return filename;
+    return true;
 }
 
 /// Generic SSZ deserializer for gossip messages. Returns null on failure (with
@@ -291,9 +312,7 @@ fn deserializeGossipMessage(
     var message_data: T = undefined;
     ssz.deserialize(T, data, &message_data, allocator) catch |e| {
         logger.err("Error in deserializing the signed {s} message: {any}", .{ label, e });
-        if (writeFailedBytes(data, label, allocator, null, logger)) |filename| {
-            logger.err("{s} deserialization failed - debug file created: {s}", .{ label, filename });
-        } else {
+        if (!writeFailedBytes(data, label, allocator, null, logger)) {
             logger.err("{s} deserialization failed - could not create debug file", .{label});
         }
         return null;
@@ -309,16 +328,30 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
 
     const message_bytes: []const u8 = message_ptr[0..message_len];
 
-    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, MAX_RPC_MESSAGE_SIZE) catch |e| {
+    // Block gossip messages carry XMSS/post-quantum aggregated signatures and can be
+    // substantially larger than the 4 MB RPC limit (devnet4 saw ~9.37 MB — issue #723).
+    // Use the larger MAX_GOSSIP_BLOCK_SIZE for block topics; keep the tighter limit for
+    // small messages (attestations, aggregations) to bound memory use.
+    const decode_limit: usize = switch (topic.gossip_topic.kind) {
+        .block => MAX_GOSSIP_BLOCK_SIZE,
+        else => MAX_RPC_MESSAGE_SIZE,
+    };
+
+    const uncompressed_message = snappyz.decodeWithMax(zigHandler.allocator, message_bytes, decode_limit) catch |e| {
         zigHandler.logger.err("Error in snappyz decoding the message for topic={s}: {any}", .{ std.mem.span(topic_str), e });
-        if (writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("Snappyz decode failed - debug file created: {s}", .{filename});
-        } else {
+        if (!writeFailedBytes(message_bytes, "snappyz_decode", zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("Snappyz decode failed - could not create debug file", .{});
         }
         return;
     };
     defer zigHandler.allocator.free(uncompressed_message);
+
+    // Record gossip message size metrics — observed on uncompressed bytes
+    switch (topic.gossip_topic.kind) {
+        .block => zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .attestation => zeam_metrics.lean_gossip_attestation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .aggregation => zeam_metrics.lean_gossip_aggregation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+    }
 
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(
@@ -484,9 +517,7 @@ export fn handleRPCRequestFromRustBridge(
             "Error in deserializing the {s} RPC request from peer={s}{f}: {any}",
             .{ label, peer_id_slice, node_name, err },
         );
-        if (writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) |filename| {
-            zigHandler.logger.err("RPC {s} deserialization failed - debug file created: {s} from peer={s}{f}", .{ label, filename, peer_id_slice, node_name });
-        } else {
+        if (!writeFailedBytes(request_bytes, label, zigHandler.allocator, null, zigHandler.logger)) {
             zigHandler.logger.err("RPC {s} deserialization failed - could not create debug file from peer={s}{f}", .{ label, peer_id_slice, node_name });
         }
         send_rpc_error_response(zigHandler.params.networkId, channel_id, "Failed to deserialize RPC request");
@@ -514,7 +545,20 @@ export fn handleRPCRequestFromRustBridge(
 
     const request_method = std.meta.activeTag(request);
 
-    var stream_context = ServerStreamContext{
+    // Heap-allocate the stream context so its address remains valid even if
+    // a handler (now or in the future) retains the stream for work that
+    // outlives this function call. A stack-allocated context would leave
+    // stream.ptr dangling the moment handleRPCRequestFromRustBridge returns.
+    const stream_context = zigHandler.allocator.create(ServerStreamContext) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to allocate RPC stream context for peer={s}{f} channel={d}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, err },
+        );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Internal error allocating stream context");
+        return;
+    };
+    defer zigHandler.allocator.destroy(stream_context);
+    stream_context.* = ServerStreamContext{
         .zigHandler = zigHandler,
         .channel_id = channel_id,
         .peer_id = peer_id_slice,
@@ -522,7 +566,7 @@ export fn handleRPCRequestFromRustBridge(
     };
 
     var stream = interface.ReqRespServerStream{
-        .ptr = &stream_context,
+        .ptr = stream_context,
         .sendResponseFn = serverStreamSendResponse,
         .sendErrorFn = serverStreamSendError,
         .finishFn = serverStreamFinish,
@@ -831,6 +875,13 @@ export fn handlePeerDisconnectedFromRustBridge(
         @tagName(rsn),
     });
 
+    zigHandler.failInflightRpcsForPeer(peer_id_slice) catch |e| {
+        zigHandler.logger.err(
+            "network-{d}:: Error failing in-flight RPCs for disconnected peer={s}{f}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, node_name, e },
+        );
+    };
+
     zigHandler.peerEventHandler.onPeerDisconnected(peer_id_slice, dir, rsn) catch |e| {
         zigHandler.logger.err("network-{d}:: Error handling peer disconnected event: {any}", .{ zigHandler.params.networkId, e });
     };
@@ -889,24 +940,32 @@ export fn releaseStartNetworkParams(zig_handler: *EthLibp2p, local_private_key: 
     zig_handler.allocator.free(private_key_slice);
 }
 
-pub extern fn create_and_run_network(
+/// Must match `CreateNetworkParams` in `rust/libp2p-glue/src/lib.rs` (repr(C)).
+pub const CreateNetworkParams = extern struct {
     network_id: u32,
-    handle: *EthLibp2p,
+    padding: u32,
+    zig_handler: u64,
     local_private_key: [*:0]const u8,
     listen_addresses: [*:0]const u8,
     connect_addresses: [*:0]const u8,
     topics: [*:0]const u8,
-) void;
+};
+
+pub extern fn create_and_run_network(params: *const CreateNetworkParams) callconv(.c) void;
 pub extern fn wait_for_network_ready(
     network_id: u32,
     timeout_ms: u64,
-) bool;
+) callconv(.c) bool;
+/// Signal the Rust-side libp2p event loop to exit. After returning, the hosting
+/// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
+/// on a network that was never started or is already stopped (no-op).
+pub extern fn stop_network(network_id: u32) callconv(.c) void;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
     message_ptr: [*]const u8,
     message_len: usize,
-) void;
+) callconv(.c) void;
 pub extern fn send_rpc_request(
     networkId: u32,
     peer_id: [*:0]const u8,
@@ -927,9 +986,34 @@ pub extern fn send_rpc_error_response(
     message_ptr: [*:0]const u8,
 ) callconv(.c) void;
 
+/// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
+/// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
+/// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
+const CreateNetworkThreadArgs = struct {
+    network_id: u32,
+    handle: *EthLibp2p,
+    local_private_key: [*:0]const u8,
+    listen_addresses: [*:0]const u8,
+    connect_addresses: [*:0]const u8,
+    topics: [*:0]const u8,
+};
+
+fn createAndRunNetworkThread(args: CreateNetworkThreadArgs) void {
+    var c_params: CreateNetworkParams = .{
+        .network_id = args.network_id,
+        .padding = 0,
+        .zig_handler = @intFromPtr(args.handle),
+        .local_private_key = args.local_private_key,
+        .listen_addresses = args.listen_addresses,
+        .connect_addresses = args.connect_addresses,
+        .topics = args.topics,
+    };
+    create_and_run_network(&c_params);
+}
+
 pub const EthLibp2pParams = struct {
     networkId: u32,
-    network_name: []const u8,
+    fork_digest: []const u8,
     local_private_key: []const u8,
     listen_addresses: []const Multiaddr,
     connect_peers: ?[]const Multiaddr,
@@ -961,8 +1045,8 @@ pub const EthLibp2p = struct {
         params: EthLibp2pParams,
         logger: zeam_utils.ModuleLogger,
     ) !Self {
-        const owned_network_name = try allocator.dupe(u8, params.network_name);
-        errdefer allocator.free(owned_network_name);
+        const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
+        errdefer allocator.free(owned_fork_digest);
 
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
         errdefer gossip_handler.deinit();
@@ -977,7 +1061,7 @@ pub const EthLibp2p = struct {
             .allocator = allocator,
             .params = .{
                 .networkId = params.networkId,
-                .network_name = owned_network_name,
+                .fork_digest = owned_fork_digest,
                 .local_private_key = params.local_private_key,
                 .listen_addresses = params.listen_addresses,
                 .connect_peers = params.connect_peers,
@@ -994,6 +1078,23 @@ pub const EthLibp2p = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Signal the Rust libp2p event loop to exit and then wait for the OS
+        // thread to actually unwind before we start tearing down the fields it
+        // might still touch. After `stop_network` the event loop takes its
+        // shutdown arm, drops the swarm, clears the per-network handler
+        // pointer, and returns from `run_eventloop`, which lets the hosting
+        // thread exit; `thread.join` then completes deterministically.
+        //
+        // Ordering matters: we must join before freeing anything reachable
+        // from `zigHandler` (gossip/peer-event/reqresp handlers, param
+        // strings, rpcCallbacks), otherwise an in-flight callback could
+        // dereference already-freed memory.
+        if (self.rustBridgeThread) |thread| {
+            stop_network(self.params.networkId);
+            thread.join();
+            self.rustBridgeThread = null;
+        }
+
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
 
@@ -1005,7 +1106,7 @@ pub const EthLibp2p = struct {
             self.allocator.free(peers);
         }
 
-        self.allocator.free(self.params.network_name);
+        self.allocator.free(self.params.fork_digest);
 
         var it = self.rpcCallbacks.iterator();
         while (it.next()) |entry| {
@@ -1037,7 +1138,7 @@ pub const EthLibp2p = struct {
                     for (0..subnet_count) |i| {
                         const subnet_id: types.SubnetId = @intCast(i);
                         const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
-                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
                         defer topic.deinit();
                         const topic_str = try topic.encode();
                         try topics_list.append(self.allocator, topic_str);
@@ -1045,7 +1146,7 @@ pub const EthLibp2p = struct {
                 },
                 else => {
                     const gossip_topic = interface.GossipTopic{ .kind = kind };
-                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.network_name);
+                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
                     defer topic.deinit();
                     const topic_str = try topic.encode();
                     try topics_list.append(self.allocator, topic_str);
@@ -1054,7 +1155,14 @@ pub const EthLibp2p = struct {
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
-        self.rustBridgeThread = try Thread.spawn(.{}, create_and_run_network, .{ self.params.networkId, self, local_private_key.ptr, listen_addresses_str.ptr, connect_peers_str.ptr, topics_str.ptr });
+        self.rustBridgeThread = try Thread.spawn(.{}, createAndRunNetworkThread, .{CreateNetworkThreadArgs{
+            .network_id = self.params.networkId,
+            .handle = self,
+            .local_private_key = local_private_key.ptr,
+            .listen_addresses = listen_addresses_str.ptr,
+            .connect_addresses = connect_peers_str.ptr,
+            .topics = topics_str.ptr,
+        }});
 
         // Wait for the network to be fully initialized before returning
         // Use a 10 second timeout to avoid hanging indefinitely
@@ -1072,7 +1180,7 @@ pub const EthLibp2p = struct {
     pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
-        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.network_name);
+        var topic = try data.getLeanNetworkTopic(self.allocator, self.params.fork_digest);
         defer topic.deinit();
         const topic_str = try topic.encodeZ();
         defer self.allocator.free(topic_str);
@@ -1223,6 +1331,46 @@ pub const EthLibp2p = struct {
         };
 
         self.notifyRpcErrorWithOwnedMessage(request_id, method, code, owned_message);
+    }
+
+    /// Fail every in-flight RPC whose callback is waiting on the given peer.
+    ///
+    /// The Rust bridge already times requests out via REQUEST_TIMEOUT, but that
+    /// window is seconds-to-minutes. When a peer disconnects we know the
+    /// response will never arrive, so notify all matching callbacks with a
+    /// PeerDisconnected failure and drop them from the map immediately. This
+    /// gives callers fast feedback and prevents the callback entries (plus
+    /// their owned peer_id strings) from sitting around until the Rust-side
+    /// timeout fires. `ReqRespRequestCallback.deinit` frees the peer_id buffer.
+    fn failInflightRpcsForPeer(self: *Self, peer_id: []const u8) !void {
+        // Collect request_ids first so we can mutate the map without iterator
+        // invalidation while also holding a reference to each callback's peer_id.
+        var matching: std.ArrayList(u64) = .empty;
+        defer matching.deinit(self.allocator);
+
+        var it = self.rpcCallbacks.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.peer_id, peer_id)) {
+                try matching.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        // 499 = "Client Closed Request" (nginx-style); closest well-known code
+        // for "peer went away before responding". Distinct from 408 used by the
+        // Rust-side REQUEST_TIMEOUT so callers can tell them apart.
+        const PEER_DISCONNECTED_CODE: u32 = 499;
+
+        for (matching.items) |request_id| {
+            const callback_ptr = self.rpcCallbacks.getPtr(request_id) orelse continue;
+            const method = callback_ptr.method;
+            self.notifyRpcErrorFmt(
+                request_id,
+                method,
+                PEER_DISCONNECTED_CODE,
+                "peer disconnected before responding (peer={s})",
+                .{peer_id},
+            );
+        }
     }
 
     pub fn onRPCRequest(ptr: *anyopaque, data: *interface.ReqRespRequest, stream: interface.ReqRespServerStream) anyerror!void {
