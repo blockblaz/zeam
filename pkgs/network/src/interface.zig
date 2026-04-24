@@ -915,6 +915,8 @@ pub const GenericGossipHandler = struct {
 
                 const publishWrapper = try MessagePublishWrapper.init(self.allocator, handler, data, sender_peer_id, self.networkId, self.logger, completion, self);
 
+                errdefer publishWrapper.deinit();
+
                 try self.inflightWrappers.put(self.allocator, publishWrapper, {});
 
                 self.logger.debug("network-{d}:: scheduling ongossip publishWrapper={f} for topic={f}", .{ self.networkId, publishWrapper, gossip_topic });
