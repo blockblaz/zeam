@@ -122,24 +122,11 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("bindings");
 
-    // add lmdb (vendored in pkgs/lmdb/vendor/liblmdb)
-    const lmdb = b.addModule("lmdb", .{
+    // add lmdb (external dep: github.com/blockblaz/lmdb-zig)
+    const lmdb = b.dependency("lmdb", .{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("pkgs/lmdb/src/lmdb.zig"),
-        .link_libc = true,
-    });
-    lmdb.addIncludePath(b.path("pkgs/lmdb/vendor/liblmdb"));
-    lmdb.addCSourceFiles(.{
-        .root = b.path("pkgs/lmdb/vendor/liblmdb"),
-        .files = &.{ "mdb.c", "midl.c" },
-        .flags = &.{
-            "-std=c99",
-            "-pthread",
-            "-Wno-unused-parameter",
-            "-Wno-unused-but-set-variable",
-        },
-    });
+    }).module("lmdb");
 
     // add snappyz
     const snappyz = b.dependency("zig_snappy", .{

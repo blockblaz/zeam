@@ -52,6 +52,10 @@
             .url = "git+https://github.com/zen-eth/multiaddr-zig#ba57f18bb375acb3313a3017aaf9fa517f598f37",
             .hash = "multiaddr-0.1.0-CjaydtK5AABS9kkN9a3c7UBKSsweNV66ZIV86oO1yf3V",
         },
+        .lmdb = .{
+            .url = "git+https://github.com/blockblaz/lmdb-zig#8e1f5440fd2c97b9072ee729e8e4cd8593a47c55",
+            .hash = "lmdb-0.1.0-tSBItmKwBgBD1Nkkexbr3ydsa-ZpR1suATr-JqYj9Iey",
+        },
     },
     .paths = .{""},
 }
