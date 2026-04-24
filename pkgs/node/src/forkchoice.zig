@@ -1255,17 +1255,23 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
 
-        // Can't regress on safe target
+        // Safe target regression is a legitimate fork-choice outcome, not a
+        // bug: the deepest 2/3-supported descendant of `latest_justified` can
+        // move to a shallower slot when attestation weights shift across
+        // branches or when `latest_justified` itself advances to a different
+        // subtree. Previously this returned `InvalidSafeTargetCompute`, which
+        // aborted the interval-3 tick and wedged the node's time loop on
+        // devnet-4 whenever target divergence produced a shallower
+        // 2/3-supermajority subtree. Accept the new value and surface the
+        // regression via a warn-level log so operators retain visibility.
         if (safe_target.slot < self.safeTarget.slot) {
-            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
+            self.logger.warn("safe target regressed new={d} < current={d}; accepting new value", .{
                 safe_target.slot,
                 self.safeTarget.slot,
             });
-            return ForkChoiceError.InvalidSafeTargetCompute;
         }
 
         self.safeTarget = safe_target;
-        // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
     }
