@@ -33,11 +33,15 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
         const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
 
         /// Default map size for newly-created environments. LMDB
-        /// reserves the corresponding amount of virtual address space;
-        /// physical disk usage grows on demand. 1 TiB is generous
-        /// enough to avoid `MDB_MAP_FULL` in practice without committing
-        /// real resources.
-        const DEFAULT_MAP_SIZE: usize = 1 << 40;
+        /// reserves the corresponding amount of virtual address space
+        /// up front; physical disk usage grows on demand.
+        ///
+        /// 256 GiB is comfortably beyond the expected working-set size
+        /// for a lean-consensus node while still leaving room for
+        /// several parallel env opens (mock networks, in-process
+        /// multi-node tests). Bumping higher exhausts user-space VA on
+        /// crowded machines and trips `vm.overcommit_memory = 2`.
+        const DEFAULT_MAP_SIZE: usize = 256 * (1 << 30);
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing LMDB", .{});
@@ -238,35 +242,50 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
             };
         }
 
-        pub fn initWriteBatch(self: *Self) WriteBatch {
+        pub fn initWriteBatch(self: *Self) Error!WriteBatch {
             const txn = self.env.beginTxn(false) catch |err| {
-                // Match RocksDB's `initWriteBatch` signature: it is
-                // infallible. On failure we log and return a batch
-                // that will no-op subsequent operations.
                 self.logger.err("initWriteBatch: failed to open write txn: {any}", .{err});
-                return .{
-                    .allocator = self.allocator,
-                    .dbi_handles = &self.dbi_handles,
-                    .logger = self.logger,
-                    .txn = null,
-                };
+                return error.LmdbBatch;
             };
             return .{
                 .allocator = self.allocator,
                 .dbi_handles = &self.dbi_handles,
                 .logger = self.logger,
                 .txn = txn,
+                .failed = false,
             };
         }
 
-        pub fn commit(self: *Self, batch: *WriteBatch) void {
+        /// Commit a write batch.
+        ///
+        /// Two ways this can fail:
+        ///   1. One of the queued `put`/`delete` calls already failed
+        ///      (tracked in `batch.failed`). The txn is poisoned, so
+        ///      abort it and surface `error.LmdbBatch` rather than
+        ///      committing a partial batch.
+        ///   2. `txn.commit()` itself fails (disk full, MDB_MAP_FULL,
+        ///      EIO, ...). Surface `error.LmdbCommit`.
+        ///
+        /// Either way the txn handle is consumed — the batch is left in
+        /// the "already committed / aborted" state so `deinit` is a
+        /// no-op.
+        pub fn commit(self: *Self, batch: *WriteBatch) Error!void {
             _ = self;
-            if (batch.txn) |*txn| {
-                txn.commit() catch |err| {
-                    batch.logger.err("commit: txn.commit failed: {any}", .{err});
-                };
+            const txn_ptr = if (batch.txn) |*t| t else return;
+
+            if (batch.failed) {
+                txn_ptr.abort();
                 batch.txn = null;
+                batch.logger.err("commit: refusing to commit batch with failed ops", .{});
+                return error.LmdbBatch;
             }
+
+            txn_ptr.commit() catch |err| {
+                batch.logger.err("commit: txn.commit failed: {any}", .{err});
+                batch.txn = null;
+                return error.LmdbCommit;
+            };
+            batch.txn = null;
         }
 
         /// LMDB is sync-on-commit by default; this is a no-op but kept
@@ -283,9 +302,17 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
             allocator: Allocator,
             dbi_handles: *const [column_namespaces.len]lmdb.Dbi,
             logger: zeam_utils.ModuleLogger,
-            /// `null` means the batch failed to acquire a write txn at
-            /// creation time or was already committed / aborted.
+            /// Present while the batch is still pending. Cleared to
+            /// `null` once the batch is committed or aborted so
+            /// `deinit` knows not to abort a spent txn.
             txn: ?lmdb.Txn,
+            /// Sticky flag set by any queued `put`/`delete`/`deleteRange`
+            /// that failed mid-batch. `commit` refuses to commit a
+            /// poisoned batch and surfaces `error.LmdbBatch` so the
+            /// caller can react. Without this, a single silent
+            /// `MDB_MAP_FULL` on `put` would leave the chain believing a
+            /// partial batch was durably persisted.
+            failed: bool,
 
             pub fn deinit(self: *WriteBatch) void {
                 if (self.txn) |*txn| {
@@ -298,6 +325,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
                 var txn = &(self.txn orelse return);
                 txn.put(self.dbi_handles[cn.find(column_namespaces)], key, value) catch |err| {
                     self.logger.err("batch put: txn.put failed: {any}", .{err});
+                    self.failed = true;
                 };
             }
 
@@ -305,6 +333,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
                 var txn = &(self.txn orelse return);
                 txn.delete(self.dbi_handles[cn.find(column_namespaces)], key) catch |err| {
                     self.logger.err("batch delete: txn.delete failed: {any}", .{err});
+                    self.failed = true;
                 };
             }
 
@@ -313,6 +342,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
                 const dbi = self.dbi_handles[cn.find(column_namespaces)];
                 var cur = txn.openCursor(dbi) catch |err| {
                     self.logger.err("batch deleteRange: openCursor failed: {any}", .{err});
+                    self.failed = true;
                     return;
                 };
                 defer cur.close();
@@ -325,20 +355,24 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
 
                 var entry = cur.seekRange(start) catch |err| {
                     self.logger.err("batch deleteRange: seekRange failed: {any}", .{err});
+                    self.failed = true;
                     return;
                 };
                 while (entry) |e| : (entry = cur.next() catch |err| {
                     self.logger.err("batch deleteRange: cursor.next failed: {any}", .{err});
+                    self.failed = true;
                     return;
                 }) {
                     if (std.mem.order(u8, e.key, end) != .lt) break;
                     const owned = self.allocator.dupe(u8, e.key) catch |err| {
                         self.logger.err("batch deleteRange: dupe failed: {any}", .{err});
+                        self.failed = true;
                         return;
                     };
                     keys.append(self.allocator, owned) catch |err| {
                         self.allocator.free(owned);
                         self.logger.err("batch deleteRange: append failed: {any}", .{err});
+                        self.failed = true;
                         return;
                     };
                 }
@@ -346,6 +380,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
                 for (keys.items) |k| {
                     txn.delete(dbi, k) catch |err| {
                         self.logger.err("batch deleteRange: txn.delete failed: {any}", .{err});
+                        self.failed = true;
                     };
                 }
             }
@@ -870,6 +905,8 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
             LmdbDeleteRange,
             LmdbIterator,
             LmdbFlush,
+            LmdbBatch,
+            LmdbCommit,
         } || Allocator.Error;
     };
 }

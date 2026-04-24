@@ -49,6 +49,48 @@ pub const Backend = enum {
     }
 };
 
+/// If the operator previously ran with the *other* backend, that
+/// backend's on-disk directory (`{path}/rocksdb` or `{path}/lmdb`)
+/// will still contain chain data. Silently starting from genesis on
+/// the newly selected engine is almost always a surprise, so log a
+/// loud warning. Best-effort: any filesystem error here is suppressed
+/// — it is a diagnostic, not a correctness barrier.
+fn warnIfOtherBackendPopulated(
+    logger: zeam_utils.ModuleLogger,
+    path: []const u8,
+    selected: Backend,
+) void {
+    const other: Backend = switch (selected) {
+        .rocksdb => .lmdb,
+        .lmdb => .rocksdb,
+    };
+    const other_name = switch (other) {
+        .rocksdb => "rocksdb",
+        .lmdb => "lmdb",
+    };
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const other_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ path, other_name }) catch return;
+
+    var dir = std.fs.cwd().openDir(other_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var it = dir.iterate();
+    const has_entries = while (it.next() catch return) |_| break true else false;
+    if (!has_entries) return;
+
+    const selected_name = switch (selected) {
+        .rocksdb => "rocksdb",
+        .lmdb => "lmdb",
+    };
+    logger.warn(
+        "detected existing {s} data at {s} while starting with --db-backend {s}; " ++
+            "the previous engine's data is NOT migrated. Delete {s} or switch back to " ++
+            "--db-backend {s} to re-use it.",
+        .{ other_name, other_path, selected_name, other_path, other_name },
+    );
+}
+
 /// Runtime-selectable database handle. Both variants implement the
 /// same method surface (matching the RocksDB-shaped API used by
 /// `pkgs/node`); the `switch` arms below forward every call to the
@@ -79,6 +121,7 @@ pub const Db = union(Backend) {
         path: []const u8,
         backend: Backend,
     ) !Db {
+        warnIfOtherBackendPopulated(logger, path, backend);
         return switch (backend) {
             .rocksdb => Db{ .rocksdb = try RocksDbBackend.open(allocator, logger, path) },
             .lmdb => Db{ .lmdb = try LmdbBackend.open(allocator, logger, path) },
@@ -126,22 +169,26 @@ pub const Db = union(Backend) {
         }
     }
 
-    pub fn initWriteBatch(self: *Db) WriteBatch {
+    pub fn initWriteBatch(self: *Db) !WriteBatch {
         return switch (self.*) {
             .rocksdb => |*r| WriteBatch{ .rocksdb = r.initWriteBatch() },
-            .lmdb => |*l| WriteBatch{ .lmdb = l.initWriteBatch() },
+            .lmdb => |*l| WriteBatch{ .lmdb = try l.initWriteBatch() },
         };
     }
 
-    pub fn commit(self: *Db, batch: *WriteBatch) void {
+    /// Commit a write batch. Propagates the underlying backend's
+    /// error so consensus-critical writes (finalization advancement,
+    /// state persistence) can detect a failed commit instead of
+    /// silently continuing as if the write succeeded.
+    pub fn commit(self: *Db, batch: *WriteBatch) !void {
         switch (self.*) {
             .rocksdb => |*r| {
                 std.debug.assert(batch.* == .rocksdb);
-                r.commit(&batch.rocksdb);
+                try r.commit(&batch.rocksdb);
             },
             .lmdb => |*l| {
                 std.debug.assert(batch.* == .lmdb);
-                l.commit(&batch.lmdb);
+                try l.commit(&batch.lmdb);
             },
         }
     }
@@ -438,8 +485,9 @@ fn testSaveAndLoadBlock(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(data_dir);
+    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
@@ -480,8 +528,9 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(data_dir);
+    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
@@ -504,7 +553,7 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
     var state = try test_helpers.createDummyState(allocator, 2, 4, 93, 1, 0, 0xFF, 0x00);
     defer state.deinit();
 
-    var batch = db.initWriteBatch();
+    var batch = try db.initWriteBatch();
     defer batch.deinit();
 
     try std.testing.expect(db.loadBlock(DbBlocksNamespace, block_root) == null);
@@ -512,7 +561,7 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
 
     batch.putBlock(DbBlocksNamespace, block_root, signed_block);
     batch.putState(DbStatesNamespace, state_root, state);
-    db.commit(&batch);
+    try db.commit(&batch);
 
     const loaded_block = db.loadBlock(DbBlocksNamespace, block_root);
     try std.testing.expect(loaded_block != null);
@@ -533,8 +582,9 @@ fn testLoadLatestFinalizedStateHappyPath(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(data_dir);
+    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
@@ -549,12 +599,12 @@ fn testLoadLatestFinalizedStateHappyPath(backend: Backend) !void {
     var expected_state = try test_helpers.createDummyState(allocator, 123, 4, 93, 1, 0, 0x10, 0x20);
     defer expected_state.deinit();
 
-    var batch = db.initWriteBatch();
+    var batch = try db.initWriteBatch();
     defer batch.deinit();
     batch.putLatestFinalizedSlot(DbDefaultNamespace, finalized_slot);
     batch.putFinalizedSlotIndex(DbFinalizedSlotsNamespace, finalized_slot, block_root);
     batch.putState(DbStatesNamespace, block_root, expected_state);
-    db.commit(&batch);
+    try db.commit(&batch);
 
     var loaded_state: types.BeamState = undefined;
     try db.loadLatestFinalizedState(&loaded_state);
