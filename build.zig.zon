@@ -53,8 +53,8 @@
             .hash = "multiaddr-0.1.0-CjaydtK5AABS9kkN9a3c7UBKSsweNV66ZIV86oO1yf3V",
         },
         .thread_pool = .{
-            .url = "git+https://github.com/anshalshukla/zig-thread-pool#12261229c43428c2664612b3904572091607aae5",
-            .hash = "thread_pool-0.1.0-m6B8fxzhAACKJmyLvEG683UZnGD_nHzPx3oUDf8Rb_0s",
+            .url = "git+https://github.com/anshalshukla/zig-thread-pool#d095d0e3ad69dc7a0a1a8419a5244cfb291bcd01",
+            .hash = "thread_pool-0.1.0-m6B8f1PnAABDFOkSzBfEl-zV9RqihL5yPRpK5orm_NUA",
         },
     },
     .paths = .{""},
