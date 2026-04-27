@@ -56,8 +56,20 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Serializes BeamNode work between the libxev main thread (onInterval) and
-    /// the libp2p worker thread (onGossip / onReqRespResponse / onReqRespRequest).
+    /// Serializes BeamNode work between the libxev main thread (`onInterval`) and
+    /// the libp2p worker thread (`onGossip` / `onReqRespResponse` / `onReqRespRequest`).
+    ///
+    /// Invariant: every mutation of `chain` and `network` from those callbacks must
+    /// happen with this mutex held. Compute-heavy work — state transition,
+    /// signature verification, fork-choice updates — currently runs synchronously
+    /// inside the critical section, so a long STF can stall the libxev tick path
+    /// (and vice-versa). See issue #786 for context and follow-ups (offloading
+    /// heavy work to a bounded worker queue, shrinking critical sections, etc.).
+    ///
+    /// `acquireMutex(site)` is the canonical way to take this lock: it records the
+    /// wait + hold time into `lean_node_mutex_wait_time_seconds` /
+    /// `lean_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
+    /// quantify the contention described in the issue.
     mutex: std.Thread.Mutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
@@ -136,11 +148,63 @@ pub const BeamNode = struct {
         self.allocator.destroy(self.chain);
     }
 
+    /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
+    /// in its `unlock` method while observing the hold time into the
+    /// `lean_node_mutex_hold_time_seconds` histogram for the configured site.
+    /// See issue #786.
+    const MutexGuard = struct {
+        mutex: *std.Thread.Mutex,
+        site: []const u8,
+        held_start_ns: i128,
+
+        pub fn unlock(self: *MutexGuard) void {
+            const elapsed_ns = std.time.nanoTimestamp() - self.held_start_ns;
+            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+            zeam_metrics.metrics.lean_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
+            self.mutex.unlock();
+        }
+    };
+
+    /// Acquire `BeamNode.mutex`, recording the wait time into
+    /// `lean_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
+    /// records the hold time on `unlock()`. Always pair with
+    /// `defer guard.unlock()`. The `site` label flows through to the metric so
+    /// Prometheus can attribute stalls to a specific callback path.
+    fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
+        const wait_start_ns = std.time.nanoTimestamp();
+        self.mutex.lock();
+        const acquired_ns = std.time.nanoTimestamp();
+        const wait_ns = acquired_ns - wait_start_ns;
+        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
+        zeam_metrics.metrics.lean_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
+        return .{
+            .mutex = &self.mutex,
+            .site = site,
+            .held_start_ns = acquired_ns,
+        };
+    }
+
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
+        // work that does not touch any shared state, but it can be expensive on
+        // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
+        // hundreds of KB to MBs of tree-hashing). Computing it before locking
+        // shrinks the critical section and lets `onInterval` make progress on
+        // the libxev thread in parallel. The computed root is reused in every
+        // downstream branch (success path + error paths) so we never recompute
+        // under the lock.
+        var precomputed_block_root: types.Root = undefined;
+        if (data.* == .block) {
+            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
+                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
+                return;
+            };
+        }
+
+        var guard = self.acquireMutex("onGossip");
+        defer guard.unlock();
 
         switch (data.*) {
             .block => |signed_block| {
@@ -158,12 +222,8 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Compute block root first - needed for both caching and pending tracking
-                var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
-                    self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                    return;
-                };
+                // Reuse the root we computed before taking the lock.
+                const block_root = precomputed_block_root;
 
                 _ = self.network.removePendingBlockRoot(block_root);
 
@@ -232,15 +292,13 @@ pub const BeamNode = struct {
                 // descendants we might still be holding onto.
                 error.PreFinalizedSlot => {
                     if (data.* == .block) {
-                        const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            self.logger.info(
-                                "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                                .{&block_root},
-                            );
-                            _ = self.network.pruneCachedBlocks(block_root, null);
-                        } else |_| {}
+                        // Reuse the root we computed before taking the lock (issue #786).
+                        const block_root = precomputed_block_root;
+                        self.logger.info(
+                            "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
+                            .{&block_root},
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
                     }
                     return;
                 },
@@ -268,28 +326,27 @@ pub const BeamNode = struct {
                 error.FutureSlot => {
                     if (data.* == .block) {
                         const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            if (self.cacheFutureBlock(block_root, signed_block)) |_| {
-                                self.logger.debug(
-                                    "cached future gossip block 0x{s} at slot {d}",
+                        // Reuse the root we computed before taking the lock (issue #786).
+                        const block_root = precomputed_block_root;
+                        if (self.cacheFutureBlock(block_root, signed_block)) |_| {
+                            self.logger.debug(
+                                "cached future gossip block 0x{s} at slot {d}",
+                                .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
+                            );
+                        } else |cache_err| {
+                            if (cache_err == CacheBlockError.PreFinalized) {
+                                self.logger.info(
+                                    "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
                                     .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
                                 );
-                            } else |cache_err| {
-                                if (cache_err == CacheBlockError.PreFinalized) {
-                                    self.logger.info(
-                                        "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                    );
-                                    _ = self.network.pruneCachedBlocks(block_root, null);
-                                } else {
-                                    self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                        std.fmt.bytesToHex(block_root, .lower)[0..],
-                                        cache_err,
-                                    });
-                                }
+                                _ = self.network.pruneCachedBlocks(block_root, null);
+                            } else {
+                                self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
+                                    std.fmt.bytesToHex(block_root, .lower)[0..],
+                                    cache_err,
+                                });
                             }
-                        } else |_| {}
+                        }
                     }
                     return;
                 },
@@ -903,8 +960,8 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var guard = self.acquireMutex("onReqRespResponse");
+        defer guard.unlock();
         try self.handleReqRespResponse(event);
     }
 
@@ -920,8 +977,8 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
+                defer guard.unlock();
 
                 const roots = request.roots.constSlice();
 
@@ -1181,8 +1238,8 @@ pub const BeamNode = struct {
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                var guard = self.acquireMutex("onInterval");
+                defer guard.unlock();
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
