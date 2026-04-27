@@ -1583,7 +1583,7 @@ test "Node peer tracking on connect/disconnect" {
         },
     };
 
-    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr(), ctx.loggerConfig());
     defer clock.deinit(allocator);
 
     var node: BeamNode = undefined;

@@ -293,7 +293,8 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
                 return err;
             };
-            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+            var clock_logger_config = utils_lib.getLoggerConfig(console_log_level, null);
+            var clock = Clock.init(gpa.allocator(), genesis, &loop, &clock_logger_config) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize clock");
                 return err;
             };
@@ -582,7 +583,7 @@ fn mainInner() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, &logger1_config);
 
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
