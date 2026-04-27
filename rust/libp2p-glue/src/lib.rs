@@ -567,7 +567,7 @@ pub unsafe extern "C" fn send_rpc_request(
             protocol, peer_id, request_id
         ),
     );
-    return request_id;
+    request_id
 }
 
 /// # Safety
