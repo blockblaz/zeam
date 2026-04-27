@@ -9,6 +9,13 @@ pub const SECONDS_PER_INTERVAL_MS: isize = @divFloor(params.SECONDS_PER_SLOT * s
 // This prevents accepting attestations that are too far ahead of the current slot
 pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
 
+// Maximum number of intervals (sub-slot ticks) in the future that a block is allowed
+// to lead the local fork-choice clock. Soaks up tiny clock skews between peers/CI
+// nodes so a block whose slot has just begun on the sender — but not yet ticked
+// locally — is accepted instead of rejected with FutureSlot. Larger gaps still fall
+// through to the future-block cache and replay on tick. See issue #788.
+pub const MAX_FUTURE_INTERVAL_TOLERANCE = 1;
+
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
 pub const MAX_BLOCK_FETCH_DEPTH = 512;

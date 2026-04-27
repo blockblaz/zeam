@@ -1631,7 +1631,12 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
+            // Allow a small interval-level tolerance so blocks that arrive at the
+            // very start of their slot (before the local clock has ticked) are not
+            // rejected as FutureSlot under routine clock skew. Larger gaps are still
+            // rejected and the caller is expected to cache + replay on tick.
+            // See issue #788.
+            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic) + constants.MAX_FUTURE_INTERVAL_TOLERANCE) {
                 return ForkChoiceError.FutureSlot;
             } else if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;

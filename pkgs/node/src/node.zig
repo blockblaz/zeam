@@ -732,6 +732,45 @@ pub const BeamNode = struct {
                     return;
                 }
 
+                // RPC-fetched block arrived too early for local clock - cache and replay
+                // when the slot clock catches up (mirrors the gossip-path FutureSlot
+                // handler). Without this branch, blocks fetched during a sync catch-up
+                // window after a delayed onInterval (see #786 mutex contention) are
+                // dropped permanently, leaving the head stuck at the justified
+                // checkpoint with no descendants. See issue #788.
+                if (err == forkchoice.ForkChoiceError.FutureSlot) {
+                    if (self.cacheFutureBlock(block_root, signed_block.*)) |_| {
+                        self.logger.debug(
+                            "cached future RPC block 0x{s} at slot {d} from peer {s}{f}",
+                            .{
+                                std.fmt.bytesToHex(block_root, .lower)[0..],
+                                signed_block.block.slot,
+                                block_ctx.peer_id,
+                                self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                            },
+                        );
+                    } else |cache_err| {
+                        if (cache_err == CacheBlockError.PreFinalized) {
+                            self.logger.info(
+                                "future RPC block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
+                                .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
+                            );
+                            _ = self.network.pruneCachedBlocks(block_root, null);
+                        } else if (cache_err == CacheBlockError.AlreadyCached) {
+                            self.logger.debug(
+                                "future RPC block 0x{s} already cached",
+                                .{std.fmt.bytesToHex(block_root, .lower)[0..]},
+                            );
+                        } else {
+                            self.logger.warn("failed to cache future RPC block 0x{s}: {any}", .{
+                                std.fmt.bytesToHex(block_root, .lower)[0..],
+                                cache_err,
+                            });
+                        }
+                    }
+                    return;
+                }
+
                 self.logger.warn("failed to import block fetched via RPC 0x{x} from peer {s}{f}: {any}", .{
                     &block_root,
                     block_ctx.peer_id,
