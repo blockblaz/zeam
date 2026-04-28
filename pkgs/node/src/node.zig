@@ -71,8 +71,8 @@ pub const BeamNode = struct {
     /// heavy work to a bounded worker queue, shrinking critical sections, etc.).
     ///
     /// `acquireMutex(site)` is the canonical way to take this lock: it records the
-    /// wait + hold time into `lean_node_mutex_wait_time_seconds` /
-    /// `lean_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
+    /// wait + hold time into `zeam_node_mutex_wait_time_seconds` /
+    /// `zeam_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
     /// quantify the contention described in the issue.
     mutex: std.Thread.Mutex = .{},
     /// Pending parent roots deferred for batched fetching.
@@ -155,7 +155,7 @@ pub const BeamNode = struct {
 
     /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
     /// in its `unlock` method while observing the hold time into the
-    /// `lean_node_mutex_hold_time_seconds` histogram for the configured site.
+    /// `zeam_node_mutex_hold_time_seconds` histogram for the configured site.
     ///
     /// Timing uses `std.time.Timer`, which wraps `CLOCK_MONOTONIC` on Linux,
     /// `mach_absolute_time` on macOS and `QueryPerformanceCounter` on Windows.
@@ -181,13 +181,13 @@ pub const BeamNode = struct {
 
             const elapsed_ns = self.timer.read();
             const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-            zeam_metrics.metrics.lean_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
+            zeam_metrics.metrics.zeam_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
             self.mutex.unlock();
         }
     };
 
     /// Acquire `BeamNode.mutex`, recording the wait time into
-    /// `lean_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
+    /// `zeam_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
     /// records the hold time on `unlock()`. Always pair with
     /// `defer guard.unlock()`. The `site` label flows through to the metric so
     /// Prometheus can attribute stalls to a specific callback path.
@@ -204,7 +204,7 @@ pub const BeamNode = struct {
         self.mutex.lock();
         const wait_ns = timer.lap();
         const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
-        zeam_metrics.metrics.lean_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
+        zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
         return .{
             .mutex = &self.mutex,
             .site = site,
@@ -1685,7 +1685,7 @@ test "Node peer tracking on connect/disconnect" {
         },
     };
 
-    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr(), ctx.loggerConfig());
     defer clock.deinit(allocator);
 
     var node: BeamNode = undefined;

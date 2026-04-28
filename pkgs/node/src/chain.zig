@@ -130,8 +130,27 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
-    // Optional worker pool for parallelizing CPU-bound steps (currently: attestation signature
-    // verification). Owned by the caller (e.g. the CLI's main), not by the chain.
+    /// Optional worker pool for parallelizing CPU-bound steps (currently:
+    /// attestation signature verification and `compactAttestations`). Owned
+    /// by the caller (e.g. the CLI's main), not by the chain.
+    ///
+    /// Thread-safety invariants required of the pool's environment when set:
+    ///
+    ///   1. `chain.allocator` MUST be safe to use concurrently from worker
+    ///      threads. The CLI today wires this to a `GeneralPurposeAllocator`
+    ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
+    ///      or any custom non-thread-safe allocator would race. If a future
+    ///      change swaps the allocator, audit every consumer of `thread_pool`
+    ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
+    ///   2. The XMSS verifier must be set up before the pool's first verify.
+    ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
+    ///      pool construction; without that pre-warm, concurrent first-time
+    ///      verifies could race the Rust-side initialization.
+    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
+    ///      not call its `getOrPut` directly. The current parallel paths
+    ///      respect this: cache access is confined to a serial pre-phase.
+    ///
+    /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,
 
     // Callback for pruning cached blocks after finalization advances

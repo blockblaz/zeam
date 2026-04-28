@@ -296,7 +296,8 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
                 return err;
             };
-            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+            var clock_logger_config = utils_lib.getLoggerConfig(console_log_level, null);
+            var clock = Clock.init(gpa.allocator(), genesis, &loop, &clock_logger_config) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize clock");
                 return err;
             };
@@ -585,7 +586,7 @@ fn mainInner() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, &logger1_config);
 
             // Shared worker pool for CPU-bound chain work (attestation signature verification).
             // One pool is shared across all nodes in the process so total worker threads stay bounded
@@ -599,6 +600,16 @@ fn mainInner() !void {
                 .thread_count = @intCast(worker_count),
             });
             defer thread_pool.deinit();
+
+            // Pre-warm the XMSS verifier on the main thread before any worker
+            // can call `verifyAggregatedPayload`. The Rust-side verifier setup
+            // is documented as idempotent but is not hardened against
+            // first-time-init races between concurrent callers; doing it once
+            // here removes that race regardless of the Rust implementation.
+            xmss.setupVerifier() catch |err| {
+                std.debug.print("xmss.setupVerifier failed: {any}\n", .{err});
+                return err;
+            };
 
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
