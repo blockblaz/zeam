@@ -20,6 +20,7 @@ const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
 const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
+const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
@@ -319,6 +320,16 @@ pub const Node = struct {
             .thread_count = @intCast(worker_count),
         });
         errdefer self.thread_pool.deinit();
+
+        // Pre-warm the XMSS verifier on the main thread before any worker can
+        // call `verifyAggregatedPayload`. The Rust-side verifier setup is
+        // documented as idempotent but is not hardened against first-time-init
+        // races between concurrent callers; doing it once here removes that
+        // race regardless of the Rust implementation.
+        xmss.setupVerifier() catch |err| {
+            self.thread_pool.deinit();
+            return err;
+        };
 
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
