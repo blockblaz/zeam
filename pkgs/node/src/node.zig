@@ -151,14 +151,30 @@ pub const BeamNode = struct {
     /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
     /// in its `unlock` method while observing the hold time into the
     /// `lean_node_mutex_hold_time_seconds` histogram for the configured site.
+    ///
+    /// Timing uses `std.time.Timer`, which wraps `CLOCK_MONOTONIC` on Linux,
+    /// `mach_absolute_time` on macOS and `QueryPerformanceCounter` on Windows.
+    /// This avoids the wall-clock skew (NTP slew, leap-second steps, manual
+    /// clock changes) that `std.time.nanoTimestamp` is subject to and that
+    /// would corrupt histogram percentiles by producing negative deltas.
+    ///
+    /// Calling `unlock()` more than once is a no-op on the second call: a
+    /// `released` sentinel prevents the underlying mutex from being unlocked
+    /// twice, which would be undefined behavior. The metric is also recorded
+    /// only on the first call.
+    ///
     /// See issue #786.
     const MutexGuard = struct {
         mutex: *std.Thread.Mutex,
         site: []const u8,
-        held_start_ns: i128,
+        timer: std.time.Timer,
+        released: bool = false,
 
         pub fn unlock(self: *MutexGuard) void {
-            const elapsed_ns = std.time.nanoTimestamp() - self.held_start_ns;
+            if (self.released) return;
+            self.released = true;
+
+            const elapsed_ns = self.timer.read();
             const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
             zeam_metrics.metrics.lean_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
             self.mutex.unlock();
@@ -170,23 +186,41 @@ pub const BeamNode = struct {
     /// records the hold time on `unlock()`. Always pair with
     /// `defer guard.unlock()`. The `site` label flows through to the metric so
     /// Prometheus can attribute stalls to a specific callback path.
+    ///
+    /// Wait/hold timing is measured with `std.time.Timer` (monotonic clock) so
+    /// the deltas observed by Prometheus are guaranteed non-negative even when
+    /// the wall clock is adjusted by NTP, leap seconds or operator action.
     fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
-        const wait_start_ns = std.time.nanoTimestamp();
+        // `Timer.start()` only fails on platforms without a monotonic clock; on
+        // every supported zeam target (Linux/macOS/Windows) it is infallible.
+        // Falling back to wall-clock time would re-introduce the skew bug we
+        // are fixing, so we panic instead.
+        var timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
         self.mutex.lock();
-        const acquired_ns = std.time.nanoTimestamp();
-        const wait_ns = acquired_ns - wait_start_ns;
+        const wait_ns = timer.lap();
         const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
         zeam_metrics.metrics.lean_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
         return .{
             .mutex = &self.mutex,
             .site = site,
-            .held_start_ns = acquired_ns,
+            .timer = timer,
         };
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // Lifetime invariant for `data`:
+        //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
+        //   `GossipMessage` for the entire duration of this callback. It is the
+        //   standard libp2p callback contract: the buffer is not recycled, freed
+        //   or mutated until `onGossip` returns. We rely on this twice — once
+        //   for the pre-lock `hashTreeRoot` read of `data.block.block` and again
+        //   inside the locked section for the same field. If a future refactor
+        //   ever changes that contract (e.g. arena-pooled message buffers), the
+        //   pre-lock read becomes a use-after-free and this comment must be the
+        //   place to revisit. Do NOT cache or stash `data` past this scope.
+        //
         // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
         // work that does not touch any shared state, but it can be expensive on
         // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
@@ -195,6 +229,12 @@ pub const BeamNode = struct {
         // the libxev thread in parallel. The computed root is reused in every
         // downstream branch (success path + error paths) so we never recompute
         // under the lock.
+        //
+        // `precomputed_block_root` stays `undefined` for non-block gossip
+        // messages and is read only inside the `.block` arm of the switch
+        // below (and its error sub-branches). Any future code path that reads
+        // it outside that arm will hit Zig's `undefined` poison in debug
+        // builds — intentional defensive behavior.
         var precomputed_block_root: types.Root = undefined;
         if (data.* == .block) {
             zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
