@@ -599,6 +599,16 @@ fn mainInner() !void {
             });
             defer thread_pool.deinit();
 
+            // Pre-warm the XMSS verifier on the main thread before any worker
+            // can call `verifyAggregatedPayload`. The Rust-side verifier setup
+            // is documented as idempotent but is not hardened against
+            // first-time-init races between concurrent callers; doing it once
+            // here removes that race regardless of the Rust implementation.
+            xmss.setupVerifier() catch |err| {
+                std.debug.print("xmss.setupVerifier failed: {any}\n", .{err});
+                return err;
+            };
+
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
             var validator_ids_2 = [_]usize{1};
