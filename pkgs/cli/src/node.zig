@@ -180,7 +180,7 @@ pub const Node = struct {
         self.options = options;
         self.api_server_handle = null;
         self.metrics_server_handle = null;
-
+        self.logger = options.logger_config.logger(.node);
         // If path is specified load from it, otherwise use default settings
         const chain_spec_owned = self.options.chain_spec != null;
         const chain_spec = if (self.options.chain_spec) |path|
@@ -242,8 +242,6 @@ pub const Node = struct {
 
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
         errdefer db.deinit();
-
-        self.logger = options.logger_config.logger(.node);
 
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
