@@ -1512,7 +1512,7 @@ pub const BeamNode = struct {
             data.slot,
             validator_id,
         });
-        try self.chain.onGossipAttestation(signed_attestation);
+        try self.chain.onGossipAttestation(signed_attestation, &self.mutex);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
@@ -1527,7 +1527,7 @@ pub const BeamNode = struct {
 
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
-        try self.chain.onGossipAggregatedAttestation(signed_aggregation);
+        try self.chain.onGossipAggregatedAttestation(signed_aggregation, &self.mutex);
 
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
         try self.network.publish(&gossip_msg);

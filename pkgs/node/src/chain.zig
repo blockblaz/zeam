@@ -820,7 +820,7 @@ pub const BeamChain = struct {
 
                 if (self.is_aggregator_enabled.load(.acquire)) {
                     // Process validated attestation
-                    self.onGossipAttestation(signed_attestation) catch |err| {
+                    self.onGossipAttestation(signed_attestation, external_mutex) catch |err| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                         self.logger.err("attestation processing error: {any}", .{err});
                         return err;
@@ -872,7 +872,7 @@ pub const BeamChain = struct {
                     }
                 };
 
-                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
+                self.onGossipAggregatedAttestation(signed_aggregation, external_mutex) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
                         // Propagate unknown block errors to node.zig for context-aware logging
@@ -1612,61 +1612,107 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
-        // Validation is done upstream in onGossip before this function is called.
+    /// Process a gossip individual attestation. Validation that requires chain
+    /// state is done upstream in `onGossip` before this function is called;
+    /// here we verify the XMSS signature and update the forkchoice tracker.
+    ///
+    /// `external_mutex` (issue #786 phase 2b): when non-null, we release the
+    /// caller's mutex around the XMSS verify call so other libxev / libp2p
+    /// threads (notably `onInterval`) can make progress while the FFI verify
+    /// runs. Per devnet metrics this single call accumulates ~33ms × 11k
+    /// events ≈ 375s of mutex hold per session under the gossip path.
+    ///
+    /// Thread-safety contract during the unlocked window:
+    ///   - Validator pubkey bytes are copied into a local 52-byte buffer
+    ///     before unlocking, so a concurrent state prune cannot turn the
+    ///     `state.validators` slice into a use-after-free.
+    ///   - `xmss.verifySsz` reads the local pubkey + message + signature
+    ///     buffers only. No shared state.
+    pub fn onGossipAttestation(
+        self: *Self,
+        signedAttestation: networks.AttestationGossip,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !void {
         const attestation = signedAttestation.message.toAttestation();
 
+        // Phase 1 (locked): snapshot validator pubkey bytes from state.
         const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        const validators = state.validators.constSlice();
+        const validator_index: usize = @intCast(signedAttestation.message.validator_id);
+        if (validator_index >= validators.len) {
+            return types.StateTransitionError.InvalidValidatorId;
+        }
+        var pubkey_snapshot: types.Bytes52 = undefined;
+        @memcpy(&pubkey_snapshot, validators[validator_index].getAttestationPubkey());
 
-        try stf.verifySingleAttestation(
-            self.allocator,
-            state,
-            @intCast(signedAttestation.message.validator_id),
-            &signedAttestation.message.message,
-            &signedAttestation.message.signature,
-        );
+        const att_data = signedAttestation.message.message;
+        const sig_bytes = signedAttestation.message.signature;
 
+        // Compute the message hash under lock — the allocator is thread-safe
+        // (GPA in production) but doing this small step inside the locked
+        // window keeps the unlocked window dedicated to the FFI verify call.
+        var message_hash: [32]u8 = undefined;
+        try zeam_utils.hashTreeRoot(types.AttestationData, att_data, &message_hash, self.allocator);
+        const epoch: u32 = @intCast(att_data.slot);
+
+        // Phase 2 (unlocked): XMSS verify.
+        if (external_mutex) |m| m.unlock();
+        const verify_timer = zeam_metrics.zeam_chain_gossip_attestation_verify_unlocked_seconds.start();
+        // Mirror the verifySingleAttestation metric semantics so dashboards
+        // built on the existing PQ-sig counters still observe gossip
+        // attestations.
+        zeam_metrics.metrics.lean_pq_sig_attestation_signatures_total.incr();
+        const xmss_timer = zeam_metrics.lean_pq_sig_attestation_verification_time_seconds.start();
+
+        const verify_result: anyerror!void = blk: {
+            xmss.verifySsz(&pubkey_snapshot, &message_hash, epoch, &sig_bytes) catch |err| {
+                break :blk err;
+            };
+            break :blk {};
+        };
+
+        _ = xmss_timer.observe();
+        _ = verify_timer.observe();
+        if (external_mutex) |m| m.lock();
+
+        verify_result catch |err| {
+            zeam_metrics.metrics.lean_pq_sig_attestation_signatures_invalid_total.incr();
+            return err;
+        };
+        zeam_metrics.metrics.lean_pq_sig_attestation_signatures_valid_total.incr();
+
+        // Phase 3 (locked): forkchoice tracker mutation.
         return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
-    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate the attestation data first (same rules as individual gossip attestations)
+    /// Process a gossip aggregated attestation. Same external_mutex contract
+    /// as `onGossipAttestation`: when non-null, the caller's lock is released
+    /// for the XMSS aggregate-verify FFI call. Per devnet metrics aggregate
+    /// verify is ~59ms mean and runs hundreds of times per session, so
+    /// hoisting it materially shrinks `onGossip`'s mutex hold tail.
+    ///
+    /// Thread-safety contract during the unlocked window:
+    ///   - Validator pubkey HANDLES are obtained via `PublicKeyCache.getOrPut`
+    ///     which is internally synchronized (#798). Handles are stable for
+    ///     the lifetime of the cache (== chain), so a concurrent state prune
+    ///     cannot invalidate them.
+    ///   - The participant message hash is computed under lock and copied
+    ///     into a local buffer before unlocking.
+    ///   - `proof.verify` reads only the snapshotted handles + message hash
+    ///     + the proof bytes (which live in `signedAggregation`, owned by
+    ///     the caller for the duration of this call).
+    pub fn onGossipAggregatedAttestation(
+        self: *Self,
+        signedAggregation: types.SignedAggregatedAttestation,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !void {
+        // Phase 1 (locked): validate + build pubkey snapshot.
         try self.validateAttestationData(signedAggregation.data, false);
-
-        try self.verifyAggregatedAttestation(signedAggregation);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
-        defer self.allocator.free(validator_ids);
-        for (validator_indices.items, 0..) |vi, i| {
-            validator_ids[i] = @intCast(vi);
-        }
-
-        // Update attestation trackers for gossip attestations so fork choice sees these votes
-        for (validator_ids) |validator_id| {
-            const attestation = types.Attestation{
-                .validator_id = validator_id,
-                .data = signedAggregation.data,
-            };
-            self.forkChoice.onAttestation(attestation, false) catch |err| {
-                self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
-                    validator_id, err,
-                });
-            };
-        }
-
-        try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
-    }
-
-    fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
         const data = signedAggregation.data;
-        const proof = signedAggregation.proof;
-
-        var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
-        defer validator_indices.deinit(self.allocator);
-
         const key_state = self.states.get(data.target.root) orelse return error.MissingState;
         const validators = key_state.validators.constSlice();
 
@@ -1681,16 +1727,62 @@ pub const BeamChain = struct {
             const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
                 return error.InvalidBlockSignatures;
             };
-            try public_keys.append(self.allocator, pk_handle);
+            public_keys.appendAssumeCapacity(pk_handle);
         }
 
         var message_hash: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.AttestationData, data, &message_hash, self.allocator);
-
         const epoch: u64 = data.slot;
-        proof.verify(public_keys.items, &message_hash, epoch) catch {
-            return error.InvalidAggregationSignature;
+
+        // Phase 2 (unlocked): XMSS aggregate verify.
+        if (external_mutex) |m| m.unlock();
+        const verify_timer = zeam_metrics.zeam_chain_gossip_aggregation_verify_unlocked_seconds.start();
+        const agg_verify_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
+
+        const verify_result: anyerror!void = blk: {
+            signedAggregation.proof.verify(public_keys.items, &message_hash, epoch) catch |err| {
+                break :blk err;
+            };
+            break :blk {};
         };
+
+        _ = agg_verify_timer.observe();
+        _ = verify_timer.observe();
+        if (external_mutex) |m| m.lock();
+
+        verify_result catch |err| {
+            zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
+            // Map the bare-FFI error to the named error the caller's switch
+            // expects (the previous private helper returned
+            // `error.InvalidAggregationSignature`).
+            switch (err) {
+                error.InvalidAggregateSignature => return error.InvalidAggregationSignature,
+                else => return err,
+            }
+        };
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_valid_total.incr();
+
+        // Phase 3 (locked): forkchoice mutation.
+        var validator_ids = try self.allocator.alloc(types.ValidatorIndex, validator_indices.items.len);
+        defer self.allocator.free(validator_ids);
+        for (validator_indices.items, 0..) |vi, i| {
+            validator_ids[i] = @intCast(vi);
+        }
+
+        // Update attestation trackers for gossip attestations so fork choice sees these votes
+        for (validator_ids) |validator_id| {
+            const attestation = types.Attestation{
+                .validator_id = validator_id,
+                .data = data,
+            };
+            self.forkChoice.onAttestation(attestation, false) catch |err| {
+                self.logger.debug("skip tracker update for aggregated attestation validator={d}: {any}", .{
+                    validator_id, err,
+                });
+            };
+        }
+
+        try self.forkChoice.storeAggregatedPayload(&data, signedAggregation.proof, false);
     }
 
     pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
@@ -2621,7 +2713,7 @@ test "attestation processing - valid block attestation" {
     };
 
     // Process attestation through chain (this validates and then processes)
-    try beam_chain.onGossipAttestation(gossip_attestation);
+    try beam_chain.onGossipAttestation(gossip_attestation, null);
 
     // Verify the attestation data was recorded for aggregation
     try std.testing.expect(beam_chain.forkChoice.attestation_signatures.getPtr(valid_attestation.message) != null);
