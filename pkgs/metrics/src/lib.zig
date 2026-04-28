@@ -98,6 +98,12 @@ const Metrics = struct {
     zeam_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
     zeam_compact_attestations_input_total: CompactAttestationsInputCounter,
     zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
+    // BeamNode mutex contention metrics (issue #786)
+    // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
+    // Hold time = how long the callsite kept the mutex locked.
+    // Labeled by callsite so we can attribute stalls to onInterval vs onGossip vs req-resp paths.
+    lean_node_mutex_wait_time_seconds: NodeMutexWaitTimeHistogram,
+    lean_node_mutex_hold_time_seconds: NodeMutexHoldTimeHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -166,6 +172,12 @@ const Metrics = struct {
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
     const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
     const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
+    // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
+    // both fast acquisitions and long stalls observed when STF runs under the lock.
+    const NodeMutexLabel = struct { site: []const u8 };
+    const NODE_MUTEX_BUCKETS = [_]f32{ 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2 };
+    const NodeMutexWaitTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
+    const NodeMutexHoldTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -497,6 +509,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
         .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
+        // BeamNode mutex contention metrics (issue #786)
+        .lean_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, "lean_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite" }, .{}),
+        .lean_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, "lean_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
