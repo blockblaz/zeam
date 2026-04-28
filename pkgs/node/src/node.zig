@@ -331,7 +331,9 @@ pub const BeamNode = struct {
             },
         }
 
-        const result = self.chain.onGossip(data, sender_peer_id) catch |err| {
+        // Pass our mutex so chain.onBlock can release it for the verify + STF
+        // window. See issue #786 + chain.onBlock doc comment for the contract.
+        const result = self.chain.onGossip(data, sender_peer_id, &self.mutex) catch |err| {
             switch (err) {
                 // Block rejected because it's before finalized - drop it and prune any cached
                 // descendants we might still be holding onto.
@@ -534,7 +536,7 @@ pub const BeamNode = struct {
                 );
 
                 const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
-                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }) catch |err| {
+                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }, &self.mutex) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
                         self.logger.debug(
@@ -776,8 +778,9 @@ pub const BeamNode = struct {
                 return;
             }
 
-            // Try to add the block to the chain
-            const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
+            // Try to add the block to the chain. Pass our mutex so the verify
+            // + STF window runs unlocked.
+            const missing_roots = self.chain.onBlock(signed_block.*, .{}, &self.mutex) catch |err| {
                 // Check if the error is due to missing parent
                 if (err == chainFactory.BlockProcessingError.MissingPreState) {
                     // Check if we've hit the max depth
@@ -1473,10 +1476,13 @@ pub const BeamNode = struct {
             });
         }
 
+        // Locally produced block: post_state is already computed and provided
+        // via the cache, so chain.onBlock skips the verify + STF window
+        // entirely. Pass null — there is nothing to release the lock around.
         const missing_roots = try self.chain.onBlock(signed_block, .{
             .postState = self.chain.states.get(block_root),
             .blockRoot = block_root,
-        });
+        }, null);
         defer self.allocator.free(missing_roots);
 
         self.fetchBlockByRoots(missing_roots, 0) catch |err| {
@@ -1905,7 +1911,7 @@ test "Node: processCachedDescendants basic flow" {
 
     // Advance forkchoice time to block1 slot and add block1 to the chain
     try node.chain.forkChoice.onInterval(block1_slot * constants.INTERVALS_PER_SLOT, false);
-    const missing_roots1 = try node.chain.onBlock(block1, .{});
+    const missing_roots1 = try node.chain.onBlock(block1, .{}, null);
     defer allocator.free(missing_roots1);
 
     // Verify block1 is now in the chain
@@ -1914,7 +1920,13 @@ test "Node: processCachedDescendants basic flow" {
     // Now call processCachedDescendants with block1_root. This should discover
     // cached block2 as a descendant and process it automatically.
     try node.chain.forkChoice.onInterval(block2_slot * constants.INTERVALS_PER_SLOT, false);
+    // processCachedDescendants → chain.onBlock(...&self.mutex) expects the
+    // mutex to be held by the calling thread (production callers run under
+    // the BeamNode mutex). Mirror that invariant in the test so the
+    // unlock/relock dance inside chain.onBlock succeeds.
+    node.mutex.lock();
     node.processCachedDescendants(block1_root);
+    node.mutex.unlock();
 
     // Verify block2 was removed from cache because it was successfully processed
     try std.testing.expect(!node.network.hasFetchedBlock(block2_root));

@@ -24,9 +24,16 @@ pub const HashSigPrivateKey = hashsig.HashSigPrivateKey;
 
 /// Cache for validator public keys to avoid repeated SSZ deserialization.
 /// Maps validator index to the deserialized public key handle.
-/// Thread-safety: NOT thread-safe. Use one cache per chain instance.
+///
+/// Thread-safety: internally synchronized via `mutex`. `getOrPut`, `contains`
+/// and `count` are safe to call from multiple threads concurrently. The
+/// underlying Rust `hashsig_public_key_from_ssz` FFI call is not documented
+/// as `Send`, so we serialize first-time deserialization under the mutex too.
+/// In steady state every validator pubkey is cached, so the lock is taken
+/// only for short hashmap-lookup windows.
 pub const PublicKeyCache = struct {
     cache: std.AutoHashMap(usize, PublicKey),
+    mutex: std.Thread.Mutex = .{},
     allocator: Allocator,
 
     const Self = @This();
@@ -51,11 +58,16 @@ pub const PublicKeyCache = struct {
     /// Get a cached public key handle, deserializing from bytes if not cached.
     /// Returns the raw HashSigPublicKey pointer for FFI use.
     pub fn getOrPut(self: *Self, validator_index: usize, pubkey_bytes: []const u8) HashSigError!*const HashSigPublicKey {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.cache.get(validator_index)) |cached| {
             return cached.handle;
         }
 
-        // Deserialize and cache
+        // Deserialize and cache. The Rust FFI call below is not documented as
+        // `Send`, so we keep it inside the cache mutex to serialize concurrent
+        // first-time deserialization.
         var pubkey = try PublicKey.fromBytes(pubkey_bytes);
         errdefer pubkey.deinit(); // Free the Rust handle if cache.put fails
         try self.cache.put(validator_index, pubkey);
@@ -65,12 +77,16 @@ pub const PublicKeyCache = struct {
     }
 
     /// Check if a validator's public key is already cached
-    pub fn contains(self: *const Self, validator_index: usize) bool {
+    pub fn contains(self: *Self, validator_index: usize) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.cache.contains(validator_index);
     }
 
     /// Get the number of cached public keys
-    pub fn count(self: *const Self) usize {
+    pub fn count(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.cache.count();
     }
 };

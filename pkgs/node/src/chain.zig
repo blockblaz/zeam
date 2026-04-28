@@ -292,9 +292,14 @@ pub const BeamChain = struct {
                     .{ queued_slot, &block_root, fc_time },
                 );
 
+                // Pending-block replay runs inside `BeamNode.onInterval`, which
+                // already holds the BeamNode mutex. Releasing it here would
+                // require interval ordering protection that is not currently
+                // in place. Pass null until a follow-up PR addresses the
+                // tick-replay path. Pending-block replay is rare in practice.
                 const missing_roots = self.onBlock(queued_block, .{
                     .blockRoot = block_root,
-                }) catch |err| {
+                }, null) catch |err| {
                     self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
                     continue;
                 };
@@ -677,7 +682,12 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !GossipProcessingResult {
+    pub fn onGossip(
+        self: *Self,
+        data: *const networks.GossipMessage,
+        sender_peer_id: []const u8,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
@@ -737,7 +747,7 @@ pub const BeamChain = struct {
 
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
-                    }) catch |err| {
+                    }, external_mutex) catch |err| {
                         // we will not catch and enqueue block for FutureSlot error because this error here means
                         // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
                         // clock skew or race between oninterval and block arrival
@@ -882,8 +892,35 @@ pub const BeamChain = struct {
     // import block assuming it is gossip validated or synced
     // this onBlock corresponds to spec's forkchoice's onblock with some functionality split between this and
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
-    // Returns a list of missing block roots that need to be fetched from the network
-    pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
+    // Returns a list of missing block roots that need to be fetched from the network.
+    //
+    // `external_mutex`: optional pointer to a caller-owned mutex (typically
+    // `BeamNode.mutex`) that is currently held by the caller. When provided,
+    // `onBlock` releases it for the CPU-bound verify + STF window so other
+    // libxev / libp2p threads can make progress (e.g. `onInterval`'s tick is
+    // not stalled by a slow block import). The lock is re-acquired before
+    // chain mutation resumes. See issue #786.
+    //
+    // Thread-safety contract during the unlocked window:
+    //   - `self.public_key_cache` is internally synchronized.
+    //   - `self.thread_pool` is shared across other unlocked callers (already
+    //     thread-safe by construction).
+    //   - `self.allocator` must be a thread-safe allocator (the CLI uses GPA).
+    //   - The cloned `cpost_state` is local to this call — no other thread
+    //     can observe it before we re-acquire the mutex.
+    //   - `pre_state` is only read for `validators` snapshot during signature
+    //     verification, and the local `cpost_state` clone is used as the
+    //     argument so a concurrent state map mutation does not affect us.
+    //
+    // Callers that do NOT hold an outer mutex (tests, internal replays where
+    // the lock dance would be wasteful) pass `null` and `onBlock` runs
+    // synchronously.
+    pub fn onBlock(
+        self: *Self,
+        signedBlock: types.SignedBlock,
+        blockInfo: CachedProcessedBlockInfo,
+        external_mutex: ?*std.Thread.Mutex,
+    ) ![]types.Root {
         const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 
         const block = signedBlock.block;
@@ -896,7 +933,8 @@ pub const BeamChain = struct {
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
-            // 1. get parent state
+            // 1. get parent state and clone it under the caller's lock so the
+            // CPU-bound verify + STF can operate on a private snapshot.
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
             // If sszClone or anything after fails, destroy the outer allocation.
@@ -907,21 +945,46 @@ pub const BeamChain = struct {
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
 
-            // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
-            // rejected without mutating post state). Uses the shared thread pool when available to
-            // parallelize per-attestation verification across CPU workers.
-            if (self.thread_pool) |pool| {
-                try stf.verifySignaturesParallel(self.allocator, pre_state, &signedBlock, &self.public_key_cache, pool);
-            } else {
-                try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
-            }
+            // 2. Release the caller's mutex (if any) for the CPU-bound phase.
+            // Verify + STF read only `cpost_state` (validators snapshot) and
+            // mutate `cpost_state` in place. They do not touch any other
+            // shared chain state. See doc comment above for invariants.
+            if (external_mutex) |m| m.unlock();
+            const compute_timer = zeam_metrics.zeam_chain_onblock_compute_unlocked_seconds.start();
 
-            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
-            try stf.apply_transition(self.allocator, cpost_state, block, .{
-                .logger = self.stf_logger,
-                .validSignatures = true,
-                .rootToSlotCache = &self.root_to_slot_cache,
-            });
+            // Encapsulate the unlocked work so we re-acquire on every exit
+            // path (success or error) before propagating control.
+            const compute_result = computeUnlocked: {
+                // 2a. verify XMSS signatures (independent step; placed before STF so an invalid block is
+                // rejected without mutating post state). Uses the shared thread pool when available to
+                // parallelize per-attestation verification across CPU workers. Both verifySignatures
+                // variants accept `pre_state` for the validator set; we pass the cloned `cpost_state`
+                // here because at this point its `validators` slice is byte-identical to `pre_state`'s
+                // (STF has not run yet) and using the local clone removes any dependency on the live
+                // `pre_state` pointer for the duration of the unlocked phase.
+                if (self.thread_pool) |pool| {
+                    stf.verifySignaturesParallel(self.allocator, cpost_state, &signedBlock, &self.public_key_cache, pool) catch |err| break :computeUnlocked err;
+                } else {
+                    stf.verifySignatures(self.allocator, cpost_state, &signedBlock, &self.public_key_cache) catch |err| break :computeUnlocked err;
+                }
+
+                // 2b. apply state transition assuming signatures are valid (STF does not re-verify).
+                stf.apply_transition(self.allocator, cpost_state, block, .{
+                    .logger = self.stf_logger,
+                    .validSignatures = true,
+                    .rootToSlotCache = &self.root_to_slot_cache,
+                }) catch |err| break :computeUnlocked err;
+
+                break :computeUnlocked {};
+            };
+
+            _ = compute_timer.observe();
+            // 3. Re-acquire caller's mutex BEFORE returning (success or error)
+            // so chain state mutation below proceeds under the same invariant
+            // the caller assumed at entry.
+            if (external_mutex) |m| m.lock();
+
+            try compute_result;
             break :computedstate cpost_state;
         };
         // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
@@ -1890,7 +1953,7 @@ test "process and add mock blocks into a node's chain" {
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false }, null);
         allocator.free(missing_roots);
 
         try std.testing.expect(beam_chain.forkChoice.protoArray.nodes.items.len == i + 1);
@@ -1969,7 +2032,7 @@ test "printSlot output demonstration" {
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{}, null);
         allocator.free(missing_roots);
     }
 
@@ -2045,7 +2108,7 @@ test "buildTreeVisualization integration test" {
         const current_slot = block.slot;
 
         try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{}, null);
         allocator.free(missing_roots);
     }
 
@@ -2134,7 +2197,7 @@ test "attestation validation - comprehensive" {
         const signed_block = mock_chain.blocks[i];
         const block = signed_block.block;
         try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        const missing_roots = try beam_chain.onBlock(signed_block, .{}, null);
         allocator.free(missing_roots);
     }
 
@@ -2410,7 +2473,7 @@ test "attestation validation - gossip vs block future slot handling" {
     // Add one block (slot 1)
     const block = mock_chain.blocks[1];
     try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
-    const missing_roots = try beam_chain.onBlock(block, .{});
+    const missing_roots = try beam_chain.onBlock(block, .{}, null);
     allocator.free(missing_roots);
 
     // Current time is at slot 1, create attestation for slot 2 (next slot)
@@ -2513,7 +2576,7 @@ test "attestation processing - valid block attestation" {
     for (1..mock_chain.blocks.len) |i| {
         const block = mock_chain.blocks[i];
         try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(block, .{});
+        const missing_roots = try beam_chain.onBlock(block, .{}, null);
         allocator.free(missing_roots);
     }
 
@@ -2616,7 +2679,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
         const signed_block = mock_chain.blocks[i];
         const block = signed_block.block;
         try beam_chain.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false });
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false }, null);
         allocator.free(missing_roots);
     }
 

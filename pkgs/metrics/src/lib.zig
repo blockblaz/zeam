@@ -29,6 +29,7 @@ var g_initialized: bool = false;
 
 const Metrics = struct {
     zeam_chain_onblock_duration_seconds: ChainHistogram,
+    zeam_chain_onblock_compute_unlocked_seconds: ChainHistogram,
     lean_head_slot: LeanHeadSlotGauge,
     lean_latest_justified_slot: LeanLatestJustifiedSlotGauge,
     lean_latest_finalized_slot: LeanLatestFinalizedSlotGauge,
@@ -235,6 +236,12 @@ fn observeChainOnblock(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeChainOnblockComputeUnlocked(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return; // No-op if not initialized
+    const histogram: *Metrics.ChainHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 fn observeStateTransition(ctx: ?*anyopaque, value: f32) void {
     const histogram_ptr = ctx orelse return; // No-op if not initialized
     const histogram: *Metrics.StateTransitionHistogram = @ptrCast(@alignCast(histogram_ptr));
@@ -367,6 +374,10 @@ pub var zeam_chain_onblock_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeChainOnblock,
 };
+pub var zeam_chain_onblock_compute_unlocked_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeChainOnblockComputeUnlocked,
+};
 pub var lean_state_transition_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeStateTransition,
@@ -467,6 +478,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
+        .zeam_chain_onblock_compute_unlocked_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_compute_unlocked_seconds", .{ .help = "Time spent in chain.onBlock with the BeamNode mutex released (signature verification + STF). Only emitted when caller passes a mutex to release; subset of zeam_chain_onblock_duration_seconds." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
         .lean_latest_justified_slot = Metrics.LeanLatestJustifiedSlotGauge.init("lean_latest_justified_slot", .{ .help = "Latest justified slot" }, .{}),
         .lean_latest_finalized_slot = Metrics.LeanLatestFinalizedSlotGauge.init("lean_latest_finalized_slot", .{ .help = "Latest finalized slot" }, .{}),
@@ -555,6 +567,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     // Set context for histogram wrappers (observe functions already assigned at compile time)
     zeam_chain_onblock_duration_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_duration_seconds);
+    zeam_chain_onblock_compute_unlocked_seconds.context = @ptrCast(&metrics.zeam_chain_onblock_compute_unlocked_seconds);
     lean_state_transition_time_seconds.context = @ptrCast(&metrics.lean_state_transition_time_seconds);
     lean_state_transition_slots_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_slots_processing_time_seconds);
     lean_state_transition_block_processing_time_seconds.context = @ptrCast(&metrics.lean_state_transition_block_processing_time_seconds);
