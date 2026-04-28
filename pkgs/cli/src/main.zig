@@ -294,7 +294,8 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
                 return err;
             };
-            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+            var clock_logger_config = utils_lib.getLoggerConfig(console_log_level, null);
+            var clock = Clock.init(gpa.allocator(), genesis, &loop, &clock_logger_config) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize clock");
                 return err;
             };
@@ -583,7 +584,7 @@ fn mainInner() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, &logger1_config);
 
             // Shared worker pool for CPU-bound chain work (attestation signature verification).
             // One pool is shared across all nodes in the process so total worker threads stay bounded
