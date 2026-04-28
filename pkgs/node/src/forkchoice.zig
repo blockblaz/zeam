@@ -307,6 +307,7 @@ pub const ForkChoice = struct {
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
+    last_node_tick_time_ms: ?i64,
 
     const Self = @This();
 
@@ -379,6 +380,7 @@ pub const ForkChoice = struct {
             // (slot > 0) start in `initing` and become `ready` once the first real justified
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
+            .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -823,6 +825,14 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        const time_now_ms: i64 = std.time.milliTimestamp();
+        if (self.last_node_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+        }
+        self.last_node_tick_time_ms = time_now_ms;
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
