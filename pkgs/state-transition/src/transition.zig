@@ -200,6 +200,12 @@ pub fn verifySignaturesParallel(
         public_keys: []*const xmss.HashSigPublicKey,
         message_hash: [32]u8,
         epoch: u64,
+        // Per-task elapsed time (nanoseconds) measured inside the worker. We
+        // record this so the post-pool emit can call `observe()` once per
+        // attestation, matching the granularity of the serial path. Without
+        // per-task timing the histogram would receive one batch sample per
+        // block and percentiles would diverge from the serial baseline.
+        elapsed_ns: u64 = 0,
         result: ?anyerror = null,
         verified: bool = false,
     };
@@ -283,21 +289,33 @@ pub fn verifySignaturesParallel(
         fn runOne(task: *VerifyTask, err_flag: *std.atomic.Value(bool)) void {
             if (err_flag.load(.acquire)) return;
             task.verified = true;
+            // Time the FFI verify call with a monotonic Timer so the per-task
+            // sample matches what the serial path observes. `Timer.start()`
+            // only fails on platforms without a monotonic clock (none of the
+            // supported zeam targets) — fall through with elapsed_ns=0 if it
+            // ever does, rather than poisoning the result with garbage.
+            var timer = std.time.Timer.start() catch null;
             task.signature_proof.verify(task.public_keys, &task.message_hash, task.epoch) catch |err| {
+                if (timer) |*t| task.elapsed_ns = t.read();
                 task.result = err;
                 err_flag.store(true, .release);
+                return;
             };
+            if (timer) |*t| task.elapsed_ns = t.read();
         }
     };
 
     var any_err = std.atomic.Value(bool).init(false);
-    const batch_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
     try thread_pool.scope(Runner.runScope, .{ tasks, &any_err });
-    _ = batch_timer.observe();
 
-    // Collect metrics and surface the first error (deterministic: index order).
+    // Emit one histogram sample per verified task so the parallel path's
+    // percentiles match the serial path (which observes once per
+    // attestation). Mixing the two granularities into the same histogram
+    // would silently distort P50/P99 across deployments.
     for (tasks) |*task| {
         if (!task.verified) continue;
+        const elapsed_s: f32 = @as(f32, @floatFromInt(task.elapsed_ns)) / std.time.ns_per_s;
+        zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.record(elapsed_s);
         if (task.result) |_| {
             zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_invalid_total.incr();
         } else {
