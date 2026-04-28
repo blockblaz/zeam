@@ -91,6 +91,7 @@ pub const NodeOptions = struct {
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
+    chain_spec: ?[]const u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -180,10 +181,19 @@ pub const Node = struct {
         self.api_server_handle = null;
         self.metrics_server_handle = null;
 
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
+        // If path is specified load from it, otherwise use default settings
+        const chain_spec_owned = self.options.chain_spec != null;
+        const chain_spec = if (self.options.chain_spec) |path|
+            std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+                self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
+                return err;
+            }
+        else
             \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
+
+        defer if (chain_spec_owned) allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
@@ -713,6 +723,7 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.chain_spec = node_cmd.@"chain-spec";
     opts.is_aggregator = node_cmd.@"is-aggregator";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
