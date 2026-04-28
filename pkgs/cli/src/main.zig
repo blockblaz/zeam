@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const xev = @import("xev").Dynamic;
 const Multiaddr = @import("multiaddr").Multiaddr;
 
@@ -585,6 +586,19 @@ fn mainInner() !void {
             var clock = try allocator.create(Clock);
             clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, &logger1_config);
 
+            // Shared worker pool for CPU-bound chain work (attestation signature verification).
+            // One pool is shared across all nodes in the process so total worker threads stay bounded
+            // regardless of the number of nodes in the simulation.
+            const cpu_count = std.Thread.getCpuCount() catch 2;
+            const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
+            const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
+            const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+            const thread_pool = try ThreadPool.init(.{
+                .allocator = allocator,
+                .thread_count = @intCast(worker_count),
+            });
+            defer thread_pool.deinit();
+
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
             var validator_ids_2 = [_]usize{1};
@@ -623,6 +637,7 @@ fn mainInner() !void {
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
                 .is_aggregator = beamcmd.@"is-aggregator",
+                .thread_pool = thread_pool,
             });
 
             if (api_server_handle) |handle| {
@@ -643,6 +658,7 @@ fn mainInner() !void {
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
                 .is_aggregator = false,
+                .thread_pool = thread_pool,
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -661,6 +677,7 @@ fn mainInner() !void {
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
                 .is_aggregator = false,
+                .thread_pool = thread_pool,
             });
 
             // Delayed runner - starts both network3 and node3 together
