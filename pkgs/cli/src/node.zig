@@ -201,8 +201,26 @@ pub const Node = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
+
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
         chain_options.genesis_time = options.genesis_spec.genesis_time;
+
+        if (chain_spec_owned) {
+            if (chain_options.preset == null) {
+                self.logger.err("chain spec: 'preset' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.name == null or chain_options.name.?.len == 0) {
+                self.logger.err("chain spec: 'name' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.fork_digest == null or chain_options.fork_digest.?.len != 8) {
+                self.logger.err("chain spec: 'fork_digest' field must be 4 bytes (8 hex characters)", .{});
+                return error.InvalidChainSpec;
+            }
+        }
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
