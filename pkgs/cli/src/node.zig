@@ -230,7 +230,7 @@ pub const Node = struct {
             .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
-        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
         errdefer self.clock.deinit(allocator);
 
         var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);

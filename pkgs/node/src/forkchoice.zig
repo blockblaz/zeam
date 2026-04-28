@@ -311,6 +311,7 @@ pub const ForkChoice = struct {
     status: ForkChoiceStatus,
     // Optional shared worker pool used for CPU-heavy attestation compaction.
     thread_pool: ?*ThreadPool = null,
+    last_node_tick_time_ms: ?i64,
 
     const Self = @This();
 
@@ -384,6 +385,7 @@ pub const ForkChoice = struct {
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
             .thread_pool = opts.thread_pool,
+            .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -828,6 +830,14 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        const time_now_ms: i64 = std.time.milliTimestamp();
+        if (self.last_node_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+        }
+        self.last_node_tick_time_ms = time_now_ms;
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
@@ -2259,6 +2269,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2613,6 +2624,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
 
     return .{
@@ -3598,6 +3610,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
