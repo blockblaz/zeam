@@ -17,6 +17,7 @@ const event_broadcaster = api.event_broadcaster;
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
 const xmss = @import("@zeam/xmss");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
@@ -53,6 +54,9 @@ pub const ChainOpts = struct {
     // via `setAggregator`; the CLI `--is-aggregator` flag only supplies the
     // initial value. See `BeamChain.is_aggregator_enabled`.
     is_aggregator: bool = false,
+    // Optional shared worker pool for CPU-bound work (signature verification).
+    // When null, the chain falls back to the serial code paths.
+    thread_pool: ?*ThreadPool = null,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -126,6 +130,9 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
+    // Optional worker pool for parallelizing CPU-bound steps (currently: attestation signature
+    // verification). Owned by the caller (e.g. the CLI's main), not by the chain.
+    thread_pool: ?*ThreadPool = null,
 
     // Callback for pruning cached blocks after finalization advances
     prune_cached_blocks_ctx: ?*anyopaque = null,
@@ -151,6 +158,7 @@ pub const BeamChain = struct {
             .config = opts.config,
             .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
+            .thread_pool = opts.thread_pool,
         });
 
         var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
@@ -183,6 +191,7 @@ pub const BeamChain = struct {
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
+            .thread_pool = opts.thread_pool,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -898,9 +907,14 @@ pub const BeamChain = struct {
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
 
-            // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
-            // Use public key cache to avoid repeated SSZ deserialization of validator public keys
-            try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
+            // rejected without mutating post state). Uses the shared thread pool when available to
+            // parallelize per-attestation verification across CPU workers.
+            if (self.thread_pool) |pool| {
+                try stf.verifySignaturesParallel(self.allocator, pre_state, &signedBlock, &self.public_key_cache, pool);
+            } else {
+                try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            }
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
