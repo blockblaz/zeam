@@ -2264,6 +2264,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2618,6 +2619,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
 
     return .{
@@ -3603,6 +3605,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
