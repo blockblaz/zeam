@@ -5,7 +5,7 @@ Tracking issue: #803
 Status: **DESIGN — REVISION 2 (review feedback applied)**
 Author: zclawz bot (under direction of @ch4r10t33r, @gr3999)
 
-Changelog vs. r1:
+Changelog vs. r1 (Partha #1–#7):
 - Added §State-pointer lifetime (Partha #1) — slice (a) ships `BorrowedState` wrapper; refcount deferred but the API contract is fixed now.
 - Added §Long-hold FFI paths (Partha #2) — `aggregate` and `getProposalAttestations` now snapshot-then-release explicitly.
 - Added §Single-writer claim retracted (Partha #3) — `events_lock` introduced for `last_emitted_*` and `cached_finalized_state`.
@@ -13,6 +13,16 @@ Changelog vs. r1:
 - Split `caches_lock` into `pubkey_cache_lock` + `root_to_slot_lock` (Partha #5).
 - Folded (a-1) into (a-2) (Partha #6); LockedMap unit tests still required.
 - Reworked `processPendingBlocks` to one-at-a-time `orderedRemove(0)` (Partha #7).
+
+Changelog vs. r2 (Partha #8–#13 + open-question responses):
+- Added §Lock-dance ownership note (Partha #8) — (a-2) absorbs the cognitive load that previously lived in `external_mutex`; LOC estimate revised to ~1000+, and the slice's review burden lives here.
+- Added §Cross-thread chain readers (Partha #9) — enumerates current API/metrics/event-broadcaster reads, and reserves the `/eth/v1/*` HTTP surface for an explicit follow-up section.
+- Added §Lock-hierarchy semantics clarification (Partha #10) — the rule is about *simultaneous* hold order, not all-time acquire order; sequential acquire/release of any lock is fine.
+- Reaffirmed metric migration plan (Partha #11) — emit both old and new metrics for one release; folded into (a-2) since it touches the same labels.
+- Added §Stress test plan (Partha #12) — (a-3) gets gossip-flood + RPC concurrency, 10-node devnet under jitter, reorg + finalization stress.
+- Added §`connected_peers` access pattern (Partha #13) — atomic counter for hot-path `count()`, `RwLock` for the few `iterator()` callers, mutex sized for adds/removes.
+- Resolved open questions: (1) refcount required before slice (c) goes off-thread; (2) `connected_peers` → atomic count + RwLock for iterator; (3) metric migration in (a-2); (4) drop `external_mutex` outright, no null-only transitional release.
+- Added §Long-term direction — single chain-mutator thread + queues vs. fine-grained locks. Slice (a) lock-hierarchy work survives either way; per-resource exclusive write locks become dead weight if mutation marshalls. Captured as a #803 question, not slice (a)'s decision.
 
 ## Why a design doc first
 
@@ -68,12 +78,13 @@ Only forkchoice has its own per-resource lock today. Everything else is "BeamNod
 6. BeamChain.forkChoice            (its own RwLock — innermost)
 ```
 
-Rules:
-- Higher number = inner lock. Acquire 1 → 2 → 3 → 4 → 5* → 6 only. Never reverse.
-- A holder of lock N can take lock M only if M > N.
-- The 5a/5b/5c locks are siblings: they sit at the same tier but **must not be held simultaneously** (they protect independent resources). Treat them as mutually exclusive within a single critical section to avoid deadlock-via-different-orderings.
+Rules (clarified per Partha #10):
+- **Scope:** the rule applies to locks held *simultaneously*. A code path that does `lock(forkChoice) ... unlock(forkChoice); lock(states) ... unlock(states)` sequentially is fine even though it appears to acquire 6 before 3 — they are never co-held.
+- A holder of lock N can additionally take lock M (i.e. nest M inside N's critical section) only if M > N. Never the reverse.
+- The 5a/5b/5c locks are siblings: they sit at the same tier but **must not be held simultaneously** (they protect independent resources). Treat them as mutually exclusive within a single nesting depth to avoid deadlock-via-different-orderings.
 - The vast majority of code paths take **at most one** of these. The hierarchy exists for the few paths that legitimately span multiple resources.
 - Finalization advancement is the only known multi-resource path that may legitimately need (1).
+- (`onBlock` legitimately touches multiple locks sequentially — forkchoice read for parent lookup, then states for STF commit, then forkchoice write for head update. This is sequential, not nested, and stays legal.)
 
 ### Resource-by-resource design
 
@@ -170,6 +181,21 @@ Fix: add `events_lock: std.Thread.Mutex` (lock 5c) covering `last_emitted_justif
 
 Alternative considered: route all event emission through a single-writer queue drained by a dedicated thread. Rejected for slice (a) — adds a thread before we need one. Revisit in slice (c) when the followup worker lands.
 
+#### Cross-thread chain readers (Partha #9)
+
+Existing and forward-looking surfaces that read chain/network state from a thread other than libxev/libp2p-bridge:
+
+| Surface | File | What it reads | Status today | After slice (a) |
+|---|---|---|---|---|
+| Prometheus `/metrics` writer | `pkgs/api/src/lib.zig` (HTTP worker thread when wired up) | metric values only — metric registry has its own internal sync | already lock-free | unchanged |
+| `event_broadcaster.zig` (SSE consumers) | `pkgs/api/src/event_broadcaster.zig` | broadcaster.subscribers + queued events | own `Mutex` | unchanged; receives events via `events_lock` writer pushing into the broadcaster |
+| `lean_connected_peers` metric set | `pkgs/node/src/node.zig:1174,1215` | called from `onPeerConnected` / `onPeerDisconnected` callbacks (libp2p bridge thread) | inside `BeamNode.mutex` | uses `connected_peers` lock only |
+| Peer broadcast iterator | `pkgs/node/src/node.zig:1389` | iterates `connected_peers` for outgoing req/resp | inside `BeamNode.mutex` | takes `connected_peers_lock.shared` (RwLock — see Partha #13) |
+
+**Reserved for a separate follow-up section before code:** the upcoming `/eth/v1/beacon/states/*`, `/eth/v1/beacon/headers`, `/eth/v1/beacon/blocks/{block_id}` HTTP endpoints. Those run on an HTTP worker thread independent of libxev/libp2p, and they read `chain.forkChoice`, `chain.states`, `chain.last_emitted_*`, and `db.loadBlock`. After slice (a) they MUST take per-resource locks (forkchoice shared / `BorrowedState` / `events_lock` / db handles its own sync). Today they don't exist; the doc reserves the contract here so it isn't discovered at runtime when they land.
+
+If any prototype HTTP route lives on a feature branch I'm not aware of, please flag it before (a-2) merges so the route migration lands together.
+
 #### `Network` maps
 Wrap independent maps in a small `LockedMap(K, V)` helper that bundles `std.Thread.Mutex` + the underlying map and exposes the few methods we actually use (`get`, `put`, `remove`, `count`, `iterator-while-locked`). This keeps callsite changes mechanical: `self.network.pending_rpc_requests.get(...)` becomes thread-safe by construction.
 
@@ -177,11 +203,16 @@ The maps that get **independent** locks (separate code paths, no shared invarian
 - `pending_rpc_requests`
 - `pending_block_roots`
 - `timed_out_requests`
-- `connected_peers`
+- `connected_peers` — see special handling below (Partha #13)
 
 **`block_cache_lock` — bundled (Partha #4).** `fetched_blocks`, `fetched_block_ssz`, and `fetched_block_children` share a lifecycle: when a block arrives from req/resp we cache the parsed block, the raw ssz bytes, and link its children atomically. With three independent locks a reader can observe an inconsistent slice (block present, ssz absent) — today this triple-update is atomic under `BeamNode.mutex` and code relies on it.
 
 Fix: a single `block_cache_lock: std.Thread.Mutex` guards all three maps together, exposed via a small `BlockCache` helper (`insert(block, ssz, parent)`, `get(root) -> ?CachedBlock`, `removeChildrenOf(root)`, etc.). The three underlying `HashMap`s are private; callers can only mutate via the helper, so the invariant is structural, not aspirational.
+
+**`connected_peers` access pattern (Partha #13).** `connected_peers.count()` is read from logger config on most gossip paths — frequent, hot. `connected_peers.iterator()` is read from peer broadcast (`node.zig:1389`) — less frequent, longer hold. Adds/removes happen on libp2p bridge callbacks. Plan:
+- Replace the `count`-only hot path with an `std.atomic.Value(usize)` (`connected_peer_count`) that is incremented/decremented atomically under the lock when entries are added/removed. Logger reads this atomic, never touches the lock.
+- Use `std.Thread.RwLock` for the map itself: `iterator()` callers take `lockShared`; `add` / `remove` take `lockExclusive` and update the atomic count alongside the map mutation.
+- Net: logger pays one atomic load instead of a mutex acquire per gossip log line; iterator readers run concurrently.
 
 #### `BeamNode.batch_pending_parent_roots`
 Same `LockedMap` helper. Single-resource lock.
@@ -191,6 +222,18 @@ Same `LockedMap` helper. Single-resource lock.
 Renamed → `BeamNode.finalization_lock`. Held by:
 - `processFinalizationFollowup` (and its dispatcher when slice c lands).
 - Anywhere we need a multi-resource view (today only finalization).
+
+#### Lock-dance ownership in `chain.zig` (Partha #8)
+
+The r1 doc described `external_mutex` removal as "mechanical." It isn't. Each of `onBlock`, `onGossipAttestation`, `onGossipAggregatedAttestation`, `produceBlock`, `processPendingBlocks` currently has a lock-dance shape that today is owned by `BeamNode` via `external_mutex`. After slice (a) that shape moves *into* `chain.zig`:
+
+- `states_lock.shared` is taken at the top to fetch the parent state via `BorrowedState`.
+- The borrow is converted to an owned snapshot (`sszClone`) for any work that crosses an unlock — verify, FFI, STF.
+- For STF commit, `states_lock.exclusive` is re-acquired at the *end* of the path to publish the new state and forkchoice update.
+
+The cognitive load ("release shared → do work → re-acquire exclusive → commit") is preserved, just owned by `chain.zig` instead of `BeamNode.zig`. Callers no longer have to know about it. That is the win — not less code, less spreading.
+
+**LOC reality check:** ~1000+ for (a-2), not the ~600 I estimated in r1. Most of it is per-callsite migration + tests. (a-2) carries the slice's whole review burden — plan reviewer time accordingly.
 
 NOT held by:
 - `onGossip` — uses per-resource locks now.
@@ -269,32 +312,42 @@ Listed explicitly to keep PR scope tight:
 
 Revised to **two PRs** per Partha #6 — folding (a-1) into (a-2) so reviewers can evaluate the new primitives against real callsites in one pass instead of trying to spot init/deinit ordering bugs in isolation. The cost (a slightly bigger (a-2)) is offset by mandatory unit tests on the new primitives.
 
-1. **`(a-2) chain + primitives`** — adds the `LockedMap` and `BlockCache` helpers, adds `BorrowedState`, adds `states_lock`, `pending_blocks_lock`, `pubkey_cache_lock`, `root_to_slot_lock`, `events_lock`. Migrates every `chain.zig` callsite (states.get → BorrowedState, pending_blocks → new lock, caches → split locks, events → events_lock). Updates `chain.onBlock` / `chain.onGossip` / `chain.processPendingBlocks` to no longer require an `external_mutex` parameter. Drops the `external_mutex` parameter (was added by #798–#801, now obsolete). Implements the snapshot-then-release pattern in `chain.aggregate` and `produceBlock` so `forkChoice.aggregate` / `getProposalAttestations` see an owned snapshot, not a borrow.
+1. **`(a-2) chain + primitives`** — adds the `LockedMap` and `BlockCache` helpers, adds `BorrowedState`, adds `states_lock`, `pending_blocks_lock`, `pubkey_cache_lock`, `root_to_slot_lock`, `events_lock`. Migrates every `chain.zig` callsite (states.get → BorrowedState, pending_blocks → new lock, caches → split locks, events → events_lock). Updates `chain.onBlock` / `chain.onGossip` / `chain.processPendingBlocks` to no longer require an `external_mutex` parameter. Drops the `external_mutex` parameter (was added by #798–#801, now obsolete — dropped outright, no null-only transitional release). Implements the snapshot-then-release pattern in `chain.aggregate` and `produceBlock` so `forkChoice.aggregate` / `getProposalAttestations` see an owned snapshot, not a borrow. Adds the per-lock metric histograms (`zeam_lock_wait_seconds{lock="...", site="..."}`) and keeps the old `zeam_node_mutex_*` series alive as a derived sum for one release (compat shim) so dashboards don't go dark (Partha #11).
    - **Mandatory unit tests** (per Partha #6): `LockedMap` (constructor, get/put/remove, iterator-while-locked, deinit-when-empty, deinit-when-non-empty), `BlockCache` (atomic triple-insert, partial-state invariants), `BorrowedState` (one-release assertion, sszClone-then-deinit). These are the only standalone tests in this slice; everything else is covered by chain integration tests.
-   - ~800 LOC. Real semantic change; this is the one to review carefully.
+   - **Realistic LOC: ~1000+** (revised up from r1's 600 per Partha #8 — the lock-dance moves into chain.zig, not away). This PR carries the slice's full review burden.
 
-2. **`(a-3) node + req/resp`** — migrate `Network` map accesses to the new locks (`block_cache_lock` plus the four independent ones). Drop `BeamNode.mutex` from `onGossip`, `onInterval`, `onReqRespResponse`. Make `onReqRespRequest` fully lock-free. Rename `BeamNode.mutex` → `finalization_lock` for the few remaining multi-resource paths. ~400 LOC.
+2. **`(a-3) node + req/resp`** — migrate `Network` map accesses to the new locks (`block_cache_lock` plus the four independent ones, with `connected_peers` getting the atomic count + RwLock pattern). Drop `BeamNode.mutex` from `onGossip`, `onInterval`, `onReqRespResponse`. Make `onReqRespRequest` fully lock-free. Rename `BeamNode.mutex` → `finalization_lock` for the few remaining multi-resource paths. ~400 LOC.
+   - **Stress test plan** (per Partha #12) — devnet smoke alone catches obvious deadlocks but misses UAFs and concurrency races. (a-3) ships at minimum:
+     1. **Single-node ingestion stress.** Synthetic gossip-block flood + concurrent `blocks_by_root` RPC against the same node. Run 30+ minutes; assert no `state-map-key-not-found` panics, no assertion failures, no `MissingPreState`.
+     2. **10-node devnet under jitter.** Existing devnet runner + tc-netem packet loss/delay for ≥1h. Watch for divergence, deadlock, or growing pending_blocks queue.
+     3. **Reorg + finalization stress.** Constructed scenario where two competing chain branches force a reorg right around a finalization advance — exercises the `events_lock` / `finalization_lock` boundary. (Partha right that this is rare on current devnet; need a synthetic harness.)
+   - At least one of these gates merge; ideally all three are wired into nightly so the slice keeps paying off in regression catches.
 
 Each PR builds + tests cleanly on its own; (a-2) and (a-3) get devnet smoke runs against the existing instrumentation from #786 to confirm no contention regression.
 
-## Open questions for review
+## Resolved open questions (Partha r2 responses)
 
-1. **`states` map prune coordination.** Today prune runs under the global mutex, so no reader can hold a stale `*BeamState`. After slice (a), prune runs under `states_lock` exclusive — fine — but the followup-dispatch path (slice c) might want to read a state from a worker thread that started before prune ran. Slice (a) handles this by keeping followup inline (slice c hasn't landed yet); revisit when slice c lands.
+1. **`states` map prune coordination.** Slice (a) handles this by keeping followup inline. **However:** if slice (c) moves the followup off-thread without first adding refcounted state pointers, it will tear. **Hard requirement: slice (c) MUST land an `Arc<BeamState>` (or equivalent refcount) before going off-thread.** Captured as a slice-(c) blocker in #803.
 
-2. **`connected_peers` lock granularity.** It's read on every gossip block (logger), so a coarse mutex on it could become a contention point itself. Consider `RwLock` here? The reads are pure and short, so probably fine with `Mutex`, but worth measuring.
+2. **`connected_peers` lock granularity.** Resolved — atomic counter for the hot `count()` path + `RwLock` for the iterator path. See §Network maps above.
 
-3. **Lock metric coverage.** The current `zeam_node_mutex_{wait,hold}_time_seconds` instrumentation is keyed by site label and assumes a single mutex. Slice (a) should replace this with per-lock histograms (`zeam_lock_wait_seconds{lock="states", site="..."}`). Lean toward folding into (a-2) since the metric label set changes anyway.
+3. **Lock metric coverage.** Resolved — fold into (a-2) since the metric label set changes anyway. Emit both old (`zeam_node_mutex_*`) and new (`zeam_lock_wait_seconds{lock=...}`) for one release; old metric becomes the sum across new lock labels via a recording rule / derived shim. Drop the old series in the release after.
 
-4. **`external_mutex` removal vs. backward-compat.** Once (a-2) lands, the `external_mutex: ?*std.Thread.Mutex` parameter on `onBlock`/`processPendingBlocks` is dead weight. Drop in (a-2), or keep as `null`-only for one release in case external embedders depend on it? (No known external embedders today, so probably just drop.)
+4. **`external_mutex` removal vs. backward-compat.** Resolved — drop outright in (a-2). No `null`-only transitional release. (No external embedders today; the param was internal-only plumbing from #798–#801.)
 
-## Ask for reviewers (r2)
+## Long-term direction note (Partha post-script)
 
-Please weigh in on:
+This refactor preserves the shape "every chain mutator can be called from any thread, synchronised via per-resource locks." An alternative long-term shape is "all chain mutation marshalled to a single chain-mutator thread with a queue, readers read snapshots." Slice (a)'s lock-hierarchy work survives the marshalling refactor (still useful for *read* paths and for any per-resource cache the mutator thread owns), but per-resource *exclusive write* locks become dead weight under marshalling.
 
-- The revised lock hierarchy with sibling 5a/5b/5c — anyone see a path that legitimately needs two of those at once?
-- `BorrowedState` API shape — do we want the typed wrapper now or skip straight to refcounted `Arc<BeamState>`? (My read: wrapper now, refcount only if slice c forces the issue.)
-- `BlockCache` helper — is bundling the three maps the right call, or is it cleaner to keep them as separate `LockedMap`s and document the readers-may-see-partial invariant?
-- The snapshot-then-release pattern in `aggregate` / `produceBlock` — OK with full `sszClone`, or do we need an `AggregatorView` partial-copy from day one for cost reasons?
-- The 2-PR breakdown after folding (a-1) into (a-2) — still tractable for review, or should I split (a-2) along chain-vs-primitives lines instead?
+Which direction is #803's long-term target should be a #803-level decision before slice (b)/(c) commits to a specific shape; flagging here so each slice converges in the same direction. My read of the original 8-point plan: the marshalling shape is the cleaner end state, and slice (a) is a strict prerequisite either way (read snapshots need lock-hierarchy regardless). Worth a one-paragraph statement of intent on #803.
 
-Once we agree, I’ll cut PR (a-2) with the LockedMap/BlockCache/BorrowedState primitives + chain migration in one go.
+## Ask for reviewers (r3)
+
+Most of r1/r2's open questions are now closed. Remaining decisions before I cut code:
+
+- **Long-term direction in #803.** Marshalled chain-mutator vs fine-grained per-resource locks. Slice (a) is compatible with either, but slice (b)+(c) need this pinned. Looking for a one-paragraph statement of intent in #803.
+- **`AggregatorView` partial-copy vs full `sszClone`** in `aggregate` / `produceBlock`. Default is full clone; only worth the partial copy if benchmarks show ssz-clone time dominates the FFI. Defer to (a-2) profiling unless someone has data already.
+- **HTTP `/eth/v1/*` surface.** If a prototype branch already exists, please flag before (a-2) merges so the route migration lands together rather than as a follow-up.
+- **Stress test prioritisation.** All three scenarios in (a-3) are useful but only one is required as a merge gate. My pick: **single-node ingestion stress** (cheapest to wire up, catches the largest UAF surface). Open to a different pick.
+
+Once these are resolved (or explicitly punted), I’ll cut PR (a-2) with the LockedMap/BlockCache/BorrowedState primitives + chain migration in one go.
