@@ -24,6 +24,17 @@ Changelog vs. r2 (Partha #8–#13 + open-question responses):
 - Resolved open questions: (1) refcount required before slice (c) goes off-thread; (2) `connected_peers` → atomic count + RwLock for iterator; (3) metric migration in (a-2); (4) drop `external_mutex` outright, no null-only transitional release.
 - Added §Long-term direction — single chain-mutator thread + queues vs. fine-grained locks. Slice (a) lock-hierarchy work survives either way; per-resource exclusive write locks become dead weight if mutation marshalls. Captured as a #803 question, not slice (a)'s decision.
 
+Changelog vs. r3 polish (Partha r3 verification feedback):
+- Renamed `BorrowedState.sszClone` → `cloneAndRelease` — the old name read like a non-mutating snapshot helper, but the call consumes the borrow and releases the lock. Honest naming prevents double-release bugs.
+- Spelled out `BorrowedState` `errdefer` for OOM-mid-clone — lock always released, success or failure.
+- Added `released: bool` sentinel + `debug.assert(borrow.released)` in deinit — mirrors `MutexGuard.released` from #787.
+- Added debug-build TLS depth counter for tier-5 sibling locks (5a/5b/5c) — "never co-held" enforced at runtime in tests, not just by convention.
+- Metric compat shim clarified to **code-side derived double-emit**, not a Prometheus recording rule. Operators do not redeploy.
+- Added `getFinalizedState` migration scope note — (a-2) PR description must enumerate every caller; grepping `states.get` won't find them.
+- Documented O(n²) worst case for `processPendingBlocks` re-scan; ships a histogram so we measure before optimising; cap-or-cursor mitigations on the shelf.
+- Documented `removeChildrenOf` ceiling (`MAX_CACHED_BLOCKS = 1024`) as the longest critical section under `block_cache_lock`.
+- Resolved final r3 asks: long-term direction does NOT gate (a-2); single-node ingestion stress is the merge gate; full `sszClone` default; no `/eth/v1/*` prototype branch.
+
 ## Why a design doc first
 
 Slice (a) of #803 is the riskiest of the five slices: it changes how every chain-mutation entry point synchronises against shared state, and a wrong lock hierarchy here = consensus bug or deadlock on devnet. Burning a few hundred lines of design before touching code is a much cheaper failure mode than discovering the wrong shape in a 2000-line PR review.
@@ -86,6 +97,8 @@ Rules (clarified per Partha #10):
 - Finalization advancement is the only known multi-resource path that may legitimately need (1).
 - (`onBlock` legitimately touches multiple locks sequentially — forkchoice read for parent lookup, then states for STF commit, then forkchoice write for head update. This is sequential, not nested, and stays legal.)
 
+**Debug-build runtime enforcement (Partha r3 #4).** The 5a/5b/5c "never co-held" rule is a design constraint, not a property: a future contributor can violate it accidentally. (a-2) ships a thread-local depth counter for tier 5 that increments on entry to any 5* lock and decrements on exit, with `debug.assert(depth_tier5 == 0)` at the top of every 5* lock-acquire. A violation fails loudly in tests, not silently in production. Same shape as the lock-hierarchy assertions Folly / Abseil ship in debug builds.
+
 ### Resource-by-resource design
 
 #### `BeamChain.forkChoice` — already done ✅
@@ -104,18 +117,38 @@ Slice (a) introduces a typed wrapper:
 ```zig
 pub const BorrowedState = struct {
     state: *const types.BeamState,
-    // tied to states_lock.shared — released by deinit().
-    states_lock: *std.Thread.RwLock,
-    pub fn deinit(self: *BorrowedState) void { self.states_lock.unlockShared(); }
-    /// Materialise an owned copy and drop the borrow.
-    pub fn sszClone(self: *BorrowedState, allocator: Allocator) !*types.BeamState { ... self.deinit(); ... }
+    states_lock: *std.Thread.RwLock,  // tied to states_lock.shared
+    released: bool = false,            // sentinel — mirrors MutexGuard.released from #787
+
+    /// Idempotent-on-release; debug builds catch double-release / drop-without-release.
+    pub fn deinit(self: *BorrowedState) void {
+        if (self.released) return;
+        self.states_lock.unlockShared();
+        self.released = true;
+    }
+
+    /// Consume this borrow: materialise an owned copy AND release the lock atomically.
+    /// Caller does NOT call deinit() afterwards — ownership of the lock has moved out.
+    /// On allocator failure the lock is still released (errdefer below).
+    pub fn cloneAndRelease(self: *BorrowedState, allocator: Allocator) !*types.BeamState {
+        // errdefer covers the OOM-mid-clone path: the lock must always be released
+        // before this function returns, success or failure.
+        errdefer self.deinit();
+        const owned = try self.state.sszClone(allocator);
+        self.deinit();
+        return owned;
+    }
 };
+
+// In deinit-of-parent / drop sites:
+//   debug.assert(borrow.released)   // "BorrowedState dropped without release"
 ```
 
 - Every `states.get` returns a `?BorrowedState`, not a raw `*const BeamState`.
 - The lock is held for the borrow's lifetime → readers cannot observe a freed pointer.
-- If a caller needs the state across a long-running operation (FFI, STF, await), it calls `sszClone` to materialise an owned copy and drop the borrow.
-- `deinit` is `defer`-style; in debug builds we assert exactly one release per borrow.
+- If a caller needs the state across a long-running operation (FFI, STF, await), it calls **`cloneAndRelease`** to materialise an owned copy and drop the borrow in one shot. (Renamed from r2's `sszClone` per Partha r3 — the old name read like a non-mutating snapshot helper, but the semantics consume the borrow. The new name is honest about ownership transfer.)
+- `deinit` is `defer`-style and idempotent; in debug builds we assert exactly one release per borrow via the `released: bool` sentinel.
+- Allocator failure inside `cloneAndRelease` still releases the lock (`errdefer self.deinit()` before the clone, then explicit `deinit()` after success). No path leaks the lock.
 
 This keeps slice (a) **simple** (no atomic refcount, no Arc) while fixing the API contract. Refcount/Arc is still an option for slice (b) or (c) if a later workload needs reader-outlives-prune semantics, but slice (a) does not need it.
 
@@ -134,6 +167,8 @@ This keeps slice (a) **simple** (no atomic refcount, no Arc) while fixing the AP
 | `node.zig:1477` | `publishBlock`'s `.postState = self.chain.states.get(block_root)` | passes raw pointer to API response builder — needs to take a borrow until the response is serialised, OR sszClone |
 
 (a-2) migrates each row. Each test-only site stays raw with a `// SAFETY: test-only, single-threaded` comment.
+
+**Note on `getFinalizedState` (chain.zig:1716, Partha r3 #6).** This function returns a `*const types.BeamState` *outward* by a different code path than `states.get` — grepping `states.get` will not catch its callers. Before (a-2) merges, the PR description must list every `getFinalizedState` caller (HTTP/RPC layer, validator, tests). One forgotten caller = production UAF after the lock-borrow contract lands. The migration is straightforward (return `?BorrowedState` instead, callers `cloneAndRelease` if they cross an unlock) but the call-site enumeration is non-negotiable.
 
 #### `BeamChain.pending_blocks`
 Add `pending_blocks_lock: std.Thread.Mutex`.
@@ -159,6 +194,11 @@ Add `pending_blocks_lock: std.Thread.Mutex`.
   }
   ```
   This avoids the index-drift bug class entirely: between the unlock and the next lock, the gossip thread is free to append (which only adds at the tail) and the next iteration re-scans from index 0.
+
+**Worst-case complexity note (Partha r3 #7).** The re-scan-from-front pattern is O(n) per iteration; draining n blocks is O(n²). For typical n<10 (current devnet) this is irrelevant. For pathological n (devnet partitioned for hours, large catch-up) it could become a measurable hot-path cost. Two mitigations available if needed:
+  1. **Bound the queue:** introduce `MAX_PENDING_BLOCKS` cap, drop oldest-by-slot on overflow with a metric. Today there is no cap.
+  2. **Track a "first ready" cursor:** maintain a hint index that the gossip-append path doesn't invalidate (it only appends at the tail, so the leftmost-ready index never moves left).
+  Slice (a) ships the simple O(n) form and adds a `lean_pending_blocks_drain_iters` histogram so we can measure before optimising. Documented assumption: n stays small in normal operation.
 
 #### `BeamChain.public_key_cache` (XMSS) — separate lock
 Add `pubkey_cache_lock: std.Thread.Mutex` (own lock, lock 5a). On a miss, `getOrPut` does a Rust FFI deserialize that can take ~ms. Holding this lock over `root_to_slot_cache` lookups (which fire on every gossip-attestation validation) would be a contention trap (Partha #5).
@@ -208,6 +248,8 @@ The maps that get **independent** locks (separate code paths, no shared invarian
 **`block_cache_lock` — bundled (Partha #4).** `fetched_blocks`, `fetched_block_ssz`, and `fetched_block_children` share a lifecycle: when a block arrives from req/resp we cache the parsed block, the raw ssz bytes, and link its children atomically. With three independent locks a reader can observe an inconsistent slice (block present, ssz absent) — today this triple-update is atomic under `BeamNode.mutex` and code relies on it.
 
 Fix: a single `block_cache_lock: std.Thread.Mutex` guards all three maps together, exposed via a small `BlockCache` helper (`insert(block, ssz, parent)`, `get(root) -> ?CachedBlock`, `removeChildrenOf(root)`, etc.). The three underlying `HashMap`s are private; callers can only mutate via the helper, so the invariant is structural, not aspirational.
+
+**Critical-section ceiling (Partha r3 #8).** `removeChildrenOf(root)` worst-case iterates `MAX_CACHED_BLOCKS = 1024` entries while holding `block_cache_lock`. Bounded but ms-scale on the gossip thread. This is the longest critical section under that lock; documenting so the next perf review knows where to look.
 
 **`connected_peers` access pattern (Partha #13).** `connected_peers.count()` is read from logger config on most gossip paths — frequent, hot. `connected_peers.iterator()` is read from peer broadcast (`node.zig:1389`) — less frequent, longer hold. Adds/removes happen on libp2p bridge callbacks. Plan:
 - Replace the `count`-only hot path with an `std.atomic.Value(usize)` (`connected_peer_count`) that is incremented/decremented atomically under the lock when entries are added/removed. Logger reads this atomic, never touches the lock.
@@ -312,7 +354,7 @@ Listed explicitly to keep PR scope tight:
 
 Revised to **two PRs** per Partha #6 — folding (a-1) into (a-2) so reviewers can evaluate the new primitives against real callsites in one pass instead of trying to spot init/deinit ordering bugs in isolation. The cost (a slightly bigger (a-2)) is offset by mandatory unit tests on the new primitives.
 
-1. **`(a-2) chain + primitives`** — adds the `LockedMap` and `BlockCache` helpers, adds `BorrowedState`, adds `states_lock`, `pending_blocks_lock`, `pubkey_cache_lock`, `root_to_slot_lock`, `events_lock`. Migrates every `chain.zig` callsite (states.get → BorrowedState, pending_blocks → new lock, caches → split locks, events → events_lock). Updates `chain.onBlock` / `chain.onGossip` / `chain.processPendingBlocks` to no longer require an `external_mutex` parameter. Drops the `external_mutex` parameter (was added by #798–#801, now obsolete — dropped outright, no null-only transitional release). Implements the snapshot-then-release pattern in `chain.aggregate` and `produceBlock` so `forkChoice.aggregate` / `getProposalAttestations` see an owned snapshot, not a borrow. Adds the per-lock metric histograms (`zeam_lock_wait_seconds{lock="...", site="..."}`) and keeps the old `zeam_node_mutex_*` series alive as a derived sum for one release (compat shim) so dashboards don't go dark (Partha #11).
+1. **`(a-2) chain + primitives`** — adds the `LockedMap` and `BlockCache` helpers, adds `BorrowedState`, adds `states_lock`, `pending_blocks_lock`, `pubkey_cache_lock`, `root_to_slot_lock`, `events_lock`. Migrates every `chain.zig` callsite (states.get → BorrowedState, pending_blocks → new lock, caches → split locks, events → events_lock). Updates `chain.onBlock` / `chain.onGossip` / `chain.processPendingBlocks` to no longer require an `external_mutex` parameter. Drops the `external_mutex` parameter (was added by #798–#801, now obsolete — dropped outright, no null-only transitional release). Implements the snapshot-then-release pattern in `chain.aggregate` and `produceBlock` so `forkChoice.aggregate` / `getProposalAttestations` see an owned snapshot, not a borrow. Adds per-lock metric histograms (`zeam_lock_wait_seconds{lock="...", site="..."}`) plus a **code-side derived shim** that double-emits the legacy `zeam_node_mutex_{wait,hold}_time_seconds` from the new lock observations, summed across `lock∈{states,pending_blocks,pubkey_cache,root_to_slot,events,block_cache,...}` (Partha #11, r3 polish #5). Operators do NOT have to redeploy Prometheus or change recording rules — the legacy metric stays alive automatically for one release, then is removed in the release after.
    - **Mandatory unit tests** (per Partha #6): `LockedMap` (constructor, get/put/remove, iterator-while-locked, deinit-when-empty, deinit-when-non-empty), `BlockCache` (atomic triple-insert, partial-state invariants), `BorrowedState` (one-release assertion, sszClone-then-deinit). These are the only standalone tests in this slice; everything else is covered by chain integration tests.
    - **Realistic LOC: ~1000+** (revised up from r1's 600 per Partha #8 — the lock-dance moves into chain.zig, not away). This PR carries the slice's full review burden.
 
@@ -341,13 +383,12 @@ This refactor preserves the shape "every chain mutator can be called from any th
 
 Which direction is #803's long-term target should be a #803-level decision before slice (b)/(c) commits to a specific shape; flagging here so each slice converges in the same direction. My read of the original 8-point plan: the marshalling shape is the cleaner end state, and slice (a) is a strict prerequisite either way (read snapshots need lock-hierarchy regardless). Worth a one-paragraph statement of intent on #803.
 
-## Ask for reviewers (r3)
+## Status (r4 — ready to cut code)
 
-Most of r1/r2's open questions are now closed. Remaining decisions before I cut code:
+All r1/r2/r3 review items closed:
+- Long-term direction is a #803-level question and does NOT gate (a-2). Lock-hierarchy work is a no-regret prerequisite either way.
+- Stress merge gate: **single-node ingestion stress**; the other two scenarios run in nightly post-merge.
+- `AggregatorView` deferred — default to full `cloneAndRelease`; profile in (a-2), cut over only if `lean_block_building_time_seconds` flags clone time as dominant.
+- No prototype `/eth/v1/*` HTTP surface to fold in; the reservation in §Cross-thread chain readers is sufficient.
 
-- **Long-term direction in #803.** Marshalled chain-mutator vs fine-grained per-resource locks. Slice (a) is compatible with either, but slice (b)+(c) need this pinned. Looking for a one-paragraph statement of intent in #803.
-- **`AggregatorView` partial-copy vs full `sszClone`** in `aggregate` / `produceBlock`. Default is full clone; only worth the partial copy if benchmarks show ssz-clone time dominates the FFI. Defer to (a-2) profiling unless someone has data already.
-- **HTTP `/eth/v1/*` surface.** If a prototype branch already exists, please flag before (a-2) merges so the route migration lands together rather than as a follow-up.
-- **Stress test prioritisation.** All three scenarios in (a-3) are useful but only one is required as a merge gate. My pick: **single-node ingestion stress** (cheapest to wire up, catches the largest UAF surface). Open to a different pick.
-
-Once these are resolved (or explicitly punted), I’ll cut PR (a-2) with the LockedMap/BlockCache/BorrowedState primitives + chain migration in one go.
+Next step: cut PR (a-2) with the LockedMap / BlockCache / BorrowedState primitives + every chain.zig migration + per-lock metrics + the legacy-metric derived shim + mandatory unit tests + getFinalizedState caller enumeration in the PR description.
