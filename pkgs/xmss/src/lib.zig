@@ -57,6 +57,20 @@ pub const PublicKeyCache = struct {
 
     /// Get a cached public key handle, deserializing from bytes if not cached.
     /// Returns the raw HashSigPublicKey pointer for FFI use.
+    ///
+    /// Pointer stability: the returned `*const HashSigPublicKey` points to
+    /// Rust-side opaque memory allocated by `hashsig_public_key_from_ssz`,
+    /// not to anything inside the Zig hashmap. The Zig hashmap stores a
+    /// `PublicKey { handle: *HashSigPublicKey }` wrapper; on rehash the
+    /// hashmap moves the wrapper struct into a new bucket but the
+    /// `handle` field's value (the pointer) is copied unchanged. The
+    /// Rust-side allocation it points to is freed only by
+    /// `hashsig_public_key_free`, which only runs in `PublicKeyCache.deinit`
+    /// for entries still resident at shutdown. Therefore a returned handle
+    /// pointer remains valid for the lifetime of this cache, even across
+    /// concurrent rehashes triggered by other threads' `getOrPut` calls.
+    /// Callers may keep the handle past the function return without holding
+    /// the cache mutex.
     pub fn getOrPut(self: *Self, validator_index: usize, pubkey_bytes: []const u8) HashSigError!*const HashSigPublicKey {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -72,7 +86,9 @@ pub const PublicKeyCache = struct {
         errdefer pubkey.deinit(); // Free the Rust handle if cache.put fails
         try self.cache.put(validator_index, pubkey);
 
-        // Return the handle from the newly cached entry
+        // Return the handle from the newly cached entry. See pointer-stability
+        // note above — this pointer is to Rust-side memory and is not
+        // invalidated by future rehashes of `self.cache`.
         return self.cache.get(validator_index).?.handle;
     }
 

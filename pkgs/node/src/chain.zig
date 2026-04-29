@@ -130,8 +130,27 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
-    // Optional worker pool for parallelizing CPU-bound steps (currently: attestation signature
-    // verification). Owned by the caller (e.g. the CLI's main), not by the chain.
+    /// Optional worker pool for parallelizing CPU-bound steps (currently:
+    /// attestation signature verification and `compactAttestations`). Owned
+    /// by the caller (e.g. the CLI's main), not by the chain.
+    ///
+    /// Thread-safety invariants required of the pool's environment when set:
+    ///
+    ///   1. `chain.allocator` MUST be safe to use concurrently from worker
+    ///      threads. The CLI today wires this to a `GeneralPurposeAllocator`
+    ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
+    ///      or any custom non-thread-safe allocator would race. If a future
+    ///      change swaps the allocator, audit every consumer of `thread_pool`
+    ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
+    ///   2. The XMSS verifier must be set up before the pool's first verify.
+    ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
+    ///      pool construction; without that pre-warm, concurrent first-time
+    ///      verifies could race the Rust-side initialization.
+    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
+    ///      not call its `getOrPut` directly. The current parallel paths
+    ///      respect this: cache access is confined to a serial pre-phase.
+    ///
+    /// New consumers of `thread_pool` should preserve all three invariants.
     thread_pool: ?*ThreadPool = null,
 
     // Callback for pruning cached blocks after finalization advances
@@ -935,6 +954,16 @@ pub const BeamChain = struct {
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
             // 1. get parent state and clone it under the caller's lock so the
             // CPU-bound verify + STF can operate on a private snapshot.
+            //
+            // `sszClone` performs a deep copy via `ssz.serialize` followed by
+            // `ssz.deserialize` into the destination, both backed by
+            // `self.allocator`. Every interior `List`, `Bitlist`, and
+            // SSZ-managed buffer in `BeamState` is freshly allocated on the
+            // clone — no field shares storage with `pre_state`. This is the
+            // load-bearing invariant for the lock release below: nothing the
+            // unlocked phase reads or mutates aliases live chain state, so a
+            // concurrent state prune (which calls `state.deinit` on a value
+            // we no longer reference) cannot corrupt our work.
             const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
             const cpost_state = try self.allocator.create(types.BeamState);
             // If sszClone or anything after fails, destroy the outer allocation.
@@ -1023,6 +1052,30 @@ pub const BeamChain = struct {
 
         var missing_roots: std.ArrayList(types.Root) = .empty;
         errdefer missing_roots.deinit(self.allocator);
+
+        // Concurrent-import dedup: when `external_mutex` is non-null, two
+        // threads (e.g. gossip + RPC paths) may race to import the same
+        // block. Caller-side `hasBlock` checks happen before this function
+        // acquires the lock, so the race is observable: thread A finishes
+        // its commit phase and registers the block; thread B re-acquires the
+        // lock, finds the block already present, and would otherwise stomp
+        // the registered post_state with its own redundant clone (leaking
+        // the original) and double-emit DB writes / events.
+        //
+        // If we hold a freshly-cloned post_state (post_state_owned == true)
+        // and forkchoice already has the block, drop our clone and return
+        // an empty missing_roots slice. Caller's `processCachedDescendants`
+        // / `onBlockFollowup` flow remains correct because the previous
+        // importer ran them.
+        if (post_state_owned and self.forkChoice.hasBlock(block_root)) {
+            self.logger.debug(
+                "skipping redundant block import 0x{x} slot={d}: another path already registered it during the unlocked window",
+                .{ &block_root, block.slot },
+            );
+            post_state.deinit();
+            self.allocator.destroy(post_state);
+            return missing_roots.toOwnedSlice(self.allocator);
+        }
 
         // 3. fc onblock if the block was not pre added by the block production
         const fcBlock = self.forkChoice.getBlock(block_root) orelse fcprocessing: {
@@ -2070,6 +2123,98 @@ test "process and add mock blocks into a node's chain" {
         // all validators should have attested as per the mock chain
         const attestations_tracker = beam_chain.forkChoice.attestations.get(validator_id);
         try std.testing.expect(attestations_tracker != null);
+    }
+}
+
+test "onBlock preserves caller-held external_mutex on entry/exit (issue #786)" {
+    // Lock-invariant regression test for the phase 2a hoist: chain.onBlock
+    // unlocks `external_mutex` for verify + STF and re-acquires before
+    // returning. This test enforces that contract by holding the mutex
+    // before/after the call and asserting tryLock fails (mutex held) on
+    // success and on the most easily reachable error path (MissingPreState
+    // for an orphan block).
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    var mutex: std.Thread.Mutex = .{};
+
+    // Success path: import slot-1 block. Lock held on entry, must be held on exit.
+    {
+        const signed_block = mock_chain.blocks[1];
+        try beam_chain.forkChoice.onInterval(signed_block.block.slot * constants.INTERVALS_PER_SLOT, false);
+
+        mutex.lock();
+        const missing_roots = try beam_chain.onBlock(signed_block, .{ .pruneForkchoice = false }, &mutex);
+        // tryLock must fail because onBlock should have re-acquired before returning.
+        try std.testing.expect(!mutex.tryLock());
+        mutex.unlock();
+        allocator.free(missing_roots);
+        // Cleanly unlocked now.
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
+
+    // Error path (MissingPreState — phase 1, before any unlock): lock must
+    // remain held when chain.onBlock returns the error.
+    {
+        // Synthesize an orphan block by mutating the parent_root to a
+        // root the chain has never seen. Use the slot-2 block but rewrite
+        // its parent_root to all-FF.
+        var orphan = mock_chain.blocks[2];
+        orphan.block.parent_root = [_]u8{0xff} ** 32;
+
+        mutex.lock();
+        const result = beam_chain.onBlock(orphan, .{ .pruneForkchoice = false }, &mutex);
+        try std.testing.expectError(BlockProcessingError.MissingPreState, result);
+        // Lock must still be held on the error return.
+        try std.testing.expect(!mutex.tryLock());
+        mutex.unlock();
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
     }
 }
 
