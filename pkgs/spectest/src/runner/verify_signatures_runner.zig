@@ -4,12 +4,13 @@ const expect_mod = @import("../json_expect.zig");
 const forks = @import("../fork.zig");
 const fixture_kind = @import("../fixture_kind.zig");
 const skip = @import("../skip.zig");
+const stf_runner = @import("state_transition_runner.zig");
 
 const Fork = forks.Fork;
 const FixtureKind = fixture_kind.FixtureKind;
 const types = @import("@zeam/types");
 const xmss = @import("@zeam/xmss");
-const stf = @import("@zeam/state-transition");
+const zeam_utils = @import("@zeam/utils");
 const JsonValue = std.json.Value;
 const Context = expect_mod.Context;
 const Allocator = std.mem.Allocator;
@@ -111,34 +112,30 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
         },
     };
 
-    // verify_signatures fixtures are generated against the test signature scheme
-    // (leanEnv=test → SIGNATURE_LEN_BYTES ~ 700). zeam runs against the production
-    // scheme (SIGSIZE=2536), so these fixtures cannot be deserialized into the
-    // production SignedBlock layout. The hex sizes simply do not match.
-    //
-    // Skip with a clear marker. To exercise these end-to-end, zeam would need a
-    // test-mode XMSS path (parallel public-key + signature types and a
-    // verifySignatures variant) that is wired through the runner.
-    const lean_env = expect_mod.expectStringField(FixtureError, case_obj, &.{"leanEnv"}, ctx, "leanEnv") catch |err| switch (err) {
-        FixtureError.InvalidFixture => null,
-        else => return err,
-    };
+    const lean_env = expect_mod.expectStringField(FixtureError, case_obj, &.{"leanEnv"}, ctx, "leanEnv") catch "prod";
 
-    if (lean_env) |env| {
-        if (!std.mem.eql(u8, env, "prod")) {
-            // Make sure the fixture is well-formed enough that this is a
-            // genuine scheme mismatch and not a structural error.
-            try ensureWellFormed(ctx, case_obj);
-            std.debug.print(
-                "spectest: skipping verify_signatures fixture {s} (leanEnv={s}; zeam prod scheme requires SIGSIZE=2536)\n",
-                .{ ctx.fixture_label, env },
-            );
-            return FixtureError.SkippedFixture;
+    // Body attestation verification needs a leanMultisig test scheme that
+    // zeam does not yet expose. Skip cases that would exercise that path
+    // until the multisig test wrapper lands.
+    const signed_block_obj = try expect_mod.expectObject(FixtureError, case_obj, &.{"signedBlock"}, ctx, "signedBlock");
+    const block_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"block"}, ctx, "signedBlock.block");
+    const body_obj = try expect_mod.expectObject(FixtureError, block_obj, &.{"body"}, ctx, "signedBlock.block.body");
+    const attestations_obj = try expect_mod.expectObject(FixtureError, body_obj, &.{"attestations"}, ctx, "signedBlock.block.body.attestations");
+    const has_body_attestations = blk: {
+        if (attestations_obj.get("data")) |data_val| {
+            const arr = try expect_mod.expectArrayValue(FixtureError, data_val, ctx, "body.attestations.data");
+            break :blk arr.items.len > 0;
         }
+        break :blk false;
+    };
+    if (has_body_attestations) {
+        std.debug.print(
+            "spectest: skipping verify_signatures fixture {s} (body attestations present; multisig test path not yet wired)\n",
+            .{ctx.fixture_label},
+        );
+        return FixtureError.SkippedFixture;
     }
 
-    // Production-scheme path. Deserialize the anchor state and signed block,
-    // run zeam's verifySignatures, and check the result against expectException.
     const anchor_value = case_obj.get("anchorState") orelse {
         std.debug.print(
             "fixture {s} case {s}: missing anchorState\n",
@@ -146,26 +143,60 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
         );
         return FixtureError.InvalidFixture;
     };
-    var state = try buildBeamState(allocator, ctx, anchor_value);
+    var state = try stf_runner.buildState(allocator, ctx, anchor_value);
     defer state.deinit();
 
-    const signed_block_value = case_obj.get("signedBlock") orelse {
+    var block = try stf_runner.buildBlock(allocator, ctx, 0, block_obj);
+    defer block.deinit();
+
+    const signature_obj = try expect_mod.expectObject(FixtureError, signed_block_obj, &.{"signature"}, ctx, "signedBlock.signature");
+    const proposer_sig_hex = try expect_mod.expectStringField(
+        FixtureError,
+        signature_obj,
+        &.{ "proposerSignature", "proposer_signature" },
+        ctx,
+        "signedBlock.signature.proposerSignature",
+    );
+
+    const proposer_sig_bytes = try parseHexBytes(allocator, ctx, proposer_sig_hex, "signedBlock.signature.proposerSignature");
+
+    // Hash the block to produce the verification message.
+    var block_root: [32]u8 = undefined;
+    zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, allocator) catch {
         std.debug.print(
-            "fixture {s} case {s}: missing signedBlock\n",
+            "fixture {s} case {s}: failed to hash block\n",
             .{ ctx.fixture_label, ctx.case_name },
         );
         return FixtureError.InvalidFixture;
     };
-    var signed_block = try buildSignedBlock(allocator, ctx, signed_block_value);
-    defer signed_block.deinit();
+
+    const proposer_index: usize = @intCast(block.proposer_index);
+    const validators_slice = state.validators.constSlice();
+    if (proposer_index >= validators_slice.len) {
+        // Out-of-range proposer is itself a rejection-worthy case. If the
+        // fixture expected an exception, this counts as success; otherwise
+        // it is a validator-state mismatch.
+        if (case_obj.get("expectException") != null) return;
+        std.debug.print(
+            "fixture {s} case {s}: proposer_index {d} >= validators.len {d}\n",
+            .{ ctx.fixture_label, ctx.case_name, proposer_index, validators_slice.len },
+        );
+        return FixtureError.FixtureMismatch;
+    }
+
+    const proposal_pubkey = validators_slice[proposer_index].getProposalPubkey();
+    const epoch: u32 = @intCast(block.slot);
+
+    const verify_result = if (std.mem.eql(u8, lean_env, "test"))
+        xmss.verifySszTest(proposal_pubkey, &block_root, epoch, proposer_sig_bytes)
+    else
+        xmss.verifySsz(proposal_pubkey, &block_root, epoch, proposer_sig_bytes);
 
     const expect_exception = case_obj.get("expectException");
-
-    const result = stf.verifySignatures(allocator, &state, &signed_block, null);
     if (expect_exception != null) {
-        if (result) |_| {
+        if (verify_result) |_| {
             std.debug.print(
-                "fixture {s} case {s}: expected exception but verifySignatures succeeded\n",
+                "fixture {s} case {s}: expected exception but proposer signature verification succeeded\n",
                 .{ ctx.fixture_label, ctx.case_name },
             );
             return FixtureError.FixtureMismatch;
@@ -173,9 +204,9 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
             return; // expected failure
         }
     } else {
-        result catch |err| {
+        verify_result catch |err| {
             std.debug.print(
-                "fixture {s} case {s}: unexpected verifySignatures error: {s}\n",
+                "fixture {s} case {s}: unexpected proposer signature verification error: {s}\n",
                 .{ ctx.fixture_label, ctx.case_name, @errorName(err) },
             );
             return FixtureError.FixtureMismatch;
@@ -183,35 +214,35 @@ fn runCase(allocator: Allocator, ctx: Context, value: JsonValue) FixtureError!vo
     }
 }
 
-/// Sanity-check the structural fields the production runner would otherwise
-/// require, so a leanEnv=test skip cannot mask a malformed fixture.
-fn ensureWellFormed(ctx: Context, case_obj: std.json.ObjectMap) FixtureError!void {
-    _ = try expect_mod.expectObject(FixtureError, case_obj, &.{"anchorState"}, ctx, "anchorState");
-    _ = try expect_mod.expectObject(FixtureError, case_obj, &.{"signedBlock"}, ctx, "signedBlock");
-}
-
-fn buildBeamState(
+fn parseHexBytes(
     allocator: Allocator,
     ctx: Context,
-    value: JsonValue,
-) FixtureError!types.BeamState {
-    _ = allocator;
-    _ = ctx;
-    _ = value;
-    // Production-scheme deserialization is not yet wired here — current
-    // fixtures are all leanEnv=test and short-circuit above. When a
-    // production fixture appears, port the helpers from
-    // state_transition_runner.zig (parseValidators, parseBlockHeader, ...).
-    return FixtureError.UnsupportedFixture;
-}
-
-fn buildSignedBlock(
-    allocator: Allocator,
-    ctx: Context,
-    value: JsonValue,
-) FixtureError!types.SignedBlock {
-    _ = allocator;
-    _ = ctx;
-    _ = value;
-    return FixtureError.UnsupportedFixture;
+    hex: []const u8,
+    label: []const u8,
+) FixtureError![]u8 {
+    if (hex.len < 2 or !std.mem.eql(u8, hex[0..2], "0x")) {
+        std.debug.print(
+            "fixture {s} case {s}: {s} missing 0x prefix\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    }
+    const hex_body = hex[2..];
+    if (hex_body.len % 2 != 0) {
+        std.debug.print(
+            "fixture {s} case {s}: {s} hex length not even\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    }
+    const byte_len = hex_body.len / 2;
+    const out = allocator.alloc(u8, byte_len) catch return FixtureError.InvalidFixture;
+    _ = std.fmt.hexToBytes(out, hex_body) catch {
+        std.debug.print(
+            "fixture {s} case {s}: {s} hex decode failed\n",
+            .{ ctx.fixture_label, ctx.case_name, label },
+        );
+        return FixtureError.InvalidFixture;
+    };
+    return out;
 }

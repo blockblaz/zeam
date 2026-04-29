@@ -337,7 +337,7 @@ fn skipExpectExceptionIfEnabled(ctx: Context) bool {
     return true;
 }
 
-fn buildState(
+pub fn buildState(
     allocator: std.mem.Allocator,
     ctx: Context,
     value: JsonValue,
@@ -396,7 +396,7 @@ fn buildState(
     };
 }
 
-fn parseValidators(
+pub fn parseValidators(
     allocator: std.mem.Allocator,
     ctx: Context,
     pre_obj: std.json.ObjectMap,
@@ -448,7 +448,7 @@ fn parseValidators(
     return validators;
 }
 
-fn buildBlock(
+pub fn buildBlock(
     allocator: std.mem.Allocator,
     ctx: Context,
     index: usize,
@@ -508,7 +508,7 @@ fn buildBlock(
     };
 }
 
-fn parseAggregationBits(
+pub fn parseAggregationBits(
     allocator: std.mem.Allocator,
     ctx: Context,
     value: JsonValue,
@@ -542,7 +542,7 @@ fn parseAggregationBits(
     return bits;
 }
 
-fn parseAttestationData(ctx: Context, data_obj: std.json.ObjectMap) FixtureError!types.AttestationData {
+pub fn parseAttestationData(ctx: Context, data_obj: std.json.ObjectMap) FixtureError!types.AttestationData {
     const att_slot = try expect.expectU64Field(FixtureError, data_obj, &.{"slot"}, ctx, "data.slot");
     const head_obj = try expect.expectObject(FixtureError, data_obj, &.{"head"}, ctx, "data.head");
     const target_obj = try expect.expectObject(FixtureError, data_obj, &.{"target"}, ctx, "data.target");
@@ -648,7 +648,7 @@ fn verifyPost(
     }
 }
 
-fn parseCheckpoint(
+pub fn parseCheckpoint(
     ctx: Context,
     parent: std.json.ObjectMap,
     field_name: []const u8,
@@ -666,7 +666,7 @@ fn parseCheckpoint(
     };
 }
 
-fn parseBlockHeader(
+pub fn parseBlockHeader(
     ctx: Context,
     obj: std.json.ObjectMap,
 ) FixtureError!types.BeamBlockHeader {
