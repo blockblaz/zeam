@@ -21,6 +21,7 @@ pub const chainFactory = @import("./chain.zig");
 pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
+pub const followupWorkerFactory = @import("./followup_worker.zig");
 const constants = @import("./constants.zig");
 const forkchoice = @import("./forkchoice.zig");
 
@@ -60,26 +61,28 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Serializes BeamNode work between the libxev main thread (`onInterval`) and
-    /// the libp2p worker thread (`onGossip` / `onReqRespResponse` / `onReqRespRequest`).
+    /// Outermost lock in the per-resource hierarchy (#803). Held only by
+    /// finalization-advancement paths that legitimately need a multi-resource
+    /// view (canonicality scan + states/network prune sweep). Single-mutator
+    /// today — gossip/req-resp/onInterval no longer take this lock; they use
+    /// the per-resource locks documented on `BeamChain` and on `Network`.
     ///
-    /// Invariant: every mutation of `chain` and `network` from those callbacks must
-    /// happen with this mutex held. Compute-heavy work — state transition,
-    /// signature verification, fork-choice updates — currently runs synchronously
-    /// inside the critical section, so a long STF can stall the libxev tick path
-    /// (and vice-versa). See issue #786 for context and follow-ups (offloading
-    /// heavy work to a bounded worker queue, shrinking critical sections, etc.).
-    ///
-    /// `acquireMutex(site)` is the canonical way to take this lock: it records the
-    /// wait + hold time into `zeam_node_mutex_wait_time_seconds` /
-    /// `zeam_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
-    /// quantify the contention described in the issue.
-    mutex: std.Thread.Mutex = .{},
+    /// Renamed from `mutex` (issue #803). `acquireMutex(site)` continues to
+    /// record wait/hold time so the existing histogram dashboards keep
+    /// working during the migration.
+    finalization_lock: std.Thread.Mutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
     /// 300+ individual round-trips caused by sequential parent-chain walking.
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
+    /// Worker thread + queue for `chain.onBlockFollowup` (issue #786 req. 6/7).
+    /// Decouples the gossip thread from event emission, finalization
+    /// advancement, and prune sweeps. Backfill / cached-descendant paths do
+    /// NOT enqueue follow-ups (req. 7) — those imports are already
+    /// state-only and the publishing/eventing is owned by the original
+    /// gossip-importer.
+    followup_worker: followupWorkerFactory.FollowupWorker,
 
     const Self = @This();
 
@@ -139,14 +142,60 @@ pub const BeamNode = struct {
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
             .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
+            .followup_worker = followupWorkerFactory.FollowupWorker.init(
+                allocator,
+                opts.logger_config.logger(.chain),
+            ),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
 
+        // Spawn the follow-up worker. The dispatch callback runs on the
+        // worker thread and invokes `chain.onBlockFollowup` (which takes the
+        // chain-level events_lock + finalization_lock as needed).
+        try self.followup_worker.start(self, runFollowupDispatch);
+
+        // Wire chain → followup-worker so gossip-path follow-ups run
+        // off-thread (issue #786 req. 6). Backfill paths are unchanged —
+        // they skip follow-up entirely (req. 7).
+        chain.setOnBlockFollowupDispatch(self, enqueueChainFollowup);
+
         network_init_cleanup = false;
     }
 
+    /// Worker-thread entry point: forward a dequeued follow-up job into the
+    /// chain layer. Wrapped here so `chain.zig` doesn't have to import
+    /// `followup_worker.zig` directly.
+    fn runFollowupDispatch(ctx: *anyopaque, job: followupWorkerFactory.FollowupJob) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const block_ptr: ?*const types.SignedBlock = job.signed_block;
+        self.chain.onBlockFollowup(job.prune_forkchoice, block_ptr);
+    }
+
+    /// Adapter to bridge `chain.OnBlockFollowupDispatchFn` into the
+    /// `FollowupWorker` queue. Runs on whichever thread chain.onGossip /
+    /// chain.processPendingBlocks runs on (libp2p worker / libxev) — pushes
+    /// onto the worker's MPSC queue and returns immediately.
+    fn enqueueChainFollowup(ctx: *anyopaque, prune_forkchoice: bool) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        // We don't currently need the SignedBlock pointer in `onBlockFollowup`
+        // (it's `_ = signedBlock` in the body). Pass null to keep the
+        // queue entry small and avoid sszCloning every gossip block.
+        self.followup_worker.enqueue(.{
+            .prune_forkchoice = prune_forkchoice,
+            .signed_block = null,
+        }) catch |e| {
+            // Allocation failure on enqueue is non-fatal — fall back to
+            // running follow-up inline so events still fire.
+            self.logger.warn("followup_worker enqueue failed ({any}); running inline", .{e});
+            self.chain.onBlockFollowup(prune_forkchoice, null);
+        };
+    }
+
     pub fn deinit(self: *Self) void {
+        // Stop the follow-up worker first so any in-flight job finishes
+        // BEFORE we tear down chain / network state it references.
+        self.followup_worker.deinit();
         self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
@@ -201,12 +250,12 @@ pub const BeamNode = struct {
         // Falling back to wall-clock time would re-introduce the skew bug we
         // are fixing, so we panic instead.
         var timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
-        self.mutex.lock();
+        self.finalization_lock.lock();
         const wait_ns = timer.lap();
         const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
         zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
         return .{
-            .mutex = &self.mutex,
+            .mutex = &self.finalization_lock,
             .site = site,
             .timer = timer,
         };
@@ -572,15 +621,15 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                // Run the same post-block followup that processBlockByRootChunk performs:
-                // emits head/justification/finalization events and advances finalization.
-                // Note: onBlockFollowup currently ignores the signedBlock pointer (_ = signedBlock),
-                // so the ordering relative to removeFetchedBlock is not a memory-safety requirement
-                // today — kept here as good practice for when the parameter is wired up.
-                // Note: pruneForkchoice=true means processFinalizationAdvancement may fire on every
-                // iteration of a deep cached-block chain. Correct semantically; a future optimisation
-                // could pass false during catch-up and prune once at the end.
-                self.chain.onBlockFollowup(true, cached_block);
+                // Issue #786 req. 7: backfill paths (cached descendants here,
+                // blocks-by-root in `processBlockByRootChunk`) intentionally
+                // SKIP `onBlockFollowup`. Backfill imports are state-only —
+                // we do not need to re-emit head/justification/finalization
+                // events for blocks we are catching up on, and finalization
+                // advance still runs from the gossip path that originally
+                // imports the canonical chain. Calling followup here would
+                // also fire `processFinalizationAdvancement` on every
+                // iteration of a deep cached-block chain, which is wasteful.
 
                 // Remove from cache now that it's been processed
                 _ = self.network.removeFetchedBlock(descendant_root);
@@ -849,9 +898,12 @@ pub const BeamNode = struct {
                 .{&block_root},
             );
 
-            // Store aggregated signature proofs from this block so they can be reused
-            // in future block production. This is the same followup done for gossiped blocks.
-            self.chain.onBlockFollowup(true, signed_block);
+            // Issue #786 req. 7: blocks-by-root (RPC backfill) skips
+            // `onBlockFollowup`. The block has been added to the chain;
+            // events / finalization-advance fire from the gossip path that
+            // originally imported the canonical chain. Skipping here keeps
+            // the RPC handler short and avoids redundant prune sweeps when
+            // a peer hands us a long backfill.
 
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
@@ -1022,8 +1074,12 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
-                defer guard.unlock();
+                // LOCK-FREE (issue #786 req. 2): this path reads only
+                // `chain.db` (own internal synchronisation) and emits
+                // responses via the responder. It does NOT mutate chain or
+                // network state. Forkchoice / state-map are not touched.
+                // Removing the BeamNode lock lets req/resp serving proceed
+                // in parallel with gossip ingestion and onInterval ticks.
 
                 const roots = request.roots.constSlice();
 

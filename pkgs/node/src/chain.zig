@@ -157,13 +157,91 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
+    // Callback to dispatch `onBlockFollowup` to a worker thread (issue #786
+    // req. 6). When set, gossip / pending-replay paths post a job instead of
+    // running followup inline; the gossip thread returns immediately and
+    // event emission / finalization-advance / prune sweep run off-thread.
+    // Backfill paths (cached descendants, blocks-by-root) intentionally do
+    // NOT post a job — see req. 7.
+    followup_dispatch_ctx: ?*anyopaque = null,
+    followup_dispatch_fn: ?OnBlockFollowupDispatchFn = null,
+
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
     // When a peer gossips a block for the current slot before our local interval
     // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
     // blocks here and replay them in onInterval once the clock has caught up.
     pending_blocks: std.ArrayList(types.SignedBlock),
 
+    // ---------- Per-resource locks (issue #803 / #786 follow-up) ----------
+    //
+    // The original `BeamNode.mutex` (renamed to `BeamNode.finalization_lock`)
+    // serialised every chain-mutation entry point against shared state. The
+    // refactor splits the protection so each resource has its own lock,
+    // locked for the smallest possible window. Lock-hierarchy ordering
+    // (acquire only in increasing tier when nesting):
+    //
+    //   1. BeamNode.finalization_lock      (multi-resource view, prune)
+    //   2. Network.{single-purpose maps}   (per-map; see network module)
+    //   2'. Network.block_cache_lock       (covers fetched_blocks + ssz + children)
+    //   3. BeamChain.states_lock           (read-mostly during gossip; write on STF commit / prune)
+    //   4. BeamChain.pending_blocks_lock   (gossip future-slot queue)
+    //   5a. BeamChain.pubkey_cache_lock    (FFI miss latency lives here — separate from 5b)
+    //   5b. BeamChain.root_to_slot_lock    (per-attestation hot path)
+    //   5c. BeamChain.events_lock          (last_emitted_* + cached_finalized_state)
+    //   6. BeamChain.forkChoice            (its own RwLock — innermost)
+    //
+    // Sibling locks (5a/5b/5c) MUST NOT be held simultaneously.
+    states_lock: std.Thread.RwLock = .{},
+    pending_blocks_lock: std.Thread.Mutex = .{},
+    pubkey_cache_lock: std.Thread.Mutex = .{},
+    root_to_slot_lock: std.Thread.Mutex = .{},
+    events_lock: std.Thread.Mutex = .{},
+
+    /// Typed wrapper for a state-map borrow. The underlying `*const BeamState`
+    /// is valid only for the lifetime of the borrow; `deinit()` releases the
+    /// `states_lock` shared lock that backs the borrow.
+    ///
+    /// Callers that need the state across an unlock (FFI, STF, pool-spawned
+    /// work) MUST call `cloneAndRelease` to materialise an owned copy and
+    /// drop the borrow. Holding a `BorrowedState` across an `await`-style
+    /// unlock is a use-after-free waiting to happen and the assertion in
+    /// `deinit` will fire in debug builds if a borrow is dropped twice or
+    /// never released.
+    pub const BorrowedState = struct {
+        state: *const types.BeamState,
+        states_lock: *std.Thread.RwLock,
+        released: bool = false,
+
+        /// Release the underlying `states_lock.shared`. Idempotent: a second
+        /// call is a no-op (debug builds assert exactly one release).
+        pub fn deinit(self: *BorrowedState) void {
+            if (self.released) {
+                if (std.debug.runtime_safety) @panic("BorrowedState released twice");
+                return;
+            }
+            self.released = true;
+            self.states_lock.unlockShared();
+        }
+
+        /// Materialise an owned copy and drop the borrow. Caller owns the
+        /// returned `*types.BeamState` and must call `deinit` + `destroy`
+        /// it via the same allocator. Releases the borrow on success and
+        /// on the failure paths inside `sszClone` (errdefer guarantees).
+        pub fn cloneAndRelease(self: *BorrowedState, allocator: Allocator) !*types.BeamState {
+            const owned = try allocator.create(types.BeamState);
+            errdefer allocator.destroy(owned);
+            try types.sszClone(allocator, types.BeamState, self.state.*, owned);
+            self.deinit();
+            return owned;
+        }
+    };
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
+
+    /// Dispatch signature for off-thread `onBlockFollowup`. The callback
+    /// captures `prune_forkchoice` and posts a job onto the BeamNode's
+    /// follow-up worker; the worker eventually invokes `onBlockFollowup`.
+    pub const OnBlockFollowupDispatchFn = *const fn (ctx: *anyopaque, prune_forkchoice: bool) void;
 
     const Self = @This();
 
@@ -221,6 +299,49 @@ pub const BeamChain = struct {
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
         self.prune_cached_blocks_ctx = ctx;
         self.prune_cached_blocks_fn = func;
+    }
+
+    /// Wire up the off-thread follow-up dispatcher (issue #786 req. 6).
+    /// When unset, paths that previously ran `self.onBlockFollowup(...)`
+    /// inline keep doing so; once set, those paths post a job and return.
+    pub fn setOnBlockFollowupDispatch(
+        self: *Self,
+        ctx: *anyopaque,
+        func: OnBlockFollowupDispatchFn,
+    ) void {
+        self.followup_dispatch_ctx = ctx;
+        self.followup_dispatch_fn = func;
+    }
+
+    /// Helper used by gossip / pending-replay paths: post a follow-up to the
+    /// worker if a dispatcher is wired, otherwise run inline. Backfill
+    /// callers do NOT use this — they skip follow-up entirely (req. 7).
+    fn dispatchOrRunFollowup(self: *Self, prune_forkchoice: bool, signed_block: ?*const types.SignedBlock) void {
+        if (self.followup_dispatch_fn) |dispatch| {
+            if (self.followup_dispatch_ctx) |ctx| {
+                dispatch(ctx, prune_forkchoice);
+                return;
+            }
+        }
+        self.onBlockFollowup(prune_forkchoice, signed_block);
+    }
+
+    /// Borrow a state pointer keyed by `root`. Returns `null` when the state
+    /// is not in the map. The returned `BorrowedState` holds
+    /// `states_lock.shared` until `deinit` (or `cloneAndRelease`) is called.
+    /// Callers MUST release the borrow promptly — never hold it across an
+    /// FFI call, an STF apply, or a thread-pool spawn. Use `cloneAndRelease`
+    /// to convert to an owned copy in those cases.
+    pub fn borrowState(self: *Self, root: types.Root) ?BorrowedState {
+        self.states_lock.lockShared();
+        const state = self.states.get(root) orelse {
+            self.states_lock.unlockShared();
+            return null;
+        };
+        return BorrowedState{
+            .state = state,
+            .states_lock = &self.states_lock,
+        };
     }
 
     pub fn deinit(self: *Self) void {
@@ -319,7 +440,8 @@ pub const BeamChain = struct {
                 };
                 defer self.allocator.free(missing_roots);
 
-                self.onBlockFollowup(true, &queued_block);
+                // Off-thread when a dispatcher is wired (req. 6).
+                self.dispatchOrRunFollowup(true, &queued_block);
 
                 // Accumulate missing roots so the caller can fetch them.
                 all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
@@ -767,8 +889,10 @@ pub const BeamChain = struct {
                         });
                         return err;
                     };
-                    // followup with additional housekeeping tasks
-                    self.onBlockFollowup(true, &signed_block);
+                    // Followup runs off-thread when a dispatcher is wired
+                    // (req. 6) so the gossip thread is freed for the next
+                    // message immediately. Falls back to inline if unset.
+                    self.dispatchOrRunFollowup(true, &signed_block);
                     // NOTE: ownership of `missing_roots` is transferred to the caller (BeamNode),
                     // which is responsible for freeing it after optionally fetching those roots.
 
