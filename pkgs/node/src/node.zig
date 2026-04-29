@@ -1297,7 +1297,11 @@ pub const BeamNode = struct {
 
                 // Replay blocks that were queued waiting for the forkchoice clock to advance,
                 // then fetch any attestation head roots that were missing during replay.
-                const pending_missing_roots = self.chain.processPendingBlocks();
+                // Pass &self.mutex so each inner replay's verify + STF window
+                // runs unlocked (issue #786 phase 2d). The current scope holds
+                // `acquireMutex("onInterval")` so the contract "lock held on
+                // entry/exit" is preserved across the inner lock dance.
+                const pending_missing_roots = self.chain.processPendingBlocks(&self.mutex);
                 defer self.allocator.free(pending_missing_roots);
                 if (pending_missing_roots.len > 0) {
                     self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
@@ -1385,11 +1389,36 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
-                if (self.chain.maybeAggregateOnInterval(interval) catch |e| {
-                    self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
-                    return e;
-                }) |aggregations| {
+                // Phase 2d (issue #786): wrap aggregator's i=2 dispatch in a
+                // fresh BeamNode.mutex acquisition. Pre-PR this code path
+                // ran without the mutex held, racing chain.states / forkchoice
+                // mutations from concurrent libp2p workers. Holding the mutex
+                // here serializes correctly. `chain.maybeAggregateOnInterval`
+                // does not currently hoist its FFI-heavy aggregation step off
+                // the lock — see commit message for the deferred work — so
+                // for now this serializes a ~700ms aggregator window against
+                // libp2p workers when running as an aggregator. Acceptable
+                // trade for correctness; phase 2e can hoist if devnet shows
+                // the regression matters.
+                //
+                // The validator-output dispatch above also publishes via
+                // `publishAggregation` which calls
+                // `chain.onGossipAggregatedAttestation(.., null)` — that path
+                // remains unchanged.
+                var maybe_aggregations: ?[]types.SignedAggregatedAttestation = null;
+                {
+                    var aggregator_guard = self.acquireMutex("maybeAggregateOnInterval");
+                    defer aggregator_guard.unlock();
+                    maybe_aggregations = self.chain.maybeAggregateOnInterval(interval) catch |e| {
+                        self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
+                        return e;
+                    };
+                }
+                if (maybe_aggregations) |aggregations| {
                     defer self.allocator.free(aggregations);
+                    // Publish runs without BeamNode.mutex (mirrors validator
+                    // output dispatch above) so that network.publish does not
+                    // stall libp2p workers behind a socket round-trip.
                     self.publishProducedAggregations(aggregations) catch |e| {
                         self.logger.err("error producing/publishing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
                         return e;

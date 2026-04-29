@@ -289,7 +289,14 @@ pub const BeamChain = struct {
     /// reached their slot.  Called from onInterval after advancing the clock.
     /// Returns a slice of all missing attestation roots encountered while
     /// processing queued blocks; the caller owns and must free the slice.
-    pub fn processPendingBlocks(self: *Self) []types.Root {
+    ///
+    /// `external_mutex` (issue #786 phase 2d): forwarded to each inner
+    /// `self.onBlock` call so the verify + STF window of replayed pending
+    /// blocks runs unlocked. The pending_blocks queue itself is mutated only
+    /// under the outer mutex (gossip path appends here too), so replays and
+    /// appends remain serialized correctly even though `onBlock` releases
+    /// the lock between its own phases.
+    pub fn processPendingBlocks(self: *Self, external_mutex: ?*std.Thread.Mutex) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
         const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
         var i: usize = 0;
@@ -311,14 +318,17 @@ pub const BeamChain = struct {
                     .{ queued_slot, &block_root, fc_time },
                 );
 
-                // Pending-block replay runs inside `BeamNode.onInterval`, which
-                // already holds the BeamNode mutex. Releasing it here would
-                // require interval ordering protection that is not currently
-                // in place. Pass null until a follow-up PR addresses the
-                // tick-replay path. Pending-block replay is rare in practice.
+                // Forward `external_mutex` so each replay's verify + STF
+                // window runs unlocked (issue #786 phase 2d). The
+                // `pending_blocks` slice itself is only mutated under
+                // BeamNode.mutex, so the loop's index/len bookkeeping
+                // remains coherent across the inner unlock/relock. New
+                // appends from concurrent `chain.onGossip.block` paths
+                // land at the tail and are picked up on the next
+                // iteration's `i < self.pending_blocks.items.len` check.
                 const missing_roots = self.onBlock(queued_block, .{
                     .blockRoot = block_root,
-                }, null) catch |err| {
+                }, external_mutex) catch |err| {
                     self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
                     continue;
                 };
