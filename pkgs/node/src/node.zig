@@ -1315,20 +1315,38 @@ pub const BeamNode = struct {
             }
 
             if (self.validator) |*validator| {
-                // we also tick validator per interval in case it would
-                // need to sync its future duties when its an independent validator
-                // Pass our mutex so chain.produceBlock can release it for the
-                // CPU-bound aggregation + STF window during block proposal
-                // (issue #786 phase 2c).
-                var validator_output = validator.onInterval(interval, &self.mutex) catch |e| {
-                    self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
-                    return e;
-                };
+                // We also tick the validator per interval so it can sync
+                // future duties when running as an independent validator.
+                //
+                // Phase 2c (issue #786): chain.produceBlock releases its
+                // caller's mutex for the CPU-bound aggregation + STF window
+                // and re-acquires before forkchoice mutation. The contract
+                // is "lock held on entry == lock held on exit", so we MUST
+                // acquire `self.mutex` before invoking validator.onInterval
+                // and release after — the surrounding `acquireMutex("onInterval")`
+                // guard above has already gone out of scope.
+                //
+                // The validator output dispatch (publish*) runs OUTSIDE this
+                // fresh mutex acquisition: each publish helper performs its
+                // own network.publish (which would otherwise stall every
+                // libp2p worker waiting on BeamNode.mutex) and the chain
+                // mutations they make pass `null` for external_mutex (the
+                // caller does not hold the lock there).
+                var validator_output_opt: ?validatorClient.ValidatorClientOutput = null;
+                defer if (validator_output_opt) |*output| output.deinit();
+                {
+                    var validator_guard = self.acquireMutex("validator.onInterval");
+                    defer validator_guard.unlock();
+                    validator_output_opt = validator.onInterval(interval, &self.mutex) catch |e| {
+                        self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
+                        return e;
+                    };
+                }
 
-                if (validator_output) |*output| {
-                    defer output.deinit();
+                if (validator_output_opt) |*output| {
                     for (output.gossip_messages.items) |gossip_msg| {
-                        // Process based on message type
+                        // Process based on message type. publish* helpers run
+                        // without BeamNode.mutex held — see note above.
                         switch (gossip_msg) {
                             .block => |signed_block| {
                                 self.publishBlock(signed_block) catch |e| {
