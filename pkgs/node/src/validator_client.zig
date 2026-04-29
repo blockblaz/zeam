@@ -81,13 +81,20 @@ pub const ValidatorClient = struct {
         };
     }
 
-    pub fn onInterval(self: *Self, time_intervals: usize) !?ValidatorClientOutput {
+    pub fn onInterval(
+        self: *Self,
+        time_intervals: usize,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !?ValidatorClientOutput {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
         const interval = time_intervals % constants.INTERVALS_PER_SLOT;
 
         // if a new slot interval may be do a proposal
         switch (interval) {
-            0 => return self.maybeDoProposal(slot),
+            // Block production releases `external_mutex` around the heavy
+            // CPU window (proposal-attestation aggregation + STF) — see
+            // issue #786 phase 2c.
+            0 => return self.maybeDoProposal(slot, external_mutex),
             1 => return self.mayBeDoAttestation(slot),
             2 => return null,
             3 => return null,
@@ -107,7 +114,11 @@ pub const ValidatorClient = struct {
         }
     }
 
-    pub fn maybeDoProposal(self: *Self, slot: usize) !?ValidatorClientOutput {
+    pub fn maybeDoProposal(
+        self: *Self,
+        slot: usize,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !?ValidatorClientOutput {
         if (self.getSlotProposer(slot)) |slot_proposer_id| {
             // Check if chain is synced before producing a block
             const sync_status = self.chain.getSyncStatus();
@@ -134,7 +145,7 @@ pub const ValidatorClient = struct {
             }
 
             self.logger.debug("constructing block for slot={d} proposer={d}", .{ slot, slot_proposer_id });
-            const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id });
+            const produced_block = try self.chain.produceBlock(.{ .slot = slot, .proposer_index = slot_proposer_id }, external_mutex);
             self.logger.info("produced block for slot={d} proposer={d} with root={x}", .{ slot, slot_proposer_id, &produced_block.blockRoot });
 
             // Sign block root with proposer's proposal key

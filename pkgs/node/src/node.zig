@@ -1317,7 +1317,10 @@ pub const BeamNode = struct {
             if (self.validator) |*validator| {
                 // we also tick validator per interval in case it would
                 // need to sync its future duties when its an independent validator
-                var validator_output = validator.onInterval(interval) catch |e| {
+                // Pass our mutex so chain.produceBlock can release it for the
+                // CPU-bound aggregation + STF window during block proposal
+                // (issue #786 phase 2c).
+                var validator_output = validator.onInterval(interval, &self.mutex) catch |e| {
                     self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
                     return e;
                 };
@@ -2393,7 +2396,7 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
     const produced_block = try node.chain.produceBlock(.{
         .slot = slot,
         .proposer_index = validator_ids[0],
-    });
+    }, null);
     const produced_root = produced_block.blockRoot;
 
     const proposer_signature = try ctx.key_manager.signBlockRoot(

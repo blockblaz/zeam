@@ -431,25 +431,51 @@ pub const BeamChain = struct {
         };
     }
 
-    pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
+    /// Construct a fresh block for the given slot/proposer.
+    ///
+    /// `external_mutex` (issue #786 phase 2c): when non-null, the caller's
+    /// mutex is released around the CPU-heavy phase — proposal-attestation
+    /// aggregation + STF + block hash. Per devnet metrics block building
+    /// runs at ~826ms mean (12.07s aggregation work over 15 builds), which
+    /// single-handedly stalls 1+ libxev tick when held under BeamNode.mutex.
+    ///
+    /// Thread-safety contract during the unlocked window:
+    ///   - The cloned `post_state` is local to this call. STF mutates it
+    ///     in place; nothing else can observe it before we re-acquire.
+    ///   - `getProposalAttestations` reads forkchoice internal state under
+    ///     forkchoice's own RwLock (shared). Concurrent `onGossipBlock` /
+    ///     `storeAggregatedPayload` paths take the RwLock for write, so
+    ///     reads serialize correctly even with the outer BeamNode.mutex
+    ///     released. We pass `post_state` (not the live `pre_state`) as
+    ///     the validator/checkpoint snapshot for the same reason as in
+    ///     `chain.onBlock` — STF has not run yet, validators slice +
+    ///     latest_block_header + latest_justified are byte-identical to
+    ///     `pre_state` at this moment, and using the local clone removes
+    ///     dependency on the live state-map pointer for the duration of
+    ///     the unlocked window.
+    ///   - `apply_raw_block` (STF) runs entirely on the local clone.
+    ///   - `hashTreeRoot` over the constructed block is pure CPU on local
+    ///     data.
+    ///   - All counter / histogram updates during the unlocked window go
+    ///     through atomic-backed metrics primitives.
+    ///
+    /// Phase 3 (locked) handles `states.put` + `forkChoice.onBlock` +
+    /// `updateHead` so a competing thread's `onBlock` for the same root —
+    /// extremely unlikely (we just generated this block, hash unique) —
+    /// would surface as a forkchoice error rather than corrupting state.
+    pub fn produceBlock(
+        self: *Self,
+        opts: BlockProductionParams,
+        external_mutex: ?*std.Thread.Mutex,
+    ) !ProducedBlock {
         // Block building total time timer
         const block_building_timer = zeam_metrics.lean_block_building_time_seconds.start();
         errdefer {
             _ = block_building_timer.observe();
             zeam_metrics.metrics.lean_block_building_failures_total.incr();
         }
-        // dump the vote tracker, letting this stay here commented for handy debugging activation
-        // var iterator = self.forkChoice.attestations.iterator();
-        // while (iterator.next()) |entry| {
-        //     var latest_new: []const u8 = "null";
-        //     if (entry.value_ptr.latestNew) |latest_new_in| {
-        //         if (latest_new_in.attestation) |latest_new_att| {
-        //             latest_new = try latest_new_att.message.toJsonString(self.allocator);
-        //         }
-        //     }
-        //     self.logger.warn("validator id={d} vote is={s}", .{ entry.key_ptr.*, latest_new });
-        // }
 
+        // ---------------- Phase 1 (locked) ----------------
         // right now with integrated validator into node produceBlock is always gurranteed to be
         // called post ticking the chain to the correct time, but once validator is separated
         // one must make the forkchoice tick to the right time if there is a race condition
@@ -469,56 +495,95 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
-        _ = payload_agg_timer.observe();
+        // ---------------- Phase 2 (unlocked) ----------------
+        // After this point and until the matching re-lock, every read goes
+        // through `post_state` (local clone) or forkchoice's internal RwLock.
+        // No code below the unlock and above the re-lock may mutate
+        // chain-level state (chain.states, chain.root_to_slot_cache, etc.).
+        if (external_mutex) |m| m.unlock();
+        const compute_timer = zeam_metrics.zeam_chain_produceblock_compute_unlocked_seconds.start();
 
-        var agg_attestations = proposal_atts.attestations;
-        var agg_att_cleanup = true;
-        errdefer if (agg_att_cleanup) {
-            for (agg_attestations.slice()) |*att| att.deinit();
-            agg_attestations.deinit();
+        const ComputeResult = struct {
+            block: types.BeamBlock,
+            block_root: [32]u8,
+            attestation_signatures: types.AttestationSignatures,
+            num_agg_sigs: u64,
+            total_attestations_in_agg: u64,
         };
 
-        var attestation_signatures = proposal_atts.signatures;
-        var agg_sig_cleanup = true;
-        errdefer if (agg_sig_cleanup) {
-            for (attestation_signatures.slice()) |*sig| sig.deinit();
-            attestation_signatures.deinit();
-        };
+        const compute_result: anyerror!ComputeResult = compute: {
+            const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
+            const proposal_atts_or_err = self.forkChoice.getProposalAttestations(post_state, opts.slot, opts.proposer_index, parent_root);
+            _ = payload_agg_timer.observe();
+            const proposal_atts = proposal_atts_or_err catch |err| break :compute err;
 
-        // Record aggregated signature metrics
-        const num_agg_sigs = attestation_signatures.len();
-        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(num_agg_sigs);
+            var agg_attestations = proposal_atts.attestations;
+            var agg_att_cleanup = true;
+            errdefer if (agg_att_cleanup) {
+                for (agg_attestations.slice()) |*att| att.deinit();
+                agg_attestations.deinit();
+            };
 
-        var total_attestations_in_agg: u64 = 0;
-        for (agg_attestations.constSlice()) |agg_att| {
-            const bits_len = agg_att.aggregation_bits.len();
-            for (0..bits_len) |i| {
-                if (agg_att.aggregation_bits.get(i) catch false) {
-                    total_attestations_in_agg += 1;
+            var attestation_signatures = proposal_atts.signatures;
+            var agg_sig_cleanup = true;
+            errdefer if (agg_sig_cleanup) {
+                for (attestation_signatures.slice()) |*sig| sig.deinit();
+                attestation_signatures.deinit();
+            };
+
+            const num_agg_sigs = attestation_signatures.len();
+            var total_attestations_in_agg: u64 = 0;
+            for (agg_attestations.constSlice()) |agg_att| {
+                const bits_len = agg_att.aggregation_bits.len();
+                for (0..bits_len) |i| {
+                    if (agg_att.aggregation_bits.get(i) catch false) {
+                        total_attestations_in_agg += 1;
+                    }
                 }
             }
-        }
-        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(total_attestations_in_agg);
 
-        // keeping for later when execution will be integrated into lean
-        // const timestamp = self.config.genesis.genesis_time + opts.slot * params.SECONDS_PER_SLOT;
+            var block = types.BeamBlock{
+                .slot = opts.slot,
+                .proposer_index = opts.proposer_index,
+                .parent_root = parent_root,
+                .state_root = undefined,
+                .body = types.BeamBlockBody{
+                    // .execution_payload_header = .{ .timestamp = timestamp },
+                    .attestations = agg_attestations,
+                },
+            };
+            agg_att_cleanup = false; // Ownership moved to block.body.attestations
+            errdefer block.deinit();
 
-        var block = types.BeamBlock{
-            .slot = opts.slot,
-            .proposer_index = opts.proposer_index,
-            .parent_root = parent_root,
-            .state_root = undefined,
-            .body = types.BeamBlockBody{
-                // .execution_payload_header = .{ .timestamp = timestamp },
-                .attestations = agg_attestations,
-            },
+            // STF on the local clone.
+            stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache) catch |err| {
+                break :compute err;
+            };
+
+            // hashTreeRoot of the now-final block.
+            var block_root: [32]u8 = undefined;
+            zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator) catch |err| {
+                break :compute err;
+            };
+
+            agg_sig_cleanup = false; // ownership moves to ComputeResult
+            break :compute ComputeResult{
+                .block = block,
+                .block_root = block_root,
+                .attestation_signatures = attestation_signatures,
+                .num_agg_sigs = num_agg_sigs,
+                .total_attestations_in_agg = total_attestations_in_agg,
+            };
         };
-        agg_att_cleanup = false; // Ownership moved to block.body.attestations
-        errdefer block.deinit();
 
-        agg_sig_cleanup = false; // Ownership moved to attestation_signatures
+        _ = compute_timer.observe();
+        if (external_mutex) |m| m.lock();
+
+        const result = compute_result catch |err| return err;
+        var block = result.block;
+        const block_root = result.block_root;
+        var attestation_signatures = result.attestation_signatures;
+        errdefer block.deinit();
         errdefer {
             for (attestation_signatures.slice()) |*sig_group| {
                 sig_group.deinit();
@@ -526,23 +591,21 @@ pub const BeamChain = struct {
             attestation_signatures.deinit();
         }
 
+        // Phase-2 metrics emitted under re-acquired lock so they are
+        // ordered with respect to other counter updates.
+        zeam_metrics.metrics.lean_pq_sig_aggregated_signatures_total.incrBy(result.num_agg_sigs);
+        zeam_metrics.metrics.lean_pq_sig_attestations_in_aggregated_signatures_total.incrBy(result.total_attestations_in_agg);
+
         const block_str = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str);
-
         self.logger.debug("node-{d}::going for block production opts={f} raw block={s}", .{ self.nodeId, opts, block_str });
-
-        // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
-
         self.logger.debug("applied raw block opts={f} raw block={s}", .{ opts, block_str_2 });
 
-        // 3. cache state to save recompute while adding the block on publish
-        var block_root: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
-
+        // ---------------- Phase 3 (locked) ----------------
+        // Cache state to save recompute while adding the block on publish.
         try self.states.put(block_root, post_state);
         post_state_opt = null;
 
@@ -554,15 +617,9 @@ pub const BeamChain = struct {
             }
         };
 
-        // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        // PS: this isn't required because forkchoice is already ticked before validator's oninterval is called
-        // which then leads to block production call
-        //
-        // try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-
-        // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
-        //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
-        //   them in the forkchoice
+        // Add the block directly to forkchoice; this proposer will next need
+        // to construct its vote. Attestations packed in the block are already
+        // in knownVotes so we don't need to re-import them.
         _ = try self.forkChoice.onBlock(block, post_state, .{
             .currentSlot = block.slot,
             .blockDelayMs = 0,
@@ -3124,7 +3181,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     var produced = try beam_chain.produceBlock(.{
         .slot = proposal_slot,
         .proposer_index = proposal_slot % num_validators,
-    });
+    }, null);
     defer produced.deinit();
 
     // The block should contain attestation entries for both att_data since both
@@ -3155,4 +3212,86 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Only the known attestation is included in the block
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
+}
+
+test "produceBlock preserves caller-held external_mutex on entry/exit (issue #786)" {
+    // Lock-invariant regression test for the phase 2c hoist: chain.produceBlock
+    // unlocks `external_mutex` for proposal-attestation aggregation + STF +
+    // block hash and re-acquires before forkchoice mutation. Asserts the
+    // contract "lock held on entry == lock held on exit" on the success
+    // path. (The phase-1 error paths share the same shape as the phase-1
+    // checks already covered by the chain.onBlock lock-invariant test.)
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Import slots 1 and 2 so getProposalHead returns a known head.
+    for (1..mock_chain.blocks.len) |i| {
+        const block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(block, .{}, null);
+        allocator.free(missing_roots);
+    }
+
+    // Tick forkchoice to slot 3 so produceBlock for slot 3 succeeds.
+    const proposal_slot: types.Slot = 3;
+    try beam_chain.forkChoice.onInterval(proposal_slot * constants.INTERVALS_PER_SLOT, false);
+
+    var mutex: std.Thread.Mutex = .{};
+
+    const num_validators: u64 = @intCast(mock_chain.genesis_config.numValidators());
+    mutex.lock();
+    var produced = try beam_chain.produceBlock(.{
+        .slot = proposal_slot,
+        .proposer_index = proposal_slot % num_validators,
+    }, &mutex);
+    defer produced.deinit();
+    // tryLock must fail — the lock must still be held.
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
