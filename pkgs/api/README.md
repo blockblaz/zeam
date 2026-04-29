@@ -304,7 +304,7 @@ docker-compose up -d
 **Example query** (95th percentile block processing):
 
 ```promql
-histogram_quantile(0.95, sum(rate(chain_onblock_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(zeam_chain_onblock_duration_seconds_bucket[5m])) by (le))
 ```
 
 ## Package Dependencies

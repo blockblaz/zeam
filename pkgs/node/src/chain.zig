@@ -17,6 +17,7 @@ const event_broadcaster = api.event_broadcaster;
 const zeam_utils = @import("@zeam/utils");
 const keymanager = @import("@zeam/key-manager");
 const xmss = @import("@zeam/xmss");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
@@ -49,8 +50,13 @@ pub const ChainOpts = struct {
     db: database.Db,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool = false,
-    // import and aggregate all subnet ids subscribed to
+    // Seeds the runtime aggregator role. The role can be toggled at runtime
+    // via `setAggregator`; the CLI `--is-aggregator` flag only supplies the
+    // initial value. See `BeamChain.is_aggregator_enabled`.
     is_aggregator: bool = false,
+    // Optional shared worker pool for CPU-bound work (signature verification).
+    // When null, the chain falls back to the serial code paths.
+    thread_pool: ?*ThreadPool = null,
 };
 
 pub const CachedProcessedBlockInfo = struct {
@@ -107,7 +113,16 @@ pub const BeamChain = struct {
     connected_peers: *const std.StringHashMap(PeerInfo),
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
-    is_aggregator_enabled: bool,
+    // Aggregator role flag, toggleable at runtime via `setAggregator`.
+    // Read from gossip handlers, the tick loop, and the network subscribe
+    // phase, so it is stored as an atomic to permit lock-free reads while
+    // the admin API flips the flag.
+    //
+    // Note: network subnet subscriptions are decided once at startup based
+    // on the initial value. Flipping this at runtime affects gossip import
+    // and aggregation duties for subnets the node is already subscribed to,
+    // matching the hot-standby model documented in leanEthereum/leanSpec#636.
+    is_aggregator_enabled: std.atomic.Value(bool),
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -115,17 +130,34 @@ pub const BeamChain = struct {
     public_key_cache: xmss.PublicKeyCache,
     // Cache for root to slot mapping to optimize block processing performance.
     root_to_slot_cache: types.RootToSlotCache,
+    /// Optional worker pool for parallelizing CPU-bound steps (currently:
+    /// attestation signature verification and `compactAttestations`). Owned
+    /// by the caller (e.g. the CLI's main), not by the chain.
+    ///
+    /// Thread-safety invariants required of the pool's environment when set:
+    ///
+    ///   1. `chain.allocator` MUST be safe to use concurrently from worker
+    ///      threads. The CLI today wires this to a `GeneralPurposeAllocator`
+    ///      whose `alloc`/`free` are internally serialized; an `ArenaAllocator`
+    ///      or any custom non-thread-safe allocator would race. If a future
+    ///      change swaps the allocator, audit every consumer of `thread_pool`
+    ///      (`stf.verifySignaturesParallel`, `types.compactAttestations`).
+    ///   2. The XMSS verifier must be set up before the pool's first verify.
+    ///      The CLI calls `xmss.setupVerifier()` on the main thread right after
+    ///      pool construction; without that pre-warm, concurrent first-time
+    ///      verifies could race the Rust-side initialization.
+    ///   3. `xmss.PublicKeyCache` is documented NOT thread-safe. Workers must
+    ///      not call its `getOrPut` directly. The current parallel paths
+    ///      respect this: cache access is confined to a serial pre-phase.
+    ///
+    /// New consumers of `thread_pool` should preserve all three invariants.
+    thread_pool: ?*ThreadPool = null,
 
     // Callback for pruning cached blocks after finalization advances
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
-    // When a peer gossips a block for the current slot before our local interval
-    // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
-    // blocks here and replay them in onInterval once the clock has caught up.
-    pending_blocks: std.ArrayList(types.SignedBlock),
-
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -140,6 +172,7 @@ pub const BeamChain = struct {
             .config = opts.config,
             .anchorState = opts.anchorState,
             .logger = logger_config.logger(.forkchoice),
+            .thread_pool = opts.thread_pool,
         });
 
         var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
@@ -168,10 +201,10 @@ pub const BeamChain = struct {
             .connected_peers = connected_peers,
             .node_registry = opts.node_registry,
             .force_block_production = opts.force_block_production,
-            .is_aggregator_enabled = opts.is_aggregator,
+            .is_aggregator_enabled = std.atomic.Value(bool).init(opts.is_aggregator),
             .public_key_cache = xmss.PublicKeyCache.init(allocator),
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
-            .pending_blocks = .empty,
+            .thread_pool = opts.thread_pool,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -206,15 +239,32 @@ pub const BeamChain = struct {
 
         // Clean up root to slot cache
         self.root_to_slot_cache.deinit();
-        // Clean up any blocks that were queued waiting for the forkchoice clock
-        for (self.pending_blocks.items) |*block| {
-            block.deinit();
-        }
-        self.pending_blocks.deinit(self.allocator);
 
         // assume the allocator of config is same as self.allocator
         self.config.deinit(self.allocator);
         // self.anchor_state.deinit();
+    }
+
+    /// Returns the current aggregator role flag.
+    pub fn isAggregator(self: *const Self) bool {
+        return self.is_aggregator_enabled.load(.acquire);
+    }
+
+    /// Atomically flips the aggregator role and returns the previous value.
+    /// Both the gossip import path and the tick-driven aggregation path pick
+    /// up the new value on their next read, so no restart is required.
+    ///
+    /// Logs transitions at info and no-op writes at debug so operators can
+    /// trace toggles (from the admin API or any other caller) in the node
+    /// logs without needing to cross-reference request logs.
+    pub fn setAggregator(self: *Self, enabled: bool) bool {
+        const previous = self.is_aggregator_enabled.swap(enabled, .acq_rel);
+        if (previous != enabled) {
+            self.logger.info("aggregator role changed: {any} -> {any}", .{ previous, enabled });
+        } else {
+            self.logger.debug("aggregator role set to {any} (no change)", .{enabled});
+        }
+        return previous;
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
@@ -222,51 +272,6 @@ pub const BeamChain = struct {
         // tacking registrations and keeping it alive for 3*2=6 slots
         self.registered_validator_ids = validator_ids;
         zeam_metrics.metrics.lean_validators_count.set(self.registered_validator_ids.len);
-    }
-
-    /// Replay blocks that were queued because the forkchoice clock hadn't yet
-    /// reached their slot.  Called from onInterval after advancing the clock.
-    /// Returns a slice of all missing attestation roots encountered while
-    /// processing queued blocks; the caller owns and must free the slice.
-    pub fn processPendingBlocks(self: *Self) []types.Root {
-        var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
-        const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-        var i: usize = 0;
-        while (i < self.pending_blocks.items.len) {
-            const queued_slot = self.pending_blocks.items[i].block.slot;
-            if (queued_slot * constants.INTERVALS_PER_SLOT <= fc_time) {
-                // Remove from queue (ownership transferred to local var).
-                var queued_block = self.pending_blocks.orderedRemove(i);
-                defer queued_block.deinit();
-
-                var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
-                    self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
-                    continue;
-                };
-
-                self.logger.info(
-                    "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
-                    .{ queued_slot, &block_root, fc_time },
-                );
-
-                const missing_roots = self.onBlock(queued_block, .{
-                    .blockRoot = block_root,
-                }) catch |err| {
-                    self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
-                    continue;
-                };
-                defer self.allocator.free(missing_roots);
-
-                self.onBlockFollowup(true, &queued_block);
-
-                // Accumulate missing roots so the caller can fetch them.
-                all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
-            } else {
-                i += 1;
-            }
-        }
-        return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
     }
 
     pub fn onInterval(self: *Self, time_intervals: usize) !void {
@@ -277,6 +282,13 @@ pub const BeamChain = struct {
 
         // Update current slot metric (wall-clock time slot)
         zeam_metrics.metrics.lean_current_slot.set(slot);
+        // Update sync status metric: labeled gauge, 1 for active state
+        {
+            const sync_status = self.getSyncStatus();
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "idle" }, if (sync_status == .no_peers or sync_status == .fc_initing) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "syncing" }, if (sync_status == .behind_peers) 1 else 0) catch {};
+            zeam_metrics.metrics.lean_node_sync_status.set(.{ .status = "synced" }, if (sync_status == .synced) 1 else 0) catch {};
+        }
 
         var has_proposal = false;
         if (interval == 0) {
@@ -359,6 +371,12 @@ pub const BeamChain = struct {
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
+        // Block building total time timer
+        const block_building_timer = zeam_metrics.lean_block_building_time_seconds.start();
+        errdefer {
+            _ = block_building_timer.observe();
+            zeam_metrics.metrics.lean_block_building_failures_total.incr();
+        }
         // dump the vote tracker, letting this stay here commented for handy debugging activation
         // var iterator = self.forkChoice.attestations.iterator();
         // while (iterator.next()) |entry| {
@@ -390,9 +408,9 @@ pub const BeamChain = struct {
         const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
-        const building_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_building_time_seconds.start();
+        const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
         const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
-        _ = building_timer.observe();
+        _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
         var agg_att_cleanup = true;
@@ -475,13 +493,7 @@ pub const BeamChain = struct {
             }
         };
 
-        // 4. Advance fork choice to this block's slot so the block is not rejected as FutureSlot
-        // PS: this isn't required because forkchoice is already ticked before validator's oninterval is called
-        // which then leads to block production call
-        //
-        // try self.forkChoice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
-
-        // 5. Add the block to directly forkchoice as this proposer will next need to construct its vote
+        // 4. Add the block directly to forkchoice as this proposer will next need to construct its vote
         //   note - attestations packed in the block are already in the knownVotes so we don't need to re-import
         //   them in the forkchoice
         _ = try self.forkChoice.onBlock(block, post_state, .{
@@ -493,6 +505,11 @@ pub const BeamChain = struct {
         });
         forkchoice_added = true;
         _ = try self.forkChoice.updateHead();
+
+        // Record block production success metrics
+        _ = block_building_timer.observe();
+        zeam_metrics.metrics.lean_block_building_success_total.incr();
+        zeam_metrics.lean_block_aggregated_payloads.record(@floatFromInt(attestation_signatures.len()));
 
         return .{
             .block = block,
@@ -638,49 +655,14 @@ pub const BeamChain = struct {
                 });
 
                 if (!hasBlock) {
-                    // Validation errors propagate to node.zig for context-aware logging
+                    // Validation errors propagate to node.zig for context-aware logging.
+                    // validateBlock checks parent / signature / STF preconditions; STF
+                    // and signature verification are the gating layers for any block.
                     try self.validateBlock(block, true);
-
-                    // If the forkchoice clock hasn't yet ticked to this block's slot,
-                    // onBlock would reject it with FutureSlot.  Queue the block and
-                    // replay it from onInterval once the clock has advanced.
-                    if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                        self.logger.debug(
-                            "queuing gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                            .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
-                        );
-                        var cloned: types.SignedBlock = undefined;
-                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
-
-                        // TODO: in beam sim, it seems to have queued after the oninterval fires even if block arrives pre on interval
-                        // because of race conditions between competing threads as the above sszClone aparently takes too much time
-                        // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
-                        // holding mutex between then for chain modification sections
-                        if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                            try self.pending_blocks.append(self.allocator, cloned);
-
-                            self.logger.info(
-                                "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
-                            );
-                            return .{};
-                        } else {
-                            self.logger.debug(
-                                //
-                                "chain already ticked while cloning block for queuing, skipping queuing and directly processing slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                                //
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT });
-                            // by the time we cloned, chain ticked, so we can directly add and deinit clone
-                            cloned.deinit();
-                        }
-                    }
 
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
-                        // we will not catch and enqueue block for FutureSlot error because this error here means
-                        // that the block's slot is 2 ahead of the local because we have tolerance of 1 in case of
-                        // clock skew or race between oninterval and block arrival
                         self.logger.err("error processing block for slot={d} root=0x{x}: {any}", .{
                             block.slot,
                             &block_root,
@@ -748,7 +730,7 @@ pub const BeamChain = struct {
                     }
                 };
 
-                if (self.is_aggregator_enabled) {
+                if (self.is_aggregator_enabled.load(.acquire)) {
                     // Process validated attestation
                     self.onGossipAttestation(signed_attestation) catch |err| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
@@ -779,7 +761,7 @@ pub const BeamChain = struct {
 
                 // Validate attestation data before processing (same rules as individual gossip attestations)
                 self.validateAttestationData(signed_aggregation.data, false) catch |err| {
-                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
+                    zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                     switch (err) {
                         error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
                             // Add the missing root to the result so node's onGossip can enqueue it for fetching
@@ -824,7 +806,7 @@ pub const BeamChain = struct {
     // our implemented forkchoice's onblock. this is to parallelize "apply transition" with other verifications
     // Returns a list of missing block roots that need to be fetched from the network
     pub fn onBlock(self: *Self, signedBlock: types.SignedBlock, blockInfo: CachedProcessedBlockInfo) ![]types.Root {
-        const onblock_timer = zeam_metrics.chain_onblock_duration_seconds.start();
+        const onblock_timer = zeam_metrics.zeam_chain_onblock_duration_seconds.start();
 
         const block = signedBlock.block;
 
@@ -847,9 +829,14 @@ pub const BeamChain = struct {
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
 
-            // 2. verify XMSS signatures (independent step; placed before STF for now, parallelizable later)
-            // Use public key cache to avoid repeated SSZ deserialization of validator public keys
-            try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
+            // rejected without mutating post state). Uses the shared thread pool when available to
+            // parallelize per-attestation verification across CPU workers.
+            if (self.thread_pool) |pool| {
+                try stf.verifySignaturesParallel(self.allocator, pre_state, &signedBlock, &self.public_key_cache, pool);
+            } else {
+                try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            }
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
             try stf.apply_transition(self.allocator, cpost_state, block, .{
@@ -1264,9 +1251,35 @@ pub const BeamChain = struct {
             pruned_count,
         });
 
-        // 5 Rebase forkchouce
-        if (pruneForkchoice)
-            try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+        // 5 Rebase forkchoice — lazy prune with node-count threshold.
+        //
+        // Eager rebase drops pre-finalized ancestors from proto-array and
+        // remaps attestation-tracker indices. In-flight attestations whose
+        // source/target/head still points at one of those ancestors then
+        // fail the existence checks in validateAttestationData with
+        // Unknown{Source,Target,Head}Block, and the node burns bandwidth
+        // re-fetching blocks that will never come back. The grace window
+        // is measured in proto-array node count — see
+        // constants.PRUNE_NODE_THRESHOLD for the sizing rationale.
+        if (pruneForkchoice) {
+            if (self.forkChoice.getProtoNodeIndex(latestFinalized.root)) |finalized_idx| {
+                if (finalized_idx >= constants.PRUNE_NODE_THRESHOLD) {
+                    try self.forkChoice.rebase(latestFinalized.root, &canonical_view);
+                }
+                // else: threshold not reached; keep pre-finalized ancestors
+                // in proto-array so in-flight attestations still resolve.
+            } else {
+                // Shouldn't happen: getCanonicalViewAndAnalysis already resolved
+                // latestFinalized.root via protoArray.indices. If it ever does,
+                // proto-array has fallen out of sync with fcStore — log loudly so
+                // the invariant violation is visible, and keep skipping the rebase
+                // (which also drops pruning) rather than dereferencing a stale node.
+                self.logger.warn(
+                    "forkchoice: finalized root 0x{x} missing from proto-array; skipping rebase (invariant violation)",
+                    .{&latestFinalized.root},
+                );
+            }
+        }
 
         // TODO:
         // 6. Remove orphaned blocks from database and cleanup unfinalized indices of there are any
@@ -1297,8 +1310,20 @@ pub const BeamChain = struct {
         //     }
         // }
 
-        // Prune root-to-slot cache up to finalized slot
-        try self.root_to_slot_cache.prune(latestFinalized.slot);
+        // Prune root-to-slot cache up to the PREVIOUS finalized slot, not the
+        // new one. Cached post-states retained in `self.states` (block.slot >
+        // latestFinalized.slot survived `pruneStates` above) can still hold
+        // `justifications_roots` whose slots lie in
+        // (state.latest_finalized.slot, state.slot]. When a later block is
+        // imported on top of such a state and its STF advances finality, the
+        // post-finalization cleanup loop in `BeamState.processAttestations`
+        // looks those roots up in this cache — so the cache must keep them
+        // reachable across one finalization boundary. Pruning on
+        // `latestFinalized.slot` drops exactly the roots in
+        // (previousFinalized.slot, latestFinalized.slot] that such states can
+        // reference, which wedged zeam_0 on devnet-4 via a cross-fork reorg
+        // (see issue #771 and the complementary STF hotfix in #772).
+        try self.root_to_slot_cache.prune(previousFinalized.slot);
 
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
@@ -1312,34 +1337,22 @@ pub const BeamChain = struct {
     /// flooding the node with invalid blocks.
     ///
     /// Validations performed:
-    /// 1. Future slot check: block.slot must not be too far in the future
-    /// 2. Pre-finalized slot check: block.slot must be >= finalized_slot
-    /// 3. Proposer index bounds check: proposer_index must be < validator_count
-    /// 4. Parent existence check: parent_root must be known
-    /// 5. Slot ordering check: block.slot must be > parent.slot
-    /// 6. Finalized-descendant check: parent chain must reach the finalized
+    /// 1. Pre-finalized slot check: block.slot must be >= finalized_slot
+    /// 2. Proposer index bounds check: proposer_index must be < validator_count
+    /// 3. Parent existence check: parent_root must be known
+    /// 4. Slot ordering check: block.slot must be > parent.slot
+    /// 5. Finalized-descendant check: parent chain must reach the finalized
     ///    checkpoint (DoS defense — forks off pre-finalization ancestors are
     ///    rejected here so they never enter the fork choice store).
+    ///
+    /// Block admission is gated by parent / signature / STF; the slot is only
+    /// checked relative to the finalized boundary and to the parent block.
     pub fn validateBlock(self: *Self, block: types.BeamBlock, is_from_gossip: bool) !void {
         _ = is_from_gossip;
 
-        const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
         const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
 
-        // 1. Future slot check - reject blocks too far in the future
-        // Allow a small tolerance for clock skew, but reject clearly invalid future slots
-        // this can also happen because of race conditions between oninterval and block arrival
-        const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
-        if (block.slot > current_slot + max_future_tolerance) {
-            self.logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
-                block.slot,
-                current_slot + max_future_tolerance,
-                self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
-            });
-            return BlockValidationError.FutureSlot;
-        }
-
-        // 2. Pre-finalized slot check - reject blocks before finalized slot
+        // 1. Pre-finalized slot check - reject blocks before finalized slot
         if (block.slot < finalized_slot) {
             self.logger.debug("block validation failed: pre-finalized slot {d} < finalized {d}", .{
                 block.slot,
@@ -1348,7 +1361,7 @@ pub const BeamChain = struct {
             return BlockValidationError.PreFinalizedSlot;
         }
 
-        // 3. Proposer index bounds check - sanity check against registry limit
+        // 2. Proposer index bounds check - sanity check against registry limit
         // This is a fast pre-check; actual proposer validity is verified during signature verification
         // We use VALIDATOR_REGISTRY_LIMIT as the upper bound since the validator set can grow beyond genesis
         if (block.proposer_index >= params.VALIDATOR_REGISTRY_LIMIT) {
@@ -1359,14 +1372,14 @@ pub const BeamChain = struct {
             return BlockValidationError.InvalidProposerIndex;
         }
 
-        // 4. Parent existence check
+        // 3. Parent existence check
         const parent_block = self.forkChoice.getBlock(block.parent_root);
         if (parent_block == null) {
             // Log decision moved to node.zig where we can check if parent is already being fetched
             return BlockValidationError.UnknownParentBlock;
         }
 
-        // 5. Slot ordering check - block slot must be greater than parent slot
+        // 4. Slot ordering check - block slot must be greater than parent slot
         if (block.slot <= parent_block.?.slot) {
             self.logger.debug("block validation failed: slot {d} <= parent slot {d}", .{
                 block.slot,
@@ -1375,7 +1388,7 @@ pub const BeamChain = struct {
             return BlockValidationError.SlotNotAfterParent;
         }
 
-        // 6. Finalized-descendant check - reject forks that branch off from
+        // 5. Finalized-descendant check - reject forks that branch off from
         // pre-finalization ancestors. This is the gossip-level DoS defense that
         // prevents malicious peers from flooding the fork choice store with
         // blocks whose parent chain cannot reach the finalized checkpoint.
@@ -1392,11 +1405,13 @@ pub const BeamChain = struct {
 
     /// Validate incoming attestation before processing.
     ///
-    /// is_from_block: true if attestation came from a block, false if from network gossip
+    /// The time check applies only to the gossip path: admit a vote iff
+    /// `data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS`.
+    /// The bound is in intervals, not slots: a whole-slot margin would let an
+    /// adversary pre-publish next-slot aggregates ahead of any honest validator.
     ///
-    /// Per leanSpec:
-    /// - Gossip attestations (is_from_block=false): attestation.slot <= current_slot (no future tolerance)
-    /// - Block attestations (is_from_block=true): attestation.slot <= current_slot + 1 (lenient)
+    /// Block-included attestations skip the time check; they are trusted under
+    /// the block's own validation. `is_from_block` is retained as a log marker.
     pub fn validateAttestationData(self: *Self, data: types.AttestationData, is_from_block: bool) !void {
         const timer = zeam_metrics.lean_attestation_validation_time_seconds.start();
         defer _ = timer.observe();
@@ -1424,7 +1439,6 @@ pub const BeamChain = struct {
             });
             return AttestationValidationError.UnknownHeadBlock;
         };
-        _ = head_block; // Will be used in future validations
 
         // 2. Validate slot relationships
         if (source_block.slot > target_block.slot) {
@@ -1442,6 +1456,15 @@ pub const BeamChain = struct {
                 data.target.slot,
             });
             return AttestationValidationError.SourceCheckpointExceedsTarget;
+        }
+
+        //    This corresponds to leanSpec's: assert data.head.slot >= data.target.slot
+        if (data.head.slot < data.target.slot) {
+            self.logger.debug("attestation validation failed: head slot {d} < target slot {d}", .{
+                data.head.slot,
+                data.target.slot,
+            });
+            return AttestationValidationError.HeadOlderThanTarget;
         }
 
         // 3. Validate checkpoint slots match block slots
@@ -1462,24 +1485,34 @@ pub const BeamChain = struct {
             return AttestationValidationError.TargetCheckpointSlotMismatch;
         }
 
-        // 4. Validate attestation is not too far in the future
-        //
-        //    Gossip attestations must be for current or past slots only. Validators attest
-        //    in interval 1 of the current slot, so they cannot attest for future slots.
-        //    Block attestations can be more lenient since the block itself was validated.
-        const current_slot = self.forkChoice.getCurrentSlot();
-        const max_allowed_slot = if (is_from_block)
-            current_slot + constants.MAX_FUTURE_SLOT_TOLERANCE // Block attestations: allow +1
-        else
-            current_slot; // Gossip attestations: no future slots allowed
-
-        if (data.slot > max_allowed_slot) {
-            self.logger.debug("attestation validation failed: attestation slot {d} > max allowed slot {d} (is_from_block={any})", .{
-                data.slot,
-                max_allowed_slot,
-                is_from_block,
+        //    This corresponds to leanSpec's: assert head_block.slot == attestation.head.slot
+        if (head_block.slot != data.head.slot) {
+            self.logger.debug("attestation validation failed: head block slot {d} != head checkpoint slot {d}", .{
+                head_block.slot,
+                data.head.slot,
             });
-            return AttestationValidationError.AttestationTooFarInFuture;
+            return AttestationValidationError.HeadCheckpointSlotMismatch;
+        }
+
+        // 4. Validate gossip attestation is not too far in the future.
+        //
+        //    Bound is in intervals, not slots, and only applies to the gossip
+        //    path. Block-included attestations are trusted under the block's
+        //    own validation (matching leanSpec on_block, which doesn't run
+        //    validate_attestation on block-body attestations at all).
+        if (!is_from_block) {
+            const current_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const attestation_start_interval = data.slot * constants.INTERVALS_PER_SLOT;
+            const max_allowed_interval = current_time + constants.GOSSIP_DISPARITY_INTERVALS;
+            if (attestation_start_interval > max_allowed_interval) {
+                self.logger.debug("attestation validation failed: gossip attestation start interval {d} > max allowed interval {d} (slot={d}, time={d})", .{
+                    attestation_start_interval,
+                    max_allowed_interval,
+                    data.slot,
+                    current_time,
+                });
+                return AttestationValidationError.AttestationTooFarInFuture;
+            }
         }
         self.logger.debug("attestation validation passed: slot={d} source={d} target={d} is_from_block={any}", .{
             data.slot,
@@ -1507,7 +1540,6 @@ pub const BeamChain = struct {
     }
 
     pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
-        // Validate the attestation data first (same rules as individual gossip attestations)
         try self.validateAttestationData(signedAggregation.data, false);
 
         try self.verifyAggregatedAttestation(signedAggregation);
@@ -1578,7 +1610,7 @@ pub const BeamChain = struct {
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
         const slot = @divFloor(time_intervals, constants.INTERVALS_PER_SLOT);
-        if (!self.is_aggregator_enabled or self.registered_validator_ids.len == 0) return null;
+        if (!self.is_aggregator_enabled.load(.acquire) or self.registered_validator_ids.len == 0) return null;
 
         const sync_status = self.getSyncStatus();
         switch (sync_status) {
@@ -1755,12 +1787,12 @@ const AttestationValidationError = error{
     SourceCheckpointExceedsTarget,
     SourceCheckpointSlotMismatch,
     TargetCheckpointSlotMismatch,
+    HeadCheckpointSlotMismatch,
+    HeadOlderThanTarget,
     AttestationTooFarInFuture,
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
-    /// Block slot is too far in the future
-    FutureSlot,
     /// Block slot is before the finalized slot
     PreFinalizedSlot,
     /// Block proposer_index exceeds validator count
@@ -2277,12 +2309,17 @@ test "attestation validation - comprehensive" {
         try std.testing.expectError(error.TargetCheckpointSlotMismatch, beam_chain.validateAttestationData(invalid_attestation.message, false));
     }
 
-    // Test 9: Attestation too far in future (for gossip)
+    // Test 9: Attestation too far in future (gossip path)
+    //
+    // Setup ended at time = 2 * INTERVALS_PER_SLOT = 10 (slot 2, interval 0).
+    // Gossip bound: data.slot * INTERVALS_PER_SLOT <= time + GOSSIP_DISPARITY_INTERVALS
+    //               → max admitted slot here is ⌊(10 + 1) / 5⌋ = 2.
+    // slot 4 → start interval 20, well beyond 11. Rejected.
     {
         const future_attestation: types.SignedAttestation = .{
             .validator_id = 0,
             .message = .{
-                .slot = 3, // Future slot (current is 2)
+                .slot = 4,
                 .head = types.Checkpoint{
                     .root = mock_chain.blockRoots[2],
                     .slot = 2,
@@ -2304,10 +2341,21 @@ test "attestation validation - comprehensive" {
 
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
-test "attestation validation - gossip vs block future slot handling" {
-    // Test that gossip and block attestations have different future slot tolerances
-    // Gossip: must be <= current_slot
-    // Block: can be <= current_slot + 1
+test "attestation validation - gossip future-slot bound" {
+    // Gossip path is interval-grained:
+    //
+    //   data.slot * INTERVALS_PER_SLOT <= time + GOSSIP_DISPARITY_INTERVALS
+    //
+    // Block-included attestations skip the time check entirely.
+    //
+    // Scenario:
+    //   - Setup leaves the chain at slot 1, time = 5 (slot 1, interval 0).
+    //   - A slot-2 vote at time = 5: gossip rejects (10 > 5 + 1 = 6).
+    //   - Tick to time = 9 (slot 1, interval 4 — disparity boundary):
+    //     gossip accepts (10 <= 9 + 1 = 10).
+    //   - A slot-3 vote at time = 9: gossip rejects (15 > 9 + 1 = 10).
+    //   - Block-included path admits the slot-3 vote at every tick.
+
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -2349,13 +2397,12 @@ test "attestation validation - gossip vs block future slot handling" {
     var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = 0, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, connected_peers);
     defer beam_chain.deinit();
 
-    // Add one block (slot 1)
+    // Add one block (slot 1). Forkchoice ticks to time = INTERVALS_PER_SLOT (slot 1, interval 0).
     const block = mock_chain.blocks[1];
     try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
     const missing_roots = try beam_chain.onBlock(block, .{});
     allocator.free(missing_roots);
 
-    // Current time is at slot 1, create attestation for slot 2 (next slot)
     const next_slot_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
@@ -2376,17 +2423,27 @@ test "attestation validation - gossip vs block future slot handling" {
         .signature = ZERO_SIGBYTES,
     };
 
-    // Gossip attestations: should FAIL for next slot (current + 1)
-    // Per spec store.py:177: assert attestation.slot <= time_slots
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(next_slot_attestation.message, false));
+    // At time = 5 the gossip path rejects a slot-2 vote (3 intervals shy of boundary).
+    try std.testing.expectError(
+        error.AttestationTooFarInFuture,
+        beam_chain.validateAttestationData(next_slot_attestation.message, false),
+    );
 
-    // Block attestations: should PASS for next slot (current + 1)
-    // Per spec store.py:140: assert attestation.slot <= Slot(current_slot + Slot(1))
+    // Block-included attestations skip the time check.
     try beam_chain.validateAttestationData(next_slot_attestation.message, true);
+
+    // Tick to the gossip disparity boundary: time = 2 * INTERVALS_PER_SLOT - GOSSIP_DISPARITY_INTERVALS = 9.
+    const boundary_time = 2 * constants.INTERVALS_PER_SLOT - constants.GOSSIP_DISPARITY_INTERVALS;
+    try beam_chain.forkChoice.onInterval(boundary_time, false);
+
+    // At the boundary the gossip path admits the same vote.
+    try beam_chain.validateAttestationData(next_slot_attestation.message, false);
+
+    // A slot-3 vote stays beyond the boundary on the gossip path but still admitted on the block path.
     const too_far_attestation: types.SignedAttestation = .{
         .validator_id = 0,
         .message = .{
-            .slot = 3, // Too far in future
+            .slot = 3,
             .head = types.Checkpoint{
                 .root = mock_chain.blockRoots[1],
                 .slot = 1,
@@ -2402,9 +2459,8 @@ test "attestation validation - gossip vs block future slot handling" {
         },
         .signature = ZERO_SIGBYTES,
     };
-    // Both should fail for slot 3 when current is slot 1
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
-    try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
+    try beam_chain.validateAttestationData(too_far_attestation.message, true);
 }
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
@@ -2633,4 +2689,96 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Only the known attestation is included in the block
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
+}
+
+test "processFinalizationAdvancement: below PRUNE_NODE_THRESHOLD keeps pre-finalized ancestors" {
+    // Regression: eager ProtoArray.rebase dropped pre-finalized ancestors on
+    // every finalization advance, so in-flight attestations whose source /
+    // target / head referenced those ancestors failed the existence check in
+    // validateAttestationData with Unknown{Source,Target,Head}Block.
+    //
+    // With the threshold gate, rebase is skipped while the finalized node's
+    // index in protoArray is below PRUNE_NODE_THRESHOLD. A short mock chain
+    // never crosses the threshold, so all recently-finalized ancestors must
+    // still be addressable after the chain finalizes.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 5, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(
+        allocator,
+        ChainOpts{
+            .config = chain_config,
+            .anchorState = &beam_state,
+            .nodeId = 7,
+            .logger_config = &zeam_logger_config,
+            .db = db,
+            .node_registry = test_registry,
+        },
+        connected_peers,
+    );
+    defer beam_chain.deinit();
+
+    // Drive the chain through the same entrypoint node.zig uses so the gate
+    // (fired inside processFinalizationAdvancement → onBlockFollowup) is
+    // actually exercised. Calling onBlock alone never triggers the rebase
+    // path, so the test would pass even without the threshold fix.
+    for (1..mock_chain.blocks.len) |i| {
+        const signed_block = mock_chain.blocks[i];
+        const current_slot = signed_block.block.slot;
+        try beam_chain.forkChoice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(signed_block, .{});
+        allocator.free(missing_roots);
+        beam_chain.onBlockFollowup(true, &signed_block);
+    }
+
+    // Sanity-check: mock chain must actually advance finalization for this
+    // regression to mean anything.
+    try std.testing.expect(beam_chain.forkChoice.getLatestFinalized().slot > 0);
+
+    // The finalized node's index in protoArray should be well under the
+    // threshold (5 blocks total, threshold = 64).
+    const finalized_idx = beam_chain.forkChoice.getProtoNodeIndex(beam_chain.forkChoice.getLatestFinalized().root);
+    try std.testing.expect(finalized_idx != null);
+    try std.testing.expect(finalized_idx.? < constants.PRUNE_NODE_THRESHOLD);
+
+    // All processed block roots — including the pre-finalized ones — must
+    // still resolve through the fork-choice API that validateAttestationData
+    // consults. Pre-gate, rebase would have dropped the below-finalized ones.
+    for (1..mock_chain.blocks.len) |i| {
+        try std.testing.expect(beam_chain.forkChoice.getProtoNode(mock_chain.blockRoots[i]) != null);
+    }
 }

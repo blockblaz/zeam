@@ -10,6 +10,7 @@ const multiaddr_mod = @import("multiaddr");
 const Multiaddr = multiaddr_mod.Multiaddr;
 const uvarint = multiformats.uvarint;
 const zeam_utils = @import("@zeam/utils");
+const zeam_metrics = @import("@zeam/metrics");
 
 const interface = @import("./interface.zig");
 const NetworkInterface = interface.NetworkInterface;
@@ -345,6 +346,13 @@ export fn handleMsgFromRustBridge(zigHandler: *EthLibp2p, topic_str: [*:0]const 
     };
     defer zigHandler.allocator.free(uncompressed_message);
 
+    // Record gossip message size metrics — observed on uncompressed bytes
+    switch (topic.gossip_topic.kind) {
+        .block => zeam_metrics.lean_gossip_block_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .attestation => zeam_metrics.lean_gossip_attestation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+        .aggregation => zeam_metrics.lean_gossip_aggregation_size_bytes.record(@floatFromInt(uncompressed_message.len)),
+    }
+
     var message: interface.GossipMessage = switch (topic.gossip_topic.kind) {
         .block => .{ .block = deserializeGossipMessage(
             types.SignedBlock,
@@ -537,7 +545,20 @@ export fn handleRPCRequestFromRustBridge(
 
     const request_method = std.meta.activeTag(request);
 
-    var stream_context = ServerStreamContext{
+    // Heap-allocate the stream context so its address remains valid even if
+    // a handler (now or in the future) retains the stream for work that
+    // outlives this function call. A stack-allocated context would leave
+    // stream.ptr dangling the moment handleRPCRequestFromRustBridge returns.
+    const stream_context = zigHandler.allocator.create(ServerStreamContext) catch |err| {
+        zigHandler.logger.err(
+            "network-{d}:: Failed to allocate RPC stream context for peer={s}{f} channel={d}: {any}",
+            .{ zigHandler.params.networkId, peer_id_slice, node_name, channel_id, err },
+        );
+        send_rpc_error_response(zigHandler.params.networkId, channel_id, "Internal error allocating stream context");
+        return;
+    };
+    defer zigHandler.allocator.destroy(stream_context);
+    stream_context.* = ServerStreamContext{
         .zigHandler = zigHandler,
         .channel_id = channel_id,
         .peer_id = peer_id_slice,
@@ -545,7 +566,7 @@ export fn handleRPCRequestFromRustBridge(
     };
 
     var stream = interface.ReqRespServerStream{
-        .ptr = &stream_context,
+        .ptr = stream_context,
         .sendResponseFn = serverStreamSendResponse,
         .sendErrorFn = serverStreamSendError,
         .finishFn = serverStreamFinish,
@@ -935,6 +956,10 @@ pub extern fn wait_for_network_ready(
     network_id: u32,
     timeout_ms: u64,
 ) callconv(.c) bool;
+/// Signal the Rust-side libp2p event loop to exit. After returning, the hosting
+/// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
+/// on a network that was never started or is already stopped (no-op).
+pub extern fn stop_network(network_id: u32) callconv(.c) void;
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
@@ -1053,6 +1078,23 @@ pub const EthLibp2p = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Signal the Rust libp2p event loop to exit and then wait for the OS
+        // thread to actually unwind before we start tearing down the fields it
+        // might still touch. After `stop_network` the event loop takes its
+        // shutdown arm, drops the swarm, clears the per-network handler
+        // pointer, and returns from `run_eventloop`, which lets the hosting
+        // thread exit; `thread.join` then completes deterministically.
+        //
+        // Ordering matters: we must join before freeing anything reachable
+        // from `zigHandler` (gossip/peer-event/reqresp handlers, param
+        // strings, rpcCallbacks), otherwise an in-flight callback could
+        // dereference already-freed memory.
+        if (self.rustBridgeThread) |thread| {
+            stop_network(self.params.networkId);
+            thread.join();
+            self.rustBridgeThread = null;
+        }
+
         self.gossipHandler.deinit();
         self.peerEventHandler.deinit();
 

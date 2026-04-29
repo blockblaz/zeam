@@ -11,6 +11,7 @@ const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -42,6 +43,9 @@ const NodeOpts = struct {
     is_aggregator: bool = false,
     /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
+    /// When non-null it is shared across all nodes in the same process.
+    thread_pool: ?*ThreadPool = null,
 };
 
 pub const BeamNode = struct {
@@ -56,9 +60,26 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Serializes BeamNode work between the libxev main thread (onInterval) and
-    /// the libp2p worker thread (onGossip / onReqRespResponse / onReqRespRequest).
+    /// Serializes BeamNode work between the libxev main thread (`onInterval`) and
+    /// the libp2p worker thread (`onGossip` / `onReqRespResponse` / `onReqRespRequest`).
+    ///
+    /// Invariant: every mutation of `chain` and `network` from those callbacks must
+    /// happen with this mutex held. Compute-heavy work — state transition,
+    /// signature verification, fork-choice updates — currently runs synchronously
+    /// inside the critical section, so a long STF can stall the libxev tick path
+    /// (and vice-versa). See issue #786 for context and follow-ups (offloading
+    /// heavy work to a bounded worker queue, shrinking critical sections, etc.).
+    ///
+    /// `acquireMutex(site)` is the canonical way to take this lock: it records the
+    /// wait + hold time into `zeam_node_mutex_wait_time_seconds` /
+    /// `zeam_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
+    /// quantify the contention described in the issue.
     mutex: std.Thread.Mutex = .{},
+    /// Pending parent roots deferred for batched fetching.
+    /// Maps block root → fetch depth. Collected during gossip/RPC processing
+    /// and flushed as a single batched blocks_by_root request, avoiding the
+    /// 300+ individual round-trips caused by sequential parent-chain walking.
+    batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
 
     const Self = @This();
 
@@ -82,6 +103,7 @@ pub const BeamNode = struct {
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
+                .thread_pool = opts.thread_pool,
             },
             network.connected_peers,
         );
@@ -116,6 +138,7 @@ pub const BeamNode = struct {
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
+            .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -124,16 +147,109 @@ pub const BeamNode = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
         self.allocator.destroy(self.chain);
     }
 
+    /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
+    /// in its `unlock` method while observing the hold time into the
+    /// `zeam_node_mutex_hold_time_seconds` histogram for the configured site.
+    ///
+    /// Timing uses `std.time.Timer`, which wraps `CLOCK_MONOTONIC` on Linux,
+    /// `mach_absolute_time` on macOS and `QueryPerformanceCounter` on Windows.
+    /// This avoids the wall-clock skew (NTP slew, leap-second steps, manual
+    /// clock changes) that `std.time.nanoTimestamp` is subject to and that
+    /// would corrupt histogram percentiles by producing negative deltas.
+    ///
+    /// Calling `unlock()` more than once is a no-op on the second call: a
+    /// `released` sentinel prevents the underlying mutex from being unlocked
+    /// twice, which would be undefined behavior. The metric is also recorded
+    /// only on the first call.
+    ///
+    /// See issue #786.
+    const MutexGuard = struct {
+        mutex: *std.Thread.Mutex,
+        site: []const u8,
+        timer: std.time.Timer,
+        released: bool = false,
+
+        pub fn unlock(self: *MutexGuard) void {
+            if (self.released) return;
+            self.released = true;
+
+            const elapsed_ns = self.timer.read();
+            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+            zeam_metrics.metrics.zeam_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
+            self.mutex.unlock();
+        }
+    };
+
+    /// Acquire `BeamNode.mutex`, recording the wait time into
+    /// `zeam_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
+    /// records the hold time on `unlock()`. Always pair with
+    /// `defer guard.unlock()`. The `site` label flows through to the metric so
+    /// Prometheus can attribute stalls to a specific callback path.
+    ///
+    /// Wait/hold timing is measured with `std.time.Timer` (monotonic clock) so
+    /// the deltas observed by Prometheus are guaranteed non-negative even when
+    /// the wall clock is adjusted by NTP, leap seconds or operator action.
+    fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
+        // `Timer.start()` only fails on platforms without a monotonic clock; on
+        // every supported zeam target (Linux/macOS/Windows) it is infallible.
+        // Falling back to wall-clock time would re-introduce the skew bug we
+        // are fixing, so we panic instead.
+        var timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
+        self.mutex.lock();
+        const wait_ns = timer.lap();
+        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
+        zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
+        return .{
+            .mutex = &self.mutex,
+            .site = site,
+            .timer = timer,
+        };
+    }
+
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Lifetime invariant for `data`:
+        //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
+        //   `GossipMessage` for the entire duration of this callback. It is the
+        //   standard libp2p callback contract: the buffer is not recycled, freed
+        //   or mutated until `onGossip` returns. We rely on this twice — once
+        //   for the pre-lock `hashTreeRoot` read of `data.block.block` and again
+        //   inside the locked section for the same field. If a future refactor
+        //   ever changes that contract (e.g. arena-pooled message buffers), the
+        //   pre-lock read becomes a use-after-free and this comment must be the
+        //   place to revisit. Do NOT cache or stash `data` past this scope.
+        //
+        // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
+        // work that does not touch any shared state, but it can be expensive on
+        // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
+        // hundreds of KB to MBs of tree-hashing). Computing it before locking
+        // shrinks the critical section and lets `onInterval` make progress on
+        // the libxev thread in parallel. The computed root is reused in every
+        // downstream branch (success path + error paths) so we never recompute
+        // under the lock.
+        //
+        // `precomputed_block_root` stays `undefined` for non-block gossip
+        // messages and is read only inside the `.block` arm of the switch
+        // below (and its error sub-branches). Any future code path that reads
+        // it outside that arm will hit Zig's `undefined` poison in debug
+        // builds — intentional defensive behavior.
+        var precomputed_block_root: types.Root = undefined;
+        if (data.* == .block) {
+            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
+                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
+                return;
+            };
+        }
+
+        var guard = self.acquireMutex("onGossip");
+        defer guard.unlock();
 
         switch (data.*) {
             .block => |signed_block| {
@@ -151,12 +267,8 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Compute block root first - needed for both caching and pending tracking
-                var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
-                    self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                    return;
-                };
+                // Reuse the root we computed before taking the lock.
+                const block_root = precomputed_block_root;
 
                 _ = self.network.removePendingBlockRoot(block_root);
 
@@ -189,6 +301,8 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    // Flush any pending parent root fetches accumulated during caching.
+                    self.flushPendingParentFetches();
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
@@ -223,15 +337,13 @@ pub const BeamNode = struct {
                 // descendants we might still be holding onto.
                 error.PreFinalizedSlot => {
                     if (data.* == .block) {
-                        const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            self.logger.info(
-                                "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                                .{&block_root},
-                            );
-                            _ = self.network.pruneCachedBlocks(block_root, null);
-                        } else |_| {}
+                        // Reuse the root we computed before taking the lock (issue #786).
+                        const block_root = precomputed_block_root;
+                        self.logger.info(
+                            "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
+                            .{&block_root},
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
                     }
                     return;
                 },
@@ -252,35 +364,6 @@ pub const BeamNode = struct {
                                 &parent_root,
                             });
                         }
-                    }
-                    return;
-                },
-                // Block arrived too early for local clock - cache and retry later.
-                error.FutureSlot => {
-                    if (data.* == .block) {
-                        const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            if (self.cacheFutureBlock(block_root, signed_block)) |_| {
-                                self.logger.debug(
-                                    "cached future gossip block 0x{s} at slot {d}",
-                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                );
-                            } else |cache_err| {
-                                if (cache_err == CacheBlockError.PreFinalized) {
-                                    self.logger.info(
-                                        "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                    );
-                                    _ = self.network.pruneCachedBlocks(block_root, null);
-                                } else {
-                                    self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                        std.fmt.bytesToHex(block_root, .lower)[0..],
-                                        cache_err,
-                                    });
-                                }
-                            }
-                        } else |_| {}
                     }
                     return;
                 },
@@ -346,6 +429,9 @@ pub const BeamNode = struct {
                 );
             };
         }
+
+        // Flush any parent roots accumulated during block/descendant processing.
+        self.flushPendingParentFetches();
     }
 
     fn pruneCachedBlocksCallback(ptr: *anyopaque, finalized: types.Checkpoint) usize {
@@ -427,12 +513,6 @@ pub const BeamNode = struct {
                             "Cached block 0x{x} still missing parent, keeping in cache",
                             .{&descendant_root},
                         );
-                    } else if (err == error.FutureSlot) {
-                        // Block is still in the future, keep it cached
-                        self.logger.debug(
-                            "Cached block 0x{s} still in future slot, keeping in cache",
-                            .{std.fmt.bytesToHex(descendant_root, .lower)[0..]},
-                        );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
                         // Prune this block and all its cached descendants; they are no longer useful.
@@ -510,7 +590,6 @@ pub const BeamNode = struct {
         AllocationFailed,
         CloneFailed,
         CachingFailed,
-        FetchFailed,
     };
 
     /// Cache a block and fetch its parent. Common logic used by both gossip and req-resp handlers.
@@ -569,70 +648,18 @@ pub const BeamNode = struct {
         // Ownership transferred to the network cache — disable errdefers
         block_owned = false;
 
-        // Fetch the parent block
+        // Enqueue the parent root for batched fetching rather than firing an individual
+        // request immediately. All accumulated roots are sent as one blocks_by_root
+        // request at the flush point, avoiding 300+ sequential round-trips when a
+        // syncing peer walks a long parent chain one block at a time.
         const parent_root = signed_block.block.parent_root;
-        const roots = [_]types.Root{parent_root};
-        self.fetchBlockByRoots(&roots, depth) catch {
-            // Parent fetch failed - drop the cached block so we don't keep dangling entries.
+        self.batch_pending_parent_roots.put(parent_root, depth) catch {
+            // Evict the cached block if we can't enqueue — otherwise it dangles forever.
             _ = self.network.removeFetchedBlock(block_root);
-            return CacheBlockError.FetchFailed;
+            return CacheBlockError.CachingFailed;
         };
 
         return parent_root;
-    }
-
-    fn cacheFutureBlock(
-        self: *Self,
-        block_root: types.Root,
-        signed_block: types.SignedBlock,
-    ) CacheBlockError!void {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
-        const block_slot = signed_block.block.slot;
-
-        if (block_slot <= finalized_slot) {
-            return CacheBlockError.PreFinalized;
-        }
-
-        if (self.network.hasFetchedBlock(block_root)) {
-            return CacheBlockError.AlreadyCached;
-        }
-
-        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
-            self.logger.warn("Cache full ({d} blocks), rejecting future block 0x{s} at slot {d}", .{
-                self.network.fetched_blocks.count(),
-                std.fmt.bytesToHex(block_root, .lower)[0..],
-                block_slot,
-            });
-            return CacheBlockError.CachingFailed;
-        }
-
-        const block_ptr = self.allocator.create(types.SignedBlock) catch {
-            return CacheBlockError.AllocationFailed;
-        };
-        var block_owned = true;
-        errdefer if (block_owned) self.allocator.destroy(block_ptr);
-
-        // Clone the block and capture its SSZ bytes in one pass.
-        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
-        // then deserializes into the clone. The returned bytes are stored alongside the cached
-        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
-        // observed to cause memory corruption on the next cached block's processing.
-        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
-            return CacheBlockError.CloneFailed;
-        };
-        errdefer if (block_owned) block_ptr.deinit();
-        errdefer self.allocator.free(ssz_bytes);
-
-        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
-            return CacheBlockError.CachingFailed;
-        };
-        block_owned = false;
-
-        // Store the SSZ bytes after caching; ignore store failure (block is already cached,
-        // onBlock will fall back to fresh serialization if bytes are unavailable).
-        self.network.storeFetchedBlockSsz(block_root, ssz_bytes) catch {
-            self.allocator.free(ssz_bytes);
-        };
     }
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
@@ -702,6 +729,7 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    self.flushPendingParentFetches();
                     return;
                 }
 
@@ -747,6 +775,11 @@ pub const BeamNode = struct {
         } else |err| {
             self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
+
+        // Flush any parent roots queued during this RPC block's processing. When a syncing peer
+        // walks a long parent chain one block at a time, each response triggers one more parent
+        // fetch. Batching them here consolidates concurrent parent requests into one round-trip.
+        self.flushPendingParentFetches();
     }
 
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
@@ -884,8 +917,8 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var guard = self.acquireMutex("onReqRespResponse");
+        defer guard.unlock();
         try self.handleReqRespResponse(event);
     }
 
@@ -901,8 +934,8 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
+                defer guard.unlock();
 
                 const roots = request.roots.constSlice();
 
@@ -942,6 +975,38 @@ pub const BeamNode = struct {
         return .{
             .ptr = self,
             .onReqRespRequestCb = onReqRespRequest,
+        };
+    }
+
+    /// Send all accumulated pending parent roots as a single batched blocks_by_root request.
+    ///
+    /// Multiple gossip blocks or RPC responses received close together may each need a
+    /// different parent block fetched. Without batching, each one opens its own libp2p
+    /// stream, causing 300+ sequential round-trips when a peer walks a long parent chain.
+    /// Collecting roots here and flushing them in one request reduces that to a single
+    /// round-trip for the same burst of missing parents.
+    fn flushPendingParentFetches(self: *Self) void {
+        const count = self.batch_pending_parent_roots.count();
+        if (count == 0) return;
+
+        var roots = std.ArrayList(types.Root).initCapacity(self.allocator, count) catch {
+            self.logger.warn("failed to allocate roots list for pending parent fetch flush", .{});
+            return;
+        };
+        defer roots.deinit(self.allocator);
+
+        var max_depth: u32 = 0;
+        var it = self.batch_pending_parent_roots.iterator();
+        while (it.next()) |entry| {
+            roots.appendAssumeCapacity(entry.key_ptr.*);
+            if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
+        }
+        self.batch_pending_parent_roots.clearRetainingCapacity();
+
+        self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
+
+        self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
+            self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
         };
     }
 
@@ -993,6 +1058,15 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Extract client type prefix from a node name like "zeam_0" -> "zeam", fallback "unknown".
+    fn clientTypeFromName(name: ?[]const u8) []const u8 {
+        const n = name orelse return "unknown";
+        if (std.mem.indexOfScalar(u8, n, '_')) |sep| {
+            if (sep > 0) return n[0..sep];
+        }
+        return if (n.len > 0) n else "unknown";
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -1007,7 +1081,9 @@ pub const BeamNode = struct {
 
         // Record metrics
         zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
-        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+        const client_name = node_name.name orelse "unknown";
+        const client_type = clientTypeFromName(node_name.name);
+        zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 1) catch {};
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -1033,10 +1109,12 @@ pub const BeamNode = struct {
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+
         if (self.network.disconnectPeer(peer_id)) {
             self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
-                self.node_registry.getNodeNameFromPeerId(peer_id),
+                node_name,
                 @tagName(direction),
                 @tagName(reason),
                 self.network.getPeerCount(),
@@ -1044,7 +1122,9 @@ pub const BeamNode = struct {
 
             // Record metrics
             zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
-            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+            const client_name = node_name.name orelse "unknown";
+            const client_type = clientTypeFromName(node_name.name);
+            zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
     }
 
@@ -1115,27 +1195,14 @@ pub const BeamNode = struct {
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                var guard = self.acquireMutex("onInterval");
+                defer guard.unlock();
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
                     // no point going further if chain is not ticked properly
                     return e;
                 };
-
-                // Replay blocks that were queued waiting for the forkchoice clock to advance,
-                // then fetch any attestation head roots that were missing during replay.
-                const pending_missing_roots = self.chain.processPendingBlocks();
-                defer self.allocator.free(pending_missing_roots);
-                if (pending_missing_roots.len > 0) {
-                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                        self.logger.warn(
-                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                            .{ pending_missing_roots.len, err },
-                        );
-                    };
-                }
 
                 // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
                 self.sweepTimedOutRequests();
@@ -1373,7 +1440,7 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         // Catch up fork choice time to current interval before processing any requests.
-        // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
+        // Keeps validator duties and aggregation timing aligned with the local clock.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
             try self.chain.forkChoice.onInterval(@intCast(current_interval), false);
@@ -1398,8 +1465,15 @@ pub const BeamNode = struct {
             defer seen_subnets.deinit();
 
             // Always subscribe to explicitly specified import subnet ids for aggregation irrespective of
-            // validators
-            if (self.chain.is_aggregator_enabled) {
+            // validators.
+            //
+            // Note: this subscription decision is only taken once at startup,
+            // using the initial aggregator flag. Toggling the role at runtime
+            // via the admin API does not add or remove gossip subscriptions;
+            // a node that wants to serve as a hot-standby aggregator should
+            // start with `--is-aggregator true` and turn the role off via the
+            // API until it's needed.
+            if (self.chain.isAggregator()) {
                 if (self.aggregation_subnet_ids) |explicit_subnets| {
                     for (explicit_subnets) |subnet_id| {
                         if (seen_subnets.contains(subnet_id)) continue;
@@ -1421,12 +1495,12 @@ pub const BeamNode = struct {
 
             // If no subnets were added yet (aggregator but no explicit ids and no
             // validators registered), fall back to subnet 0 to keep parity with leanSpec.
-            if (seen_subnets.count() == 0 and self.chain.is_aggregator_enabled) {
+            if (seen_subnets.count() == 0 and self.chain.isAggregator()) {
                 try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
             }
         }
         // if no committee count specified and still aggregator, all are in subnet 0
-        else if (self.chain.is_aggregator_enabled) {
+        else if (self.chain.isAggregator()) {
             try topics_list.append(self.allocator, .{ .kind = .attestation, .subnet_id = 0 });
         }
 
@@ -1510,7 +1584,7 @@ test "Node peer tracking on connect/disconnect" {
         },
     };
 
-    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr(), ctx.loggerConfig());
     defer clock.deinit(allocator);
 
     var node: BeamNode = undefined;

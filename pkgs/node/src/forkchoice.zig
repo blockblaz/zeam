@@ -11,6 +11,7 @@ const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
 const params = @import("@zeam/params");
 const keymanager = @import("@zeam/key-manager");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
@@ -278,6 +279,7 @@ pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
+    thread_pool: ?*ThreadPool = null,
 };
 
 // Use shared signature map types from types package
@@ -324,6 +326,9 @@ pub const ForkChoice = struct {
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
+    // Optional shared worker pool used for CPU-heavy attestation compaction.
+    thread_pool: ?*ThreadPool = null,
+    last_node_tick_time_ms: ?i64,
 
     const Self = @This();
 
@@ -396,6 +401,8 @@ pub const ForkChoice = struct {
             // (slot > 0) start in `initing` and become `ready` once the first real justified
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
+            .thread_pool = opts.thread_pool,
+            .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -840,6 +847,14 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        const time_now_ms: i64 = std.time.milliTimestamp();
+        if (self.last_node_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+        }
+        self.last_node_tick_time_ms = time_now_ms;
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
@@ -1080,14 +1095,19 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
                 &agg_attestations,
                 &attestation_signatures,
                 &pre_state.validators,
+                self.thread_pool,
             );
+            _ = compact_timer.observe();
+            zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
+            zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1262,17 +1282,23 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
 
-        // Can't regress on safe target
+        // Safe target regression is a legitimate fork-choice outcome, not a
+        // bug: the deepest 2/3-supported descendant of `latest_justified` can
+        // move to a shallower slot when attestation weights shift across
+        // branches or when `latest_justified` itself advances to a different
+        // subtree. Previously this returned `InvalidSafeTargetCompute`, which
+        // aborted the interval-3 tick and wedged the node's time loop on
+        // devnet-4 whenever target divergence produced a shallower
+        // 2/3-supermajority subtree. Accept the new value and surface the
+        // regression via a warn-level log so operators retain visibility.
         if (safe_target.slot < self.safeTarget.slot) {
-            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
+            self.logger.warn("safe target regressed new={d} < current={d}; accepting new value", .{
                 safe_target.slot,
                 self.safeTarget.slot,
             });
-            return ForkChoiceError.InvalidSafeTargetCompute;
         }
 
         self.safeTarget = safe_target;
-        // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
     }
@@ -1437,6 +1463,8 @@ pub const ForkChoice = struct {
     /// via two-pass greedy selection. Replaces new_payloads with fresh results.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+        const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = agg_timer.observe();
 
         // Capture counts for metrics update outside lock scope
         var new_payloads_count: usize = 0;
@@ -1640,9 +1668,10 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
-                return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            // Block admission only requires a known parent and a slot above
+            // the finalized boundary; STF and signature verification are the
+            // gating layers.
+            if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -1922,6 +1951,15 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Get a ProtoNode's index in the underlying nodes array. Callers use
+    /// this to measure how many nodes precede a given block (e.g. to gate
+    /// proto-array rebase on a grace-window threshold).
+    pub fn getProtoNodeIndex(self: *Self, blockRoot: types.Root) ?usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.indices.get(blockRoot);
+    }
+
     /// Get the current number of nodes in the forkchoice tree
     pub fn getNodeCount(self: *Self) usize {
         self.mutex.lockShared();
@@ -1933,7 +1971,6 @@ pub const ForkChoice = struct {
 pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
-    FutureSlot,
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
@@ -1997,11 +2034,8 @@ test "forkchoice block tree" {
         const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
-        // shouldn't accept a future slot
-        const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
-
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        // onBlock only requires a known parent and a non-pre-finalized slot.
+        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
@@ -2268,6 +2302,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2622,6 +2657,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
 
     return .{
@@ -3607,6 +3643,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
