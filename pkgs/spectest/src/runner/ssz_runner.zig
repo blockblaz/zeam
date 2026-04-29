@@ -58,6 +58,18 @@ const TestHashTreeOpening = struct {
     }
 };
 
+// xmss HashTreeLayer: Container{ start_index: Uint64,
+// nodes: List[Vector[Fp, HASH_DIGEST_LENGTH], NODE_LIST_LIMIT] }.
+// Same NODE_LIST_LIMIT sizing as TestHashTreeOpening.
+const TestHashTreeLayer = struct {
+    start_index: u64,
+    nodes: TestHashDigestList,
+
+    pub fn deinit(self: *TestHashTreeLayer) void {
+        self.nodes.deinit();
+    }
+};
+
 pub const name = "ssz";
 
 pub const RunnerError = error{
@@ -175,8 +187,9 @@ const ssz_type_map = [_]SszTypeEntry{
     .{ .name = "SampleBytes32List8", .zig_type = SampleBytes32List8, .has_deinit = true },
     .{ .name = "SampleUint32List16", .zig_type = SampleUint32List16, .has_deinit = true },
     .{ .name = "ByteListMiB", .zig_type = ByteListMiB, .has_deinit = true },
-    // xmss HashTreeOpening (test-env only; prod LOG_LIFETIME differs).
+    // xmss HashTreeOpening / HashTreeLayer (test-env only; prod LOG_LIFETIME differs).
     .{ .name = "HashTreeOpening", .zig_type = TestHashTreeOpening, .has_deinit = true },
+    .{ .name = "HashTreeLayer", .zig_type = TestHashTreeLayer, .has_deinit = true },
 };
 
 pub fn TestCase(
@@ -310,19 +323,9 @@ fn runCase(
 /// Types that leanSpec exercises but zeam cannot yet roundtrip:
 ///   - SSZ Union (new variadic-selector feature; zeam's SSZ library has
 ///     no `union(enum)` serialization path).
-///   - Types embedding `[N]T` where T has size > 1 (e.g. `[3]u16`,
-///     `Vector[Fp, 8]`): `ssz.deserialize` for `.array` conflates element
-///     index with byte offset, so only out[0] and out[2...] get written,
-///     leaving interior elements undefined. Upstream blockblaz/ssz.zig bug.
-///     Affected fixture types: SampleUint16Vector3, SampleUint64Vector4,
-///     HashTreeOpening (typical payload), HashTreeLayer.
 const skip_type_names = [_][]const u8{
     "SampleUnionNone",
     "SampleUnionTypes",
-    "SampleUint16Vector3",
-    "SampleUint64Vector4",
-    "HashTreeLayer",
-    "HashTreeOpening",
 };
 
 fn shouldSkipType(type_name: []const u8) bool {
