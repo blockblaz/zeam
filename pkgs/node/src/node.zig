@@ -1515,7 +1515,15 @@ pub const BeamNode = struct {
             data.slot,
             validator_id,
         });
-        try self.chain.onGossipAttestation(signed_attestation, &self.mutex);
+        // BeamNode.onInterval releases the mutex before reaching the
+        // validator-output dispatch (the inner `{ ... }` block scope
+        // closes the `acquireMutex("onInterval")` guard), so the mutex is
+        // NOT held here. Pass null — `chain.onGossipAttestation` would
+        // panic on `mutex.unlock()` if we passed `&self.mutex` without
+        // having acquired it. The lock dance still applies on the gossip
+        // path (chain.onGossip → chain.onGossipAttestation receives the
+        // mutex pointer there), which is where the volume is.
+        try self.chain.onGossipAttestation(signed_attestation, null);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
@@ -1530,7 +1538,11 @@ pub const BeamNode = struct {
 
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
-        try self.chain.onGossipAggregatedAttestation(signed_aggregation, &self.mutex);
+        // Same reasoning as `publishAttestation`: BeamNode.onInterval has
+        // already released the mutex by the time validator output dispatch
+        // runs, so the mutex is NOT held here. Pass null. The gossip-import
+        // path (chain.onGossip arm) still benefits from the lock dance.
+        try self.chain.onGossipAggregatedAttestation(signed_aggregation, null);
 
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
         try self.network.publish(&gossip_msg);
