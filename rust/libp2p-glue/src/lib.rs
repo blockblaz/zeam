@@ -1966,7 +1966,10 @@ mod tests {
                     request_data.len(),
                 )
             };
-            assert_eq!(request_id, 0, "Should return 0 when network is not initialized");
+            assert_eq!(
+                request_id, 0,
+                "Should return 0 when network is not initialized"
+            );
         }
         let after = REQUEST_ID_COUNTER.load(Ordering::Relaxed);
         assert_eq!(
