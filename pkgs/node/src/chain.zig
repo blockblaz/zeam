@@ -157,6 +157,13 @@ pub const BeamChain = struct {
     prune_cached_blocks_ctx: ?*anyopaque = null,
     prune_cached_blocks_fn: ?PruneCachedBlocksFn = null,
 
+    // Optional dispatcher for the heavy Phase-B follow-up work. When set,
+    // `runFollowupAsync` hands the call off to the dispatcher (e.g. a
+    // dedicated worker thread) instead of running it inline. See
+    // `runFollowupAsync` and `setFollowupDispatch`. Default: null (inline).
+    followup_dispatch_ctx: ?*anyopaque = null,
+    followup_dispatch_fn: ?FollowupDispatchFn = null,
+
     // Queue for blocks that arrived before forkchoice had ticked to their slot.
     // When a peer gossips a block for the current slot before our local interval
     // timer fires, the forkchoice rejects it with FutureSlot.  We hold such
@@ -164,6 +171,12 @@ pub const BeamChain = struct {
     pending_blocks: std.ArrayList(types.SignedBlock),
 
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
+    pub const FollowupDispatchFn = *const fn (
+        ctx: ?*anyopaque,
+        chain: *BeamChain,
+        previous_finalized: types.Checkpoint,
+        pruneForkchoice: bool,
+    ) void;
 
     const Self = @This();
 
@@ -299,6 +312,7 @@ pub const BeamChain = struct {
     pub fn processPendingBlocks(self: *Self, external_mutex: ?*std.Thread.Mutex) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
         const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+        var processed_any: bool = false;
         var i: usize = 0;
         while (i < self.pending_blocks.items.len) {
             const queued_slot = self.pending_blocks.items[i].block.slot;
@@ -334,13 +348,36 @@ pub const BeamChain = struct {
                 };
                 defer self.allocator.free(missing_roots);
 
-                self.onBlockFollowup(true, &queued_block);
+                // NOTE: per-block onBlockFollowup intentionally removed in
+                // backfill replay. Each followup performs DB writes, canonical
+                // view analysis, state/forkchoice/cached-block pruning, and
+                // SSE event emission — all of which scale with the size of
+                // the chain, not with the single block. Running it N times
+                // for a backfill of N blocks made replay cost O(N * fc_size).
+                //
+                // We instead run a single trailing followup after the loop:
+                //   - SSE events still fire (head/justification/finalization
+                //     still reflect the latest forkchoice state).
+                //   - Finalization-advancement pruning runs at most once per
+                //     batch instead of per replayed block.
+                //
+                // Correctness: forkchoice itself is updated inside `onBlock`
+                // for every block, so consensus state is identical. Only the
+                // housekeeping is collapsed.
+                processed_any = true;
 
                 // Accumulate missing roots so the caller can fetch them.
                 all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
             } else {
                 i += 1;
             }
+        }
+
+        // Single trailing followup for the whole batch. Cheap when finalization
+        // didn't advance; runs the heavy prune path at most once per batch when
+        // it did.
+        if (processed_any) {
+            self.onBlockFollowup(true, null);
         }
         return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
     }
@@ -1281,9 +1318,16 @@ pub const BeamChain = struct {
         return missing_roots.toOwnedSlice(self.allocator);
     }
 
-    pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
-        _ = signedBlock;
-        // 7. Asap emit new events via SSE (use forkchoice ProtoBlock directly)
+    /// Phase A of post-block work: cheap, latency-sensitive event emission.
+    ///
+    /// Emits SSE head/justification/finalization events and updates the
+    /// `last_emitted_*` checkpoints. This phase reads forkchoice state but
+    /// does NOT touch DB / state map / forkchoice prune paths, so it is
+    /// safe to run on the gossip thread directly.
+    ///
+    /// Returns whether finalization advanced. The caller uses this to decide
+    /// whether the (heavier) Phase B prune work needs to run at all.
+    fn emitChainEvents(self: *Self) bool {
         const new_head = self.forkChoice.getHead();
         if (api.events.NewHeadEvent.fromProtoBlock(self.allocator, new_head)) |head_event| {
             var chain_event = api.events.ChainEvent{ .new_head = head_event };
@@ -1298,7 +1342,6 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
-        // 8. Asap emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified.slot) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
@@ -1313,9 +1356,11 @@ pub const BeamChain = struct {
             }
         }
 
-        // Emit finalization event only when slot increases beyond last emitted
         const last_emitted_finalized = self.last_emitted_finalized;
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
+        const finalization_advanced = latest_finalized.slot > last_emitted_finalized.slot;
+
+        // Emit finalization event only when slot increases beyond last emitted
+        if (finalization_advanced) {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
@@ -1328,33 +1373,75 @@ pub const BeamChain = struct {
             }
         }
 
+        zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
+        zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+
+        return finalization_advanced;
+    }
+
+    /// Phase B of post-block work: heavy, finalization-driven prune work.
+    ///
+    /// Runs only when finalization has advanced past `previous_finalized`.
+    /// Performs canonical-view analysis, DB index moves, and prunes:
+    ///   - state map (states older than finalized that are non-canonical)
+    ///   - forkchoice (when `pruneForkchoice` is set)
+    ///   - stale attestation data
+    ///   - cached blocks (via `prune_cached_blocks_fn` if registered)
+    ///
+    /// All of this is read-write on chain-owned resources. Today it runs
+    /// inline on the calling thread (gossip / interval / pending replay).
+    /// Once a dedicated followup worker is wired (see `runFollowupAsync` /
+    /// the `followup_dispatch_*` hook on `BeamChain`), this phase will move
+    /// off the gossip thread so onGossip can return as soon as forkchoice
+    /// is updated. Until then, the split keeps the call site shape
+    /// unchanged so the dispatch wiring is a one-line change.
+    pub fn processFinalizationFollowup(self: *Self, previous_finalized: types.Checkpoint, pruneForkchoice: bool) void {
+        const latest_finalized = self.forkChoice.getLatestFinalized();
+        if (latest_finalized.slot <= previous_finalized.slot) return;
+
         // Update finalized slot indices and cleanup if finalization has advanced
-        // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
-            self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
-                // Record failed finalization attempt
-                zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
-                self.logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
-                    last_emitted_finalized.slot,
-                    latest_finalized.slot,
-                    err,
-                });
-            };
+        self.processFinalizationAdvancement(previous_finalized, latest_finalized, pruneForkchoice) catch |err| {
+            // Record failed finalization attempt
+            zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "error" }) catch {};
+            self.logger.err("failed to process finalization advancement from slot {d} to {d}: {any}", .{
+                previous_finalized.slot,
+                latest_finalized.slot,
+                err,
+            });
+        };
 
-            // Prune stale attestation data when finalization advances
-            self.forkChoice.pruneStaleAttestationData(latest_finalized.slot) catch |err| {
-                self.logger.warn("failed to prune stale attestation data: {any}", .{err});
-            };
+        // Prune stale attestation data when finalization advances
+        self.forkChoice.pruneStaleAttestationData(latest_finalized.slot) catch |err| {
+            self.logger.warn("failed to prune stale attestation data: {any}", .{err});
+        };
 
-            // Prune cached blocks at or before finalized slot
-            if (self.prune_cached_blocks_fn) |prune_fn| {
-                if (self.prune_cached_blocks_ctx) |ctx| {
-                    const pruned = prune_fn(ctx, latest_finalized);
-                    if (pruned > 0) {
-                        self.logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
-                    }
+        // Prune cached blocks at or before finalized slot
+        if (self.prune_cached_blocks_fn) |prune_fn| {
+            if (self.prune_cached_blocks_ctx) |ctx| {
+                const pruned = prune_fn(ctx, latest_finalized);
+                if (pruned > 0) {
+                    self.logger.info("pruned {d} cached blocks at finalized slot {d}", .{ pruned, latest_finalized.slot });
                 }
             }
+        }
+    }
+
+    pub fn onBlockFollowup(self: *Self, pruneForkchoice: bool, signedBlock: ?*const types.SignedBlock) void {
+        _ = signedBlock;
+
+        // Snapshot finalized checkpoint BEFORE event emission. emitChainEvents
+        // mutates `self.last_emitted_finalized`, so reading it after would
+        // miss the diff that drives Phase B.
+        const previous_finalized = self.last_emitted_finalized;
+
+        // Phase A: latency-sensitive event emission. Always inline.
+        const finalization_advanced = self.emitChainEvents();
+
+        // Phase B: heavy prune work. Today inline; designed to be hoisted
+        // onto a dedicated follow-up worker thread in a follow-on PR. See
+        // doc comment on `processFinalizationFollowup` and `runFollowupAsync`.
+        if (finalization_advanced) {
+            self.runFollowupAsync(previous_finalized, pruneForkchoice);
         }
 
         const states_count_after_block = self.states.count();
@@ -1363,9 +1450,41 @@ pub const BeamChain = struct {
             states_count_after_block,
             fc_nodes_count_after_block,
         });
+    }
 
-        zeam_metrics.metrics.lean_latest_justified_slot.set(latest_justified.slot);
-        zeam_metrics.metrics.lean_latest_finalized_slot.set(latest_finalized.slot);
+    /// Dispatch hook for the heavy Phase-B follow-up work.
+    ///
+    /// Default: runs `processFinalizationFollowup` inline on the calling
+    /// thread (preserves current behavior bit-for-bit).
+    ///
+    /// When `followup_dispatch_fn` is set, the chain hands `(prev_finalized,
+    /// pruneForkchoice)` to the registered dispatcher (e.g. a single-consumer
+    /// worker thread owned by BeamNode). The dispatcher is responsible for:
+    ///   1. Eventually invoking `chain.processFinalizationFollowup(prev, prune)`
+    ///      on its own thread.
+    ///   2. Serializing follow-up calls so chain-state mutation remains
+    ///      single-writer.
+    ///   3. Coordinating with BeamNode.mutex (or a successor lock) so chain
+    ///      reads/writes during followup do not race onGossip / onInterval.
+    ///
+    /// Until a dispatcher is wired, this is a pure refactor with no
+    /// behavior change. See issue tracking the gossip-thread parallelism
+    /// follow-up plan.
+    pub fn runFollowupAsync(self: *Self, previous_finalized: types.Checkpoint, pruneForkchoice: bool) void {
+        if (self.followup_dispatch_fn) |dispatch| {
+            dispatch(self.followup_dispatch_ctx, self, previous_finalized, pruneForkchoice);
+            return;
+        }
+        self.processFinalizationFollowup(previous_finalized, pruneForkchoice);
+    }
+
+    /// Wire a dispatcher (e.g. a worker-thread MPSC queue) to take ownership
+    /// of finalization-followup work. Pass `null` for `func` to revert to
+    /// inline execution. See `runFollowupAsync` for the contract the
+    /// dispatcher must honor.
+    pub fn setFollowupDispatch(self: *Self, ctx: ?*anyopaque, func: ?FollowupDispatchFn) void {
+        self.followup_dispatch_ctx = ctx;
+        self.followup_dispatch_fn = func;
     }
 
     /// Update block database with block, state, and slot indices.
