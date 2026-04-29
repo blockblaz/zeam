@@ -8,6 +8,7 @@ pub const justifiability_runner = @import("./runner/justifiability_runner.zig");
 pub const verify_signatures_runner = @import("./runner/verify_signatures_runner.zig");
 pub const slot_clock_runner = @import("./runner/slot_clock_runner.zig");
 pub const api_endpoint_runner = @import("./runner/api_endpoint_runner.zig");
+pub const networking_codec_runner = @import("./runner/networking_codec_runner.zig");
 pub const skip = @import("./skip.zig");
 pub const generated = @import("./generated/index.zig");
 
