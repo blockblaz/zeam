@@ -1681,6 +1681,14 @@ pub const BeamChain = struct {
     ///     `state.validators` slice into a use-after-free.
     ///   - `xmss.verifySsz` reads the local pubkey + message + signature
     ///     buffers only. No shared state.
+    ///   - `lean_pq_sig_attestation_signatures_*` counters and
+    ///     `*_verification_time_seconds` timers used during the unlocked
+    ///     window are atomic-backed (`Counter.incr` is `@atomicRmw`,
+    ///     `Histogram.observe` updates sum/count/buckets via atomic RMW).
+    ///   - Phase 3 (forkchoice mutation) re-serializes via the re-acquired
+    ///     external_mutex. `forkChoice.onSignedAttestation` returns
+    ///     `InvalidAttestation` (does not panic) if the target block was
+    ///     pruned during the unlocked window.
     pub fn onGossipAttestation(
         self: *Self,
         signedAttestation: networks.AttestationGossip,
@@ -1700,15 +1708,13 @@ pub const BeamChain = struct {
 
         const att_data = signedAttestation.message.message;
         const sig_bytes = signedAttestation.message.signature;
-
-        // Compute the message hash under lock — the allocator is thread-safe
-        // (GPA in production) but doing this small step inside the locked
-        // window keeps the unlocked window dedicated to the FFI verify call.
-        var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, att_data, &message_hash, self.allocator);
         const epoch: u32 = @intCast(att_data.slot);
 
-        // Phase 2 (unlocked): XMSS verify.
+        // Phase 2 (unlocked): hashTreeRoot + XMSS verify. `att_data` is a
+        // by-value local copy; `pubkey_snapshot` is a 52-byte stack array;
+        // `sig_bytes` is by-value owned by `signedAttestation`. None of these
+        // alias chain state, so the hash computation is safe to run unlocked
+        // and shrinks the locked window further at no safety cost.
         if (external_mutex) |m| m.unlock();
         const verify_timer = zeam_metrics.zeam_chain_gossip_attestation_verify_unlocked_seconds.start();
         // Mirror the verifySingleAttestation metric semantics so dashboards
@@ -1718,6 +1724,10 @@ pub const BeamChain = struct {
         const xmss_timer = zeam_metrics.lean_pq_sig_attestation_verification_time_seconds.start();
 
         const verify_result: anyerror!void = blk: {
+            var message_hash: [32]u8 = undefined;
+            zeam_utils.hashTreeRoot(types.AttestationData, att_data, &message_hash, self.allocator) catch |err| {
+                break :blk err;
+            };
             xmss.verifySsz(&pubkey_snapshot, &message_hash, epoch, &sig_bytes) catch |err| {
                 break :blk err;
             };
@@ -1734,7 +1744,9 @@ pub const BeamChain = struct {
         };
         zeam_metrics.metrics.lean_pq_sig_attestation_signatures_valid_total.incr();
 
-        // Phase 3 (locked): forkchoice tracker mutation.
+        // Phase 3 (locked): forkchoice tracker mutation. `onSignedAttestation`
+        // returns `InvalidAttestation` (no panic) if the head block referenced
+        // by this attestation was pruned during the unlocked window.
         return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
@@ -1749,11 +1761,21 @@ pub const BeamChain = struct {
     ///     which is internally synchronized (#798). Handles are stable for
     ///     the lifetime of the cache (== chain), so a concurrent state prune
     ///     cannot invalidate them.
-    ///   - The participant message hash is computed under lock and copied
-    ///     into a local buffer before unlocking.
-    ///   - `proof.verify` reads only the snapshotted handles + message hash
-    ///     + the proof bytes (which live in `signedAggregation`, owned by
-    ///     the caller for the duration of this call).
+    ///   - `proof.verify` reads only the snapshotted handles + the locally
+    ///     computed message hash + the proof bytes (which live in
+    ///     `signedAggregation`, owned by the caller for the duration of this
+    ///     call).
+    ///   - `lean_pq_sig_aggregated_signatures_*` counters and the timer
+    ///     started during the unlocked window are atomic-backed and safe to
+    ///     fire from multiple threads concurrently.
+    ///   - Phase 3 (forkchoice mutation) re-serializes via the re-acquired
+    ///     external_mutex. `forkChoice.onAttestation` returns
+    ///     `InvalidAttestation` (no panic) if the attestation's head block
+    ///     was pruned during the unlocked window — we already swallow that
+    ///     error per validator with a debug log. `forkChoice.storeAggregatedPayload`
+    ///     value-copies `attestation_data.*` and SSZ-clones the proof
+    ///     internally, so the `&data` argument's stack-local lifetime is
+    ///     never escaped past the call.
     pub fn onGossipAggregatedAttestation(
         self: *Self,
         signedAggregation: types.SignedAggregatedAttestation,
@@ -1783,16 +1805,21 @@ pub const BeamChain = struct {
             public_keys.appendAssumeCapacity(pk_handle);
         }
 
-        var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, data, &message_hash, self.allocator);
         const epoch: u64 = data.slot;
 
-        // Phase 2 (unlocked): XMSS aggregate verify.
+        // Phase 2 (unlocked): hashTreeRoot + XMSS aggregate verify. `data` is
+        // a by-value local copy; pubkey handles are stable across the
+        // unlocked window (see contract above). Hoisting hashTreeRoot here
+        // shrinks the locked window further with no safety cost.
         if (external_mutex) |m| m.unlock();
         const verify_timer = zeam_metrics.zeam_chain_gossip_aggregation_verify_unlocked_seconds.start();
         const agg_verify_timer = zeam_metrics.lean_pq_sig_aggregated_signatures_verification_time_seconds.start();
 
         const verify_result: anyerror!void = blk: {
+            var message_hash: [32]u8 = undefined;
+            zeam_utils.hashTreeRoot(types.AttestationData, data, &message_hash, self.allocator) catch |err| {
+                break :blk err;
+            };
             signedAggregation.proof.verify(public_keys.items, &message_hash, epoch) catch |err| {
                 break :blk err;
             };
@@ -1835,6 +1862,10 @@ pub const BeamChain = struct {
             };
         }
 
+        // `storeAggregatedPayload` value-copies `attestation_data.*` into the
+        // payload map and SSZ-clones the proof internally; passing a pointer
+        // to the stack-local `data` is safe (the pointer is not stored past
+        // the call).
         try self.forkChoice.storeAggregatedPayload(&data, signedAggregation.proof, false);
     }
 
@@ -2862,6 +2893,139 @@ test "attestation processing - valid block attestation" {
 
     // Verify the attestation data was recorded for aggregation
     try std.testing.expect(beam_chain.forkChoice.attestation_signatures.getPtr(valid_attestation.message) != null);
+}
+
+test "onGossipAttestation preserves caller-held external_mutex on entry/exit (issue #786)" {
+    // Lock-invariant regression test for the phase 2b hoist: chain.onGossipAttestation
+    // unlocks `external_mutex` for hashTreeRoot + XMSS verify and re-acquires
+    // before forkchoice mutation. The contract is "lock held on entry == lock
+    // held on exit" on every return path, which is enforced here for both the
+    // success path and an early-return error path (MissingState — phase 1,
+    // before any unlock).
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    for (1..mock_chain.blocks.len) |i| {
+        const block = mock_chain.blocks[i];
+        try beam_chain.forkChoice.onInterval(block.block.slot * constants.INTERVALS_PER_SLOT, false);
+        const missing_roots = try beam_chain.onBlock(block, .{}, null);
+        allocator.free(missing_roots);
+    }
+
+    const message = types.Attestation{
+        .validator_id = 1,
+        .data = .{
+            .slot = 2,
+            .head = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+            .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+            .target = types.Checkpoint{ .root = mock_chain.blockRoots[2], .slot = 2 },
+        },
+    };
+
+    var key_manager = try keymanager.getTestKeyManager(allocator, 4, 3);
+    defer key_manager.deinit();
+    const signature = try key_manager.signAttestation(&message, allocator);
+
+    const valid_attestation: types.SignedAttestation = .{
+        .validator_id = message.validator_id,
+        .message = message.data,
+        .signature = signature,
+    };
+    const subnet_id = try types.computeSubnetId(
+        @intCast(valid_attestation.validator_id),
+        beam_chain.config.spec.attestation_committee_count,
+    );
+    const gossip_attestation = networks.AttestationGossip{
+        .subnet_id = @intCast(subnet_id),
+        .message = valid_attestation,
+    };
+
+    var mutex: std.Thread.Mutex = .{};
+
+    // Success path: lock held on entry, must be held on exit.
+    {
+        mutex.lock();
+        try beam_chain.onGossipAttestation(gossip_attestation, &mutex);
+        // tryLock must fail — if onGossipAttestation skipped the re-acquire,
+        // the lock would be free and tryLock would succeed.
+        try std.testing.expect(!mutex.tryLock());
+        mutex.unlock();
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
+
+    // Error path (MissingState — phase 1, before any unlock): build an
+    // attestation whose target.root is unknown to the chain. The error must
+    // surface with the lock still held.
+    {
+        const orphan_attestation: types.SignedAttestation = .{
+            .validator_id = 0,
+            .message = .{
+                .slot = 2,
+                .head = types.Checkpoint{ .root = [_]u8{0xff} ** 32, .slot = 2 },
+                .source = types.Checkpoint{ .root = mock_chain.blockRoots[1], .slot = 1 },
+                .target = types.Checkpoint{ .root = [_]u8{0xff} ** 32, .slot = 2 },
+            },
+            .signature = ZERO_SIGBYTES,
+        };
+        const orphan_gossip = networks.AttestationGossip{
+            .subnet_id = 0,
+            .message = orphan_attestation,
+        };
+
+        mutex.lock();
+        const result = beam_chain.onGossipAttestation(orphan_gossip, &mutex);
+        try std.testing.expectError(AttestationValidationError.MissingState, result);
+        // Lock must still be held.
+        try std.testing.expect(!mutex.tryLock());
+        mutex.unlock();
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
 }
 
 test "produceBlock - greedy selection by latest slot is suboptimal when attestation references unseen block" {
