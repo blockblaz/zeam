@@ -206,8 +206,16 @@ enum SwarmCommand {
         request_id: u64,
         request_message: RequestMessage,
     },
+    /// Pre-resolved on the FFI side under a single `RESPONSE_CHANNEL_MAP` lock so
+    /// the executor side does not need to re-lock the map. This avoids a race
+    /// against `SendRpcEndOfStream` / the response-channel timeout sweep that
+    /// could otherwise drop the chunk and log a spurious `No response channel
+    /// found` error between the two locks.
     SendRpcResponseChunk {
         channel_id: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream_id: u64,
         response_message: ResponseMessage,
     },
     SendRpcEndOfStream {
@@ -218,6 +226,21 @@ enum SwarmCommand {
         payload: Vec<u8>,
     },
 }
+
+/// Capacity for the per-network swarm command channel.
+///
+/// The channel is bounded to apply backpressure when FFI publishers run faster
+/// than the swarm can drain (slow peer, gossipsub overflow, etc.). Send sites
+/// use `try_send` and drop the message with an error log when the channel is
+/// full rather than blocking the calling thread or growing memory without
+/// bound. Sized for short, bursty traffic; tune with care.
+const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum number of queued swarm commands the event loop drains in a single
+/// iteration before yielding back to the rest of the `tokio::select!` arms
+/// (notably swarm event polling). Keeps a command flood from starving gossip
+/// ingestion / reqresp completion under load.
+const MAX_SWARM_COMMANDS_PER_TICK: usize = 32;
 
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
@@ -230,8 +253,8 @@ lazy_static::lazy_static! {
     static ref RECONNECT_ATTEMPTS: Mutex<HashMap<(u32, PeerId), (Multiaddr, u32)>> = Mutex::new(HashMap::new());
     // Track connection directions for disconnect events (network_id, peer_id, connection_id) -> direction
     static ref CONNECTION_DIRECTIONS: Mutex<HashMap<(u32, PeerId, ConnectionId), u32>> = Mutex::new(HashMap::new());
-    static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::UnboundedSender<SwarmCommand>>> = Mutex::new(HashMap::new());
-    static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::UnboundedReceiver<SwarmCommand>>> = Mutex::new(HashMap::new());
+    static ref COMMAND_SENDERS: Mutex<HashMap<u32, mpsc::Sender<SwarmCommand>>> = Mutex::new(HashMap::new());
+    static ref COMMAND_RECEIVERS: Mutex<HashMap<u32, mpsc::Receiver<SwarmCommand>>> = Mutex::new(HashMap::new());
 }
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -451,13 +474,35 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
     });
 }
 
+/// Get a clone of the per-network swarm command sender, if the network has
+/// been initialized. Cloning lets us drop the `COMMAND_SENDERS` lock before
+/// performing `try_send`, which is important because `try_send` can block
+/// briefly on the channel's internal semaphore.
+fn get_command_sender(network_id: u32) -> Option<mpsc::Sender<SwarmCommand>> {
+    COMMAND_SENDERS.lock().unwrap().get(&network_id).cloned()
+}
+
 fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
-    let senders = COMMAND_SENDERS.lock().unwrap();
-    if let Some(tx) = senders.get(&network_id) {
-        tx.send(cmd).is_ok()
-    } else {
-        logger::rustLogger.error(network_id, "send_swarm_command: network not initialized");
-        false
+    let tx = match get_command_sender(network_id) {
+        Some(tx) => tx,
+        None => {
+            logger::rustLogger.error(network_id, "send_swarm_command: network not initialized");
+            return false;
+        }
+    };
+    match tx.try_send(cmd) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            logger::rustLogger.error(
+                network_id,
+                "send_swarm_command: command channel full, dropping command (slow drain or peer backpressure)",
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            logger::rustLogger.error(network_id, "send_swarm_command: command channel closed");
+            false
+        }
     }
 }
 
@@ -543,17 +588,40 @@ pub unsafe extern "C" fn send_rpc_request(
 
     let protocol_id: ProtocolId = protocol.into();
 
+    // Acquire the sender first so we don't burn a request id on a network that
+    // isn't initialized (or is shutting down). The id is still allocated
+    // before `try_send` because the command needs to carry it; on send failure
+    // we roll the counter back with a `fetch_sub` so ids are not leaked over
+    // the lifetime of the process.
+    let tx = match get_command_sender(network_id) {
+        Some(tx) => tx,
+        None => {
+            logger::rustLogger.error(network_id, "send_rpc_request: network not initialized");
+            return 0;
+        }
+    };
+
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     let request_message = RequestMessage::new(protocol_id.clone(), request_bytes);
-    if !send_swarm_command(
-        network_id,
-        SwarmCommand::SendRpcRequest {
-            peer_id,
-            request_id,
-            request_message,
-        },
-    ) {
-        return 0;
+    match tx.try_send(SwarmCommand::SendRpcRequest {
+        peer_id,
+        request_id,
+        request_message,
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            // Roll the counter back so the id is not permanently leaked.
+            REQUEST_ID_COUNTER.fetch_sub(1, Ordering::Relaxed);
+            let reason = match e {
+                mpsc::error::TrySendError::Full(_) => "command channel full",
+                mpsc::error::TrySendError::Closed(_) => "command channel closed",
+            };
+            logger::rustLogger.error(
+                network_id,
+                &format!("send_rpc_request: failed to enqueue request: {}", reason),
+            );
+            return 0;
+        }
     }
     REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
     REQUEST_PROTOCOL_MAP
@@ -563,7 +631,7 @@ pub unsafe extern "C" fn send_rpc_request(
     logger::rustLogger.info(
         network_id,
         &format!(
-            "[reqresp] Queued {:?} request to {} (id: {})",
+            "[reqresp] Sent {:?} request to {} (id: {})",
             protocol, peer_id, request_id
         ),
     );
@@ -582,6 +650,13 @@ pub unsafe extern "C" fn send_rpc_response_chunk(
     let response_slice = std::slice::from_raw_parts(response_data, response_len);
     let response_bytes = response_slice.to_vec();
 
+    // Look up the response channel and refresh its timeout under a single lock,
+    // and pass the resolved (peer_id, connection_id, stream_id) inside the
+    // command. The executor side then does not need to re-lock
+    // `RESPONSE_CHANNEL_MAP`, which closes the race against
+    // `send_rpc_end_of_stream` / the response-channel timeout sweep that
+    // would otherwise drop the chunk and log a spurious `No response channel
+    // found` between the two locks.
     let channel = {
         let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
         let c = response_map.get(&channel_id).cloned();
@@ -596,6 +671,9 @@ pub unsafe extern "C" fn send_rpc_response_chunk(
             network_id,
             SwarmCommand::SendRpcResponseChunk {
                 channel_id,
+                peer_id: channel.peer_id,
+                connection_id: channel.connection_id,
+                stream_id: channel.stream_id,
                 response_message,
             },
         );
@@ -911,7 +989,7 @@ impl Network {
         }
 
         // Set up actor model command channel
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(SWARM_COMMAND_CHANNEL_CAPACITY);
         COMMAND_SENDERS
             .lock()
             .unwrap()
@@ -1097,73 +1175,12 @@ impl Network {
                 }
             }
 
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    SwarmCommand::Publish { topic, data } => {
-                        let t = gossipsub::IdentTopic::new(topic);
-                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, data) {
-                            logger::rustLogger.error(self.network_id, &format!("Publish error: {e:?}"));
-                        }
-                    }
-                    SwarmCommand::SendRpcRequest { peer_id, request_id, request_message } => {
-                        swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
-                    }
-                    SwarmCommand::SendRpcResponseChunk { channel_id, response_message } => {
-                        let channel = {
-                            let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
-                            let c = response_map.get(&channel_id).cloned();
-                            if c.is_some() {
-                                _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
-                            }
-                            c
-                        };
-                        if let Some(channel) = channel {
-                            swarm.behaviour_mut().reqresp.send_response(
-                                channel.peer_id, channel.connection_id, channel.stream_id, response_message,
-                            );
-                            logger::rustLogger.info(self.network_id, &format!(
-                                "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, channel.peer_id));
-                        } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcResponseChunk)", channel_id));
-                        }
-                    }
-                    SwarmCommand::SendRpcEndOfStream { channel_id } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
-                        if let Some(channel) = channel {
-                            let peer_id = channel.peer_id;
-                            swarm.behaviour_mut().reqresp.finish_response_stream(
-                                peer_id, channel.connection_id, channel.stream_id,
-                            );
-                            logger::rustLogger.info(self.network_id, &format!(
-                                "[reqresp] Sent end-of-stream on channel {} (peer: {})", channel_id, peer_id));
-                        } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcEndOfStream)", channel_id));
-                        }
-                    }
-                    SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
-                        if let Some(channel) = channel {
-                            let peer_id = channel.peer_id;
-                            let protocol = channel.protocol.clone();
-                            let response_message = ResponseMessage::new(protocol, payload);
-                            swarm.behaviour_mut().reqresp.send_response(
-                                peer_id, channel.connection_id, channel.stream_id, response_message.clone(),
-                            );
-                            swarm.behaviour_mut().reqresp.finish_response_stream(
-                                peer_id, channel.connection_id, channel.stream_id,
-                            );
-                            logger::rustLogger.info(self.network_id, &format!(
-                                "[reqresp] Sent error response on channel {} (peer: {})", channel_id, peer_id));
-                        } else {
-                            logger::rustLogger.error(self.network_id, &format!(
-                                "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
-                        }
-                    }
-                }
-            }
-
+            // NOTE on arm ordering: with `biased;` above, arms are polled in source
+            // order. Swarm event polling MUST come before the FFI command arm so a
+            // burst of commands cannot starve gossip ingestion / reqresp completion
+            // (i.e. swarm events get a chance every loop iteration). The command
+            // arm additionally caps each iteration at MAX_SWARM_COMMANDS_PER_TICK so
+            // we never sit inside it indefinitely.
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -1577,6 +1594,87 @@ impl Network {
                         e => logger::rustLogger.debug(self.network_id, &format!("{:?}", e)),
                     }
                 }
+
+            // Drain a bounded burst of swarm commands per loop iteration. We
+            // pull up to `MAX_SWARM_COMMANDS_PER_TICK` commands here (without
+            // awaiting between them, so we never yield in the middle of a
+            // burst), then break out so the next `select!` iteration can
+            // service swarm events / timeouts. The combination of `biased;`
+            // (above) plus this cap means a flood of FFI publishes cannot
+            // starve gossip ingestion or reqresp event handling.
+            Some(first_cmd) = cmd_rx.recv() => {
+                let mut cmd = first_cmd;
+                let mut drained = 0usize;
+                loop {
+                    match cmd {
+                    SwarmCommand::Publish { topic, data } => {
+                        let t = gossipsub::IdentTopic::new(topic);
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, data) {
+                            logger::rustLogger.error(self.network_id, &format!("Publish error: {e:?}"));
+                        }
+                    }
+                    SwarmCommand::SendRpcRequest { peer_id, request_id, request_message } => {
+                        swarm.behaviour_mut().reqresp.send_request(peer_id, request_id, request_message);
+                    }
+                    SwarmCommand::SendRpcResponseChunk { channel_id, peer_id, connection_id, stream_id, response_message } => {
+                        // Channel coordinates were resolved on the FFI side
+                        // under a single `RESPONSE_CHANNEL_MAP` lock; we just
+                        // forward the response and log it. We do not re-look
+                        // up the channel here, so an interleaved
+                        // `SendRpcEndOfStream` (or timeout sweep) cannot make
+                        // this chunk silently disappear.
+                        swarm.behaviour_mut().reqresp.send_response(
+                            peer_id, connection_id, stream_id, response_message,
+                        );
+                        logger::rustLogger.info(self.network_id, &format!(
+                            "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
+                    }
+                    SwarmCommand::SendRpcEndOfStream { channel_id } => {
+                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        if let Some(channel) = channel {
+                            let peer_id = channel.peer_id;
+                            swarm.behaviour_mut().reqresp.finish_response_stream(
+                                peer_id, channel.connection_id, channel.stream_id,
+                            );
+                            logger::rustLogger.info(self.network_id, &format!(
+                                "[reqresp] Sent end-of-stream on channel {} (peer: {})", channel_id, peer_id));
+                        } else {
+                            logger::rustLogger.error(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcEndOfStream)", channel_id));
+                        }
+                    }
+                    SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
+                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        if let Some(channel) = channel {
+                            let peer_id = channel.peer_id;
+                            let protocol = channel.protocol.clone();
+                            let response_message = ResponseMessage::new(protocol, payload);
+                            swarm.behaviour_mut().reqresp.send_response(
+                                peer_id, channel.connection_id, channel.stream_id, response_message.clone(),
+                            );
+                            swarm.behaviour_mut().reqresp.finish_response_stream(
+                                peer_id, channel.connection_id, channel.stream_id,
+                            );
+                            logger::rustLogger.info(self.network_id, &format!(
+                                "[reqresp] Sent error response on channel {} (peer: {})", channel_id, peer_id));
+                        } else {
+                            logger::rustLogger.error(self.network_id, &format!(
+                                "No response channel found for id {} (SendRpcErrorResponse)", channel_id));
+                        }
+                    }
+                    }
+                    drained += 1;
+                    if drained >= MAX_SWARM_COMMANDS_PER_TICK {
+                        break;
+                    }
+                    match cmd_rx.try_recv() {
+                        Ok(next) => cmd = next,
+                        Err(_) => break,
+                    }
+                }
+            }
+
+
             }
         }
 
@@ -1844,6 +1942,36 @@ mod tests {
         assert_eq!(
             request_id, 0,
             "Should return 0 when network is not initialized"
+        );
+    }
+
+    #[test]
+    fn test_send_rpc_request_does_not_burn_id_on_uninitialized_network() {
+        // Regression test for the comment on PR #789: when the per-network
+        // command channel is missing, `send_rpc_request` must not advance
+        // `REQUEST_ID_COUNTER`. Otherwise every failed FFI call permanently
+        // leaks a request id and successive ids skip values.
+        let network_id = 100; // unused network slot
+        let peer_id = std::ffi::CString::new("12D3KooWTest").unwrap();
+        let request_data = b"test request";
+
+        let before = REQUEST_ID_COUNTER.load(Ordering::Relaxed);
+        for _ in 0..5 {
+            let request_id = unsafe {
+                send_rpc_request(
+                    network_id,
+                    peer_id.as_ptr(),
+                    0,
+                    request_data.as_ptr(),
+                    request_data.len(),
+                )
+            };
+            assert_eq!(request_id, 0, "Should return 0 when network is not initialized");
+        }
+        let after = REQUEST_ID_COUNTER.load(Ordering::Relaxed);
+        assert_eq!(
+            before, after,
+            "REQUEST_ID_COUNTER must not advance when send_rpc_request fails"
         );
     }
 }
