@@ -20,7 +20,7 @@ extern fn hashsig_keypair_generate(
     seed_phrase: [*:0]const u8,
     activation_epoch: usize,
     num_active_epochs: usize,
-) ?*HashSigKeyPair;
+) callconv(.c) ?*HashSigKeyPair;
 
 /// Reconstruct a key pair from SSZ-encoded bytes
 extern fn hashsig_keypair_from_ssz(
@@ -28,23 +28,23 @@ extern fn hashsig_keypair_from_ssz(
     private_key_len: usize,
     public_key_ssz: [*]const u8,
     public_key_len: usize,
-) ?*HashSigKeyPair;
+) callconv(.c) ?*HashSigKeyPair;
 
 /// Free a key pair
-extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) void;
+extern fn hashsig_keypair_free(keypair: ?*HashSigKeyPair) callconv(.c) void;
 
 /// Get pointer to public key from keypair (valid as long as keypair is alive)
-extern fn hashsig_keypair_get_public_key(keypair: *const HashSigKeyPair) ?*const HashSigPublicKey;
+extern fn hashsig_keypair_get_public_key(keypair: *const HashSigKeyPair) callconv(.c) ?*const HashSigPublicKey;
 
 /// Get pointer to private key from keypair (valid as long as keypair is alive)
-extern fn hashsig_keypair_get_private_key(keypair: *const HashSigKeyPair) ?*const HashSigPrivateKey;
+extern fn hashsig_keypair_get_private_key(keypair: *const HashSigKeyPair) callconv(.c) ?*const HashSigPrivateKey;
 
 /// Sign a message using private key directly
 extern fn hashsig_sign(
     private_key: *const HashSigPrivateKey,
     message_ptr: [*]const u8,
     epoch: u32,
-) ?*HashSigSignature;
+) callconv(.c) ?*HashSigSignature;
 
 /// Verify a signature using public key directly
 extern fn hashsig_verify(
@@ -52,49 +52,49 @@ extern fn hashsig_verify(
     message_ptr: [*]const u8,
     epoch: u32,
     signature: *const HashSigSignature,
-) i32;
+) callconv(.c) i32;
 
 /// Serialize a public key pointer to bytes
 extern fn hashsig_public_key_to_bytes(
     public_key: *const HashSigPublicKey,
     buffer: [*]u8,
     buffer_len: usize,
-) usize;
+) callconv(.c) usize;
 
 /// Serialize a private key pointer to bytes
 extern fn hashsig_private_key_to_bytes(
     private_key: *const HashSigPrivateKey,
     buffer: [*]u8,
     buffer_len: usize,
-) usize;
+) callconv(.c) usize;
 
 /// Free a signature
-extern fn hashsig_signature_free(signature: ?*HashSigSignature) void;
+extern fn hashsig_signature_free(signature: ?*HashSigSignature) callconv(.c) void;
 
 /// Construct a signature from SSZ bytes
 extern fn hashsig_signature_from_ssz(
     sig_bytes: [*]const u8,
     sig_len: usize,
-) ?*HashSigSignature;
+) callconv(.c) ?*HashSigSignature;
 
 /// Construct a public key from SSZ bytes
 extern fn hashsig_public_key_from_ssz(
     pubkey_bytes: [*]const u8,
     pubkey_len: usize,
-) ?*HashSigPublicKey;
+) callconv(.c) ?*HashSigPublicKey;
 
 /// Free a standalone public key
-extern fn hashsig_public_key_free(pubkey: ?*HashSigPublicKey) void;
+extern fn hashsig_public_key_free(pubkey: ?*HashSigPublicKey) callconv(.c) void;
 
 /// Get the message length constant
-extern fn hashsig_message_length() usize;
+extern fn hashsig_message_length() callconv(.c) usize;
 
 /// Serialize a signature to bytes using SSZ encoding
 extern fn hashsig_signature_to_bytes(
     signature: *const HashSigSignature,
     buffer: [*]u8,
     buffer_len: usize,
-) usize;
+) callconv(.c) usize;
 
 /// Verify XMSS signature from SSZ-encoded bytes
 extern fn hashsig_verify_ssz(
@@ -104,7 +104,7 @@ extern fn hashsig_verify_ssz(
     epoch: u32,
     signature_bytes: [*]const u8,
     signature_len: usize,
-) i32;
+) callconv(.c) i32;
 
 pub const HashSigError = error{ KeyGenerationFailed, SigningFailed, VerificationFailed, InvalidSignature, SerializationFailed, InvalidMessageLength, DeserializationFailed, OutOfMemory };
 

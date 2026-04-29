@@ -147,6 +147,7 @@ const LoggerScope = enum {
 pub const ModuleTag = enum {
     api_server,
     cli,
+    clock,
     chain,
     configs,
     database,
@@ -486,6 +487,7 @@ fn getModuleTagName(tag: ModuleTag) []const u8 {
     return switch (tag) {
         .api_server => "api-server",
         .cli => "cli",
+        .clock => "clock",
         .chain => "chain",
         .configs => "configs",
         .database => "database",

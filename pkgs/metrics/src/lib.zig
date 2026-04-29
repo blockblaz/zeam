@@ -98,6 +98,16 @@ const Metrics = struct {
     zeam_compact_attestations_time_seconds: CompactAttestationsTimeHistogram,
     zeam_compact_attestations_input_total: CompactAttestationsInputCounter,
     zeam_compact_attestations_output_total: CompactAttestationsOutputCounter,
+    // Tick interval duration: actual elapsed time between clock ticks (nominal 0.8s)
+    lean_tick_interval_duration_seconds: TickIntervalDurationHistogram,
+    // Fork-choice tick interval duration: actual elapsed time between forkchoice tickIntervalUnlocked calls
+    zeam_fork_choice_tick_interval_duration_seconds: ForkChoiceTickIntervalDurationHistogram,
+    // BeamNode mutex contention metrics (issue #786)
+    // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
+    // Hold time = how long the callsite kept the mutex locked.
+    // Labeled by callsite so we can attribute stalls to onInterval vs onGossip vs req-resp paths.
+    zeam_node_mutex_wait_time_seconds: NodeMutexWaitTimeHistogram,
+    zeam_node_mutex_hold_time_seconds: NodeMutexHoldTimeHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -164,8 +174,16 @@ const Metrics = struct {
     const AttestationProductionTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 });
     // compactAttestations metric types
     const CompactAttestationsTimeHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 });
+    const TickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
+    const ForkChoiceTickIntervalDurationHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 });
     const CompactAttestationsInputCounter = metrics_lib.Counter(u64);
     const CompactAttestationsOutputCounter = metrics_lib.Counter(u64);
+    // BeamNode mutex contention histogram types. Buckets span 100us..2s to cover
+    // both fast acquisitions and long stalls observed when STF runs under the lock.
+    const NodeMutexLabel = struct { site: []const u8 };
+    const NODE_MUTEX_BUCKETS = [_]f32{ 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2 };
+    const NodeMutexWaitTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
+    const NodeMutexHoldTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -331,6 +349,18 @@ fn observeCompactAttestations(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observeTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.TickIntervalDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
+fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.ForkChoiceTickIntervalDurationHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var zeam_chain_onblock_duration_seconds: Histogram = .{
@@ -415,6 +445,14 @@ pub var zeam_compact_attestations_time_seconds: Histogram = .{
     .context = null,
     .observe = &observeCompactAttestations,
 };
+pub var lean_tick_interval_duration_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeTickIntervalDuration,
+};
+pub var zeam_fork_choice_tick_interval_duration_seconds: Histogram = .{
+    .context = null,
+    .observe = &observeForkChoiceTickIntervalDuration,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -497,6 +535,11 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_compact_attestations_time_seconds = Metrics.CompactAttestationsTimeHistogram.init("zeam_compact_attestations_time_seconds", .{ .help = "Time taken by compactAttestations to merge payloads sharing the same AttestationData" }, .{}),
         .zeam_compact_attestations_input_total = Metrics.CompactAttestationsInputCounter.init("zeam_compact_attestations_input_total", .{ .help = "Total number of attestations input to compactAttestations" }, .{}),
         .zeam_compact_attestations_output_total = Metrics.CompactAttestationsOutputCounter.init("zeam_compact_attestations_output_total", .{ .help = "Total number of attestations output from compactAttestations after compaction" }, .{}),
+        .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
+        // BeamNode mutex contention metrics (issue #786)
+        .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite" }, .{}),
+        .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -533,6 +576,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
     lean_gossip_aggregation_size_bytes.context = @ptrCast(&metrics.lean_gossip_aggregation_size_bytes);
     lean_attestations_production_time_seconds.context = @ptrCast(&metrics.lean_attestations_production_time_seconds);
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
+    lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
+    zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
     try metrics.lean_node_sync_status.set(.{ .status = "syncing" }, 0);
