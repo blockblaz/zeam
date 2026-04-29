@@ -396,19 +396,6 @@ fn runSnappyFrame(allocator: Allocator, ctx: Context, input_obj: std.json.Object
     // Same non-canonical-encoder caveat as snappy_block: emitter choices
     // about chunk layout differ between implementations. Validate via
     // round-trip on both sides.
-    //
-    // zeam's snappyframesz rejects a stream that contains only the 10-byte
-    // magic header (no data chunks). leanSpec's encoder happens to emit
-    // exactly that for empty input, while every other implementation
-    // (rust, go) accepts it as valid. Track the lib gap separately and
-    // skip just the empty case here.
-    if (data.len == 0) {
-        std.debug.print(
-            "spectest: skipping snappy_frame fixture {s} (zeam snappyframesz rejects header-only stream; lib bug, tracked separately)\n",
-            .{ctx.fixture_label},
-        );
-        return FixtureError.SkippedFixture;
-    }
     const decoded_expected = snappyframesz.decode(allocator, expected) catch {
         std.debug.print(
             "fixture {s} case {s}: snappy_frame: zeam decoder failed on leanSpec-emitted bytes\n",

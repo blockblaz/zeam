@@ -41,8 +41,8 @@
             .hash = "zig_snappy-0.0.3-bDFzXmBjAAA4DE0B9xYQt9jiKz1qBJrnailFrp9ShxvM",
         },
         .snappyframesz = .{
-            .url = "https://github.com/blockblaz/snappyframesz/archive/v0.0.3.tar.gz",
-            .hash = "snappyframesz-0.0.2-COCLy3QRBABRPWGBkHOM99FOVpJLZXkc42_ksiw1nV_e",
+            .url = "git+https://github.com/blockblaz/snappyframesz#cb0a08e4ada60cc427bf7d8ad3b706d6be405163",
+            .hash = "snappyframesz-0.0.2-COCLy68XBAA9ormPwV3D2OyOLK6BDVBHjoBcFeiaK1YC",
         },
         .hash_zig = .{
             .url = "git+https://github.com/chetanyb/hash-zig#710ed7eaed67e6c6993ec0f262c0ed4e83b19cdc",
