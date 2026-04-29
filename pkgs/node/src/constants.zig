@@ -5,9 +5,20 @@ const params = @import("@zeam/params");
 pub const INTERVALS_PER_SLOT = 5;
 pub const SECONDS_PER_INTERVAL_MS: isize = @divFloor(params.SECONDS_PER_SLOT * std.time.ms_per_s, INTERVALS_PER_SLOT);
 
-// Maximum number of slots in the future that an attestation is allowed to reference
-// This prevents accepting attestations that are too far ahead of the current slot
-pub const MAX_FUTURE_SLOT_TOLERANCE = 1;
+// Future-slot tolerance for gossip attestations, measured in intervals:
+//
+//     data.slot * INTERVALS_PER_SLOT <= store.time + GOSSIP_DISPARITY_INTERVALS
+//
+// where store.time is in intervals. One interval is roughly 800 ms at
+// SECONDS_PER_SLOT=4 / INTERVALS_PER_SLOT=5.
+//
+// A whole-slot tolerance would let an adversary pre-publish next-slot
+// aggregates ahead of any honest validator (~800 ms head start at 4 s
+// slots); tightening to one interval bounds that head start to NTP drift.
+//
+// Block-included attestations skip this check entirely; they are trusted
+// under the block's own validation.
+pub const GOSSIP_DISPARITY_INTERVALS = 1;
 
 // Maximum depth for recursive block fetching
 // When fetching parent blocks, we stop after this many levels to avoid infinite loops
