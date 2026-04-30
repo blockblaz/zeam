@@ -347,6 +347,11 @@ pub fn verifySingleAttestation(
     validator_index: usize,
     attestation_data: *const types.AttestationData,
     signatureBytes: *const types.SIGBYTES,
+    /// Optional precomputed `hashTreeRoot(AttestationData)` digest. When
+    /// supplied, the function skips re-hashing the attestation data.
+    /// Producers (e.g. `BeamNode.onGossip`) compute the hash before any
+    /// lock to keep the hot path lock-free (issue #786 req. 5).
+    precomputed_message_hash: ?*const [32]u8,
 ) !void {
     const validatorIndex = validator_index;
     const validators = state.validators.constSlice();
@@ -358,15 +363,18 @@ pub fn verifySingleAttestation(
     const pubkey = validator.getAttestationPubkey();
 
     const verification_timer = zeam_metrics.lean_pq_sig_attestation_verification_time_seconds.start();
-    var message: [32]u8 = undefined;
-    try zeam_utils.hashTreeRoot(types.AttestationData, attestation_data.*, &message, allocator);
+    var message_buf: [32]u8 = undefined;
+    const message_ptr: *const [32]u8 = if (precomputed_message_hash) |h| h else blk: {
+        try zeam_utils.hashTreeRoot(types.AttestationData, attestation_data.*, &message_buf, allocator);
+        break :blk &message_buf;
+    };
 
     const epoch: u32 = @intCast(attestation_data.slot);
 
     // Increment total signatures counter for verification path (signatures received from wire)
     zeam_metrics.metrics.lean_pq_sig_attestation_signatures_total.incr();
 
-    xmss.verifySsz(pubkey, &message, epoch, signatureBytes) catch |err| {
+    xmss.verifySsz(pubkey, message_ptr, epoch, signatureBytes) catch |err| {
         _ = verification_timer.observe();
         zeam_metrics.metrics.lean_pq_sig_attestation_signatures_invalid_total.incr();
         return err;

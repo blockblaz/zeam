@@ -337,20 +337,39 @@ pub const BeamNode = struct {
         // below (and its error sub-branches). Any future code path that reads
         // it outside that arm will hit Zig's `undefined` poison in debug
         // builds — intentional defensive behavior.
+        // Hash-root cache for gossip envelopes (issue #786 req. 5):
+        // pre-compute outside any lock and pass to chain.onGossip so the
+        // verify path skips the re-hash. Each buffer is read only inside
+        // its matching `.block` / `.attestation` / `.aggregation` switch
+        // arm; outside that arm the buffer stays `undefined` and is not
+        // referenced.
         var precomputed_block_root: types.Root = undefined;
-        if (data.* == .block) {
-            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
-                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                return;
-            };
+        var precomputed_attestation_hash: [32]u8 = undefined;
+        var precomputed_aggregation_hash: [32]u8 = undefined;
+        var have_attestation_hash = false;
+        var have_aggregation_hash = false;
+        switch (data.*) {
+            .block => {
+                zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
+                    self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
+                    return;
+                };
+            },
+            .attestation => {
+                zeam_utils.hashTreeRoot(types.AttestationData, data.attestation.message.message, &precomputed_attestation_hash, self.allocator) catch |err| {
+                    self.logger.warn("failed to compute attestation message hash: {any}", .{err});
+                    return;
+                };
+                have_attestation_hash = true;
+            },
+            .aggregation => {
+                zeam_utils.hashTreeRoot(types.AttestationData, data.aggregation.data, &precomputed_aggregation_hash, self.allocator) catch |err| {
+                    self.logger.warn("failed to compute aggregation message hash: {any}", .{err});
+                    return;
+                };
+                have_aggregation_hash = true;
+            },
         }
-        // TODO (issue #786 req. 5 follow-up): also pre-compute
-        // hashTreeRoot(AttestationData) for `.attestation` and `.aggregation`
-        // arms here, then thread the digest into chain.onGossip → verify
-        // paths so verifySingleAttestation / verifyAggregatedAttestation
-        // skip the re-hash. Requires plumbing through state-transition's
-        // verifySingleAttestation signature; out of scope for this
-        // iteration.
 
         // Lock-free entry (issue #786 iter 3): the chain methods invoked
         // below take per-resource locks internally — forkchoice has its
@@ -438,7 +457,9 @@ pub const BeamNode = struct {
             },
         }
 
-        const result = self.chain.onGossip(data, sender_peer_id) catch |err| {
+        const att_hash_ptr: ?*const [32]u8 = if (have_attestation_hash) &precomputed_attestation_hash else null;
+        const agg_hash_ptr: ?*const [32]u8 = if (have_aggregation_hash) &precomputed_aggregation_hash else null;
+        const result = self.chain.onGossip(data, sender_peer_id, att_hash_ptr, agg_hash_ptr) catch |err| {
             switch (err) {
                 // Block rejected because it's before finalized - drop it and prune any cached
                 // descendants we might still be holding onto.
@@ -1623,7 +1644,9 @@ pub const BeamNode = struct {
             data.slot,
             validator_id,
         });
-        try self.chain.onGossipAttestation(signed_attestation);
+        // Locally-produced path; chain.onGossipAttestation re-hashes
+        // internally. precomputed_message_hash = null.
+        try self.chain.onGossipAttestation(signed_attestation, null);
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
@@ -1638,7 +1661,9 @@ pub const BeamNode = struct {
 
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
         self.logger.info("adding locally produced aggregation to chain: slot={d}", .{signed_aggregation.data.slot});
-        try self.chain.onGossipAggregatedAttestation(signed_aggregation);
+        // Locally-produced path; chain.onGossipAggregatedAttestation
+        // re-hashes internally. precomputed_message_hash = null.
+        try self.chain.onGossipAggregatedAttestation(signed_aggregation, null);
 
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
         try self.network.publish(&gossip_msg);

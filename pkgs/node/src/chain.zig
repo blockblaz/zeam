@@ -908,7 +908,18 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !GossipProcessingResult {
+    pub fn onGossip(
+        self: *Self,
+        data: *const networks.GossipMessage,
+        sender_peer_id: []const u8,
+        /// Optional precomputed `hashTreeRoot(AttestationData)` digest for
+        /// the attestation gossip arm (issue #786 req. 5). Computed by the
+        /// producer before any lock and threaded through to skip a
+        /// re-hash inside the verify path.
+        precomputed_attestation_hash: ?*const [32]u8,
+        /// Same for the aggregation gossip arm.
+        precomputed_aggregation_hash: ?*const [32]u8,
+    ) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
@@ -1046,8 +1057,11 @@ pub const BeamChain = struct {
                 };
 
                 if (self.is_aggregator_enabled.load(.acquire)) {
-                    // Process validated attestation
-                    self.onGossipAttestation(signed_attestation) catch |err| {
+                    // Forward the producer-side precomputed digest (issue
+                    // #786 req. 5) so verifySingleAttestation skips the
+                    // re-hash. Falls back to internal hashTreeRoot when
+                    // null (e.g. internal callers).
+                    self.onGossipAttestation(signed_attestation, precomputed_attestation_hash) catch |err| {
                         zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
                         self.logger.err("attestation processing error: {any}", .{err});
                         return err;
@@ -1099,7 +1113,7 @@ pub const BeamChain = struct {
                     }
                 };
 
-                self.onGossipAggregatedAttestation(signed_aggregation) catch |err| {
+                self.onGossipAggregatedAttestation(signed_aggregation, precomputed_aggregation_hash) catch |err| {
                     zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "aggregation" }) catch {};
                     switch (err) {
                         // Propagate unknown block errors to node.zig for context-aware logging
@@ -1808,17 +1822,21 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossipAttestation(self: *Self, signedAttestation: networks.AttestationGossip) !void {
+    pub fn onGossipAttestation(
+        self: *Self,
+        signedAttestation: networks.AttestationGossip,
+        /// Optional precomputed `hashTreeRoot(AttestationData)` digest
+        /// computed by the producer (e.g. `BeamNode.onGossip`) before any
+        /// lock — issue #786 req. 5. When supplied, the inner verify
+        /// skips the re-hash. Pass `null` if no precomputed digest is
+        /// available (e.g. internal callers that already have data
+        /// locally).
+        precomputed_message_hash: ?*const [32]u8,
+    ) !void {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
 
         // Borrow the target state via BorrowedState (issue #786 req. 1).
-        // verifySingleAttestation reads `state.validators` only — short
-        // borrow is sufficient. The XMSS verify FFI itself is the slow
-        // step but it runs on a slice into the state, so we keep the
-        // borrow alive across it. If this turns into measurable
-        // contention on states_lock under aggregator-heavy load, switch
-        // to `cloneAndRelease` here.
         var borrow = self.borrowState(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
         defer borrow.deinit();
 
@@ -1828,16 +1846,24 @@ pub const BeamChain = struct {
             @intCast(signedAttestation.message.validator_id),
             &signedAttestation.message.message,
             &signedAttestation.message.signature,
+            precomputed_message_hash,
         );
 
         return self.forkChoice.onSignedAttestation(signedAttestation.message);
     }
 
-    pub fn onGossipAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+    pub fn onGossipAggregatedAttestation(
+        self: *Self,
+        signedAggregation: types.SignedAggregatedAttestation,
+        /// Optional precomputed `hashTreeRoot(AttestationData)` digest
+        /// (issue #786 req. 5). When supplied, the inner verify uses
+        /// this value and avoids the re-hash.
+        precomputed_message_hash: ?*const [32]u8,
+    ) !void {
         // Validate the attestation data first (same rules as individual gossip attestations)
         try self.validateAttestationData(signedAggregation.data, false);
 
-        try self.verifyAggregatedAttestation(signedAggregation);
+        try self.verifyAggregatedAttestation(signedAggregation, precomputed_message_hash);
 
         var validator_indices = try types.aggregationBitsToValidatorIndices(&signedAggregation.proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
@@ -1864,7 +1890,11 @@ pub const BeamChain = struct {
         try self.forkChoice.storeAggregatedPayload(&signedAggregation.data, signedAggregation.proof, false);
     }
 
-    fn verifyAggregatedAttestation(self: *Self, signedAggregation: types.SignedAggregatedAttestation) !void {
+    fn verifyAggregatedAttestation(
+        self: *Self,
+        signedAggregation: types.SignedAggregatedAttestation,
+        precomputed_message_hash: ?*const [32]u8,
+    ) !void {
         const data = signedAggregation.data;
         const proof = signedAggregation.proof;
 
@@ -1895,11 +1925,14 @@ pub const BeamChain = struct {
             }
         }
 
-        var message_hash: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(types.AttestationData, data, &message_hash, self.allocator);
+        var message_buf: [32]u8 = undefined;
+        const message_ptr: *const [32]u8 = if (precomputed_message_hash) |h| h else blk: {
+            try zeam_utils.hashTreeRoot(types.AttestationData, data, &message_buf, self.allocator);
+            break :blk &message_buf;
+        };
 
         const epoch: u64 = data.slot;
-        proof.verify(public_keys.items, &message_hash, epoch) catch {
+        proof.verify(public_keys.items, message_ptr, epoch) catch {
             return error.InvalidAggregationSignature;
         };
     }
@@ -2862,7 +2895,7 @@ test "attestation processing - valid block attestation" {
     };
 
     // Process attestation through chain (this validates and then processes)
-    try beam_chain.onGossipAttestation(gossip_attestation);
+    try beam_chain.onGossipAttestation(gossip_attestation, null);
 
     // Verify the attestation data was recorded for aggregation
     try std.testing.expect(beam_chain.forkChoice.attestation_signatures.getPtr(valid_attestation.message) != null);
