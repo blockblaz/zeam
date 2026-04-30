@@ -383,6 +383,38 @@ pub const BeamChain = struct {
         return self.states.count();
     }
 
+    /// Thread-safe wrapper around `xmss.PublicKeyCache.getOrPut`. The
+    /// underlying cache is documented NOT thread-safe; chain holds
+    /// `pubkey_cache_lock` (tier 5a) around every access.
+    ///
+    /// The returned `*const HashSigPublicKey` is a stable pointer to
+    /// Rust-side memory allocated by `hashsig_public_key_from_ssz` — the
+    /// pointer remains valid for the lifetime of the cache. Callers MAY
+    /// hold the handle past the lock release.
+    pub fn cacheGetOrPutPubkey(
+        self: *Self,
+        validator_index: usize,
+        pubkey_bytes: []const u8,
+    ) xmss.HashSigError!*const xmss.HashSigPublicKey {
+        self.pubkey_cache_lock.lock();
+        defer self.pubkey_cache_lock.unlock();
+        return self.public_key_cache.getOrPut(validator_index, pubkey_bytes);
+    }
+
+    /// Thread-safe wrapper around `root_to_slot_cache.put`. Tier 5b.
+    pub fn rootToSlotPut(self: *Self, root: types.Root, slot: types.Slot) !void {
+        self.root_to_slot_lock.lock();
+        defer self.root_to_slot_lock.unlock();
+        try self.root_to_slot_cache.put(root, slot);
+    }
+
+    /// Thread-safe wrapper around `root_to_slot_cache.get`. Tier 5b.
+    pub fn rootToSlotGet(self: *Self, root: types.Root) ?types.Slot {
+        self.root_to_slot_lock.lock();
+        defer self.root_to_slot_lock.unlock();
+        return self.root_to_slot_cache.get(root);
+    }
+
     pub fn deinit(self: *Self) void {
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
@@ -452,41 +484,54 @@ pub const BeamChain = struct {
     pub fn processPendingBlocks(self: *Self) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
         const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-        var i: usize = 0;
-        while (i < self.pending_blocks.items.len) {
-            const queued_slot = self.pending_blocks.items[i].block.slot;
-            if (queued_slot * constants.INTERVALS_PER_SLOT <= fc_time) {
-                // Remove from queue (ownership transferred to local var).
-                var queued_block = self.pending_blocks.orderedRemove(i);
-                defer queued_block.deinit();
-
-                var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
-                    self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
-                    continue;
-                };
-
-                self.logger.info(
-                    "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
-                    .{ queued_slot, &block_root, fc_time },
-                );
-
-                const missing_roots = self.onBlock(queued_block, .{
-                    .blockRoot = block_root,
-                }) catch |err| {
-                    self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
-                    continue;
-                };
-                defer self.allocator.free(missing_roots);
-
-                // Off-thread when a dispatcher is wired (req. 6).
-                self.dispatchOrRunFollowup(true, &queued_block);
-
-                // Accumulate missing roots so the caller can fetch them.
-                all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
-            } else {
-                i += 1;
+        // One-at-a-time drain (issue #786 req. 1 + #803 design): take
+        // pending_blocks_lock briefly to find + remove a ready block,
+        // release before the heavy onBlock import. Concurrent gossip-thread
+        // appends are appended at the tail under their own lock; the next
+        // iteration re-scans from index 0.
+        while (true) {
+            var queued_block_opt: ?types.SignedBlock = null;
+            {
+                self.pending_blocks_lock.lock();
+                defer self.pending_blocks_lock.unlock();
+                for (self.pending_blocks.items, 0..) |item, idx| {
+                    if (item.block.slot * constants.INTERVALS_PER_SLOT <= fc_time) {
+                        queued_block_opt = self.pending_blocks.orderedRemove(idx);
+                        break;
+                    }
+                }
             }
+            const queued_block_resolved = queued_block_opt orelse break;
+            var queued_block = queued_block_resolved;
+            defer queued_block.deinit();
+            const queued_slot = queued_block.block.slot;
+            // Original implementation continues below — i and the index-
+            // scan loop are obsolete with the one-at-a-time pattern.
+
+            var block_root: types.Root = undefined;
+            zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
+                self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
+                continue;
+            };
+
+            self.logger.info(
+                "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
+                .{ queued_slot, &block_root, fc_time },
+            );
+
+            const missing_roots = self.onBlock(queued_block, .{
+                .blockRoot = block_root,
+            }) catch |err| {
+                self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
+                continue;
+            };
+            defer self.allocator.free(missing_roots);
+
+            // Off-thread when a dispatcher is wired (req. 6).
+            self.dispatchOrRunFollowup(true, &queued_block);
+
+            // Accumulate missing roots so the caller can fetch them.
+            all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
         }
         return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
     }
@@ -903,7 +948,11 @@ pub const BeamChain = struct {
                         // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
                         // holding mutex between then for chain modification sections
                         if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                            try self.pending_blocks.append(self.allocator, cloned);
+                            {
+                                self.pending_blocks_lock.lock();
+                                defer self.pending_blocks_lock.unlock();
+                                try self.pending_blocks.append(self.allocator, cloned);
+                            }
 
                             self.logger.info(
                                 "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
@@ -1122,7 +1171,7 @@ pub const BeamChain = struct {
         };
 
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
-        try self.root_to_slot_cache.put(block_root, block.slot);
+        try self.rootToSlotPut(block_root, block.slot);
 
         // Obtain SSZ bytes for RocksDB persistence.
         //
@@ -1305,31 +1354,51 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
-        // 8. Asap emit justification/finalization events based on forkchoice store
+        // 8. Asap emit justification/finalization events. The
+        // `last_emitted_*` checkpoints are guarded by `events_lock`
+        // (issue #786 req. 1, tier 5c). The lock is held only for the
+        // read-modify-write of those fields; `event_broadcaster.broadcastGlobalEvent`
+        // is invoked OUTSIDE the lock — broadcaster has its own internal
+        // mutex and can be slow, so we don't want to nest under
+        // events_lock.
+        var should_broadcast_justification = false;
+        var should_broadcast_finalization = false;
+        const last_emitted_finalized = blk_emit: {
+            self.events_lock.lock();
+            defer self.events_lock.unlock();
+            const prev_finalized = self.last_emitted_finalized;
+            if (latest_justified.slot > self.last_emitted_justified.slot) {
+                self.last_emitted_justified = latest_justified;
+                should_broadcast_justification = true;
+            }
+            if (latest_finalized.slot > prev_finalized.slot) {
+                self.last_emitted_finalized = latest_finalized;
+                should_broadcast_finalization = true;
+            }
+            break :blk_emit prev_finalized;
+        };
+
         // Emit justification event only when slot increases beyond last emitted
-        if (latest_justified.slot > self.last_emitted_justified.slot) {
+        if (should_broadcast_justification) {
             if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
                 var chain_event = api.events.ChainEvent{ .new_justification = just_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.logger.warn("failed to broadcast justification event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
-                self.last_emitted_justified = latest_justified;
             } else |err| {
                 self.logger.warn("failed to create justification event: {any}", .{err});
             }
         }
 
         // Emit finalization event only when slot increases beyond last emitted
-        const last_emitted_finalized = self.last_emitted_finalized;
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
+        if (should_broadcast_finalization) {
             if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
                 var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
                 event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
                     self.logger.warn("failed to broadcast finalization event: {any}", .{err});
                     chain_event.deinit(self.allocator);
                 };
-                self.last_emitted_finalized = latest_finalized;
             } else |err| {
                 self.logger.warn("failed to create finalization event: {any}", .{err});
             }
@@ -1819,7 +1888,7 @@ pub const BeamChain = struct {
                     return error.InvalidValidatorId;
                 }
                 const pubkey_bytes = validators[validator_index].getAttestationPubkey();
-                const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
+                const pk_handle = self.cacheGetOrPutPubkey(validator_index, pubkey_bytes) catch {
                     return error.InvalidBlockSignatures;
                 };
                 try public_keys.append(self.allocator, pk_handle);
@@ -1915,14 +1984,27 @@ pub const BeamChain = struct {
     pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
 
-        // First try to get from in-memory states map
-        if (self.states.get(finalized_checkpoint.root)) |state| {
-            return state;
+        // First try to get from in-memory states map (states_lock.shared
+        // via borrowState). Returning a raw pointer is the existing
+        // contract — caller assumes unsafe-escape-hatch lifetime semantics
+        // until the surrounding API gets fully migrated to BorrowedState.
+        // Keeping that semantics here for compatibility; brief shared lock
+        // around the lookup avoids the AutoHashMap data race.
+        {
+            self.states_lock.lockShared();
+            defer self.states_lock.unlockShared();
+            if (self.states.get(finalized_checkpoint.root)) |state| {
+                return state;
+            }
         }
 
+        // events_lock (tier 5c) guards `cached_finalized_state` so concurrent
+        // callers don't race on the read-modify-write below.
+        self.events_lock.lock();
+        defer self.events_lock.unlock();
+
         // Check if we already have a cached state. Invalidate if it's behind the
-        // current finalized checkpoint (can happen if the cache was seeded from the
-        // DB at startup before any in-memory finalization happened).
+        // current finalized checkpoint.
         if (self.cached_finalized_state) |cached_state| {
             if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
                 return cached_state;

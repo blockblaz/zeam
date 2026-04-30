@@ -334,9 +334,12 @@ pub const BeamNode = struct {
         // verifySingleAttestation signature; out of scope for this
         // iteration.
 
-        var guard = self.acquireMutex("onGossip");
-        defer guard.unlock();
-
+        // Lock-free entry (issue #786 iter 3): the chain methods invoked
+        // below take per-resource locks internally — forkchoice has its
+        // own RwLock, states_lock guards the state map, network maps each
+        // have their own per-map lock, the followup worker queue serialises
+        // event emission. The outer finalization_lock is no longer
+        // required here.
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
@@ -1380,9 +1383,11 @@ pub const BeamNode = struct {
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             {
-                var guard = self.acquireMutex("onInterval");
-                defer guard.unlock();
-
+                // Lock-free entry (issue #786 iter 3): chain.onInterval +
+                // processPendingBlocks + processReadyCachedBlocks all use
+                // per-resource locks internally. Network calls below take
+                // per-map locks. finalization_lock is no longer needed at
+                // this entry.
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
                     // no point going further if chain is not ticked properly
