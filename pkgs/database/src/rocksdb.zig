@@ -132,11 +132,11 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             };
         }
 
-        pub fn commit(self: *Self, batch: *WriteBatch) void {
-            callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner }) catch |err| {
-                self.logger.err("failed to commit write batch: {any}", .{err});
-                return;
-            };
+        pub fn commit(self: *Self, batch: *WriteBatch) !void {
+            // callRocksDB already logs on failure; rethrow so callers
+            // (and consensus-critical writes) can detect the miss
+            // rather than assuming success.
+            try callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner });
         }
 
         /// A write batch is a sequence of operations that execute atomically.
@@ -869,7 +869,7 @@ test "test_batch_write_function" {
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 
     // Commit the batch to make changes visible
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify entry is now visible in database
     const value1 = try db.get(column_namespace[0], "default_key1");
@@ -889,7 +889,7 @@ test "test_batch_write_function" {
     }
 
     // Commit the delete operation
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify entry is now deleted from database
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
@@ -1135,7 +1135,7 @@ test "batch write and commit" {
     defer test_state.deinit();
 
     // Test batch write and commit
-    var batch = db.initWriteBatch();
+    var batch = try db.initWriteBatch();
     defer batch.deinit();
 
     // Verify block doesn't exist before batch commit
@@ -1151,7 +1151,7 @@ test "batch write and commit" {
     batch.putState(database.DbStatesNamespace, test_state_root, test_state);
 
     // Commit the batch
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify block was saved and can be loaded
     const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
@@ -1203,12 +1203,12 @@ test "loadLatestFinalizedState" {
 
     // Metadata present but slot index missing -> error
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 7;
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var out_state: types.BeamState = undefined;
         try std.testing.expectError(error.FinalizedSlotNotFoundInIndex, db.loadLatestFinalizedState(&out_state));
@@ -1216,14 +1216,14 @@ test "loadLatestFinalizedState" {
 
     // Slot index present but state missing -> error
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 9;
         const block_root = test_helpers.createDummyRoot(0xAA);
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
         batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var out_state: types.BeamState = undefined;
         try std.testing.expectError(error.FinalizedStateNotFoundInDatabase, db.loadLatestFinalizedState(&out_state));
@@ -1231,7 +1231,7 @@ test "loadLatestFinalizedState" {
 
     // Happy path: metadata + slot index + state all present
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 11;
@@ -1243,7 +1243,7 @@ test "loadLatestFinalizedState" {
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
         batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
         batch.putState(database.DbStatesNamespace, block_root, expected_state);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var loaded_state: types.BeamState = undefined;
         try db.loadLatestFinalizedState(&loaded_state);
