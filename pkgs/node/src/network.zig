@@ -155,7 +155,12 @@ pub const Network = struct {
         self.allocator.destroy(self.connected_peers);
     }
 
-    pub fn publish(self: *Self, data: *const networks.GossipMessage) !void {
+    /// Publish a gossip message via the configured backend. Returns `true`
+    /// when the message was successfully accepted by the backend, `false`
+    /// when the backend dropped it (e.g. rust-libp2p command channel full,
+    /// see issue #808). Callers should treat `false` as "this message did not
+    /// leave the host" and surface it accordingly.
+    pub fn publish(self: *Self, data: *const networks.GossipMessage) !bool {
         return self.backend.gossip.publish(data);
     }
 
