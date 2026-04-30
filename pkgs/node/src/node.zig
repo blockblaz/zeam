@@ -1057,8 +1057,12 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        var guard = self.acquireMutex("onReqRespResponse");
-        defer guard.unlock();
+        // Lock-free entry (issue #786 iter 3): RPC response handling
+        // dispatches to chain.onBlock for block chunks, which now uses
+        // BorrowedState + putState internally. Network maps it touches
+        // (pending_rpc_requests, pending_block_roots, fetched_blocks)
+        // are guarded by their own per-resource locks. No outer mutex
+        // needed.
         try self.handleReqRespResponse(event);
     }
 

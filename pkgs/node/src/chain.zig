@@ -705,14 +705,14 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        try self.states.put(block_root, post_state);
+        try self.putState(block_root, post_state);
         post_state_opt = null;
 
         var forkchoice_added = false;
         errdefer if (!forkchoice_added) {
-            if (self.states.fetchRemove(block_root)) |entry| {
-                entry.value.deinit();
-                self.allocator.destroy(entry.value);
+            if (self.fetchRemoveState(block_root)) |state_ptr| {
+                state_ptr.deinit();
+                self.allocator.destroy(state_ptr);
             }
         };
 
@@ -1265,7 +1265,7 @@ pub const BeamChain = struct {
 
             break :fcprocessing freshFcBlock;
         };
-        try self.states.put(fcBlock.blockRoot, post_state);
+        try self.putState(fcBlock.blockRoot, post_state);
 
         const processing_time = onblock_timer.observe();
 
