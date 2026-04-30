@@ -578,12 +578,10 @@ pub const BeamNode = struct {
         defer if (missing_roots.len > 0) self.allocator.free(missing_roots);
 
         if (missing_roots.len > 0) {
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn(
-                    "failed to fetch {d} missing block root(s) from gossip: {any}",
-                    .{ missing_roots.len, err },
-                );
-            };
+            // Issue #786 req. 8: enqueue on net-fetch worker so the
+            // gossip thread doesn't block on libp2p send for missing
+            // attestation heads.
+            self.dispatchFetchBlockByRoots(missing_roots, 0);
         }
 
         // Flush any parent roots accumulated during block/descendant processing.
@@ -716,10 +714,9 @@ pub const BeamNode = struct {
                 // Recursively check for this block's descendants
                 self.processCachedDescendants(descendant_root);
 
-                // Fetch any missing attestation head blocks
-                self.fetchBlockByRoots(missing_roots, 0) catch |fetch_err| {
-                    self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, fetch_err });
-                };
+                // Fetch any missing attestation head blocks (issue #786
+                // req. 8 — fire-and-forget on net-fetch worker).
+                self.dispatchFetchBlockByRoots(missing_roots, 0);
             }
         }
     }
@@ -987,10 +984,8 @@ pub const BeamNode = struct {
             // Block was successfully added, try to process any cached descendants
             self.processCachedDescendants(block_root);
 
-            // Fetch any missing attestation head blocks
-            self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-                self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
-            };
+            // Fetch any missing attestation head blocks (issue #786 req. 8).
+            self.dispatchFetchBlockByRoots(missing_roots, 0);
         } else |err| {
             self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
@@ -1048,13 +1043,8 @@ pub const BeamNode = struct {
                                             &status_resp.head_root,
                                         });
                                         const roots = [_]types.Root{status_resp.head_root};
-                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync by fetching head block from peer {s}{f}: {any}", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                        };
+                                        // Issue #786 req. 8.
+                                        self.dispatchFetchBlockByRoots(&roots, 0);
                                     }
                                 },
                                 .fc_initing => {
@@ -1074,13 +1064,8 @@ pub const BeamNode = struct {
                                             &status_resp.head_root,
                                         });
                                         const roots = [_]types.Root{status_resp.head_root};
-                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                        };
+                                        // Issue #786 req. 8.
+                                        self.dispatchFetchBlockByRoots(&roots, 0);
                                     }
                                 },
                                 .synced, .no_peers => {},
@@ -1232,9 +1217,9 @@ pub const BeamNode = struct {
 
         self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
 
-        self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
-            self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
-        };
+        // Issue #786 req. 8: enqueue on net-fetch worker so the producer
+        // (gossip / RPC thread) returns immediately.
+        self.dispatchFetchBlockByRoots(roots.items, max_depth);
     }
 
     fn fetchBlockByRoots(
@@ -1617,9 +1602,8 @@ pub const BeamNode = struct {
         });
         defer self.allocator.free(missing_roots);
 
-        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
-            self.logger.warn("failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
-        };
+        // Issue #786 req. 8: enqueue on net-fetch worker.
+        self.dispatchFetchBlockByRoots(missing_roots, 0);
 
         // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
