@@ -5,7 +5,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# only one can run at a time in PRs
+# Only one can run at a time in PRs
 concurrency:
   # If PR, cancel prev commits. head_ref = source branch name on pull_request, null if push
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -32,6 +32,7 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Fetch Zig dependencies
@@ -62,7 +63,8 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: lint
+        workspaces: "rust -> target"
 
     - name: Check Rust formatting
       run: |
@@ -75,7 +77,75 @@ jobs:
     - name: Lint
       run: zig fmt --check .
 
+  deps:
+    name: deps
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Zig
+      uses: mlugg/setup-zig@v2.0.5
+      with:
+        version: 0.15.2
+
+    - name: Set up Rust/Cargo
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+
+    - name: Cache Zig packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/zig
+        key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
+        restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
+          ${{ runner.os }}-zig-
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "rust -> target"
+        shared-key: ci
+
+    - name: Fetch Zig dependencies
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build --fetch; then
+            echo "Successfully fetched dependencies on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All fetch attempts failed"
+        exit 1
+
+    - name: Build Rust FFI libraries
+      run: cargo +nightly -C rust -Z unstable-options build --release -p libp2p-glue -p hashsig-glue -p multisig-glue
+
+    - name: Build all (warms Zig cache including RocksDB)
+      run: |
+        max_attempts=3
+        for attempt in $(seq 1 $max_attempts); do
+          if zig build all; then
+            echo "Successfully built on attempt $attempt"
+            exit 0
+          fi
+          echo "Attempt $attempt/$max_attempts failed, retrying in 5 seconds..."
+          sleep 5
+        done
+        echo "All build attempts failed"
+        exit 1
+
   build:
+    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -108,13 +178,14 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: ci
 
     - name: Fetch Zig dependencies
       run: |
@@ -180,13 +251,14 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-all-provers-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: ci-all-provers
 
     - name: Fetch Zig dependencies
       run: |
@@ -228,6 +300,7 @@ jobs:
 
   test:
     name: test
+    needs: deps
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -260,13 +333,14 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: ci
 
     - name: Fetch Zig dependencies
       run: |
@@ -310,13 +384,22 @@ jobs:
         echo "All sim test attempts failed"
         exit 1
 
+    - name: Cache LeanSpec fixtures
+      id: cache-leanspec
+      uses: actions/cache@v4
+      with:
+        path: leanSpec/fixtures
+        key: ${{ runner.os }}-leanspec-${{ hashFiles('leanSpec/**') }}
+
     - name: Install uv
+      if: steps.cache-leanspec.outputs.cache-hit != 'true'
       shell: bash
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
     - name: Generate LeanSpec fixtures
+      if: steps.cache-leanspec.outputs.cache-hit != 'true'
       working-directory: leanSpec
       run: uv run fill --clean --fork=devnet -n auto
     
@@ -360,13 +443,14 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: ci
 
     - name: Fetch Zig dependencies
       run: |
@@ -432,13 +516,14 @@ jobs:
         path: ~/.cache/zig
         key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon', 'build.zig') }}
         restore-keys: |
+          ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}-
           ${{ runner.os }}-zig-
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "rust -> target"
-        key: ${{ runner.os }}-cargo-docker-${{ hashFiles('**/Cargo.lock') }}
+        shared-key: ci
 
     - name: Fetch Zig dependencies
       run: |
