@@ -22,6 +22,7 @@ pub const clockFactory = @import("./clock.zig");
 pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 pub const followupWorkerFactory = @import("./followup_worker.zig");
+pub const netFetchWorkerFactory = @import("./net_fetch_worker.zig");
 const constants = @import("./constants.zig");
 const forkchoice = @import("./forkchoice.zig");
 
@@ -83,6 +84,12 @@ pub const BeamNode = struct {
     /// state-only and the publishing/eventing is owned by the original
     /// gossip-importer.
     followup_worker: followupWorkerFactory.FollowupWorker,
+    /// Worker thread + queue for parallel network fetching of missed roots
+    /// (issue #786 req. 8). Scaffold today: spawned but only one call
+    /// site (sweepTimedOutRequests retry) migrated. The remaining
+    /// `fetchBlockByRoots` sites in BeamNode are migrated incrementally
+    /// in follow-up iterations as the surrounding paths settle.
+    net_fetch_worker: netFetchWorkerFactory.NetFetchWorker,
 
     const Self = @This();
 
@@ -146,6 +153,10 @@ pub const BeamNode = struct {
                 allocator,
                 opts.logger_config.logger(.chain),
             ),
+            .net_fetch_worker = netFetchWorkerFactory.NetFetchWorker.init(
+                allocator,
+                opts.logger_config.logger(.network),
+            ),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -154,6 +165,11 @@ pub const BeamNode = struct {
         // worker thread and invokes `chain.onBlockFollowup` (which takes the
         // chain-level events_lock + finalization_lock as needed).
         try self.followup_worker.start(self, runFollowupDispatch);
+
+        // Spawn the network-fetch worker. The dispatch callback runs on the
+        // worker thread and invokes `fetchBlockByRoots` so the producer
+        // thread is freed for the next gossip / RPC event immediately.
+        try self.net_fetch_worker.start(self, runNetFetchDispatch);
 
         // Wire chain → followup-worker so gossip-path follow-ups run
         // off-thread (issue #786 req. 6). Backfill paths are unchanged —
@@ -170,6 +186,16 @@ pub const BeamNode = struct {
         const self: *Self = @ptrCast(@alignCast(ctx));
         const block_ptr: ?*const types.SignedBlock = job.signed_block;
         self.chain.onBlockFollowup(job.prune_forkchoice, block_ptr);
+    }
+
+    /// Worker-thread entry point for the network-fetch worker. Runs on the
+    /// dedicated net-fetch thread; calls into the existing
+    /// `fetchBlockByRoots` which talks to the libp2p bridge.
+    fn runNetFetchDispatch(ctx: *anyopaque, roots: []const types.Root, depth: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.fetchBlockByRoots(roots, depth) catch |err| {
+            self.logger.warn("net_fetch_worker: fetchBlockByRoots failed: {any}", .{err});
+        };
     }
 
     /// Adapter to bridge `chain.OnBlockFollowupDispatchFn` into the
@@ -193,8 +219,12 @@ pub const BeamNode = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Stop the follow-up worker first so any in-flight job finishes
-        // BEFORE we tear down chain / network state it references.
+        // Stop both worker threads first so any in-flight job finishes
+        // BEFORE we tear down chain / network state they reference.
+        // Order: net-fetch first (its dispatch may enqueue followup
+        // jobs?), then followup. Conservatively join in reverse spawn
+        // order in case of future cross-worker dependencies.
+        self.net_fetch_worker.deinit();
         self.followup_worker.deinit();
         self.batch_pending_parent_roots.deinit();
         self.network.deinit();
@@ -296,6 +326,13 @@ pub const BeamNode = struct {
                 return;
             };
         }
+        // TODO (issue #786 req. 5 follow-up): also pre-compute
+        // hashTreeRoot(AttestationData) for `.attestation` and `.aggregation`
+        // arms here, then thread the digest into chain.onGossip → verify
+        // paths so verifySingleAttestation / verifyAggregatedAttestation
+        // skip the re-hash. Requires plumbing through state-transition's
+        // verifySingleAttestation signature; out of scope for this
+        // iteration.
 
         var guard = self.acquireMutex("onGossip");
         defer guard.unlock();
