@@ -198,6 +198,24 @@ pub const BeamNode = struct {
         };
     }
 
+    /// Producer-side helper: dupe the roots slice and enqueue onto the
+    /// network-fetch worker. Fire-and-forget — errors are logged on the
+    /// producer thread (allocation failures only) and on the worker
+    /// thread (network failures). Replaces the synchronous
+    /// `fetchBlockByRoots` call at producer sites that don't read the
+    /// result (issue #786 req. 8).
+    fn dispatchFetchBlockByRoots(self: *Self, roots: []const types.Root, depth: u32) void {
+        if (roots.len == 0) return;
+        const owned = self.allocator.dupe(types.Root, roots) catch |err| {
+            self.logger.warn("dispatchFetchBlockByRoots: dupe failed for {d} roots: {any}", .{ roots.len, err });
+            return;
+        };
+        self.net_fetch_worker.enqueue(owned, depth) catch |err| {
+            self.allocator.free(owned);
+            self.logger.warn("dispatchFetchBlockByRoots: enqueue failed: {any}", .{err});
+        };
+    }
+
     /// Adapter to bridge `chain.OnBlockFollowupDispatchFn` into the
     /// `FollowupWorker` queue. Runs on whichever thread chain.onGossip /
     /// chain.processPendingBlocks runs on (libp2p worker / libxev) — pushes
@@ -1399,12 +1417,9 @@ pub const BeamNode = struct {
                 const pending_missing_roots = self.chain.processPendingBlocks();
                 defer self.allocator.free(pending_missing_roots);
                 if (pending_missing_roots.len > 0) {
-                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                        self.logger.warn(
-                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                            .{ pending_missing_roots.len, err },
-                        );
-                    };
+                    // Issue #786 req. 8: enqueue on the net-fetch worker so
+                    // the libxev tick thread doesn't block on libp2p send.
+                    self.dispatchFetchBlockByRoots(pending_missing_roots, 0);
                 }
 
                 // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
@@ -1533,12 +1548,12 @@ pub const BeamNode = struct {
                     // Finalize clears pending state + frees memory
                     self.network.finalizePendingRequest(request_id);
 
-                    // Retry each root — fetchBlockByRoots picks a new random peer
+                    // Retry each root — fetchBlockByRoots picks a new random peer.
+                    // Issue #786 req. 8: dispatch on the net-fetch worker so
+                    // sweepTimedOutRequests returns quickly.
                     for (roots_to_retry.items) |item| {
                         const roots = [_]types.Root{item.root};
-                        self.fetchBlockByRoots(&roots, item.depth) catch |err| {
-                            self.logger.warn("failed to retry block fetch after timeout: {any}", .{err});
-                        };
+                        self.dispatchFetchBlockByRoots(&roots, item.depth);
                     }
                 },
                 .status => |status_ctx| {
