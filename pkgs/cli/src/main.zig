@@ -74,6 +74,7 @@ pub const NodeCommand = struct {
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
+    @"db-backend": database.Backend = .rocksdb,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -96,6 +97,7 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Seed the node's aggregator role on startup. The role can be toggled at runtime via POST /lean/v0/admin/aggregator.",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
+        .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .help = "Show help information for the node command",
     };
 };
@@ -107,14 +109,16 @@ const BeamCmd = struct {
     @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
     @"is-aggregator": bool = true,
+    @"db-backend": database.Backend = .rocksdb,
 
     pub fn format(self: BeamCmd, writer: anytype) !void {
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={} }}", .{
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={}, db-backend={s} }}", .{
             self.mockNetwork,
             self.@"api-port",
             self.@"metrics-port",
             self.data_dir,
             self.@"is-aggregator",
+            @tagName(self.@"db-backend"),
         });
     }
 };
@@ -621,11 +625,12 @@ fn mainInner() !void {
             const data_dir_3 = try std.fmt.allocPrint(allocator, "{s}/node3", .{beamcmd.data_dir});
             defer allocator.free(data_dir_3);
 
-            var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), data_dir_1);
+            const db_backend = beamcmd.@"db-backend";
+            var db_1 = try database.Db.openBackend(allocator, logger1_config.logger(.database), data_dir_1, db_backend);
             defer db_1.deinit();
-            var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
+            var db_2 = try database.Db.openBackend(allocator, logger2_config.logger(.database), data_dir_2, db_backend);
             defer db_2.deinit();
-            var db_3 = try database.Db.open(allocator, logger3_config.logger(.database), data_dir_3);
+            var db_3 = try database.Db.openBackend(allocator, logger3_config.logger(.database), data_dir_3, db_backend);
             defer db_3.deinit();
 
             // Use the same shared registry for all beam nodes
@@ -807,6 +812,7 @@ fn mainInner() !void {
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
+                .db_backend = leancmd.@"db-backend",
             };
 
             defer start_options.deinit(allocator);
