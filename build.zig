@@ -122,6 +122,12 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("bindings");
 
+    // add lmdb (external dep: github.com/blockblaz/lmdb-zig)
+    const lmdb = b.dependency("lmdb", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lmdb");
+
     // add snappyz
     const snappyz = b.dependency("zig_snappy", .{
         .target = target,
@@ -291,6 +297,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/database/src/lib.zig"),
     });
     zeam_database.addImport("rocksdb", rocksdb);
+    zeam_database.addImport("lmdb", lmdb);
     zeam_database.addImport("ssz", ssz);
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
@@ -565,6 +572,13 @@ pub fn build(b: *Builder) !void {
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
+
+    const lmdb_tests = b.addTest(.{
+        .root_module = lmdb,
+    });
+    const run_lmdb_tests = b.addRunArtifact(lmdb_tests);
+    setTestRunLabelFromCompile(b, run_lmdb_tests, lmdb_tests);
+    test_step.dependOn(&run_lmdb_tests.step);
 
     const api_tests = b.addTest(.{
         .root_module = zeam_api,
