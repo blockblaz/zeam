@@ -2093,7 +2093,7 @@ mod tests {
     fn test_swarm_command_drop_counter_increments_on_uninitialized() {
         // Issue #808: every dropped swarm command must bump the per-reason
         // counter exposed via `get_swarm_command_dropped_total` so the Zig
-        // metrics layer can publish it as `lean_libp2p_swarm_command_dropped_total`.
+        // metrics layer can publish it as `zeam_libp2p_swarm_command_dropped_total`.
         // Tests run in-process so the counter is shared; assert *delta*, not absolute.
         let before = get_swarm_command_dropped_total(SwarmCommandDropReason::Uninitialized as u32);
 

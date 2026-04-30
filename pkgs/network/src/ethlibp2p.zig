@@ -1004,7 +1004,7 @@ pub const SwarmCommandDropReason = enum(u32) {
 /// Returns the cumulative count of swarm commands dropped before reaching the
 /// Rust event loop, for the given reason tag. Counts are global across all
 /// networks; the metrics layer scrapes once per Prometheus hit and turns the
-/// monotonic count into a labeled `lean_libp2p_swarm_command_dropped_total`
+/// monotonic count into a labeled `zeam_libp2p_swarm_command_dropped_total`
 /// counter via deltas (see `pkgs/metrics`).
 pub extern fn get_swarm_command_dropped_total(reason_tag: u32) callconv(.c) u64;
 
@@ -1020,7 +1020,7 @@ fn refreshSwarmCommandDropMetric() void {
         const last = swarm_command_drop_last_seen[idx];
         if (current > last) {
             const delta = current - last;
-            zeam_metrics.metrics.lean_libp2p_swarm_command_dropped_total.incrBy(
+            zeam_metrics.metrics.zeam_libp2p_swarm_command_dropped_total.incrBy(
                 .{ .reason = @tagName(reason) },
                 delta,
             ) catch {};
@@ -1093,7 +1093,7 @@ pub const EthLibp2p = struct {
 
         // Issue #808: hand the metrics layer a callback so every Prometheus
         // scrape pulls the latest cumulative drop counts from the Rust side
-        // and turns them into deltas on `lean_libp2p_swarm_command_dropped_total`.
+        // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
         zeam_metrics.registerScrapeRefresher(refreshSwarmCommandDropMetric);
