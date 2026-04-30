@@ -234,13 +234,24 @@ enum SwarmCommand {
 /// use `try_send` and drop the message with an error log when the channel is
 /// full rather than blocking the calling thread or growing memory without
 /// bound. Sized for short, bursty traffic; tune with care.
-const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 1024;
+///
+/// devnet-4 (issue #808) showed the previous 1024-slot bound saturating under
+/// steady-state validator load: ~5 commands/min/node were silently dropped,
+/// causing fork-choice divergence because outbound attestations and req-resp
+/// parent fetches never made it onto the wire. 8192 gives ~8x headroom for the
+/// same workload while still bounding memory.
+const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 
 /// Maximum number of queued swarm commands the event loop drains in a single
 /// iteration before yielding back to the rest of the `tokio::select!` arms
 /// (notably swarm event polling). Keeps a command flood from starving gossip
 /// ingestion / reqresp completion under load.
-const MAX_SWARM_COMMANDS_PER_TICK: usize = 32;
+///
+/// Bumped from 32 to 256 alongside the channel capacity above so we actually
+/// drain the new headroom: 32/tick was the symmetric bottleneck paired with
+/// the 1024-slot channel. Still small enough that one busy network can't
+/// monopolize the executor.
+const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
@@ -510,6 +521,12 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
 ///
 /// The caller must ensure that `message_str` points to valid memory of `message_len` bytes.
 /// The caller must ensure that `topic` points to valid null-terminated C string.
+///
+/// Returns `true` if the publish command was successfully enqueued onto the
+/// per-network swarm command channel, `false` if the publish was dropped
+/// (network not initialized, channel full / closed, or null topic). Callers
+/// should treat `false` as "this gossip message did not leave the host" and
+/// surface it accordingly (metric, log, retry on next slot, etc.).
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn publish_msg_to_rust_bridge(
@@ -517,7 +534,7 @@ pub unsafe extern "C" fn publish_msg_to_rust_bridge(
     topic: *const c_char,
     message_str: *const u8,
     message_len: usize,
-) {
+) -> bool {
     let message_slice = std::slice::from_raw_parts(message_str, message_len);
     logger::rustLogger.debug(
         network_id,
@@ -534,7 +551,7 @@ pub unsafe extern "C" fn publish_msg_to_rust_bridge(
             network_id,
             "null pointer passed for `topic` in publish_msg_to_rust_bridge",
         );
-        return;
+        return false;
     }
 
     let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
@@ -545,7 +562,7 @@ pub unsafe extern "C" fn publish_msg_to_rust_bridge(
             topic,
             data: message_data,
         },
-    );
+    )
 }
 
 /// # Safety
@@ -1975,6 +1992,52 @@ mod tests {
         assert_eq!(
             before, after,
             "REQUEST_ID_COUNTER must not advance when send_rpc_request fails"
+        );
+    }
+
+    #[test]
+    fn test_publish_msg_to_rust_bridge_returns_false_when_uninitialized() {
+        // Regression test for issue #808: publish_msg_to_rust_bridge must
+        // return false when the per-network swarm command channel does not
+        // exist (i.e. the network was never started or has been torn down),
+        // so the Zig-side caller can stop logging "published" for messages
+        // that never actually reached the wire.
+        let network_id = 101; // unused network slot
+        let topic = std::ffi::CString::new("test/topic").unwrap();
+        let payload = b"hello";
+
+        let ok = unsafe {
+            publish_msg_to_rust_bridge(
+                network_id,
+                topic.as_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+            )
+        };
+        assert!(
+            !ok,
+            "publish_msg_to_rust_bridge must return false when the network is not initialized"
+        );
+    }
+
+    #[test]
+    fn test_publish_msg_to_rust_bridge_returns_false_on_null_topic() {
+        // Defensive check: the FFI guard against a null topic pointer must
+        // also surface as `false` so the Zig caller treats it as a dropped
+        // publish (issue #808).
+        let network_id = 102;
+        let payload = b"hello";
+        let ok = unsafe {
+            publish_msg_to_rust_bridge(
+                network_id,
+                std::ptr::null(),
+                payload.as_ptr(),
+                payload.len(),
+            )
+        };
+        assert!(
+            !ok,
+            "publish_msg_to_rust_bridge must return false when topic pointer is null"
         );
     }
 }

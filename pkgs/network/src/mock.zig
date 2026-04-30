@@ -608,7 +608,7 @@ pub const Mock = struct {
         self.finalizeServerStream(ctx);
     }
 
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
         // Try to find a valid peer_id from connected peers, otherwise use a default
@@ -622,7 +622,10 @@ pub const Mock = struct {
             // Fallback to default if no peers found
             break :blk "mock_publisher";
         };
-        return self.gossipHandler.onGossip(data, sender_peer_id, true);
+        try self.gossipHandler.onGossip(data, sender_peer_id, true);
+        // Mock backend has no command channel, so the publish always reaches
+        // the local gossip handler synchronously.
+        return true;
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -819,7 +822,8 @@ test "Mock messaging across two subscribers" {
     } };
 
     // Publish the message using the network interface - both subscribers should receive it
-    try network.gossip.publish(block_message);
+    const published = try network.gossip.publish(block_message);
+    try std.testing.expect(published);
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);

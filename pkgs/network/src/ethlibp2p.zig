@@ -960,12 +960,17 @@ pub extern fn wait_for_network_ready(
 /// bridge thread is guaranteed to unwind soon and can be `join`ed. Safe to call
 /// on a network that was never started or is already stopped (no-op).
 pub extern fn stop_network(network_id: u32) callconv(.c) void;
+/// Returns `true` when the publish was successfully enqueued onto the Rust-side
+/// swarm command channel, `false` when the command was dropped (network not
+/// initialized, channel full / closed, or null topic). See issue #808 — under
+/// load the bounded command channel can drop our own attestations and the
+/// caller needs to know rather than logging "published" unconditionally.
 pub extern fn publish_msg_to_rust_bridge(
     networkId: u32,
     topic_str: [*:0]const u8,
     message_ptr: [*]const u8,
     message_len: usize,
-) callconv(.c) void;
+) callconv(.c) bool;
 pub extern fn send_rpc_request(
     networkId: u32,
     peer_id: [*:0]const u8,
@@ -1177,7 +1182,7 @@ pub const EthLibp2p = struct {
         self.logger.info("network-{d}:: Network initialization complete, ready to send/receive messages", .{self.params.networkId});
     }
 
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // publish
         var topic = try data.getLeanNetworkTopic(self.allocator, self.params.fork_digest);
@@ -1192,7 +1197,7 @@ pub const EthLibp2p = struct {
         const compressed_message = try snappyz.encode(self.allocator, message);
         defer self.allocator.free(compressed_message);
         self.logger.debug("network-{d}:: publishing to rust bridge data={f} size={d}", .{ self.params.networkId, data.*, compressed_message.len });
-        publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
+        return publish_msg_to_rust_bridge(self.params.networkId, topic_str.ptr, compressed_message.ptr, compressed_message.len);
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
