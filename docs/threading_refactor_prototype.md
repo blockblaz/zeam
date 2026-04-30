@@ -13,7 +13,10 @@ Local working branch: `refactor/per-resource-locks-prototype`. Implements the 8-
 | `f52071e` | iter 6 scaffold: `NetFetchWorker` module + `BeamNode` wiring |
 | `c7c1da0` | iter 3 rest: wire pending_blocks_lock + pubkey_cache_lock + root_to_slot_lock + events_lock; drop finalization_lock from onGossip + onInterval |
 | `bb21e78` | iter 6: migrate sweepTimedOutRequests + onInterval pending-replay fetches to NetFetchWorker via `dispatchFetchBlockByRoots` |
-| (this) | iter 5: hash-root cache for attestation + aggregation gossip envelopes — pre-compute in BeamNode.onGossip, thread through chain.onGossip → verify path |
+| `8185057` | iter 5: hash-root cache for attestation + aggregation gossip envelopes — pre-compute in BeamNode.onGossip, thread through chain.onGossip → verify path |
+| `778a33c` | iter 8 finish: migrate remaining 7 fetchBlockByRoots sites to dispatchFetchBlockByRoots |
+| `a206d22` | cleanup: drop finalization_lock + acquireMutex wrapper (now dead) |
+| `ad36da0` | tests: lock-invariant unit tests for FollowupWorker, NetFetchWorker, BorrowedState + putState/fetchRemoveState/statesCount |
 
 ## Status of the 8 requirements
 
@@ -58,7 +61,7 @@ Sibling locks at tier 5 (a/b/c) MUST NOT be held simultaneously. Verified by ins
 ## What remains (not blocking; tracked here for future iterations)
 
 1. **Migrate remaining `fetchBlockByRoots` call sites** to `dispatchFetchBlockByRoots`. Currently 8 sites are synchronous — most sit on the libp2p worker thread which already runs alongside libxev, so the win is incremental. Audit each producer's expected ordering vs. `batch_pending_parent_roots` flushing before flipping.
-2. **Lock-invariant unit tests** for `BorrowedState`, `putState`/`fetchRemoveState`, `FollowupWorker`, `NetFetchWorker`. Standalone tests, not chain-integration.
+2. ~~**Lock-invariant unit tests** for `BorrowedState`, `putState`/`fetchRemoveState`, `FollowupWorker`, `NetFetchWorker`. Standalone tests, not chain-integration.~~ **done** in `ad36da0` — worker tests use a sentinel dispatch ctx and exercise enqueue/dispatch/shutdown paths; chain accessor tests reuse the mock-chain harness.
 3. **Refcounted `*BeamState`** if a future workload needs reader-outlives-prune semantics (slice c). Slice (a) avoids it via the borrow-or-clone contract on `BorrowedState`.
 4. **Drop the `finalization_lock` field entirely** once a migration window has closed and operators no longer depend on the legacy `zeam_node_mutex_*` histogram series. Today the field is acquired only by the `acquireMutex` wrapper; the wrapper itself is dead code on the consensus path but kept alive for metric compatibility.
 5. **Stress test plan**: single-node ingestion stress + 10-node devnet under jitter + reorg/finalization stress. Devnet smoke (current `simtest`) passes but doesn't catch UAFs / data races under sustained load.
