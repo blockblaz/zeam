@@ -429,8 +429,14 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run();
+        // Order matters: BeamNode.run() registers gossip handlers (and thereby
+        // declares which subnets we want to be on). EthLibp2p.run() reads that
+        // set to decide which gossipsub topics to subscribe to. Reversing the
+        // order would either subscribe to an empty topic set or — historically
+        // — fall back to subscribing to *all* subnets, defeating the bandwidth
+        // savings of attestation subnets.
         try self.beam_node.run();
+        try self.network.run();
 
         const ascii_art =
             \\  ███████████████████████████████████████████████████████

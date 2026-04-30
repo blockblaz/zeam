@@ -717,12 +717,16 @@ fn mainInner() !void {
                     std.debug.print("=== Finalization reached slot {d} on reference node — starting node 3 ===\n", .{finalized_slot});
                     std.debug.print("=== Node 3 will sync from genesis using parent block syncing ===\n\n", .{});
 
-                    // Start network FIRST so node3 joins fresh without pre-cached gossip blocks
+                    // Start BeamNode first so it registers selective gossip
+                    // topic handlers; EthLibp2p.run() then derives the
+                    // gossipsub subscribe set from those handlers (instead of
+                    // joining every attestation subnet). See
+                    // pkgs/network/src/ethlibp2p.zig run() for the rationale.
+                    try self.beam_node.run();
+
                     if (self.network) |net| {
                         try net.run();
                     }
-
-                    try self.beam_node.run();
                     self.started = true;
 
                     std.debug.print("=== NODE 3 STARTED - will now sync via STATUS and parent block requests ===\n\n", .{});
