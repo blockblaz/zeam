@@ -2255,6 +2255,113 @@ test "process and add mock blocks into a node's chain" {
     }
 }
 
+test "BorrowedState + putState/fetchRemoveState/statesCount accessors (issue #786 req. 1)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 42,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    const anchor_root = mock_chain.blockRoots[0];
+
+    // (1) borrowState on anchor returns a valid borrow; deinit releases the lock.
+    {
+        var borrow = beam_chain.borrowState(anchor_root) orelse return error.AnchorBorrowMissing;
+        try std.testing.expectEqual(beam_state.slot, borrow.state.slot);
+        borrow.deinit();
+        try std.testing.expectEqual(true, borrow.released);
+    }
+
+    // (2) borrowState on an absent root returns null and releases the lock.
+    {
+        const missing_root = std.mem.zeroes(types.Root);
+        try std.testing.expectEqual(@as(?BeamChain.BorrowedState, null), beam_chain.borrowState(missing_root));
+    }
+
+    // (3) cloneAndRelease materialises an independent owned copy and drops the
+    //     borrow without requiring a follow-up deinit.
+    {
+        var borrow = beam_chain.borrowState(anchor_root) orelse return error.AnchorBorrowMissing;
+        const owned = try borrow.cloneAndRelease(allocator);
+        try std.testing.expectEqual(beam_state.slot, owned.slot);
+        try std.testing.expectEqual(true, borrow.released);
+        // arena owns the owned copy's backing allocations
+    }
+
+    // (4) putState round-trip via borrowState. Synthesise a non-anchor root and
+    //     a freshly-cloned state, hand it to the chain, recover it, then
+    //     fetchRemove + free.
+    var fake_root = std.mem.zeroes(types.Root);
+    fake_root[0] = 0xab;
+
+    const before_count = beam_chain.statesCount();
+
+    const synthetic = try allocator.create(types.BeamState);
+    try types.sszClone(allocator, types.BeamState, beam_state, synthetic);
+    try beam_chain.putState(fake_root, synthetic);
+
+    try std.testing.expectEqual(before_count + 1, beam_chain.statesCount());
+
+    {
+        var borrow = beam_chain.borrowState(fake_root) orelse return error.SyntheticBorrowMissing;
+        try std.testing.expectEqual(synthetic, @as(*const types.BeamState, borrow.state));
+        borrow.deinit();
+    }
+
+    // (5) fetchRemoveState returns the same pointer and removes it from the map.
+    const removed = beam_chain.fetchRemoveState(fake_root) orelse return error.FetchRemoveMissing;
+    try std.testing.expectEqual(synthetic, removed);
+    try std.testing.expectEqual(before_count, beam_chain.statesCount());
+    try std.testing.expectEqual(@as(?BeamChain.BorrowedState, null), beam_chain.borrowState(fake_root));
+
+    // Synthetic state's interior allocations are arena-owned; nothing to free
+    // by hand. The anchor in the chain map will be cleaned up by `beam_chain.deinit`.
+
+    // (6) fetchRemoveState on absent root returns null.
+    try std.testing.expectEqual(@as(?*types.BeamState, null), beam_chain.fetchRemoveState(fake_root));
+}
+
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "printSlot output demonstration" {

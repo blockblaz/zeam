@@ -138,3 +138,79 @@ pub const FollowupWorker = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests (issue #786 follow-up: lock-invariant unit tests).
+//
+// These exercise the queue + worker lifecycle in isolation. They use
+// `signed_block = null` so the SignedBlock free path is not exercised here;
+// the worker's free-on-shutdown branch is covered with a sentinel ctx that
+// only counts dispatches.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const TestCtx = struct {
+    dispatched: std.atomic.Value(u64) = .init(0),
+    last_prune: std.atomic.Value(bool) = .init(false),
+
+    fn dispatch(ctx_opaque: *anyopaque, job: FollowupJob) void {
+        const self: *TestCtx = @ptrCast(@alignCast(ctx_opaque));
+        _ = self.dispatched.fetchAdd(1, .seq_cst);
+        self.last_prune.store(job.prune_forkchoice, .seq_cst);
+    }
+};
+
+fn testLogger() zeam_utils.ModuleLogger {
+    const Holder = struct {
+        var cfg = zeam_utils.getTestLoggerConfig();
+    };
+    return Holder.cfg.logger(.node);
+}
+
+test "FollowupWorker dispatches enqueued jobs in order" {
+    var worker = FollowupWorker.init(testing.allocator, testLogger());
+    defer worker.deinit();
+
+    var ctx = TestCtx{};
+    try worker.start(&ctx, TestCtx.dispatch);
+
+    try worker.enqueue(.{ .prune_forkchoice = false, .signed_block = null });
+    try worker.enqueue(.{ .prune_forkchoice = true, .signed_block = null });
+    try worker.enqueue(.{ .prune_forkchoice = false, .signed_block = null });
+
+    // Spin until the worker has drained all 3 jobs (or timeout).
+    const deadline_ms: u64 = 2000;
+    const step_ms: u64 = 5;
+    var waited: u64 = 0;
+    while (ctx.dispatched.load(.seq_cst) < 3 and waited < deadline_ms) {
+        std.Thread.sleep(step_ms * std.time.ns_per_ms);
+        waited += step_ms;
+    }
+    try testing.expectEqual(@as(u64, 3), ctx.dispatched.load(.seq_cst));
+    // Last enqueue's prune flag is false; FIFO order means last_prune ends up false.
+    try testing.expectEqual(false, ctx.last_prune.load(.seq_cst));
+}
+
+test "FollowupWorker drops jobs after shutdown without leaking" {
+    var worker = FollowupWorker.init(testing.allocator, testLogger());
+    var ctx = TestCtx{};
+    try worker.start(&ctx, TestCtx.dispatch);
+    worker.deinit();
+
+    // Post-shutdown enqueue must be silently dropped (signed_block is null
+    // here so no clone-free path is taken; the branch is still exercised).
+    try worker.enqueue(.{ .prune_forkchoice = false, .signed_block = null });
+    try testing.expectEqual(@as(u64, 0), ctx.dispatched.load(.seq_cst));
+}
+
+test "FollowupWorker deinit drains undispatched jobs (no worker started)" {
+    // No `start` call: worker thread never runs. Inject a job directly so
+    // that deinit exercises the queue-drain branch.
+    var worker = FollowupWorker.init(testing.allocator, testLogger());
+    try worker.queue.append(testing.allocator, .{
+        .prune_forkchoice = true,
+        .signed_block = null,
+    });
+    worker.deinit();
+}
