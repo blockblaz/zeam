@@ -818,11 +818,136 @@ fn extendProofsGreedily(
 ///
 /// Takes ownership of the input lists and returns new compacted lists.
 /// The caller must deinit the returned lists.
+const CompactGroupEntry = struct {
+    att_data: attestation.AttestationData,
+    indices: []const usize,
+};
+
+const CompactGroupResult = struct {
+    attestation: AggregatedAttestation,
+    signature: aggregation.AggregatedSignatureProof,
+};
+
+const CompactGroupSlot = struct {
+    result: ?CompactGroupResult = null,
+    err: ?anyerror = null,
+};
+
+/// Per-entry preparation built serially before any worker thread runs.
+///
+/// Holds the per-child `*const HashSigPublicKey` slices that the multi-proof
+/// aggregate path needs. Building these slices requires `xmss.PublicKey.fromBytes`,
+/// which is a Rust FFI call whose thread-safety we do not control. By
+/// constructing every prep on the main thread we keep `fromBytes` out of the
+/// parallel worker entirely; worker code only invokes the Rust `aggregate`
+/// entry point on already-deserialized handles.
+const CompactGroupPrep = struct {
+    entry: CompactGroupEntry,
+    /// Empty for single-proof groups (no aggregation needed). For multi-proof
+    /// groups, one `[]*const HashSigPublicKey` per child, in `entry.indices`
+    /// order.
+    child_pk_slices: []const []*const xmss.HashSigPublicKey,
+};
+
+/// Single-proof passthrough — clone proof, derive aggregation bits.
+fn compactSingleProof(
+    allocator: Allocator,
+    att_data: attestation.AttestationData,
+    sig: *const aggregation.AggregatedSignatureProof,
+) !CompactGroupResult {
+    var cloned_proof: aggregation.AggregatedSignatureProof = undefined;
+    try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig.*, &cloned_proof);
+    errdefer cloned_proof.deinit();
+
+    var att_bits = try attestation.AggregationBits.init(allocator);
+    errdefer att_bits.deinit();
+    for (0..cloned_proof.participants.len()) |i| {
+        if (cloned_proof.participants.get(i) catch false) {
+            try attestation.aggregationBitsSet(&att_bits, i, true);
+        }
+    }
+
+    return .{
+        .attestation = .{ .aggregation_bits = att_bits, .data = att_data },
+        .signature = cloned_proof,
+    };
+}
+
+/// Multi-proof aggregation using pre-built per-child pubkey slices. Safe to
+/// run from a worker thread: no FFI deserialization, only `aggregate()` which
+/// receives const handles.
+fn compactMultiProofWithPrep(
+    allocator: Allocator,
+    att_data: attestation.AttestationData,
+    indices: []const usize,
+    sig_slice: []const aggregation.AggregatedSignatureProof,
+    child_pk_slices: []const []*const xmss.HashSigPublicKey,
+) !CompactGroupResult {
+    const epoch: u64 = att_data.slot;
+    var message_hash: [32]u8 = undefined;
+    try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
+
+    const children = try allocator.alloc(aggregation.AggregatedSignatureProof, indices.len);
+    defer allocator.free(children);
+    for (indices, 0..) |idx, i| {
+        children[i] = sig_slice[idx];
+    }
+
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    errdefer proof.deinit();
+
+    const empty_pks: []*const xmss.HashSigPublicKey = &.{};
+    const empty_sigs: []*const xmss.HashSigSignature = &.{};
+
+    try aggregation.AggregatedSignatureProof.aggregate(
+        allocator,
+        null, // no raw XMSS participants
+        children,
+        child_pk_slices,
+        empty_pks,
+        empty_sigs,
+        &message_hash,
+        epoch,
+        &proof,
+    );
+
+    var att_bits = try attestation.AggregationBits.init(allocator);
+    errdefer att_bits.deinit();
+    for (0..proof.participants.len()) |i| {
+        if (proof.participants.get(i) catch false) {
+            try attestation.aggregationBitsSet(&att_bits, i, true);
+        }
+    }
+
+    return .{
+        .attestation = .{ .aggregation_bits = att_bits, .data = att_data },
+        .signature = proof,
+    };
+}
+
+fn runCompactGroupPrep(
+    allocator: Allocator,
+    prep: CompactGroupPrep,
+    sig_slice: []const aggregation.AggregatedSignatureProof,
+) !CompactGroupResult {
+    if (prep.entry.indices.len == 1) {
+        return compactSingleProof(allocator, prep.entry.att_data, &sig_slice[prep.entry.indices[0]]);
+    }
+    return compactMultiProofWithPrep(
+        allocator,
+        prep.entry.att_data,
+        prep.entry.indices,
+        sig_slice,
+        prep.child_pk_slices,
+    );
+}
+
 pub fn compactAttestations(
     allocator: Allocator,
     attestations: *AggregatedAttestations,
     signatures: *AttestationSignatures,
     validators: *const Validators,
+    thread_pool: anytype,
 ) !struct { attestations: AggregatedAttestations, signatures: AttestationSignatures } {
     const att_slice = attestations.constSlice();
     const sig_slice = signatures.constSlice();
@@ -875,114 +1000,190 @@ pub fn compactAttestations(
         out_sigs.deinit();
     }
 
-    // Iterate groups — no sorting, consistent with leanSpec which has no deterministic order
-    var group_it = groups.iterator();
-    while (group_it.next()) |group_entry| {
-        const att_data = group_entry.key_ptr.*;
-        const indices = group_entry.value_ptr.items;
+    // Snapshot groups and sort deterministically. `std.AutoHashMap.iterator()`
+    // order is not stable across runs (insertion order is preserved only until
+    // the next rehash), so two validators producing the same attestation set
+    // could otherwise emit byte-different blocks. Sort by AttestationData
+    // (slot, head.root, target.root, source.root) — totally ordered, cheap on
+    // small block counts (≤ MAX_ATTESTATIONS).
+    var group_entries: std.ArrayList(CompactGroupEntry) = .empty;
+    defer group_entries.deinit(allocator);
+    {
+        var group_it = groups.iterator();
+        while (group_it.next()) |group_entry| {
+            try group_entries.append(allocator, .{
+                .att_data = group_entry.key_ptr.*,
+                .indices = group_entry.value_ptr.items,
+            });
+        }
+    }
 
-        if (indices.len == 1) {
-            // Single proof — clone and pass through
-            const idx = indices[0];
-            var cloned_proof: aggregation.AggregatedSignatureProof = undefined;
-            try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig_slice[idx], &cloned_proof);
-            errdefer cloned_proof.deinit();
+    const SortCtx = struct {
+        fn lessThan(_: void, a: CompactGroupEntry, b: CompactGroupEntry) bool {
+            if (a.att_data.slot != b.att_data.slot) return a.att_data.slot < b.att_data.slot;
+            const head_cmp = std.mem.order(u8, &a.att_data.head.root, &b.att_data.head.root);
+            if (head_cmp != .eq) return head_cmp == .lt;
+            const target_cmp = std.mem.order(u8, &a.att_data.target.root, &b.att_data.target.root);
+            if (target_cmp != .eq) return target_cmp == .lt;
+            const source_cmp = std.mem.order(u8, &a.att_data.source.root, &b.att_data.source.root);
+            if (source_cmp != .eq) return source_cmp == .lt;
+            // Slot ties on each checkpoint resolved by checkpoint slot.
+            if (a.att_data.head.slot != b.att_data.head.slot) return a.att_data.head.slot < b.att_data.head.slot;
+            if (a.att_data.target.slot != b.att_data.target.slot) return a.att_data.target.slot < b.att_data.target.slot;
+            return a.att_data.source.slot < b.att_data.source.slot;
+        }
+    };
+    std.mem.sort(CompactGroupEntry, group_entries.items, {}, SortCtx.lessThan);
 
-            var att_bits = try attestation.AggregationBits.init(allocator);
-            errdefer att_bits.deinit();
-            for (0..cloned_proof.participants.len()) |i| {
-                if (cloned_proof.participants.get(i) catch false) {
-                    try attestation.aggregationBitsSet(&att_bits, i, true);
+    // -------- Serial pre-phase: build CompactGroupPrep for every entry --------
+    //
+    // All `xmss.PublicKey.fromBytes` calls happen on this thread. The Rust FFI
+    // for pubkey deserialization is not documented as `Send`, and `setupVerifier`
+    // (called transitively) carries first-time-init races. By doing every FFI
+    // construction here we ensure the parallel worker only invokes
+    // `aggregate()` on already-deserialized handles.
+    //
+    // All wrapper handles are owned by `pubkey_wrappers`; we deinit each at the
+    // end so Rust handles do not leak. The slice arrays themselves live in a
+    // single `prep_slice_arena` to keep cleanup branch-free.
+    var pubkey_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+    defer {
+        for (pubkey_wrappers.items) |*pw| pw.deinit();
+        pubkey_wrappers.deinit(allocator);
+    }
+
+    var prep_slice_arena = std.heap.ArenaAllocator.init(allocator);
+    defer prep_slice_arena.deinit();
+    const prep_alloc = prep_slice_arena.allocator();
+
+    const preps = try allocator.alloc(CompactGroupPrep, group_entries.items.len);
+    defer allocator.free(preps);
+
+    for (group_entries.items, 0..) |entry, ei| {
+        if (entry.indices.len == 1) {
+            preps[ei] = .{ .entry = entry, .child_pk_slices = &.{} };
+            continue;
+        }
+
+        const child_arr = try prep_alloc.alloc([]*const xmss.HashSigPublicKey, entry.indices.len);
+
+        for (entry.indices, 0..) |sig_idx, child_i| {
+            const child = &sig_slice[sig_idx];
+            var n_participants: usize = 0;
+            for (0..child.participants.len()) |i| {
+                if (child.participants.get(i) catch false) n_participants += 1;
+            }
+
+            const cpks = try prep_alloc.alloc(*const xmss.HashSigPublicKey, n_participants);
+
+            var cpk_idx: usize = 0;
+            for (0..child.participants.len()) |i| {
+                if (child.participants.get(i) catch false) {
+                    if (i >= validators.len()) continue;
+                    const val = validators.get(@intCast(i)) catch continue;
+                    const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
+                    try pubkey_wrappers.append(allocator, pk);
+                    cpks[cpk_idx] = pk.handle;
+                    cpk_idx += 1;
+                }
+            }
+            child_arr[child_i] = cpks[0..cpk_idx];
+        }
+
+        preps[ei] = .{ .entry = entry, .child_pk_slices = child_arr };
+    }
+
+    if (thread_pool) |pool| {
+        // Parallel path: per-AttestationData aggregation across the shared
+        // worker pool. Workers receive prebuilt `CompactGroupPrep` and never
+        // touch FFI deserialization themselves.
+        const slots = try allocator.alloc(CompactGroupSlot, preps.len);
+        defer allocator.free(slots);
+        for (slots) |*slot| slot.* = .{};
+        errdefer {
+            for (slots) |*slot| {
+                if (slot.result) |*r| {
+                    r.attestation.deinit();
+                    r.signature.deinit();
+                }
+            }
+        }
+
+        const Runner = struct {
+            fn runScope(
+                scope: anytype,
+                preps_in: []const CompactGroupPrep,
+                sigs: []const aggregation.AggregatedSignatureProof,
+                alloc: Allocator,
+                out_slots: []CompactGroupSlot,
+                any_err: *std.atomic.Value(bool),
+            ) Allocator.Error!void {
+                for (preps_in, 0..) |prep, i| {
+                    try scope.spawn(runOne, .{ alloc, prep, sigs, &out_slots[i], any_err });
                 }
             }
 
-            try out_atts.append(.{ .aggregation_bits = att_bits, .data = att_data });
-            try out_sigs.append(cloned_proof);
-        } else {
-            // Multiple proofs — merge via recursive children aggregation
-            const epoch: u64 = att_data.slot;
-            var message_hash: [32]u8 = undefined;
-            try zeam_utils.hashTreeRoot(attestation.AttestationData, att_data, &message_hash, allocator);
-
-            // Collect children proofs
-            const children = try allocator.alloc(aggregation.AggregatedSignatureProof, indices.len);
-            defer allocator.free(children);
-            for (indices, 0..) |idx, i| {
-                children[i] = sig_slice[idx];
+            fn runOne(
+                alloc: Allocator,
+                prep: CompactGroupPrep,
+                sigs: []const aggregation.AggregatedSignatureProof,
+                out_slot: *CompactGroupSlot,
+                any_err: *std.atomic.Value(bool),
+            ) void {
+                if (any_err.load(.acquire)) return;
+                const result = runCompactGroupPrep(alloc, prep, sigs) catch |err| {
+                    out_slot.err = err;
+                    any_err.store(true, .release);
+                    return;
+                };
+                out_slot.result = result;
             }
+        };
 
-            // Build per-child public key arrays
-            var child_pk_allocs: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
+        var any_err = std.atomic.Value(bool).init(false);
+        try pool.scope(Runner.runScope, .{
+            preps,
+            sig_slice,
+            allocator,
+            slots,
+            &any_err,
+        });
+
+        for (slots) |*slot| {
+            if (slot.err) |err| return err;
+        }
+
+        for (slots) |*slot| {
+            var result = slot.result orelse continue;
+            slot.result = null;
+
+            var att_moved = false;
+            var sig_moved = false;
             defer {
-                for (child_pk_allocs.items) |arr| allocator.free(arr);
-                child_pk_allocs.deinit(allocator);
+                if (!att_moved) result.attestation.deinit();
+                if (!sig_moved) result.signature.deinit();
             }
-            var child_pk_slices: std.ArrayList([]*const xmss.HashSigPublicKey) = .empty;
-            defer child_pk_slices.deinit(allocator);
 
-            var child_pk_wrappers: std.ArrayList(xmss.PublicKey) = .empty;
+            try out_atts.append(result.attestation);
+            att_moved = true;
+            try out_sigs.append(result.signature);
+            sig_moved = true;
+        }
+    } else {
+        for (preps) |prep| {
+            var result = try runCompactGroupPrep(allocator, prep, sig_slice);
+
+            var att_moved = false;
+            var sig_moved = false;
             defer {
-                for (child_pk_wrappers.items) |*pw| pw.deinit();
-                child_pk_wrappers.deinit(allocator);
+                if (!att_moved) result.attestation.deinit();
+                if (!sig_moved) result.signature.deinit();
             }
 
-            for (children) |*child| {
-                var n_participants: usize = 0;
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        n_participants += 1;
-                    }
-                }
-
-                const cpks = try allocator.alloc(*const xmss.HashSigPublicKey, n_participants);
-                errdefer allocator.free(cpks);
-
-                var cpk_idx: usize = 0;
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        if (i >= validators.len()) continue;
-                        const val = validators.get(@intCast(i)) catch continue;
-                        const pk = xmss.PublicKey.fromBytes(&val.attestation_pubkey) catch continue;
-                        try child_pk_wrappers.append(allocator, pk);
-                        cpks[cpk_idx] = pk.handle;
-                        cpk_idx += 1;
-                    }
-                }
-
-                try child_pk_allocs.append(allocator, cpks);
-                try child_pk_slices.append(allocator, cpks[0..cpk_idx]);
-            }
-
-            // Aggregate children into single proof
-            var proof = try aggregation.AggregatedSignatureProof.init(allocator);
-            errdefer proof.deinit();
-
-            const empty_pks: []*const xmss.HashSigPublicKey = &.{};
-            const empty_sigs: []*const xmss.HashSigSignature = &.{};
-
-            try aggregation.AggregatedSignatureProof.aggregate(
-                allocator,
-                null, // no raw XMSS participants
-                children,
-                child_pk_slices.items,
-                empty_pks,
-                empty_sigs,
-                &message_hash,
-                epoch,
-                &proof,
-            );
-
-            // Create attestation bits from merged participants
-            var att_bits = try attestation.AggregationBits.init(allocator);
-            errdefer att_bits.deinit();
-            for (0..proof.participants.len()) |i| {
-                if (proof.participants.get(i) catch false) {
-                    try attestation.aggregationBitsSet(&att_bits, i, true);
-                }
-            }
-
-            try out_atts.append(.{ .aggregation_bits = att_bits, .data = att_data });
-            try out_sigs.append(proof);
+            try out_atts.append(result.attestation);
+            att_moved = true;
+            try out_sigs.append(result.signature);
+            sig_moved = true;
         }
     }
 

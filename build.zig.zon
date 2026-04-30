@@ -56,6 +56,10 @@
             .url = "git+https://github.com/blockblaz/lmdb-zig#8e1f5440fd2c97b9072ee729e8e4cd8593a47c55",
             .hash = "lmdb-0.1.0-tSBItmKwBgBD1Nkkexbr3ydsa-ZpR1suATr-JqYj9Iey",
         },
+        .thread_pool = .{
+            .url = "git+https://github.com/anshalshukla/zig-thread-pool#d095d0e3ad69dc7a0a1a8419a5244cfb291bcd01",
+            .hash = "thread_pool-0.1.0-m6B8f1PnAABDFOkSzBfEl-zV9RqihL5yPRpK5orm_NUA",
+        },
     },
     .paths = .{""},
 }

@@ -11,6 +11,7 @@ const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
 const params = @import("@zeam/params");
 const keymanager = @import("@zeam/key-manager");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
@@ -261,6 +262,7 @@ pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
+    thread_pool: ?*ThreadPool = null,
 };
 
 // Use shared signature map types from types package
@@ -307,6 +309,9 @@ pub const ForkChoice = struct {
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
+    // Optional shared worker pool used for CPU-heavy attestation compaction.
+    thread_pool: ?*ThreadPool = null,
+    last_node_tick_time_ms: ?i64,
 
     const Self = @This();
 
@@ -379,6 +384,8 @@ pub const ForkChoice = struct {
             // (slot > 0) start in `initing` and become `ready` once the first real justified
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
+            .thread_pool = opts.thread_pool,
+            .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -823,6 +830,14 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        const time_now_ms: i64 = std.time.milliTimestamp();
+        if (self.last_node_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+        }
+        self.last_node_tick_time_ms = time_now_ms;
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
@@ -1069,6 +1084,7 @@ pub const ForkChoice = struct {
                 &agg_attestations,
                 &attestation_signatures,
                 &pre_state.validators,
+                self.thread_pool,
             );
             _ = compact_timer.observe();
             zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
@@ -2248,6 +2264,7 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2602,6 +2619,7 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
 
     return .{
@@ -3587,6 +3605,7 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .signatures_mutex = std.Thread.Mutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately
