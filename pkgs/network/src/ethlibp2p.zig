@@ -991,6 +991,44 @@ pub extern fn send_rpc_error_response(
     message_ptr: [*:0]const u8,
 ) callconv(.c) void;
 
+/// Issue #808: tag space for `get_swarm_command_dropped_total`. Mirrors the
+/// `SwarmCommandDropReason` enum on the Rust side. **Stable wire contract** —
+/// these tags are passed by value across FFI; do not renumber. Adding a new
+/// reason is fine; existing reasons must keep their tag.
+pub const SwarmCommandDropReason = enum(u32) {
+    full = 0,
+    closed = 1,
+    uninitialized = 2,
+};
+
+/// Returns the cumulative count of swarm commands dropped before reaching the
+/// Rust event loop, for the given reason tag. Counts are global across all
+/// networks; the metrics layer scrapes once per Prometheus hit and turns the
+/// monotonic count into a labeled `lean_libp2p_swarm_command_dropped_total`
+/// counter via deltas (see `pkgs/metrics`).
+pub extern fn get_swarm_command_dropped_total(reason_tag: u32) callconv(.c) u64;
+
+/// Last cumulative drop count we observed from the Rust side, per reason
+/// (matching `SwarmCommandDropReason`). The scrape refresher computes
+/// `current - last_seen`, calls `incrBy` with the delta, and updates this.
+var swarm_command_drop_last_seen: [3]u64 = .{ 0, 0, 0 };
+
+fn refreshSwarmCommandDropMetric() void {
+    inline for (.{ SwarmCommandDropReason.full, SwarmCommandDropReason.closed, SwarmCommandDropReason.uninitialized }) |reason| {
+        const idx: usize = @intFromEnum(reason);
+        const current = get_swarm_command_dropped_total(@intFromEnum(reason));
+        const last = swarm_command_drop_last_seen[idx];
+        if (current > last) {
+            const delta = current - last;
+            zeam_metrics.metrics.lean_libp2p_swarm_command_dropped_total.incrBy(
+                .{ .reason = @tagName(reason) },
+                delta,
+            ) catch {};
+            swarm_command_drop_last_seen[idx] = current;
+        }
+    }
+}
+
 /// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
 /// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
 /// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
@@ -1052,6 +1090,13 @@ pub const EthLibp2p = struct {
     ) !Self {
         const owned_fork_digest = try allocator.dupe(u8, params.fork_digest);
         errdefer allocator.free(owned_fork_digest);
+
+        // Issue #808: hand the metrics layer a callback so every Prometheus
+        // scrape pulls the latest cumulative drop counts from the Rust side
+        // and turns them into deltas on `lean_libp2p_swarm_command_dropped_total`.
+        // Counts are global; registering once is enough even with multiple
+        // EthLibp2p instances (the call is idempotent).
+        zeam_metrics.registerScrapeRefresher(refreshSwarmCommandDropMetric);
 
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
         errdefer gossip_handler.deinit();
@@ -1262,6 +1307,16 @@ pub const EthLibp2p = struct {
         );
 
         if (request_id == 0) {
+            // Issue #808: send_rpc_request returns 0 when the Rust-side swarm
+            // command channel is uninitialized / full / closed, i.e. the
+            // request never reached the wire. The Rust layer already logs
+            // the specific reason and bumps `get_swarm_command_dropped_total`,
+            // but surface a Zig-side warn so operators correlating req-resp
+            // timeouts have the dispatch-failure event in the same log stream.
+            self.logger.warn(
+                "network-{d}:: dropping RPC request to peer={s}{f} protocol_tag={d}: rust-bridge swarm command channel rejected enqueue (see preceding rust-bridge error for reason)",
+                .{ self.params.networkId, peer_id, node_name, protocol_tag },
+            );
             return error.RequestDispatchFailed;
         }
 

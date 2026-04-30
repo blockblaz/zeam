@@ -253,6 +253,47 @@ const SWARM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
 /// monopolize the executor.
 const MAX_SWARM_COMMANDS_PER_TICK: usize = 256;
 
+/// Reason tags for `SWARM_COMMAND_DROPPED_TOTAL` and the matching FFI getter
+/// `get_swarm_command_dropped_total`. Mirrored on the Zig side as a plain
+/// `u32` enum so the Prometheus counter can be labeled by reason without
+/// passing strings across the FFI boundary.
+///
+/// **Stable contract — do not renumber**: the Zig metrics layer scrapes by
+/// passing these integer tags back into the FFI getter. Adding a new reason
+/// is fine; renumbering an existing one will silently misattribute drops.
+#[repr(u32)]
+enum SwarmCommandDropReason {
+    Full = 0,
+    Closed = 1,
+    Uninitialized = 2,
+}
+
+/// Cumulative count of swarm commands dropped before reaching the event loop,
+/// indexed by `SwarmCommandDropReason`. Read via `get_swarm_command_dropped_total`
+/// from Zig on each Prometheus scrape; never reset, so a Zig-side tracker can
+/// compute deltas against its last-seen value (issue #808).
+static SWARM_COMMAND_DROPPED_TOTAL: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn record_swarm_command_drop(reason: SwarmCommandDropReason) {
+    SWARM_COMMAND_DROPPED_TOTAL[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// FFI getter: cumulative count of dropped swarm commands for the given
+/// reason tag (see `SwarmCommandDropReason`). Returns 0 for unknown tags so
+/// future Zig builds compiled against an older Rust glue do not panic.
+///
+/// Counts are global across all networks; the Zig caller is expected to scrape
+/// once per metrics endpoint hit and turn deltas into a `CounterVec` with
+/// `reason` labels.
+#[no_mangle]
+pub extern "C" fn get_swarm_command_dropped_total(reason_tag: u32) -> u64 {
+    SWARM_COMMAND_DROPPED_TOTAL
+        .get(reason_tag as usize)
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
@@ -497,6 +538,7 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
     let tx = match get_command_sender(network_id) {
         Some(tx) => tx,
         None => {
+            record_swarm_command_drop(SwarmCommandDropReason::Uninitialized);
             logger::rustLogger.error(network_id, "send_swarm_command: network not initialized");
             return false;
         }
@@ -504,6 +546,7 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
     match tx.try_send(cmd) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
+            record_swarm_command_drop(SwarmCommandDropReason::Full);
             logger::rustLogger.error(
                 network_id,
                 "send_swarm_command: command channel full, dropping command (slow drain or peer backpressure)",
@@ -511,6 +554,7 @@ fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
+            record_swarm_command_drop(SwarmCommandDropReason::Closed);
             logger::rustLogger.error(network_id, "send_swarm_command: command channel closed");
             false
         }
@@ -613,6 +657,7 @@ pub unsafe extern "C" fn send_rpc_request(
     let tx = match get_command_sender(network_id) {
         Some(tx) => tx,
         None => {
+            record_swarm_command_drop(SwarmCommandDropReason::Uninitialized);
             logger::rustLogger.error(network_id, "send_rpc_request: network not initialized");
             return 0;
         }
@@ -629,13 +674,21 @@ pub unsafe extern "C" fn send_rpc_request(
         Err(e) => {
             // Roll the counter back so the id is not permanently leaked.
             REQUEST_ID_COUNTER.fetch_sub(1, Ordering::Relaxed);
-            let reason = match e {
-                mpsc::error::TrySendError::Full(_) => "command channel full",
-                mpsc::error::TrySendError::Closed(_) => "command channel closed",
+            let (reason_label, reason_tag) = match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    ("command channel full", SwarmCommandDropReason::Full)
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    ("command channel closed", SwarmCommandDropReason::Closed)
+                }
             };
+            record_swarm_command_drop(reason_tag);
             logger::rustLogger.error(
                 network_id,
-                &format!("send_rpc_request: failed to enqueue request: {}", reason),
+                &format!(
+                    "send_rpc_request: failed to enqueue request: {}",
+                    reason_label
+                ),
             );
             return 0;
         }
@@ -2007,12 +2060,7 @@ mod tests {
         let payload = b"hello";
 
         let ok = unsafe {
-            publish_msg_to_rust_bridge(
-                network_id,
-                topic.as_ptr(),
-                payload.as_ptr(),
-                payload.len(),
-            )
+            publish_msg_to_rust_bridge(network_id, topic.as_ptr(), payload.as_ptr(), payload.len())
         };
         assert!(
             !ok,
@@ -2039,5 +2087,97 @@ mod tests {
             !ok,
             "publish_msg_to_rust_bridge must return false when topic pointer is null"
         );
+    }
+
+    #[test]
+    fn test_swarm_command_drop_counter_increments_on_uninitialized() {
+        // Issue #808: every dropped swarm command must bump the per-reason
+        // counter exposed via `get_swarm_command_dropped_total` so the Zig
+        // metrics layer can publish it as `lean_libp2p_swarm_command_dropped_total`.
+        // Tests run in-process so the counter is shared; assert *delta*, not absolute.
+        let before = get_swarm_command_dropped_total(SwarmCommandDropReason::Uninitialized as u32);
+
+        // Send to a network slot that was never initialized: must return false.
+        let network_id = 103;
+        let topic = std::ffi::CString::new("test/topic").unwrap();
+        let payload = b"hello";
+        for _ in 0..3 {
+            let ok = unsafe {
+                publish_msg_to_rust_bridge(
+                    network_id,
+                    topic.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            };
+            assert!(!ok);
+        }
+
+        let after = get_swarm_command_dropped_total(SwarmCommandDropReason::Uninitialized as u32);
+        assert!(
+            after - before >= 3,
+            "Uninitialized drop counter must advance by at least 3 (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn test_swarm_command_drop_counter_unknown_reason_is_zero() {
+        // The FFI getter must return 0 for unknown reason tags so a Zig
+        // build compiled against an older Rust glue cannot panic on scrape.
+        assert_eq!(get_swarm_command_dropped_total(999), 0);
+    }
+
+    #[test]
+    fn test_swarm_command_full_channel_drops_and_counts() {
+        // Issue #808 review point #3: exercise the actual full-channel path
+        // by installing a bounded sender into COMMAND_SENDERS without a
+        // matching drainer, pushing past capacity, and asserting the
+        // overflow returns false and bumps the Full counter.
+        //
+        // We use a small dedicated network_id and a tiny channel so the test
+        // runs in microseconds instead of allocating SWARM_COMMAND_CHANNEL_CAPACITY
+        // commands.
+        let network_id = 104;
+        let cap: usize = 4;
+        let (tx, _rx) = mpsc::channel::<SwarmCommand>(cap);
+        // Keep _rx alive (no drainer => first `cap` sends fill the channel,
+        // anything beyond returns Full instead of Closed).
+        COMMAND_SENDERS.lock().unwrap().insert(network_id, tx);
+
+        let before_full = get_swarm_command_dropped_total(SwarmCommandDropReason::Full as u32);
+
+        // Fill the channel exactly to capacity — every send must succeed.
+        for i in 0..cap {
+            let ok = send_swarm_command(
+                network_id,
+                SwarmCommand::Publish {
+                    topic: format!("t/{i}"),
+                    data: vec![0u8; 4],
+                },
+            );
+            assert!(ok, "send #{i} into a non-full channel must succeed");
+        }
+
+        // Next 3 sends must all return false and each bump the Full counter.
+        let overflow_attempts = 3;
+        for i in 0..overflow_attempts {
+            let ok = send_swarm_command(
+                network_id,
+                SwarmCommand::Publish {
+                    topic: format!("overflow/{i}"),
+                    data: vec![0u8; 4],
+                },
+            );
+            assert!(!ok, "overflow send #{i} must return false");
+        }
+
+        let after_full = get_swarm_command_dropped_total(SwarmCommandDropReason::Full as u32);
+        assert!(
+            after_full - before_full >= overflow_attempts as u64,
+            "Full drop counter must advance by at least {overflow_attempts} (before={before_full}, after={after_full})"
+        );
+
+        // Cleanup: remove the test sender so this network_id is reusable.
+        COMMAND_SENDERS.lock().unwrap().remove(&network_id);
     }
 }

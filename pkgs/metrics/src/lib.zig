@@ -60,6 +60,12 @@ const Metrics = struct {
     lean_connected_peers: LeanConnectedPeersGauge,
     lean_peer_connection_events_total: PeerConnectionEventsCounter,
     lean_peer_disconnection_events_total: PeerDisconnectionEventsCounter,
+    // Issue #808: per-reason count of swarm commands dropped before reaching
+    // the rust-libp2p event loop (channel full / closed / uninitialized).
+    // Refreshed from a Rust-side atomic on every scrape via a registered
+    // refresher — see `registerScrapeRefresher` and the network-layer
+    // implementation in `pkgs/network/src/ethlibp2p.zig`.
+    lean_libp2p_swarm_command_dropped_total: LibP2pSwarmCommandDroppedCounter,
     // Node lifecycle metrics
     lean_node_info: LeanNodeInfoGauge,
     lean_node_start_time_seconds: LeanNodeStartTimeGauge,
@@ -141,6 +147,7 @@ const Metrics = struct {
     const LeanConnectedPeersGauge = metrics_lib.GaugeVec(u64, struct { client: []const u8, client_type: []const u8 });
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
+    const LibP2pSwarmCommandDroppedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     // Node lifecycle metric types
     const LeanNodeInfoGauge = metrics_lib.GaugeVec(u64, struct { name: []const u8, version: []const u8 });
     const LeanNodeStartTimeGauge = metrics_lib.Gauge(u64);
@@ -498,6 +505,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_connected_peers = try Metrics.LeanConnectedPeersGauge.init(allocator, "lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
+        .lean_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, "lean_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
         // Node lifecycle metrics
         .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
         .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
@@ -586,6 +594,19 @@ pub fn init(allocator: std.mem.Allocator) !void {
     g_initialized = true;
 }
 
+/// Optional pre-scrape refresher. Modules that own state outside the
+/// `Metrics` struct (e.g. a Rust-side atomic counter accessed via FFI) can
+/// register a callback here; it is invoked on every `writeMetrics` so the
+/// counter values reflect the latest source-of-truth at scrape time. Issue
+/// #808 (libp2p swarm command drops) is the first user.
+var g_scrape_refresher: ?*const fn () void = null;
+
+/// Register (or replace) a scrape refresher. Pass `null` to clear. Safe to
+/// call before `init()`; the registration sticks regardless of init order.
+pub fn registerScrapeRefresher(refresher: ?*const fn () void) void {
+    g_scrape_refresher = refresher;
+}
+
 /// Writes metrics to a writer (for Prometheus endpoint).
 pub fn writeMetrics(writer: *std.Io.Writer) !void {
     if (!g_initialized) return error.NotInitialized;
@@ -595,6 +616,10 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
         try writer.writeAll("# Metrics disabled for ZKVM target\n");
         return;
     }
+
+    // Pull in any externally-owned counters (e.g. Rust-side libp2p drops)
+    // before serializing so each scrape returns up-to-date values.
+    if (g_scrape_refresher) |refresher| refresher();
 
     try metrics_lib.write(&metrics, writer);
 }
