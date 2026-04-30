@@ -181,6 +181,13 @@ pub fn build(b: *Builder) !void {
     });
     zeam_metrics.addImport("metrics", metrics);
 
+    // add zeam-thread-pool (work-stealing thread pool, zero dependencies)
+    const thread_pool_dep = b.dependency("thread_pool", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zeam_thread_pool = thread_pool_dep.module("thread-pool");
+
     // add zeam-xmss
     const zeam_xmss = b.addModule("@zeam/xmss", .{
         .root_source_file = b.path("pkgs/xmss/src/lib.zig"),
@@ -249,6 +256,9 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
     zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
+    // Used only by the host-side benchmark test; zkVM builds instantiate their own
+    // state-transition module further below without this import.
+    zeam_state_transition.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -321,6 +331,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
+    zeam_beam_node.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -371,6 +382,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/api", zeam_api);
     cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    cli_exe.root_module.addImport("@zeam/thread-pool", zeam_thread_pool);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("multiaddr", multiaddr_mod);
