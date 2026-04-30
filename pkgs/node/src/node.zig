@@ -62,16 +62,6 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Outermost lock in the per-resource hierarchy (#803). Held only by
-    /// finalization-advancement paths that legitimately need a multi-resource
-    /// view (canonicality scan + states/network prune sweep). Single-mutator
-    /// today — gossip/req-resp/onInterval no longer take this lock; they use
-    /// the per-resource locks documented on `BeamChain` and on `Network`.
-    ///
-    /// Renamed from `mutex` (issue #803). `acquireMutex(site)` continues to
-    /// record wait/hold time so the existing histogram dashboards keep
-    /// working during the migration.
-    finalization_lock: std.Thread.Mutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
@@ -250,64 +240,6 @@ pub const BeamNode = struct {
         self.allocator.destroy(self.chain);
     }
 
-    /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
-    /// in its `unlock` method while observing the hold time into the
-    /// `zeam_node_mutex_hold_time_seconds` histogram for the configured site.
-    ///
-    /// Timing uses `std.time.Timer`, which wraps `CLOCK_MONOTONIC` on Linux,
-    /// `mach_absolute_time` on macOS and `QueryPerformanceCounter` on Windows.
-    /// This avoids the wall-clock skew (NTP slew, leap-second steps, manual
-    /// clock changes) that `std.time.nanoTimestamp` is subject to and that
-    /// would corrupt histogram percentiles by producing negative deltas.
-    ///
-    /// Calling `unlock()` more than once is a no-op on the second call: a
-    /// `released` sentinel prevents the underlying mutex from being unlocked
-    /// twice, which would be undefined behavior. The metric is also recorded
-    /// only on the first call.
-    ///
-    /// See issue #786.
-    const MutexGuard = struct {
-        mutex: *std.Thread.Mutex,
-        site: []const u8,
-        timer: std.time.Timer,
-        released: bool = false,
-
-        pub fn unlock(self: *MutexGuard) void {
-            if (self.released) return;
-            self.released = true;
-
-            const elapsed_ns = self.timer.read();
-            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-            zeam_metrics.metrics.zeam_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
-            self.mutex.unlock();
-        }
-    };
-
-    /// Acquire `BeamNode.mutex`, recording the wait time into
-    /// `zeam_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
-    /// records the hold time on `unlock()`. Always pair with
-    /// `defer guard.unlock()`. The `site` label flows through to the metric so
-    /// Prometheus can attribute stalls to a specific callback path.
-    ///
-    /// Wait/hold timing is measured with `std.time.Timer` (monotonic clock) so
-    /// the deltas observed by Prometheus are guaranteed non-negative even when
-    /// the wall clock is adjusted by NTP, leap seconds or operator action.
-    fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
-        // `Timer.start()` only fails on platforms without a monotonic clock; on
-        // every supported zeam target (Linux/macOS/Windows) it is infallible.
-        // Falling back to wall-clock time would re-introduce the skew bug we
-        // are fixing, so we panic instead.
-        var timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
-        self.finalization_lock.lock();
-        const wait_ns = timer.lap();
-        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
-        zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
-        return .{
-            .mutex = &self.finalization_lock,
-            .site = site,
-            .timer = timer,
-        };
-    }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
