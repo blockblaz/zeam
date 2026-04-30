@@ -78,6 +78,30 @@ pub const Network = struct {
     fetched_block_children: ChildrenMap,
     timed_out_requests: std.ArrayList(u64),
 
+    // ---------- Per-resource locks (issue #786 / #803) ----------
+    //
+    // Hierarchy tier 2 / 2'. Each lock guards a single resource (or the
+    // bundled block-cache trio) and is held only for short critical
+    // sections. Sibling locks at this tier MUST NOT be held simultaneously.
+    //
+    // The block cache trio (fetched_blocks + fetched_block_ssz +
+    // fetched_block_children) is bundled under one mutex because the three
+    // maps share a lifecycle: a cached block is cached, ssz-stored, and
+    // child-linked atomically (and removed atomically). Splitting them
+    // would let readers observe inconsistent slices.
+    block_cache_lock: std.Thread.Mutex = .{},
+    pending_rpc_lock: std.Thread.Mutex = .{},
+    pending_block_roots_lock: std.Thread.Mutex = .{},
+    timed_out_lock: std.Thread.Mutex = .{},
+
+    // `connected_peers` is read on every gossip block (logger reads count)
+    // and iterated on broadcast paths. Mutex-only would burn an acquire on
+    // every gossip log line; instead we keep a lock-free atomic counter
+    // for `count()` and an `RwLock` for the map itself (shared for
+    // iterator, exclusive for connect/disconnect).
+    connected_peers_lock: std.Thread.RwLock = .{},
+    connected_peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: networks.NetworkInterface) !Self {
@@ -196,6 +220,15 @@ pub const Network = struct {
     }
 
     pub fn selectPeer(self: *Self) ?[]const u8 {
+        // Read connected_peers under the shared lock. The returned slice
+        // points into the peer-info struct stored in the map; it remains
+        // valid until the corresponding `disconnectPeer` runs (which
+        // takes the exclusive lock and frees the slice). Caller MUST use
+        // the peer id synchronously / under their own short-lived
+        // assumption — racing a disconnect can dangle the pointer.
+        self.connected_peers_lock.lockShared();
+        defer self.connected_peers_lock.unlockShared();
+
         const peer_count = self.connected_peers.count();
         if (peer_count == 0) return null;
 
@@ -212,15 +245,23 @@ pub const Network = struct {
         return null;
     }
 
+    /// Lock-free read of the connected-peers count via the atomic shadow.
+    /// Safe to call from logger config without burning a mutex acquire.
+    /// Eventually-consistent: a connect/disconnect in flight may not yet
+    /// be reflected.
     pub fn getPeerCount(self: *Self) usize {
-        return self.connected_peers.count();
+        return self.connected_peer_count.load(.acquire);
     }
 
     pub fn hasPeer(self: *Self, peer_id: []const u8) bool {
+        self.connected_peers_lock.lockShared();
+        defer self.connected_peers_lock.unlockShared();
         return self.connected_peers.contains(peer_id);
     }
 
     pub fn setPeerLatestStatus(self: *Self, peer_id: []const u8, status: types.Status) bool {
+        self.connected_peers_lock.lock();
+        defer self.connected_peers_lock.unlock();
         if (self.connected_peers.getPtr(peer_id)) |peer_info| {
             peer_info.latest_status = status;
             return true;
@@ -229,9 +270,14 @@ pub const Network = struct {
     }
 
     pub fn connectPeer(self: *Self, peer_id: []const u8) !void {
+        self.connected_peers_lock.lock();
+        defer self.connected_peers_lock.unlock();
+
+        var was_existing = false;
         if (self.connected_peers.fetchRemove(peer_id)) |entry| {
             self.allocator.free(entry.key);
             self.allocator.free(entry.value.peer_id);
+            was_existing = true;
         }
 
         const owned_key = try self.allocator.dupe(u8, peer_id);
@@ -249,55 +295,93 @@ pub const Network = struct {
             self.allocator.free(owned_peer_id);
             return err;
         };
+
+        // Update atomic shadow only if this is a NEW peer (replace = no-op
+        // for the count).
+        if (!was_existing) {
+            _ = self.connected_peer_count.fetchAdd(1, .acq_rel);
+        }
     }
 
     pub fn disconnectPeer(self: *Self, peer_id: []const u8) bool {
-        if (self.connected_peers.fetchRemove(peer_id)) |peer_entry| {
+        // Phase 1 (peers lock exclusive): remove from map + decrement
+        // atomic count. Collect pending request ids that reference this
+        // peer; the actual finalization runs without the peers lock so we
+        // don't violate hierarchy ordering with `pending_rpc_lock`.
+        var request_ids_to_remove: std.ArrayList(u64) = .empty;
+        defer request_ids_to_remove.deinit(self.allocator);
+
+        const removed = peers_block: {
+            self.connected_peers_lock.lock();
+            defer self.connected_peers_lock.unlock();
+
+            const peer_entry_opt = self.connected_peers.fetchRemove(peer_id);
+            if (peer_entry_opt == null) break :peers_block false;
+
+            const peer_entry = peer_entry_opt.?;
             self.allocator.free(peer_entry.key);
             self.allocator.free(peer_entry.value.peer_id);
+            _ = self.connected_peer_count.fetchSub(1, .acq_rel);
+            break :peers_block true;
+        };
+        if (!removed) return false;
 
-            // Finalize all pending RPC requests for this peer
+        // Phase 2 (pending_rpc_lock): collect request ids that referenced
+        // the disconnected peer.
+        {
+            self.pending_rpc_lock.lock();
+            defer self.pending_rpc_lock.unlock();
+
             var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove: std.ArrayList(u64) = .empty;
-            defer request_ids_to_remove.deinit(self.allocator);
-
             while (rpc_it.next()) |rpc_entry| {
                 const pending_peer_id = switch (rpc_entry.value_ptr.request) {
                     .status => |*ctx| ctx.peer_id,
                     .blocks_by_root => |*ctx| ctx.peer_id,
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
-                    // If we can't allocate, skip this request (should be rare)
                     request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
                 }
             }
-
-            for (request_ids_to_remove.items) |request_id| {
-                self.finalizePendingRequest(request_id);
-            }
-
-            return true;
         }
-        return false;
+
+        // Phase 3 (no peers/rpc locks held): finalize each request.
+        // finalizePendingRequest acquires its own pending_rpc_lock +
+        // pending_block_roots_lock as needed.
+        for (request_ids_to_remove.items) |request_id| {
+            self.finalizePendingRequest(request_id);
+        }
+
+        return true;
     }
 
     pub fn hasPendingBlockRoot(self: *Self, root: types.Root) bool {
+        self.pending_block_roots_lock.lock();
+        defer self.pending_block_roots_lock.unlock();
         return self.pending_block_roots.get(root) != null;
     }
 
     pub fn getPendingBlockRootDepth(self: *Self, root: types.Root) ?u32 {
+        self.pending_block_roots_lock.lock();
+        defer self.pending_block_roots_lock.unlock();
         return self.pending_block_roots.get(root);
     }
 
     pub fn trackPendingBlockRoot(self: *Self, root: types.Root, depth: u32) !void {
+        self.pending_block_roots_lock.lock();
+        defer self.pending_block_roots_lock.unlock();
         try self.pending_block_roots.put(root, depth);
     }
 
     pub fn removePendingBlockRoot(self: *Self, root: types.Root) bool {
+        self.pending_block_roots_lock.lock();
+        defer self.pending_block_roots_lock.unlock();
         return self.pending_block_roots.remove(root);
     }
 
     pub fn shouldRequestBlocksByRoot(self: *Self, roots: []const types.Root) bool {
+        // Each iteration takes the relevant locks individually. The check
+        // is best-effort — a root can transition between calls; a stale
+        // result triggers at most a duplicate request, never corruption.
         for (roots) |root| {
             if (!self.hasPendingBlockRoot(root) and !self.hasFetchedBlock(root)) {
                 return true;
@@ -307,14 +391,32 @@ pub const Network = struct {
     }
 
     pub fn hasFetchedBlock(self: *Self, root: types.Root) bool {
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
         return self.fetched_blocks.get(root) != null;
     }
 
     pub fn getFetchedBlock(self: *Self, root: types.Root) ?*types.SignedBlock {
+        // NOTE: returns a raw pointer that lives in the block cache. Caller
+        // must NOT hold the result across a `removeFetchedBlock` /
+        // `pruneCachedBlocks` call from another thread, or the block will
+        // be freed underneath them. Today's callers all consume the
+        // pointer synchronously inside the same lock-tier critical section
+        // — see `cacheFetchedBlock`'s docstring for the lifetime rules.
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
         return self.fetched_blocks.get(root);
     }
 
     pub fn cacheFetchedBlock(self: *Self, root: types.Root, block: *types.SignedBlock) !void {
+        // Atomic across the three block-cache maps (issue #786 req. 1):
+        // fetched_blocks gets the block, fetched_block_children gets the
+        // parent→child link. fetched_block_ssz is populated separately by
+        // `storeFetchedBlockSsz`. Holding `block_cache_lock` across both
+        // operations keeps readers from observing an inconsistent slice.
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
+
         const block_gop = try self.fetched_blocks.getOrPut(root);
 
         // If we already have this block cached, free the duplicate and return early
@@ -347,12 +449,16 @@ pub const Network = struct {
 
     /// Returns the pre-serialized SSZ bytes for a cached block, if stored.
     pub fn getFetchedBlockSsz(self: *Self, root: types.Root) ?[]const u8 {
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
         return self.fetched_block_ssz.get(root);
     }
 
     /// Store pre-serialized SSZ bytes alongside a cached block.
     /// Caller transfers ownership of `ssz_bytes` to the map.
     pub fn storeFetchedBlockSsz(self: *Self, root: types.Root, ssz_bytes: []u8) !void {
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
         const gop = try self.fetched_block_ssz.getOrPut(root);
         if (gop.found_existing) {
             self.allocator.free(gop.value_ptr.*);
@@ -361,6 +467,11 @@ pub const Network = struct {
     }
 
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
+        // Atomic across the three block-cache maps (same reason as
+        // `cacheFetchedBlock`).
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
+
         if (self.fetched_block_ssz.fetchRemove(root)) |ssz_entry| {
             self.allocator.free(ssz_entry.value);
         }
@@ -394,7 +505,14 @@ pub const Network = struct {
 
     /// Returns the cached children of the given parent block root.
     /// This is O(1) lookup instead of iterating over all fetched blocks.
+    /// NOTE: returns a slice into the underlying map. Callers MUST NOT
+    /// hold the slice across calls to `cacheFetchedBlock` /
+    /// `removeFetchedBlock` / `pruneCachedBlocks` from another thread —
+    /// the slice's backing storage may be freed. Today's callers consume
+    /// the slice synchronously.
     pub fn getChildrenOfBlock(self: *Self, parent_root: types.Root) []const types.Root {
+        self.block_cache_lock.lock();
+        defer self.block_cache_lock.unlock();
         if (self.fetched_block_children.get(parent_root)) |children_list| {
             return children_list.items;
         }
@@ -486,13 +604,17 @@ pub const Network = struct {
 
         const request_id = try self.sendStatus(peer_id, status, handler);
 
-        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
-            .request = pending,
-            .created_at = std.time.timestamp(),
-        }) catch |err| {
-            pending.deinit(self.allocator);
-            return err;
-        };
+        {
+            self.pending_rpc_lock.lock();
+            defer self.pending_rpc_lock.unlock();
+            self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+                .request = pending,
+                .created_at = std.time.timestamp(),
+            }) catch |err| {
+                pending.deinit(self.allocator);
+                return err;
+            };
+        }
 
         pending_owned = true;
 
@@ -541,13 +663,17 @@ pub const Network = struct {
             return err;
         };
 
-        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
-            .request = pending,
-            .created_at = std.time.timestamp(),
-        }) catch |err| {
-            pending.deinit(self.allocator);
-            return err;
-        };
+        {
+            self.pending_rpc_lock.lock();
+            defer self.pending_rpc_lock.unlock();
+            self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+                .request = pending,
+                .created_at = std.time.timestamp(),
+            }) catch |err| {
+                pending.deinit(self.allocator);
+                return err;
+            };
+        }
 
         pending_owned = true;
 
@@ -583,11 +709,33 @@ pub const Network = struct {
     }
 
     pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPCEntry {
+        // NOTE: returns a pointer into the pending-rpc map. Caller MUST
+        // synchronously consume the pointer before any thread can call
+        // `finalizePendingRequest` on the same id. Today's callers (RPC
+        // response dispatch on the libp2p worker thread) use the pointer
+        // inside the same callback that owns it.
+        self.pending_rpc_lock.lock();
+        defer self.pending_rpc_lock.unlock();
         return self.pending_rpc_requests.getPtr(request_id);
     }
 
     pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
+        // Two locks held briefly in tier-2 order: pending_rpc_lock for the
+        // iteration, timed_out_lock for the buffer. Sibling tier-2 locks
+        // are normally NOT held simultaneously; this is the one place that
+        // legitimately needs both — the iteration produces the buffer
+        // contents. We acquire pending_rpc first, mutate timed_out under
+        // timed_out_lock per-append, and release pending_rpc before
+        // returning. Held order is consistent across the function.
+        self.timed_out_lock.lock();
         self.timed_out_requests.clearAndFree(self.allocator);
+        self.timed_out_lock.unlock();
+
+        self.pending_rpc_lock.lock();
+        defer self.pending_rpc_lock.unlock();
+        self.timed_out_lock.lock();
+        defer self.timed_out_lock.unlock();
+
         var it = self.pending_rpc_requests.iterator();
         while (it.next()) |entry| {
             if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
@@ -598,8 +746,19 @@ pub const Network = struct {
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {
-        if (self.pending_rpc_requests.fetchRemove(request_id)) |entry| {
-            var rpc_entry = entry.value;
+        // Two-phase to respect lock hierarchy: pending_rpc first (collect
+        // the entry under its lock), then pending_block_roots (remove
+        // associated roots under its lock). Avoids holding both
+        // simultaneously.
+        var rpc_entry_opt: ?PendingRPCEntry = null;
+        {
+            self.pending_rpc_lock.lock();
+            defer self.pending_rpc_lock.unlock();
+            if (self.pending_rpc_requests.fetchRemove(request_id)) |kv| {
+                rpc_entry_opt = kv.value;
+            }
+        }
+        if (rpc_entry_opt) |*rpc_entry| {
             switch (rpc_entry.request) {
                 .blocks_by_root => |block_ctx| {
                     for (block_ctx.requested_roots) |root| {
