@@ -225,9 +225,18 @@ pub const BeamChain = struct {
 
         /// Materialise an owned copy and drop the borrow. Caller owns the
         /// returned `*types.BeamState` and must call `deinit` + `destroy`
-        /// it via the same allocator. Releases the borrow on success and
-        /// on the failure paths inside `sszClone` (errdefer guarantees).
+        /// it via the same allocator.
+        ///
+        /// **Always releases the borrow.** Whether `allocator.create` /
+        /// `sszClone` succeed or fail, the underlying `states_lock.shared`
+        /// is unlocked before this function returns. Callers therefore
+        /// MUST NOT call `deinit` on the borrow after `cloneAndRelease` —
+        /// the debug assertion in `deinit` would fire.
         pub fn cloneAndRelease(self: *BorrowedState, allocator: Allocator) !*types.BeamState {
+            // Release the borrow's shared lock on every exit path (success
+            // or error). The owned copy is independent of the state map,
+            // so we don't need the lock past the sszClone return.
+            errdefer self.deinit();
             const owned = try allocator.create(types.BeamState);
             errdefer allocator.destroy(owned);
             try types.sszClone(allocator, types.BeamState, self.state.*, owned);
@@ -342,6 +351,36 @@ pub const BeamChain = struct {
             .state = state,
             .states_lock = &self.states_lock,
         };
+    }
+
+    /// Take `states_lock.exclusive` and put `state_ptr` under `root`. Caller
+    /// transfers ownership of `state_ptr` to the chain — the state will be
+    /// freed by `deinit` or by a future prune/remove call. If a state
+    /// already exists under `root`, the previous pointer is leaked (callers
+    /// should not put twice; use `replaceState` for explicit-overwrite
+    /// semantics if it ever becomes a real use case).
+    pub fn putState(self: *Self, root: types.Root, state_ptr: *types.BeamState) !void {
+        self.states_lock.lock();
+        defer self.states_lock.unlock();
+        try self.states.put(root, state_ptr);
+    }
+
+    /// Take `states_lock.exclusive` and remove the state under `root`,
+    /// returning the previously-stored pointer (caller assumes ownership
+    /// for `deinit`/`destroy`). Returns `null` if absent.
+    pub fn fetchRemoveState(self: *Self, root: types.Root) ?*types.BeamState {
+        self.states_lock.lock();
+        defer self.states_lock.unlock();
+        if (self.states.fetchRemove(root)) |kv| return kv.value;
+        return null;
+    }
+
+    /// Snapshot the current states-map size under shared lock. Use only for
+    /// metrics / logging; the value is stale immediately after return.
+    pub fn statesCount(self: *Self) u32 {
+        self.states_lock.lockShared();
+        defer self.states_lock.unlockShared();
+        return self.states.count();
     }
 
     pub fn deinit(self: *Self) void {
@@ -577,17 +616,23 @@ pub const BeamChain = struct {
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
         const parent_root = proposal_head.root;
 
-        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
-        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
+        // Borrow → owned snapshot (issue #786 req. 1). The proposal-attestations
+        // build + STF runs ~826ms total per #786 metrics; releasing
+        // states_lock.shared early lets concurrent gossip block commits
+        // proceed. `post_state.validators` / checkpoints equal `pre_state`'s
+        // until `apply_raw_block` runs, so passing `post_state` to
+        // `getProposalAttestations` (instead of the live pre_state pointer)
+        // is semantically identical and removes the live-state dependency.
+        var pre_borrow = self.borrowState(parent_root) orelse return BlockProductionError.MissingPreState;
+        var post_state_opt: ?*types.BeamState = pre_borrow.cloneAndRelease(self.allocator) catch |e| return e;
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
             self.allocator.destroy(post_state_ptr);
         };
         const post_state = post_state_opt.?;
-        try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
+        const proposal_atts = try self.forkChoice.getProposalAttestations(post_state, opts.slot, opts.proposer_index, parent_root);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -1039,24 +1084,26 @@ pub const BeamChain = struct {
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
-            // 1. get parent state
-            const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
-            const cpost_state = try self.allocator.create(types.BeamState);
-            // If sszClone or anything after fails, destroy the outer allocation.
-            errdefer self.allocator.destroy(cpost_state);
+            // 1. Borrow parent state, clone into cpost_state, release the
+            // borrow. After this point the unlocked verify+STF runs against
+            // the local clone — pre_state pointer is not needed (validators
+            // / checkpoints in cpost_state are byte-identical at clone time
+            // because STF has not run yet). See issue #786 req. 1.
+            var pre_borrow = self.borrowState(block.parent_root) orelse return BlockProcessingError.MissingPreState;
+            const cpost_state = pre_borrow.cloneAndRelease(self.allocator) catch |e| return e;
+            // If anything below fails, deinit interior + destroy.
+            errdefer {
+                cpost_state.deinit();
+                self.allocator.destroy(cpost_state);
+            }
 
-            try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
-            // sszClone succeeded — interior heap fields are now allocated.
-            // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
-            errdefer cpost_state.deinit();
-
-            // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
-            // rejected without mutating post state). Uses the shared thread pool when available to
-            // parallelize per-attestation verification across CPU workers.
+            // 2. verify XMSS signatures against the cloned snapshot (no live
+            // state-map pointer used; safe even if a concurrent prune
+            // removes the parent state during verify).
             if (self.thread_pool) |pool| {
-                try stf.verifySignaturesParallel(self.allocator, pre_state, &signedBlock, &self.public_key_cache, pool);
+                try stf.verifySignaturesParallel(self.allocator, cpost_state, &signedBlock, &self.public_key_cache, pool);
             } else {
-                try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+                try stf.verifySignatures(self.allocator, cpost_state, &signedBlock, &self.public_key_cache);
             }
 
             // 3. apply state transition assuming signatures are valid (STF does not re-verify)
@@ -1696,11 +1743,19 @@ pub const BeamChain = struct {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
 
-        const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        // Borrow the target state via BorrowedState (issue #786 req. 1).
+        // verifySingleAttestation reads `state.validators` only — short
+        // borrow is sufficient. The XMSS verify FFI itself is the slow
+        // step but it runs on a slice into the state, so we keep the
+        // borrow alive across it. If this turns into measurable
+        // contention on states_lock under aggregator-heavy load, switch
+        // to `cloneAndRelease` here.
+        var borrow = self.borrowState(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        defer borrow.deinit();
 
         try stf.verifySingleAttestation(
             self.allocator,
-            state,
+            borrow.state,
             @intCast(signedAttestation.message.validator_id),
             &signedAttestation.message.message,
             &signedAttestation.message.signature,
@@ -1747,21 +1802,28 @@ pub const BeamChain = struct {
         var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        const key_state = self.states.get(data.target.root) orelse return error.MissingState;
-        const validators = key_state.validators.constSlice();
-
+        // Borrow the target state. Pubkey handles cached in
+        // `public_key_cache` are stable across the cache lifetime (Rust-side
+        // memory), so we can release the state borrow once handles are
+        // collected — before the FFI verify call. This minimises
+        // states_lock.shared hold time.
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.items.len);
         defer public_keys.deinit(self.allocator);
+        {
+            var borrow = self.borrowState(data.target.root) orelse return error.MissingState;
+            defer borrow.deinit();
+            const validators = borrow.state.validators.constSlice();
 
-        for (validator_indices.items) |validator_index| {
-            if (validator_index >= validators.len) {
-                return error.InvalidValidatorId;
+            for (validator_indices.items) |validator_index| {
+                if (validator_index >= validators.len) {
+                    return error.InvalidValidatorId;
+                }
+                const pubkey_bytes = validators[validator_index].getAttestationPubkey();
+                const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
+                    return error.InvalidBlockSignatures;
+                };
+                try public_keys.append(self.allocator, pk_handle);
             }
-            const pubkey_bytes = validators[validator_index].getAttestationPubkey();
-            const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
-                return error.InvalidBlockSignatures;
-            };
-            try public_keys.append(self.allocator, pk_handle);
         }
 
         var message_hash: [32]u8 = undefined;
@@ -1774,9 +1836,26 @@ pub const BeamChain = struct {
     }
 
     pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
-        const head_root = self.forkChoice.head.blockRoot;
-        const state = self.states.get(head_root) orelse return error.MissingState;
-        return self.forkChoice.aggregate(state);
+        // Snapshot-then-release (issue #786 req. 1 + 2): forkchoice.aggregate
+        // runs a ~700ms FFI over `state.validators`. Holding states_lock.shared
+        // for that whole window blocks every concurrent gossip block commit.
+        // Clone the state under the brief borrow, release the lock, then
+        // hand the owned snapshot to the FFI.
+        //
+        // `head_root` snapshot is taken via forkchoice's own RwLock at the
+        // call site below; reading the field directly is safe because we
+        // only need a single u256 value, not a coherent multi-field view.
+        const head_root = self.forkChoice.getHead().blockRoot;
+        var borrow = self.borrowState(head_root) orelse return error.MissingState;
+        // cloneAndRelease unconditionally releases the borrow on every exit
+        // path. Caller MUST NOT call `borrow.deinit()` after this — the
+        // debug-build double-release assertion would fire.
+        const owned_state = try borrow.cloneAndRelease(self.allocator);
+        defer {
+            owned_state.deinit();
+            self.allocator.destroy(owned_state);
+        }
+        return self.forkChoice.aggregate(owned_state);
     }
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
