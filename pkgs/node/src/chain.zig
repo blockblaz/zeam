@@ -1513,7 +1513,7 @@ pub const BeamChain = struct {
     /// Update block database with block, state, and slot indices.
     /// `signed_block_ssz` must be the SSZ encoding of `SignedBlock` (see onBlock).
     fn updateBlockDb(self: *Self, signed_block_ssz: []const u8, blockRoot: types.Root, postState: types.BeamState, slot: types.Slot) !void {
-        var batch = self.db.initWriteBatch();
+        var batch = try self.db.initWriteBatch();
         defer batch.deinit();
 
         // Store block and state
@@ -1538,7 +1538,7 @@ pub const BeamChain = struct {
         //     batch.putUnfinalizedSlotIndex(database.DbUnfinalizedSlotsNamespace, slot, updated_blockroots.items);
         // }
 
-        self.db.commit(&batch);
+        try self.db.commit(&batch);
     }
 
     /// Prune old non-canonical states from memory
@@ -1588,7 +1588,7 @@ pub const BeamChain = struct {
 
     /// Process finalization advancement: move canonical blocks to finalized index and cleanup unfinalized indices
     fn processFinalizationAdvancement(self: *Self, previousFinalized: types.Checkpoint, latestFinalized: types.Checkpoint, pruneForkchoice: bool) !void {
-        var batch = self.db.initWriteBatch();
+        var batch = try self.db.initWriteBatch();
         defer batch.deinit();
 
         self.logger.debug("processing finalization advancement from slot={d} to slot={d}", .{ previousFinalized.slot, latestFinalized.slot });
@@ -1649,7 +1649,7 @@ pub const BeamChain = struct {
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, latestFinalized.slot);
 
         // 3. commit all batch ops for finalized indices before we prune
-        self.db.commit(&batch);
+        try self.db.commit(&batch);
 
         // 4. Prunestates from memory
         // Get all canonical blocks from finalized to head (not just newly finalized)
