@@ -108,7 +108,7 @@ pub const NodeTestContext = struct {
             },
         };
 
-        var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop);
+        var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, &loop, logger_config);
         errdefer clock.deinit(allocator);
 
         return NodeTestContext{

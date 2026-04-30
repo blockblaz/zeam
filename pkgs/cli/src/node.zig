@@ -19,6 +19,8 @@ const node_lib = @import("@zeam/node");
 const key_manager_lib = @import("@zeam/key-manager");
 const Clock = node_lib.Clock;
 const BeamNode = node_lib.BeamNode;
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
+const xmss = @import("@zeam/xmss");
 const types = @import("@zeam/types");
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const NodeCommand = @import("main.zig").NodeCommand;
@@ -91,6 +93,7 @@ pub const NodeOptions = struct {
     checkpoint_sync_url: ?[]const u8 = null,
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
+    db_backend: database.Backend = .rocksdb,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -140,6 +143,8 @@ pub const Node = struct {
     api_server_handle: ?*api_server.ApiServer,
     metrics_server_handle: ?*metrics_server.MetricsServer,
     anchor_state: *types.BeamState,
+    /// Shared worker pool for CPU-bound chain work (attestation signature verification).
+    thread_pool: *ThreadPool,
 
     const Self = @This();
 
@@ -156,18 +161,25 @@ pub const Node = struct {
         database_path: []const u8,
         logger_config: *LoggerConfig,
         logger: zeam_utils.ModuleLogger,
+        backend: database.Backend,
         ignore_not_found: bool,
     ) !void {
         db.deinit();
-        const rocksdb_path = try std.fmt.allocPrint(allocator, "{s}/rocksdb", .{database_path});
-        defer allocator.free(rocksdb_path);
-        std.fs.deleteTreeAbsolute(rocksdb_path) catch |wipe_err| {
+        // Both backends store their working set under the same base
+        // directory; deleting it yields a clean slate for either engine.
+        const backend_dir = switch (backend) {
+            .rocksdb => "rocksdb",
+            .lmdb => "lmdb",
+        };
+        const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ database_path, backend_dir });
+        defer allocator.free(db_path);
+        std.fs.deleteTreeAbsolute(db_path) catch |wipe_err| {
             if (!ignore_not_found or wipe_err != error.FileNotFound) {
-                logger.err("failed to delete database directory '{s}': {any}", .{ rocksdb_path, wipe_err });
+                logger.err("failed to delete database directory '{s}': {any}", .{ db_path, wipe_err });
                 return wipe_err;
             }
         };
-        db.* = try database.Db.open(allocator, logger_config.logger(.database), database_path);
+        db.* = try database.Db.openBackend(allocator, logger_config.logger(.database), database_path, backend);
     }
 
     pub fn init(
@@ -227,10 +239,15 @@ pub const Node = struct {
             .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
-        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop);
+        self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
         errdefer self.clock.deinit(allocator);
 
-        var db = try database.Db.open(allocator, options.logger_config.logger(.database), options.database_path);
+        var db = try database.Db.openBackend(
+            allocator,
+            options.logger_config.logger(.database),
+            options.database_path,
+            options.db_backend,
+        );
         errdefer db.deinit();
 
         self.logger = options.logger_config.logger(.node);
@@ -248,7 +265,7 @@ pub const Node = struct {
                     local_finalized_state.config.genesis_time,
                     chain_config.genesis.genesis_time,
                 });
-                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, false);
+                try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, false);
                 self.logger.info("stale database wiped, starting fresh & generating genesis", .{});
 
                 local_finalized_state.deinit();
@@ -259,7 +276,7 @@ pub const Node = struct {
         } else |_| {
             self.logger.info("no finalized state found in db, wiping database for a clean slate", .{});
             // ignore_not_found=true: db dir may not exist yet on a fresh install
-            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, true);
+            try wipeAndReopenDb(&db, allocator, options.database_path, options.logger_config, self.logger, options.db_backend, true);
             self.logger.info("starting fresh & generating genesis", .{});
             try self.anchor_state.genGenesisState(allocator, chain_config.genesis);
         }
@@ -307,6 +324,26 @@ pub const Node = struct {
             zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
         }
 
+        const cpu_count = std.Thread.getCpuCount() catch 2;
+        const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
+        const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
+        const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+        self.thread_pool = try ThreadPool.init(.{
+            .allocator = allocator,
+            .thread_count = @intCast(worker_count),
+        });
+        errdefer self.thread_pool.deinit();
+
+        // Pre-warm the XMSS verifier on the main thread before any worker can
+        // call `verifyAggregatedPayload`. The Rust-side verifier setup is
+        // documented as idempotent but is not hardened against first-time-init
+        // races between concurrent callers; doing it once here removes that
+        // race regardless of the Rust implementation.
+        xmss.setupVerifier() catch |err| {
+            self.thread_pool.deinit();
+            return err;
+        };
+
         try self.beam_node.init(allocator, .{
             .nodeId = @intCast(options.node_key_index),
             .config = chain_config,
@@ -320,6 +357,7 @@ pub const Node = struct {
             .node_registry = options.node_registry,
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
+            .thread_pool = self.thread_pool,
         });
         errdefer self.beam_node.deinit();
 
@@ -379,6 +417,7 @@ pub const Node = struct {
         }
         self.clock.deinit(self.allocator);
         self.beam_node.deinit();
+        self.thread_pool.deinit();
         self.key_manager.deinit();
         self.network.deinit();
         self.enr.deinit();

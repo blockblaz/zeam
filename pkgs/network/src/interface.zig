@@ -60,7 +60,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
+    publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!bool,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
@@ -73,7 +73,12 @@ pub const GossipSub = struct {
         return self.subscribeFn(self.ptr, topics, handler);
     }
 
-    pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!void {
+    /// Publish a gossip message. Returns `true` if the message was successfully
+    /// handed off to the underlying transport (and is therefore expected to
+    /// reach the network), `false` if the publish was dropped (e.g. backend
+    /// command channel full, see issue #808). Callers should not log the
+    /// publish as successful when this returns `false`.
+    pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!bool {
         return self.publishFn(self.ptr, obj);
     }
 };

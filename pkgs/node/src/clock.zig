@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const xev = @import("xev").Dynamic;
+const zeam_metrics = @import("@zeam/metrics");
+const zeam_utils = @import("@zeam/utils");
 
 const constants = @import("./constants.zig");
 
@@ -14,12 +16,14 @@ pub const Clock = struct {
     genesis_time_ms: isize,
     current_interval_time_ms: isize,
     current_interval: isize,
+    last_tick_time_ms: ?isize,
     events: utils.EventLoop,
     // track those who subscribed for on slot callbacks
     on_interval_cbs: std.ArrayList(*OnIntervalCbWrapper),
     allocator: Allocator,
 
     timer: xev.Timer,
+    logger: zeam_utils.ModuleLogger,
 
     const Self = @This();
 
@@ -31,6 +35,7 @@ pub const Clock = struct {
         allocator: Allocator,
         genesis_time: usize,
         loop: *xev.Loop,
+        logger_config: *const zeam_utils.ZeamLoggerConfig,
     ) !Self {
         const events = try utils.EventLoop.init(loop);
         const timer = try xev.Timer.init();
@@ -43,10 +48,12 @@ pub const Clock = struct {
             .genesis_time_ms = genesis_time_ms,
             .current_interval_time_ms = current_interval_time_ms,
             .current_interval = current_interval,
+            .last_tick_time_ms = null,
             .events = events,
             .timer = timer,
             .on_interval_cbs = .empty,
             .allocator = allocator,
+            .logger = logger_config.logger(.clock),
         };
     }
 
@@ -60,6 +67,12 @@ pub const Clock = struct {
 
     pub fn tickInterval(self: *Self) void {
         const time_now_ms: isize = @intCast(std.time.milliTimestamp());
+        if (self.last_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.lean_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ @mod(self.current_interval, constants.INTERVALS_PER_SLOT), elapsed_s });
+        }
+        self.last_tick_time_ms = time_now_ms;
         while (self.current_interval_time_ms + constants.SECONDS_PER_INTERVAL_MS < time_now_ms + CLOCK_DISPARITY_MS) {
             self.current_interval_time_ms += constants.SECONDS_PER_INTERVAL_MS;
             self.current_interval += 1;

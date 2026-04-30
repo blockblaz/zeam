@@ -122,6 +122,12 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     }).module("bindings");
 
+    // add lmdb (external dep: github.com/blockblaz/lmdb-zig)
+    const lmdb = b.dependency("lmdb", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lmdb");
+
     // add snappyz
     const snappyz = b.dependency("zig_snappy", .{
         .target = target,
@@ -180,6 +186,13 @@ pub fn build(b: *Builder) !void {
         .optimize = optimize,
     });
     zeam_metrics.addImport("metrics", metrics);
+
+    // add zeam-thread-pool (work-stealing thread pool, zero dependencies)
+    const thread_pool_dep = b.dependency("thread_pool", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zeam_thread_pool = thread_pool_dep.module("thread-pool");
 
     // add zeam-xmss
     const zeam_xmss = b.addModule("@zeam/xmss", .{
@@ -249,6 +262,9 @@ pub fn build(b: *Builder) !void {
     zeam_state_transition.addImport("@zeam/xmss", zeam_xmss);
     zeam_state_transition.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_state_transition.addImport("@zeam/metrics", zeam_metrics);
+    // Used only by the host-side benchmark test; zkVM builds instantiate their own
+    // state-transition module further below without this import.
+    zeam_state_transition.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     // add state proving manager
     const zeam_state_proving_manager = b.addModule("@zeam/state-proving-manager", .{
@@ -281,6 +297,7 @@ pub fn build(b: *Builder) !void {
         .root_source_file = b.path("pkgs/database/src/lib.zig"),
     });
     zeam_database.addImport("rocksdb", rocksdb);
+    zeam_database.addImport("lmdb", lmdb);
     zeam_database.addImport("ssz", ssz);
     zeam_database.addImport("@zeam/utils", zeam_utils);
     zeam_database.addImport("@zeam/types", zeam_types);
@@ -321,6 +338,7 @@ pub fn build(b: *Builder) !void {
     zeam_beam_node.addImport("@zeam/api", zeam_api);
     zeam_beam_node.addImport("@zeam/key-manager", zeam_key_manager);
     zeam_beam_node.addImport("@zeam/xmss", zeam_xmss);
+    zeam_beam_node.addImport("@zeam/thread-pool", zeam_thread_pool);
 
     const zeam_spectests = b.addModule("zeam_spectests", .{
         .target = target,
@@ -371,6 +389,7 @@ pub fn build(b: *Builder) !void {
     cli_exe.root_module.addImport("@zeam/node", zeam_beam_node);
     cli_exe.root_module.addImport("@zeam/api", zeam_api);
     cli_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    cli_exe.root_module.addImport("@zeam/thread-pool", zeam_thread_pool);
     cli_exe.root_module.addImport("metrics", metrics);
     cli_exe.root_module.addImport("multiformats", multiformats);
     cli_exe.root_module.addImport("multiaddr", multiaddr_mod);
@@ -553,6 +572,13 @@ pub fn build(b: *Builder) !void {
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
+
+    const lmdb_tests = b.addTest(.{
+        .root_module = lmdb,
+    });
+    const run_lmdb_tests = b.addRunArtifact(lmdb_tests);
+    setTestRunLabelFromCompile(b, run_lmdb_tests, lmdb_tests);
+    test_step.dependOn(&run_lmdb_tests.step);
 
     const api_tests = b.addTest(.{
         .root_module = zeam_api,

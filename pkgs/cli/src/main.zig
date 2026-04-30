@@ -19,6 +19,7 @@ const node_lib = @import("@zeam/node");
 const Clock = node_lib.Clock;
 const state_proving_manager = @import("@zeam/state-proving-manager");
 const BeamNode = node_lib.BeamNode;
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 const xev = @import("xev").Dynamic;
 const Multiaddr = @import("multiaddr").Multiaddr;
 
@@ -73,6 +74,7 @@ pub const NodeCommand = struct {
     @"is-aggregator": bool = false,
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
+    @"db-backend": database.Backend = .rocksdb,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -95,6 +97,7 @@ pub const NodeCommand = struct {
         .@"is-aggregator" = "Seed the node's aggregator role on startup. The role can be toggled at runtime via POST /lean/v0/admin/aggregator.",
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
+        .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
         .help = "Show help information for the node command",
     };
 };
@@ -106,14 +109,16 @@ const BeamCmd = struct {
     @"metrics-port": u16 = constants.DEFAULT_METRICS_PORT,
     data_dir: []const u8 = constants.DEFAULT_DATA_DIR,
     @"is-aggregator": bool = true,
+    @"db-backend": database.Backend = .rocksdb,
 
     pub fn format(self: BeamCmd, writer: anytype) !void {
-        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={} }}", .{
+        try writer.print("BeamCmd{{ mockNetwork={}, api-port={d}, metrics-port={d}, data_dir=\"{s}\", is-aggregator={}, db-backend={s} }}", .{
             self.mockNetwork,
             self.@"api-port",
             self.@"metrics-port",
             self.data_dir,
             self.@"is-aggregator",
+            @tagName(self.@"db-backend"),
         });
     }
 };
@@ -293,7 +298,8 @@ fn mainInner() !void {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
                 return err;
             };
-            var clock = Clock.init(gpa.allocator(), genesis, &loop) catch |err| {
+            var clock_logger_config = utils_lib.getLoggerConfig(console_log_level, null);
+            var clock = Clock.init(gpa.allocator(), genesis, &loop, &clock_logger_config) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize clock");
                 return err;
             };
@@ -582,7 +588,30 @@ fn mainInner() !void {
             }
 
             var clock = try allocator.create(Clock);
-            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop);
+            clock.* = try Clock.init(allocator, chain_config.genesis.genesis_time, loop, &logger1_config);
+
+            // Shared worker pool for CPU-bound chain work (attestation signature verification).
+            // One pool is shared across all nodes in the process so total worker threads stay bounded
+            // regardless of the number of nodes in the simulation.
+            const cpu_count = std.Thread.getCpuCount() catch 2;
+            const reserved_system_threads: usize = 4; // main, p2p, api server, metrics server
+            const desired_workers = @max(@as(usize, 1), cpu_count -| reserved_system_threads);
+            const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
+            const thread_pool = try ThreadPool.init(.{
+                .allocator = allocator,
+                .thread_count = @intCast(worker_count),
+            });
+            defer thread_pool.deinit();
+
+            // Pre-warm the XMSS verifier on the main thread before any worker
+            // can call `verifyAggregatedPayload`. The Rust-side verifier setup
+            // is documented as idempotent but is not hardened against
+            // first-time-init races between concurrent callers; doing it once
+            // here removes that race regardless of the Rust implementation.
+            xmss.setupVerifier() catch |err| {
+                std.debug.print("xmss.setupVerifier failed: {any}\n", .{err});
+                return err;
+            };
 
             // 3-node setup: validators 0,1 start immediately; validator 2 (node 3) starts after finalization
             var validator_ids_1 = [_]usize{0};
@@ -596,11 +625,12 @@ fn mainInner() !void {
             const data_dir_3 = try std.fmt.allocPrint(allocator, "{s}/node3", .{beamcmd.data_dir});
             defer allocator.free(data_dir_3);
 
-            var db_1 = try database.Db.open(allocator, logger1_config.logger(.database), data_dir_1);
+            const db_backend = beamcmd.@"db-backend";
+            var db_1 = try database.Db.openBackend(allocator, logger1_config.logger(.database), data_dir_1, db_backend);
             defer db_1.deinit();
-            var db_2 = try database.Db.open(allocator, logger2_config.logger(.database), data_dir_2);
+            var db_2 = try database.Db.openBackend(allocator, logger2_config.logger(.database), data_dir_2, db_backend);
             defer db_2.deinit();
-            var db_3 = try database.Db.open(allocator, logger3_config.logger(.database), data_dir_3);
+            var db_3 = try database.Db.openBackend(allocator, logger3_config.logger(.database), data_dir_3, db_backend);
             defer db_3.deinit();
 
             // Use the same shared registry for all beam nodes
@@ -622,6 +652,7 @@ fn mainInner() !void {
                 .logger_config = &logger1_config,
                 .node_registry = registry_1,
                 .is_aggregator = beamcmd.@"is-aggregator",
+                .thread_pool = thread_pool,
             });
 
             if (api_server_handle) |handle| {
@@ -642,6 +673,7 @@ fn mainInner() !void {
                 .logger_config = &logger2_config,
                 .node_registry = registry_2,
                 .is_aggregator = false,
+                .thread_pool = thread_pool,
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -660,6 +692,7 @@ fn mainInner() !void {
                 .logger_config = &logger3_config,
                 .node_registry = registry_3,
                 .is_aggregator = false,
+                .thread_pool = thread_pool,
             });
 
             // Delayed runner - starts both network3 and node3 together
@@ -779,6 +812,7 @@ fn mainInner() !void {
                 .database_path = leancmd.@"data-dir",
                 .hash_sig_key_dir = &.{}, // Initialize to empty slice to avoid segfault in deinit
                 .node_registry = node_registry,
+                .db_backend = leancmd.@"db-backend",
             };
 
             defer start_options.deinit(allocator);
