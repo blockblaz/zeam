@@ -30,7 +30,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
 
         const Self = @This();
 
-        const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
+        const OpenError = anyerror;
 
         /// Default map size for newly-created environments. LMDB
         /// reserves the corresponding amount of virtual address space
@@ -45,6 +45,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing LMDB", .{});
+            const io = std.Io.Threaded.global_single_threaded.io();
 
             comptime {
                 if (column_namespaces.len == 0 or !std.mem.eql(u8, column_namespaces[0].namespace, "default")) {
@@ -54,7 +55,7 @@ pub fn Lmdb(comptime column_namespaces: []const ColumnNamespace) type {
 
             const owned_path = try std.fmt.allocPrintSentinel(allocator, "{s}/lmdb", .{path}, 0);
             errdefer allocator.free(owned_path);
-            try std.fs.cwd().makePath(owned_path);
+            try std.Io.Dir.cwd().createDirPath(io, owned_path);
 
             var env = lmdb.Env.open(owned_path, .{
                 .map_size = DEFAULT_MAP_SIZE,
