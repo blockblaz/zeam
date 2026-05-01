@@ -66,6 +66,14 @@ const Metrics = struct {
     // refresher — see `registerScrapeRefresher` and the network-layer
     // implementation in `pkgs/network/src/ethlibp2p.zig`.
     zeam_libp2p_swarm_command_dropped_total: LibP2pSwarmCommandDroppedCounter,
+    // leanMetrics PR #35: number of remote peers in the gossipsub mesh
+    // across all subscribed topics. Refreshed from a Rust-side atomic on
+    // every scrape via a registered refresher — see
+    // `registerScrapeRefresher` and the network-layer implementation in
+    // `pkgs/network/src/ethlibp2p.zig`. TODO: per-remote-peer label scheme
+    // (matching `lean_connected_peers`) requires subscribing to gossipsub
+    // Subscribed/Unsubscribed events; left as follow-up work.
+    lean_gossip_mesh_peers: LeanGossipMeshPeersGauge,
     // Node lifecycle metrics
     lean_node_info: LeanNodeInfoGauge,
     lean_node_start_time_seconds: LeanNodeStartTimeGauge,
@@ -148,6 +156,7 @@ const Metrics = struct {
     const PeerConnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, result: []const u8 });
     const PeerDisconnectionEventsCounter = metrics_lib.CounterVec(u64, struct { direction: []const u8, reason: []const u8 });
     const LibP2pSwarmCommandDroppedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const LeanGossipMeshPeersGauge = metrics_lib.Gauge(u64);
     // Node lifecycle metric types
     const LeanNodeInfoGauge = metrics_lib.GaugeVec(u64, struct { name: []const u8, version: []const u8 });
     const LeanNodeStartTimeGauge = metrics_lib.Gauge(u64);
@@ -506,6 +515,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
         .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
         .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
+        .lean_gossip_mesh_peers = Metrics.LeanGossipMeshPeersGauge.init("lean_gossip_mesh_peers", .{ .help = "Number of peers in the gossipsub mesh" }, .{}),
         // Node lifecycle metrics
         .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
         .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
