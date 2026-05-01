@@ -98,7 +98,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
+    zig build --seed 0 -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
 
 # rec_aggregation's compilation.rs reads .py source files at runtime to verify
 # a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at compile time).
