@@ -1647,9 +1647,10 @@ pub const ForkChoice = struct {
             // we will use parent block later as per the finalization gadget
             _ = parent_block;
 
-            if (slot * constants.INTERVALS_PER_SLOT > self.fcStore.slot_clock.time.load(.monotonic)) {
-                return ForkChoiceError.FutureSlot;
-            } else if (slot < self.fcStore.latest_finalized.slot) {
+            // Block admission only requires a known parent and a slot above
+            // the finalized boundary; STF and signature verification are the
+            // gating layers.
+            if (slot < self.fcStore.latest_finalized.slot) {
                 return ForkChoiceError.PreFinalizedSlot;
             }
 
@@ -1919,6 +1920,15 @@ pub const ForkChoice = struct {
         return self.protoArray.nodes.items[idx];
     }
 
+    /// Get a ProtoNode's index in the underlying nodes array. Callers use
+    /// this to measure how many nodes precede a given block (e.g. to gate
+    /// proto-array rebase on a grace-window threshold).
+    pub fn getProtoNodeIndex(self: *Self, blockRoot: types.Root) ?usize {
+        self.mutex.lockShared();
+        defer self.mutex.unlockShared();
+        return self.protoArray.indices.get(blockRoot);
+    }
+
     /// Get the current number of nodes in the forkchoice tree
     pub fn getNodeCount(self: *Self) usize {
         self.mutex.lockShared();
@@ -1930,7 +1940,6 @@ pub const ForkChoice = struct {
 pub const ForkChoiceError = error{
     NotImplemented,
     UnknownParent,
-    FutureSlot,
     InvalidFutureAttestation,
     InvalidOnChainAttestation,
     PreFinalizedSlot,
@@ -1993,11 +2002,8 @@ test "forkchoice block tree" {
         const block = signed_block.block;
         try stf.apply_transition(allocator, &beam_state, block, .{ .logger = module_logger });
 
-        // shouldn't accept a future slot
-        const current_slot = block.slot;
-        try std.testing.expectError(error.FutureSlot, fork_choice.onBlock(block, &beam_state, .{ .currentSlot = current_slot, .blockDelayMs = 0, .confirmed = true }));
-
-        try fork_choice.onInterval(current_slot * constants.INTERVALS_PER_SLOT, false);
+        // onBlock only requires a known parent and a non-pre-finalized slot.
+        try fork_choice.onInterval(block.slot * constants.INTERVALS_PER_SLOT, false);
         _ = try fork_choice.onBlock(block, &beam_state, .{ .currentSlot = block.slot, .blockDelayMs = 0, .confirmed = true });
         try std.testing.expect(fork_choice.protoArray.nodes.items.len == i + 1);
         try std.testing.expect(std.mem.eql(u8, &mock_chain.blockRoots[i], &fork_choice.protoArray.nodes.items[i].blockRoot));
