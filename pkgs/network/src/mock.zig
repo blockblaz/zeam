@@ -29,6 +29,13 @@ pub const Mock = struct {
     timer: xev.Timer,
     nextPeerIndex: usize,
     nextRequestId: u64,
+    /// Issue #808 review: when set to true, every `publish` call returns
+    /// `false` without invoking subscribers — simulating the rust-libp2p
+    /// command channel having dropped the publish. Lets the node-level
+    /// `failed to publish … (backend dropped publish)` warn arms in
+    /// `Node.publishBlock` / `publishAttestation` / `publishAggregation` be
+    /// exercised in tests without spinning up a real Rust bridge.
+    force_publish_drop: bool = false,
 
     const Self = @This();
 
@@ -256,7 +263,13 @@ pub const Mock = struct {
             .timer = timer,
             .nextPeerIndex = 0,
             .nextRequestId = 1,
+            .force_publish_drop = false,
         };
+    }
+
+    /// Issue #808 review knob: toggle the simulated drop on every publish.
+    pub fn setForcePublishDrop(self: *Self, drop: bool) void {
+        self.force_publish_drop = drop;
     }
 
     pub fn deinit(self: *Self) void {
@@ -608,9 +621,16 @@ pub const Mock = struct {
         self.finalizeServerStream(ctx);
     }
 
-    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!void {
+    pub fn publish(ptr: *anyopaque, data: *const interface.GossipMessage) anyerror!bool {
         // TODO: prevent from publishing to self handler
         const self: *Self = @ptrCast(@alignCast(ptr));
+        // Issue #808: when the test harness toggles `force_publish_drop`, behave
+        // like a real backend that dropped the publish (rust-libp2p command
+        // channel full): no subscriber invocation, return `false` so the
+        // caller exercises its drop-handling branch.
+        if (self.force_publish_drop) {
+            return false;
+        }
         // Try to find a valid peer_id from connected peers, otherwise use a default
         const sender_peer_id = blk: {
             // Find first peer with a valid peer_id
@@ -622,7 +642,10 @@ pub const Mock = struct {
             // Fallback to default if no peers found
             break :blk "mock_publisher";
         };
-        return self.gossipHandler.onGossip(data, sender_peer_id, true);
+        try self.gossipHandler.onGossip(data, sender_peer_id, true);
+        // Mock backend has no command channel, so the publish always reaches
+        // the local gossip handler synchronously.
+        return true;
     }
 
     pub fn subscribe(ptr: *anyopaque, topics: []interface.GossipTopic, handler: interface.OnGossipCbHandler) anyerror!void {
@@ -819,7 +842,8 @@ test "Mock messaging across two subscribers" {
     } };
 
     // Publish the message using the network interface - both subscribers should receive it
-    try network.gossip.publish(block_message);
+    const published = try network.gossip.publish(block_message);
+    try std.testing.expect(published);
 
     // Run the event loop to process scheduled callbacks
     try loop.run(.until_done);
@@ -844,6 +868,22 @@ test "Mock messaging across two subscribers" {
     try std.testing.expect(std.mem.eql(u8, &received1.block.block.state_root, &received2.block.block.state_root));
     try std.testing.expect(received1.block.block.slot == received2.block.block.slot);
     try std.testing.expect(received1.block.block.proposer_index == received2.block.block.proposer_index);
+
+    // ---- Issue #808 review #2: force_publish_drop coverage ----
+    // Reset subscriber call counters and toggle the drop knob: a subsequent
+    // publish must return false and must NOT invoke any subscriber. This
+    // gives the new `failed to publish … (backend dropped publish)` warn
+    // arms in `Node.publishBlock` / `publishAttestation` / `publishAggregation`
+    // an exercisable code path through the mock.
+    subscriber1.calls = 0;
+    subscriber2.calls = 0;
+    mock.setForcePublishDrop(true);
+    const dropped_publish = try network.gossip.publish(block_message);
+    try std.testing.expect(!dropped_publish);
+    try loop.run(.until_done);
+    try std.testing.expect(subscriber1.calls == 0);
+    try std.testing.expect(subscriber2.calls == 0);
+    mock.setForcePublishDrop(false);
 }
 
 test "Mock status RPC between peers" {

@@ -1,6 +1,9 @@
 const rocksDB = @import("./rocksdb.zig");
 pub const RocksDB = rocksDB.RocksDB;
 
+const lmdbBackend = @import("./lmdb.zig");
+pub const Lmdb = lmdbBackend.Lmdb;
+
 const interface = @import("./interface.zig");
 pub const formatBlockKey = interface.formatBlockKey;
 pub const formatStateKey = interface.formatStateKey;
@@ -21,6 +24,11 @@ pub const DbFinalizedSlotsNamespace = database.DbFinalizedSlotsNamespace;
 // TODO: uncomment this code if there is a need of slot to unfinalized index
 // pub const DbUnfinalizedSlotsNamespace = database.DbUnfinalizedSlotsNamespace;
 pub const Db = database.Db;
+pub const Backend = database.Backend;
+pub const RocksDbBackend = database.RocksDbBackend;
+pub const LmdbBackend = database.LmdbBackend;
+pub const WriteBatch = database.WriteBatch;
+pub const Iterator = database.Iterator;
 
 test "get tests" {
     @import("std").testing.refAllDeclsRecursive(@This());
