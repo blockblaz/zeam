@@ -40,11 +40,47 @@ use crate::req_resp::{
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
+/// Extension trait for `Mutex` that converts a poisoned-mutex `Err` into the
+/// inner guard rather than panicking.
+///
+/// Every Mutex in this crate protects a plain map, atomic counter, or simple
+/// state struct with no internal invariants — none of them care whether a
+/// previous panic occurred mid-update. Using `lock_recover` everywhere a
+/// previous version called `.lock_recover()` lets us avoid the dominant
+/// source of panic in this crate, which matters under the `risc0-release`
+/// and `openvm-release` profiles where `panic = "abort"` makes `catch_ffi`
+/// a no-op.
+trait MutexExt<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for std::sync::Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        match self.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Run a closure with `catch_unwind` so panics never unwind across the FFI
 /// boundary into Zig (which would be undefined behaviour). On panic the
 /// closure's return value is `None`; callers convert that to a sensible
 /// "failure" return for their FFI signature (e.g. `false` for a bool, `0`
 /// for a u64, no-op for a void).
+///
+/// **Profile caveat — `panic = "abort"` builds.** `cargo test --release` and
+/// the dummy-prover dev path both inherit the workspace default
+/// `panic = "unwind"`, so `catch_unwind` works as intended there. The
+/// `risc0-release` and `openvm-release` profiles in `rust/Cargo.toml` set
+/// `panic = "abort"` for binary-size reasons; under those profiles the panic
+/// runtime calls `abort()` directly and `catch_unwind` becomes a no-op (the
+/// closure never returns to its caller because the process is gone). We
+/// therefore complement `catch_ffi` by routing the dominant panic source —
+/// every `Mutex::lock().unwrap()` on a poisoned mutex — through
+/// `MutexExt::lock_recover`, which accepts the poison and continues. Other
+/// `.unwrap()` sites that remain are either at startup before any FFI call
+/// (`tokio::runtime::Builder::build`) or test-only.
 ///
 /// Uses `AssertUnwindSafe` because the closures executed here either do not
 /// share state with anything outside the FFI call or only touch lazy-static
@@ -124,7 +160,7 @@ lazy_static::lazy_static! {
 }
 
 fn with_slot_mut<R>(network_id: u32, f: impl FnOnce(&mut NetworkSlot) -> R) -> R {
-    let mut slots = NETWORK_SLOTS.lock().unwrap();
+    let mut slots = NETWORK_SLOTS.lock_recover();
     let slot = slots.entry(network_id).or_insert_with(NetworkSlot::empty);
     f(slot)
 }
@@ -182,7 +218,7 @@ fn is_network_ready(network_id: u32) -> bool {
 /// post-stop `wait_for_network_ready` does not return a stale `true`.
 fn clear_network_slot(network_id: u32) {
     {
-        let mut slots = NETWORK_SLOTS.lock().unwrap();
+        let mut slots = NETWORK_SLOTS.lock_recover();
         slots.remove(&network_id);
     }
     NETWORK_READY_CONDVAR.notify_all();
@@ -342,8 +378,8 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
         // arrive — but we still rely on the shutdown notify to break the
         // outer `tokio::select!` because the loop's other arms (swarm events,
         // delay maps) keep firing independently.
-        COMMAND_SENDERS.lock().unwrap().remove(&network_id);
-        COMMAND_RECEIVERS.lock().unwrap().remove(&network_id);
+        COMMAND_SENDERS.lock_recover().remove(&network_id);
+        COMMAND_RECEIVERS.lock_recover().remove(&network_id);
         if let Some(notify) = get_shutdown_notify(network_id) {
             notify.notify_one();
         }
@@ -366,7 +402,7 @@ pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64
         // for is checked against `NETWORK_SLOTS` directly so the slot map can
         // remain a regular `Mutex<HashMap>` without nesting awaits under it.
         let dummy = std::sync::Mutex::new(());
-        let mut guard = dummy.lock().unwrap();
+        let mut guard = dummy.lock_recover();
         loop {
             if is_network_ready(network_id) {
                 return true;
@@ -376,9 +412,10 @@ pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64
                 return false;
             }
             let remaining = deadline - now;
-            let (g, timeout_result) = NETWORK_READY_CONDVAR
-                .wait_timeout(guard, remaining)
-                .unwrap();
+            let (g, timeout_result) = match NETWORK_READY_CONDVAR.wait_timeout(guard, remaining) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             guard = g;
             if timeout_result.timed_out() {
                 return is_network_ready(network_id);
@@ -460,6 +497,15 @@ unsafe fn create_and_run_network_inner(
     // is supposed to hand us null-terminated valid UTF-8 strings, but a bug
     // there would otherwise be UB; explicit null checks turn it into a
     // clean error path.
+    //
+    // We deliberately do NOT call `release_params()` on this branch.
+    // `releaseStartNetworkParams` (Zig side) declares its arguments as
+    // `[*:0]const u8`, which is non-nullable; passing one of the offending
+    // null pointers back would itself be UB inside `std.mem.span` on the
+    // Zig side. Leaking the (presumably also null) buffers is the safer
+    // recovery. This branch should be unreachable in practice — the Zig
+    // caller never hands us nulls — and reaching it already means the Zig
+    // side has a bug; we just want to avoid compounding it.
     if local_private_key.is_null()
         || listen_addresses.is_null()
         || connect_addresses.is_null()
@@ -467,9 +513,8 @@ unsafe fn create_and_run_network_inner(
     {
         logger::rustLogger.error(
             network_id,
-            "create_and_run_network: null pointer in CreateNetworkParams string fields",
+            "create_and_run_network: null pointer in CreateNetworkParams string fields; not calling releaseStartNetworkParams (Zig side requires non-null)",
         );
-        release_params();
         return;
     }
 
@@ -581,7 +626,7 @@ unsafe fn create_and_run_network_inner(
 /// performing `try_send`, which is important because `try_send` can block
 /// briefly on the channel's internal semaphore.
 fn get_command_sender(network_id: u32) -> Option<mpsc::Sender<SwarmCommand>> {
-    COMMAND_SENDERS.lock().unwrap().get(&network_id).cloned()
+    COMMAND_SENDERS.lock_recover().get(&network_id).cloned()
 }
 
 fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
@@ -785,7 +830,7 @@ unsafe fn send_rpc_request_inner(
             return 0;
         }
     }
-    REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
+    REQUEST_ID_MAP.lock_recover().insert(request_id, ());
     REQUEST_PROTOCOL_MAP
         .lock()
         .unwrap()
@@ -842,7 +887,7 @@ unsafe fn send_rpc_response_chunk_inner(
     // would otherwise drop the chunk and log a spurious `No response channel
     // found` between the two locks.
     let channel = {
-        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock_recover();
         let c = response_map.get(&channel_id).cloned();
         if c.is_some() {
             _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
@@ -1091,7 +1136,7 @@ impl Network {
             ),
         );
 
-        let mut queue = RECONNECT_QUEUE.lock().unwrap();
+        let mut queue = RECONNECT_QUEUE.lock_recover();
         queue.insert_at(
             (self.network_id, peer_id),
             (addr, attempt),
@@ -1208,7 +1253,7 @@ impl Network {
         // without further changes.
         let swarm = &mut swarm;
 
-        let mut cmd_rx = match COMMAND_RECEIVERS.lock().unwrap().remove(&self.network_id) {
+        let mut cmd_rx = match COMMAND_RECEIVERS.lock_recover().remove(&self.network_id) {
             Some(rx) => rx,
             None => {
                 logger::rustLogger.error(
@@ -1238,7 +1283,7 @@ impl Network {
             }
 
             Some(timeout_result) = poll_fn(|cx| {
-                let mut map = REQUEST_ID_MAP.lock().unwrap();
+                let mut map = REQUEST_ID_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
                 match timeout_result {
@@ -1275,7 +1320,7 @@ impl Network {
             }
 
             Some(reconnect_result) = poll_fn(|cx| {
-                let mut queue = RECONNECT_QUEUE.lock().unwrap();
+                let mut queue = RECONNECT_QUEUE.lock_recover();
                 std::pin::Pin::new(&mut *queue).poll_next(cx)
             }) => {
                     match reconnect_result {
@@ -1337,7 +1382,7 @@ impl Network {
             }
 
             Some(response_channel_timeout) = poll_fn(|cx| {
-                let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+                let mut map = RESPONSE_CHANNEL_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
                 match response_channel_timeout {
@@ -1403,12 +1448,12 @@ impl Network {
                             );
 
                             // Store direction for later use on disconnect
-                            CONNECTION_DIRECTIONS.lock().unwrap().insert(
+                            CONNECTION_DIRECTIONS.lock_recover().insert(
                                 (self.network_id, peer_id, connection_id),
                                 direction,
                             );
 
-                            RECONNECT_QUEUE.lock().unwrap().remove(&(self.network_id, peer_id));
+                            RECONNECT_QUEUE.lock_recover().remove(&(self.network_id, peer_id));
                             RECONNECT_ATTEMPTS
                                 .lock()
                                 .unwrap()
@@ -1469,7 +1514,7 @@ impl Network {
                                 // Drop any pending response channels tied to this connection.
                                 // We can't finish streams here (the connection is already gone), but we must
                                 // remove them from the map to avoid leaking entries until idle TTL.
-                                RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
+                                RESPONSE_CHANNEL_MAP.lock_recover().retain(|_, pending| {
                                     !(pending.peer_id == peer_id && pending.connection_id == connection_id)
                                 });
 
@@ -1604,7 +1649,7 @@ impl Network {
 
                                 let channel_id =
                                     RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(
+                                RESPONSE_CHANNEL_MAP.lock_recover().insert(
                                     channel_id,
                                     PendingResponse {
                                         peer_id,
@@ -1650,7 +1695,7 @@ impl Network {
                             }
                             Ok(ReqRespMessageReceived::Response { request_id, message }) => {
                                 {
-                                    let mut map = REQUEST_ID_MAP.lock().unwrap();
+                                    let mut map = REQUEST_ID_MAP.lock_recover();
                                     if !map.update_timeout(&request_id, REQUEST_TIMEOUT) {
                                         map.insert(request_id, ());
                                     }
@@ -1696,7 +1741,7 @@ impl Network {
                                 }
                             }
                             Ok(ReqRespMessageReceived::EndOfStream { request_id }) => {
-                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
                                     .lock()
                                     .unwrap()
@@ -1757,7 +1802,7 @@ impl Network {
                                     });
                             }
                             Err(ReqRespMessageError::Outbound { request_id, err }) => {
-                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
                                     .lock()
                                     .unwrap()
@@ -1824,7 +1869,7 @@ impl Network {
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
                     SwarmCommand::SendRpcEndOfStream { channel_id } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
                             swarm.behaviour_mut().reqresp.finish_response_stream(
@@ -1838,7 +1883,7 @@ impl Network {
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
                             let protocol = channel.protocol.clone();
@@ -2268,7 +2313,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<SwarmCommand>(cap);
         // Keep _rx alive (no drainer => first `cap` sends fill the channel,
         // anything beyond returns Full instead of Closed).
-        COMMAND_SENDERS.lock().unwrap().insert(network_id, tx);
+        COMMAND_SENDERS.lock_recover().insert(network_id, tx);
 
         let before_full = get_swarm_command_dropped_total(SwarmCommandDropReason::Full as u32);
 
@@ -2304,6 +2349,6 @@ mod tests {
         );
 
         // Cleanup: remove the test sender so this network_id is reusable.
-        COMMAND_SENDERS.lock().unwrap().remove(&network_id);
+        COMMAND_SENDERS.lock_recover().remove(&network_id);
     }
 }
