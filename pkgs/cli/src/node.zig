@@ -358,6 +358,7 @@ pub const Node = struct {
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
+            .loop = &self.loop,
         });
         errdefer self.beam_node.deinit();
 

@@ -653,6 +653,7 @@ fn mainInner() !void {
                 .node_registry = registry_1,
                 .is_aggregator = beamcmd.@"is-aggregator",
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             if (api_server_handle) |handle| {
@@ -674,6 +675,7 @@ fn mainInner() !void {
                 .node_registry = registry_2,
                 .is_aggregator = false,
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             // Node 3 setup - delayed start for initial sync testing
@@ -693,6 +695,7 @@ fn mainInner() !void {
                 .node_registry = registry_3,
                 .is_aggregator = false,
                 .thread_pool = thread_pool,
+                .loop = loop,
             });
 
             // Delayed runner - starts both network3 and node3 together
