@@ -171,8 +171,7 @@ fn set_zig_handler(network_id: u32, handler: u64) {
 
 fn get_zig_handler(network_id: u32) -> Option<u64> {
     NETWORK_SLOTS
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(&network_id)
         .and_then(|s| s.zig_handler)
 }
@@ -192,8 +191,7 @@ fn install_shutdown_notify(network_id: u32) -> Arc<Notify> {
 /// installed.
 fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
     NETWORK_SLOTS
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(&network_id)
         .and_then(|s| s.shutdown_notify.clone())
 }
@@ -205,8 +203,7 @@ fn mark_network_ready(network_id: u32) {
 
 fn is_network_ready(network_id: u32) -> bool {
     NETWORK_SLOTS
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(&network_id)
         .map(|s| s.ready)
         .unwrap_or(false)
@@ -832,8 +829,7 @@ unsafe fn send_rpc_request_inner(
     }
     REQUEST_ID_MAP.lock_recover().insert(request_id, ());
     REQUEST_PROTOCOL_MAP
-        .lock()
-        .unwrap()
+        .lock_recover()
         .insert(request_id, protocol_id.clone());
     logger::rustLogger.info(
         network_id,
@@ -1117,8 +1113,7 @@ impl Network {
             );
             self.peer_addr_map.remove(&peer_id);
             RECONNECT_ATTEMPTS
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .remove(&(self.network_id, peer_id));
             return;
         }
@@ -1232,12 +1227,10 @@ impl Network {
         // Set up actor model command channel
         let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(SWARM_COMMAND_CHANNEL_CAPACITY);
         COMMAND_SENDERS
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(self.network_id, cmd_tx);
         COMMAND_RECEIVERS
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(self.network_id, cmd_rx);
 
         // Signal that this network is now ready
@@ -1293,8 +1286,7 @@ impl Network {
                             &format!("[reqresp] Request {} timed out after {:?}", request_id, REQUEST_TIMEOUT),
                         );
                         if let Some(protocol_id) = REQUEST_PROTOCOL_MAP
-                            .lock()
-                            .unwrap()
+                            .lock_recover()
                             .remove(&request_id)
                         {
                             if let (Ok(protocol_cstring), Ok(message_cstring)) = (
@@ -1343,8 +1335,7 @@ impl Network {
                                 );
 
                             RECONNECT_ATTEMPTS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .insert((self.network_id, peer_id), (addr.clone(), attempt));
 
                             let mut dial_addr = addr.clone();
@@ -1367,8 +1358,7 @@ impl Network {
                                         &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
                                     );
                                     RECONNECT_ATTEMPTS
-                                        .lock()
-                                        .unwrap()
+                                        .lock_recover()
                                         .remove(&(self.network_id, peer_id));
                                     self.schedule_reconnection(peer_id, addr, attempt + 1);
                                 }
@@ -1455,8 +1445,7 @@ impl Network {
 
                             RECONNECT_QUEUE.lock_recover().remove(&(self.network_id, peer_id));
                             RECONNECT_ATTEMPTS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .remove(&(self.network_id, peer_id));
                             let peer_id_cstr = match CString::new(peer_id_str.as_str()) {
                                 Ok(cstr) => cstr,
@@ -1479,8 +1468,7 @@ impl Network {
 
                             // Retrieve and remove stored direction
                             let direction = CONNECTION_DIRECTIONS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .remove(&(self.network_id, peer_id, connection_id))
                                 .unwrap_or(2); // 2 = unknown if not found
 
@@ -1591,8 +1579,7 @@ impl Network {
 
                                 // Schedule reconnection if this was a tracked connection attempt
                                 if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&(self.network_id, pid))
                                 {
                                     self.schedule_reconnection(pid, addr, attempt + 1);
@@ -1743,8 +1730,7 @@ impl Network {
                             Ok(ReqRespMessageReceived::EndOfStream { request_id }) => {
                                 REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
@@ -1791,8 +1777,7 @@ impl Network {
                                     &format!("[reqresp] Inbound error from {} on stream {}: {:?}", peer_id, stream_id, err),
                                 );
                                 RESPONSE_CHANNEL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .retain(|_, pending| {
                                         !(
                                             pending.peer_id == peer_id
@@ -1804,8 +1789,7 @@ impl Network {
                             Err(ReqRespMessageError::Outbound { request_id, err }) => {
                                 REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
