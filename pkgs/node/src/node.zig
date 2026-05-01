@@ -2613,3 +2613,90 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         try std.testing.expect(std.mem.eql(u8, &stored_block.block.parent_root, &signed_block.block.parent_root));
     }
 }
+
+test "Node: BoundedQueue basic operations" {
+    const TestQueue = BeamNode.BoundedQueue(u32, 4);
+    var q = TestQueue{};
+
+    try std.testing.expectEqual(@as(usize, 0), q.len);
+    try std.testing.expect(q.pop() == null);
+
+    try std.testing.expect(q.push(1));
+    try std.testing.expect(q.push(2));
+    try std.testing.expectEqual(@as(usize, 2), q.len);
+
+    try std.testing.expectEqual(@as(u32, 1), q.pop().?);
+    try std.testing.expectEqual(@as(u32, 2), q.pop().?);
+    try std.testing.expectEqual(@as(usize, 0), q.len);
+
+    try std.testing.expect(q.push(10));
+    try std.testing.expect(q.push(20));
+    try std.testing.expect(q.push(30));
+    try std.testing.expect(q.push(40));
+    try std.testing.expect(!q.push(50));
+    try std.testing.expectEqual(@as(usize, 4), q.len);
+
+    try std.testing.expectEqual(@as(u32, 10), q.pop().?);
+    try std.testing.expect(q.push(50));
+    try std.testing.expectEqual(@as(usize, 4), q.len);
+    try std.testing.expectEqual(@as(u32, 20), q.pop().?);
+}
+
+test "Node: async response queue end-to-end" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+        .loop = ctx.loopPtr(),
+    });
+    defer node.deinit();
+
+    const event = networks.ReqRespResponseEvent{
+        .method = .status,
+        .request_id = 123,
+        .payload = .{ .status = .{
+            .head_slot = 10,
+            .head_root = [_]u8{0x12} ** 32,
+            .finalized_slot = 5,
+            .finalized_root = [_]u8{0x34} ** 32,
+        } },
+    };
+
+    try node.onReqRespResponse(&node, &event);
+
+    node.resp_queue_mutex.lock();
+    try std.testing.expectEqual(@as(usize, 1), node.resp_queue.len);
+    node.resp_queue_mutex.unlock();
+
+    try ctx.loopPtr().run(.once);
+
+    node.resp_queue_mutex.lock();
+    try std.testing.expectEqual(@as(usize, 0), node.resp_queue.len);
+    node.resp_queue_mutex.unlock();
+}
