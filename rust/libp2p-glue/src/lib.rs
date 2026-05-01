@@ -1506,39 +1506,36 @@ impl Network {
                             let mesh_count = swarm.behaviour().gossipsub.all_mesh_peers().count() as u64;
                             record_mesh_peers(self.network_id, mesh_count);
 
-                            match gossipsub_event {
-                                gossipsub::Event::Message { message, .. } => {
-                                    let topic = message.topic.as_str();
-                                    let topic = match CString::new(topic) {
-                                        Ok(cstr) => cstr,
-                                        Err(_) => {
-                                            logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
-                                            continue;
-                                        }
-                                    };
-                                    let topic = topic.as_ptr();
+                            if let gossipsub::Event::Message { message, .. } = gossipsub_event {
+                                let topic = message.topic.as_str();
+                                let topic = match CString::new(topic) {
+                                    Ok(cstr) => cstr,
+                                    Err(_) => {
+                                        logger::rustLogger.error(self.network_id, &format!("invalid_topic_string={}", topic));
+                                        continue;
+                                    }
+                                };
+                                let topic = topic.as_ptr();
 
-                                    let message_ptr = message.data.as_ptr();
-                                    let message_len = message.data.len();
+                                let message_ptr = message.data.as_ptr();
+                                let message_len = message.data.len();
 
-                                    let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
-                                    let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
-                                        Ok(cstring) => cstring,
-                                        Err(_) => {
-                                            logger::rustLogger.error(
-                                                self.network_id,
-                                                &format!("Failed to create C string for peer id {}", sender_peer_id_string),
-                                            );
-                                            continue;
-                                        }
-                                    };
+                                let sender_peer_id_string = message.source.map(|p| p.to_string()).unwrap_or_else(|| "unknown_peer".to_string());
+                                let sender_peer_id_cstring = match CString::new(sender_peer_id_string.clone()) {
+                                    Ok(cstring) => cstring,
+                                    Err(_) => {
+                                        logger::rustLogger.error(
+                                            self.network_id,
+                                            &format!("Failed to create C string for peer id {}", sender_peer_id_string),
+                                        );
+                                        continue;
+                                    }
+                                };
 
-                                    unsafe {
-                                        handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
-                                    };
-                                    logger::rustLogger.debug(self.network_id, "zig callback completed");
-                                }
-                                _ => {}
+                                unsafe {
+                                    handleMsgFromRustBridge(self.zig_handler, topic, message_ptr, message_len, sender_peer_id_cstring.as_ptr())
+                                };
+                                logger::rustLogger.debug(self.network_id, "zig callback completed");
                             }
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Reqresp(ReqRespMessage {
