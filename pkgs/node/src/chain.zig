@@ -2804,10 +2804,12 @@ test "Chain: cached status snapshot updates" {
     // Update status manually
     const new_head = types.ProtoBlock{
         .slot = 100,
+        .proposer_index = 0,
         .blockRoot = [_]u8{0xAA} ** 32,
         .parentRoot = [_]u8{0xBB} ** 32,
         .stateRoot = [_]u8{0xCC} ** 32,
-        .targetSlot = 100,
+        .timeliness = true,
+        .confirmed = true,
     };
     const new_finalized = types.Checkpoint{
         .slot = 50,

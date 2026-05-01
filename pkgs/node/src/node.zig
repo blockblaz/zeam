@@ -2680,15 +2680,15 @@ test "Node: async response queue end-to-end" {
     const event = networks.ReqRespResponseEvent{
         .method = .status,
         .request_id = 123,
-        .payload = .{ .status = .{
+        .payload = .{ .success = .{ .status = .{
             .head_slot = 10,
             .head_root = [_]u8{0x12} ** 32,
             .finalized_slot = 5,
             .finalized_root = [_]u8{0x34} ** 32,
-        } },
+        } } },
     };
 
-    try node.onReqRespResponse(&node, &event);
+    try BeamNode.onReqRespResponse(&node, &event);
 
     node.resp_queue_mutex.lock();
     try std.testing.expectEqual(@as(usize, 1), node.resp_queue.len);
