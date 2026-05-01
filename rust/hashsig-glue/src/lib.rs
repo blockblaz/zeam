@@ -560,12 +560,12 @@ pub unsafe extern "C" fn hashsig_verify_ssz(
 // generated with leanEnv=test (LOG_LIFETIME=8, DIMENSION=4, ~424-byte signatures).
 mod test_scheme {
     use leansig::serialization::Serializable;
-    use leansig::signature::SignatureScheme;
     use leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_8::{
         PubKeyAbortingTargetSumLifetime8Dim46Base8 as TestPublicKey,
         SchemeAbortingTargetSumLifetime8Dim46Base8 as TestScheme,
         SigAbortingTargetSumLifetime8Dim46Base8 as TestSignature,
     };
+    use leansig::signature::SignatureScheme;
     use leansig::MESSAGE_LENGTH;
     use std::slice;
 
