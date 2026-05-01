@@ -125,9 +125,7 @@ lazy_static::lazy_static! {
 
 fn with_slot_mut<R>(network_id: u32, f: impl FnOnce(&mut NetworkSlot) -> R) -> R {
     let mut slots = NETWORK_SLOTS.lock().unwrap();
-    let slot = slots
-        .entry(network_id)
-        .or_insert_with(NetworkSlot::empty);
+    let slot = slots.entry(network_id).or_insert_with(NetworkSlot::empty);
     f(slot)
 }
 
@@ -423,14 +421,14 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
     // Wrap the rest of the body in catch_unwind so a panic from the runtime,
     // parser, or libp2p does not unwind across the FFI boundary into Zig.
     let _ = catch_ffi(move || {
-    create_and_run_network_inner(
-        network_id,
-        zig_handler,
-        local_private_key,
-        listen_addresses,
-        connect_addresses,
-        topics_str,
-    );
+        create_and_run_network_inner(
+            network_id,
+            zig_handler,
+            local_private_key,
+            listen_addresses,
+            connect_addresses,
+            topics_str,
+        );
     });
 }
 
@@ -442,7 +440,6 @@ unsafe fn create_and_run_network_inner(
     connect_addresses: *const c_char,
     topics_str: *const c_char,
 ) {
-
     // Register the handler early so any logs emitted from the parse/validation
     // path below are routed through the Zig logger.
     set_zig_handler(network_id, zig_handler);
@@ -688,8 +685,10 @@ pub unsafe extern "C" fn send_rpc_request(
     request_data: *const u8,
     request_len: usize,
 ) -> u64 {
-    catch_ffi(|| send_rpc_request_inner(network_id, peer_id, protocol_tag, request_data, request_len))
-        .unwrap_or(0)
+    catch_ffi(|| {
+        send_rpc_request_inner(network_id, peer_id, protocol_tag, request_data, request_len)
+    })
+    .unwrap_or(0)
 }
 
 unsafe fn send_rpc_request_inner(
