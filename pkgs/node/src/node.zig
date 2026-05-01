@@ -1198,9 +1198,6 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
-                defer guard.unlock();
-
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
