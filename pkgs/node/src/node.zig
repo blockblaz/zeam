@@ -1497,12 +1497,23 @@ pub const BeamNode = struct {
 
         // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.network.publish(&gossip_msg);
-        self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
-            block.slot,
-            block.proposer_index,
-            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
-        });
+        const block_published = try self.network.publish(&gossip_msg);
+        if (block_published) {
+            self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
+                block.slot,
+                block.proposer_index,
+                self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+            });
+        } else {
+            // Issue #808: backend dropped the publish (e.g. rust-libp2p command
+            // channel full). The block is in our local chain but never reached
+            // the network — surface it instead of logging "published".
+            self.logger.warn("failed to publish block to network (backend dropped publish): slot={d} proposer={d}{f}", .{
+                block.slot,
+                block.proposer_index,
+                self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+            });
+        }
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
@@ -1522,13 +1533,23 @@ pub const BeamNode = struct {
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
-        try self.network.publish(&gossip_msg);
+        const attestation_published = try self.network.publish(&gossip_msg);
 
-        self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
-            data.slot,
-            validator_id,
-            self.node_registry.getNodeNameFromValidatorIndex(validator_id),
-        });
+        if (attestation_published) {
+            self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
+                data.slot,
+                validator_id,
+                self.node_registry.getNodeNameFromValidatorIndex(validator_id),
+            });
+        } else {
+            // Issue #808: backend dropped the publish. The attestation is in
+            // our local chain but never reached gossip — don't log "published".
+            self.logger.warn("failed to publish attestation to network (backend dropped publish): slot={d} validator={d}{f}", .{
+                data.slot,
+                validator_id,
+                self.node_registry.getNodeNameFromValidatorIndex(validator_id),
+            });
+        }
     }
 
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
@@ -1536,9 +1557,14 @@ pub const BeamNode = struct {
         try self.chain.onGossipAggregatedAttestation(signed_aggregation);
 
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
-        try self.network.publish(&gossip_msg);
+        const aggregation_published = try self.network.publish(&gossip_msg);
 
-        self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+        if (aggregation_published) {
+            self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+        } else {
+            // Issue #808: backend dropped the publish.
+            self.logger.warn("failed to publish aggregation to network (backend dropped publish): slot={d}", .{signed_aggregation.data.slot});
+        }
     }
 
     fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
