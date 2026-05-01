@@ -724,6 +724,9 @@ fn writeEmptyIndex(
     try writer.writeAll("pub const fork_choice = struct {\n");
     try writer.writeAll("    pub const fixture_count: usize = 0;\n");
     try writer.writeAll("};\n\n");
+    try writer.writeAll("pub const ssz = struct {\n");
+    try writer.writeAll("    pub const fixture_count: usize = 0;\n");
+    try writer.writeAll("};\n\n");
     try writer.writeAll("pub const fixture_count: usize = 0;\n");
 
     // Write buffer to file

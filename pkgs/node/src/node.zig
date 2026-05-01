@@ -367,34 +367,6 @@ pub const BeamNode = struct {
                     }
                     return;
                 },
-                // Block arrived too early for local clock - cache and retry later.
-                error.FutureSlot => {
-                    if (data.* == .block) {
-                        const signed_block = data.block;
-                        // Reuse the root we computed before taking the lock (issue #786).
-                        const block_root = precomputed_block_root;
-                        if (self.cacheFutureBlock(block_root, signed_block)) |_| {
-                            self.logger.debug(
-                                "cached future gossip block 0x{s} at slot {d}",
-                                .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                            );
-                        } else |cache_err| {
-                            if (cache_err == CacheBlockError.PreFinalized) {
-                                self.logger.info(
-                                    "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                    .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                );
-                                _ = self.network.pruneCachedBlocks(block_root, null);
-                            } else {
-                                self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                    std.fmt.bytesToHex(block_root, .lower)[0..],
-                                    cache_err,
-                                });
-                            }
-                        }
-                    }
-                    return;
-                },
                 // Attestation/aggregation validation failed due to missing head/source/target block -
                 // downgrade to debug when the missing block is already being fetched.
                 error.UnknownHeadBlock, error.UnknownSourceBlock, error.UnknownTargetBlock => {
@@ -540,12 +512,6 @@ pub const BeamNode = struct {
                         self.logger.debug(
                             "Cached block 0x{x} still missing parent, keeping in cache",
                             .{&descendant_root},
-                        );
-                    } else if (err == error.FutureSlot) {
-                        // Block is still in the future, keep it cached
-                        self.logger.debug(
-                            "Cached block 0x{s} still in future slot, keeping in cache",
-                            .{std.fmt.bytesToHex(descendant_root, .lower)[0..]},
                         );
                     } else if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
                         // This block is now before finalized (finalization advanced while it was cached).
@@ -694,60 +660,6 @@ pub const BeamNode = struct {
         };
 
         return parent_root;
-    }
-
-    fn cacheFutureBlock(
-        self: *Self,
-        block_root: types.Root,
-        signed_block: types.SignedBlock,
-    ) CacheBlockError!void {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
-        const block_slot = signed_block.block.slot;
-
-        if (block_slot <= finalized_slot) {
-            return CacheBlockError.PreFinalized;
-        }
-
-        if (self.network.hasFetchedBlock(block_root)) {
-            return CacheBlockError.AlreadyCached;
-        }
-
-        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
-            self.logger.warn("Cache full ({d} blocks), rejecting future block 0x{s} at slot {d}", .{
-                self.network.fetched_blocks.count(),
-                std.fmt.bytesToHex(block_root, .lower)[0..],
-                block_slot,
-            });
-            return CacheBlockError.CachingFailed;
-        }
-
-        const block_ptr = self.allocator.create(types.SignedBlock) catch {
-            return CacheBlockError.AllocationFailed;
-        };
-        var block_owned = true;
-        errdefer if (block_owned) self.allocator.destroy(block_ptr);
-
-        // Clone the block and capture its SSZ bytes in one pass.
-        // sszCloneAndGetBytes serializes the original block once (read-only on `signed_block`),
-        // then deserializes into the clone. The returned bytes are stored alongside the cached
-        // block so that onBlock never needs to re-serialize a live SignedBlock, which has been
-        // observed to cause memory corruption on the next cached block's processing.
-        const ssz_bytes = types.sszCloneAndGetBytes(self.allocator, types.SignedBlock, signed_block, block_ptr) catch {
-            return CacheBlockError.CloneFailed;
-        };
-        errdefer if (block_owned) block_ptr.deinit();
-        errdefer self.allocator.free(ssz_bytes);
-
-        self.network.cacheFetchedBlock(block_root, block_ptr) catch {
-            return CacheBlockError.CachingFailed;
-        };
-        block_owned = false;
-
-        // Store the SSZ bytes after caching; ignore store failure (block is already cached,
-        // onBlock will fall back to fresh serialization if bytes are unavailable).
-        self.network.storeFetchedBlockSsz(block_root, ssz_bytes) catch {
-            self.allocator.free(ssz_bytes);
-        };
     }
 
     fn processBlockByRootChunk(self: *Self, block_ctx: *const BlockByRootContext, signed_block: *const types.SignedBlock) !void {
@@ -1292,19 +1204,6 @@ pub const BeamNode = struct {
                     return e;
                 };
 
-                // Replay blocks that were queued waiting for the forkchoice clock to advance,
-                // then fetch any attestation head roots that were missing during replay.
-                const pending_missing_roots = self.chain.processPendingBlocks();
-                defer self.allocator.free(pending_missing_roots);
-                if (pending_missing_roots.len > 0) {
-                    self.fetchBlockByRoots(pending_missing_roots, 0) catch |err| {
-                        self.logger.warn(
-                            "failed to fetch {d} missing block(s) from pending blocks: {any}",
-                            .{ pending_missing_roots.len, err },
-                        );
-                    };
-                }
-
                 // Sweep timed-out RPC requests to prevent sync stalls from non-responsive peers.
                 self.sweepTimedOutRequests();
 
@@ -1567,7 +1466,7 @@ pub const BeamNode = struct {
 
     pub fn run(self: *Self) !void {
         // Catch up fork choice time to current interval before processing any requests.
-        // This prevents FutureSlot errors when receiving blocks via RPC immediately after starting.
+        // Keeps validator duties and aggregation timing aligned with the local clock.
         const current_interval = self.clock.current_interval;
         if (current_interval > 0) {
             try self.chain.forkChoice.onInterval(@intCast(current_interval), false);

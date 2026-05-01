@@ -354,6 +354,10 @@ pub fn build(b: *Builder) !void {
     zeam_spectests.addImport("build_options", build_options_module);
     zeam_spectests.addImport("@zeam/state-transition", zeam_state_transition);
     zeam_spectests.addImport("@zeam/node", zeam_beam_node);
+    zeam_spectests.addImport("@zeam/xmss", zeam_xmss);
+    zeam_spectests.addImport("@zeam/network", zeam_network);
+    zeam_spectests.addImport("snappyz", snappyz);
+    zeam_spectests.addImport("snappyframesz", snappyframesz);
 
     // Add the cli executable
     const cli_exe = b.addExecutable(.{
@@ -608,6 +612,9 @@ pub fn build(b: *Builder) !void {
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
     spectests.root_module.addImport("@zeam/metrics", zeam_metrics);
     spectests.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    spectests.root_module.addImport("@zeam/network", zeam_network);
+    spectests.root_module.addImport("snappyz", snappyz);
+    spectests.root_module.addImport("snappyframesz", snappyframesz);
     spectests.root_module.addImport("ssz", ssz);
 
     manager_tests.step.dependOn(&build_rust_lib_steps.step);
