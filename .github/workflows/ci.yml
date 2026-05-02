@@ -24,7 +24,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Cache Zig packages
       uses: actions/cache@v4
@@ -95,7 +95,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -166,7 +166,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -247,7 +247,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -347,7 +347,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -419,7 +419,7 @@ jobs:
     - name: Set up Zig
       uses: mlugg/setup-zig@v2.0.5
       with:
-        version: 0.15.2
+        version: 0.16.0
 
     - name: Set up Rust/Cargo
       uses: actions-rust-lang/setup-rust-toolchain@v1

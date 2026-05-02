@@ -165,6 +165,7 @@ pub const Node = struct {
         ignore_not_found: bool,
     ) !void {
         db.deinit();
+        const io = std.Io.Threaded.global_single_threaded.io();
         // Both backends store their working set under the same base
         // directory; deleting it yields a clean slate for either engine.
         const backend_dir = switch (backend) {
@@ -173,7 +174,7 @@ pub const Node = struct {
         };
         const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ database_path, backend_dir });
         defer allocator.free(db_path);
-        std.fs.deleteTreeAbsolute(db_path) catch |wipe_err| {
+        std.Io.Dir.cwd().deleteTree(io, db_path) catch |wipe_err| {
             if (!ignore_not_found or wipe_err != error.FileNotFound) {
                 logger.err("failed to delete database directory '{s}': {any}", .{ db_path, wipe_err });
                 return wipe_err;
@@ -321,7 +322,7 @@ pub const Node = struct {
         // metrics instead of being discarded by noop metrics.
         if (options.metrics_enable) {
             try api.init(allocator);
-            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(zeam_utils.unixTimestampSeconds()));
         }
 
         const cpu_count = std.Thread.getCpuCount() catch 2;
@@ -330,6 +331,7 @@ pub const Node = struct {
         const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
         self.thread_pool = try ThreadPool.init(.{
             .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
             .thread_count = @intCast(worker_count),
         });
         errdefer self.thread_pool.deinit();
@@ -809,7 +811,11 @@ fn downloadCheckpointState(
 ) !types.BeamState {
     logger.info("downloading checkpoint state from: {s}", .{url});
 
-    var client = std.http.Client{ .allocator = allocator };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
 
     // Use an Allocating writer so client.fetch handles both Content-Length and
@@ -1178,10 +1184,10 @@ fn constructENRFromFields(
 
     // Set IP address (IPv4)
     if (enr_fields.ip) |ip_str| {
-        const ip_addr = std.net.Ip4Address.parse(ip_str, 0) catch {
+        const ip_addr = std.Io.net.Ip4Address.parse(ip_str, 0) catch {
             return error.InvalidIPAddress;
         };
-        const ip_addr_bytes = std.mem.asBytes(&ip_addr.sa.addr);
+        const ip_addr_bytes = &ip_addr.bytes;
         signable_enr.set("ip", ip_addr_bytes) catch {
             return error.ENRSetIPFailed;
         };
@@ -1189,10 +1195,10 @@ fn constructENRFromFields(
 
     // Set IP address (IPv6)
     if (enr_fields.ip6) |ip6_str| {
-        const ip6_addr = std.net.Ip6Address.parse(ip6_str, 0) catch {
+        const ip6_addr = std.Io.net.Ip6Address.parse(ip6_str, 0) catch {
             return error.InvalidIP6Address;
         };
-        const ip6_addr_bytes = std.mem.asBytes(&ip6_addr.sa.addr);
+        const ip6_addr_bytes = &ip6_addr.bytes;
         signable_enr.set("ip6", ip6_addr_bytes) catch {
             return error.ENRSetIP6Failed;
         };
@@ -1272,11 +1278,11 @@ fn constructENRFromFields(
     }
 
     // Convert SignableENR to ENR
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    try enr_lib.writeSignableENR(buffer.writer(allocator), &signable_enr);
-    const enr_text = buffer.items;
+    try enr_lib.writeSignableENR(&writer_alloc.writer, &signable_enr);
+    const enr_text = writer_alloc.writer.buffered();
 
     var enr: ENR = undefined;
     try ENR.decodeTxtInto(&enr, enr_text);

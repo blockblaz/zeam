@@ -1,12 +1,17 @@
 const std = @import("std");
+const net = std.Io.net;
 
 const types = @import("@zeam/types");
+const zeam_utils = @import("@zeam/utils");
 
 const events = @import("./events.zig");
 
 const Checkpoint = types.Checkpoint;
-const Mutex = Thread.Mutex;
-const Thread = std.Thread;
+const Mutex = zeam_utils.SyncMutex;
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 
 /// Maximum size of the SSE send buffer in event_broadcaster.zig. Serialized events
 /// must not exceed this to avoid buffer overflow when sending.
@@ -14,11 +19,11 @@ pub const sse_send_buffer_size = 512;
 
 /// SSE connection wrapper
 pub const SSEConnection = struct {
-    stream: std.net.Stream,
+    stream: net.Stream,
     allocator: std.mem.Allocator,
     mutex: Mutex,
 
-    pub fn init(stream: std.net.Stream, allocator: std.mem.Allocator) SSEConnection {
+    pub fn init(stream: net.Stream, allocator: std.mem.Allocator) SSEConnection {
         return SSEConnection{
             .stream = stream,
             .allocator = allocator,
@@ -30,21 +35,26 @@ pub const SSEConnection = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.stream.writeAll(data);
+        const io = defaultIo();
+        var write_buf: [sse_send_buffer_size]u8 = undefined;
+        var writer = self.stream.writer(io, &write_buf);
+        try writer.interface.writeAll(data);
+        try writer.interface.flush();
     }
 
     pub fn sendEvent(self: *SSEConnection, event_json: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const io = defaultIo();
         var write_buf: [sse_send_buffer_size]u8 = undefined;
-        var writer = self.stream.writer(&write_buf);
+        var writer = self.stream.writer(io, &write_buf);
         try writer.interface.writeAll(event_json);
         try writer.interface.flush();
     }
 
     pub fn deinit(self: *SSEConnection) void {
-        self.stream.close();
+        self.stream.close(defaultIo());
     }
 };
 
@@ -76,7 +86,7 @@ pub const EventBroadcaster = struct {
     }
 
     /// Add a new SSE connection
-    pub fn addConnection(self: *Self, stream: std.net.Stream) !void {
+    pub fn addConnection(self: *Self, stream: net.Stream) !void {
         const connection = try self.allocator.create(SSEConnection);
         connection.* = SSEConnection.init(stream, self.allocator);
 
@@ -101,12 +111,12 @@ pub const EventBroadcaster = struct {
         }
     }
 
-    pub fn removeConnectionByHandle(self: *Self, stream: std.net.Stream) void {
+    pub fn removeConnectionByHandle(self: *Self, stream: net.Stream) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.connections.items, 0..) |conn, i| {
-            if (conn.stream.handle == stream.handle) {
+            if (conn.stream.socket.handle == stream.socket.handle) {
                 _ = self.connections.swapRemove(i);
                 conn.deinit();
                 self.allocator.destroy(conn);
@@ -184,13 +194,13 @@ pub fn getGlobalBroadcaster() ?*EventBroadcaster {
 }
 
 /// Add a connection to the global broadcaster
-pub fn removeGlobalConnection(stream: std.net.Stream) void {
+pub fn removeGlobalConnection(stream: net.Stream) void {
     if (getGlobalBroadcaster()) |broadcaster| {
         broadcaster.removeConnectionByHandle(stream);
     }
 }
 
-pub fn addGlobalConnection(stream: std.net.Stream) !*SSEConnection {
+pub fn addGlobalConnection(stream: net.Stream) !*SSEConnection {
     if (getGlobalBroadcaster()) |broadcaster| {
         const connection = try broadcaster.allocator.create(SSEConnection);
         errdefer broadcaster.allocator.destroy(connection);
@@ -229,9 +239,12 @@ test "event broadcaster basic functionality" {
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) {
         return error.SocketPairFailed;
     }
-    defer std.posix.close(fds[0]); // read end; write end fds[1] is owned by the connection and closed in broadcaster.deinit()
+    defer _ = std.c.close(fds[0]); // read end; write end fds[1] is owned by the connection and closed in broadcaster.deinit()
 
-    const stream = std.net.Stream{ .handle = fds[1] };
+    const stream = net.Stream{ .socket = .{
+        .handle = fds[1],
+        .address = .{ .ip4 = .unspecified(0) },
+    } };
 
     // Add connection
     try broadcaster.addConnection(stream);
