@@ -289,19 +289,18 @@ pub fn verifySignaturesParallel(
         fn runOne(task: *VerifyTask, err_flag: *std.atomic.Value(bool)) void {
             if (err_flag.load(.acquire)) return;
             task.verified = true;
-            // Time the FFI verify call with a monotonic Timer so the per-task
-            // sample matches what the serial path observes. `Timer.start()`
-            // only fails on platforms without a monotonic clock (none of the
-            // supported zeam targets) — fall through with elapsed_ns=0 if it
-            // ever does, rather than poisoning the result with garbage.
-            var timer = std.time.Timer.start() catch null;
+            // Time the FFI verify call with a monotonic clock so samples stay
+            // non-negative even if wall clock time is adjusted.
+            const start_ns = zeam_utils.monotonicTimestampNs();
             task.signature_proof.verify(task.public_keys, &task.message_hash, task.epoch) catch |err| {
-                if (timer) |*t| task.elapsed_ns = t.read();
+                const end_ns = zeam_utils.monotonicTimestampNs();
+                task.elapsed_ns = if (end_ns >= start_ns) @intCast(end_ns - start_ns) else 0;
                 task.result = err;
                 err_flag.store(true, .release);
                 return;
             };
-            if (timer) |*t| task.elapsed_ns = t.read();
+            const end_ns = zeam_utils.monotonicTimestampNs();
+            task.elapsed_ns = if (end_ns >= start_ns) @intCast(end_ns - start_ns) else 0;
         }
     };
 

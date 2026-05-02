@@ -26,10 +26,10 @@ pub const Validator = struct {
     const Self = @This();
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("attestation_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.attestation_pubkey) });
-        try obj.put("proposal_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.proposal_pubkey) });
-        try obj.put("index", json.Value{ .integer = @as(i64, @intCast(self.index)) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "attestation_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.attestation_pubkey) });
+        try obj.put(allocator, "proposal_pubkey", json.Value{ .string = try bytesToHex(allocator, &self.proposal_pubkey) });
+        try obj.put(allocator, "index", json.Value{ .integer = @as(i64, @intCast(self.index)) });
         return json.Value{ .object = obj };
     }
 
@@ -57,6 +57,6 @@ pub const Validator = struct {
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("attestation_pubkey").?.string);
         allocator.free(val.object.get("proposal_pubkey").?.string);
-        val.object.deinit();
+        val.object.deinit(allocator);
     }
 };

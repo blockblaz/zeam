@@ -42,8 +42,8 @@ pub const BeamSTFProof = struct {
     pub fn deinit(_: *BeamSTFProof) void {}
 
     pub fn toJson(self: *const BeamSTFProof, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "proof", json.Value{ .string = try bytesToHex(allocator, self.proof) });
         return json.Value{ .object = obj };
     }
 
@@ -55,7 +55,7 @@ pub const BeamSTFProof = struct {
 
     pub fn freeJson(val: *json.Value, allocator: Allocator) void {
         allocator.free(val.object.get("proof").?.string);
-        val.object.deinit();
+        val.object.deinit(allocator);
     }
 };
 
@@ -64,9 +64,9 @@ pub const BeamSTFProverInput = struct {
     state: state.BeamState,
 
     pub fn toJson(self: *const BeamSTFProverInput, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("block", try self.block.toJson(allocator));
-        try obj.put("state", try self.state.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "block", try self.block.toJson(allocator));
+        try obj.put(allocator, "state", try self.state.toJson(allocator));
         return json.Value{ .object = obj };
     }
 

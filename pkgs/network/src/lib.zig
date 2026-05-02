@@ -40,5 +40,5 @@ const node_registryFactory = @import("./node_registry.zig");
 pub const NodeNameRegistry = node_registryFactory.NodeNameRegistry;
 
 test "get tests" {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
