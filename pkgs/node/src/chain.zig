@@ -163,6 +163,13 @@ pub const BeamChain = struct {
     // blocks here and replay them in onInterval once the clock has caught up.
     pending_blocks: std.ArrayList(types.SignedBlock),
 
+    /// Lock-free-ish cached status snapshot for serving req/resp status
+    /// requests without contending for the forkchoice RwLock.  Updated under
+    /// `cached_status_mutex` whenever head or finalized checkpoints change
+    /// (in `onBlockFollowup` and `onInterval`).
+    cached_status_mutex: std.Thread.Mutex = .{},
+    cached_status: types.Status,
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -211,6 +218,12 @@ pub const BeamChain = struct {
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
             .thread_pool = opts.thread_pool,
+            .cached_status = .{
+                .finalized_root = fork_choice.fcStore.latest_finalized.root,
+                .finalized_slot = fork_choice.fcStore.latest_finalized.slot,
+                .head_root = fork_choice.head.blockRoot,
+                .head_slot = fork_choice.head.slot,
+            },
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -364,6 +377,14 @@ pub const BeamChain = struct {
         });
 
         try self.forkChoice.onInterval(time_intervals, has_proposal);
+
+        // Refresh cached status after the forkchoice tick.
+        {
+            const head = self.forkChoice.getHead();
+            const finalized = self.forkChoice.getLatestFinalized();
+            self.updateCachedStatus(head, finalized);
+        }
+
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
@@ -1134,6 +1155,9 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
+        // Update cached status snapshot for lock-free serving.
+        self.updateCachedStatus(new_head, latest_finalized);
+
         // 8. Asap emit justification/finalization events based on forkchoice store
         // Emit justification event only when slot increases beyond last emitted
         if (latest_justified.slot > self.last_emitted_justified.slot) {
@@ -1694,11 +1718,23 @@ pub const BeamChain = struct {
         return aggregations;
     }
 
+    /// Returns the cached status snapshot.  The snapshot is updated under a
+    /// lightweight dedicated mutex whenever head or finalized checkpoints
+    /// change (see `updateCachedStatus`), so this read never contends for
+    /// the forkchoice RwLock.
     pub fn getStatus(self: *Self) types.Status {
-        const finalized = self.forkChoice.getLatestFinalized();
-        const head = self.forkChoice.getHead();
+        self.cached_status_mutex.lock();
+        defer self.cached_status_mutex.unlock();
+        return self.cached_status;
+    }
 
-        return .{
+    /// Atomically update the cached status snapshot.  Called from
+    /// `onBlockFollowup` (after every processed block) and from `onInterval`
+    /// (after the forkchoice tick).
+    fn updateCachedStatus(self: *Self, head: types.ProtoBlock, finalized: types.Checkpoint) void {
+        self.cached_status_mutex.lock();
+        defer self.cached_status_mutex.unlock();
+        self.cached_status = .{
             .finalized_root = finalized.root,
             .finalized_slot = finalized.slot,
             .head_root = head.blockRoot,
@@ -2710,4 +2746,81 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Only the known attestation is included in the block
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
+}
+
+test "Chain: cached status snapshot updates" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const spec_name = try allocator.dupe(u8, "beamdev");
+    const fork_digest = try allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+    var beam_state = mock_chain.genesis_state;
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir);
+
+    var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
+    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Initial status should match genesis
+    const status1 = beam_chain.getStatus();
+    try std.testing.expectEqual(@as(types.Slot, 0), status1.head_slot);
+    try std.testing.expectEqual(@as(types.Slot, 0), status1.finalized_slot);
+
+    // Update status manually
+    const new_head = types.ProtoBlock{
+        .slot = 100,
+        .proposer_index = 0,
+        .blockRoot = [_]u8{0xAA} ** 32,
+        .parentRoot = [_]u8{0xBB} ** 32,
+        .stateRoot = [_]u8{0xCC} ** 32,
+        .timeliness = true,
+        .confirmed = true,
+    };
+    const new_finalized = types.Checkpoint{
+        .slot = 50,
+        .root = [_]u8{0xDD} ** 32,
+    };
+
+    beam_chain.updateCachedStatus(new_head, new_finalized);
+
+    const status2 = beam_chain.getStatus();
+    try std.testing.expectEqual(@as(types.Slot, 100), status2.head_slot);
+    try std.testing.expectEqual(@as(types.Slot, 50), status2.finalized_slot);
+    try std.testing.expect(std.mem.eql(u8, &status2.head_root, &new_head.blockRoot));
+    try std.testing.expect(std.mem.eql(u8, &status2.finalized_root, &new_finalized.root));
 }

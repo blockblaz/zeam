@@ -46,6 +46,9 @@ const NodeOpts = struct {
     /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
     /// When non-null it is shared across all nodes in the same process.
     thread_pool: ?*ThreadPool = null,
+    /// Event loop for registering the xev.Async watcher that wakes the main
+    /// loop when the Rust bridge thread enqueues a ReqRespResponseEvent.
+    loop: ?*xev.Loop = null,
 };
 
 pub const BeamNode = struct {
@@ -80,6 +83,56 @@ pub const BeamNode = struct {
     /// and flushed as a single batched blocks_by_root request, avoiding the
     /// 300+ individual round-trips caused by sequential parent-chain walking.
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
+
+    // The Rust bridge thread enqueues `ReqRespResponseEvent` into this
+    // bounded ring buffer and calls `async_notifier.notify()`.  The main
+    // libxev loop wakes up, acquires `BeamNode.mutex`, and drains the queue
+    // by calling `handleReqRespResponse` for each event.  This eliminates
+    // cross-thread contention on `BeamNode.mutex` between the bridge thread
+    // and the `onInterval` tick path.
+    //
+    // Queue capacity is 256 — large enough to absorb burst sync traffic
+    // while providing natural back-pressure if the main loop stalls.
+
+    resp_queue: RespQueue = .{},
+    resp_queue_mutex: std.Thread.Mutex = .{},
+
+    /// Wakes the main libxev loop when the bridge thread enqueues an event.
+    async_notifier: ?xev.Async = null,
+    /// Completion storage for the async watcher (must be stable, so lives
+    /// inside the `BeamNode` struct which is heap-allocated by the caller).
+    async_completion: xev.Completion = .{},
+
+    const RespQueue = BoundedQueue(networks.ReqRespResponseEvent, 256);
+
+    /// Fixed-capacity ring buffer for inter-thread event passing.
+    fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
+        return struct {
+            buf: [capacity]T = undefined,
+            head: usize = 0, // next index to pop
+            tail: usize = 0, // next index to push
+            len: usize = 0,
+
+            const BQ = @This();
+
+            /// Returns false if the queue is full.
+            fn push(self: *BQ, item: T) bool {
+                if (self.len == capacity) return false;
+                self.buf[self.tail] = item;
+                self.tail = (self.tail + 1) % capacity;
+                self.len += 1;
+                return true;
+            }
+
+            fn pop(self: *BQ) ?T {
+                if (self.len == 0) return null;
+                const item = self.buf[self.head];
+                self.head = (self.head + 1) % capacity;
+                self.len -= 1;
+                return item;
+            }
+        };
+    }
 
     const Self = @This();
 
@@ -143,10 +196,26 @@ pub const BeamNode = struct {
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
 
+        if (opts.loop) |loop| {
+            var notifier = xev.Async.init() catch |err| {
+                opts.logger_config.logger(.node).err("failed to init xev.Async notifier: {any}", .{err});
+                return err;
+            };
+            notifier.wait(loop, &self.async_completion, Self, self, drainRespQueueCb);
+            self.async_notifier = notifier;
+        }
+
         network_init_cleanup = false;
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.async_notifier) |*n| n.deinit();
+        self.resp_queue_mutex.lock();
+        while (self.resp_queue.pop()) |*ev| {
+            var e = ev.*;
+            e.deinit(self.allocator);
+        }
+        self.resp_queue_mutex.unlock();
         self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
@@ -1000,11 +1069,118 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Clone a `ReqRespResponseEvent` so it can outlive the caller's stack
+    /// frame.  Block payloads are deep-copied via sszClone; status/error/
+    /// completed events are trivially copied.
+    fn cloneRespEvent(self: *Self, event: *const networks.ReqRespResponseEvent) !networks.ReqRespResponseEvent {
+        switch (event.payload) {
+            .success => |resp| switch (resp) {
+                .blocks_by_root => |block| {
+                    var cloned: networks.ReqRespResponse = .{ .blocks_by_root = undefined };
+                    try types.sszClone(self.allocator, types.SignedBlock, block, &cloned.blocks_by_root);
+                    return .{
+                        .method = event.method,
+                        .request_id = event.request_id,
+                        .payload = .{ .success = cloned },
+                    };
+                },
+                .status => |status| {
+                    return .{
+                        .method = event.method,
+                        .request_id = event.request_id,
+                        .payload = .{ .success = .{ .status = status } },
+                    };
+                },
+            },
+            .failure => |err_payload| {
+                const owned_msg = try self.allocator.dupe(u8, err_payload.message);
+                return .{
+                    .method = event.method,
+                    .request_id = event.request_id,
+                    .payload = .{ .failure = .{ .code = err_payload.code, .message = owned_msg } },
+                };
+            },
+            .completed => {
+                return .{
+                    .method = event.method,
+                    .request_id = event.request_id,
+                    .payload = .completed,
+                };
+            },
+        }
+    }
+
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+
+        // when an xev.Async notifier is registered,
+        // clone the event into the bounded queue and wake the main loop.
+        if (self.async_notifier != null) {
+            const cloned = self.cloneRespEvent(event) catch |err| {
+                self.logger.warn("failed to clone ReqRespResponseEvent for async queue: {any}", .{err});
+                return err;
+            };
+
+            self.resp_queue_mutex.lock();
+            const pushed = self.resp_queue.push(cloned);
+            self.resp_queue_mutex.unlock();
+
+            if (!pushed) {
+                self.logger.warn("resp_queue full (256), dropping ReqRespResponseEvent request_id={d}", .{event.request_id});
+                var to_free = cloned;
+                to_free.deinit(self.allocator);
+                return;
+            }
+
+            self.async_notifier.?.notify() catch |err| {
+                self.logger.warn("xev.Async.notify() failed: {any}", .{err});
+            };
+            return;
+        }
+
+        // Fallback: synchronous handling
         var guard = self.acquireMutex("onReqRespResponse");
         defer guard.unlock();
         try self.handleReqRespResponse(event);
+    }
+
+    /// xev.Async callback: runs on the main libxev loop thread.
+    /// Drains all queued events under `BeamNode.mutex`.
+    fn drainRespQueueCb(
+        ud: ?*Self,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        r catch |err| {
+            if (ud) |self| {
+                self.logger.err("xev.Async wait error: {any}", .{err});
+            }
+            return .rearm;
+        };
+
+        const self = ud orelse return .rearm;
+
+        var guard = self.acquireMutex("drainRespQueue");
+        defer guard.unlock();
+
+        while (true) {
+            self.resp_queue_mutex.lock();
+            const maybe_event = self.resp_queue.pop();
+            self.resp_queue_mutex.unlock();
+
+            if (maybe_event) |ev| {
+                var event = ev;
+                defer event.deinit(self.allocator);
+                self.handleReqRespResponse(&event) catch |err| {
+                    self.logger.warn("drainRespQueue: handleReqRespResponse failed: {any}", .{err});
+                };
+            } else break;
+        }
+
+        self.flushPendingParentFetches();
+
+        return .rearm;
     }
 
     pub fn getOnGossipCbHandler(self: *Self) !networks.OnGossipCbHandler {
@@ -1019,9 +1195,6 @@ pub const BeamNode = struct {
 
         switch (data.*) {
             .blocks_by_root => |request| {
-                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
-                defer guard.unlock();
-
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
@@ -2433,4 +2606,91 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         try std.testing.expectEqual(@as(usize, slot), stored_block.block.slot);
         try std.testing.expect(std.mem.eql(u8, &stored_block.block.parent_root, &signed_block.block.parent_root));
     }
+}
+
+test "Node: BoundedQueue basic operations" {
+    const TestQueue = BeamNode.BoundedQueue(u32, 4);
+    var q = TestQueue{};
+
+    try std.testing.expectEqual(@as(usize, 0), q.len);
+    try std.testing.expect(q.pop() == null);
+
+    try std.testing.expect(q.push(1));
+    try std.testing.expect(q.push(2));
+    try std.testing.expectEqual(@as(usize, 2), q.len);
+
+    try std.testing.expectEqual(@as(u32, 1), q.pop().?);
+    try std.testing.expectEqual(@as(u32, 2), q.pop().?);
+    try std.testing.expectEqual(@as(usize, 0), q.len);
+
+    try std.testing.expect(q.push(10));
+    try std.testing.expect(q.push(20));
+    try std.testing.expect(q.push(30));
+    try std.testing.expect(q.push(40));
+    try std.testing.expect(!q.push(50));
+    try std.testing.expectEqual(@as(usize, 4), q.len);
+
+    try std.testing.expectEqual(@as(u32, 10), q.pop().?);
+    try std.testing.expect(q.push(50));
+    try std.testing.expectEqual(@as(usize, 4), q.len);
+    try std.testing.expectEqual(@as(u32, 20), q.pop().?);
+}
+
+test "Node: async response queue end-to-end" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+
+    const backend = mock.getNetworkInterface();
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+        .loop = ctx.loopPtr(),
+    });
+    defer node.deinit();
+
+    const event = networks.ReqRespResponseEvent{
+        .method = .status,
+        .request_id = 123,
+        .payload = .{ .success = .{ .status = .{
+            .head_slot = 10,
+            .head_root = [_]u8{0x12} ** 32,
+            .finalized_slot = 5,
+            .finalized_root = [_]u8{0x34} ** 32,
+        } } },
+    };
+
+    try BeamNode.onReqRespResponse(&node, &event);
+
+    node.resp_queue_mutex.lock();
+    try std.testing.expectEqual(@as(usize, 1), node.resp_queue.len);
+    node.resp_queue_mutex.unlock();
+
+    try ctx.loopPtr().run(.once);
+
+    node.resp_queue_mutex.lock();
+    try std.testing.expectEqual(@as(usize, 0), node.resp_queue.len);
+    node.resp_queue_mutex.unlock();
 }
