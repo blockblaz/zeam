@@ -230,7 +230,7 @@ pub const BeamBlockBody = struct {
     }
 
     pub fn toJson(self: *const BeamBlockBody, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
+        var obj = json.ObjectMap.empty;
 
         var attestations_array = json.Array.init(allocator);
         errdefer attestations_array.deinit();
@@ -238,7 +238,7 @@ pub const BeamBlockBody = struct {
         for (self.attestations.constSlice()) |att| {
             try attestations_array.append(try att.toJson(allocator));
         }
-        try obj.put("attestations", json.Value{ .array = attestations_array });
+        try obj.put(allocator, "attestations", json.Value{ .array = attestations_array });
 
         return json.Value{ .object = obj };
     }
@@ -258,12 +258,12 @@ pub const BeamBlockHeader = struct {
     body_root: Bytes32,
 
     pub fn toJson(self: *const BeamBlockHeader, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
-        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
-        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
-        try obj.put("body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put(allocator, "parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put(allocator, "state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put(allocator, "body_root", json.Value{ .string = try bytesToHex(allocator, &self.body_root) });
         return json.Value{ .object = obj };
     }
 
@@ -283,7 +283,7 @@ pub const BeamBlockHeader = struct {
         if (val.object.get("body_root")) |*body_root| {
             allocator.free(body_root.string);
         }
-        val.object.deinit();
+        val.object.deinit(allocator);
     }
 };
 
@@ -352,12 +352,12 @@ pub const BeamBlock = struct {
     }
 
     pub fn toJson(self: *const BeamBlock, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
-        try obj.put("parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
-        try obj.put("state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
-        try obj.put("body", try self.body.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "proposer_index", json.Value{ .integer = @as(i64, @intCast(self.proposer_index)) });
+        try obj.put(allocator, "parent_root", json.Value{ .string = try bytesToHex(allocator, &self.parent_root) });
+        try obj.put(allocator, "state_root", json.Value{ .string = try bytesToHex(allocator, &self.state_root) });
+        try obj.put(allocator, "body", try self.body.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
@@ -380,7 +380,7 @@ pub const BlockSignatures = struct {
     }
 
     pub fn toJson(self: *const BlockSignatures, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
+        var obj = json.ObjectMap.empty;
 
         var groups_array = json.Array.init(allocator);
         errdefer groups_array.deinit();
@@ -389,8 +389,8 @@ pub const BlockSignatures = struct {
             try groups_array.append(try group.toJson(allocator));
         }
 
-        try obj.put("attestation_signatures", json.Value{ .array = groups_array });
-        try obj.put("proposer_signature", json.Value{ .string = try bytesToHex(allocator, &self.proposer_signature) });
+        try obj.put(allocator, "attestation_signatures", json.Value{ .array = groups_array });
+        try obj.put(allocator, "proposer_signature", json.Value{ .string = try bytesToHex(allocator, &self.proposer_signature) });
         return json.Value{ .object = obj };
     }
 
@@ -411,9 +411,9 @@ pub const SignedBlock = struct {
     }
 
     pub fn toJson(self: *const SignedBlock, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("block", try self.block.toJson(allocator));
-        try obj.put("signature", try self.signature.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "block", try self.block.toJson(allocator));
+        try obj.put(allocator, "signature", try self.signature.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
@@ -1200,13 +1200,13 @@ pub const BlockByRootRequest = struct {
     roots: ssz.utils.List(utils.Root, params.MAX_REQUEST_BLOCKS),
 
     pub fn toJson(self: *const BlockByRootRequest, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
+        var obj = json.ObjectMap.empty;
         var roots_array = json.Array.init(allocator);
         errdefer roots_array.deinit();
         for (self.roots.constSlice()) |root| {
             try roots_array.append(json.Value{ .string = try bytesToHex(allocator, &root) });
         }
-        try obj.put("roots", json.Value{ .array = roots_array });
+        try obj.put(allocator, "roots", json.Value{ .array = roots_array });
         return json.Value{ .object = obj };
     }
 
@@ -1232,12 +1232,12 @@ pub const ProtoBlock = struct {
     confirmed: bool,
 
     pub fn toJson(self: *const ProtoBlock, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
-        try obj.put("parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
-        try obj.put("stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
-        try obj.put("timeliness", json.Value{ .bool = self.timeliness });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "blockRoot", json.Value{ .string = try bytesToHex(allocator, &self.blockRoot) });
+        try obj.put(allocator, "parentRoot", json.Value{ .string = try bytesToHex(allocator, &self.parentRoot) });
+        try obj.put(allocator, "stateRoot", json.Value{ .string = try bytesToHex(allocator, &self.stateRoot) });
+        try obj.put(allocator, "timeliness", json.Value{ .bool = self.timeliness });
         return json.Value{ .object = obj };
     }
 
@@ -1252,14 +1252,14 @@ pub const ExecutionPayloadHeader = struct {
     timestamp: u64,
 
     pub fn toJson(self: *const ExecutionPayloadHeader, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("timestamp", json.Value{ .integer = @as(i64, @intCast(self.timestamp)) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "timestamp", json.Value{ .integer = @as(i64, @intCast(self.timestamp)) });
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const ExecutionPayloadHeader, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
-        defer json_value.object.deinit();
+        defer json_value.object.deinit(allocator);
         return utils.jsonToString(allocator, json_value);
     }
 };

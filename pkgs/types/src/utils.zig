@@ -49,7 +49,7 @@ pub fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
             while (it.next()) |entry| {
                 freeJsonValue(&entry.value_ptr.*, allocator);
             }
-            o.deinit();
+            o.deinit(allocator);
         },
         .array => |*a| {
             for (a.items) |*item| {
@@ -197,18 +197,18 @@ pub const ChainSpec = struct {
     }
 
     pub fn toJson(self: *const ChainSpec, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("preset", json.Value{ .string = @tagName(self.preset) });
-        try obj.put("name", json.Value{ .string = self.name });
-        try obj.put("fork_digest", json.Value{ .string = self.fork_digest });
-        try obj.put("attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
-        try obj.put("max_attestations_data", json.Value{ .integer = self.max_attestations_data });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "preset", json.Value{ .string = @tagName(self.preset) });
+        try obj.put(allocator, "name", json.Value{ .string = self.name });
+        try obj.put(allocator, "fork_digest", json.Value{ .string = self.fork_digest });
+        try obj.put(allocator, "attestation_committee_count", json.Value{ .integer = self.attestation_committee_count });
+        try obj.put(allocator, "max_attestations_data", json.Value{ .integer = self.max_attestations_data });
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const ChainSpec, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
-        defer json_value.object.deinit();
+        defer json_value.object.deinit(allocator);
         return jsonToString(allocator, json_value);
     }
 };

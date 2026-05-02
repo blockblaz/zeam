@@ -74,7 +74,7 @@ pub const BeamNode = struct {
     /// wait + hold time into `zeam_node_mutex_wait_time_seconds` /
     /// `zeam_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
     /// quantify the contention described in the issue.
-    mutex: std.Thread.Mutex = .{},
+    mutex: zeam_utils.SyncMutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
@@ -157,10 +157,9 @@ pub const BeamNode = struct {
     /// in its `unlock` method while observing the hold time into the
     /// `zeam_node_mutex_hold_time_seconds` histogram for the configured site.
     ///
-    /// Timing uses `std.time.Timer`, which wraps `CLOCK_MONOTONIC` on Linux,
-    /// `mach_absolute_time` on macOS and `QueryPerformanceCounter` on Windows.
+    /// Timing uses a monotonic clock via `zeam_utils.monotonicTimestampNs()`.
     /// This avoids the wall-clock skew (NTP slew, leap-second steps, manual
-    /// clock changes) that `std.time.nanoTimestamp` is subject to and that
+    /// clock changes) that wall-clock timestamps are subject to and that
     /// would corrupt histogram percentiles by producing negative deltas.
     ///
     /// Calling `unlock()` more than once is a no-op on the second call: a
@@ -170,17 +169,18 @@ pub const BeamNode = struct {
     ///
     /// See issue #786.
     const MutexGuard = struct {
-        mutex: *std.Thread.Mutex,
+        mutex: *zeam_utils.SyncMutex,
         site: []const u8,
-        timer: std.time.Timer,
+        hold_start_ns: i128,
         released: bool = false,
 
         pub fn unlock(self: *MutexGuard) void {
             if (self.released) return;
             self.released = true;
 
-            const elapsed_ns = self.timer.read();
-            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+            const hold_end_ns = zeam_utils.monotonicTimestampNs();
+            const elapsed_ns = if (hold_end_ns >= self.hold_start_ns) hold_end_ns - self.hold_start_ns else 0;
+            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
             zeam_metrics.metrics.zeam_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
             self.mutex.unlock();
         }
@@ -192,23 +192,20 @@ pub const BeamNode = struct {
     /// `defer guard.unlock()`. The `site` label flows through to the metric so
     /// Prometheus can attribute stalls to a specific callback path.
     ///
-    /// Wait/hold timing is measured with `std.time.Timer` (monotonic clock) so
+    /// Wait/hold timing is measured with a monotonic clock so
     /// the deltas observed by Prometheus are guaranteed non-negative even when
     /// the wall clock is adjusted by NTP, leap seconds or operator action.
     fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
-        // `Timer.start()` only fails on platforms without a monotonic clock; on
-        // every supported zeam target (Linux/macOS/Windows) it is infallible.
-        // Falling back to wall-clock time would re-introduce the skew bug we
-        // are fixing, so we panic instead.
-        var timer = std.time.Timer.start() catch @panic("monotonic timer unavailable");
+        const wait_start_ns = zeam_utils.monotonicTimestampNs();
         self.mutex.lock();
-        const wait_ns = timer.lap();
-        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
+        const hold_start_ns = zeam_utils.monotonicTimestampNs();
+        const wait_ns = if (hold_start_ns >= wait_start_ns) hold_start_ns - wait_start_ns else 0;
+        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
         zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
         return .{
             .mutex = &self.mutex,
             .site = site,
-            .timer = timer,
+            .hold_start_ns = hold_start_ns,
         };
     }
 
@@ -1400,7 +1397,7 @@ pub const BeamNode = struct {
     }
 
     fn sweepTimedOutRequests(self: *Self) void {
-        const current_time = std.time.timestamp();
+        const current_time = zeam_utils.unixTimestampSeconds();
         const timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
             self.logger.warn("failed to check for timed-out RPC requests: {any}", .{err});
             return;
@@ -1703,7 +1700,7 @@ test "Node peer tracking on connect/disconnect" {
     defer allocator.free(all_pubkeys.proposal_pubkeys);
 
     const genesis_config = types.GenesisSpec{
-        .genesis_time = @intCast(std.time.timestamp()),
+        .genesis_time = @intCast(zeam_utils.unixTimestampSeconds()),
         .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
         .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
     };
@@ -1714,7 +1711,7 @@ test "Node peer tracking on connect/disconnect" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, ctx.loggerConfig().logger(.database), data_dir);
@@ -1799,7 +1796,7 @@ test "Node peer tracking on connect/disconnect" {
     // Process pending async operations (status request timer callbacks and their responses)
     var iterations: u32 = 0;
     while (iterations < 5) : (iterations += 1) {
-        std.Thread.sleep(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
+        zeam_utils.sleepNs(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
         try ctx.loopPtr().run(.until_done);
     }
 }

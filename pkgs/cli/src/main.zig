@@ -244,8 +244,8 @@ const ZeamArgs = struct {
 const error_handler = @import("error_handler.zig");
 const ErrorHandler = error_handler.ErrorHandler;
 
-pub fn main() void {
-    mainInner() catch |err| {
+pub fn main(init: std.process.Init) void {
+    mainInner(init) catch |err| {
         if (err == error.MissingSubCommand) {
             std.process.exit(1);
         }
@@ -254,8 +254,8 @@ pub fn main() void {
     };
 }
 
-fn mainInner() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn mainInner(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
     const allocator = gpa.allocator();
     defer {
         const leaked = gpa.deinit();
@@ -271,20 +271,23 @@ fn mainInner() !void {
     var parse_arena = std.heap.ArenaAllocator.init(allocator);
     defer parse_arena.deinit();
 
-    const opts = simargs.parse(parse_arena.allocator(), ZeamArgs, app_description, app_version) catch |err| {
+    const opts = simargs.structargs.parse(parse_arena.allocator(), init.io, init.minimal.args, ZeamArgs, .{
+        .argument_prompt = app_description,
+        .version_string = app_version,
+    }) catch |err| {
         std.debug.print("Failed to parse command-line arguments: {s}\n", .{@errorName(err)});
         std.debug.print("Run 'zeam --help' for usage information.\n", .{});
         return err;
     };
     defer opts.deinit();
 
-    const genesis = opts.args.genesis;
-    const log_filename = opts.args.log_filename;
-    const log_file_active_level = opts.args.log_file_active_level;
-    const monocolor_file_log = opts.args.monocolor_file_log;
-    const console_log_level = opts.args.console_log_level;
+    const genesis = opts.options.genesis;
+    const log_filename = opts.options.log_filename;
+    const log_file_active_level = opts.options.log_file_active_level;
+    const monocolor_file_log = opts.options.monocolor_file_log;
+    const console_log_level = opts.options.console_log_level;
 
-    std.debug.print("opts={any} genesis={d}\n", .{ opts.args, genesis });
+    std.debug.print("opts={any} genesis={d}\n", .{ opts.options, genesis });
 
     // Detect the best available I/O backend (io_uring or epoll on Linux).
     node_lib.detectBackend() catch |err| {
@@ -292,7 +295,7 @@ fn mainInner() !void {
         return err;
     };
 
-    switch (opts.args.__commands__) {
+    switch (opts.options.__commands__) {
         .clock => {
             var loop = xev.Loop.init(.{}) catch |err| {
                 ErrorHandler.logErrorWithOperation(err, "initialize event loop");
@@ -375,7 +378,7 @@ fn mainInner() !void {
 
             // Set node lifecycle metrics
             zeam_metrics.metrics.lean_node_info.set(.{ .name = "zeam", .version = build_options.version }, 1) catch {};
-            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(std.time.timestamp()));
+            zeam_metrics.metrics.lean_node_start_time_seconds.set(@intCast(utils_lib.unixTimestampSeconds()));
 
             // Create logger config for API and metrics servers
             var api_logger_config = utils_lib.getLoggerConfig(console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
@@ -439,7 +442,7 @@ fn mainInner() !void {
             chain_options.validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys;
             owns_pubkeys = false; // ownership moved into genesis spec
 
-            const time_now_ms: usize = @intCast(std.time.milliTimestamp());
+            const time_now_ms: usize = @intCast(utils_lib.unixTimestampMillis());
             const time_now: usize = @intCast(time_now_ms / std.time.ms_per_s);
             chain_options.genesis_time = time_now;
 
@@ -455,7 +458,7 @@ fn mainInner() !void {
             const loop = try allocator.create(xev.Loop);
             loop.* = try xev.Loop.init(.{});
 
-            try std.fs.cwd().makePath(beamcmd.data_dir);
+            try std.Io.Dir.cwd().createDirPath(init.io, beamcmd.data_dir);
 
             // Create loggers first so they can be passed to network implementations
             var logger1_config = utils_lib.getScopedLoggerConfig(.n1, console_log_level, utils_lib.FileBehaviourParams{ .fileActiveLevel = log_file_active_level, .filePath = beamcmd.data_dir, .fileName = log_filename, .monocolorFile = monocolor_file_log });
@@ -599,6 +602,7 @@ fn mainInner() !void {
             const worker_count = @min(desired_workers, @as(usize, ThreadPool.max_thread_count));
             const thread_pool = try ThreadPool.init(.{
                 .allocator = allocator,
+                .io = init.io,
                 .thread_count = @intCast(worker_count),
             });
             defer thread_pool.deinit();
@@ -768,14 +772,13 @@ fn mainInner() !void {
                 };
                 defer allocator.free(generated_config);
 
-                const cwd = std.fs.cwd();
-                const config_file = cwd.createFile(genconfig.filename, .{ .truncate = true }) catch |err| {
+                const config_file = std.Io.Dir.cwd().createFile(init.io, genconfig.filename, .{ .truncate = true }) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "create Prometheus config file", .{ .filename = genconfig.filename });
                     return err;
                 };
-                defer config_file.close();
+                defer config_file.close(init.io);
                 var write_buf: [4096]u8 = undefined;
-                var writer = config_file.writer(&write_buf);
+                var writer = config_file.writer(init.io, &write_buf);
                 writer.interface.writeAll(generated_config) catch |err| {
                     ErrorHandler.logErrorWithDetails(err, "write Prometheus config", .{ .filename = genconfig.filename });
                     return err;
@@ -788,7 +791,7 @@ fn mainInner() !void {
             },
         },
         .node => |leancmd| {
-            std.fs.cwd().makePath(leancmd.@"data-dir") catch |err| {
+            std.Io.Dir.cwd().createDirPath(init.io, leancmd.@"data-dir") catch |err| {
                 ErrorHandler.logErrorWithDetails(err, "create data directory", .{ .path = leancmd.@"data-dir" });
                 return err;
             };
@@ -912,5 +915,5 @@ fn mainInner() !void {
 }
 
 test {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }

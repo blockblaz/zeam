@@ -25,5 +25,5 @@ pub const events = @import("./events.zig");
 pub const event_broadcaster = @import("./event_broadcaster.zig");
 
 test "get tests" {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
