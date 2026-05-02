@@ -1027,6 +1027,32 @@ fn refreshSwarmCommandDropMetric() void {
     }
 }
 
+/// leanMetrics PR #35: current number of remote peers in this node's
+/// gossipsub mesh, across all subscribed topics. Kept fresh from inside the
+/// rust-libp2p swarm task (gossipsub events, connection closes, 1s tick) and
+/// read here on every Prometheus scrape — "on scrape" semantics.
+pub extern fn get_mesh_peers_total(network_id: u32) callconv(.c) u64;
+
+/// leanMetrics PR #35 — `lean_gossip_mesh_peers`.
+/// zeam currently runs a single libp2p network instance per process. If that
+/// changes, switch to per-instance scrape refreshers so each network reports
+/// its own mesh size.
+var mesh_peers_network_id: u32 = 0;
+
+fn refreshMeshPeersMetric() void {
+    const count = get_mesh_peers_total(mesh_peers_network_id);
+    zeam_metrics.metrics.lean_gossip_mesh_peers.set(count);
+}
+
+/// Combined scrape refresher: `registerScrapeRefresher` currently stores a
+/// single callback, so we chain all network-layer refreshers from one entry
+/// point. Add new refreshers here; do NOT register them individually or you
+/// will overwrite the previous registration.
+fn refreshNetworkMetrics() void {
+    refreshSwarmCommandDropMetric();
+    refreshMeshPeersMetric();
+}
+
 /// Arguments for the libp2p Rust runtime thread. Kept in a Zig function so `std.Thread.spawn`
 /// uses a normal Zig entry point; passing `create_and_run_network` (a C symbol) as the spawn
 /// target has been observed to fault on Linux x86_64 (GPF in `Thread.callFn`).
@@ -1094,7 +1120,12 @@ pub const EthLibp2p = struct {
         // and turns them into deltas on `zeam_libp2p_swarm_command_dropped_total`.
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
-        zeam_metrics.registerScrapeRefresher(refreshSwarmCommandDropMetric);
+        // leanMetrics PR #35: stash the network_id for the mesh-peers
+        // refresher. `registerScrapeRefresher` only stores a single callback,
+        // so we register `refreshNetworkMetrics` (a fan-out) that calls both
+        // the swarm-drop and mesh-peers refreshers — see its definition.
+        mesh_peers_network_id = params.networkId;
+        zeam_metrics.registerScrapeRefresher(refreshNetworkMetrics);
 
         const gossip_handler = try interface.GenericGossipHandler.init(allocator, loop, params.networkId, logger, params.node_registry);
         errdefer gossip_handler.deinit();
