@@ -94,6 +94,7 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    chain_spec: ?[]const u8 = null,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -192,17 +193,44 @@ pub const Node = struct {
         self.options = options;
         self.api_server_handle = null;
         self.metrics_server_handle = null;
-
-        // some base mainnet spec would be loaded to build this up
-        const chain_spec =
+        self.logger = options.logger_config.logger(.node);
+        // If path is specified load from it, otherwise use default settings
+        const chain_spec_owned = self.options.chain_spec != null;
+        const chain_spec = if (self.options.chain_spec) |path|
+            std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+                self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
+                return err;
+            }
+        else
             \\{"preset": "mainnet", "name": "devnet0", "fork_digest": "12345678"}
         ;
+
+        defer if (chain_spec_owned) allocator.free(chain_spec);
+
         const json_options = json.ParseOptions{
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
+
         var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
         chain_options.genesis_time = options.genesis_spec.genesis_time;
+
+        if (chain_spec_owned) {
+            if (chain_options.preset == null) {
+                self.logger.err("chain spec: 'preset' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.name == null or chain_options.name.?.len == 0) {
+                self.logger.err("chain spec: 'name' field is required", .{});
+                return error.InvalidChainSpec;
+            }
+
+            if (chain_options.fork_digest == null or chain_options.fork_digest.?.len != 8) {
+                self.logger.err("chain spec: 'fork_digest' field must be 4 bytes (8 hex characters)", .{});
+                return error.InvalidChainSpec;
+            }
+        }
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
         chain_options.validator_attestation_pubkeys = options.genesis_spec.validator_attestation_pubkeys;
@@ -250,8 +278,6 @@ pub const Node = struct {
             options.db_backend,
         );
         errdefer db.deinit();
-
-        self.logger = options.logger_config.logger(.node);
 
         const anchorState: *types.BeamState = try allocator.create(types.BeamState);
         errdefer allocator.destroy(anchorState);
@@ -754,6 +780,7 @@ pub fn buildStartOptions(
     opts.node_key_index = node_key_index;
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
+    opts.chain_spec = node_cmd.@"chain-spec";
     opts.is_aggregator = node_cmd.@"is-aggregator";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")

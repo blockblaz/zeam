@@ -75,6 +75,7 @@ pub const NodeCommand = struct {
     @"attestation-committee-count": ?u64 = null,
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"db-backend": database.Backend = .rocksdb,
+    @"chain-spec": ?[]const u8 = null,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -98,6 +99,7 @@ pub const NodeCommand = struct {
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
+        .@"chain-spec" = "Path to the chain specification file, if unspecified falls back to the default setting",
         .help = "Show help information for the node command",
     };
 };
