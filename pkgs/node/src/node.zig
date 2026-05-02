@@ -1630,6 +1630,32 @@ pub const BeamNode = struct {
 
         const topics_slice = try topics_list.toOwnedSlice(self.allocator);
         defer self.allocator.free(topics_slice);
+
+        // Report the selective gossip subscription set so operators can verify
+        // (and so subnet-routing regressions are visible in logs). Mirrors the
+        // leanSpec behaviour at src/lean_spec/__main__.py:541-549.
+        var attestation_subnet_count: usize = 0;
+        for (topics_slice) |topic| {
+            if (topic.kind == .attestation) attestation_subnet_count += 1;
+        }
+        if (attestation_subnet_count == 0) {
+            self.logger.info("gossip subscriptions: block + aggregation only (no attestation subnets — non-aggregator node with no registered validators)", .{});
+        } else {
+            // Format the attestation subnet IDs into a comma-separated list for a single
+            // human-readable log line.
+            var subnet_ids_buf: std.ArrayList(u8) = .empty;
+            defer subnet_ids_buf.deinit(self.allocator);
+            var first = true;
+            for (topics_slice) |topic| {
+                if (topic.kind != .attestation) continue;
+                const subnet_id = topic.subnet_id orelse continue;
+                if (!first) try subnet_ids_buf.appendSlice(self.allocator, ",");
+                first = false;
+                try subnet_ids_buf.writer(self.allocator).print("{d}", .{subnet_id});
+            }
+            self.logger.info("gossip subscriptions: block + aggregation + {d} attestation subnet(s) [{s}]", .{ attestation_subnet_count, subnet_ids_buf.items });
+        }
+
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 
         const peer_handler = self.getPeerEventHandler();

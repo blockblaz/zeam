@@ -1075,11 +1075,6 @@ pub const EthLibp2p = struct {
 
     const Self = @This();
 
-    fn getAttestationSubnetCount(committee_count: types.SubnetId) !usize {
-        if (committee_count == 0) return error.InvalidAttestationCommitteeCount;
-        return @intCast(committee_count);
-    }
-
     pub fn init(
         allocator: Allocator,
         loop: *xev.Loop,
@@ -1179,27 +1174,31 @@ pub const EthLibp2p = struct {
             topics_list.deinit(self.allocator);
         }
 
-        for (std.enums.values(interface.GossipTopicKind)) |kind| {
-            switch (kind) {
-                .attestation => {
-                    const subnet_count = try getAttestationSubnetCount(self.params.attestation_committee_count);
-                    for (0..subnet_count) |i| {
-                        const subnet_id: types.SubnetId = @intCast(i);
-                        const gossip_topic = interface.GossipTopic{ .kind = .attestation, .subnet_id = subnet_id };
-                        var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
-                        defer topic.deinit();
-                        const topic_str = try topic.encode();
-                        try topics_list.append(self.allocator, topic_str);
-                    }
-                },
-                else => {
-                    const gossip_topic = interface.GossipTopic{ .kind = kind };
-                    var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic, .ssz_snappy, self.params.fork_digest);
-                    defer topic.deinit();
-                    const topic_str = try topic.encode();
-                    try topics_list.append(self.allocator, topic_str);
-                },
-            }
+        // Subscribe to gossipsub mesh topics derived from the topics that the
+        // BeamNode actually registered handlers for via `gossip.subscribe(...)`.
+        //
+        // Previously this enumerated *every* attestation subnet in addition to
+        // block + aggregation, which made the gossipsub mesh effectively flat:
+        // every node joined every subnet's mesh, regardless of which subnets
+        // its validators were assigned to. That defeated the bandwidth-saving
+        // purpose of attestation subnets — see
+        // https://github.com/leanEthereum/leanSpec/blob/main/src/lean_spec/__main__.py
+        // for the spec-conformant selective subscribe.
+        //
+        // The selection logic lives in `BeamNode.run` (validator-derived
+        // subnets + explicit aggregator subnets + block + aggregation). It must
+        // run before this point — see the call order in
+        // `pkgs/cli/src/node.zig` (`Node.run`) and the multi-node bring-up in
+        // `pkgs/cli/src/main.zig`.
+        if (self.gossipHandler.onGossipHandlers.count() == 0) {
+            self.logger.warn("network-{d}:: EthLibp2p.run() called before any gossip subscriptions were registered; the gossipsub mesh will start empty. Make sure BeamNode.run() runs first.", .{self.params.networkId});
+        }
+        var topic_iter = self.gossipHandler.onGossipHandlers.keyIterator();
+        while (topic_iter.next()) |gossip_topic_ptr| {
+            var topic = try interface.LeanNetworkTopic.init(self.allocator, gossip_topic_ptr.*, .ssz_snappy, self.params.fork_digest);
+            defer topic.deinit();
+            const topic_str = try topic.encode();
+            try topics_list.append(self.allocator, topic_str);
         }
         const topics_str = try std.mem.joinZ(self.allocator, ",", topics_list.items);
 
