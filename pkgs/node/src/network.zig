@@ -2,6 +2,7 @@ const std = @import("std");
 const networks = @import("@zeam/network");
 const types = @import("@zeam/types");
 const params = @import("@zeam/params");
+const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
 
 const Allocator = std.mem.Allocator;
@@ -204,7 +205,10 @@ pub const Network = struct {
         const peer_count = self.connected_peers.count();
         if (peer_count == 0) return null;
 
-        const target_index = std.crypto.random.uintLessThan(usize, peer_count);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var random_source = std.Random.IoSource{ .io = io };
+        const random = random_source.interface();
+        const target_index = random.uintLessThan(usize, peer_count);
 
         var it = self.connected_peers.iterator();
         var current_index: usize = 0;
@@ -247,7 +251,7 @@ pub const Network = struct {
 
         const peer_info = PeerInfo{
             .peer_id = owned_peer_id,
-            .connected_at = std.time.timestamp(),
+            .connected_at = zeam_utils.unixTimestampSeconds(),
         };
 
         self.connected_peers.put(owned_key, peer_info) catch |err| {
@@ -419,17 +423,25 @@ pub const Network = struct {
             }
         }
 
-        var to_remove = std.AutoArrayHashMap(types.Root, void).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove_set = std.AutoHashMap(types.Root, void).init(self.allocator);
+        defer to_remove_set.deinit();
+        var to_remove_order: std.ArrayList(types.Root) = .empty;
+        defer to_remove_order.deinit(self.allocator);
 
-        to_remove.put(root, {}) catch return 0;
+        const root_gop = to_remove_set.getOrPut(root) catch return 0;
+        if (!root_gop.found_existing) {
+            to_remove_order.append(self.allocator, root) catch return 0;
+        }
 
         // Walk up: traverse parent chain and add all cached ancestors
         var current = root;
         while (self.getFetchedBlock(current)) |block_ptr| {
             const parent_root = block_ptr.block.parent_root;
             if (self.hasFetchedBlock(parent_root)) {
-                to_remove.put(parent_root, {}) catch break;
+                const parent_gop = to_remove_set.getOrPut(parent_root) catch break;
+                if (!parent_gop.found_existing) {
+                    to_remove_order.append(self.allocator, parent_root) catch break;
+                }
                 current = parent_root;
             } else {
                 break;
@@ -439,8 +451,8 @@ pub const Network = struct {
         // Walk down: process entries, expanding children as we go.
         // We iterate by index since new entries may be appended during iteration.
         var i: usize = 0;
-        while (i < to_remove.count()) : (i += 1) {
-            const current_root = to_remove.keys()[i];
+        while (i < to_remove_order.items.len) : (i += 1) {
+            const current_root = to_remove_order.items[i];
 
             // Enqueue children before removing (since removal modifies the children map)
             const children_slice = self.getChildrenOfBlock(current_root);
@@ -457,13 +469,16 @@ pub const Network = struct {
                         }
                     }
                 }
-                to_remove.put(child_root, {}) catch continue;
+                const child_gop = to_remove_set.getOrPut(child_root) catch continue;
+                if (!child_gop.found_existing) {
+                    to_remove_order.append(self.allocator, child_root) catch continue;
+                }
             }
         }
 
         // Remove all collected roots
         var pruned: usize = 0;
-        for (to_remove.keys()) |entry_root| {
+        for (to_remove_order.items) |entry_root| {
             if (self.removeFetchedBlock(entry_root)) {
                 pruned += 1;
             }
@@ -493,7 +508,7 @@ pub const Network = struct {
 
         self.pending_rpc_requests.put(request_id, PendingRPCEntry{
             .request = pending,
-            .created_at = std.time.timestamp(),
+            .created_at = zeam_utils.unixTimestampSeconds(),
         }) catch |err| {
             pending.deinit(self.allocator);
             return err;
@@ -548,7 +563,7 @@ pub const Network = struct {
 
         self.pending_rpc_requests.put(request_id, PendingRPCEntry{
             .request = pending,
-            .created_at = std.time.timestamp(),
+            .created_at = zeam_utils.unixTimestampSeconds(),
         }) catch |err| {
             pending.deinit(self.allocator);
             return err;

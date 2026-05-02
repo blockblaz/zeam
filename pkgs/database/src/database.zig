@@ -60,6 +60,7 @@ fn warnIfOtherBackendPopulated(
     path: []const u8,
     selected: Backend,
 ) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
     const other: Backend = switch (selected) {
         .rocksdb => .lmdb,
         .lmdb => .rocksdb,
@@ -72,11 +73,11 @@ fn warnIfOtherBackendPopulated(
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const other_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ path, other_name }) catch return;
 
-    var dir = std.fs.cwd().openDir(other_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(io, other_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     var it = dir.iterate();
-    const has_entries = while (it.next() catch return) |_| break true else false;
+    const has_entries = while (it.next(io) catch return) |_| break true else false;
     if (!has_entries) return;
 
     const selected_name = switch (selected) {
@@ -485,9 +486,8 @@ fn testSaveAndLoadBlock(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(data_dir);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
@@ -528,9 +528,8 @@ fn testBatchWriteAndCommit(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(data_dir);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();
@@ -582,9 +581,8 @@ fn testLoadLatestFinalizedStateHappyPath(backend: Backend) !void {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    // Avoid `realpathAlloc`: it was removed in Zig 0.16.0.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const data_dir = try tmp_dir.dir.realpath(".", &path_buf);
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    defer allocator.free(data_dir);
 
     var db = try Db.openBackend(allocator, zeam_logger_config.logger(.database_test), data_dir, backend);
     defer db.deinit();

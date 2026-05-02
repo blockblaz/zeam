@@ -16,7 +16,9 @@ fn getTimestamp() i128 {
     if (comptime isZKVM()) {
         return 0;
     } else {
-        return std.time.nanoTimestamp();
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+        return @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
     }
 }
 
@@ -481,6 +483,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    const io = std.Io.Threaded.global_single_threaded.io();
+
     metrics = .{
         .zeam_chain_onblock_duration_seconds = Metrics.ChainHistogram.init("zeam_chain_onblock_duration_seconds", .{ .help = "Time taken to process a block in the chain's onBlock function." }, .{}),
         .lean_head_slot = Metrics.LeanHeadSlotGauge.init("lean_head_slot", .{ .help = "Latest slot of the lean chain" }, .{}),
@@ -494,8 +498,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_state_transition_attestations_processing_time_seconds = Metrics.AttestationsProcessingHistogram.init("lean_state_transition_attestations_processing_time_seconds", .{ .help = "Time taken to process attestations" }, .{}),
         .lean_validators_count = Metrics.LeanValidatorsCountGauge.init("lean_validators_count", .{ .help = "Number of validators managed by a node" }, .{}),
         .lean_fork_choice_block_processing_time_seconds = Metrics.ForkChoiceBlockProcessingTimeHistogram.init("lean_fork_choice_block_processing_time_seconds", .{ .help = "Time taken to process block" }, .{}),
-        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
-        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
+        .lean_attestations_valid_total = try Metrics.ForkChoiceAttestationsValidLabeledCounter.init(allocator, io, "lean_attestations_valid_total", .{ .help = "Total number of valid attestations" }, .{}),
+        .lean_attestations_invalid_total = try Metrics.ForkChoiceAttestationsInvalidLabeledCounter.init(allocator, io, "lean_attestations_invalid_total", .{ .help = "Total number of invalid attestations" }, .{}),
         .lean_attestation_validation_time_seconds = Metrics.ForkChoiceAttestationValidationTimeHistogram.init("lean_attestation_validation_time_seconds", .{ .help = "Time taken to validate attestation" }, .{}),
         // Individual attestation signature metrics
         .lean_pq_sig_attestation_signing_time_seconds = Metrics.PQSignatureSigningHistogram.init("lean_pq_sig_attestation_signing_time_seconds", .{ .help = "Time taken to sign an attestation" }, .{}),
@@ -511,13 +515,13 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_pq_sig_aggregated_signatures_valid_total = Metrics.PQSigAggregatedValidCounter.init("lean_pq_sig_aggregated_signatures_valid_total", .{ .help = "Total number of valid aggregated signatures" }, .{}),
         .lean_pq_sig_aggregated_signatures_invalid_total = Metrics.PQSigAggregatedInvalidCounter.init("lean_pq_sig_aggregated_signatures_invalid_total", .{ .help = "Total number of invalid aggregated signatures" }, .{}),
         // Network peer metrics
-        .lean_connected_peers = try Metrics.LeanConnectedPeersGauge.init(allocator, "lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
-        .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
-        .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
-        .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
+        .lean_connected_peers = try Metrics.LeanConnectedPeersGauge.init(allocator, io, "lean_connected_peers", .{ .help = "Number of connected peers" }, .{}),
+        .lean_peer_connection_events_total = try Metrics.PeerConnectionEventsCounter.init(allocator, io, "lean_peer_connection_events_total", .{ .help = "Total number of peer connection events" }, .{}),
+        .lean_peer_disconnection_events_total = try Metrics.PeerDisconnectionEventsCounter.init(allocator, io, "lean_peer_disconnection_events_total", .{ .help = "Total number of peer disconnection events" }, .{}),
+        .zeam_libp2p_swarm_command_dropped_total = try Metrics.LibP2pSwarmCommandDroppedCounter.init(allocator, io, "zeam_libp2p_swarm_command_dropped_total", .{ .help = "Total number of swarm commands dropped before reaching the rust-libp2p event loop, by reason (issue #808)" }, .{}),
         .lean_gossip_mesh_peers = Metrics.LeanGossipMeshPeersGauge.init("lean_gossip_mesh_peers", .{ .help = "Number of peers in the gossipsub mesh" }, .{}),
         // Node lifecycle metrics
-        .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
+        .lean_node_info = try Metrics.LeanNodeInfoGauge.init(allocator, io, "lean_node_info", .{ .help = "Node information (always 1)" }, .{}),
         .lean_node_start_time_seconds = Metrics.LeanNodeStartTimeGauge.init("lean_node_start_time_seconds", .{ .help = "Start timestamp" }, .{}),
         .lean_current_slot = Metrics.LeanCurrentSlotGauge.init("lean_current_slot", .{ .help = "Current slot of the lean chain" }, .{}),
         .lean_safe_target_slot = Metrics.LeanSafeTargetSlotGauge.init("lean_safe_target_slot", .{ .help = "Safe target slot" }, .{}),
@@ -525,7 +529,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_fork_choice_reorgs_total = Metrics.LeanForkChoiceReorgsTotalCounter.init("lean_fork_choice_reorgs_total", .{ .help = "Total number of fork choice reorgs" }, .{}),
         .lean_fork_choice_reorg_depth = Metrics.LeanForkChoiceReorgDepthHistogram.init("lean_fork_choice_reorg_depth", .{ .help = "Depth of fork choice reorgs (in blocks)" }, .{}),
         // Finalization metrics
-        .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, "lean_finalizations_total", .{ .help = "Total number of finalization attempts" }, .{}),
+        .lean_finalizations_total = try Metrics.LeanFinalizationsTotalCounter.init(allocator, io, "lean_finalizations_total", .{ .help = "Total number of finalization attempts" }, .{}),
         // Fork-choice store gauges
         .lean_gossip_signatures = Metrics.LeanGossipSignaturesGauge.init("lean_gossip_signatures", .{ .help = "Number of gossip signatures in fork-choice store" }, .{}),
         .lean_latest_new_aggregated_payloads = Metrics.LeanLatestNewAggregatedPayloadsGauge.init("lean_latest_new_aggregated_payloads", .{ .help = "Number of new aggregated payload items" }, .{}),
@@ -543,7 +547,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_block_building_success_total = Metrics.BlockBuildingSuccessCounter.init("lean_block_building_success_total", .{ .help = "Successful block builds" }, .{}),
         .lean_block_building_failures_total = Metrics.BlockBuildingFailuresCounter.init("lean_block_building_failures_total", .{ .help = "Failed block builds (exception in build_block)" }, .{}),
         // Sync status: labeled gauge with status in {idle, syncing, synced}
-        .lean_node_sync_status = try Metrics.LeanNodeSyncStatusGauge.init(allocator, "lean_node_sync_status", .{ .help = "Node sync status" }, .{}),
+        .lean_node_sync_status = try Metrics.LeanNodeSyncStatusGauge.init(allocator, io, "lean_node_sync_status", .{ .help = "Node sync status" }, .{}),
         // Gossip message size histograms
         .lean_gossip_block_size_bytes = Metrics.GossipBlockSizeBytesHistogram.init("lean_gossip_block_size_bytes", .{ .help = "Bytes size of a gossip block message" }, .{}),
         .lean_gossip_attestation_size_bytes = Metrics.GossipAttestationSizeBytesHistogram.init("lean_gossip_attestation_size_bytes", .{ .help = "Bytes size of a gossip attestation message" }, .{}),
@@ -556,8 +560,8 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         // BeamNode mutex contention metrics (issue #786)
-        .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite" }, .{}),
-        .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite" }, .{}),
+        .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite" }, .{}),
+        .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite" }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)

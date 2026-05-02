@@ -260,17 +260,15 @@ fn serverStreamIsFinished(ptr: *anyopaque) bool {
 /// segfaulted when logging it.  The fix: log from inside this function and return
 /// a plain bool; callers no longer touch the filename string at all (#725).
 fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocator: Allocator, timestamp: ?i64, logger: zeam_utils.ModuleLogger) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
     // Create dumps directory if it doesn't exist
-    std.fs.cwd().makeDir("deserialization_dumps") catch |e| switch (e) {
-        error.PathAlreadyExists => {}, // Directory already exists, continue
-        else => {
-            logger.err("Failed to create deserialization dumps directory: {any}", .{e});
-            return false;
-        },
+    std.Io.Dir.cwd().createDirPath(io, "deserialization_dumps") catch |e| {
+        logger.err("Failed to create deserialization dumps directory: {any}", .{e});
+        return false;
     };
 
     // Generate timestamp-based filename
-    const actual_timestamp = timestamp orelse std.time.timestamp();
+    const actual_timestamp = timestamp orelse zeam_utils.unixTimestampSeconds();
     const filename = std.fmt.allocPrint(allocator, "deserialization_dumps/failed_{s}_{d}.bin", .{ message_type, actual_timestamp }) catch |e| {
         logger.err("Failed to allocate filename for {s} deserialization dump: {any}", .{ message_type, e });
         return false;
@@ -278,14 +276,14 @@ fn writeFailedBytes(message_bytes: []const u8, message_type: []const u8, allocat
     defer allocator.free(filename);
 
     // Write bytes to file
-    const file = std.fs.cwd().createFile(filename, .{ .truncate = true }) catch |e| {
+    const file = std.Io.Dir.cwd().createFile(io, filename, .{ .truncate = true }) catch |e| {
         logger.err("Failed to create file {s} for {s} deserialization dump: {any}", .{ filename, message_type, e });
         return false;
     };
-    defer file.close();
+    defer file.close(io);
 
     var write_buf: [4096]u8 = undefined;
-    var writer = file.writer(&write_buf);
+    var writer = file.writer(io, &write_buf);
     writer.interface.writeAll(message_bytes) catch |e| {
         logger.err("Failed to write {d} bytes to file {s} for {s} deserialization dump: {any}", .{ message_bytes.len, filename, message_type, e });
         return false;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const process = std.process;
-const net = std.net;
+const net = std.Io.net;
+const zeam_utils = @import("@zeam/utils");
 const build_options = @import("build_options");
 const constants = @import("cli_constants");
 const error_handler = @import("error_handler");
@@ -9,11 +10,13 @@ const ErrorHandler = error_handler.ErrorHandler;
 /// Verify that the Zeam executable exists and return its path
 /// Includes detailed debugging output if the executable is not found
 fn getZeamExecutable() ![]const u8 {
+    const io = std.testing.io;
+
     // Handle both absolute and relative paths
     const exe_file = if (std.fs.path.isAbsolute(build_options.cli_exe_path))
-        std.fs.openFileAbsolute(build_options.cli_exe_path, .{})
+        std.Io.Dir.openFileAbsolute(io, build_options.cli_exe_path, .{})
     else
-        std.fs.cwd().openFile(build_options.cli_exe_path, .{});
+        std.Io.Dir.cwd().openFile(io, build_options.cli_exe_path, .{});
 
     const file = exe_file catch |err| {
         std.debug.print("ERROR: Cannot find executable at {s}: {}\n", .{ build_options.cli_exe_path, err });
@@ -23,26 +26,26 @@ fn getZeamExecutable() ![]const u8 {
         const dir_path = std.fs.path.dirname(build_options.cli_exe_path);
         if (dir_path) |path| {
             const dir = if (std.fs.path.isAbsolute(path))
-                std.fs.openDirAbsolute(path, .{ .iterate = true })
+                std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
             else
-                std.fs.cwd().openDir(path, .{ .iterate = true });
+                std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 
             var d = dir catch |dir_err| {
                 std.debug.print("ERROR: Cannot open directory {s}: {}\n", .{ path, dir_err });
                 return err;
             };
-            defer d.close();
+            defer d.close(io);
 
             var iterator = d.iterate();
             std.debug.print("INFO: Contents of {s}:\n", .{path});
-            while (try iterator.next()) |entry| {
+            while (try iterator.next(io)) |entry| {
                 std.debug.print("  - {s} (type: {})\n", .{ entry.name, entry.kind });
             }
         }
 
         return err;
     };
-    file.close();
+    file.close(io);
     std.debug.print("INFO: Found executable at {s}\n", .{build_options.cli_exe_path});
     return build_options.cli_exe_path;
 }
@@ -51,21 +54,16 @@ fn getZeamExecutable() ![]const u8 {
 /// Handles the complete process lifecycle: creation, spawning, and waiting for readiness
 /// Returns the process handle for cleanup, or error if startup fails
 fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process.Child {
+    const io = std.testing.io;
+
     // Set up process with beam command and mock network
     const args = [_][]const u8{ exe_path, "beam", "--mockNetwork", "true", "--is-aggregator", "true" };
     const cli_process = try allocator.create(process.Child);
-    cli_process.* = process.Child.init(&args, allocator);
-
-    // Capture stdout and stderr for debugging
-    // However this leads to test being cut short probably because of child process getting killed
-    // so commenting the pipe and letting the output to flow to console
-    // TODO: figureout and fix the behavior and uncomment the following
-    //
-    // cli_process.stdout_behavior = .Pipe;
-    // cli_process.stderr_behavior = .Pipe;
 
     // Start the process
-    cli_process.spawn() catch |err| {
+    cli_process.* = process.spawn(io, .{
+        .argv = &args,
+    }) catch |err| {
         std.debug.print("ERROR: Failed to spawn process: {}\n", .{err});
         allocator.destroy(cli_process);
         return err;
@@ -74,38 +72,38 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
     std.debug.print("INFO: Process spawned successfully with PID\n", .{});
 
     // Wait for server to be ready
-    const start_time = std.time.milliTimestamp();
+    const start_time = zeam_utils.unixTimestampMillis();
     var server_ready = false;
     var retry_count: u32 = 0;
 
-    while (std.time.milliTimestamp() - start_time < constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS) {
+    while (zeam_utils.unixTimestampMillis() - start_time < constants.DEFAULT_SERVER_STARTUP_TIMEOUT_MS) {
         retry_count += 1;
 
         // Print progress every 10 retries
         if (retry_count % 10 == 0) {
-            const elapsed = @divTrunc(std.time.milliTimestamp() - start_time, 1000);
+            const elapsed = @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000);
             std.debug.print("INFO: Still waiting for server... ({} seconds, {} retries)\n", .{ elapsed, retry_count });
         }
 
         // Try to connect to the metrics server
-        const address = net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
-            std.Thread.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
+        const address = net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT) catch {
+            zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
-        var connection = net.tcpConnectToAddress(address) catch |err| {
+        var connection = address.connect(io, .{ .mode = .stream }) catch |err| {
             // Only print error details on certain intervals to avoid spam
             if (retry_count % 20 == 0) {
                 std.debug.print("DEBUG: Connection attempt {} failed: {}\n", .{ retry_count, err });
             }
-            std.Thread.sleep(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
+            zeam_utils.sleepNs(constants.DEFAULT_RETRY_INTERVAL_MS * std.time.ns_per_ms);
             continue;
         };
 
         // Test if we can actually send/receive data
-        connection.close();
+        connection.close(io);
         server_ready = true;
-        std.debug.print("SUCCESS: Server ready after {} seconds ({} retries)\n", .{ @divTrunc(std.time.milliTimestamp() - start_time, 1000), retry_count });
+        std.debug.print("SUCCESS: Server ready after {} seconds ({} retries)\n", .{ @divTrunc(zeam_utils.unixTimestampMillis() - start_time, 1000), retry_count });
         break;
     }
 
@@ -117,7 +115,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         if (cli_process.stdout) |stdout| {
             var stdout_buffer: [4096]u8 = undefined;
             var read_buf: [4096]u8 = undefined;
-            var stdout_reader = stdout.reader(&read_buf);
+            var stdout_reader = stdout.reader(io, &read_buf);
             const stdout_bytes = stdout_reader.interface.readSliceShort(&stdout_buffer) catch 0;
             if (stdout_bytes > 0) {
                 std.debug.print("STDOUT: {s}\n", .{stdout_buffer[0..stdout_bytes]});
@@ -127,24 +125,15 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
         if (cli_process.stderr) |stderr| {
             var stderr_buffer: [4096]u8 = undefined;
             var read_buf: [4096]u8 = undefined;
-            var stderr_reader = stderr.reader(&read_buf);
+            var stderr_reader = stderr.reader(io, &read_buf);
             const stderr_bytes = stderr_reader.interface.readSliceShort(&stderr_buffer) catch 0;
             if (stderr_bytes > 0) {
                 std.debug.print("STDERR: {s}\n", .{stderr_buffer[0..stderr_bytes]});
             }
         }
 
-        // Check if process is still running
-        if (cli_process.wait() catch null) |term| {
-            switch (term) {
-                .Exited => |code| std.debug.print("ERROR: Process exited with code {}\n", .{code}),
-                .Signal => |sig| std.debug.print("ERROR: Process killed by signal {}\n", .{sig}),
-                .Stopped => |sig| std.debug.print("ERROR: Process stopped by signal {}\n", .{sig}),
-                .Unknown => |code| std.debug.print("ERROR: Process terminated with unknown code {}\n", .{code}),
-            }
-        } else {
-            std.debug.print("INFO: Process is still running\n", .{});
-        }
+        cli_process.kill(io);
+        std.debug.print("INFO: Terminated process after startup timeout\n", .{});
 
         // Server not ready, cleanup and return error
         allocator.destroy(cli_process);
@@ -158,7 +147,7 @@ fn spinBeamSimNode(allocator: std.mem.Allocator, exe_path: []const u8) !*process
 /// TODO: Over time, this can be abstracted to listen for some event
 /// that the node can output when being active, rather than using a fixed sleep
 fn waitForNodeStart() void {
-    std.Thread.sleep(2000 * std.time.ns_per_ms);
+    zeam_utils.sleepNs(2000 * std.time.ns_per_ms);
 }
 
 /// Helper struct for making HTTP requests to Zeam endpoints
@@ -219,7 +208,8 @@ const ZeamRequest = struct {
         );
         defer self.allocator.free(url);
 
-        var client = std.http.Client{ .allocator = self.allocator };
+        const io = std.testing.io;
+        var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
         var body_writer = std.Io.Writer.Allocating.init(self.allocator);
@@ -251,9 +241,10 @@ const ZeamRequest = struct {
     /// use a raw TCP writer because the metrics/health callers predate the
     /// aggregator work and aren't in scope here.
     fn makeRequestToPort(self: ZeamRequest, endpoint: []const u8, port: u16) ![]u8 {
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, port);
-        var connection = try net.tcpConnectToAddress(address);
-        defer connection.close();
+        const io = std.testing.io;
+        const address = try net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, port);
+        var connection = try address.connect(io, .{ .mode = .stream });
+        defer connection.close(io);
 
         var request_buffer: [4096]u8 = undefined;
         const request = try std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\n" ++
@@ -262,7 +253,7 @@ const ZeamRequest = struct {
             "\r\n", .{ endpoint, constants.DEFAULT_SERVER_IP, port });
 
         var conn_write_buf: [4096]u8 = undefined;
-        var conn_writer = connection.writer(&conn_write_buf);
+        var conn_writer = connection.writer(io, &conn_write_buf);
         try conn_writer.interface.writeAll(request);
         try conn_writer.interface.flush();
 
@@ -270,12 +261,14 @@ const ZeamRequest = struct {
     }
 
     fn readFullResponse(self: ZeamRequest, connection: *net.Stream) ![]u8 {
+        const io = std.testing.io;
         var response_buffer: [8192]u8 = undefined;
+        var read_buf: [8192]u8 = undefined;
+        var stream_reader = connection.reader(io, &read_buf);
         var total_bytes: usize = 0;
         while (total_bytes < response_buffer.len) {
-            const bytes_read = connection.read(response_buffer[total_bytes..]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => break,
-                else => return err,
+            const bytes_read = stream_reader.interface.readSliceShort(response_buffer[total_bytes..]) catch |err| switch (err) {
+                error.ReadFailed => if (stream_reader.err) |e| (if (e == error.ConnectionResetByPeer) break else return e) else return err,
             };
             if (bytes_read == 0) break;
             total_bytes += bytes_read;
@@ -305,15 +298,18 @@ const ChainEvent = struct {
 /// SSE Client for testing event streaming - FIXED VERSION
 const SSEClient = struct {
     allocator: std.mem.Allocator,
-    connection: std.net.Stream,
+    connection: net.Stream,
     received_events: std.ArrayList([]u8),
     // NEW: Add proper buffering for handling partial events and multiple events per read
     read_buffer: std.ArrayList(u8),
     parsed_events_queue: std.ArrayList(ChainEvent),
+    stream_read_buf: [8192]u8 = undefined,
+    stream_reader: net.Stream.Reader = undefined,
 
     fn init(allocator: std.mem.Allocator) !SSEClient {
-        const address = try net.Address.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
-        const connection = try net.tcpConnectToAddress(address);
+        const io = std.testing.io;
+        const address = try net.IpAddress.parseIp4(constants.DEFAULT_SERVER_IP, constants.DEFAULT_API_PORT);
+        const connection = try address.connect(io, .{ .mode = .stream });
 
         return SSEClient{
             .allocator = allocator,
@@ -325,7 +321,8 @@ const SSEClient = struct {
     }
 
     fn deinit(self: *SSEClient) void {
-        self.connection.close();
+        const io = std.testing.io;
+        self.connection.close(io);
         for (self.received_events.items) |event| {
             self.allocator.free(event);
         }
@@ -348,10 +345,12 @@ const SSEClient = struct {
             "Connection: keep-alive\r\n" ++
             "\r\n";
 
+        const io = std.testing.io;
         var conn_write_buf: [4096]u8 = undefined;
-        var conn_writer = self.connection.writer(&conn_write_buf);
+        var conn_writer = self.connection.writer(io, &conn_write_buf);
         try conn_writer.interface.writeAll(request);
         try conn_writer.interface.flush();
+        self.stream_reader = net.Stream.Reader.init(self.connection, io, &self.stream_read_buf);
     }
 
     /// NEW: Parse all complete events from the current buffer
@@ -489,16 +488,21 @@ const SSEClient = struct {
 
         // Read new data from network
         var temp_buffer: [4096]u8 = undefined;
-        const bytes_read = self.connection.read(&temp_buffer) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-                return null; // No data available
+        const bytes_read = self.stream_reader.interface.readSliceShort(&temp_buffer) catch |err| switch (err) {
+            error.ReadFailed => {
+                if (self.stream_reader.err) |e| switch (e) {
+                    error.Timeout => {
+                        zeam_utils.sleepNs(50 * std.time.ns_per_ms);
+                        return null;
+                    },
+                    else => return e,
+                };
+                return err;
             },
-            else => return err,
         };
 
         if (bytes_read == 0) {
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            zeam_utils.sleepNs(50 * std.time.ns_per_ms);
             return null; // No data available
         }
 
@@ -538,8 +542,9 @@ const SSEClient = struct {
 
 /// Clean up a process created by spinBeamSimNode
 fn cleanupProcess(allocator: std.mem.Allocator, cli_process: *process.Child) void {
-    _ = cli_process.kill() catch {};
-    _ = cli_process.wait() catch {};
+    const io = std.testing.io;
+    cli_process.kill(io);
+    // cli_process.wait(io) catch {};
     allocator.destroy(cli_process);
 }
 
@@ -588,15 +593,15 @@ test "admin aggregator endpoint - GET returns seed, POST toggles at runtime" {
     // `setChain` is called inside main.zig after validator key generation).
     // Poll until the chain is ready, then assert the baseline.
     const chain_ready_deadline_ms: i64 = 60_000;
-    const poll_start = std.time.milliTimestamp();
+    const poll_start = zeam_utils.unixTimestampMillis();
     var get_before = try zeam_request.getAggregator();
     while (get_before.status != .ok) {
         get_before.deinit();
-        if (std.time.milliTimestamp() - poll_start > chain_ready_deadline_ms) {
+        if (zeam_utils.unixTimestampMillis() - poll_start > chain_ready_deadline_ms) {
             std.debug.print("timed out waiting for chain to be ready\n", .{});
             return error.ChainNotReady;
         }
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        zeam_utils.sleepNs(500 * std.time.ns_per_ms);
         get_before = try zeam_request.getAggregator();
     }
     defer get_before.deinit();
@@ -669,13 +674,13 @@ test "SSE events integration test - wait for justification and finalization" {
     // Read events until justification, any finalization, AND explicit node3 finalization sync are verified, or timeout.
     // Node3 sync is proven only when node3 itself emits new_finalization with finalized_slot > 0.
     const timeout_ms: u64 = 480000; // 480 seconds timeout
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = zeam_utils.monotonicTimestampNs();
     const deadline_ns = start_ns + timeout_ms * std.time.ns_per_ms;
     var got_justification = false;
     var got_finalization = false;
     var got_node3_sync = false;
 
-    var current_ns = std.time.nanoTimestamp();
+    var current_ns = zeam_utils.monotonicTimestampNs();
     while (current_ns < deadline_ns and !(got_justification and got_finalization and got_node3_sync)) {
         const event = try sse_client.readEvent();
         if (event) |e| {
@@ -712,7 +717,7 @@ test "SSE events integration test - wait for justification and finalization" {
             e.deinit(allocator);
         }
 
-        current_ns = std.time.nanoTimestamp();
+        current_ns = zeam_utils.monotonicTimestampNs();
         std.debug.print("CURRENT TIME:{d} DEADLINE={d} START={d} PASSED={d} TIMEOUT={d} (in ms)\n", .{
             @divTrunc(current_ns, std.time.ns_per_ms),
             @divTrunc(deadline_ns, std.time.ns_per_ms),

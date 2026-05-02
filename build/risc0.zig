@@ -3,25 +3,24 @@ const std = @import("std");
 const magic = "R0BF";
 const BinaryFormatVersion = 1;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const allocator = std.heap.page_allocator;
-    var args = std.process.args();
-    _ = args.next(); // skip self name
-    if (args.next()) |srcfile| {
+    const args = try init.minimal.args.toSlice(allocator);
+    if (args.len > 1) {
+        const srcfile = args[1];
         std.debug.print("Post-processing {s}\n", .{srcfile});
 
-        const src = try std.fs.cwd().openFile(srcfile, .{});
-        defer src.close();
-        const srcstat = try src.stat();
-        const srcsize = srcstat.size;
-        const bindata = try src.readToEndAlloc(allocator, srcsize);
+        const cwd = std.Io.Dir.cwd();
+        const bindata = try cwd.readFileAlloc(io, srcfile, allocator, .limited(std.math.maxInt(usize)));
+        defer allocator.free(bindata);
 
         const dir = std.fs.path.dirname(srcfile).?;
         const output_path = try std.fs.path.join(allocator, &[_][]const u8{ dir, "risc0_runtime.elf" });
         defer allocator.free(output_path);
 
-        const file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-        defer file.close();
+        const file = try cwd.createFile(io, output_path, .{ .truncate = true });
+        defer file.close(io);
 
         var write_buf = std.Io.Writer.Allocating.init(allocator);
         defer write_buf.deinit();
@@ -41,11 +40,7 @@ pub fn main() !void {
         try write_buf.writer.writeAll(bindata);
 
         // DO NOT write the kernel length, it's inferred
-        const kernel = try std.fs.cwd().openFile("build/v1compat.elf", .{});
-        defer kernel.close();
-        const kernelstat = try kernel.stat();
-        const kernelsize = kernelstat.size;
-        const kerneldata = try kernel.readToEndAlloc(allocator, kernelsize);
+        const kerneldata = try cwd.readFileAlloc(io, "build/v1compat.elf", allocator, .limited(std.math.maxInt(usize)));
         defer allocator.free(kerneldata);
         try write_buf.writer.writeAll(kerneldata);
         try write_buf.writer.flush();
@@ -55,7 +50,7 @@ pub fn main() !void {
         // write accumulated data to file
         var file_buf = std.Io.Writer.Allocating.init(allocator);
         defer file_buf.deinit();
-        var file_writer = file.writer(file_buf.writer.buffer);
+        var file_writer = file.writer(io, file_buf.writer.buffer);
         try file_writer.interface.writeAll(write_buf.written());
         try file_writer.interface.flush();
     } else {
