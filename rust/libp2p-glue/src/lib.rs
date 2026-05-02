@@ -40,159 +40,184 @@ use crate::req_resp::{
 
 type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
-// TODO: protect the access by mutex
-#[allow(static_mut_refs)]
-static mut SWARM_STATE: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-// additional network slots for multi-node testing
-#[allow(static_mut_refs)]
-static mut SWARM_STATE1: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-#[allow(static_mut_refs)]
-static mut SWARM_STATE2: Option<libp2p::swarm::Swarm<Behaviour>> = None;
-
-// Store Zig handler pointers per network id so free functions can forward logs
-#[allow(static_mut_refs)]
-static mut ZIG_HANDLER0: Option<u64> = None;
-#[allow(static_mut_refs)]
-static mut ZIG_HANDLER1: Option<u64> = None;
-#[allow(static_mut_refs)]
-static mut ZIG_HANDLER2: Option<u64> = None;
-
-// Per-network shutdown signal. The event loop polls a `.notified()` future on
-// the matching slot; `stop_network` calls `notify_one` to wake it. `notify_one`
-// stores a permit if no waiter is parked yet, so a `stop_network` call that
-// races the first `.notified().await` is not lost.
-#[allow(static_mut_refs)]
-static mut SHUTDOWN_NOTIFY0: Option<Arc<Notify>> = None;
-#[allow(static_mut_refs)]
-static mut SHUTDOWN_NOTIFY1: Option<Arc<Notify>> = None;
-#[allow(static_mut_refs)]
-static mut SHUTDOWN_NOTIFY2: Option<Arc<Notify>> = None;
-
-/// Get a mutable reference to the swarm for the given network id.
+/// Extension trait for `Mutex` that converts a poisoned-mutex `Err` into the
+/// inner guard rather than panicking.
 ///
-/// # Safety
-/// The caller must ensure no other thread is concurrently writing to the same slot.
-#[allow(static_mut_refs)]
-unsafe fn get_swarm_mut(network_id: u32) -> Option<&'static mut libp2p::swarm::Swarm<Behaviour>> {
-    match network_id {
-        0 => SWARM_STATE.as_mut(),
-        1 => SWARM_STATE1.as_mut(),
-        2 => SWARM_STATE2.as_mut(),
-        _ => None,
+/// Every Mutex in this crate protects a plain map, atomic counter, or simple
+/// state struct with no internal invariants — none of them care whether a
+/// previous panic occurred mid-update. Using `lock_recover` everywhere a
+/// previous version called `.lock_recover()` lets us avoid the dominant
+/// source of panic in this crate, which matters under the `risc0-release`
+/// and `openvm-release` profiles where `panic = "abort"` makes `catch_ffi`
+/// a no-op.
+trait MutexExt<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for std::sync::Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        match self.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
-/// Store a swarm in the global slot for the given network id.
+/// Run a closure with `catch_unwind` so panics never unwind across the FFI
+/// boundary into Zig (which would be undefined behaviour). On panic the
+/// closure's return value is `None`; callers convert that to a sensible
+/// "failure" return for their FFI signature (e.g. `false` for a bool, `0`
+/// for a u64, no-op for a void).
 ///
-/// # Safety
-/// The caller must ensure no other thread is concurrently accessing the same slot.
-unsafe fn set_swarm(network_id: u32, swarm: libp2p::swarm::Swarm<Behaviour>) {
-    match network_id {
-        0 => SWARM_STATE = Some(swarm),
-        1 => SWARM_STATE1 = Some(swarm),
-        2 => SWARM_STATE2 = Some(swarm),
-        _ => panic!("unsupported network_id: {}", network_id),
+/// **Profile caveat — `panic = "abort"` builds.** `cargo test --release` and
+/// the dummy-prover dev path both inherit the workspace default
+/// `panic = "unwind"`, so `catch_unwind` works as intended there. The
+/// `risc0-release` and `openvm-release` profiles in `rust/Cargo.toml` set
+/// `panic = "abort"` for binary-size reasons; under those profiles the panic
+/// runtime calls `abort()` directly and `catch_unwind` becomes a no-op (the
+/// closure never returns to its caller because the process is gone). We
+/// therefore complement `catch_ffi` by routing the dominant panic source —
+/// every `Mutex::lock().unwrap()` on a poisoned mutex — through
+/// `MutexExt::lock_recover`, which accepts the poison and continues. Other
+/// `.unwrap()` sites that remain are either at startup before any FFI call
+/// (`tokio::runtime::Builder::build`) or test-only.
+///
+/// Uses `AssertUnwindSafe` because the closures executed here either do not
+/// share state with anything outside the FFI call or only touch lazy-static
+/// globals that are themselves panic-safe. The alternative — sprinkling
+/// `UnwindSafe` bounds through every FFI helper — buys no real safety since
+/// a poisoned mutex is a recoverable error, not an unsafety.
+fn catch_ffi<R>(f: impl FnOnce() -> R) -> Option<R> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            // Best-effort log; never panic from inside the panic handler.
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "panic with non-string payload".to_string()
+            };
+            // logger::rustLogger may itself panic if its handler panics; guard
+            // with a second catch_unwind so we always return rather than abort.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                eprintln!("[libp2p-glue] FFI call panicked, recovered: {}", msg);
+            }));
+            None
+        }
     }
 }
 
-/// Store the Zig handler pointer for the given network id.
+/// Per-network state, replaces the previous family of `static mut SWARM_STATE*`,
+/// `ZIG_HANDLER*`, `SHUTDOWN_NOTIFY*` slots and the `NETWORK_READY_SIGNALS`
+/// 3-tuple. Stored inside a `Mutex<HashMap<u32, NetworkSlot>>` so any number of
+/// networks can coexist (the previous implementation hardcoded slots 0/1/2 and
+/// panicked on a fourth) and so cross-thread access (FFI thread vs the tokio
+/// runtime thread) is correctly synchronised.
 ///
-/// # Safety
-/// The caller must ensure no other thread is concurrently accessing the same slot.
-unsafe fn set_zig_handler(network_id: u32, handler: u64) {
-    match network_id {
-        0 => ZIG_HANDLER0 = Some(handler),
-        1 => ZIG_HANDLER1 = Some(handler),
-        2 => ZIG_HANDLER2 = Some(handler),
-        _ => {}
+/// The `Swarm` itself is no longer parked in a global. `Network::start_network`
+/// now returns it directly to `Network::run_eventloop`, eliminating the only
+/// reason the swarm ever needed a global slot. Everything kept here is data
+/// the FFI thread legitimately needs to read or update independently of the
+/// runtime thread (handler pointer for log forwarding, shutdown notify for
+/// `stop_network`, ready flag for `wait_for_network_ready`).
+struct NetworkSlot {
+    /// Zig-side `*EthLibp2p` value, opaque to rust. Used by free-function
+    /// callbacks that need to forward into Zig but don't have access to the
+    /// `Network` instance directly (e.g. `forward_log_by_network`). `None`
+    /// once `clear_network_slot` has run so post-shutdown FFI dispatches see
+    /// "no handler" rather than a freed pointer.
+    zig_handler: Option<u64>,
+    /// Per-network shutdown signal. The event loop polls a `.notified()`
+    /// future; `stop_network` calls `notify_one` to wake it. `notify_one`
+    /// stores a permit if no waiter is parked yet, so a `stop_network` that
+    /// races the first `.notified().await` is not lost.
+    shutdown_notify: Option<Arc<Notify>>,
+    /// Set to `true` once `start_network` finishes binding listeners and
+    /// publishing the command channel. `wait_for_network_ready` blocks on
+    /// `NETWORK_READY_CONDVAR` until this transitions.
+    ready: bool,
+}
+
+impl NetworkSlot {
+    const fn empty() -> Self {
+        Self {
+            zig_handler: None,
+            shutdown_notify: None,
+            ready: false,
+        }
     }
 }
 
-/// Get the Zig handler pointer for the given network id.
-///
-/// # Safety
-/// The caller must ensure no other thread is concurrently writing to the same slot.
-unsafe fn get_zig_handler(network_id: u32) -> Option<u64> {
-    match network_id {
-        0 => ZIG_HANDLER0,
-        1 => ZIG_HANDLER1,
-        2 => ZIG_HANDLER2,
-        _ => None,
-    }
+lazy_static::lazy_static! {
+    /// One entry per active or pending network. Entries are inserted on the
+    /// first FFI call that touches a network id (typically `create_and_run_network`)
+    /// and removed by `clear_network_slot` after the event loop has fully
+    /// unwound. Holding the lock across awaits is forbidden (every callsite
+    /// drops the guard before any `.await`).
+    static ref NETWORK_SLOTS: Mutex<HashMap<u32, NetworkSlot>> = Mutex::new(HashMap::new());
+}
+
+fn with_slot_mut<R>(network_id: u32, f: impl FnOnce(&mut NetworkSlot) -> R) -> R {
+    let mut slots = NETWORK_SLOTS.lock_recover();
+    let slot = slots.entry(network_id).or_insert_with(NetworkSlot::empty);
+    f(slot)
+}
+
+fn set_zig_handler(network_id: u32, handler: u64) {
+    with_slot_mut(network_id, |slot| slot.zig_handler = Some(handler));
+}
+
+fn get_zig_handler(network_id: u32) -> Option<u64> {
+    NETWORK_SLOTS
+        .lock_recover()
+        .get(&network_id)
+        .and_then(|s| s.zig_handler)
 }
 
 /// Install a fresh shutdown signal for the given network and return a handle
 /// to it. Called by the event loop owner so a subsequent `stop_network` call
 /// has somewhere to post its wake-up permit.
-///
-/// # Safety
-/// The caller must ensure no other thread is concurrently accessing the same slot.
-#[allow(static_mut_refs)]
-unsafe fn install_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+fn install_shutdown_notify(network_id: u32) -> Arc<Notify> {
     let notify = Arc::new(Notify::new());
-    match network_id {
-        0 => SHUTDOWN_NOTIFY0 = Some(notify.clone()),
-        1 => SHUTDOWN_NOTIFY1 = Some(notify.clone()),
-        2 => SHUTDOWN_NOTIFY2 = Some(notify.clone()),
-        _ => return None,
-    }
-    Some(notify)
+    with_slot_mut(network_id, |slot| {
+        slot.shutdown_notify = Some(notify.clone());
+    });
+    notify
 }
 
 /// Get a handle to the shutdown signal for the given network, if one is
 /// installed.
-///
-/// # Safety
-/// The caller must ensure no other thread is concurrently writing to the same slot.
-#[allow(static_mut_refs)]
-unsafe fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
-    match network_id {
-        0 => SHUTDOWN_NOTIFY0.clone(),
-        1 => SHUTDOWN_NOTIFY1.clone(),
-        2 => SHUTDOWN_NOTIFY2.clone(),
-        _ => None,
-    }
+fn get_shutdown_notify(network_id: u32) -> Option<Arc<Notify>> {
+    NETWORK_SLOTS
+        .lock_recover()
+        .get(&network_id)
+        .and_then(|s| s.shutdown_notify.clone())
 }
 
-/// Tear down per-network state after the event loop has exited. Drops the
-/// swarm (closing sockets), clears the Zig handler pointer so any in-flight
-/// attempts to dispatch into Zig become no-ops, and releases the shutdown
-/// notify.
-///
-/// # Safety
-/// The caller must ensure no other thread is concurrently accessing these slots.
-unsafe fn clear_network_state(network_id: u32) {
-    match network_id {
-        0 => {
-            SWARM_STATE = None;
-            ZIG_HANDLER0 = None;
-            SHUTDOWN_NOTIFY0 = None;
-        }
-        1 => {
-            SWARM_STATE1 = None;
-            ZIG_HANDLER1 = None;
-            SHUTDOWN_NOTIFY1 = None;
-        }
-        2 => {
-            SWARM_STATE2 = None;
-            ZIG_HANDLER2 = None;
-            SHUTDOWN_NOTIFY2 = None;
-        }
-        _ => {}
-    }
+fn mark_network_ready(network_id: u32) {
+    with_slot_mut(network_id, |slot| slot.ready = true);
+    NETWORK_READY_CONDVAR.notify_all();
+}
 
-    // Clear the ready flag so a post-stop `wait_for_network_ready` does not
-    // return a stale `true` left over from the previous session. Wake any
-    // current waiters so they re-check the (now-false) flag and return
-    // `false` on the next deadline instead of parking indefinitely.
-    let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
-    match network_id {
-        0 => ready.0 = false,
-        1 => ready.1 = false,
-        2 => ready.2 = false,
-        _ => {}
+fn is_network_ready(network_id: u32) -> bool {
+    NETWORK_SLOTS
+        .lock_recover()
+        .get(&network_id)
+        .map(|s| s.ready)
+        .unwrap_or(false)
+}
+
+/// Tear down per-network state after the event loop has exited. Clears the
+/// Zig handler pointer so any in-flight attempts to dispatch into Zig become
+/// no-ops, releases the shutdown notify, and resets the ready flag so a
+/// post-stop `wait_for_network_ready` does not return a stale `true`.
+fn clear_network_slot(network_id: u32) {
+    {
+        let mut slots = NETWORK_SLOTS.lock_recover();
+        slots.remove(&network_id);
     }
-    drop(ready);
     NETWORK_READY_CONDVAR.notify_all();
 }
 
@@ -288,17 +313,19 @@ fn record_swarm_command_drop(reason: SwarmCommandDropReason) {
 /// `reason` labels.
 #[no_mangle]
 pub extern "C" fn get_swarm_command_dropped_total(reason_tag: u32) -> u64 {
-    SWARM_COMMAND_DROPPED_TOTAL
-        .get(reason_tag as usize)
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0)
+    catch_ffi(|| {
+        SWARM_COMMAND_DROPPED_TOTAL
+            .get(reason_tag as usize)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 lazy_static::lazy_static! {
     static ref REQUEST_ID_MAP: Mutex<HashMapDelay<u64, ()>> = Mutex::new(HashMapDelay::new(REQUEST_TIMEOUT));
     static ref REQUEST_PROTOCOL_MAP: Mutex<HashMap<u64, ProtocolId>> = Mutex::new(HashMap::new());
     static ref RESPONSE_CHANNEL_MAP: Mutex<HashMapDelay<u64, PendingResponse>> = Mutex::new(HashMapDelay::new(RESPONSE_CHANNEL_IDLE_TIMEOUT));
-    static ref NETWORK_READY_SIGNALS: std::sync::Mutex<(bool, bool, bool)> = std::sync::Mutex::new((false, false, false));
     static ref NETWORK_READY_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
     static ref RECONNECT_QUEUE: Mutex<HashMapDelay<(u32, PeerId), (Multiaddr, u32)>> =
         Mutex::new(HashMapDelay::new(Duration::from_secs(5))); // default delay, will be overridden
@@ -340,11 +367,20 @@ struct PendingResponse {
 /// This function is thread-safe and can be called from any thread.
 #[no_mangle]
 pub unsafe extern "C" fn stop_network(network_id: u32) {
-    if let Some(notify) = get_shutdown_notify(network_id) {
-        notify.notify_one();
-    }
-    COMMAND_SENDERS.lock().unwrap().remove(&network_id);
-    COMMAND_RECEIVERS.lock().unwrap().remove(&network_id);
+    let _ = catch_ffi(|| {
+        // Drop the command sender first so any new FFI publish/RPC sites that
+        // call `send_swarm_command` (or look up the channel directly) see a
+        // closed channel and bail out cleanly. The receiver is removed too —
+        // its drop signals to the event loop that no more commands will
+        // arrive — but we still rely on the shutdown notify to break the
+        // outer `tokio::select!` because the loop's other arms (swarm events,
+        // delay maps) keep firing independently.
+        COMMAND_SENDERS.lock_recover().remove(&network_id);
+        COMMAND_RECEIVERS.lock_recover().remove(&network_id);
+        if let Some(notify) = get_shutdown_notify(network_id) {
+            notify.notify_one();
+        }
+    });
 }
 
 /// Wait for a network to be fully initialized and ready to accept messages.
@@ -355,35 +391,35 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
 /// This function is thread-safe and can be called from any thread.
 #[no_mangle]
 pub unsafe extern "C" fn wait_for_network_ready(network_id: u32, timeout_ms: u64) -> bool {
-    let timeout = Duration::from_millis(timeout_ms);
-    let deadline = std::time::Instant::now() + timeout;
+    catch_ffi(|| {
+        let timeout = Duration::from_millis(timeout_ms);
+        let deadline = std::time::Instant::now() + timeout;
 
-    let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
-    loop {
-        if match network_id {
-            0 => ready.0,
-            1 => ready.1,
-            2 => ready.2,
-            _ => false,
-        } {
-            return true;
+        // Park on the condvar using a sacrificial mutex; the condition we wake
+        // for is checked against `NETWORK_SLOTS` directly so the slot map can
+        // remain a regular `Mutex<HashMap>` without nesting awaits under it.
+        let dummy = std::sync::Mutex::new(());
+        let mut guard = dummy.lock_recover();
+        loop {
+            if is_network_ready(network_id) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline - now;
+            let (g, timeout_result) = match NETWORK_READY_CONDVAR.wait_timeout(guard, remaining) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard = g;
+            if timeout_result.timed_out() {
+                return is_network_ready(network_id);
+            }
         }
-
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-
-        let remaining = deadline - now;
-        let (guard, timeout_result) = NETWORK_READY_CONDVAR
-            .wait_timeout(ready, remaining)
-            .unwrap();
-        ready = guard;
-
-        if timeout_result.timed_out() {
-            return false;
-        }
-    }
+    })
+    .unwrap_or(false)
 }
 
 /// C-ABI parameters for [`create_and_run_network`].
@@ -416,7 +452,28 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
     let listen_addresses = p.listen_addresses;
     let connect_addresses = p.connect_addresses;
     let topics_str = p.topics_str;
+    // Wrap the rest of the body in catch_unwind so a panic from the runtime,
+    // parser, or libp2p does not unwind across the FFI boundary into Zig.
+    let _ = catch_ffi(move || {
+        create_and_run_network_inner(
+            network_id,
+            zig_handler,
+            local_private_key,
+            listen_addresses,
+            connect_addresses,
+            topics_str,
+        );
+    });
+}
 
+unsafe fn create_and_run_network_inner(
+    network_id: u32,
+    zig_handler: u64,
+    local_private_key: *const c_char,
+    listen_addresses: *const c_char,
+    connect_addresses: *const c_char,
+    topics_str: *const c_char,
+) {
     // Register the handler early so any logs emitted from the parse/validation
     // path below are routed through the Zig logger.
     set_zig_handler(network_id, zig_handler);
@@ -432,6 +489,31 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
             topics_str,
         );
     };
+
+    // Validate every C-string parameter before dereferencing. The Zig side
+    // is supposed to hand us null-terminated valid UTF-8 strings, but a bug
+    // there would otherwise be UB; explicit null checks turn it into a
+    // clean error path.
+    //
+    // We deliberately do NOT call `release_params()` on this branch.
+    // `releaseStartNetworkParams` (Zig side) declares its arguments as
+    // `[*:0]const u8`, which is non-nullable; passing one of the offending
+    // null pointers back would itself be UB inside `std.mem.span` on the
+    // Zig side. Leaking the (presumably also null) buffers is the safer
+    // recovery. This branch should be unreachable in practice — the Zig
+    // caller never hands us nulls — and reaching it already means the Zig
+    // side has a bug; we just want to avoid compounding it.
+    if local_private_key.is_null()
+        || listen_addresses.is_null()
+        || connect_addresses.is_null()
+        || topics_str.is_null()
+    {
+        logger::rustLogger.error(
+            network_id,
+            "create_and_run_network: null pointer in CreateNetworkParams string fields; not calling releaseStartNetworkParams (Zig side requires non-null)",
+        );
+        return;
+    }
 
     let listen_str = CStr::from_ptr(listen_addresses).to_string_lossy();
     let listen_multiaddrs: Vec<Multiaddr> = match listen_str
@@ -514,7 +596,7 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
 
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
-        p2p_net
+        let swarm = p2p_net
             .start_network(
                 local_key_pair,
                 listen_multiaddrs,
@@ -522,7 +604,17 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
                 topics,
             )
             .await;
-        p2p_net.run_eventloop().await;
+        if let Some(swarm) = swarm {
+            p2p_net.run_eventloop(swarm).await;
+        } else {
+            logger::rustLogger.error(
+                network_id,
+                "create_and_run_network: start_network failed; not entering event loop",
+            );
+            // Make sure subsequent FFI calls see a fresh slot if start_network
+            // populated any partial state.
+            clear_network_slot(network_id);
+        }
     });
 }
 
@@ -531,7 +623,7 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
 /// performing `try_send`, which is important because `try_send` can block
 /// briefly on the channel's internal semaphore.
 fn get_command_sender(network_id: u32) -> Option<mpsc::Sender<SwarmCommand>> {
-    COMMAND_SENDERS.lock().unwrap().get(&network_id).cloned()
+    COMMAND_SENDERS.lock_recover().get(&network_id).cloned()
 }
 
 fn send_swarm_command(network_id: u32, cmd: SwarmCommand) -> bool {
@@ -579,34 +671,48 @@ pub unsafe extern "C" fn publish_msg_to_rust_bridge(
     message_str: *const u8,
     message_len: usize,
 ) -> bool {
-    let message_slice = std::slice::from_raw_parts(message_str, message_len);
-    logger::rustLogger.debug(
-        network_id,
-        &format!(
-            "publishing message s={:?}..({})",
-            hex::encode(&message_slice[..message_len.min(100)]),
-            message_len
-        ),
-    );
-    let message_data = message_slice.to_vec();
+    catch_ffi(|| {
+        if message_str.is_null() && message_len != 0 {
+            logger::rustLogger.error(
+                network_id,
+                "null pointer with non-zero len passed for `message_str` in publish_msg_to_rust_bridge",
+            );
+            return false;
+        }
+        if topic.is_null() {
+            logger::rustLogger.error(
+                network_id,
+                "null pointer passed for `topic` in publish_msg_to_rust_bridge",
+            );
+            return false;
+        }
 
-    if topic.is_null() {
-        logger::rustLogger.error(
+        let message_slice = if message_len == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(message_str, message_len)
+        };
+        logger::rustLogger.debug(
             network_id,
-            "null pointer passed for `topic` in publish_msg_to_rust_bridge",
+            &format!(
+                "publishing message s={:?}..({})",
+                hex::encode(&message_slice[..message_len.min(100)]),
+                message_len
+            ),
         );
-        return false;
-    }
+        let message_data = message_slice.to_vec();
 
-    let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
+        let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
 
-    send_swarm_command(
-        network_id,
-        SwarmCommand::Publish {
-            topic,
-            data: message_data,
-        },
-    )
+        send_swarm_command(
+            network_id,
+            SwarmCommand::Publish {
+                topic,
+                data: message_data,
+            },
+        )
+    })
+    .unwrap_or(false)
 }
 
 /// # Safety
@@ -621,6 +727,30 @@ pub unsafe extern "C" fn send_rpc_request(
     request_data: *const u8,
     request_len: usize,
 ) -> u64 {
+    catch_ffi(|| {
+        send_rpc_request_inner(network_id, peer_id, protocol_tag, request_data, request_len)
+    })
+    .unwrap_or(0)
+}
+
+unsafe fn send_rpc_request_inner(
+    network_id: u32,
+    peer_id: *const c_char,
+    protocol_tag: u32,
+    request_data: *const u8,
+    request_len: usize,
+) -> u64 {
+    if peer_id.is_null() {
+        logger::rustLogger.error(network_id, "null peer_id pointer in send_rpc_request");
+        return 0;
+    }
+    if request_data.is_null() && request_len != 0 {
+        logger::rustLogger.error(
+            network_id,
+            "null request_data pointer with non-zero len in send_rpc_request",
+        );
+        return 0;
+    }
     let peer_id_str = CStr::from_ptr(peer_id).to_string_lossy().to_string();
     let peer_id: PeerId = match peer_id_str.parse() {
         Ok(id) => id,
@@ -630,7 +760,11 @@ pub unsafe extern "C" fn send_rpc_request(
         }
     };
 
-    let request_slice = std::slice::from_raw_parts(request_data, request_len);
+    let request_slice = if request_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(request_data, request_len)
+    };
     let request_bytes = request_slice.to_vec();
 
     let protocol = match LeanSupportedProtocol::try_from(protocol_tag) {
@@ -693,10 +827,9 @@ pub unsafe extern "C" fn send_rpc_request(
             return 0;
         }
     }
-    REQUEST_ID_MAP.lock().unwrap().insert(request_id, ());
+    REQUEST_ID_MAP.lock_recover().insert(request_id, ());
     REQUEST_PROTOCOL_MAP
-        .lock()
-        .unwrap()
+        .lock_recover()
         .insert(request_id, protocol_id.clone());
     logger::rustLogger.info(
         network_id,
@@ -717,7 +850,29 @@ pub unsafe extern "C" fn send_rpc_response_chunk(
     response_data: *const u8,
     response_len: usize,
 ) {
-    let response_slice = std::slice::from_raw_parts(response_data, response_len);
+    let _ = catch_ffi(|| {
+        send_rpc_response_chunk_inner(network_id, channel_id, response_data, response_len);
+    });
+}
+
+unsafe fn send_rpc_response_chunk_inner(
+    network_id: u32,
+    channel_id: u64,
+    response_data: *const u8,
+    response_len: usize,
+) {
+    if response_data.is_null() && response_len != 0 {
+        logger::rustLogger.error(
+            network_id,
+            "null response_data pointer with non-zero len in send_rpc_response_chunk",
+        );
+        return;
+    }
+    let response_slice = if response_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(response_data, response_len)
+    };
     let response_bytes = response_slice.to_vec();
 
     // Look up the response channel and refresh its timeout under a single lock,
@@ -728,7 +883,7 @@ pub unsafe extern "C" fn send_rpc_response_chunk(
     // would otherwise drop the chunk and log a spurious `No response channel
     // found` between the two locks.
     let channel = {
-        let mut response_map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+        let mut response_map = RESPONSE_CHANNEL_MAP.lock_recover();
         let c = response_map.get(&channel_id).cloned();
         if c.is_some() {
             _ = response_map.update_timeout(&channel_id, RESPONSE_CHANNEL_IDLE_TIMEOUT);
@@ -759,13 +914,25 @@ pub unsafe extern "C" fn send_rpc_response_chunk(
 /// The caller must ensure the channel id is valid for a pending response.
 #[no_mangle]
 pub unsafe extern "C" fn send_rpc_end_of_stream(network_id: u32, channel_id: u64) {
-    send_swarm_command(network_id, SwarmCommand::SendRpcEndOfStream { channel_id });
+    let _ = catch_ffi(|| {
+        send_swarm_command(network_id, SwarmCommand::SendRpcEndOfStream { channel_id });
+    });
 }
 
 /// # Safety
 /// The caller must ensure `message_ptr` points to a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn send_rpc_error_response(
+    network_id: u32,
+    channel_id: u64,
+    message_ptr: *const c_char,
+) {
+    let _ = catch_ffi(|| {
+        send_rpc_error_response_inner(network_id, channel_id, message_ptr);
+    });
+}
+
+unsafe fn send_rpc_error_response_inner(
     network_id: u32,
     channel_id: u64,
     message_ptr: *const c_char,
@@ -906,8 +1073,7 @@ fn forward_log_with_handler(zig_handler: u64, level: u32, message: &str) {
 }
 
 pub(crate) fn forward_log_by_network(network_id: u32, level: u32, message: &str) {
-    let handler_opt = unsafe { get_zig_handler(network_id) };
-    if let Some(handler) = handler_opt {
+    if let Some(handler) = get_zig_handler(network_id) {
         forward_log_with_handler(handler, level, message);
     }
 }
@@ -947,8 +1113,7 @@ impl Network {
             );
             self.peer_addr_map.remove(&peer_id);
             RECONNECT_ATTEMPTS
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .remove(&(self.network_id, peer_id));
             return;
         }
@@ -966,7 +1131,7 @@ impl Network {
             ),
         );
 
-        let mut queue = RECONNECT_QUEUE.lock().unwrap();
+        let mut queue = RECONNECT_QUEUE.lock_recover();
         queue.insert_at(
             (self.network_id, peer_id),
             (addr, attempt),
@@ -974,13 +1139,18 @@ impl Network {
         );
     }
 
-    pub async fn start_network(
+    /// Build the swarm, bind listeners, dial connect peers, publish the per-network
+    /// command channel, and mark the network ready. Returns the constructed
+    /// swarm so `run_eventloop` can drive it directly. Returns `None` on bind
+    /// failure (no listener succeeded); callers should not invoke
+    /// `run_eventloop` in that case.
+    pub(crate) async fn start_network(
         &mut self,
         key_pair: Keypair,
         listen_addresses: Vec<Multiaddr>,
         connect_addresses: Vec<Multiaddr>,
         topics: Vec<String>,
-    ) {
+    ) -> Option<libp2p::swarm::Swarm<Behaviour>> {
         let mut swarm = new_swarm(key_pair, topics, self.network_id);
         logger::rustLogger.info(self.network_id, "starting listener");
 
@@ -1010,7 +1180,7 @@ impl Network {
                 "Failed to start listener on any address - network initialization failed",
             );
             // Signal failure by NOT setting the ready flag
-            return;
+            return None;
         }
 
         logger::rustLogger.debug(self.network_id, "going for loop match");
@@ -1054,52 +1224,44 @@ impl Network {
             logger::rustLogger.debug(self.network_id, "no connect addresses");
         }
 
-        unsafe {
-            set_swarm(self.network_id, swarm);
-        }
-
         // Set up actor model command channel
         let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(SWARM_COMMAND_CHANNEL_CAPACITY);
         COMMAND_SENDERS
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(self.network_id, cmd_tx);
         COMMAND_RECEIVERS
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(self.network_id, cmd_rx);
 
         // Signal that this network is now ready
-        {
-            let mut ready = NETWORK_READY_SIGNALS.lock().unwrap();
-            match self.network_id {
-                0 => ready.0 = true,
-                1 => ready.1 = true,
-                2 => ready.2 = true,
-                _ => {}
-            }
-            NETWORK_READY_CONDVAR.notify_all();
-        }
+        mark_network_ready(self.network_id);
 
         logger::rustLogger.info(self.network_id, "network initialization complete and ready");
+        Some(swarm)
     }
 
-    pub async fn run_eventloop(&mut self) {
-        let swarm = unsafe { get_swarm_mut(self.network_id) }
-            .expect("run_eventloop called before start_network stored the swarm");
+    pub(crate) async fn run_eventloop(&mut self, mut swarm: libp2p::swarm::Swarm<Behaviour>) {
+        // Borrow `&mut swarm` once so the rest of the body can match the
+        // pre-refactor shape (`swarm.dial(...)`, `swarm.behaviour_mut()`, etc.)
+        // without further changes.
+        let swarm = &mut swarm;
 
-        let mut cmd_rx = COMMAND_RECEIVERS
-            .lock()
-            .unwrap()
-            .remove(&self.network_id)
-            .expect("run_eventloop called before start_network set up command channel");
+        let mut cmd_rx = match COMMAND_RECEIVERS.lock_recover().remove(&self.network_id) {
+            Some(rx) => rx,
+            None => {
+                logger::rustLogger.error(
+                    self.network_id,
+                    "run_eventloop called before start_network set up command channel; aborting",
+                );
+                return;
+            }
+        };
 
         // Install the shutdown signal before entering the loop so `stop_network`
         // calls issued between here and the first `.notified().await` land on
         // this slot. `notify_one` stores a permit if no waiter is parked yet,
         // so the first iteration's shutdown arm will see the permit and break.
-        let shutdown = unsafe { install_shutdown_notify(self.network_id) }
-            .expect("unsupported network_id for shutdown signal");
+        let shutdown = install_shutdown_notify(self.network_id);
 
         'eventloop: loop {
             tokio::select! {
@@ -1114,7 +1276,7 @@ impl Network {
             }
 
             Some(timeout_result) = poll_fn(|cx| {
-                let mut map = REQUEST_ID_MAP.lock().unwrap();
+                let mut map = REQUEST_ID_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
                 match timeout_result {
@@ -1124,8 +1286,7 @@ impl Network {
                             &format!("[reqresp] Request {} timed out after {:?}", request_id, REQUEST_TIMEOUT),
                         );
                         if let Some(protocol_id) = REQUEST_PROTOCOL_MAP
-                            .lock()
-                            .unwrap()
+                            .lock_recover()
                             .remove(&request_id)
                         {
                             if let (Ok(protocol_cstring), Ok(message_cstring)) = (
@@ -1151,7 +1312,7 @@ impl Network {
             }
 
             Some(reconnect_result) = poll_fn(|cx| {
-                let mut queue = RECONNECT_QUEUE.lock().unwrap();
+                let mut queue = RECONNECT_QUEUE.lock_recover();
                 std::pin::Pin::new(&mut *queue).poll_next(cx)
             }) => {
                     match reconnect_result {
@@ -1174,8 +1335,7 @@ impl Network {
                                 );
 
                             RECONNECT_ATTEMPTS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .insert((self.network_id, peer_id), (addr.clone(), attempt));
 
                             let mut dial_addr = addr.clone();
@@ -1198,8 +1358,7 @@ impl Network {
                                         &format!("Failed to dial peer {} at {}: {:?}", peer_id, dial_addr, e),
                                     );
                                     RECONNECT_ATTEMPTS
-                                        .lock()
-                                        .unwrap()
+                                        .lock_recover()
                                         .remove(&(self.network_id, peer_id));
                                     self.schedule_reconnection(peer_id, addr, attempt + 1);
                                 }
@@ -1213,7 +1372,7 @@ impl Network {
             }
 
             Some(response_channel_timeout) = poll_fn(|cx| {
-                let mut map = RESPONSE_CHANNEL_MAP.lock().unwrap();
+                let mut map = RESPONSE_CHANNEL_MAP.lock_recover();
                 std::pin::Pin::new(&mut *map).poll_next(cx)
             }) => {
                 match response_channel_timeout {
@@ -1279,15 +1438,14 @@ impl Network {
                             );
 
                             // Store direction for later use on disconnect
-                            CONNECTION_DIRECTIONS.lock().unwrap().insert(
+                            CONNECTION_DIRECTIONS.lock_recover().insert(
                                 (self.network_id, peer_id, connection_id),
                                 direction,
                             );
 
-                            RECONNECT_QUEUE.lock().unwrap().remove(&(self.network_id, peer_id));
+                            RECONNECT_QUEUE.lock_recover().remove(&(self.network_id, peer_id));
                             RECONNECT_ATTEMPTS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .remove(&(self.network_id, peer_id));
                             let peer_id_cstr = match CString::new(peer_id_str.as_str()) {
                                 Ok(cstr) => cstr,
@@ -1310,8 +1468,7 @@ impl Network {
 
                             // Retrieve and remove stored direction
                             let direction = CONNECTION_DIRECTIONS
-                                .lock()
-                                .unwrap()
+                                .lock_recover()
                                 .remove(&(self.network_id, peer_id, connection_id))
                                 .unwrap_or(2); // 2 = unknown if not found
 
@@ -1345,7 +1502,7 @@ impl Network {
                                 // Drop any pending response channels tied to this connection.
                                 // We can't finish streams here (the connection is already gone), but we must
                                 // remove them from the map to avoid leaking entries until idle TTL.
-                                RESPONSE_CHANNEL_MAP.lock().unwrap().retain(|_, pending| {
+                                RESPONSE_CHANNEL_MAP.lock_recover().retain(|_, pending| {
                                     !(pending.peer_id == peer_id && pending.connection_id == connection_id)
                                 });
 
@@ -1422,8 +1579,7 @@ impl Network {
 
                                 // Schedule reconnection if this was a tracked connection attempt
                                 if let Some((addr, attempt)) = RECONNECT_ATTEMPTS
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&(self.network_id, pid))
                                 {
                                     self.schedule_reconnection(pid, addr, attempt + 1);
@@ -1480,7 +1636,7 @@ impl Network {
 
                                 let channel_id =
                                     RESPONSE_CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                                RESPONSE_CHANNEL_MAP.lock().unwrap().insert(
+                                RESPONSE_CHANNEL_MAP.lock_recover().insert(
                                     channel_id,
                                     PendingResponse {
                                         peer_id,
@@ -1526,7 +1682,7 @@ impl Network {
                             }
                             Ok(ReqRespMessageReceived::Response { request_id, message }) => {
                                 {
-                                    let mut map = REQUEST_ID_MAP.lock().unwrap();
+                                    let mut map = REQUEST_ID_MAP.lock_recover();
                                     if !map.update_timeout(&request_id, REQUEST_TIMEOUT) {
                                         map.insert(request_id, ());
                                     }
@@ -1572,10 +1728,9 @@ impl Network {
                                 }
                             }
                             Ok(ReqRespMessageReceived::EndOfStream { request_id }) => {
-                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
@@ -1622,8 +1777,7 @@ impl Network {
                                     &format!("[reqresp] Inbound error from {} on stream {}: {:?}", peer_id, stream_id, err),
                                 );
                                 RESPONSE_CHANNEL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .retain(|_, pending| {
                                         !(
                                             pending.peer_id == peer_id
@@ -1633,10 +1787,9 @@ impl Network {
                                     });
                             }
                             Err(ReqRespMessageError::Outbound { request_id, err }) => {
-                                REQUEST_ID_MAP.lock().unwrap().remove(&request_id);
+                                REQUEST_ID_MAP.lock_recover().remove(&request_id);
                                 let protocol = REQUEST_PROTOCOL_MAP
-                                    .lock()
-                                    .unwrap()
+                                    .lock_recover()
                                     .remove(&request_id);
 
                                 if let Some(protocol_id) = protocol {
@@ -1700,7 +1853,7 @@ impl Network {
                             "[reqresp] Sent response chunk on channel {} (peer: {})", channel_id, peer_id));
                     }
                     SwarmCommand::SendRpcEndOfStream { channel_id } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
                             swarm.behaviour_mut().reqresp.finish_response_stream(
@@ -1714,7 +1867,7 @@ impl Network {
                         }
                     }
                     SwarmCommand::SendRpcErrorResponse { channel_id, payload } => {
-                        let channel = RESPONSE_CHANNEL_MAP.lock().unwrap().remove(&channel_id);
+                        let channel = RESPONSE_CHANNEL_MAP.lock_recover().remove(&channel_id);
                         if let Some(channel) = channel {
                             let peer_id = channel.peer_id;
                             let protocol = channel.protocol.clone();
@@ -1751,7 +1904,9 @@ impl Network {
         // Clean up per-network state so any later `stop_network`/`start_network`
         // calls start from a blank slate and any in-flight dispatchers into Zig
         // see an absent handler rather than a pointer to a freed EthLibp2p.
-        unsafe { clear_network_state(self.network_id) };
+        clear_network_slot(self.network_id);
+        // The owned `swarm` argument is dropped here on return, closing
+        // sockets and peer connections.
     }
 }
 
@@ -2142,7 +2297,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<SwarmCommand>(cap);
         // Keep _rx alive (no drainer => first `cap` sends fill the channel,
         // anything beyond returns Full instead of Closed).
-        COMMAND_SENDERS.lock().unwrap().insert(network_id, tx);
+        COMMAND_SENDERS.lock_recover().insert(network_id, tx);
 
         let before_full = get_swarm_command_dropped_total(SwarmCommandDropReason::Full as u32);
 
@@ -2178,6 +2333,6 @@ mod tests {
         );
 
         // Cleanup: remove the test sender so this network_id is reusable.
-        COMMAND_SENDERS.lock().unwrap().remove(&network_id);
+        COMMAND_SENDERS.lock_recover().remove(&network_id);
     }
 }
