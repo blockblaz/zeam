@@ -76,7 +76,7 @@ const ToolsArgs = struct {
     };
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -84,7 +84,10 @@ pub fn main() !void {
     const app_description = "Zeam Tools - Utilities for Beam Chain development";
     const app_version = build_options.version;
 
-    const opts = simargs.parse(allocator, ToolsArgs, app_description, app_version) catch |err| switch (err) {
+    const opts = simargs.structargs.parse(allocator, init.io, init.minimal.args, ToolsArgs, .{
+        .argument_prompt = app_description,
+        .version_string = app_version,
+    }) catch |err| switch (err) {
         error.MissingSubCommand => {
             std.debug.print("Error: Missing subcommand. Use --help for usage information.\n", .{});
             std.process.exit(1);
@@ -109,7 +112,7 @@ pub fn main() !void {
     defer opts.deinit();
     defer enr.deinitGlobalSecp256k1Ctx();
 
-    switch (opts.args.__commands__) {
+    switch (opts.options.__commands__) {
         .keygen => |cmd| {
             handleKeyGen(allocator, cmd) catch |err| {
                 std.debug.print("Error generating keys: {}\n", .{err});
@@ -151,11 +154,13 @@ fn handleKeyGen(allocator: std.mem.Allocator, cmd: ToolsArgs.KeyGenCmd) !void {
     std.debug.print("Generating {d} validator keys with {d} active epochs...\n", .{ num_validators, num_active_epochs });
     std.debug.print("Output directory: {s}\n", .{output_dir});
 
+    const io = std.Io.Threaded.global_single_threaded.io();
+
     // Create output directories
     const hash_sig_dir = try std.fmt.allocPrint(allocator, "{s}/hash-sig-keys", .{output_dir});
     defer allocator.free(hash_sig_dir);
 
-    std.fs.cwd().makePath(hash_sig_dir) catch |err| {
+    std.Io.Dir.cwd().createDirPath(io, hash_sig_dir) catch |err| {
         std.debug.print("Error creating directory {s}: {}\n", .{ hash_sig_dir, err });
         return err;
     };
@@ -169,11 +174,11 @@ fn handleKeyGen(allocator: std.mem.Allocator, cmd: ToolsArgs.KeyGenCmd) !void {
     // Open manifest file
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}/validator-keys-manifest.yaml", .{output_dir});
     defer allocator.free(manifest_path);
-    const manifest_file = try std.fs.cwd().createFile(manifest_path, .{});
-    defer manifest_file.close();
+    const manifest_file = try std.Io.Dir.cwd().createFile(io, manifest_path, .{});
+    defer manifest_file.close(io);
 
     var manifest_buf: [4096]u8 = undefined;
-    var manifest_writer = manifest_file.writer(&manifest_buf);
+    var manifest_writer = manifest_file.writer(io, &manifest_buf);
 
     // Write manifest header
     try manifest_writer.interface.print(
@@ -211,10 +216,10 @@ fn handleKeyGen(allocator: std.mem.Allocator, cmd: ToolsArgs.KeyGenCmd) !void {
         const sk_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hash_sig_dir, sk_filename });
         defer allocator.free(sk_path);
 
-        const sk_file = try std.fs.cwd().createFile(sk_path, .{});
-        defer sk_file.close();
+        const sk_file = try std.Io.Dir.cwd().createFile(io, sk_path, .{});
+        defer sk_file.close(io);
         var sk_write_buf: [65536]u8 = undefined;
-        var sk_writer = sk_file.writer(&sk_write_buf);
+        var sk_writer = sk_file.writer(io, &sk_write_buf);
         try sk_writer.interface.writeAll(sk_buffer[0..sk_len]);
         try sk_writer.interface.flush();
 
@@ -224,10 +229,10 @@ fn handleKeyGen(allocator: std.mem.Allocator, cmd: ToolsArgs.KeyGenCmd) !void {
         const pk_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hash_sig_dir, pk_filename });
         defer allocator.free(pk_path);
 
-        const pk_file = try std.fs.cwd().createFile(pk_path, .{});
-        defer pk_file.close();
+        const pk_file = try std.Io.Dir.cwd().createFile(io, pk_path, .{});
+        defer pk_file.close(io);
         var pk_write_buf: [4096]u8 = undefined;
-        var pk_writer = pk_file.writer(&pk_write_buf);
+        var pk_writer = pk_file.writer(io, &pk_write_buf);
         try pk_writer.interface.writeAll(pk_buffer[0..pk_len]);
         try pk_writer.interface.flush();
 
@@ -269,25 +274,29 @@ fn handleENRGen(cmd: ToolsArgs.ENRGenCmd) !void {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var buffer: std.ArrayList(u8) = .empty;
-    try genENR(cmd.sk, cmd.ip, cmd.quic, buffer.writer(alloc));
+    var enr_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer enr_writer.deinit();
+    try genENR(cmd.sk, cmd.ip, cmd.quic, &enr_writer.writer);
+    const enr_text = enr_writer.writer.buffered();
 
     if (cmd.out) |output_path| {
         // Write the result to the file
-        const file = try std.fs.cwd().createFile(output_path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+        defer file.close(io);
         var write_buf: [max_enr_txt_size]u8 = undefined;
-        var file_writer = file.writer(&write_buf);
-        try file_writer.interface.writeAll(buffer.items);
+        var file_writer = file.writer(io, &write_buf);
+        try file_writer.interface.writeAll(enr_text);
         try file_writer.interface.flush();
 
         std.debug.print("ENR written to: {s}\n", .{output_path});
     } else {
         // Write the result to stdout
-        const stdout = std.fs.File.stdout();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const stdout = std.Io.File.stdout();
         var stdout_write_buf: [max_enr_txt_size]u8 = undefined;
-        var stdout_writer = stdout.writer(&stdout_write_buf);
-        try stdout_writer.interface.writeAll(buffer.items);
+        var stdout_writer = stdout.writer(io, &stdout_write_buf);
+        try stdout_writer.interface.writeAll(enr_text);
         try stdout_writer.interface.flush();
     }
 }
@@ -311,10 +320,10 @@ fn genENR(secret_key: []const u8, ip: []const u8, quic: u16, out_writer: anytype
         return error.ENRCreationFailed;
     };
 
-    const ip_addr = std.net.Ip4Address.parse(ip, 0) catch {
+    const ip_addr = std.Io.net.Ip4Address.parse(ip, 0) catch {
         return error.InvalidIPAddress;
     };
-    const ip_addr_bytes = std.mem.asBytes(&ip_addr.sa.addr);
+    const ip_addr_bytes = &ip_addr.bytes;
     signable_enr.set("ip", ip_addr_bytes) catch {
         return error.ENRSetIPFailed;
     };
@@ -330,38 +339,38 @@ fn genENR(secret_key: []const u8, ip: []const u8, quic: u16, out_writer: anytype
 
 test "generate ENR to buffer" {
     const allocator = std.testing.allocator;
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    try genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "192.0.2.1", 1234, buffer.writer(allocator));
+    try genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "192.0.2.1", 1234, &writer_alloc.writer);
 
-    try std.testing.expectEqualStrings("enr:-IW4QP3E2K97wLIvYbu2upNn5CfjWdD4kmW6YjxNcdroKIA_V81rQhAtp_JG711GtlHXStpGT03JZzM1I3VoAj9S5Z-AgmlkgnY0gmlwhMAAAgGEcXVpY4IE0olzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", buffer.items);
+    try std.testing.expectEqualStrings("enr:-IW4QP3E2K97wLIvYbu2upNn5CfjWdD4kmW6YjxNcdroKIA_V81rQhAtp_JG711GtlHXStpGT03JZzM1I3VoAj9S5Z-AgmlkgnY0gmlwhMAAAgGEcXVpY4IE0olzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", writer_alloc.writer.buffered());
 }
 
 test "generate ENR with 0x prefix" {
     const allocator = std.testing.allocator;
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    try genENR("0xb71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "127.0.0.1", 30303, buffer.writer(allocator));
+    try genENR("0xb71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "127.0.0.1", 30303, &writer_alloc.writer);
 
-    try std.testing.expectEqualStrings("enr:-IW4QI9SLVH8scoBp80eUJdBENXALDXyf4psnqjs9be2rVYgcLY-R9FUPU0Ykg1o44fYBacr3V9OyfyXuggsBIDgbSOAgmlkgnY0gmlwhH8AAAGEcXVpY4J2X4lzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", buffer.items);
+    try std.testing.expectEqualStrings("enr:-IW4QI9SLVH8scoBp80eUJdBENXALDXyf4psnqjs9be2rVYgcLY-R9FUPU0Ykg1o44fYBacr3V9OyfyXuggsBIDgbSOAgmlkgnY0gmlwhH8AAAGEcXVpY4J2X4lzZWNwMjU2azGhA8pjTK4NSay0Adikxrb-jFW3DRFb9AB2nMFADzJYzTE4", writer_alloc.writer.buffered());
 }
 
 test "invalid secret key length" {
     const allocator = std.testing.allocator;
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    const result = genENR("invalid", "127.0.0.1", 30303, buffer.writer(allocator));
+    const result = genENR("invalid", "127.0.0.1", 30303, &writer_alloc.writer);
     try std.testing.expectError(error.InvalidSecretKeyLength, result);
 }
 
 test "invalid IP address" {
     const allocator = std.testing.allocator;
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
 
-    const result = genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "invalid.ip", 30303, buffer.writer(allocator));
+    const result = genENR("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", "invalid.ip", 30303, &writer_alloc.writer);
     try std.testing.expectError(error.InvalidIPAddress, result);
 }

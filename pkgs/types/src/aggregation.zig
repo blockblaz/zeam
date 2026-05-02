@@ -44,7 +44,7 @@ pub const AggregatedSignatureProof = struct {
     }
 
     pub fn toJson(self: *const Self, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
+        var obj = json.ObjectMap.empty;
 
         // Serialize participants as array of booleans
         var participants_array = json.Array.init(allocator);
@@ -52,12 +52,12 @@ pub const AggregatedSignatureProof = struct {
         for (0..self.participants.len()) |i| {
             try participants_array.append(json.Value{ .bool = try self.participants.get(i) });
         }
-        try obj.put("participants", json.Value{ .array = participants_array });
+        try obj.put(allocator, "participants", json.Value{ .array = participants_array });
 
         // Serialize proof_data as hex string
         const proof_bytes = self.proof_data.constSlice();
         const proof_hex = try utils.BytesToHex(allocator, proof_bytes);
-        try obj.put("proof_data", json.Value{ .string = proof_hex });
+        try obj.put(allocator, "proof_data", json.Value{ .string = proof_hex });
 
         return json.Value{ .object = obj };
     }
