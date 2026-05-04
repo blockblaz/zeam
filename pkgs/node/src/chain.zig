@@ -2305,7 +2305,7 @@ test "process and add mock blocks into a node's chain" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -2396,7 +2396,7 @@ test "printSlot output demonstration" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -2473,7 +2473,7 @@ test "buildTreeVisualization integration test" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -2560,7 +2560,7 @@ test "attestation validation - comprehensive" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -2838,7 +2838,7 @@ test "attestation validation - gossip vs block future slot handling" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -2940,7 +2940,7 @@ test "attestation processing - valid block attestation" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -3043,7 +3043,7 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);

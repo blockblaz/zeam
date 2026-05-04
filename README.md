@@ -1,7 +1,7 @@
-<p align="center"><a href="https://github.com/blockblaz/zeam"><img width="500" title="Zeam" src='assets/zeam-logo.png' /></a></p>
 
-[![CI](https://github.com/blockblaz/zeam/actions/workflows/ci.yml/badge.svg)](https://github.com/blockblaz/zeam/actions/workflows/ci.yml)
-[![risc0](https://github.com/blockblaz/zeam/actions/workflows/risc0.yml/badge.svg)](https://github.com/blockblaz/zeam/actions/workflows/risc0.yml)
+
+[CI](https://github.com/blockblaz/zeam/actions/workflows/ci.yml)
+[risc0](https://github.com/blockblaz/zeam/actions/workflows/risc0.yml)
 
 # Zeam — Zig Beam Client
 
@@ -53,14 +53,16 @@ Zeam's architecture closely mirrors the Beacon Chain client structure, adapted f
 
 The team is currently building and validating foundational POCs and libraries before composing them into a full client:
 
-| Area | Status |
-|------|--------|
-| ZK-VM state transition proving | Active POC |
-| libp2p networking (Zig ↔ Rust) | POC complete |
-| SSZ serialization | Library available |
-| Hash-based signatures (XMSS) | In development |
-| Snappy compression | Library available |
-| Full client integration | Upcoming |
+
+| Area                           | Status            |
+| ------------------------------ | ----------------- |
+| ZK-VM state transition proving | Active POC        |
+| libp2p networking (Zig ↔ Rust) | POC complete      |
+| SSZ serialization              | Library available |
+| Hash-based signatures (XMSS)   | In development    |
+| Snappy compression             | Library available |
+| Full client integration        | Upcoming          |
+
 
 Refer to [ZEAM POC](./resources/zeam.md) for detailed documentation on the current POC scope and design.
 
@@ -70,25 +72,27 @@ Refer to [ZEAM POC](./resources/zeam.md) for detailed documentation on the curre
 
 The `pkgs/` directory contains the modular components of the Zeam client:
 
-| Package | Description |
-|---------|-------------|
-| `pkgs/state-transition` | Core state transition logic (Zig) |
-| `pkgs/state-transition-runtime` | RISC-V binary executed inside ZK-VMs |
-| `pkgs/state-proving-manager` | Orchestrates ZK proving and verification |
-| `pkgs/node` | Main node lifecycle and coordination |
-| `pkgs/network` | libp2p-based P2P networking |
-| `pkgs/api` | HTTP API layer |
-| `pkgs/cli` | Command-line interface |
-| `pkgs/database` | Persistent storage (RocksDB) |
-| `pkgs/types` | Shared Beam/Zeam data types |
-| `pkgs/spectest` | Spec test framework |
-| `pkgs/metrics` | Prometheus-compatible metrics |
-| `pkgs/xmss` | Hash-based signature scheme |
-| `pkgs/key-manager` | Key management utilities |
-| `pkgs/params` | Protocol parameters |
-| `pkgs/configs` | Node configuration |
-| `pkgs/utils` | Shared utilities |
-| `pkgs/tools` | Developer tooling |
+
+| Package                         | Description                              |
+| ------------------------------- | ---------------------------------------- |
+| `pkgs/state-transition`         | Core state transition logic (Zig)        |
+| `pkgs/state-transition-runtime` | RISC-V binary executed inside ZK-VMs     |
+| `pkgs/state-proving-manager`    | Orchestrates ZK proving and verification |
+| `pkgs/node`                     | Main node lifecycle and coordination     |
+| `pkgs/network`                  | libp2p-based P2P networking              |
+| `pkgs/api`                      | HTTP API layer                           |
+| `pkgs/cli`                      | Command-line interface                   |
+| `pkgs/database`                 | Persistent storage (RocksDB)             |
+| `pkgs/types`                    | Shared Beam/Zeam data types              |
+| `pkgs/spectest`                 | Spec test framework                      |
+| `pkgs/metrics`                  | Prometheus-compatible metrics            |
+| `pkgs/xmss`                     | Hash-based signature scheme              |
+| `pkgs/key-manager`              | Key management utilities                 |
+| `pkgs/params`                   | Protocol parameters                      |
+| `pkgs/configs`                  | Node configuration                       |
+| `pkgs/utils`                    | Shared utilities                         |
+| `pkgs/tools`                    | Developer tooling                        |
+
 
 ---
 
@@ -96,10 +100,12 @@ The `pkgs/` directory contains the modular components of the Zeam client:
 
 Zeam supports multiple ZK-VMs for state transition proving:
 
-| Prover | Status | Notes |
-|--------|--------|-------|
-| [risc0](https://github.com/risc0/risc0) v3.0.3 | Supported | Requires external toolchain |
+
+| Prover                                         | Status    | Notes                               |
+| ---------------------------------------------- | --------- | ----------------------------------- |
+| [risc0](https://github.com/risc0/risc0) v3.0.3 | Supported | Requires external toolchain         |
 | [OpenVM](https://github.com/openvm-org/openvm) | Supported | Self-contained, no toolchain needed |
+
 
 ---
 
@@ -107,13 +113,15 @@ Zeam supports multiple ZK-VMs for state transition proving:
 
 Zeam is developing and contributing to the Zig Ethereum ecosystem. These libraries are used in and alongside the client:
 
-| Library | Description |
-|---------|-------------|
-| [ssz.zig](https://github.com/blockblaz/ssz.zig) | SSZ serialization with configurable hash function (SHA256 or Poseidon2) |
-| [zig-snappy](https://github.com/blockblaz/zig-snappy) / [snappyframesz](https://github.com/blockblaz/snappyframesz) | Snappy compression |
-| [zig-libp2p-pocs](https://github.com/blockblaz/zig-libp2p-pocs) | Zig ↔ Rust libp2p interop |
-| [hash-sigz](https://github.com/blockblaz/hash-sigz) | Hash-based signature schemes |
-| [zeam-runtime](https://github.com/blockblaz/zeam-runtime) | ZK-VM runtime POC |
+
+| Library                                                                                                             | Description                                                |
+| ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| [ssz.zig](https://github.com/blockblaz/ssz.zig)                                                                     | SSZ serialization with configurable hash function (SHA256) |
+| [zig-snappy](https://github.com/blockblaz/zig-snappy) / [snappyframesz](https://github.com/blockblaz/snappyframesz) | Snappy compression                                         |
+| [zig-libp2p-pocs](https://github.com/blockblaz/zig-libp2p-pocs)                                                     | Zig ↔ Rust libp2p interop                                  |
+| [hash-sigz](https://github.com/blockblaz/hash-sigz)                                                                 | Hash-based signature schemes                               |
+| [zeam-runtime](https://github.com/blockblaz/zeam-runtime)                                                           | ZK-VM runtime POC                                          |
+
 
 If you are developing a library in the Zig ecosystem that could benefit Zeam, please reach out via [Telegram](https://t.me/zeamETH).
 
@@ -123,10 +131,10 @@ If you are developing a library in the Zig ecosystem that could benefit Zeam, pl
 
 ### Prerequisites
 
-- **Zig** `0.15.2`
+- **Zig** `0.16.0`
 - **Rust** `1.85+` (required for ZK-VM Rust bindings)
 - **risc0 toolchain** (only if using risc0 prover): `rzup install r0vm 3.0.3`
-  - Install guide: https://dev.risczero.com/api/zkvm/install
+  - Install guide: [https://dev.risczero.com/api/zkvm/install](https://dev.risczero.com/api/zkvm/install)
 - **OpenVM** is self-contained — no additional toolchain required
 
 ### Building
@@ -143,8 +151,6 @@ To include the git version in the binary:
 zig build -Doptimize=ReleaseFast -Dgit_version="$(git rev-parse --short HEAD)"
 ```
 
-
-> To use Poseidon2 as the SSZ hash function instead of SHA256, see [resources/poseidon.md](resources/poseidon.md).
 ### Running the Prover Demo
 
 ```bash
@@ -179,6 +185,7 @@ docker build -f Dockerfile.prebuilt \
 **Build fails with `EndOfStream` error**
 
 If you encounter errors like:
+
 ```
 error: invalid HTTP response: EndOfStream
 ```
@@ -186,6 +193,7 @@ error: invalid HTTP response: EndOfStream
 This may be caused by proxy environment variables interfering with Zig's HTTP client (related to the [Zig HTTP connection pool bug](https://github.com/ziglang/zig/issues/21316) mentioned above).
 
 Try building without proxy settings:
+
 ```bash
 env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY \
     -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
@@ -214,11 +222,13 @@ Zeam supports checkpoint sync for faster initial synchronization. Start a node f
 
 ## Testing
 
-| Scenario | Guide |
-|----------|-------|
-| Test blocks by root (parent sync) | [parent-sync.md](./resources/parent-sync.md) |
-| Test checkpoint sync | [checkpoint-sync.md](./resources/checkpoint-sync.md) |
-| Spec test framework | [spec-test-framework.md](./resources/spec-test-framework.md) |
+
+| Scenario                          | Guide                                                        |
+| --------------------------------- | ------------------------------------------------------------ |
+| Test blocks by root (parent sync) | [parent-sync.md](./resources/parent-sync.md)                 |
+| Test checkpoint sync              | [checkpoint-sync.md](./resources/checkpoint-sync.md)         |
+| Spec test framework               | [spec-test-framework.md](./resources/spec-test-framework.md) |
+
 
 ---
 

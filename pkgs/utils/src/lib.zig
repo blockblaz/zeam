@@ -34,6 +34,16 @@ const fs_factory = @import("./fs.zig");
 pub const checkDIRExists = fs_factory.checkDIRExists;
 pub const readFileToEndAlloc = fs_factory.readFileToEndAlloc;
 
+const sync_factory = @import("./sync.zig");
+pub const SyncMutex = sync_factory.Mutex;
+pub const SyncRwLock = sync_factory.RwLock;
+
+const time_factory = @import("./time.zig");
+pub const unixTimestampSeconds = time_factory.unixTimestampSeconds;
+pub const unixTimestampMillis = time_factory.unixTimestampMillis;
+pub const sleepNs = time_factory.sleepNs;
+pub const monotonicTimestampNs = time_factory.monotonicTimestampNs;
+
 const json_factory = @import("./json.zig");
 // Avoid to use `usingnamespace` to make upgrade easier in the future.
 pub const jsonToString = json_factory.jsonToString;
@@ -46,5 +56,5 @@ const fmt_factory = @import("./fmt.zig");
 pub const LazyJson = fmt_factory.LazyJson;
 
 test {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }

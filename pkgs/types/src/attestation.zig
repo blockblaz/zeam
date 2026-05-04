@@ -38,11 +38,11 @@ pub const AttestationData = struct {
     }
 
     pub fn toJson(self: *const AttestationData, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("head", try self.head.toJson(allocator));
-        try obj.put("target", try self.target.toJson(allocator));
-        try obj.put("source", try self.source.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "head", try self.head.toJson(allocator));
+        try obj.put(allocator, "target", try self.target.toJson(allocator));
+        try obj.put(allocator, "source", try self.source.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
@@ -67,9 +67,9 @@ pub const Attestation = struct {
     }
 
     pub fn toJson(self: *const Attestation, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
-        try obj.put("data", try self.data.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
+        try obj.put(allocator, "data", try self.data.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
@@ -95,10 +95,10 @@ pub const SignedAttestation = struct {
     }
 
     pub fn toJson(self: *const SignedAttestation, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
-        try obj.put("message", try self.message.toJson(allocator));
-        try obj.put("signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "validator_id", json.Value{ .integer = @as(i64, @intCast(self.validator_id)) });
+        try obj.put(allocator, "message", try self.message.toJson(allocator));
+        try obj.put(allocator, "signature", json.Value{ .string = try bytesToHex(allocator, &self.signature) });
         return json.Value{ .object = obj };
     }
 
@@ -122,9 +122,9 @@ pub const SignedAggregatedAttestation = struct {
     }
 
     pub fn toJson(self: *const SignedAggregatedAttestation, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("data", try self.data.toJson(allocator));
-        try obj.put("proof", try self.proof.toJson(allocator));
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "data", try self.data.toJson(allocator));
+        try obj.put(allocator, "proof", try self.proof.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
@@ -144,14 +144,14 @@ pub const AggregatedAttestation = struct {
     }
 
     pub fn toJson(self: *const AggregatedAttestation, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
+        var obj = json.ObjectMap.empty;
 
         var bits_array = json.Array.init(allocator);
         for (0..self.aggregation_bits.len()) |i| {
             try bits_array.append(json.Value{ .bool = try self.aggregation_bits.get(i) });
         }
-        try obj.put("aggregation_bits", json.Value{ .array = bits_array });
-        try obj.put("data", try self.data.toJson(allocator));
+        try obj.put(allocator, "aggregation_bits", json.Value{ .array = bits_array });
+        try obj.put(allocator, "data", try self.data.toJson(allocator));
         return json.Value{ .object = obj };
     }
 
