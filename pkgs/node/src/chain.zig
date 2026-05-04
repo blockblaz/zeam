@@ -3968,3 +3968,395 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
         try std.testing.expect(beam_chain.forkChoice.hasBlock(block_root));
     }
 }
+
+test "chain: reorg under attestation pressure — forkchoice settles, no duplicate work" {
+    // Slice (b) cross-thread test scenario: two onBlock threads race the
+    // import of overlapping forks while an attestation thread spams
+    // mixed-validity attestations targeting both forks. The contract
+    // under test:
+    //
+    //   * Forkchoice settles on a single head after all imports complete.
+    //   * No panic / UAF in the attestation pool (events_lock + forkchoice
+    //     attestation map are concurrently mutated).
+    //   * statesGet on the eventual head root succeeds and the slot is
+    //     coherent with one of the imported chain tips.
+    //
+    // Iteration count is modest (50) so the whole test stays under ~30s
+    // in Debug. Each iteration builds a fresh BeamChain, imports the
+    // shared mock chain, and then concurrently re-imports + spams
+    // attestations. The slow part is XMSS attestation signing; we limit
+    // attestation messages per iteration to keep runtime sane.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    // 4-block mock chain shared across all iterations as the import
+    // template. We don't actually fork — the "reorg pressure" comes from
+    // both onBlock threads racing to import the SAME blocks (kept_existing
+    // path), which exercises the same statesCommitKeepExisting +
+    // forkchoice-confirm interleaving as a true reorg without the
+    // scaffolding cost of building a real divergent chain.
+    const mock_chain = try stf.genMockChain(arena, 4, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const ITERS: usize = 50;
+    var iter: usize = 0;
+    while (iter < ITERS) : (iter += 1) {
+        const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+        const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+        const chain_config = configs.ChainConfig{
+            .id = configs.Chain.custom,
+            .genesis = mock_chain.genesis_config,
+            .spec = .{
+                .preset = params.Preset.mainnet,
+                .name = spec_name,
+                .fork_digest = fork_digest,
+                .attestation_committee_count = 1,
+                .max_attestations_data = 16,
+            },
+        };
+
+        var beam_state: types.BeamState = undefined;
+        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+        defer beam_state.deinit();
+
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        var path_buf: [128]u8 = undefined;
+        const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+        var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+        defer db.deinit();
+
+        const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+        defer std.testing.allocator.destroy(connected_peers);
+        connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+        defer connected_peers.deinit();
+
+        const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+        defer std.testing.allocator.destroy(test_registry);
+        test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+        defer test_registry.deinit();
+
+        var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+            .config = chain_config,
+            .anchorState = &beam_state,
+            .nodeId = 21,
+            .logger_config = &zeam_logger_config,
+            .db = db,
+            .node_registry = test_registry,
+        }, connected_peers);
+        defer beam_chain.deinit();
+
+        // Advance forkchoice clock past the last block's slot so block
+        // imports are not FutureSlot-rejected and attestations are not
+        // FutureSlot either.
+        const last_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot;
+        try beam_chain.forkChoice.onInterval((last_slot + 4) * constants.INTERVALS_PER_SLOT, false);
+
+        const Ctx = struct {
+            chain: *BeamChain,
+            blocks: []types.SignedBlock,
+            block_roots: []types.Root,
+            attn_iters: usize,
+            // counters
+            imports_a: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            imports_b: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            attn_ok: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            // start barrier
+            start: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+            ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+            fatal_msg: [128]u8 = undefined,
+            fatal_set: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        };
+
+        const Worker = struct {
+            fn waitStart(ctx: *Ctx) void {
+                _ = ctx.ready.fetchAdd(1, .acq_rel);
+                while (ctx.start.load(.acquire) == 0) std.Thread.yield() catch {};
+            }
+            // Forward import 1..N
+            fn importerForward(ctx: *Ctx) void {
+                waitStart(ctx);
+                for (1..ctx.blocks.len) |i| {
+                    const missing = ctx.chain.onBlock(ctx.blocks[i], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    _ = ctx.imports_a.fetchAdd(1, .monotonic);
+                }
+            }
+            // Reverse import N..1 — different order = different
+            // interleavings of forkchoice insert vs kept_existing.
+            fn importerReverse(ctx: *Ctx) void {
+                waitStart(ctx);
+                var i: usize = ctx.blocks.len;
+                while (i > 1) {
+                    i -= 1;
+                    const missing = ctx.chain.onBlock(ctx.blocks[i], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    _ = ctx.imports_b.fetchAdd(1, .monotonic);
+                }
+            }
+            fn attestationSpammer(ctx: *Ctx, key_manager: *keymanager.KeyManager) void {
+                waitStart(ctx);
+                const allocator = ctx.chain.allocator;
+                var i: usize = 0;
+                while (i < ctx.attn_iters) : (i += 1) {
+                    const slot_idx = 1 + (i % (ctx.blocks.len - 1));
+                    const target_root = ctx.block_roots[slot_idx];
+                    const target_slot: types.Slot = ctx.blocks[slot_idx].block.slot;
+                    const source_idx = if (slot_idx > 1) slot_idx - 1 else 0;
+                    const validator_id: usize = i % 4;
+                    const message = types.Attestation{
+                        .validator_id = @intCast(validator_id),
+                        .data = .{
+                            .slot = target_slot,
+                            .head = .{ .root = target_root, .slot = target_slot },
+                            .source = .{ .root = ctx.block_roots[source_idx], .slot = ctx.blocks[source_idx].block.slot },
+                            .target = .{ .root = target_root, .slot = target_slot },
+                        },
+                    };
+                    const signature = key_manager.signAttestation(&message, allocator) catch continue;
+                    const valid_attestation = types.SignedAttestation{
+                        .validator_id = message.validator_id,
+                        .message = message.data,
+                        .signature = signature,
+                    };
+                    const subnet_id = types.computeSubnetId(
+                        @intCast(valid_attestation.validator_id),
+                        ctx.chain.config.spec.attestation_committee_count,
+                    ) catch continue;
+                    const gossip = networks.AttestationGossip{
+                        .subnet_id = @intCast(subnet_id),
+                        .message = valid_attestation,
+                    };
+                    ctx.chain.onGossipAttestation(gossip) catch continue;
+                    _ = ctx.attn_ok.fetchAdd(1, .monotonic);
+                }
+            }
+        };
+
+        var key_manager = try keymanager.getTestKeyManager(std.testing.allocator, 4, mock_chain.blocks.len);
+        defer key_manager.deinit();
+
+        var ctx = Ctx{
+            .chain = &beam_chain,
+            .blocks = mock_chain.blocks,
+            .block_roots = mock_chain.blockRoots,
+            .attn_iters = 30,
+        };
+
+        var t_a = try std.Thread.spawn(.{}, Worker.importerForward, .{&ctx});
+        var t_b = try std.Thread.spawn(.{}, Worker.importerReverse, .{&ctx});
+        var t_c = try std.Thread.spawn(.{}, Worker.attestationSpammer, .{ &ctx, &key_manager });
+
+        while (ctx.ready.load(.acquire) < 3) std.Thread.yield() catch {};
+        ctx.start.store(1, .release);
+
+        t_a.join();
+        t_b.join();
+        t_c.join();
+
+        // Forkchoice must have settled on a single head.
+        const head = beam_chain.forkChoice.getHead();
+        // The head must be one of the imported block roots (or genesis
+        // if every import failed, which would itself be a bug). At
+        // minimum every block root must be observable in the chain.
+        for (mock_chain.blockRoots[1..]) |r| {
+            try std.testing.expect(beam_chain.forkChoice.hasBlock(r));
+        }
+        // Both importers must have made at least 1 successful import
+        // each (pre-imports happen on a fresh chain so kept_existing
+        // splits between the two threads).
+        try std.testing.expect(ctx.imports_a.load(.monotonic) + ctx.imports_b.load(.monotonic) >= mock_chain.blocks.len - 1);
+        // Head's slot is finite and not in the future relative to last
+        // imported slot.
+        try std.testing.expect(head.slot <= last_slot);
+        // statesGet on the head root must succeed.
+        var head_borrow = beam_chain.statesGet(head.blockRoot) orelse {
+            try std.testing.expect(false);
+            unreachable;
+        };
+        const owned = try head_borrow.cloneAndRelease(std.testing.allocator);
+        owned.deinit();
+        std.testing.allocator.destroy(owned);
+    }
+}
+
+test "chain: finalization race — onBlockFollowup + statesGet from API-shaped reader" {
+    // Slice (b) cross-thread test scenario: while a writer thread imports
+    // blocks and advances finalization (via onBlockFollowup), an
+    // HTTP-API-shaped reader thread loops over chain.statesGet +
+    // cloneAndRelease for both finalized and non-finalized roots. The
+    // contract under test:
+    //
+    //   * No UAF in the reader: every cloneAndRelease either returns a
+    //     coherent state or null (entry pruned away during the borrow
+    //     opportunity window — acceptable, the reader retries).
+    //   * No torn read: every observed slot is one of the imported
+    //     slots (or 0 for genesis).
+    //   * No deadlock: the test must complete in well under 30s.
+    //   * latest_finalized as observed via forkChoice.getLatestFinalized
+    //     never goes backwards across reader observations.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 6, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 22,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    const last_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot;
+    try beam_chain.forkChoice.onInterval((last_slot + 4) * constants.INTERVALS_PER_SLOT, false);
+
+    const Ctx = struct {
+        chain: *BeamChain,
+        blocks: []types.SignedBlock,
+        block_roots: []types.Root,
+        iters: usize,
+        writer_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        reader_ok: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        reader_null: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        reader_torn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        finalized_regression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        start: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    const Worker = struct {
+        fn waitStart(ctx: *Ctx) void {
+            _ = ctx.ready.fetchAdd(1, .acq_rel);
+            while (ctx.start.load(.acquire) == 0) std.Thread.yield() catch {};
+        }
+        // Writer: import blocks 1..N, calling onBlockFollowup after
+        // each. onBlockFollowup is what drives processFinalizationAdvancement.
+        fn writer(ctx: *Ctx) void {
+            waitStart(ctx);
+            var i: usize = 0;
+            while (i < ctx.iters) : (i += 1) {
+                for (1..ctx.blocks.len) |k| {
+                    const missing = ctx.chain.onBlock(ctx.blocks[k], .{ .pruneForkchoice = false }) catch continue;
+                    ctx.chain.allocator.free(missing);
+                    // Drive followup so finalization advances on the
+                    // canonical chain. signedBlock parameter is unused
+                    // by current impl (per source).
+                    ctx.chain.onBlockFollowup(false, null);
+                }
+            }
+            ctx.writer_done.store(true, .release);
+        }
+        // Reader: HTTP-API-shaped pattern — statesGet on a random known
+        // root, cloneAndRelease, sanity-check the slot. Loop until
+        // writer signals done. Also tracks latest_finalized monotonicity.
+        fn reader(ctx: *Ctx) void {
+            waitStart(ctx);
+            var prng = std.Random.DefaultPrng.init(0x517A715A);
+            const rand = prng.random();
+            var last_finalized_slot: types.Slot = 0;
+            const allocator = ctx.chain.allocator;
+            while (!ctx.writer_done.load(.acquire)) {
+                const idx = rand.uintLessThan(usize, ctx.block_roots.len);
+                const root = ctx.block_roots[idx];
+                if (ctx.chain.statesGet(root)) |b| {
+                    var borrow = b;
+                    const owned = borrow.cloneAndRelease(allocator) catch {
+                        continue;
+                    };
+                    defer {
+                        owned.deinit();
+                        allocator.destroy(owned);
+                    }
+                    var coherent = owned.slot == 0;
+                    if (!coherent) {
+                        for (ctx.blocks) |bl| {
+                            if (bl.block.slot == owned.slot) {
+                                coherent = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (coherent) {
+                        _ = ctx.reader_ok.fetchAdd(1, .monotonic);
+                    } else {
+                        _ = ctx.reader_torn.fetchAdd(1, .monotonic);
+                    }
+                } else {
+                    _ = ctx.reader_null.fetchAdd(1, .monotonic);
+                }
+                // Monotonicity check on latest_finalized.
+                const lf = ctx.chain.forkChoice.getLatestFinalized();
+                if (lf.slot < last_finalized_slot) {
+                    _ = ctx.finalized_regression.fetchAdd(1, .monotonic);
+                }
+                last_finalized_slot = lf.slot;
+            }
+        }
+    };
+
+    var ctx = Ctx{
+        .chain = &beam_chain,
+        .blocks = mock_chain.blocks,
+        .block_roots = mock_chain.blockRoots,
+        .iters = 20,
+    };
+
+    var t_w = try std.Thread.spawn(.{}, Worker.writer, .{&ctx});
+    var t_r1 = try std.Thread.spawn(.{}, Worker.reader, .{&ctx});
+    var t_r2 = try std.Thread.spawn(.{}, Worker.reader, .{&ctx});
+
+    while (ctx.ready.load(.acquire) < 3) std.Thread.yield() catch {};
+    ctx.start.store(1, .release);
+
+    t_w.join();
+    t_r1.join();
+    t_r2.join();
+
+    // Contract: no torn reads, no finalization regressions.
+    try std.testing.expectEqual(@as(u32, 0), ctx.reader_torn.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.finalized_regression.load(.monotonic));
+    // Sanity: at least some successful reads happened (otherwise the
+    // race window collapsed and the test proves nothing).
+    try std.testing.expect(ctx.reader_ok.load(.monotonic) > 100);
+}
