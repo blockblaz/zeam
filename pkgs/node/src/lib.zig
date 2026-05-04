@@ -13,6 +13,11 @@ pub const constants = @import("./constants.zig");
 pub const utils = @import("./utils.zig");
 pub const detectBackend = utils.detectBackend;
 
+pub const locking = @import("./locking.zig");
+pub const BorrowedState = locking.BorrowedState;
+pub const LockedMap = locking.LockedMap;
+pub const BlockCache = locking.BlockCache;
+
 const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
@@ -20,5 +25,6 @@ test "get tests" {
     _ = @import("./forkchoice.zig");
     _ = @import("./chain.zig");
     _ = @import("./utils.zig");
+    _ = @import("./locking.zig");
     @import("std").testing.refAllDecls(@This());
 }

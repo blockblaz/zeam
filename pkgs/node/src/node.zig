@@ -1470,8 +1470,20 @@ pub const BeamNode = struct {
             });
         }
 
+        // Slice (a-2) migration: the previous `states.get(block_root)`
+        // shortcut handed `chain.onBlock` the cached post-state pointer to
+        // skip recomputation when the block was already produced locally.
+        // Under the new per-resource locking model that pointer would have
+        // to be carried as a `BorrowedState`, but `chain.onBlock` itself
+        // takes `states_lock.exclusive` to commit — holding the read side
+        // across that call would deadlock. The post-state recompute path
+        // is now the single source of truth for both produced-locally and
+        // received-from-gossip blocks; the `statesPutOrSwap` helper inside
+        // `onBlock` keeps the original in-map pointer intact when the
+        // entry already exists, so locally produced blocks no longer leak
+        // their initial post-state on the publish hop. See the design doc
+        // §Resource-by-resource design / `BeamChain.states` for context.
         const missing_roots = try self.chain.onBlock(signed_block, .{
-            .postState = self.chain.states.get(block_root),
             .blockRoot = block_root,
         });
         defer self.allocator.free(missing_roots);

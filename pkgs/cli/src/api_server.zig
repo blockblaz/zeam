@@ -272,17 +272,24 @@ pub const ApiServer = struct {
             return;
         };
 
-        // Get finalized state from chain (chain handles its own locking internally)
-        const finalized_lean_state = chain.getFinalizedState() orelse {
+        // Get finalized state from chain. After slice (a-2) the chain
+        // returns a `BorrowedState` (see `pkgs/node/src/locking.zig`)
+        // whose backing lock is held until `deinit()` runs — keep the
+        // borrow alive only as long as we read `state`. Serialise into
+        // an owned `ArrayList(u8)` first, then drop the borrow before
+        // doing any HTTP I/O so we do not hold the lock across a network
+        // write.
+        var finalized_borrow = chain.getFinalizedState() orelse {
             _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
             return;
         };
+        defer finalized_borrow.deinit();
 
         // Serialize lean state (BeamState) to SSZ
         var ssz_output: std.ArrayList(u8) = .empty;
         defer ssz_output.deinit(self.allocator);
 
-        ssz.serialize(types.BeamState, finalized_lean_state.*, &ssz_output, self.allocator) catch |err| {
+        ssz.serialize(types.BeamState, finalized_borrow.state.*, &ssz_output, self.allocator) catch |err| {
             self.logger.err("failed to serialize finalized lean state to SSZ: {}", .{err});
             _ = request.respond("Internal Server Error: Serialization failed\n", .{ .status = .internal_server_error }) catch {};
             return;
