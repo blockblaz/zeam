@@ -180,11 +180,12 @@ pub const BeamChain = struct {
     //   tier 5c: events_lock           (sibling — never co-held with 5a/5b)
     //   tier 6: forkChoice (own RwLock, innermost)
     //
-    // The `BeamNode.mutex` (renamed `finalization_lock` in slice a-3) still
-    // wraps every chain entry point as of slice a-2, so these locks are
-    // currently nested inside the global mutex — redundant but correct. They
-    // become the actual synchronisation once a-3 drops the global mutex from
-    // the gossip / interval / req-resp paths.
+    // As of slice a-3 the previous coarse `BeamNode.mutex` is gone; these
+    // per-resource locks are now the actual synchronisation between the
+    // libxev tick path and the libp2p worker on every chain entry point.
+    // (Slice (c) will reintroduce a finalization-scoped multi-resource
+    // lock when its first real user — the chain-worker `processFinalization
+    // Followup` move-off path — lands.)
     states_lock: zeam_utils.SyncRwLock = .{},
     pending_blocks_lock: zeam_utils.SyncMutex = .{},
     pubkey_cache_lock: zeam_utils.SyncMutex = .{},

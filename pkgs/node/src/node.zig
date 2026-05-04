@@ -23,7 +23,6 @@ pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 const forkchoice = @import("./forkchoice.zig");
-const locking = @import("./locking.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
@@ -61,26 +60,14 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Coarse outer lock that previously serialised every chain + network
-    /// mutation between the libxev main thread and the libp2p worker thread.
+    /// NOTE: the previous coarse outer `BeamNode.mutex` was dropped in this
+    /// slice (a-3). The gossip / interval / req-resp call paths now take
+    /// per-resource locks via the helpers in `pkgs/node/src/locking.zig`.
+    /// Slice (c) (chain-worker / `processFinalizationFollowup` move-off-IO-
+    /// thread) will reintroduce a multi-resource lock here when its first
+    /// real user lands; until then there is no placeholder field, per
+    /// slice discipline (no dead code without callers).
     ///
-    /// As of slice (a-3) (this PR), the gossip / interval / req-resp call
-    /// paths drop this lock entirely — they now take per-resource locks via
-    /// the helpers in `pkgs/node/src/locking.zig`. The lock is renamed to
-    /// `finalization_lock` and kept available for the few code paths that
-    /// legitimately need a multi-resource view (e.g. a future
-    /// `processFinalizationFollowup` move-off-IO-thread). Today there are
-    /// no nested chain mutations holding this lock; it survives as a
-    /// labelled placeholder so the rename does not delete a synchronisation
-    /// primitive that the slice (c) chain-worker code is still expected to
-    /// reach for.
-    ///
-    /// `acquireFinalizationLock(site)` is the canonical way to take this
-    /// lock when a future caller needs it. It records wait + hold time
-    /// into `zeam_lock_{wait,hold}_seconds{lock="finalization",site=...}`
-    /// (and the legacy `zeam_node_mutex_*` series via the LockTimer
-    /// compat shim).
-    finalization_lock: zeam_utils.SyncMutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
@@ -164,40 +151,6 @@ pub const BeamNode = struct {
         self.network.deinit();
         self.chain.deinit();
         self.allocator.destroy(self.chain);
-    }
-
-    /// RAII-style guard returned by `acquireFinalizationLock`. Releases
-    /// `finalization_lock` in its `unlock` method while observing the hold
-    /// time into the per-lock `zeam_lock_hold_seconds` histogram for the
-    /// configured site (and the legacy `zeam_node_mutex_hold_time_seconds`
-    /// series via the LockTimer compat shim).
-    const FinalizationLockGuard = struct {
-        timer: locking.LockTimer,
-        mutex: *zeam_utils.SyncMutex,
-        released: bool = false,
-
-        pub fn unlock(self: *FinalizationLockGuard) void {
-            if (self.released) return;
-            self.released = true;
-            self.timer.released();
-            self.mutex.unlock();
-        }
-    };
-
-    /// Acquire `finalization_lock`, recording wait + hold time via
-    /// `LockTimer`. Always pair with `defer guard.unlock()`.
-    ///
-    /// Currently unused on the gossip / interval / req-resp paths — those
-    /// take per-resource locks instead. Reserved for future paths that
-    /// legitimately need a multi-resource view.
-    fn acquireFinalizationLock(self: *Self, comptime site: []const u8) FinalizationLockGuard {
-        var t = locking.LockTimer.start("finalization", site);
-        self.finalization_lock.lock();
-        t.acquired();
-        return .{
-            .timer = t,
-            .mutex = &self.finalization_lock,
-        };
     }
 
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
