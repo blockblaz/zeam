@@ -283,6 +283,11 @@ pub const ApiServer = struct {
             _ = request.respond("Not Found: Finalized checkpoint lean state not available\n", .{ .status = .not_found }) catch {};
             return;
         };
+        // assertReleasedOrPanic registered FIRST so it runs LAST (LIFO):
+        // by the time it runs, the deinit defer has already set
+        // `released = true`. Catches a future helper that bypasses
+        // deinit. PR #820 / issue #803.
+        defer finalized_borrow.assertReleasedOrPanic();
         defer finalized_borrow.deinit();
 
         // Serialize lean state (BeamState) to SSZ

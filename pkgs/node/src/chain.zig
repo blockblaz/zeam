@@ -665,6 +665,11 @@ pub const BeamChain = struct {
         // clone the pre-state into an owned snapshot under the borrow,
         // release the lock, then run the FFI against the snapshot.
         var pre_borrow = self.statesGet(parent_root) orelse return BlockProductionError.MissingPreState;
+        // assertReleasedOrPanic registered FIRST so it runs LAST (LIFO);
+        // cloneAndRelease drops the lock on success/error, so by the time
+        // the assert runs `released` must be true. Catches a future
+        // helper that forgets to release before scope exit.
+        defer pre_borrow.assertReleasedOrPanic();
         const pre_snapshot = try pre_borrow.cloneAndRelease(self.allocator);
         defer {
             pre_snapshot.deinit();
@@ -1160,6 +1165,7 @@ pub const BeamChain = struct {
             //    release. Verify + STF run on the owned snapshot so we
             //    don't hold the read lock across the long FFI window.
             var parent_borrow = self.statesGet(block.parent_root) orelse return BlockProcessingError.MissingPreState;
+            defer parent_borrow.assertReleasedOrPanic();
             const pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
             defer {
                 pre_snapshot.deinit();
@@ -1407,6 +1413,7 @@ pub const BeamChain = struct {
         // entry under us. See PR #820 / issue #803.
         var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
         // Release the exclusive lock on every exit path (success or error).
+        defer commit.borrow.assertReleasedOrPanic();
         defer commit.borrow.deinit();
         if (commit.kept_existing and post_state_owned) {
             // Existing entry kept — free the freshly-computed (and now
@@ -1956,6 +1963,7 @@ pub const BeamChain = struct {
         // because they only need exclusive access for STF commits, which
         // happen later under their own snapshot.
         var borrow = self.statesGet(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        defer borrow.assertReleasedOrPanic();
         defer borrow.deinit();
 
         try stf.verifySingleAttestation(
@@ -2011,6 +2019,7 @@ pub const BeamChain = struct {
         // bytes. Drop the borrow before the XMSS verify since the borrow
         // only protects the validator-list pointer.
         var borrow = self.statesGet(data.target.root) orelse return error.MissingState;
+        defer borrow.assertReleasedOrPanic();
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.items.len);
         defer public_keys.deinit(self.allocator);
 
@@ -2059,6 +2068,7 @@ pub const BeamChain = struct {
         // for that window would force any STF commit to wait. Clone first,
         // release the lock, then run the FFI on the owned snapshot.
         var borrow = self.statesGet(head_root) orelse return error.MissingState;
+        defer borrow.assertReleasedOrPanic();
         const snapshot = try borrow.cloneAndRelease(self.allocator);
         defer {
             snapshot.deinit();

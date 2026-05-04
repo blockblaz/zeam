@@ -966,7 +966,15 @@ pub const BorrowedState = struct {
     /// Consume the borrow: produce an owned `*types.BeamState` and release
     /// the lock. On allocator failure the lock is still released. Caller
     /// owns the returned pointer and MUST NOT call `deinit` afterwards.
+    ///
+    /// Calling `cloneAndRelease` more than once on the same borrow is a
+    /// use-after-free — the lock has already been released, so the
+    /// `state` pointer the second call would clone may already be freed
+    /// by another thread. Debug builds catch this with an assert; release
+    /// builds will silently UB. Use `assertReleasedOrPanic` defers at
+    /// callsites to surface the bug at the scope boundary.
     pub fn cloneAndRelease(self: *BorrowedState, allocator: Allocator) !*types.BeamState {
+        std.debug.assert(!self.released);
         // OOM-mid-clone: the lock must always be released, success or
         // failure. errdefer fires on the `try` lines below.
         errdefer self.deinit();
@@ -978,12 +986,42 @@ pub const BorrowedState = struct {
         return owned;
     }
 
-    /// Debug-only assert: panic if the borrow has not been released. Mirrors
-    /// `MutexGuard.assertReleased` from #787. Compiled out in release.
-    pub fn assertReleased(self: *const BorrowedState) void {
+    /// Debug-only assert: panic if the borrow has not been released.
+    /// Wire up at every BorrowedState callsite via
+    ///
+    ///     defer borrow.assertReleasedOrPanic();
+    ///     defer borrow.deinit();
+    ///
+    /// Source order matters: `defer borrow.assertReleasedOrPanic();` is
+    /// registered FIRST so it runs LAST (Zig defer is LIFO). On a normal
+    /// exit `defer borrow.deinit()` runs first and sets `released = true`,
+    /// then `assertReleasedOrPanic` validates and is a no-op. On a path
+    /// that bypasses the deinit (programmer error — e.g. a future helper
+    /// that takes ownership without recording release) the assert panics
+    /// in Debug. Compiled out in release.
+    ///
+    /// Renamed from `assertReleased` (Zig 0.16): the legacy name was
+    /// silently dropped at every callsite during the upgrade because the
+    /// signature took `*const Self` by reference but read a non-atomic
+    /// `released` field that callsites stored in stack-locals — the
+    /// helper read a stale copy and never panicked. The `OrPanic`
+    /// rename + signature audit forces a rewire at every callsite.
+    /// Reported by @ch4r10t33r in PR #820 / issue #803.
+    pub fn assertReleasedOrPanic(self: *const BorrowedState) void {
         if (builtin.mode == .Debug) {
-            std.debug.assert(self.released);
+            if (!self.released) {
+                std.debug.panic(
+                    "BorrowedState dropped without release; backing={s}",
+                    .{@tagName(self.backing)},
+                );
+            }
         }
+    }
+
+    /// Deprecated alias retained for source compatibility while callsites
+    /// are migrated. New code should use `assertReleasedOrPanic` directly.
+    pub fn assertReleased(self: *const BorrowedState) void {
+        self.assertReleasedOrPanic();
     }
 };
 
@@ -1132,6 +1170,20 @@ test "BorrowedState: tier5_held=false leaves tier5 depth alone" {
     };
     borrow.deinit();
     try testing.expect(tier5_depth == 0);
+}
+
+test "BorrowedState: assertReleasedOrPanic passes after deinit" {
+    if (builtin.mode != .Debug) return;
+    var rwl: zeam_utils.SyncRwLock = .{};
+    rwl.lockShared();
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .states_shared_rwlock = &rwl },
+    };
+    borrow.deinit();
+    // Must NOT panic.
+    borrow.assertReleasedOrPanic();
 }
 
 test "BorrowedState: states_exclusive_rwlock backing also releases" {
