@@ -1,9 +1,9 @@
 # Threading Refactor — Slice (a): Per-Resource Locks + Lock-Free Req/Resp
 
-Date: 2026-04-29
+Date: 2026-04-29 (last revision: 2026-05-04)
 Tracking issue: #803
-Status: **DESIGN — REVISION 2 (review feedback applied)**
-Author: zclawz bot (under direction of @ch4r10t33r, @gr3999)
+Status: **DESIGN — REVISION 5 (chain-worker-thread target absorbed per @GrapeBaBa)**
+Author: zclawz bot (under direction of @ch4r10t33r, @gr3999, @GrapeBaBa)
 
 Changelog vs. r1 (Partha #1–#7):
 - Added §State-pointer lifetime (Partha #1) — slice (a) ships `BorrowedState` wrapper; refcount deferred but the API contract is fixed now.
@@ -23,6 +23,15 @@ Changelog vs. r2 (Partha #8–#13 + open-question responses):
 - Added §`connected_peers` access pattern (Partha #13) — atomic counter for hot-path `count()`, `RwLock` for the few `iterator()` callers, mutex sized for adds/removes.
 - Resolved open questions: (1) refcount required before slice (c) goes off-thread; (2) `connected_peers` → atomic count + RwLock for iterator; (3) metric migration in (a-2); (4) drop `external_mutex` outright, no null-only transitional release.
 - Added §Long-term direction — single chain-mutator thread + queues vs. fine-grained locks. Slice (a) lock-hierarchy work survives either way; per-resource exclusive write locks become dead weight if mutation marshalls. Captured as a #803 question, not slice (a)'s decision.
+
+Changelog vs. r4 (@GrapeBaBa actor-model + lighthouse hackmd, 2026-05-02):
+- **Recognised both event-loop threads as IO-only targets.** §Threads in play now distinguishes the libxev main thread's *current* role (slot tick + pending-block drain — mixes IO and CPU) from its *target* role (event router only — enqueue-and-return). Same recognition applied to the libp2p bridge thread, with a stronger framing per @GrapeBaBa: holding either event loop for XMSS verify + STF is a correctness bug (mesh maintenance / peer scoring stalls, slot-tick jitter), not a perf nuance.
+- **Added §IO-thread non-blocking invariant.** New first-class invariant: neither libxev main nor the libp2p bridge thread may run XMSS verify, STF, or any FFI work whose worst case exceeds a slot's per-interval budget. Crossing the invariant = peers dropped, intervals missed, downstream consensus impact.
+- **Added §Chain-worker thread (target architecture).** New section describing the end state: `libxev main → event router only`, dedicated `chain worker thread → owns forkchoice + STF + pending_blocks + states (single owner, zero contention)`, `ThreadPool → parallel crypto only (XMSS verify, BLS aggr, signature batches)`. FFI callbacks become enqueue-and-return work-queue producers. Mirrors what PR #670 already did Rust-side for the `Swarm` (FFI → `SwarmCommand` enqueue → tokio task drains the queue), and mirrors lighthouse's three-tier model documented in https://hackmd.io/@JVtpwRK3SwmkRIFfF0Bmyg/rylVP_WY-g (router → BeaconProcessor manager → workers, where Tier 1 is the only tier that can trigger other tiers).
+- **Slice repositioning.** Slice (a) is the *prerequisite* for the chain-worker target, not the target itself. With per-resource locks + `BorrowedState` in place, FFI handlers can `cloneAndRelease` and hand owned snapshots to the worker queue without contending against the libxev thread. Lock-hierarchy work survives — it still describes how the chain worker thread's owned resources interact with the few legitimate cross-thread readers (HTTP API, metrics scrape, event broadcaster).
+- **Renamed slice (c).** Was "followup off-thread." Now: **"off-IO-thread chain mutation"** — introduces the chain-worker thread, marshalls `onBlock` / `onGossip` / `onAttestation` / `processPendingBlocks` to it via a bounded work queue, leaves only event routing on libxev main and the libp2p bridge. `processFinalizationFollowup` rides along (was the original (c) goal, now subsumed).
+- **Refcount requirement promoted.** The slice-(c) blocker on `Arc<BeamState>` (or equivalent refcount) is now a structural requirement of the chain-worker design, not just a prune-coordination corner case: every cross-thread reader (HTTP API handlers, metrics refreshers, event broadcaster consumers) needs to outlive the worker's `states_lock` window.
+- **Updated §Long-term direction** to be concrete instead of suggestive. The actor / chain-worker shape is the explicit target, with lighthouse cited as the proof-of-shape reference. The fine-grained-lock alternative is now described as the failure mode if we never get to slice (c).
 
 Changelog vs. r3 polish (Partha r3 verification feedback):
 - Renamed `BorrowedState.sszClone` → `cloneAndRelease` — the old name read like a non-mutating snapshot helper, but the call consumes the borrow and releases the lock. Honest naming prevents double-release bugs.
@@ -65,10 +74,112 @@ Only forkchoice has its own per-resource lock today. Everything else is "BeamNod
 
 ## Threads in play
 
+Current zeam thread inventory and the role each thread *should* play under the chain-worker target architecture (see §Chain-worker thread below).
+
+| # | Thread | Today (mixes IO + CPU) | Target role |
+|---|--------|------------------------|-------------|
+| 1 | **libxev main thread** | Drives `onInterval` (slot tick + every-interval bookkeeping), validator client, `processPendingBlocks` drain (which calls `onBlock` → STF inline). | Event router only. Slot ticks, validator-client API timers, peer/connection bookkeeping. **No STF, no XMSS verify, no FFI calls beyond the chain-worker enqueue.** |
+| 2 | **libp2p bridge thread** | Single-threaded Tokio runtime (`Builder::new_current_thread()`). Runs all of TCP/QUIC IO, GossipSub mesh, peer scoring **and** the Zig FFI callbacks (`onGossip`, `onReqRespRequest`, `onReqRespResponse`). Holds the loop for the full XMSS verify + STF window. See `forkchoice_concurrency_analysis.md`. | Same as today *minus* the FFI body. The FFI entry point synchronously enqueues a `ChainCommand` (or snapshot+enqueue for paths that need pre-state) and returns immediately. |
+| 3 | **`ThreadPool` workers** | Parallel sig-verify and aggregation compaction (`spawnWg` short-lived). | Same — but additionally the natural home for any other parallel-friendly crypto work (BLS aggregate verify, batched XMSS verify) that the chain worker dispatches. |
+| 4 | **Chain worker thread** | *(does not exist today — slice (c))* | Owns `BeamChain.{forkChoice, states, pending_blocks, public_key_cache, root_to_slot_cache, last_emitted_*, cached_finalized_state}` exclusively. Drains a bounded MPSC queue produced by libxev / libp2p bridge / HTTP API / sync. Runs all STF, all forkchoice mutation, all state-prune. |
+| 5 | **(Slice d, future)** | — | Possibly parallel net-fetch dispatch — out of scope for this design. |
+
+Rationale for the libxev/bridge separation: both are event-loop threads, so business logic on them stalls *every other connection / timer* on the same loop until the work returns. The bridge thread's case is well-known (lighthouse, libp2p docs). The libxev case is symmetric: a 700ms STF blocks the next slot tick, the validator client API timer, and the pending-block drain's own re-entry — which is exactly the source of the slot-jitter @GrapeBaBa called out.
+
+## IO-thread non-blocking invariant
+
+Added as a first-class invariant per @GrapeBaBa:
+
+> Neither the libxev main thread nor the libp2p bridge thread may run any work whose worst case exceeds a per-interval budget (currently 4s slot / 5 intervals = 800ms, and we want headroom inside that). In particular, no XMSS verify, no STF, no `forkChoice.aggregate`/`getProposalAttestations`, no `cloneAndRelease` on a hot state. FFI work that touches `states_lock` for longer than the snapshot window must be marshalled to the chain worker thread (or, for parallel-friendly crypto, the `ThreadPool`).
+
+Violating this invariant is a correctness bug, not just throughput: the libp2p side starts dropping peers (mesh scoring penalises slow handlers), and the libxev side starts missing slot ticks. Both have downstream consensus impact (missed attestation slots, lost head broadcasts).
+
+Slice (a) does not satisfy this invariant on its own — it only shrinks the FFI critical sections enough that the marshalling step in slice (c) can be a snapshot-then-enqueue rather than a stop-the-world. The invariant is satisfied end-to-end after slice (c).
+
+## Chain-worker thread (target architecture)
+
+Reference: lighthouse's threading model documented in https://hackmd.io/@JVtpwRK3SwmkRIFfF0Bmyg/rylVP_WY-g.
+
+Lighthouse uses a three-tier model:
+- **Tier 1 (Tokio async executor):** event loops, routers, the `BeaconProcessor` manager, short-lived async workers per work item. Nothing in Tier 1 may block.
+- **Tier 2 (Tokio blocking pool):** synchronous CPU-bound work the BeaconProcessor manager dispatches via `spawn_blocking` — BLS verification, gossip-attestation processing, RPC serving, etc.
+- **Tier 3 (named Rayon pools):** data-parallel work (backfill segments, PeerDAS column reconstruction).
+
+Key property: **Tier 1 is the only tier that can trigger other tiers.** Tier 2 and Tier 3 only signal back to Tier 1 (`idle_tx`, `oneshot`) when work is done. Routes are a strict pipeline: `network` task → `router` task → `BeaconProcessor` manager → spawned worker → DB / EL / fork-choice update.
+
+For zeam, the equivalent shape is:
+
+```
+┌──────────────────┐    enqueue          ┌────────────────────────────┐
+│  libxev main     │ ─────────────────▶  │                            │
+│  (event router,  │                     │   Chain worker thread      │
+│   slot tick,     │                     │   (single owner of chain)  │
+│   timers)        │                     │                            │
+└──────────────────┘                     │   - drains MPSC queue       │
+                                          │   - runs STF / forkchoice  │
+┌──────────────────┐    enqueue          │   - emits chain events     │
+│  libp2p bridge   │ ─────────────────▶  │   - prunes states           │
+│  (Tokio reactor, │                     │                            │
+│   FFI entry pt)  │                     └────────────┬───────────────┘
+└──────────────────┘                                  │ dispatch to
+                                                       ▼
+┌──────────────────┐                     ┌────────────────────────────┐
+│  HTTP API task   │ ─── snapshot read ──▶  ThreadPool workers        │
+│  /eth/v1/*       │     via BorrowedState   (XMSS verify, BLS aggr,  │
+└──────────────────┘                     │    sig batches)             │
+                                          └────────────────────────────┘
+```
+
+The chain worker thread is the **single owner** of the resources slice (a) gives per-resource locks today. Inside the worker thread, those locks become near-no-ops (uncontended) — but they remain useful as the read-side serialisation for the few cross-thread readers that legitimately bypass the queue:
+
+- HTTP API request handlers serving `/eth/v1/beacon/states/*`, `/eth/v1/beacon/headers`, `/eth/v1/beacon/blocks/{block_id}` (snapshot read of `states` / forkchoice — `BorrowedState` is exactly the right shape).
+- Prometheus `/metrics` writer (lock-free atomics where possible, `BorrowedState` for anything else).
+- Event broadcaster SSE consumers (read `last_emitted_*` under `events_lock`).
+- The peer-broadcast iterator in `node.zig:1389` (already moving to atomic count + RwLock).
+
+Mutation-side, only the chain worker touches state. That collapses every deadlock class slice (a) carefully sequences (the lock hierarchy is enforced by program structure, not by careful ordering at every callsite), and zeros locking overhead on the hot mutation path.
+
+### Refcounted state pointers are mandatory under this shape
+
+The HTTP API / metrics / event-broadcaster reads can outlive the chain worker's current view of `states` (e.g. the worker prunes a finalized state while an HTTP request is mid-serialisation). Slice (a)'s `BorrowedState` keeps `states_lock.shared` for the borrow's lifetime — which means **any cross-thread reader that holds a `BorrowedState` will block the chain worker's next state mutation** until that reader completes.
+
+For short reads (status, head block fetch) this is fine. For long reads (full beacon-state JSON serialise of an old slot), it isn't — the chain worker would stall on every old-state read.
+
+The slice (c) chain-worker PR therefore must land refcounted state pointers (`Arc<BeamState>` or a hand-rolled equivalent) before it goes live. Cross-thread readers `cloneAndRelease` *or* take a refcounted pointer that survives independently. Either way, slice (a)'s `BorrowedState` API stays correct — it just acquires a refcount instead of holding a shared lock for long-lived borrows.
+
+This is now a hard prerequisite of slice (c), not an open question.
+
+### Bounded queue, backpressure, and starvation
+
+The chain worker queue is bounded (size TBD, but ~MAX_PENDING_BLOCKS-class). Producers (libxev / bridge / HTTP) `try_send`; full queue means:
+
+- libp2p bridge: drop the message and bump a `lean_chain_queue_drops_total{source="gossip"}` counter — same shape as the swarm-command-channel drop introduced in #808.
+- libxev main `processPendingBlocks` drain: stop draining for this interval; resume next interval. Already tolerant of partial drains.
+- HTTP API: 503 Retry-After.
+
+Lighthouse's BeaconProcessor uses LIFO for attestations/aggregates (freshness > order) and FIFO for slashings/exits/blocks (ordering matters for safety). Same split applies here: gossip blocks FIFO, gossip attestations LIFO, slashings FIFO. To be specified in slice (c).
+
+Backlog visibility: every queue gets a `lean_chain_queue_depth{queue="..."}` gauge so devnet stress tests catch unbounded growth.
+
+### Slice (c) scope (revised)
+
+With the chain-worker target promoted from "long-term direction footnote" to "named slice," slice (c) now covers:
+
+1. Spawn the chain worker thread + bounded MPSC queue.
+2. Migrate `onBlock` / `onGossip` / `onAttestation` / `processPendingBlocks` from synchronous FFI / libxev calls into queue producers.
+3. Refcounted state pointers (`Arc<BeamState>` or equivalent) so cross-thread readers don't block worker mutations.
+4. `processFinalizationFollowup` rides along (the original (c) goal, now subsumed).
+5. Drop fine-grained exclusive *write* locks on chain-worker-owned resources (states_lock, pending_blocks_lock, pubkey_cache_lock, root_to_slot_lock, events_lock) — keep their *read* sides for cross-thread consumers; the worker doesn't need them for mutation since it's the sole writer.
+6. Pre-merge stress: same scenarios as slice (a-3) plus a queue-depth saturation test (synthetic gossip flood faster than STF can drain).
+
+LOC estimate: slice (c) becomes a ~1500–2000 LOC PR. Likely needs to split into (c-1) chain-worker scaffold + queue + Arc-state, and (c-2) per-handler migration.
+
+## Threads in play (legacy view, kept for slice (a-2) review)
+
 1. **libxev main thread** — drives `onInterval` (slot tick), validator client.
 2. **libp2p bridge thread** — Rust → Zig FFI delivers gossip and req/resp callbacks (`onGossip`, `onReqRespRequest`, `onReqRespResponse`). See `forkchoice_concurrency_analysis.md` for the detailed proof that these run synchronously on the bridge thread, not marshalled to the libxev loop.
 3. **`ThreadPool` workers** — used today for parallel sig verify / aggregation compaction. Stay short-lived, finite scope (`spawnWg`).
-4. **(Slice c, future)** — followup worker thread for `processFinalizationFollowup`.
+4. **(Slice c, future)** — chain worker thread + `processFinalizationFollowup` riding along (see §Chain-worker thread above for the revised scope).
 5. **(Slice d, future)** — possibly parallel net-fetch dispatch.
 
 ## Design
@@ -377,18 +488,36 @@ Each PR builds + tests cleanly on its own; (a-2) and (a-3) get devnet smoke runs
 
 4. **`external_mutex` removal vs. backward-compat.** Resolved — drop outright in (a-2). No `null`-only transitional release. (No external embedders today; the param was internal-only plumbing from #798–#801.)
 
-## Long-term direction note (Partha post-script)
+## Long-term direction (resolved per @GrapeBaBa, 2026-05-02)
 
-This refactor preserves the shape "every chain mutator can be called from any thread, synchronised via per-resource locks." An alternative long-term shape is "all chain mutation marshalled to a single chain-mutator thread with a queue, readers read snapshots." Slice (a)'s lock-hierarchy work survives the marshalling refactor (still useful for *read* paths and for any per-resource cache the mutator thread owns), but per-resource *exclusive write* locks become dead weight under marshalling.
+**Target architecture: chain worker thread, per the §Chain-worker thread section above.** Lighthouse uses the same shape (network task → router task → BeaconProcessor manager → workers, with the rule that event loops never run business logic) — see https://hackmd.io/@JVtpwRK3SwmkRIFfF0Bmyg/rylVP_WY-g for the full breakdown.
 
-Which direction is #803's long-term target should be a #803-level decision before slice (b)/(c) commits to a specific shape; flagging here so each slice converges in the same direction. My read of the original 8-point plan: the marshalling shape is the cleaner end state, and slice (a) is a strict prerequisite either way (read snapshots need lock-hierarchy regardless). Worth a one-paragraph statement of intent on #803.
+Why this is the right target rather than fine-grained per-resource locks as the end state:
 
-## Status (r4 — ready to cut code)
+1. **Forkchoice + STF have almost no useful parallelism between them.** They are inherently sequential — each block builds on the previous head. Per-resource locks pay ongoing complexity and deadlock risk to enable concurrency that doesn't materially exist on the mutation hot path.
+2. **IO threads cannot run STF.** Both libxev main and the libp2p bridge are event loops. Holding either one for ~700ms (XMSS verify + STF) breaks slot ticks, GossipSub mesh maintenance, peer scoring, and downstream consensus participation. The fix is to *not run STF on those threads at all*, which means a separate worker.
+3. **Single owner = zero locking on the hot path.** Inside the worker thread, the per-resource locks become uncontended (effectively no-ops). Mutation cost drops; deadlock classes collapse to "can the worker self-deadlock," which is structurally easier to verify.
+4. **Read paths still need the lock-hierarchy work.** Cross-thread readers (HTTP API, metrics, event broadcaster) still need a safe protocol to read worker-owned state. `BorrowedState` + `events_lock` + the lock hierarchy is exactly that protocol. Slice (a) is a strict prerequisite either way.
 
-All r1/r2/r3 review items closed:
-- Long-term direction is a #803-level question and does NOT gate (a-2). Lock-hierarchy work is a no-regret prerequisite either way.
-- Stress merge gate: **single-node ingestion stress**; the other two scenarios run in nightly post-merge.
+What that means for the slice plan:
+
+- **Slice (a)** ships the lock-hierarchy + `BorrowedState` infrastructure. Useful in its own right (devnet runs better, the legacy global mutex is unblocked), and structurally required for slice (c).
+- **Slice (b)** (parallel sig-verify + state-clone) is independent of the chain-worker direction and lands either way.
+- **Slice (c)** introduces the chain worker thread, marshalls every `chain.onBlock`/`onGossip`/`onAttestation`/`processPendingBlocks` to it, and lands refcounted state pointers so cross-thread readers don't block worker mutations.
+- **Slice (d)** (parallel net-fetch) and **slice (e)** (gossip envelope cache) are tangentially related and stay separate.
+
+The alternative end state ("keep chain mutators callable from any thread, just keep adding finer locks") is not the target. It works for slice (a) as an interim because it's a strict subset of what the worker thread needs anyway, but it does not satisfy the §IO-thread non-blocking invariant on its own.
+
+## Status (r5 — chain-worker target absorbed; (a-2) lands as prerequisite)
+
+All r1/r2/r3/r4 review items closed:
+- Long-term direction is now **explicit**, not deferred: the chain worker thread + lighthouse-style router model is the target. Slice (a-2) lands as a prerequisite, not as the end state.
+- §IO-thread non-blocking invariant added as the correctness rule that drives the chain-worker requirement.
+- Slice (c) repositioned and rescoped to deliver the chain worker thread, with refcounted state pointers as a hard prerequisite (see §Chain-worker thread).
+- Stress merge gate for (a-3): **single-node ingestion stress**; the other two scenarios run in nightly post-merge.
 - `AggregatorView` deferred — default to full `cloneAndRelease`; profile in (a-2), cut over only if `lean_block_building_time_seconds` flags clone time as dominant.
 - No prototype `/eth/v1/*` HTTP surface to fold in; the reservation in §Cross-thread chain readers is sufficient.
 
-Next step: cut PR (a-2) with the LockedMap / BlockCache / BorrowedState primitives + every chain.zig migration + per-lock metrics + the legacy-metric derived shim + mandatory unit tests + getFinalizedState caller enumeration in the PR description.
+What this revision changes for slice (a-2) implementation: nothing on the wire. The PR (#805) ships exactly the primitives + migrations described in r3/r4. The redesign is forward-looking — it reframes what slice (a-2) is *for* (chain-worker prerequisite, not standalone solution to the libxev/bridge blocking problem) and locks in slice (c)'s scope so it can be a single PR rather than a series of follow-ups.
+
+Next step: review and merge PR #805 (slice a-2) as the prerequisite it now is, then open the slice (c) tracker with the chain-worker scope above so the team can pre-agree on queue shape, refcount choice, and migration order before the implementation PR lands.
