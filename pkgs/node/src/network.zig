@@ -655,18 +655,10 @@ pub const Network = struct {
     };
 
     pub fn snapshotPendingRequest(self: *Self, request_id: u64) !?PendingRequestSnapshot {
-        var guard = self.pending_rpc_requests.iterateLocked();
-        defer guard.deinit();
-
-        var found: ?PendingRPCEntry = null;
-        while (guard.iter.next()) |entry| {
-            if (entry.key_ptr.* == request_id) {
-                found = entry.value_ptr.*;
-                break;
-            }
-        }
-
-        const entry = found orelse return null;
+        // O(1) lookup via the LockedMap's get() — the legacy
+        // iterateLocked + key compare was O(n) per call and turned the
+        // per-request timeout sweep into O(n²). PR #820 / issue #803.
+        const entry = self.pending_rpc_requests.get(request_id) orelse return null;
         switch (entry.request) {
             .status => |s| {
                 const peer_id_copy = try self.allocator.dupe(u8, s.peer_id);
