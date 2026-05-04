@@ -3402,3 +3402,41 @@ test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomic
     try std.testing.expect(full != null);
     try std.testing.expect(full.?.ssz != null);
 }
+
+test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
+    // Smoke test for the TOCTOU-free remove path. After the call:
+    //   * blocks.get(root) == null
+    //   * ssz_bytes.get(root) == null
+    //   * the parent's children list does not contain `root`
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var bc = locking.BlockCache.init(std.testing.allocator);
+    defer bc.deinit();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const root = mock_chain.blockRoots[1];
+    const parent_root = mock_chain.blocks[1].block.parent_root;
+
+    const block_ptr = try std.testing.allocator.create(types.SignedBlock);
+    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+
+    var ssz_buf: std.ArrayList(u8) = .empty;
+    defer ssz_buf.deinit(std.testing.allocator);
+    try ssz.serialize(types.SignedBlock, mock_chain.blocks[1], &ssz_buf, std.testing.allocator);
+    const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
+
+    try bc.insertBlockPtr(root, block_ptr, parent_root, ssz_bytes);
+    std.testing.allocator.destroy(block_ptr);
+
+    try std.testing.expect(bc.getBlockAndSsz(root) != null);
+    try std.testing.expect(bc.hasChildren(parent_root));
+
+    try std.testing.expect(bc.removeFetchedBlock(root));
+    try std.testing.expect(bc.getBlockAndSsz(root) == null);
+    try std.testing.expect(!bc.hasChildren(parent_root));
+
+    // Idempotent: second call returns false (no leak / panic).
+    try std.testing.expect(!bc.removeFetchedBlock(root));
+}

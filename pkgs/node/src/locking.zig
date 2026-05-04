@@ -621,7 +621,10 @@ pub const BlockCache = struct {
     pub fn removeOne(self: *Self, root: types.Root, parent_root: types.Root) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.removeOneUnlocked(root, parent_root);
+    }
 
+    fn removeOneUnlocked(self: *Self, root: types.Root, parent_root: types.Root) bool {
         var removed = false;
         if (self.blocks.fetchRemove(root)) |b| {
             var bv = b.value;
@@ -646,6 +649,29 @@ pub const BlockCache = struct {
             }
         }
         return removed;
+    }
+
+    /// Remove a single cached block by root, looking the parent_root up
+    /// from the entry being removed — all under one critical section.
+    /// This is the TOCTOU-free replacement for the legacy network-side
+    /// pattern (`getBlock(root)` then `removeOne(root, parent_root)`)
+    /// which leaked a window where another thread could remove the entry
+    /// or its parent's children list. Returns true if a block was
+    /// present + removed.
+    ///
+    /// Refs: PR #820 / issue #803.
+    pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Peek at the parent root from the in-map block value before we
+        // fetchRemove. We can't fetchRemove first because we still need
+        // the parent_root to keep the children map consistent, and the
+        // value is consumed by fetchRemove.
+        const parent_root = blk: {
+            const block = self.blocks.get(root) orelse return false;
+            break :blk block.block.parent_root;
+        };
+        return self.removeOneUnlocked(root, parent_root);
     }
 
     /// Remove a single cached block when the caller does not have the

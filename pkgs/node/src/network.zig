@@ -348,14 +348,14 @@ pub const Network = struct {
 
     /// Remove a fetched block (block + ssz + parent-link) from the cache.
     /// Returns true if the block was present.
+    ///
+    /// All three updates happen under the cache's lock in one critical
+    /// section — the legacy two-step (getBlock then removeOne) leaked a
+    /// TOCTOU window where another thread could remove the entry or its
+    /// parent's children list, leaving the cache in a torn state. See
+    /// PR #820 / issue #803.
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
-        // We need the parent root to keep the parent's children list in
-        // sync. Look it up under the cache's lock, then call the helper.
-        if (self.block_cache.getBlock(root)) |b| {
-            const parent_root = b.block.parent_root;
-            return self.block_cache.removeOne(root, parent_root);
-        }
-        return false;
+        return self.block_cache.removeFetchedBlock(root);
     }
 
     /// Returns the cached children of the given parent block root as a
