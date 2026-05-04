@@ -528,16 +528,31 @@ pub const BlockCache = struct {
     /// block)` to every entry. Iteration runs entirely inside the critical
     /// section so the underlying map cannot be mutated mid-iteration.
     /// `each` must not call back into the cache (would deadlock).
+    ///
+    /// `block` is passed BY VALUE — i.e. the callback receives a struct
+    /// copy of the cache's `SignedBlock` rather than a pointer into the
+    /// underlying HashMap. This is deliberate: passing `*const SignedBlock`
+    /// would invite callbacks to stash the pointer past the callback
+    /// return, after which a `removeFetchedBlock` / `removeChildrenOf` /
+    /// rehash on the cache could invalidate the underlying entry. By
+    /// forcing a struct copy we eliminate that footgun by construction.
+    ///
+    /// Note: the slice fields inside `SignedBlock` (e.g. attestations,
+    /// signature bytes) point into cache-owned storage. Those slices are
+    /// safe to read INSIDE the callback because the cache lock is held
+    /// across all callbacks (and therefore no removal / free can run
+    /// concurrently). They must NOT be retained past the callback return.
+    /// `MAX_CACHED_BLOCKS = 1024` bounds the per-sweep struct-copy cost.
     pub fn forEachBlock(
         self: *Self,
         ctx: *anyopaque,
-        each: *const fn (ctx: *anyopaque, root: types.Root, block: *const types.SignedBlock) void,
+        each: *const fn (ctx: *anyopaque, root: types.Root, block: types.SignedBlock) void,
     ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         var it = self.blocks.iterator();
         while (it.next()) |entry| {
-            each(ctx, entry.key_ptr.*, entry.value_ptr);
+            each(ctx, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 

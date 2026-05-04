@@ -375,7 +375,7 @@ pub const Network = struct {
         allocator: Allocator,
     };
 
-    fn pruneAtOrBelowEach(ctx_ptr: *anyopaque, root: types.Root, block: *const types.SignedBlock) void {
+    fn pruneAtOrBelowEach(ctx_ptr: *anyopaque, root: types.Root, block: types.SignedBlock) void {
         const ctx: *PruneAtOrBelowCtx = @ptrCast(@alignCast(ctx_ptr));
         if (block.block.slot <= ctx.finalized_slot) {
             ctx.roots.append(ctx.allocator, root) catch return;
@@ -415,7 +415,7 @@ pub const Network = struct {
         allocator: Allocator,
     };
 
-    fn collectReadyEach(ctx_ptr: *anyopaque, root: types.Root, block: *const types.SignedBlock) void {
+    fn collectReadyEach(ctx_ptr: *anyopaque, root: types.Root, block: types.SignedBlock) void {
         const ctx: *CollectReadyCtx = @ptrCast(@alignCast(ctx_ptr));
         if (block.block.slot <= ctx.current_slot) {
             ctx.out.append(ctx.allocator, .{
