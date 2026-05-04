@@ -2179,10 +2179,13 @@ pub const BeamChain = struct {
                 // only observe up to the function return. Downstream the
                 // borrow's deinit callsite owns timing for its hold span.
                 t_ev.released();
-                locking.leaveTier5();
+                // tier-5 depth is HANDED OFF to the borrow —
+                // BorrowedState.deinit calls leaveTier5() after unlocking.
+                // Do NOT call leaveTier5() here.
                 return BorrowedState{
                     .state = cached_state,
                     .backing = .{ .events_mutex = &self.events_lock },
+                    .tier5_held = true,
                 };
             }
             // Stale — fall through to DB load below.
@@ -2216,10 +2219,11 @@ pub const BeamChain = struct {
 
         lock_held = false;
         t_ev.released();
-        locking.leaveTier5();
+        // tier-5 depth handed off to the borrow; deinit will leaveTier5().
         return BorrowedState{
             .state = state_ptr,
             .backing = .{ .events_mutex = &self.events_lock },
+            .tier5_held = true,
         };
     }
 

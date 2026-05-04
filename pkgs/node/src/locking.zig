@@ -926,6 +926,14 @@ pub const BorrowedState = struct {
     state: *const types.BeamState,
     backing: Backing,
     released: bool = false,
+    /// True when the borrow's backing lock is also responsible for
+    /// decrementing the tier-5 depth counter on release. Set by the
+    /// helper that hands off a tier-5 lock (today: `getFinalizedState`'s
+    /// events_mutex hand-off). When false, callers manage tier-5 depth
+    /// outside the borrow lifetime (statesGet does not touch tier-5;
+    /// statesCommitKeepExisting does not touch tier-5 either since
+    /// states_lock is tier-3).
+    tier5_held: bool = false,
 
     pub const Backing = union(enum) {
         states_shared_rwlock: *zeam_utils.SyncRwLock,
@@ -942,6 +950,16 @@ pub const BorrowedState = struct {
             .states_shared_rwlock => |rw| rw.unlockShared(),
             .states_exclusive_rwlock => |rw| rw.unlock(),
             .events_mutex => |m| m.unlock(),
+        }
+        // Decrement tier-5 depth AFTER unlocking so the sibling-rule
+        // assertion at the next acquire site sees the correct depth.
+        // PR #820 / issue #803: previously chain.getFinalizedState
+        // decremented before returning the borrow, so HTTP / event-
+        // broadcaster callers silently bypassed the sibling-rule check
+        // for the entire borrow lifetime.
+        if (self.tier5_held) {
+            self.tier5_held = false;
+            leaveTier5();
         }
     }
 
@@ -1077,6 +1095,43 @@ test "BorrowedState: events_mutex backing also releases" {
     // Lock is released — should be reacquirable.
     m.lock();
     m.unlock();
+}
+
+test "BorrowedState: tier5_held=true causes deinit to decrement tier5 depth" {
+    if (builtin.mode != .Debug) return;
+    var m: zeam_utils.SyncMutex = .{};
+    m.lock();
+    enterTier5();
+    try testing.expect(tier5_depth == 1);
+
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .events_mutex = &m },
+        .tier5_held = true,
+    };
+    borrow.deinit();
+    try testing.expect(borrow.released);
+    try testing.expect(tier5_depth == 0);
+    // Idempotent: second deinit must not double-decrement.
+    borrow.deinit();
+    try testing.expect(tier5_depth == 0);
+}
+
+test "BorrowedState: tier5_held=false leaves tier5 depth alone" {
+    if (builtin.mode != .Debug) return;
+    var m: zeam_utils.SyncMutex = .{};
+    m.lock();
+    // No enterTier5 — verify deinit does not underflow when tier5_held=false.
+    try testing.expect(tier5_depth == 0);
+
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .events_mutex = &m },
+    };
+    borrow.deinit();
+    try testing.expect(tier5_depth == 0);
 }
 
 test "BorrowedState: states_exclusive_rwlock backing also releases" {
