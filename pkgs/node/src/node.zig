@@ -23,6 +23,7 @@ pub const networkFactory = @import("./network.zig");
 pub const validatorClient = @import("./validator_client.zig");
 const constants = @import("./constants.zig");
 const forkchoice = @import("./forkchoice.zig");
+const locking = @import("./locking.zig");
 
 const BlockByRootContext = networkFactory.BlockByRootContext;
 pub const NodeNameRegistry = networks.NodeNameRegistry;
@@ -60,26 +61,38 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Serializes BeamNode work between the libxev main thread (`onInterval`) and
-    /// the libp2p worker thread (`onGossip` / `onReqRespResponse` / `onReqRespRequest`).
+    /// Coarse outer lock that previously serialised every chain + network
+    /// mutation between the libxev main thread and the libp2p worker thread.
     ///
-    /// Invariant: every mutation of `chain` and `network` from those callbacks must
-    /// happen with this mutex held. Compute-heavy work — state transition,
-    /// signature verification, fork-choice updates — currently runs synchronously
-    /// inside the critical section, so a long STF can stall the libxev tick path
-    /// (and vice-versa). See issue #786 for context and follow-ups (offloading
-    /// heavy work to a bounded worker queue, shrinking critical sections, etc.).
+    /// As of slice (a-3) (this PR), the gossip / interval / req-resp call
+    /// paths drop this lock entirely — they now take per-resource locks via
+    /// the helpers in `pkgs/node/src/locking.zig`. The lock is renamed to
+    /// `finalization_lock` and kept available for the few code paths that
+    /// legitimately need a multi-resource view (e.g. a future
+    /// `processFinalizationFollowup` move-off-IO-thread). Today there are
+    /// no nested chain mutations holding this lock; it survives as a
+    /// labelled placeholder so the rename does not delete a synchronisation
+    /// primitive that the slice (c) chain-worker code is still expected to
+    /// reach for.
     ///
-    /// `acquireMutex(site)` is the canonical way to take this lock: it records the
-    /// wait + hold time into `zeam_node_mutex_wait_time_seconds` /
-    /// `zeam_node_mutex_hold_time_seconds` (labeled by `site`), which is how we
-    /// quantify the contention described in the issue.
-    mutex: zeam_utils.SyncMutex = .{},
+    /// `acquireFinalizationLock(site)` is the canonical way to take this
+    /// lock when a future caller needs it. It records wait + hold time
+    /// into `zeam_lock_{wait,hold}_seconds{lock="finalization",site=...}`
+    /// (and the legacy `zeam_node_mutex_*` series via the LockTimer
+    /// compat shim).
+    finalization_lock: zeam_utils.SyncMutex = .{},
     /// Pending parent roots deferred for batched fetching.
     /// Maps block root → fetch depth. Collected during gossip/RPC processing
     /// and flushed as a single batched blocks_by_root request, avoiding the
     /// 300+ individual round-trips caused by sequential parent-chain walking.
+    ///
+    /// Now guarded by its own mutex (slice a-3): with the global
+    /// `BeamNode.mutex` dropped, both the libxev tick path
+    /// (`flushPendingParentFetches` after `processPendingBlocks`) and the
+    /// libp2p bridge path (gossip / req-resp → `cacheBlockAndFetchParent`)
+    /// can touch this map concurrently.
     batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
+    batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
 
@@ -153,59 +166,37 @@ pub const BeamNode = struct {
         self.allocator.destroy(self.chain);
     }
 
-    /// RAII-style guard returned by `acquireMutex`. Releases `BeamNode.mutex`
-    /// in its `unlock` method while observing the hold time into the
-    /// `zeam_node_mutex_hold_time_seconds` histogram for the configured site.
-    ///
-    /// Timing uses a monotonic clock via `zeam_utils.monotonicTimestampNs()`.
-    /// This avoids the wall-clock skew (NTP slew, leap-second steps, manual
-    /// clock changes) that wall-clock timestamps are subject to and that
-    /// would corrupt histogram percentiles by producing negative deltas.
-    ///
-    /// Calling `unlock()` more than once is a no-op on the second call: a
-    /// `released` sentinel prevents the underlying mutex from being unlocked
-    /// twice, which would be undefined behavior. The metric is also recorded
-    /// only on the first call.
-    ///
-    /// See issue #786.
-    const MutexGuard = struct {
+    /// RAII-style guard returned by `acquireFinalizationLock`. Releases
+    /// `finalization_lock` in its `unlock` method while observing the hold
+    /// time into the per-lock `zeam_lock_hold_seconds` histogram for the
+    /// configured site (and the legacy `zeam_node_mutex_hold_time_seconds`
+    /// series via the LockTimer compat shim).
+    const FinalizationLockGuard = struct {
+        timer: locking.LockTimer,
         mutex: *zeam_utils.SyncMutex,
-        site: []const u8,
-        hold_start_ns: i128,
         released: bool = false,
 
-        pub fn unlock(self: *MutexGuard) void {
+        pub fn unlock(self: *FinalizationLockGuard) void {
             if (self.released) return;
             self.released = true;
-
-            const hold_end_ns = zeam_utils.monotonicTimestampNs();
-            const elapsed_ns = if (hold_end_ns >= self.hold_start_ns) hold_end_ns - self.hold_start_ns else 0;
-            const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-            zeam_metrics.metrics.zeam_node_mutex_hold_time_seconds.observe(.{ .site = self.site }, elapsed_s) catch {};
+            self.timer.released();
             self.mutex.unlock();
         }
     };
 
-    /// Acquire `BeamNode.mutex`, recording the wait time into
-    /// `zeam_node_mutex_wait_time_seconds` and returning a `MutexGuard` that
-    /// records the hold time on `unlock()`. Always pair with
-    /// `defer guard.unlock()`. The `site` label flows through to the metric so
-    /// Prometheus can attribute stalls to a specific callback path.
+    /// Acquire `finalization_lock`, recording wait + hold time via
+    /// `LockTimer`. Always pair with `defer guard.unlock()`.
     ///
-    /// Wait/hold timing is measured with a monotonic clock so
-    /// the deltas observed by Prometheus are guaranteed non-negative even when
-    /// the wall clock is adjusted by NTP, leap seconds or operator action.
-    fn acquireMutex(self: *Self, comptime site: []const u8) MutexGuard {
-        const wait_start_ns = zeam_utils.monotonicTimestampNs();
-        self.mutex.lock();
-        const hold_start_ns = zeam_utils.monotonicTimestampNs();
-        const wait_ns = if (hold_start_ns >= wait_start_ns) hold_start_ns - wait_start_ns else 0;
-        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-        zeam_metrics.metrics.zeam_node_mutex_wait_time_seconds.observe(.{ .site = site }, wait_s) catch {};
+    /// Currently unused on the gossip / interval / req-resp paths — those
+    /// take per-resource locks instead. Reserved for future paths that
+    /// legitimately need a multi-resource view.
+    fn acquireFinalizationLock(self: *Self, comptime site: []const u8) FinalizationLockGuard {
+        var t = locking.LockTimer.start("finalization", site);
+        self.finalization_lock.lock();
+        t.acquired();
         return .{
-            .mutex = &self.mutex,
-            .site = site,
-            .hold_start_ns = hold_start_ns,
+            .timer = t,
+            .mutex = &self.finalization_lock,
         };
     }
 
@@ -245,8 +236,12 @@ pub const BeamNode = struct {
             };
         }
 
-        var guard = self.acquireMutex("onGossip");
-        defer guard.unlock();
+        // Slice (a-3): the outer BeamNode.mutex is gone. Each chain entry
+        // point inside the switch arms takes its own per-resource locks
+        // (chain.{states_lock, pending_blocks_lock, pubkey_cache_lock,
+        // root_to_slot_lock, events_lock, forkChoice}); network state
+        // mutations go through `Network`'s LockedMap / BlockCache /
+        // ConnectedPeers helpers. See docs/threading_refactor_slice_a.md.
 
         switch (data.*) {
             .block => |signed_block| {
@@ -680,11 +675,15 @@ pub const BeamNode = struct {
         // request at the flush point, avoiding 300+ sequential round-trips when a
         // syncing peer walks a long parent chain one block at a time.
         const parent_root = signed_block.block.parent_root;
-        self.batch_pending_parent_roots.put(parent_root, depth) catch {
-            // Evict the cached block if we can't enqueue — otherwise it dangles forever.
-            _ = self.network.removeFetchedBlock(block_root);
-            return CacheBlockError.CachingFailed;
-        };
+        {
+            self.batch_pending_parent_roots_lock.lock();
+            defer self.batch_pending_parent_roots_lock.unlock();
+            self.batch_pending_parent_roots.put(parent_root, depth) catch {
+                // Evict the cached block if we can't enqueue — otherwise it dangles forever.
+                _ = self.network.removeFetchedBlock(block_root);
+                return CacheBlockError.CachingFailed;
+            };
+        }
 
         return parent_root;
     }
@@ -1003,8 +1002,11 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        var guard = self.acquireMutex("onReqRespResponse");
-        defer guard.unlock();
+        // Slice (a-3): no outer mutex. `handleReqRespResponse` snapshots
+        // the pending request entry under the pending_rpc_requests lock,
+        // then calls `chain.onBlock` (per-resource locks) for the
+        // blocks_by_root branch. Network mutations go through
+        // `Network`'s LockedMap / BlockCache helpers.
         try self.handleReqRespResponse(event);
     }
 
@@ -1018,11 +1020,16 @@ pub const BeamNode = struct {
     pub fn onReqRespRequest(ptr: *anyopaque, data: *const networks.ReqRespRequest, responder: networks.ReqRespServerStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // Slice (a-3): fully lock-free. The two arms below only:
+        //   * `chain.db.loadBlock` — the DB has its own internal
+        //     synchronisation (rocksdb / lmdb backends are thread-safe for
+        //     concurrent reads).
+        //   * `chain.getStatus()` — reads forkchoice via its own RwLock
+        //     shared path; no other chain state touched.
+        // Neither arm mutates `chain` or `network` state, so no caller
+        // synchronisation is required.
         switch (data.*) {
             .blocks_by_root => |request| {
-                var guard = self.acquireMutex("onReqRespRequest.blocks_by_root");
-                defer guard.unlock();
-
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
@@ -1072,23 +1079,32 @@ pub const BeamNode = struct {
     /// Collecting roots here and flushing them in one request reduces that to a single
     /// round-trip for the same burst of missing parents.
     fn flushPendingParentFetches(self: *Self) void {
-        const count = self.batch_pending_parent_roots.count();
-        if (count == 0) return;
-
-        var roots = std.ArrayList(types.Root).initCapacity(self.allocator, count) catch {
-            self.logger.warn("failed to allocate roots list for pending parent fetch flush", .{});
-            return;
-        };
+        // Drain under the dedicated lock so the gossip / req-resp paths
+        // can keep enqueueing while we issue the batched fetch.
+        var roots: std.ArrayList(types.Root) = .empty;
         defer roots.deinit(self.allocator);
-
         var max_depth: u32 = 0;
-        var it = self.batch_pending_parent_roots.iterator();
-        while (it.next()) |entry| {
-            roots.appendAssumeCapacity(entry.key_ptr.*);
-            if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
-        }
-        self.batch_pending_parent_roots.clearRetainingCapacity();
+        {
+            self.batch_pending_parent_roots_lock.lock();
+            defer self.batch_pending_parent_roots_lock.unlock();
 
+            const count = self.batch_pending_parent_roots.count();
+            if (count == 0) return;
+
+            roots.ensureTotalCapacityPrecise(self.allocator, count) catch {
+                self.logger.warn("failed to allocate roots list for pending parent fetch flush", .{});
+                return;
+            };
+
+            var it = self.batch_pending_parent_roots.iterator();
+            while (it.next()) |entry| {
+                roots.appendAssumeCapacity(entry.key_ptr.*);
+                if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
+            }
+            self.batch_pending_parent_roots.clearRetainingCapacity();
+        }
+
+        if (roots.items.len == 0) return;
         self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
 
         self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
@@ -1281,8 +1297,12 @@ pub const BeamNode = struct {
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             {
-                var guard = self.acquireMutex("onInterval");
-                defer guard.unlock();
+                // Slice (a-3): no outer mutex. `chain.onInterval` /
+                // `chain.processPendingBlocks` take their own per-resource
+                // locks (forkchoice RwLock, pending_blocks_lock,
+                // states_lock, events_lock) and `sweepTimedOutRequests` /
+                // `processReadyCachedBlocks` go through
+                // network/block_cache helpers.
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
