@@ -197,12 +197,7 @@ pub const Node = struct {
         // If path is specified load from it, otherwise use default settings
         const chain_spec_owned = self.options.chain_spec != null;
         const chain_spec = if (self.options.chain_spec) |path|
-            std.Io.Dir.cwd().readFileAlloc(
-                std.Io.Threaded.global_single_threaded.io(),
-                path,
-                allocator,
-                .limited(1024 * 1024)
-            ) catch |err| {
+            std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024)) catch |err| {
                 self.logger.err("failed to load chain spec at '{s}': {any}", .{ path, err });
                 return err;
             }
