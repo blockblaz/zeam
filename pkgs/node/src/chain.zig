@@ -180,11 +180,11 @@ pub const BeamChain = struct {
     // currently nested inside the global mutex — redundant but correct. They
     // become the actual synchronisation once a-3 drops the global mutex from
     // the gossip / interval / req-resp paths.
-    states_lock: std.Thread.RwLock = .{},
-    pending_blocks_lock: std.Thread.Mutex = .{},
-    pubkey_cache_lock: std.Thread.Mutex = .{},
-    root_to_slot_lock: std.Thread.Mutex = .{},
-    events_lock: std.Thread.Mutex = .{},
+    states_lock: zeam_utils.SyncRwLock = .{},
+    pending_blocks_lock: zeam_utils.SyncMutex = .{},
+    pubkey_cache_lock: zeam_utils.SyncMutex = .{},
+    root_to_slot_lock: zeam_utils.SyncMutex = .{},
+    events_lock: zeam_utils.SyncMutex = .{},
 
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
@@ -3160,7 +3160,7 @@ test "BorrowedState: cloneAndRelease success path against real BeamState" {
     const mock_chain = try stf.genMockChain(allocator, 2, null);
     var beam_state = mock_chain.genesis_state;
 
-    var rwl: std.Thread.RwLock = .{};
+    var rwl: zeam_utils.SyncRwLock = .{};
     rwl.lockShared();
 
     var borrow = locking.BorrowedState{

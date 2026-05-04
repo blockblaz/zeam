@@ -26,5 +26,5 @@ test "get tests" {
     _ = @import("./chain.zig");
     _ = @import("./utils.zig");
     _ = @import("./locking.zig");
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }

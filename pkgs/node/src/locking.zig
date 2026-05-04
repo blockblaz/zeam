@@ -6,7 +6,7 @@
 //
 // This file provides three primitives:
 //
-//   * `LockedMap(K, V)` — `std.Thread.Mutex` + `std.AutoHashMap(K, V)` bundle
+//   * `LockedMap(K, V)` — `zeam_utils.SyncMutex` + `std.AutoHashMap(K, V)` bundle
 //     with the small set of methods we actually use. Network-side wiring lands
 //     in slice (a-3); the helper itself ships in (a-2) so its unit tests
 //     anchor the API contract reviewers can rely on.
@@ -41,6 +41,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("@zeam/types");
 const zeam_metrics = @import("@zeam/metrics");
+const zeam_utils = @import("@zeam/utils");
 
 /// Thread-local depth counter for tier-5 sibling locks (5a/5b/5c). The design
 /// doc forbids co-holding any two of them; this counter is the runtime check
@@ -93,26 +94,30 @@ pub inline fn leaveTier5() void {
 pub const LockTimer = struct {
     lock_label: []const u8,
     site: []const u8,
-    timer: std.time.Timer,
+    /// Monotonic-clock timestamp for the start of the wait phase, captured at
+    /// `start()`. Re-used as the start of the hold phase after `acquired()`
+    /// records the wait delta and resets the anchor.
+    anchor_ns: i128,
     waited: bool = false,
     released_flag: bool = false,
 
     pub fn start(comptime lock_label: []const u8, comptime site: []const u8) LockTimer {
-        const t = std.time.Timer.start() catch @panic("monotonic timer unavailable");
         return .{
             .lock_label = lock_label,
             .site = site,
-            .timer = t,
+            .anchor_ns = zeam_utils.monotonicTimestampNs(),
         };
     }
 
     /// Call after the lock has been acquired; records wait time and resets
-    /// the timer to measure hold time.
+    /// the anchor to measure hold time.
     pub fn acquired(self: *LockTimer) void {
         if (self.waited) return;
         self.waited = true;
-        const wait_ns = self.timer.lap();
-        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / std.time.ns_per_s;
+        const now_ns = zeam_utils.monotonicTimestampNs();
+        const wait_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+        self.anchor_ns = now_ns;
+        const wait_s: f32 = @as(f32, @floatFromInt(wait_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
         zeam_metrics.metrics.zeam_lock_wait_seconds.observe(
             .{ .lock = self.lock_label, .site = self.site },
             wait_s,
@@ -131,8 +136,9 @@ pub const LockTimer = struct {
     pub fn released(self: *LockTimer) void {
         if (self.released_flag) return;
         self.released_flag = true;
-        const hold_ns = self.timer.read();
-        const hold_s: f32 = @as(f32, @floatFromInt(hold_ns)) / std.time.ns_per_s;
+        const now_ns = zeam_utils.monotonicTimestampNs();
+        const hold_ns: i128 = if (now_ns >= self.anchor_ns) now_ns - self.anchor_ns else 0;
+        const hold_s: f32 = @as(f32, @floatFromInt(hold_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
         zeam_metrics.metrics.zeam_lock_hold_seconds.observe(
             .{ .lock = self.lock_label, .site = self.site },
             hold_s,
@@ -144,7 +150,7 @@ pub const LockTimer = struct {
     }
 };
 
-/// `LockedMap(K, V)` is a `std.Thread.Mutex` + `std.AutoHashMap(K, V)` bundle
+/// `LockedMap(K, V)` is a `zeam_utils.SyncMutex` + `std.AutoHashMap(K, V)` bundle
 /// with the small set of methods we actually use. Iteration is exposed via
 /// `iteratorWhileLocked` which returns the lock-holder a raw map iterator —
 /// callers must finish iterating before releasing the lock. Mutation methods
@@ -156,7 +162,7 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
         pub const Iterator = Map.Iterator;
 
         map: Map,
-        mutex: std.Thread.Mutex = .{},
+        mutex: zeam_utils.SyncMutex = .{},
 
         pub fn init(allocator: Allocator) Self {
             return .{ .map = Map.init(allocator) };
@@ -262,7 +268,7 @@ pub const BlockCache = struct {
     const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayListUnmanaged(types.Root));
 
     allocator: Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: zeam_utils.SyncMutex = .{},
     blocks: BlockMap,
     ssz_bytes: SszMap,
     children: ChildrenMap,
@@ -496,8 +502,8 @@ pub const BorrowedState = struct {
     released: bool = false,
 
     pub const Backing = union(enum) {
-        states_shared_rwlock: *std.Thread.RwLock,
-        events_mutex: *std.Thread.Mutex,
+        states_shared_rwlock: *zeam_utils.SyncRwLock,
+        events_mutex: *zeam_utils.SyncMutex,
     };
 
     /// Idempotent. Releases the backing lock. After a successful release
@@ -609,7 +615,7 @@ test "LockedMap: deinit on non-empty map frees internal storage" {
 }
 
 test "BorrowedState: deinit is idempotent and releases the lock" {
-    var rwl: std.Thread.RwLock = .{};
+    var rwl: zeam_utils.SyncRwLock = .{};
     rwl.lockShared();
 
     var dummy: types.BeamState = undefined;
@@ -630,7 +636,7 @@ test "BorrowedState: deinit is idempotent and releases the lock" {
 }
 
 test "BorrowedState: events_mutex backing also releases" {
-    var m: std.Thread.Mutex = .{};
+    var m: zeam_utils.SyncMutex = .{};
     m.lock();
 
     var dummy: types.BeamState = undefined;
@@ -646,7 +652,7 @@ test "BorrowedState: events_mutex backing also releases" {
 }
 
 test "BorrowedState: assertReleased fires only when not released" {
-    var rwl: std.Thread.RwLock = .{};
+    var rwl: zeam_utils.SyncRwLock = .{};
     rwl.lockShared();
 
     var dummy: types.BeamState = undefined;
@@ -663,7 +669,7 @@ test "BorrowedState: cloneAndRelease releases lock on OOM-mid-clone" {
     // FailingAllocator with budget=0 causes the very first allocator.create
     // inside cloneAndRelease to fail. The errdefer must still release the
     // states_lock — the whole point of the wrapper.
-    var rwl: std.Thread.RwLock = .{};
+    var rwl: zeam_utils.SyncRwLock = .{};
     rwl.lockShared();
 
     var dummy: types.BeamState = undefined;
