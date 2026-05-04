@@ -1801,7 +1801,10 @@ pub const BeamChain = struct {
         _ = is_from_gossip;
 
         const current_slot = self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic);
-        const finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        // latest_finalized is a multi-field Checkpoint written under
+        // forkChoice.mutex (exclusive). Take the shared lock via the
+        // accessor to avoid a torn (slot, root) pair. PR #820 / #803.
+        const finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
         // 1. Future slot check - reject blocks too far in the future
         // Allow a small tolerance for clock skew, but reject clearly invalid future slots
@@ -2062,7 +2065,11 @@ pub const BeamChain = struct {
     }
 
     pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
-        const head_root = self.forkChoice.head.blockRoot;
+        // forkChoice.head is a multi-field ProtoBlock written under
+        // forkChoice.mutex (exclusive). Snapshot once via the shared-
+        // locked accessor; reading `.blockRoot` directly would tear
+        // against a concurrent updateHead. PR #820 / #803.
+        const head_root = self.forkChoice.getHead().blockRoot;
         // Snapshot-then-release: forkChoice.aggregate runs an FFI window
         // (~700ms) over `state.validators`. Holding `states_lock.shared`
         // for that window would force any STF commit to wait. Clone first,
@@ -2147,7 +2154,11 @@ pub const BeamChain = struct {
     /// PR description (a-2) enumerates every caller migrated under this
     /// API change — grepping `states.get` will not find them.
     pub fn getFinalizedState(self: *Self) ?BorrowedState {
-        const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
+        // latest_finalized is a multi-field Checkpoint written under
+        // forkChoice.mutex (exclusive); use the shared-locked accessor
+        // so we don't pair `slot` with a different update's `root`.
+        // PR #820 / #803.
+        const finalized_checkpoint = self.forkChoice.getLatestFinalized();
 
         // First try the in-memory states map under `states_lock.shared`.
         if (self.statesGet(finalized_checkpoint.root)) |borrow| {
@@ -2234,10 +2245,12 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Get the latest justified checkpoint
-    /// Returns the checkpoint with slot and root of the most recent justified checkpoint
+    /// Get the latest justified checkpoint.
+    /// Returns the checkpoint with slot and root of the most recent
+    /// justified checkpoint, snapshotted under forkChoice.mutex.lockShared
+    /// so callers see a coherent (slot, root) pair. PR #820 / #803.
     pub fn getJustifiedCheckpoint(self: *Self) types.Checkpoint {
-        return self.forkChoice.fcStore.latest_justified;
+        return self.forkChoice.getLatestJustified();
     }
 
     pub const SyncStatus = union(enum) {
@@ -2268,8 +2281,12 @@ pub const BeamChain = struct {
             return .no_peers;
         }
 
-        const our_head_slot = self.forkChoice.head.slot;
-        const our_finalized_slot = self.forkChoice.fcStore.latest_finalized.slot;
+        // forkChoice.head and fcStore.latest_finalized are multi-field
+        // structs written under forkChoice.mutex.lock(). Snapshot via the
+        // shared-locked accessors so callers see coherent values.
+        // PR #820 / #803.
+        const our_head_slot = self.forkChoice.getHead().slot;
+        const our_finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
         // Find the maximum finalized slot reported by any peer
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
