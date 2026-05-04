@@ -1624,6 +1624,232 @@ test "LockedMap: withValueLocked propagates callback errors" {
     try testing.expectEqual(@as(?u32, 7), lm.get(2));
 }
 
+// Synthetic SignedBlock fixture for BlockCache concurrency tests that
+// MUST live in `locking.zig` (because they exercise BlockCache-internal
+// contracts and must run fast — no XMSS / no STF). The shape mirrors
+// `makeTestSignedBlockWithParent` in `node.zig` but exposes only what
+// the cache actually touches (block.parent_root + the deinit chain).
+fn makeFixtureSignedBlockPtr(
+    allocator: Allocator,
+    slot: usize,
+    parent_root: types.Root,
+) !*types.SignedBlock {
+    const block_ptr = try allocator.create(types.SignedBlock);
+    errdefer allocator.destroy(block_ptr);
+    block_ptr.* = .{
+        .block = .{
+            .slot = slot,
+            .parent_root = parent_root,
+            .proposer_index = 0,
+            .state_root = types.ZERO_HASH,
+            .body = .{
+                .attestations = try types.AggregatedAttestations.init(allocator),
+            },
+        },
+        .signature = try types.createBlockSignatures(allocator, 0),
+    };
+    return block_ptr;
+}
+
+test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader" {
+    // Three-thread harness covering the production split-insert path:
+    //   * Thread A (writer): for each iteration
+    //         insertBlockPtr(ssz=null) ; attachSsz
+    //     This is the exact shape of `Network.cacheFetchedBlock` +
+    //     later `Network.storeFetchedBlockSsz` in the production code.
+    //   * Thread B (reader): spins on `getBlockAndSsz` for the roots
+    //     Thread A is producing; asserts atomic invariant
+    //         block-Some => ssz is null OR Some, never garbage
+    //     and that whenever block is Some the slot/parent_root are
+    //     readable (the SignedBlock value itself is the cache copy and
+    //     its inner slices are stable across the unlock when the entry
+    //     hasn't been removed). Counts how many times the
+    //     (block-Some, ssz-null) partial state was observed so we can
+    //     assert the bounded-window claim is actually exercised.
+    //   * Thread C (remover): drains roots from a queue once
+    //     attach-completed; calls `removeFetchedBlock` on each. Must
+    //     never trigger a double-free (the cache's own deinit path
+    //     handles the SignedBlock; this test wraps it via the cache's
+    //     contract).
+    //
+    // No XMSS, no STF — fixtures only. The contract under test is
+    // BlockCache atomicity, not signature validity.
+    const ITER: usize = 1500;
+    var bc = BlockCache.init(testing.allocator);
+    defer bc.deinit();
+
+    // SPSC-style queues for handing roots between threads. Guarded by a
+    // mutex — simpler than a lock-free ring and the cache itself is the
+    // hot path under test.
+    const RootQueue = struct {
+        items: std.ArrayListUnmanaged(types.Root) = .empty,
+        mutex: zeam_utils.SyncMutex = .{},
+        closed: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        allocator: Allocator,
+
+        fn deinit(q: *@This()) void {
+            q.items.deinit(q.allocator);
+        }
+        fn push(q: *@This(), r: types.Root) !void {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            try q.items.append(q.allocator, r);
+        }
+        fn pop(q: *@This()) ?types.Root {
+            q.mutex.lock();
+            defer q.mutex.unlock();
+            if (q.items.items.len == 0) return null;
+            return q.items.orderedRemove(0);
+        }
+        fn close(q: *@This()) void {
+            q.closed.store(1, .release);
+        }
+        fn isClosed(q: *@This()) bool {
+            return q.closed.load(.acquire) == 1;
+        }
+    };
+
+    var attached_q = RootQueue{ .allocator = testing.allocator };
+    defer attached_q.deinit();
+    var producing_q = RootQueue{ .allocator = testing.allocator };
+    defer producing_q.deinit();
+
+    const Writer = struct {
+        fn run(
+            cache: *BlockCache,
+            prod_q: *RootQueue,
+            att_q: *RootQueue,
+            iters: usize,
+        ) !void {
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var r = std.mem.zeroes(types.Root);
+                // Distinct root per iter — no duplicate-cached collision.
+                std.mem.writeInt(u32, r[0..4], @intCast(i + 1), .little);
+                const block_ptr = try makeFixtureSignedBlockPtr(testing.allocator, i + 1, types.ZERO_HASH);
+                defer testing.allocator.destroy(block_ptr);
+                cache.insertBlockPtr(r, block_ptr, types.ZERO_HASH, null) catch |err| switch (err) {
+                    error.AlreadyCached => {
+                        // Distinct roots make this unreachable, but free
+                        // the fixture if it ever fires.
+                        var b = block_ptr.*;
+                        b.deinit();
+                        continue;
+                    },
+                    else => return err,
+                };
+                // Publish to readers BEFORE attachSsz so they have a
+                // chance to observe the (block-Some, ssz-null) window.
+                try prod_q.push(r);
+                // Tiny synthetic SSZ payload owned by the cache.
+                const ssz_bytes = try testing.allocator.alloc(u8, 4);
+                ssz_bytes[0] = 0xDE;
+                ssz_bytes[1] = 0xAD;
+                ssz_bytes[2] = 0xBE;
+                ssz_bytes[3] = 0xEF;
+                cache.attachSsz(r, ssz_bytes) catch |err| {
+                    testing.allocator.free(ssz_bytes);
+                    return err;
+                };
+                try att_q.push(r);
+            }
+            prod_q.close();
+            att_q.close();
+        }
+    };
+
+    const Reader = struct {
+        fn run(
+            cache: *BlockCache,
+            prod_q: *RootQueue,
+            partial_observed: *usize,
+            full_observed: *usize,
+            stop: *std.atomic.Value(u8),
+        ) void {
+            // Snapshot a window of recently-produced roots and probe each.
+            while (stop.load(.acquire) == 0) {
+                // Take a recent root non-destructively: peek the queue
+                // tail by popping then re-pushing. We do best-effort —
+                // missing reads are fine, the test cares about whether
+                // we see ANY partial state.
+                const r_opt = blk: {
+                    prod_q.mutex.lock();
+                    defer prod_q.mutex.unlock();
+                    if (prod_q.items.items.len == 0) break :blk @as(?types.Root, null);
+                    // Read several recent roots to maximize coverage.
+                    const last = prod_q.items.items[prod_q.items.items.len - 1];
+                    break :blk @as(?types.Root, last);
+                };
+                const r = r_opt orelse {
+                    if (prod_q.isClosed()) break;
+                    continue;
+                };
+                if (cache.getBlockAndSsz(r)) |bs| {
+                    // Block-Some path: slices must be readable.
+                    // `slot` is plain u64; reading it should never trap.
+                    // `parent_root` is a fixed-size array, also safe.
+                    const slot = bs.block.block.slot;
+                    // Range check — fixtures use slot = i+1 where i is
+                    // [0, ITER); this is just "is the value sane, not
+                    // garbage from a freed allocation".
+                    std.debug.assert(slot >= 1 and slot <= ITER + 16);
+                    // parent_root must equal types.ZERO_HASH (we set it
+                    // that way in the fixture). Reading + comparing
+                    // proves the fixed-size-array storage is intact.
+                    std.debug.assert(std.mem.eql(u8, &bs.block.block.parent_root, &types.ZERO_HASH));
+                    if (bs.ssz == null) {
+                        partial_observed.* += 1;
+                    } else {
+                        // SSZ Some: bytes must be the 4-byte fixture.
+                        std.debug.assert(bs.ssz.?.len == 4);
+                        std.debug.assert(bs.ssz.?[0] == 0xDE);
+                        full_observed.* += 1;
+                    }
+                }
+            }
+        }
+    };
+
+    const Remover = struct {
+        fn run(cache: *BlockCache, att_q: *RootQueue) void {
+            while (true) {
+                if (att_q.pop()) |r| {
+                    _ = cache.removeFetchedBlock(r);
+                } else {
+                    if (att_q.isClosed()) break;
+                    // Brief yield so the writer can produce more.
+                    std.atomic.spinLoopHint();
+                }
+            }
+        }
+    };
+
+    var partial_observed: usize = 0;
+    var full_observed: usize = 0;
+    var stop_reader = std.atomic.Value(u8).init(0);
+
+    var t_write = try std.Thread.spawn(.{}, Writer.run, .{ &bc, &producing_q, &attached_q, ITER });
+    var t_read = try std.Thread.spawn(.{}, Reader.run, .{ &bc, &producing_q, &partial_observed, &full_observed, &stop_reader });
+    var t_remove = try std.Thread.spawn(.{}, Remover.run, .{ &bc, &attached_q });
+
+    t_write.join();
+    // Drain the remover before stopping the reader so the reader has
+    // maximum surface for partial-state observation.
+    t_remove.join();
+    stop_reader.store(1, .release);
+    t_read.join();
+
+    // The bounded-window claim from the BlockCache docstring (locking.zig
+    // §insertBlockPtr / §attachSsz) is that block-Some + ssz-null is a
+    // transient OBSERVABLE state. If we never observed it, the test is
+    // not actually exercising the partial-state surface and the claim
+    // is unproven — fail loudly instead of silently passing.
+    try testing.expect(partial_observed > 0);
+    // We should also observe at least one fully-attached state — if
+    // not, the writer never won the race and the test is degenerate.
+    try testing.expect(full_observed > 0);
+}
+
 // BlockCache integration tests with real SignedBlock values live in
 // `node.zig` next to the existing `makeTestSignedBlockWithParent`
 // helper — wiring them in `locking.zig` would force this file to depend
