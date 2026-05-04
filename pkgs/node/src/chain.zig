@@ -334,22 +334,21 @@ pub const BeamChain = struct {
         var t = LockTimer.start("states", "statesGet");
         self.states_lock.lockShared();
         t.acquired();
-        defer t.released();
         if (self.states.get(root)) |state| {
-            // Hand the lock off to the borrow. NOTE: this means we DO NOT
-            // call states_lock.unlockShared() here — the borrow's deinit
-            // does that. The LockTimer hold-time observation above ends
-            // when this function returns, which under-counts hold time for
-            // long-lived borrows; downstream histograms (per callsite of
-            // borrow.deinit / cloneAndRelease) cover that gap.
+            // Hand the lock off to the borrow. The borrow's deinit calls
+            // states_lock.unlockShared() AND closes the LockTimer
+            // observation — so the hold-span histogram correctly
+            // attributes the entire borrow lifetime to this site.
             return BorrowedState{
                 .state = state,
                 .backing = .{ .states_shared_rwlock = &self.states_lock },
+                .timer = t,
             };
         }
         // No entry — release the shared lock since we are not handing out
         // a borrow.
         self.states_lock.unlockShared();
+        t.released();
         return null;
     }
 
@@ -403,15 +402,15 @@ pub const BeamChain = struct {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
-        // NOTE: hold-time histogram closes here at function return; the
-        // borrow's deinit-site is responsible for any per-callsite
-        // observation of the extended hold window. Mirrors the pattern in
-        // `statesGet`.
-        defer t.released();
         // NOTE: NO `defer self.states_lock.unlock()` here — the exclusive
         // lock is owned by the returned BorrowedState and released by its
-        // deinit. errdefer below covers the OOM path on `getOrPut`.
-        errdefer self.states_lock.unlock();
+        // deinit. errdefer below covers the OOM path on `getOrPut`. The
+        // LockTimer is moved into the borrow as well so the hold-span
+        // observation closes at the deinit site, not here. PR #820.
+        errdefer {
+            self.states_lock.unlock();
+            t.released();
+        }
         const gop = try self.states.getOrPut(root);
         const effective_ptr: *types.BeamState = if (gop.found_existing) blk: {
             // Decision policy: keep the existing pointer (it's referenced
@@ -429,6 +428,7 @@ pub const BeamChain = struct {
             .borrow = BorrowedState{
                 .state = effective_ptr,
                 .backing = .{ .states_exclusive_rwlock = &self.states_lock },
+                .timer = t,
             },
             .kept_existing = gop.found_existing,
         };
@@ -2184,18 +2184,14 @@ pub const BeamChain = struct {
         if (self.cached_finalized_state) |cached_state| {
             if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
                 lock_held = false; // ownership of the lock moves into the borrow
-                // We must record release timing now, even though the lock
-                // is held a bit longer by the borrow — the LockTimer can
-                // only observe up to the function return. Downstream the
-                // borrow's deinit callsite owns timing for its hold span.
-                t_ev.released();
-                // tier-5 depth is HANDED OFF to the borrow —
-                // BorrowedState.deinit calls leaveTier5() after unlocking.
-                // Do NOT call leaveTier5() here.
+                // tier-5 depth and LockTimer are HANDED OFF to the borrow:
+                // BorrowedState.deinit calls leaveTier5() and t.released()
+                // after unlocking. Do NOT close them here.
                 return BorrowedState{
                     .state = cached_state,
                     .backing = .{ .events_mutex = &self.events_lock },
                     .tier5_held = true,
+                    .timer = t_ev,
                 };
             }
             // Stale — fall through to DB load below.
@@ -2228,12 +2224,13 @@ pub const BeamChain = struct {
         self.logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
 
         lock_held = false;
-        t_ev.released();
-        // tier-5 depth handed off to the borrow; deinit will leaveTier5().
+        // tier-5 depth + LockTimer handed off to the borrow; deinit will
+        // leaveTier5() and t.released() after unlocking.
         return BorrowedState{
             .state = state_ptr,
             .backing = .{ .events_mutex = &self.events_lock },
             .tier5_held = true,
+            .timer = t_ev,
         };
     }
 
@@ -3288,8 +3285,9 @@ test "BlockCache: insert + get + removeChildrenOf bounded" {
 
     // Every inserted root should be retrievable.
     for (1..mock_chain.blocks.len) |i| {
-        const got = bc.get(mock_chain.blockRoots[i]);
+        const got = bc.getBlockAndSsz(mock_chain.blockRoots[i]);
         try std.testing.expect(got != null);
+        try std.testing.expect(got.?.ssz != null);
     }
 
     // removeChildrenOf the genesis root should drop the entire chain.
@@ -3332,9 +3330,10 @@ test "BlockCache: partial-state invariant (re-insert leaves no orphans)" {
     // `ssz_bytes`, and the children list under the parent has the root
     // listed twice (since we appended on both inserts — documented
     // behaviour: `insert` does not de-dup, callers manage that). Either
-    // way `get` must return the latest entry.
-    const got = bc.get(mock_chain.blockRoots[1]);
+    // way `getBlockAndSsz` must return the latest entry.
+    const got = bc.getBlockAndSsz(mock_chain.blockRoots[1]);
     try std.testing.expect(got != null);
+    try std.testing.expect(got.?.ssz != null);
     try std.testing.expect(bc.count() == 1);
 }
 

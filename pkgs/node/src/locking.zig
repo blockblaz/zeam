@@ -254,12 +254,6 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
 /// "longest critical section under block_cache_lock" call-out.
 pub const MAX_CACHED_BLOCKS: usize = 1024;
 
-pub const CachedBlock = struct {
-    block: types.SignedBlock,
-    ssz: []const u8,
-    parent_root: types.Root,
-};
-
 /// Result type for `BlockCache.getBlockAndSsz`. Nominal so the same struct
 /// is referenceable from network-layer wrappers (Zig anonymous-struct
 /// return types are not assignable across function boundaries).
@@ -475,27 +469,6 @@ pub const BlockCache = struct {
         const block = self.blocks.get(root) orelse return null;
         const ssz_opt: ?[]const u8 = self.ssz_bytes.get(root);
         return .{ .block = block, .ssz = ssz_opt };
-    }
-
-    /// Read the cached triple by root. Returns null when no block is
-    /// cached at `root` OR when the block is cached but the SSZ bytes
-    /// have not been attached yet (the brief partial-state window between
-    /// `insertBlockPtr(ssz=null, ...)` and `attachSsz(...)`). The
-    /// `parent_root` field is NOT populated by this helper — it returns
-    /// `std.mem.zeroes(types.Root)`. Callers that need the parent root
-    /// must consult the `children` map directly. Prefer `getBlockAndSsz`
-    /// or `getBlock`+`getSsz` at new callsites; this entry point exists
-    /// for legacy / test callers that took both fields together.
-    pub fn get(self: *Self, root: types.Root) ?CachedBlock {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const block = self.blocks.get(root) orelse return null;
-        const ssz = self.ssz_bytes.get(root) orelse return null;
-        return .{
-            .block = block,
-            .ssz = ssz,
-            .parent_root = std.mem.zeroes(types.Root),
-        };
     }
 
     pub fn contains(self: *Self, root: types.Root) bool {
@@ -934,6 +907,14 @@ pub const BorrowedState = struct {
     /// statesCommitKeepExisting does not touch tier-5 either since
     /// states_lock is tier-3).
     tier5_held: bool = false,
+    /// Optional LockTimer travelling with the borrow so the
+    /// `zeam_lock_hold_seconds` histogram observes the FULL hold span,
+    /// not just up to the helper's return. Set by the hand-off site;
+    /// `deinit` calls `t.released()` after unlocking. PR #820 / issue
+    /// #803: previously the LockTimer ended at the helper's return, so
+    /// long-lived borrows (especially the new states_exclusive borrow)
+    /// had their hold span systematically under-reported.
+    timer: ?LockTimer = null,
 
     pub const Backing = union(enum) {
         states_shared_rwlock: *zeam_utils.SyncRwLock,
@@ -960,6 +941,11 @@ pub const BorrowedState = struct {
         if (self.tier5_held) {
             self.tier5_held = false;
             leaveTier5();
+        }
+        // Close the LockTimer hold-span observation now that the lock is
+        // actually released. Idempotent inside LockTimer.released().
+        if (self.timer) |*t| {
+            t.released();
         }
     }
 
