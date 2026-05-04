@@ -22,6 +22,9 @@ const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 pub const fcFactory = @import("./forkchoice.zig");
 const constants = @import("./constants.zig");
 const tree_visualizer = @import("./tree_visualizer.zig");
+const locking = @import("./locking.zig");
+const BorrowedState = locking.BorrowedState;
+const LockTimer = locking.LockTimer;
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -163,6 +166,26 @@ pub const BeamChain = struct {
     // blocks here and replay them in onInterval once the clock has caught up.
     pending_blocks: std.ArrayList(types.SignedBlock),
 
+    // Per-resource locks (slice a-2 of #803). See
+    // `docs/threading_refactor_slice_a.md` for the lock-hierarchy contract:
+    //   tier 3: states_lock
+    //   tier 4: pending_blocks_lock
+    //   tier 5a: pubkey_cache_lock     (sibling — never co-held with 5b/5c)
+    //   tier 5b: root_to_slot_lock     (sibling — never co-held with 5a/5c)
+    //   tier 5c: events_lock           (sibling — never co-held with 5a/5b)
+    //   tier 6: forkChoice (own RwLock, innermost)
+    //
+    // The `BeamNode.mutex` (renamed `finalization_lock` in slice a-3) still
+    // wraps every chain entry point as of slice a-2, so these locks are
+    // currently nested inside the global mutex — redundant but correct. They
+    // become the actual synchronisation once a-3 drops the global mutex from
+    // the gossip / interval / req-resp paths.
+    states_lock: zeam_utils.SyncRwLock = .{},
+    pending_blocks_lock: zeam_utils.SyncMutex = .{},
+    pubkey_cache_lock: zeam_utils.SyncMutex = .{},
+    root_to_slot_lock: zeam_utils.SyncMutex = .{},
+    events_lock: zeam_utils.SyncMutex = .{},
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -211,6 +234,14 @@ pub const BeamChain = struct {
             .root_to_slot_cache = types.RootToSlotCache.init(allocator),
             .pending_blocks = .empty,
             .thread_pool = opts.thread_pool,
+            // Per-resource locks default-initialised. RwLock and Mutex have
+            // no special init; init() runs single-threaded so no acquire
+            // here.
+            .states_lock = .{},
+            .pending_blocks_lock = .{},
+            .pubkey_cache_lock = .{},
+            .root_to_slot_lock = .{},
+            .events_lock = .{},
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
@@ -278,6 +309,106 @@ pub const BeamChain = struct {
         return previous;
     }
 
+    // ------------------------------------------------------------------
+    // Lock helpers (slice a-2)
+    //
+    // These thin wrappers keep callsites readable AND ensure every lock
+    // acquire is observed via `LockTimer` so we can attribute contention
+    // by lock + site in `zeam_lock_{wait,hold}_seconds`. The legacy
+    // `zeam_node_mutex_*` series is double-emitted by LockTimer for one
+    // release.
+    // ------------------------------------------------------------------
+
+    /// Acquire the shared (read) side of `states_lock` and return a
+    /// `BorrowedState` for the requested root, or null if the state is not
+    /// in the in-memory map. Caller MUST call either `borrow.deinit()` or
+    /// `borrow.cloneAndRelease(allocator)` exactly once before the borrow
+    /// goes out of scope. Debug builds enforce one-release via
+    /// `BorrowedState.released`.
+    pub fn statesGet(self: *Self, root: types.Root) ?BorrowedState {
+        var t = LockTimer.start("states", "statesGet");
+        self.states_lock.lockShared();
+        t.acquired();
+        defer t.released();
+        if (self.states.get(root)) |state| {
+            // Hand the lock off to the borrow. NOTE: this means we DO NOT
+            // call states_lock.unlockShared() here — the borrow's deinit
+            // does that. The LockTimer hold-time observation above ends
+            // when this function returns, which under-counts hold time for
+            // long-lived borrows; downstream histograms (per callsite of
+            // borrow.deinit / cloneAndRelease) cover that gap.
+            return BorrowedState{
+                .state = state,
+                .backing = .{ .states_shared_rwlock = &self.states_lock },
+            };
+        }
+        // No entry — release the shared lock since we are not handing out
+        // a borrow.
+        self.states_lock.unlockShared();
+        return null;
+    }
+
+    /// Take the exclusive side of `states_lock` and `put` the entry. Used
+    /// by produceBlock / onBlock STF commit and similar single-key writes.
+    fn statesPutExclusive(self: *Self, comptime site: []const u8, root: types.Root, state_ptr: *types.BeamState) !void {
+        var t = LockTimer.start("states", site);
+        self.states_lock.lock();
+        t.acquired();
+        defer t.released();
+        defer self.states_lock.unlock();
+        try self.states.put(root, state_ptr);
+    }
+
+    /// Insert under `states_lock.exclusive` if the entry is not already in
+    /// the map; otherwise keep the existing pointer untouched. Returns:
+    ///   * `effective` — the pointer the caller should USE for any
+    ///     subsequent reads (DB writes, forkchoice updates, etc.). When
+    ///     the entry already existed this is the in-map pointer, NOT the
+    ///     `state_ptr` argument; the in-map pointer outlives the borrow
+    ///     handed out by `statesGet`, so other readers don't observe a
+    ///     freed pointer.
+    ///   * `kept_existing` — true when the entry already existed and
+    ///     `state_ptr` was discarded (caller is responsible for freeing
+    ///     `state_ptr` if it owns it). False when `state_ptr` was inserted.
+    fn statesCommitKeepExisting(
+        self: *Self,
+        comptime site: []const u8,
+        root: types.Root,
+        state_ptr: *types.BeamState,
+    ) !struct { effective: *types.BeamState, kept_existing: bool } {
+        var t = LockTimer.start("states", site);
+        self.states_lock.lock();
+        t.acquired();
+        defer t.released();
+        defer self.states_lock.unlock();
+        const gop = try self.states.getOrPut(root);
+        if (gop.found_existing) {
+            // Decision policy: keep the existing pointer (it's referenced
+            // elsewhere — e.g. produceBlock just inserted it before
+            // publishBlock landed here) and tell the caller to free the
+            // freshly-computed copy. We never want to invalidate a pointer
+            // that other borrows might still observe through
+            // `states_lock.shared`.
+            return .{ .effective = gop.value_ptr.*, .kept_existing = true };
+        }
+        gop.value_ptr.* = state_ptr;
+        return .{ .effective = state_ptr, .kept_existing = false };
+    }
+
+    /// Take the exclusive side of `states_lock` and remove the entry.
+    /// Returns the removed pointer (or null) so the caller can free it.
+    fn statesFetchRemoveExclusivePtr(self: *Self, comptime site: []const u8, root: types.Root) ?*types.BeamState {
+        var t = LockTimer.start("states", site);
+        self.states_lock.lock();
+        t.acquired();
+        defer t.released();
+        defer self.states_lock.unlock();
+        if (self.states.fetchRemove(root)) |entry| {
+            return entry.value;
+        }
+        return null;
+    }
+
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {
         // right now it's simple assignment but eventually it should be a set
         // tacking registrations and keeping it alive for 3*2=6 slots
@@ -289,17 +420,50 @@ pub const BeamChain = struct {
     /// reached their slot.  Called from onInterval after advancing the clock.
     /// Returns a slice of all missing attestation roots encountered while
     /// processing queued blocks; the caller owns and must free the slice.
+    ///
+    /// One-at-a-time iteration (slice a-2): each loop iteration reacquires
+    /// `pending_blocks_lock`, rescans from index 0 for the first ready
+    /// block, removes it, releases the lock, then replays via `onBlock`.
+    /// This trades O(n²) worst case for safety — indices are never assumed
+    /// stable across an unlock, so the gossip thread is free to append to
+    /// the queue between iterations. The `lean_pending_blocks_drain_iters`
+    /// histogram measures how often this matters in practice; current
+    /// devnet workloads keep n small.
     pub fn processPendingBlocks(self: *Self) []types.Root {
         var all_missing_roots: std.ArrayListUnmanaged(types.Root) = .empty;
-        const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
-        var i: usize = 0;
-        while (i < self.pending_blocks.items.len) {
-            const queued_slot = self.pending_blocks.items[i].block.slot;
-            if (queued_slot * constants.INTERVALS_PER_SLOT <= fc_time) {
-                // Remove from queue (ownership transferred to local var).
-                var queued_block = self.pending_blocks.orderedRemove(i);
+        var iter_count: usize = 0;
+        defer {
+            const iter_f: f32 = @floatFromInt(iter_count);
+            zeam_metrics.lean_pending_blocks_drain_iters.record(iter_f);
+        }
+
+        while (true) {
+            const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+
+            // Pop the first ready block under the lock; release before any
+            // heavy work so gossip-thread appends can proceed.
+            var ready: ?types.SignedBlock = null;
+            {
+                var t = LockTimer.start("pending_blocks", "processPendingBlocks.scan");
+                self.pending_blocks_lock.lock();
+                t.acquired();
+                defer t.released();
+                defer self.pending_blocks_lock.unlock();
+
+                for (self.pending_blocks.items, 0..) |b, i| {
+                    if (b.block.slot * constants.INTERVALS_PER_SLOT <= fc_time) {
+                        ready = self.pending_blocks.orderedRemove(i);
+                        break;
+                    }
+                }
+            }
+
+            if (ready) |unwrapped| {
+                iter_count += 1;
+                var queued_block = unwrapped;
                 defer queued_block.deinit();
 
+                const queued_slot = queued_block.block.slot;
                 var block_root: types.Root = undefined;
                 zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
                     self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
@@ -324,7 +488,7 @@ pub const BeamChain = struct {
                 // Accumulate missing roots so the caller can fetch them.
                 all_missing_roots.appendSlice(self.allocator, missing_roots) catch {};
             } else {
-                i += 1;
+                break;
             }
         }
         return all_missing_roots.toOwnedSlice(self.allocator) catch &.{};
@@ -455,17 +619,31 @@ pub const BeamChain = struct {
         const proposal_head = try self.forkChoice.getProposalHead(opts.slot);
         const parent_root = proposal_head.root;
 
-        const pre_state = self.states.get(parent_root) orelse return BlockProductionError.MissingPreState;
+        // Snapshot-then-release: the FFI inside getProposalAttestations can
+        // run for hundreds of milliseconds. Holding `states_lock.shared` for
+        // that window would force any block-import path waiting on
+        // `states_lock.exclusive` to stall behind the aggregator. Instead
+        // clone the pre-state into an owned snapshot under the borrow,
+        // release the lock, then run the FFI against the snapshot.
+        var pre_borrow = self.statesGet(parent_root) orelse return BlockProductionError.MissingPreState;
+        const pre_snapshot = try pre_borrow.cloneAndRelease(self.allocator);
+        defer {
+            pre_snapshot.deinit();
+            self.allocator.destroy(pre_snapshot);
+        }
+
         var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
         errdefer if (post_state_opt) |post_state_ptr| {
             post_state_ptr.deinit();
             self.allocator.destroy(post_state_ptr);
         };
         const post_state = post_state_opt.?;
-        try types.sszClone(self.allocator, types.BeamState, pre_state.*, post_state);
+        try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, post_state);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
-        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_state, opts.slot, opts.proposer_index, parent_root);
+        // FFI call against the owned snapshot — no lock held during this
+        // window.
+        const proposal_atts = try self.forkChoice.getProposalAttestations(pre_snapshot, opts.slot, opts.proposer_index, parent_root);
         _ = payload_agg_timer.observe();
 
         var agg_attestations = proposal_atts.attestations;
@@ -526,8 +704,25 @@ pub const BeamChain = struct {
 
         self.logger.debug("node-{d}::going for block production opts={f} raw block={s}", .{ self.nodeId, opts, block_str });
 
-        // 2. apply STF to get post state & update post state root & cache it
-        try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
+        // 2. apply STF to get post state & update post state root & cache it.
+        // Hold `root_to_slot_lock` for the STF window since
+        // `apply_raw_block` reaches into the cache via the pointer for
+        // historical-block lookups. The hot attestation-validation paths
+        // do not touch this cache, so contention stays bounded to STF +
+        // the small number of cache writes around block import.
+        {
+            var t_rts = LockTimer.start("root_to_slot", "produceBlock.stf");
+            locking.assertNoTier5SiblingHeld("produceBlock.stf");
+            self.root_to_slot_lock.lock();
+            locking.enterTier5();
+            t_rts.acquired();
+            defer {
+                self.root_to_slot_lock.unlock();
+                locking.leaveTier5();
+                t_rts.released();
+            }
+            try stf.apply_raw_block(self.allocator, post_state, &block, self.block_building_logger, &self.root_to_slot_cache);
+        }
 
         const block_str_2 = try block.toJsonString(self.allocator);
         defer self.allocator.free(block_str_2);
@@ -538,14 +733,14 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        try self.states.put(block_root, post_state);
+        try self.statesPutExclusive("produceBlock.commit", block_root, post_state);
         post_state_opt = null;
 
         var forkchoice_added = false;
         errdefer if (!forkchoice_added) {
-            if (self.states.fetchRemove(block_root)) |entry| {
-                entry.value.deinit();
-                self.allocator.destroy(entry.value);
+            if (self.statesFetchRemoveExclusivePtr("produceBlock.errdefer", block_root)) |entry_ptr| {
+                entry_ptr.deinit();
+                self.allocator.destroy(entry_ptr);
             }
         };
 
@@ -736,7 +931,14 @@ pub const BeamChain = struct {
                         // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
                         // holding mutex between then for chain modification sections
                         if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                            try self.pending_blocks.append(self.allocator, cloned);
+                            {
+                                var t = LockTimer.start("pending_blocks", "onGossip.append");
+                                self.pending_blocks_lock.lock();
+                                t.acquired();
+                                defer t.released();
+                                defer self.pending_blocks_lock.unlock();
+                                try self.pending_blocks.append(self.allocator, cloned);
+                            }
 
                             self.logger.info(
                                 "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
@@ -915,13 +1117,21 @@ pub const BeamChain = struct {
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
-            // 1. get parent state
-            const pre_state = self.states.get(block.parent_root) orelse return BlockProcessingError.MissingPreState;
+            // 1. Snapshot parent state under `states_lock.shared`, then
+            //    release. Verify + STF run on the owned snapshot so we
+            //    don't hold the read lock across the long FFI window.
+            var parent_borrow = self.statesGet(block.parent_root) orelse return BlockProcessingError.MissingPreState;
+            const pre_snapshot = try parent_borrow.cloneAndRelease(self.allocator);
+            defer {
+                pre_snapshot.deinit();
+                self.allocator.destroy(pre_snapshot);
+            }
+
             const cpost_state = try self.allocator.create(types.BeamState);
             // If sszClone or anything after fails, destroy the outer allocation.
             errdefer self.allocator.destroy(cpost_state);
 
-            try types.sszClone(self.allocator, types.BeamState, pre_state.*, cpost_state);
+            try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, cpost_state);
             // sszClone succeeded — interior heap fields are now allocated.
             // If anything below fails, deinit interior first (LIFO: deinit runs before destroy above).
             errdefer cpost_state.deinit();
@@ -929,29 +1139,80 @@ pub const BeamChain = struct {
             // 2. verify XMSS signatures (independent step; placed before STF so an invalid block is
             // rejected without mutating post state). Uses the shared thread pool when available to
             // parallelize per-attestation verification across CPU workers.
-            if (self.thread_pool) |pool| {
-                try stf.verifySignaturesParallel(self.allocator, pre_state, &signedBlock, &self.public_key_cache, pool);
-            } else {
-                try stf.verifySignatures(self.allocator, pre_state, &signedBlock, &self.public_key_cache);
+            //
+            // The XMSS pubkey cache is documented NOT thread-safe; today the
+            // parallel path only consumes the cache from a serial pre-phase.
+            // Slice (a-2) wraps the cache calls in `pubkey_cache_lock`. Tier-5
+            // sibling rule: `root_to_slot_lock` (5b) and `events_lock` (5c)
+            // must NOT be held at this point.
+            {
+                var t_pk = LockTimer.start("pubkey_cache", "onBlock.verifySignatures");
+                locking.assertNoTier5SiblingHeld("onBlock.verifySignatures");
+                self.pubkey_cache_lock.lock();
+                locking.enterTier5();
+                t_pk.acquired();
+                defer {
+                    self.pubkey_cache_lock.unlock();
+                    locking.leaveTier5();
+                    t_pk.released();
+                }
+                if (self.thread_pool) |pool| {
+                    try stf.verifySignaturesParallel(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache, pool);
+                } else {
+                    try stf.verifySignatures(self.allocator, pre_snapshot, &signedBlock, &self.public_key_cache);
+                }
             }
 
-            // 3. apply state transition assuming signatures are valid (STF does not re-verify)
-            try stf.apply_transition(self.allocator, cpost_state, block, .{
-                .logger = self.stf_logger,
-                .validSignatures = true,
-                .rootToSlotCache = &self.root_to_slot_cache,
-            });
+            // 3. apply state transition assuming signatures are valid (STF does not re-verify).
+            //    Hold `root_to_slot_lock` for the STF window: STF reads/writes
+            //    the cache via the pointer. Sibling rule: pubkey_cache_lock
+            //    (5a) is already released above; events_lock (5c) is not
+            //    held on any onBlock path.
+            {
+                var t_rts = LockTimer.start("root_to_slot", "onBlock.stf");
+                locking.assertNoTier5SiblingHeld("onBlock.stf");
+                self.root_to_slot_lock.lock();
+                locking.enterTier5();
+                t_rts.acquired();
+                defer {
+                    self.root_to_slot_lock.unlock();
+                    locking.leaveTier5();
+                    t_rts.released();
+                }
+                try stf.apply_transition(self.allocator, cpost_state, block, .{
+                    .logger = self.stf_logger,
+                    .validSignatures = true,
+                    .rootToSlotCache = &self.root_to_slot_cache,
+                });
+            }
             break :computedstate cpost_state;
         };
         // If post_state was freshly allocated above and a later step errors (e.g. forkChoice.onBlock,
         // updateHead, or InvalidSignatureGroups), we must free it before returning the error.
-        errdefer if (post_state_owned) {
+        // `post_state_settled` flips to true once ownership has been resolved
+        // by `statesPutOrSwap` below — either the pointer moved into the map
+        // (insert path) or we already explicitly freed it (existing-kept
+        // path). Either way, the errdefer must not run afterwards.
+        var post_state_settled = false;
+        errdefer if (post_state_owned and !post_state_settled) {
             post_state.deinit();
             self.allocator.destroy(post_state);
         };
 
         // Add current block's root to cache AFTER STF (ensures cache stays in sync with historical_block_hashes)
-        try self.root_to_slot_cache.put(block_root, block.slot);
+        {
+            var t_rts = LockTimer.start("root_to_slot", "onBlock.cachePut");
+            locking.assertNoTier5SiblingHeld("onBlock.cachePut");
+            self.root_to_slot_lock.lock();
+            locking.enterTier5();
+            t_rts.acquired();
+            defer {
+                self.root_to_slot_lock.unlock();
+                locking.leaveTier5();
+                t_rts.released();
+            }
+            try self.root_to_slot_cache.put(block_root, block.slot);
+        }
 
         // Obtain SSZ bytes for RocksDB persistence.
         //
@@ -1094,12 +1355,35 @@ pub const BeamChain = struct {
 
             break :fcprocessing freshFcBlock;
         };
-        try self.states.put(fcBlock.blockRoot, post_state);
+        // Commit post-state under `states_lock.exclusive`. If the entry
+        // already exists (locally produced block path), keep the existing
+        // pointer and free the freshly-computed one — borrows already
+        // observe the existing pointer through `states_lock.shared`, so
+        // overwriting would create a UAF window. Returns the new pointer
+        // when the existing one was kept; null when it was inserted.
+        const commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
+        if (commit.kept_existing and post_state_owned) {
+            // Existing entry kept — free the freshly-computed (and now
+            // redundant) post_state. Caller-supplied post-states (i.e.
+            // `post_state_owned == false`) belong to the caller; we don't
+            // touch them.
+            post_state.deinit();
+            self.allocator.destroy(post_state);
+        }
+        // From here on use the effective pointer (the in-map one): if the
+        // commit kept an existing entry, our `post_state` is freed and
+        // unsafe to deref.
+        const effective_post_state: *types.BeamState = commit.effective;
+        // Past this point post_state ownership is settled — either the
+        // pointer is in the states map (insert path) or it was explicitly
+        // freed above (existing-kept path). The top-level errdefer must
+        // not double-free, so flip the gate.
+        post_state_settled = true;
 
         const processing_time = onblock_timer.observe();
 
         // 6. Save block and state to database and confirm the block in forkchoice
-        self.updateBlockDb(block_ssz_for_db, fcBlock.blockRoot, post_state.*, block.slot) catch |err| {
+        self.updateBlockDb(block_ssz_for_db, fcBlock.blockRoot, effective_post_state.*, block.slot) catch |err| {
             self.logger.err("failed to update block database for block root=0x{x}: {any}", .{
                 &fcBlock.blockRoot,
                 err,
@@ -1134,38 +1418,60 @@ pub const BeamChain = struct {
         const latest_justified = self.forkChoice.getLatestJustified();
         const latest_finalized = self.forkChoice.getLatestFinalized();
 
-        // 8. Asap emit justification/finalization events based on forkchoice store
-        // Emit justification event only when slot increases beyond last emitted
-        if (latest_justified.slot > self.last_emitted_justified.slot) {
-            if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
-                var chain_event = api.events.ChainEvent{ .new_justification = just_event };
-                event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.logger.warn("failed to broadcast justification event: {any}", .{err});
-                    chain_event.deinit(self.allocator);
-                };
-                self.last_emitted_justified = latest_justified;
-            } else |err| {
-                self.logger.warn("failed to create justification event: {any}", .{err});
+        // 8. Asap emit justification/finalization events based on forkchoice store.
+        //    `events_lock` (tier 5c) covers the read-modify-write of
+        //    `last_emitted_justified`, `last_emitted_finalized`, and (later)
+        //    `cached_finalized_state`. Sibling rule: pubkey_cache_lock (5a)
+        //    and root_to_slot_lock (5b) must NOT be held here.
+        const last_emitted_finalized: types.Checkpoint = blk: {
+            var t_ev = LockTimer.start("events", "onBlockFollowup");
+            locking.assertNoTier5SiblingHeld("onBlockFollowup");
+            self.events_lock.lock();
+            locking.enterTier5();
+            t_ev.acquired();
+            defer {
+                self.events_lock.unlock();
+                locking.leaveTier5();
+                t_ev.released();
             }
-        }
 
-        // Emit finalization event only when slot increases beyond last emitted
-        const last_emitted_finalized = self.last_emitted_finalized;
-        if (latest_finalized.slot > last_emitted_finalized.slot) {
-            if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
-                var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
-                event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
-                    self.logger.warn("failed to broadcast finalization event: {any}", .{err});
-                    chain_event.deinit(self.allocator);
-                };
-                self.last_emitted_finalized = latest_finalized;
-            } else |err| {
-                self.logger.warn("failed to create finalization event: {any}", .{err});
+            // Emit justification event only when slot increases beyond last emitted
+            if (latest_justified.slot > self.last_emitted_justified.slot) {
+                if (api.events.NewJustificationEvent.fromCheckpoint(self.allocator, latest_justified, new_head.slot, self.nodeId)) |just_event| {
+                    var chain_event = api.events.ChainEvent{ .new_justification = just_event };
+                    event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
+                        self.logger.warn("failed to broadcast justification event: {any}", .{err});
+                        chain_event.deinit(self.allocator);
+                    };
+                    self.last_emitted_justified = latest_justified;
+                } else |err| {
+                    self.logger.warn("failed to create justification event: {any}", .{err});
+                }
             }
-        }
+
+            // Emit finalization event only when slot increases beyond last emitted
+            const prev_last_emitted_finalized = self.last_emitted_finalized;
+            if (latest_finalized.slot > prev_last_emitted_finalized.slot) {
+                if (api.events.NewFinalizationEvent.fromCheckpoint(self.allocator, latest_finalized, new_head.slot, self.nodeId)) |final_event| {
+                    var chain_event = api.events.ChainEvent{ .new_finalization = final_event };
+                    event_broadcaster.broadcastGlobalEvent(&chain_event) catch |err| {
+                        self.logger.warn("failed to broadcast finalization event: {any}", .{err});
+                        chain_event.deinit(self.allocator);
+                    };
+                    self.last_emitted_finalized = latest_finalized;
+                } else |err| {
+                    self.logger.warn("failed to create finalization event: {any}", .{err});
+                }
+            }
+            break :blk prev_last_emitted_finalized;
+        };
 
         // Update finalized slot indices and cleanup if finalization has advanced
-        // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above
+        // note use presaved local last_emitted_finalized as self.last_emitted_finalized has been updated above.
+        // processFinalizationAdvancement runs OUTSIDE events_lock because
+        // it grabs root_to_slot_lock (5b) and may take the states_lock
+        // exclusive for prune — holding events_lock (5c) across that would
+        // violate the tier-5 sibling rule.
         if (latest_finalized.slot > last_emitted_finalized.slot) {
             self.processFinalizationAdvancement(last_emitted_finalized, latest_finalized, pruneForkchoice) catch |err| {
                 // Record failed finalization attempt
@@ -1239,6 +1545,16 @@ pub const BeamChain = struct {
     /// canonical_blocks: set of block roots that should be kept (e.g., canonical chain from finalized to head)
     ///                    All states in canonical_blocks are kept, all others are pruned
     fn pruneStates(self: *Self, roots: []types.Root, pruneType: []const u8) usize {
+        // Single critical section under `states_lock.exclusive` for the whole
+        // prune. Holding the exclusive lock blocks any new borrow until we
+        // finish, so an in-flight `BorrowedState` cannot observe a freed
+        // pointer mid-prune.
+        var t = LockTimer.start("states", "pruneStates");
+        self.states_lock.lock();
+        t.acquired();
+        defer t.released();
+        defer self.states_lock.unlock();
+
         const states_count_before = self.states.count();
         self.logger.debug("pruning for {s} (states_count={d}, roots={d})", .{
             pruneType,
@@ -1394,7 +1710,19 @@ pub const BeamChain = struct {
         // (previousFinalized.slot, latestFinalized.slot] that such states can
         // reference, which wedged zeam_0 on devnet-4 via a cross-fork reorg
         // (see issue #771 and the complementary STF hotfix in #772).
-        try self.root_to_slot_cache.prune(previousFinalized.slot);
+        {
+            var t_rts = LockTimer.start("root_to_slot", "processFinalizationAdvancement.prune");
+            locking.assertNoTier5SiblingHeld("processFinalizationAdvancement.prune");
+            self.root_to_slot_lock.lock();
+            locking.enterTier5();
+            t_rts.acquired();
+            defer {
+                self.root_to_slot_lock.unlock();
+                locking.leaveTier5();
+                t_rts.released();
+            }
+            try self.root_to_slot_cache.prune(previousFinalized.slot);
+        }
 
         // Record successful finalization
         zeam_metrics.metrics.lean_finalizations_total.incr(.{ .result = "success" }) catch {};
@@ -1572,11 +1900,18 @@ pub const BeamChain = struct {
         // Validation is done upstream in onGossip before this function is called.
         const attestation = signedAttestation.message.toAttestation();
 
-        const state = self.states.get(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        // Borrow-only — verifySingleAttestation reads the state for the
+        // duration of this call, then we drop the borrow before passing the
+        // attestation to forkChoice. The XMSS verify is short (~few ms);
+        // holding `states_lock.shared` over it does not stall importers
+        // because they only need exclusive access for STF commits, which
+        // happen later under their own snapshot.
+        var borrow = self.statesGet(attestation.data.target.root) orelse return AttestationValidationError.MissingState;
+        defer borrow.deinit();
 
         try stf.verifySingleAttestation(
             self.allocator,
-            state,
+            borrow.state,
             @intCast(signedAttestation.message.validator_id),
             &signedAttestation.message.message,
             &signedAttestation.message.signature,
@@ -1623,21 +1958,40 @@ pub const BeamChain = struct {
         var validator_indices = try types.aggregationBitsToValidatorIndices(&proof.participants, self.allocator);
         defer validator_indices.deinit(self.allocator);
 
-        const key_state = self.states.get(data.target.root) orelse return error.MissingState;
-        const validators = key_state.validators.constSlice();
-
+        // Borrow-only: short read of `state.validators` to look up pubkey
+        // bytes. Drop the borrow before the XMSS verify since the borrow
+        // only protects the validator-list pointer.
+        var borrow = self.statesGet(data.target.root) orelse return error.MissingState;
         var public_keys = try std.ArrayList(*const xmss.HashSigPublicKey).initCapacity(self.allocator, validator_indices.items.len);
         defer public_keys.deinit(self.allocator);
 
-        for (validator_indices.items) |validator_index| {
-            if (validator_index >= validators.len) {
-                return error.InvalidValidatorId;
+        {
+            defer borrow.deinit();
+            const validators = borrow.state.validators.constSlice();
+
+            // pubkey_cache lookup needs the lock; tier-5 sibling rule says
+            // root_to_slot_lock and events_lock must NOT be held here.
+            var t_pk = LockTimer.start("pubkey_cache", "verifyAggregatedAttestation");
+            locking.assertNoTier5SiblingHeld("verifyAggregatedAttestation");
+            self.pubkey_cache_lock.lock();
+            locking.enterTier5();
+            t_pk.acquired();
+            defer {
+                self.pubkey_cache_lock.unlock();
+                locking.leaveTier5();
+                t_pk.released();
             }
-            const pubkey_bytes = validators[validator_index].getAttestationPubkey();
-            const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
-                return error.InvalidBlockSignatures;
-            };
-            try public_keys.append(self.allocator, pk_handle);
+
+            for (validator_indices.items) |validator_index| {
+                if (validator_index >= validators.len) {
+                    return error.InvalidValidatorId;
+                }
+                const pubkey_bytes = validators[validator_index].getAttestationPubkey();
+                const pk_handle = self.public_key_cache.getOrPut(validator_index, pubkey_bytes) catch {
+                    return error.InvalidBlockSignatures;
+                };
+                try public_keys.append(self.allocator, pk_handle);
+            }
         }
 
         var message_hash: [32]u8 = undefined;
@@ -1651,8 +2005,17 @@ pub const BeamChain = struct {
 
     pub fn aggregate(self: *Self) ![]types.SignedAggregatedAttestation {
         const head_root = self.forkChoice.head.blockRoot;
-        const state = self.states.get(head_root) orelse return error.MissingState;
-        return self.forkChoice.aggregate(state);
+        // Snapshot-then-release: forkChoice.aggregate runs an FFI window
+        // (~700ms) over `state.validators`. Holding `states_lock.shared`
+        // for that window would force any STF commit to wait. Clone first,
+        // release the lock, then run the FFI on the owned snapshot.
+        var borrow = self.statesGet(head_root) orelse return error.MissingState;
+        const snapshot = try borrow.cloneAndRelease(self.allocator);
+        defer {
+            snapshot.deinit();
+            self.allocator.destroy(snapshot);
+        }
+        return self.forkChoice.aggregate(snapshot);
     }
 
     pub fn maybeAggregateOnInterval(self: *Self, time_intervals: usize) !?[]types.SignedAggregatedAttestation {
@@ -1706,28 +2069,78 @@ pub const BeamChain = struct {
         };
     }
 
-    /// Get the finalized checkpoint state (BeamState) if available
-    /// First checks in-memory states map, then cached DB state, then falls back to database
-    /// Returns null if the state is not available in any location
-    pub fn getFinalizedState(self: *Self) ?*const types.BeamState {
+    /// Get the finalized checkpoint state (BeamState) if available.
+    /// First checks the in-memory `states` map, then the `cached_finalized_state`
+    /// field, then falls back to a database load. Returns null if the state
+    /// is not available in any location.
+    ///
+    /// Slice (a-2) migration: this used to return a raw `*const BeamState`
+    /// borrowed from the in-memory map under `BeamNode.mutex`. After (a-2)
+    /// it returns a `BorrowedState` whose backing lock depends on which
+    /// path produced the result:
+    ///   * In-memory map hit  → backed by `states_lock` (shared).
+    ///   * Cache hit / DB load → backed by `events_lock` (mutex), since
+    ///     `cached_finalized_state` is mutated under `events_lock` (the
+    ///     DB-load path also writes the cache field, and that write is
+    ///     guarded by the mutex). Callers MUST release the borrow exactly
+    ///     once via `deinit()` or `cloneAndRelease(allocator)`.
+    ///
+    /// PR description (a-2) enumerates every caller migrated under this
+    /// API change — grepping `states.get` will not find them.
+    pub fn getFinalizedState(self: *Self) ?BorrowedState {
         const finalized_checkpoint = self.forkChoice.fcStore.latest_finalized;
 
-        // First try to get from in-memory states map
-        if (self.states.get(finalized_checkpoint.root)) |state| {
-            return state;
+        // First try the in-memory states map under `states_lock.shared`.
+        if (self.statesGet(finalized_checkpoint.root)) |borrow| {
+            return borrow;
         }
 
-        // Check if we already have a cached state. Invalidate if it's behind the
-        // current finalized checkpoint (can happen if the cache was seeded from the
-        // DB at startup before any in-memory finalization happened).
+        // Cache / DB-load path under `events_lock`. Tier-5 sibling rule:
+        // pubkey_cache_lock (5a) and root_to_slot_lock (5b) must NOT be
+        // held by the caller. Callers today are HTTP / RPC threads that
+        // never hold those locks.
+        var t_ev = LockTimer.start("events", "getFinalizedState");
+        locking.assertNoTier5SiblingHeld("getFinalizedState");
+        self.events_lock.lock();
+        locking.enterTier5();
+        t_ev.acquired();
+
+        // From this point onward the lock is owned by either the returned
+        // borrow (handed off to the caller via `BorrowedState.deinit`) or
+        // by an explicit `unlock()` on the not-found path. Track via a
+        // local flag so a `return null` cannot accidentally leak the lock.
+        var lock_held = true;
+        defer {
+            if (lock_held) {
+                self.events_lock.unlock();
+                locking.leaveTier5();
+                t_ev.released();
+            }
+        }
+
+        // Check if we already have a cached state. Invalidate if it's behind
+        // the current finalized checkpoint (can happen if the cache was
+        // seeded from the DB at startup before any in-memory finalization
+        // happened).
         if (self.cached_finalized_state) |cached_state| {
             if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
-                return cached_state;
+                lock_held = false; // ownership of the lock moves into the borrow
+                // We must record release timing now, even though the lock
+                // is held a bit longer by the borrow — the LockTimer can
+                // only observe up to the function return. Downstream the
+                // borrow's deinit callsite owns timing for its hold span.
+                t_ev.released();
+                locking.leaveTier5();
+                return BorrowedState{
+                    .state = cached_state,
+                    .backing = .{ .events_mutex = &self.events_lock },
+                };
             }
             // Stale — fall through to DB load below.
         }
 
-        // Fallback: try to load from database
+        // Fallback: try to load from database. Allocate the cache slot, load,
+        // store in `cached_finalized_state`, return a borrow over it.
         const state_ptr = self.allocator.create(types.BeamState) catch |err| {
             self.logger.warn("failed to allocate memory for finalized state: {any}", .{err});
             return null;
@@ -1739,11 +2152,26 @@ pub const BeamChain = struct {
             return null;
         };
 
+        // If a previous cached state is being replaced, free it now (we
+        // hold events_lock so no concurrent borrow of the old pointer can
+        // exist past this critical section).
+        if (self.cached_finalized_state) |old_cached| {
+            old_cached.deinit();
+            self.allocator.destroy(old_cached);
+        }
+
         // Cache in separate field (not in states map to avoid affecting pruning)
         self.cached_finalized_state = state_ptr;
 
         self.logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
-        return state_ptr;
+
+        lock_held = false;
+        t_ev.released();
+        locking.leaveTier5();
+        return BorrowedState{
+            .state = state_ptr,
+            .backing = .{ .events_mutex = &self.events_lock },
+        };
     }
 
     /// Get the latest justified checkpoint
@@ -1918,6 +2346,8 @@ test "process and add mock blocks into a node's chain" {
         try std.testing.expect(searched_idx == i);
 
         // should have matching states in the state
+        // SAFETY: test-only, single-threaded — no states_lock acquisition
+        // needed (the chain under test has no concurrent mutators).
         const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
@@ -2694,6 +3124,8 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // selected the highest-slot attestation (att_data_unseen at slot=2), the block
     // would contribute zero attestation weight. The lower-slot attestation
     // (att_data_known at slot=1) is the one that actually matters.
+    // SAFETY: test-only, single-threaded — no states_lock acquisition
+    // needed (the chain under test has no concurrent mutators).
     const post_state = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
     try std.testing.expect(post_state.latest_justified.slot >= 1);
 
@@ -2710,4 +3142,125 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // Only the known attestation is included in the block
     try std.testing.expect(unseen_count == 0);
     try std.testing.expect(known_count > 0);
+}
+
+// =====================================================================
+// Slice (a-2) primitive tests — these exercise BorrowedState and the
+// BlockCache helper against real BeamState / SignedBlock values produced
+// by `stf.genMockChain`. The corresponding API-level tests in
+// `pkgs/node/src/locking.zig` cover the FailingAllocator / OOM paths,
+// double-deinit, and tier-5 depth counter without needing a mock chain.
+// =====================================================================
+
+test "BorrowedState: cloneAndRelease success path against real BeamState" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    var beam_state = mock_chain.genesis_state;
+
+    var rwl: zeam_utils.SyncRwLock = .{};
+    rwl.lockShared();
+
+    var borrow = locking.BorrowedState{
+        .state = &beam_state,
+        .backing = .{ .states_shared_rwlock = &rwl },
+    };
+
+    const owned = try borrow.cloneAndRelease(allocator);
+    defer {
+        owned.deinit();
+        allocator.destroy(owned);
+    }
+    try std.testing.expect(borrow.released);
+    try std.testing.expect(owned.slot == beam_state.slot);
+
+    // Lock has been released — we should be able to grab it exclusively.
+    rwl.lock();
+    rwl.unlock();
+}
+
+test "BlockCache: insert + get + removeChildrenOf bounded" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var bc = locking.BlockCache.init(std.testing.allocator);
+    defer bc.deinit();
+
+    const mock_chain = try stf.genMockChain(allocator, 3, null);
+
+    // Insert each block into the cache as a child of its parent. The cache
+    // takes ownership of the block + ssz buffer; clone both so the mock
+    // chain's storage stays valid for assertions.
+    for (1..mock_chain.blocks.len) |i| {
+        var clone: types.SignedBlock = undefined;
+        try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[i], &clone);
+
+        var ssz_buf: std.ArrayList(u8) = .empty;
+        defer ssz_buf.deinit(std.testing.allocator);
+        try ssz.serialize(types.SignedBlock, mock_chain.blocks[i], &ssz_buf, std.testing.allocator);
+        const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
+
+        try bc.insert(
+            mock_chain.blockRoots[i],
+            clone,
+            ssz_bytes,
+            mock_chain.blocks[i].block.parent_root,
+        );
+    }
+
+    try std.testing.expect(bc.count() == mock_chain.blocks.len - 1);
+
+    // Every inserted root should be retrievable.
+    for (1..mock_chain.blocks.len) |i| {
+        const got = bc.get(mock_chain.blockRoots[i]);
+        try std.testing.expect(got != null);
+    }
+
+    // removeChildrenOf the genesis root should drop the entire chain.
+    const removed = bc.removeChildrenOf(mock_chain.blockRoots[0]);
+    try std.testing.expect(removed > 0);
+    try std.testing.expect(removed <= locking.MAX_CACHED_BLOCKS);
+}
+
+test "BlockCache: partial-state invariant (re-insert leaves no orphans)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var bc = locking.BlockCache.init(std.testing.allocator);
+    defer bc.deinit();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+
+    // Two consecutive inserts at the same root must leave the cache in a
+    // consistent triple-present state — in particular, the second insert
+    // must free the previous block + ssz so a leak detector stays happy.
+    for (0..2) |_| {
+        var clone: types.SignedBlock = undefined;
+        try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], &clone);
+
+        var ssz_buf: std.ArrayList(u8) = .empty;
+        defer ssz_buf.deinit(std.testing.allocator);
+        try ssz.serialize(types.SignedBlock, mock_chain.blocks[1], &ssz_buf, std.testing.allocator);
+        const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
+
+        try bc.insert(
+            mock_chain.blockRoots[1],
+            clone,
+            ssz_bytes,
+            mock_chain.blocks[1].block.parent_root,
+        );
+    }
+
+    // After two inserts: exactly one entry under the root in `blocks` and
+    // `ssz_bytes`, and the children list under the parent has the root
+    // listed twice (since we appended on both inserts — documented
+    // behaviour: `insert` does not de-dup, callers manage that). Either
+    // way `get` must return the latest entry.
+    const got = bc.get(mock_chain.blockRoots[1]);
+    try std.testing.expect(got != null);
+    try std.testing.expect(bc.count() == 1);
 }
