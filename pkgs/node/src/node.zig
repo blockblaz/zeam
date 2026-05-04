@@ -453,11 +453,34 @@ pub const BeamNode = struct {
 
         // Try to process each descendant
         for (children) |descendant_root| {
-            // Atomic (block, ssz) lookup — the two-call dance
-            // (getFetchedBlock + getFetchedBlockSsz) races against
-            // attachSsz / cacheFetchedBlock partial-state windows. See
-            // PR #820 / issue #803.
-            if (self.network.getFetchedBlockWithSsz(descendant_root)) |cached| {
+            // Atomic (block, ssz) clone under the cache mutex. The
+            // legacy borrow-shape `getFetchedBlockWithSsz` was removed in
+            // PR #820 (slice a-3 follow-up): its returned slice headers
+            // pointed into cache-owned storage that a concurrent
+            // `removeFetchedBlock` could free mid-`chain.onBlock`
+            // (UAF — bug 14, surfaced by macOS CI on the new N3 stress
+            // test). The clone-then-release shape transfers ownership to
+            // this caller so the data outlives any cache mutation.
+            const cached_opt = self.network.cloneFetchedBlockAndSsz(
+                descendant_root,
+                self.allocator,
+            ) catch |clone_err| {
+                self.logger.warn(
+                    "Failed to clone cached block 0x{x} for processing: {any}",
+                    .{ &descendant_root, clone_err },
+                );
+                continue;
+            };
+            if (cached_opt) |cached_const| {
+                var cached = cached_const;
+                // Free the clone on every exit path from this branch —
+                // including the early-continue paths below and the
+                // chain.onBlock error handlers. The clone is owned by
+                // `self.allocator` (matches `cloneFetchedBlockAndSsz`'s
+                // signature); deinit frees both `block` interior heap
+                // fields and the `ssz` slice.
+                defer cached.deinit(self.allocator);
+
                 const cached_block = cached.block;
                 // Skip if already known to fork choice — same guard as processBlockByRootChunk
                 if (self.chain.forkChoice.hasBlock(descendant_root)) {
@@ -524,7 +547,10 @@ pub const BeamNode = struct {
                 // could pass false during catch-up and prune once at the end.
                 self.chain.onBlockFollowup(true, &cached_block);
 
-                // Remove from cache now that it's been processed
+                // Remove from cache now that it's been processed. Note:
+                // we own `cached` (clone), so this `removeFetchedBlock`
+                // freeing the cache's copy doesn't affect us — the
+                // `defer cached.deinit(...)` above frees our clone.
                 _ = self.network.removeFetchedBlock(descendant_root);
 
                 // Recursively check for this block's descendants

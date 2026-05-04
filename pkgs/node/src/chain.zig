@@ -3303,9 +3303,11 @@ test "BlockCache: insert + get + removeChildrenOf bounded" {
 
     // Every inserted root should be retrievable.
     for (1..mock_chain.blocks.len) |i| {
-        const got = bc.getBlockAndSsz(mock_chain.blockRoots[i]);
-        try std.testing.expect(got != null);
-        try std.testing.expect(got.?.ssz != null);
+        const got_opt = try bc.cloneBlockAndSsz(mock_chain.blockRoots[i], std.testing.allocator);
+        try std.testing.expect(got_opt != null);
+        var got = got_opt.?;
+        defer got.deinit(std.testing.allocator);
+        try std.testing.expect(got.ssz != null);
     }
 
     // removeChildrenOf the genesis root should drop the entire chain.
@@ -3348,17 +3350,20 @@ test "BlockCache: partial-state invariant (re-insert leaves no orphans)" {
     // `ssz_bytes`, and the children list under the parent has the root
     // listed twice (since we appended on both inserts — documented
     // behaviour: `insert` does not de-dup, callers manage that). Either
-    // way `getBlockAndSsz` must return the latest entry.
-    const got = bc.getBlockAndSsz(mock_chain.blockRoots[1]);
-    try std.testing.expect(got != null);
-    try std.testing.expect(got.?.ssz != null);
+    // way `cloneBlockAndSsz` must return the latest entry.
+    const got_opt = try bc.cloneBlockAndSsz(mock_chain.blockRoots[1], std.testing.allocator);
+    try std.testing.expect(got_opt != null);
+    var got = got_opt.?;
+    defer got.deinit(std.testing.allocator);
+    try std.testing.expect(got.ssz != null);
     try std.testing.expect(bc.count() == 1);
 }
 
 test "BlockCache: insertBlockPtr+ssz atomic visibility" {
-    // Triple-atomic invariant: a reader using getBlockAndSsz must observe
-    // either both-Some or both-null, never a partial state. With the
-    // ssz-arg variant of insertBlockPtr the atomic case is the new path.
+    // Triple-atomic invariant: a reader using cloneBlockAndSsz must
+    // observe either both-Some or both-null, never a partial state.
+    // With the ssz-arg variant of insertBlockPtr the atomic case is
+    // the new path.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -3380,7 +3385,7 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
     const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
 
     // Before insert: both-null.
-    try std.testing.expect(bc.getBlockAndSsz(root) == null);
+    try std.testing.expect((try bc.cloneBlockAndSsz(root, std.testing.allocator)) == null);
 
     try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, ssz_bytes);
     // Cache took the inner SignedBlock value (struct copy). Free the outer
@@ -3389,17 +3394,19 @@ test "BlockCache: insertBlockPtr+ssz atomic visibility" {
     std.testing.allocator.destroy(block_ptr);
 
     // After atomic insert: both-Some.
-    const got = bc.getBlockAndSsz(root);
-    try std.testing.expect(got != null);
-    try std.testing.expect(got.?.ssz != null);
-    try std.testing.expect(got.?.ssz.?.len > 0);
+    const got_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
+    try std.testing.expect(got_opt != null);
+    var got = got_opt.?;
+    defer got.deinit(std.testing.allocator);
+    try std.testing.expect(got.ssz != null);
+    try std.testing.expect(got.ssz.?.len > 0);
 }
 
 test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomically" {
     // The partial-state window between insertBlockPtr(ssz=null,...) and
-    // attachSsz is documented; readers must use getBlockAndSsz to safely
-    // observe whichever atomic snapshot is current. After both calls, the
-    // atomic accessor must report both-Some.
+    // attachSsz is documented; readers must use cloneBlockAndSsz to
+    // safely observe whichever atomic snapshot is current. After both
+    // calls, the atomic accessor must report both-Some.
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const allocator = arena_allocator.allocator();
@@ -3416,10 +3423,14 @@ test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomic
     try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, null);
     std.testing.allocator.destroy(block_ptr);
 
-    // Block-only window: getBlockAndSsz reports block-Some, ssz-null.
-    const partial = bc.getBlockAndSsz(root);
-    try std.testing.expect(partial != null);
-    try std.testing.expect(partial.?.ssz == null);
+    // Block-only window: clone reports block-Some, ssz-null.
+    {
+        const partial_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
+        try std.testing.expect(partial_opt != null);
+        var partial = partial_opt.?;
+        defer partial.deinit(std.testing.allocator);
+        try std.testing.expect(partial.ssz == null);
+    }
 
     var ssz_buf: std.ArrayList(u8) = .empty;
     defer ssz_buf.deinit(std.testing.allocator);
@@ -3429,9 +3440,11 @@ test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomic
     try bc.attachSsz(root, ssz_bytes);
 
     // Now both-Some.
-    const full = bc.getBlockAndSsz(root);
-    try std.testing.expect(full != null);
-    try std.testing.expect(full.?.ssz != null);
+    const full_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
+    try std.testing.expect(full_opt != null);
+    var full = full_opt.?;
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expect(full.ssz != null);
 }
 
 test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
@@ -3461,11 +3474,16 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
     try bc.insertBlockPtr(root, block_ptr, parent_root, ssz_bytes);
     std.testing.allocator.destroy(block_ptr);
 
-    try std.testing.expect(bc.getBlockAndSsz(root) != null);
+    {
+        const present_opt = try bc.cloneBlockAndSsz(root, std.testing.allocator);
+        try std.testing.expect(present_opt != null);
+        var present = present_opt.?;
+        present.deinit(std.testing.allocator);
+    }
     try std.testing.expect(bc.hasChildren(parent_root));
 
     try std.testing.expect(bc.removeFetchedBlock(root));
-    try std.testing.expect(bc.getBlockAndSsz(root) == null);
+    try std.testing.expect((try bc.cloneBlockAndSsz(root, std.testing.allocator)) == null);
     try std.testing.expect(!bc.hasChildren(parent_root));
 
     // Idempotent: second call returns false (no leak / panic).
@@ -3484,7 +3502,7 @@ test "BlockCache: removeFetchedBlock atomically clears entry + parent link" {
 
 test "BlockCache: 3-thread stress — insert / read / remove preserves invariants" {
     // Test A: three threads hammer a single BlockCache. One inserts blocks
-    // (insertBlockPtr with ssz), one reads via getBlockAndSsz, one removes
+    // (insertBlockPtr with ssz), one reads via cloneBlockAndSsz, one removes
     // via removeFetchedBlock. The triple-atomic invariant from #803 says a
     // reader must see {block-Some, ssz-Some} or {block-null, ssz-null} —
     // never the partial state. Removing must not double-free.
@@ -3501,7 +3519,16 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
     var bc = locking.BlockCache.init(std.testing.allocator);
     defer bc.deinit();
 
-    const N: usize = 1500;
+    // N reduced from 1500 to 200 in PR #820 follow-up: the reader now
+    // uses `cloneBlockAndSsz`, which performs a full SSZ round-trip
+    // (serialize + deserialize) per successful probe under the cache
+    // mutex. That's the production-relevant API and the only safe
+    // shape across the unlock — see `OwnedBlockAndSsz` docstring —
+    // but it dramatically increases per-probe cost vs the old
+    // borrow-shape getter. Lower N keeps wall-time reasonable while
+    // still exercising the 3-thread interleaving that's the actual
+    // contract under test.
+    const N: usize = 200;
 
     const Worker = struct {
         // Insert N blocks under fake roots key=base..base+N. Each block
@@ -3554,7 +3581,7 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
         }
 
         // Read random roots within [0, total). Asserts the triple-atomic
-        // invariant: getBlockAndSsz must return either both-Some or null.
+        // invariant: cloneBlockAndSsz must return either both-Some or null.
         fn read(cache: *locking.BlockCache, total: u32) !void {
             var prng = std.Random.DefaultPrng.init(0xCAFEBABE);
             const rand = prng.random();
@@ -3562,7 +3589,11 @@ test "BlockCache: 3-thread stress — insert / read / remove preserves invariant
             while (i < total * 2) : (i += 1) {
                 var root: types.Root = std.mem.zeroes(types.Root);
                 std.mem.writeInt(u32, root[0..4], rand.intRangeLessThan(u32, 0, total), .little);
-                if (cache.getBlockAndSsz(root)) |entry| {
+                // OOM under stress — skip this probe, keep going.
+                const cloned_opt = cache.cloneBlockAndSsz(root, std.testing.allocator) catch continue;
+                if (cloned_opt) |cloned_const| {
+                    var entry = cloned_const;
+                    defer entry.deinit(std.testing.allocator);
                     // Triple-atomic invariant: when block is observable
                     // ssz must also be observable (after the atomic
                     // insertBlockPtr path).

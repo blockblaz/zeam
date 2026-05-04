@@ -306,7 +306,7 @@ pub const Network = struct {
     pub fn cacheFetchedBlock(self: *Self, root: types.Root, block_ptr: *types.SignedBlock) !void {
         const parent_root = block_ptr.block.parent_root;
         // SSZ is attached later via storeFetchedBlockSsz; readers that need
-        // both atomically must use `getFetchedBlockWithSsz` to avoid the
+        // both atomically must use `cloneFetchedBlockAndSsz` to avoid the
         // partial-state window.
         self.block_cache.insertBlockPtr(root, block_ptr, parent_root, null) catch |err| {
             if (err == error.AlreadyCached) {
@@ -330,14 +330,25 @@ pub const Network = struct {
         return self.block_cache.getSsz(root);
     }
 
-    /// Returns the cached `SignedBlock` and its SSZ bytes (if attached) in
-    /// a single atomic lookup. Use this whenever a caller would otherwise
-    /// call `getFetchedBlock(root)` and `getFetchedBlockSsz(root)` back-to-
-    /// back — the two-call shape races against `attachSsz` and (after PR
-    /// #820) against the `cacheFetchedBlock` + `storeFetchedBlockSsz`
-    /// partial-state window.
-    pub fn getFetchedBlockWithSsz(self: *Self, root: types.Root) ?locking.BlockAndSsz {
-        return self.block_cache.getBlockAndSsz(root);
+    /// Atomically clone the cached `SignedBlock` + its SSZ bytes (if
+    /// attached) under the cache mutex and return owned copies. Returns
+    /// null when the root is not cached. Caller MUST call
+    /// `.deinit(allocator)` on the returned value to release the clones.
+    ///
+    /// This is the only safe shape for callers that need (block, ssz) to
+    /// outlive the cache mutex — in particular, anything that hands the
+    /// data into `chain.onBlock` (STF + XMSS verify, hundreds of ms
+    /// during which a concurrent `removeFetchedBlock` could free the
+    /// underlying storage). The borrow-shape `getFetchedBlockWithSsz`
+    /// was removed in PR #820 (slice a-3 follow-up); see the
+    /// `OwnedBlockAndSsz` docstring in `locking.zig` for the full UAF
+    /// rationale.
+    pub fn cloneFetchedBlockAndSsz(
+        self: *Self,
+        root: types.Root,
+        allocator: std.mem.Allocator,
+    ) !?locking.OwnedBlockAndSsz {
+        return self.block_cache.cloneBlockAndSsz(root, allocator);
     }
 
     /// Store pre-serialized SSZ bytes alongside a cached block. Caller

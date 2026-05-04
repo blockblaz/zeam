@@ -288,14 +288,44 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
 /// "longest critical section under block_cache_lock" call-out.
 pub const MAX_CACHED_BLOCKS: usize = 1024;
 
-/// Result type for `BlockCache.getBlockAndSsz`. Nominal so the same struct
-/// is referenceable from network-layer wrappers (Zig anonymous-struct
-/// return types are not assignable across function boundaries).
-pub const BlockAndSsz = struct {
+/// Owned (allocator-allocated) snapshot of a cached (block, ssz) pair.
+/// Both `block` and `ssz` are deep-clones under the caller's allocator —
+/// no slice header aliases back into cache-owned storage. Caller MUST
+/// call `deinit(allocator)` on the returned value to release the clones.
+///
+/// This is the *only* shape the production code (and tests asserting
+/// post-unlock invariants) should use. The legacy borrow-shape
+/// `BlockAndSsz` / `getBlockAndSsz` were removed in PR #820 (slice a-3
+/// follow-up) because their slice headers pointed into cache-owned
+/// memory that a concurrent `removeFetchedBlock` could free between
+/// the lock release and the caller's read — a textbook UAF that macOS
+/// CI surfaced via the new N3 concurrent stress test on commit 42b4566.
+/// Holding the cache mutex across the consumer's STF / XMSS work is the
+/// alternative shape and is *worse* (blocks every reader for hundreds of
+/// ms); clone-then-release is the correct discipline.
+pub const OwnedBlockAndSsz = struct {
     block: types.SignedBlock,
-    ssz: ?[]const u8,
+    ssz: ?[]u8,
+
+    pub fn deinit(self: *OwnedBlockAndSsz, allocator: Allocator) void {
+        self.block.deinit();
+        if (self.ssz) |s| allocator.free(s);
+    }
 };
 
+/// `BlockCache` slice-discipline rules (slice a-3, PR #820 follow-up).
+///
+/// **Read-then-unlock is UNSAFE for ssz / SignedBlock.** Both store
+/// allocator-owned slices that another thread can `removeFetchedBlock`
+/// + free immediately after the read returns. Any caller that needs
+/// (block, ssz) to remain valid past the cache mutex MUST go through
+/// `cloneBlockAndSsz` (deep-clone under the lock, transfer ownership to
+/// the caller). The legacy borrow-shape getters were deleted on
+/// purpose; do not reintroduce them.
+///
+/// Direct access to `self.blocks` / `self.ssz_bytes` from outside
+/// `BlockCache` bypasses the clone discipline. Don't add such accessors
+/// without a written justification on the PR.
 pub const BlockCache = struct {
     const Self = @This();
 
@@ -353,16 +383,17 @@ pub const BlockCache = struct {
     ///
     /// When `ssz` is non-null the SSZ bytes are inserted in the SAME
     /// critical section as the block + parent link, preserving the
-    /// triple-atomic invariant: a concurrent reader using `getBlockAndSsz`
-    /// observes either both-null or both-Some, never a partial state.
-    /// (PR #820 / issue #803 — the legacy `insertBlockPtr` + later
-    /// `attachSsz` shape created a window where readers saw block-only.)
+    /// triple-atomic invariant: a concurrent reader using
+    /// `cloneBlockAndSsz` observes either both-null or both-Some, never
+    /// a partial state. (PR #820 / issue #803 — the legacy
+    /// `insertBlockPtr` + later `attachSsz` shape created a window
+    /// where readers saw block-only.)
     ///
     /// When `ssz` is null the SSZ slot is left empty; callers can attach
     /// the bytes later via `attachSsz`. Direct readers of `getBlock` and
     /// `getSsz` (independently) MUST tolerate this brief partial-state
     /// window; readers that need both atomically must call
-    /// `getBlockAndSsz`.
+    /// `cloneBlockAndSsz`.
     ///
     /// On duplicate root: caller still owns `block_ptr` (and `ssz` if
     /// passed); the call returns `error.AlreadyCached` so the caller can
@@ -428,7 +459,7 @@ pub const BlockCache = struct {
     /// NOTE: between `insertBlockPtr(ssz=null, ...)` and this call there is
     /// a brief window where `getBlock(root)` returns Some but `getSsz(root)`
     /// returns null. Readers that need both atomically must use
-    /// `getBlockAndSsz` instead of two independent calls.
+    /// `cloneBlockAndSsz` instead of two independent calls.
     pub fn attachSsz(self: *Self, root: types.Root, ssz: []u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -490,19 +521,58 @@ pub const BlockCache = struct {
         try child_gop.value_ptr.append(self.allocator, root);
     }
 
-    /// Read the cached (block, ssz) pair by root, atomically. Returns null
-    /// when no block is cached at `root`. The `ssz` field may itself be
-    /// null when the bytes have not yet been attached — single lock
-    /// acquisition guarantees the caller never observes a torn pair.
-    /// Callers that need both fields together MUST use this entry point
-    /// rather than `getBlock` + `getSsz` separately (those take two
-    /// independent locks and can race against `attachSsz`).
-    pub fn getBlockAndSsz(self: *Self, root: types.Root) ?BlockAndSsz {
+    /// Atomically clone (block, ssz) under the cache mutex and return owned
+    /// copies. Returns null when no block is cached at `root`. Caller MUST
+    /// call `.deinit(allocator)` on the returned value to release the
+    /// clones.
+    ///
+    /// The `ssz` field of the returned struct is null when ssz bytes have
+    /// not been attached for this root yet (the documented partial-state
+    /// window between `insertBlockPtr(ssz=null)` and `attachSsz`). A
+    /// single lock acquisition guarantees the caller never observes a
+    /// torn pair.
+    ///
+    /// All allocations happen INSIDE the critical section so the cloned
+    /// data has no aliasing back into cache-owned memory once the lock
+    /// is released. The block clone uses `types.sszClone` (round-trip
+    /// serialize/deserialize) so every interior heap field is freshly
+    /// allocated under `allocator`. The ssz clone uses `allocator.dupe`.
+    ///
+    /// Use this for any caller that needs (block, ssz) to remain valid
+    /// across cache mutations or long-running work (e.g. `chain.onBlock`
+    /// → STF + XMSS verify, hundreds of ms). The previous borrow-shape
+    /// `getBlockAndSsz` returned slice headers that pointed into
+    /// cache-owned storage; a concurrent `removeFetchedBlock` would free
+    /// those bytes mid-STF (UAF — bug 14, macOS CI #820).
+    pub fn cloneBlockAndSsz(
+        self: *Self,
+        root: types.Root,
+        allocator: Allocator,
+    ) !?OwnedBlockAndSsz {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const block = self.blocks.get(root) orelse return null;
-        const ssz_opt: ?[]const u8 = self.ssz_bytes.get(root);
-        return .{ .block = block, .ssz = ssz_opt };
+
+        const block_ptr = self.blocks.getPtr(root) orelse return null;
+
+        // Deep-clone the SignedBlock under the cache lock. `sszClone`
+        // round-trips through ssz bytes so the result has no aliasing
+        // back into cache-owned storage. If this fails (OOM mid-clone),
+        // we have not allocated anything else yet — just propagate.
+        var cloned_block: types.SignedBlock = undefined;
+        try types.sszClone(allocator, types.SignedBlock, block_ptr.*, &cloned_block);
+        errdefer cloned_block.deinit();
+
+        // Dupe the ssz bytes (if any). Done AFTER the block clone so the
+        // errdefer above unwinds the block clone if dupe fails. The
+        // returned `ssz` slice is owned by the caller's allocator —
+        // independent of the cache's allocator, so even if the cache
+        // later frees its copy the caller's clone remains valid.
+        const ssz_clone: ?[]u8 = if (self.ssz_bytes.get(root)) |s|
+            try allocator.dupe(u8, s)
+        else
+            null;
+
+        return .{ .block = cloned_block, .ssz = ssz_clone };
     }
 
     pub fn contains(self: *Self, root: types.Root) bool {
@@ -1657,15 +1727,20 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
     //         insertBlockPtr(ssz=null) ; attachSsz
     //     This is the exact shape of `Network.cacheFetchedBlock` +
     //     later `Network.storeFetchedBlockSsz` in the production code.
-    //   * Thread B (reader): spins on `getBlockAndSsz` for the roots
+    //   * Thread B (reader): spins on `cloneBlockAndSsz` for the roots
     //     Thread A is producing; asserts atomic invariant
     //         block-Some => ssz is null OR Some, never garbage
     //     and that whenever block is Some the slot/parent_root are
-    //     readable (the SignedBlock value itself is the cache copy and
-    //     its inner slices are stable across the unlock when the entry
-    //     hasn't been removed). Counts how many times the
-    //     (block-Some, ssz-null) partial state was observed so we can
-    //     assert the bounded-window claim is actually exercised.
+    //     readable (the clone owns its interior storage so it's safe
+    //     across a concurrent `removeFetchedBlock`). Counts how many
+    //     times the (block-Some, ssz-null) partial state was observed
+    //     so we can assert the bounded-window claim is actually
+    //     exercised. Pre-PR-#820-followup this test used the
+    //     borrow-shape `getBlockAndSsz` and macOS CI exposed a UAF on
+    //     `bs.ssz.?[0] == 0xDE` because the borrowed slice header
+    //     aliased cache-owned bytes that the Remover thread freed +
+    //     reused mid-read. Linux happened to keep the buffer intact
+    //     long enough to mask the bug; macOS did not.
     //   * Thread C (remover): drains roots from a queue once
     //     attach-completed; calls `removeFetchedBlock` on each. Must
     //     never trigger a double-free (the cache's own deinit path
@@ -1674,7 +1749,17 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
     //
     // No XMSS, no STF — fixtures only. The contract under test is
     // BlockCache atomicity, not signature validity.
-    const ITER: usize = 1500;
+    //
+    // ITER reduced from 1500 to 300 in PR #820 follow-up: the reader
+    // now uses `cloneBlockAndSsz`, which performs a full SSZ
+    // round-trip (serialize + deserialize) on each successful probe
+    // under the cache mutex. That's the production-relevant API — see
+    // `OwnedBlockAndSsz` docstring — but it dramatically increases
+    // per-probe cost vs the old borrow-shape `getBlockAndSsz`, so the
+    // test has to do fewer iterations to stay in a reasonable time
+    // budget. The bounded-window claim still gets exercised at this
+    // count (assertions below verify that).
+    const ITER: usize = 300;
     var bc = BlockCache.init(testing.allocator);
     defer bc.deinit();
 
@@ -1784,7 +1869,19 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
                     if (prod_q.isClosed()) break;
                     continue;
                 };
-                if (cache.getBlockAndSsz(r)) |bs| {
+                // Use the cloning variant: the borrow-shape
+                // `getBlockAndSsz` was removed in PR #820 follow-up
+                // because its returned slice headers pointed into
+                // cache-owned memory that a concurrent
+                // `removeFetchedBlock` could free — the same UAF that
+                // macOS CI surfaced via `bs.ssz.?[0] == 0xDE` failing.
+                // With the clone variant the assertion is deterministic
+                // because the reader owns the bytes.
+                // OOM under stress — skip this probe, keep stress going.
+                const cloned_opt = cache.cloneBlockAndSsz(r, testing.allocator) catch continue;
+                if (cloned_opt) |cloned_const| {
+                    var bs = cloned_const;
+                    defer bs.deinit(testing.allocator);
                     // Block-Some path: slices must be readable.
                     // `slot` is plain u64; reading it should never trap.
                     // `parent_root` is a fixed-size array, also safe.
@@ -1801,6 +1898,8 @@ test "BlockCache: split insertBlockPtr(null)+attachSsz race vs concurrent reader
                         partial_observed.* += 1;
                     } else {
                         // SSZ Some: bytes must be the 4-byte fixture.
+                        // Now deterministic with the clone variant —
+                        // the reader owns these bytes.
                         std.debug.assert(bs.ssz.?.len == 4);
                         std.debug.assert(bs.ssz.?[0] == 0xDE);
                         full_observed.* += 1;
