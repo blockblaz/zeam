@@ -628,7 +628,11 @@ pub const BeamNode = struct {
         signed_block: types.SignedBlock,
         depth: u32,
     ) CacheBlockError!types.Root {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        // Snapshot under the forkchoice shared lock — latest_finalized is
+        // a multi-field struct (Checkpoint) written under exclusive; a raw
+        // field read can tear (slot, blockRoot) pairs across concurrent
+        // updates now that BeamNode.mutex no longer serialises us.
+        const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
         const block_slot = signed_block.block.slot;
 
         // Early rejection: don't cache blocks at or before finalized slot
@@ -693,7 +697,9 @@ pub const BeamNode = struct {
         block_root: types.Root,
         signed_block: types.SignedBlock,
     ) CacheBlockError!void {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        // See cacheBlockAndFetchParent: take the shared lock via the
+        // accessor so we don't tear-read latest_finalized.
+        const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
         const block_slot = signed_block.block.slot;
 
         if (block_slot <= finalized_slot) {
@@ -903,7 +909,8 @@ pub const BeamNode = struct {
                         switch (sync_status) {
                             .behind_peers => |info| {
                                 // Only sync from this peer if their finalized slot is ahead of ours
-                                if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
+                                const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+                                if (status_resp.finalized_slot > our_finalized_slot) {
                                     self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
                                         status_ctx.peer_id,
                                         self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
@@ -929,12 +936,18 @@ pub const BeamNode = struct {
                                 // the sync code skips fc_initing.
                                 // Treat this exactly like behind_peers: if the peer's head is ahead
                                 // of our anchor, request their head block to start the parent chain.
-                                if (status_resp.head_slot > self.chain.forkChoice.head.slot) {
+                                // Snapshot once: forkChoice.head is a
+                                // multi-field ProtoBlock written under
+                                // exclusive. A second raw read in the log
+                                // call could pair this slot with a
+                                // different update's blockRoot.
+                                const head_snapshot = self.chain.forkChoice.getHead();
+                                if (status_resp.head_slot > head_snapshot.slot) {
                                     self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
                                         status_ctx.peer_id,
                                         self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
                                         status_resp.head_slot,
-                                        self.chain.forkChoice.head.slot,
+                                        head_snapshot.slot,
                                         &status_resp.head_root,
                                     });
                                     const roots = [_]types.Root{status_resp.head_root};
