@@ -28,6 +28,7 @@ const LockTimer = locking.LockTimer;
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
+const ConnectedPeers = networkFactory.ConnectedPeers;
 
 const NodeNameRegistry = networks.NodeNameRegistry;
 const ZERO_SIGBYTES = types.ZERO_SIGBYTES;
@@ -113,7 +114,11 @@ pub const BeamChain = struct {
     // Track last-emitted checkpoints to avoid duplicate SSE events (e.g., genesis spam)
     last_emitted_justified: types.Checkpoint,
     last_emitted_finalized: types.Checkpoint,
-    connected_peers: *const std.StringHashMap(PeerInfo),
+    /// Read-only handle to the network's connected-peer registry. The
+    /// chain reads `count()` (atomic, lock-free) and iterates via
+    /// `iterateLocked()` for sync-status decisions. Mutation is the
+    /// network's responsibility — the chain only consumes.
+    connected_peers: *ConnectedPeers,
     node_registry: *const NodeNameRegistry,
     force_block_production: bool,
     // Aggregator role flag, toggleable at runtime via `setAggregator`.
@@ -193,7 +198,7 @@ pub const BeamChain = struct {
     pub fn init(
         allocator: Allocator,
         opts: ChainOpts,
-        connected_peers: *const std.StringHashMap(PeerInfo),
+        connected_peers: *ConnectedPeers,
     ) !Self {
         const logger_config = opts.logger_config;
         const fork_choice = try fcFactory.ForkChoice.init(allocator, .{
@@ -2214,7 +2219,9 @@ pub const BeamChain = struct {
         // Find the maximum finalized slot reported by any peer
         var max_peer_finalized_slot: types.Slot = our_finalized_slot;
 
-        var peer_iter = self.connected_peers.iterator();
+        var peer_guard = self.connected_peers.iterateLocked();
+        defer peer_guard.deinit();
+        var peer_iter = peer_guard.iter;
         while (peer_iter.next()) |entry| {
             const peer_info = entry.value_ptr;
             if (peer_info.latest_status) |status| {
@@ -2311,8 +2318,8 @@ test "process and add mock blocks into a node's chain" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     // Create empty node registry for test
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -2409,7 +2416,11 @@ test "printSlot output demonstration" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, &std.StringHashMap(PeerInfo).init(allocator));
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, blk: {
+        const cp = try allocator.create(ConnectedPeers);
+        cp.* = ConnectedPeers.init(allocator);
+        break :blk cp;
+    });
 
     // Process some blocks to have a more interesting chain state
     for (1..mock_chain.blocks.len) |i| {
@@ -2485,7 +2496,11 @@ test "buildTreeVisualization integration test" {
     defer test_registry.deinit();
 
     // Initialize the beam chain
-    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, &std.StringHashMap(PeerInfo).init(allocator));
+    var beam_chain = try BeamChain.init(allocator, ChainOpts{ .config = chain_config, .anchorState = &beam_state, .nodeId = nodeId, .logger_config = &zeam_logger_config, .db = db, .node_registry = test_registry }, blk: {
+        const cp = try allocator.create(ConnectedPeers);
+        cp.* = ConnectedPeers.init(allocator);
+        break :blk cp;
+    });
 
     // Process blocks to build the forkchoice tree
     for (1..mock_chain.blocks.len) |i| {
@@ -2566,8 +2581,8 @@ test "attestation validation - comprehensive" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     // Create empty node registry for test
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -2844,8 +2859,8 @@ test "attestation validation - gossip vs block future slot handling" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     // Create empty node registry for test
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -2946,8 +2961,8 @@ test "attestation processing - valid block attestation" {
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     // Create empty node registry for test
     const test_registry = try allocator.create(NodeNameRegistry);
@@ -3049,8 +3064,8 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
     defer db.deinit();
 
-    const connected_peers = try allocator.create(std.StringHashMap(PeerInfo));
-    connected_peers.* = std.StringHashMap(PeerInfo).init(allocator);
+    const connected_peers = try allocator.create(ConnectedPeers);
+    connected_peers.* = ConnectedPeers.init(allocator);
 
     const test_registry = try allocator.create(NodeNameRegistry);
     defer allocator.destroy(test_registry);

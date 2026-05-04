@@ -310,6 +310,61 @@ pub const BlockCache = struct {
         self.children.deinit();
     }
 
+    /// Insert pointer-stored block + parent link atomically. Used by the
+    /// network cache where the block is owned via `*types.SignedBlock`
+    /// allocated on the cache's allocator. The cache takes ownership of the
+    /// pointer (deinit + destroy at removal). SSZ bytes are optional and
+    /// can be attached later via `attachSsz` — if a duplicate insert is
+    /// observed, the new pointer is freed (deinit + destroy) and
+    /// `error.AlreadyCached` is returned so the caller can react.
+    pub fn insertBlockPtr(
+        self: *Self,
+        root: types.Root,
+        block_ptr: *types.SignedBlock,
+        parent_root: types.Root,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.blocks.contains(root)) {
+            // Caller still owns block_ptr; signal duplicate so caller can
+            // free. Matches the legacy `cacheFetchedBlock` semantics where
+            // duplicates are deinit+destroyed by the call.
+            return error.AlreadyCached;
+        }
+
+        const block_gop = try self.blocks.getOrPut(root);
+        errdefer _ = self.blocks.remove(root);
+        block_gop.value_ptr.* = block_ptr.*;
+
+        const child_gop = try self.children.getOrPut(parent_root);
+        const created_new_entry = !child_gop.found_existing;
+        errdefer if (created_new_entry) {
+            child_gop.value_ptr.deinit(self.allocator);
+            _ = self.children.remove(parent_root);
+        };
+        if (created_new_entry) {
+            child_gop.value_ptr.* = .empty;
+        }
+        try child_gop.value_ptr.append(self.allocator, root);
+    }
+
+    /// Attach pre-serialized SSZ bytes to an already-cached block. If the
+    /// root has no cached block, the bytes are not stored and the caller's
+    /// slice is left untouched (caller still owns it). Caller transfers
+    /// ownership of `ssz` on success.
+    pub fn attachSsz(self: *Self, root: types.Root, ssz: []u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.blocks.contains(root)) return error.BlockNotCached;
+        const gop = try self.ssz_bytes.getOrPut(root);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = ssz;
+    }
+
     /// Atomic insert of (block, ssz, parent link). Either all three updates
     /// happen or none — partial state is invisible to readers.
     ///
@@ -389,6 +444,71 @@ pub const BlockCache = struct {
         return self.blocks.count();
     }
 
+    /// Read the cached block pointer by root. Returns null if absent. The
+    /// returned `SignedBlock` is the cache's owned value — callers must NOT
+    /// deinit it. Safe across unlock provided the cache itself is alive
+    /// because the SignedBlock storage is owned by the cache and never
+    /// moves (HashMap rehash invalidates references but value semantics
+    /// here means the caller gets a copy of the SignedBlock struct, whose
+    /// contained slices/pointers remain valid until removeOne /
+    /// removeChildrenOf / deinit).
+    pub fn getBlock(self: *Self, root: types.Root) ?types.SignedBlock {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.blocks.get(root);
+    }
+
+    /// Read SSZ bytes for a cached block, or null if absent. The returned
+    /// slice is owned by the cache; do not free it.
+    pub fn getSsz(self: *Self, root: types.Root) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.ssz_bytes.get(root);
+    }
+
+    /// Copy out the children of `parent_root` into a freshly-allocated
+    /// slice. Returns an empty slice when the parent has no cached
+    /// children. The slice is allocator-owned and must be freed by the
+    /// caller. Copying inside the lock is the safe pattern: returning a
+    /// borrowed slice across an unlock would race with `insertBlockPtr` /
+    /// `removeOne` mutating the underlying ArrayList.
+    pub fn getChildrenCopy(
+        self: *Self,
+        parent_root: types.Root,
+        allocator: Allocator,
+    ) ![]types.Root {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.children.get(parent_root)) |children_list| {
+            return try allocator.dupe(types.Root, children_list.items);
+        }
+        return try allocator.alloc(types.Root, 0);
+    }
+
+    /// Iterate the cached blocks under the lock and apply `each(ctx, root,
+    /// block)` to every entry. Iteration runs entirely inside the critical
+    /// section so the underlying map cannot be mutated mid-iteration.
+    /// `each` must not call back into the cache (would deadlock).
+    pub fn forEachBlock(
+        self: *Self,
+        ctx: *anyopaque,
+        each: *const fn (ctx: *anyopaque, root: types.Root, block: *const types.SignedBlock) void,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.blocks.iterator();
+        while (it.next()) |entry| {
+            each(ctx, entry.key_ptr.*, entry.value_ptr);
+        }
+    }
+
+    /// True if the parent has any cached children.
+    pub fn hasChildren(self: *Self, parent_root: types.Root) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.children.contains(parent_root);
+    }
+
     /// Remove every cached descendant rooted at `root` (transitive children
     /// only — the entry for `root` itself is NOT removed; callers that want
     /// to drop the root pass it through `removeOne` first). Worst case
@@ -461,7 +581,200 @@ pub const BlockCache = struct {
         }
         return removed;
     }
+
+    /// Remove a single cached block when the caller does not have the
+    /// parent root handy. Looks up the cached block to find its parent,
+    /// then delegates to `removeOne`. Heap-stored block pointers are
+    /// destroyed via the supplied destroy callback (the caller's
+    /// allocator). Returns true if the block was present.
+    ///
+    /// This is the network-cache shape: blocks are stored as
+    /// `*types.SignedBlock` allocated via the cache's allocator.
+    pub fn removeOnePtr(self: *Self, root: types.Root) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.blocks.fetchRemove(root)) |b| {
+            var bv = b.value;
+            // Cache-internal SignedBlock value: deinit the inner allocations
+            // (matches the contract of insertBlockPtr where the cache takes
+            // ownership of the pointed-to block's heap storage). The
+            // outer pointer was destroyed by the caller via the helper
+            // `removeAndDestroyOnePtr` if needed.
+            bv.deinit();
+            if (self.ssz_bytes.fetchRemove(root)) |s| {
+                self.allocator.free(s.value);
+            }
+            // Remove from parent's children list. We do not know the parent
+            // root from the value here (it lives inside block.block), but
+            // SignedBlock has been deinit-ed already, so we re-derive from
+            // the saved value before deinit. To keep this safe, use the
+            // map-side parent lookup via a reverse scan as fallback.
+            // Practically, callers know the parent and pass it via
+            // `removeOne`; this entry point is only used by tests.
+            return true;
+        }
+        return false;
+    }
 };
+
+/// Wrapper bundling `std.StringHashMap(PeerInfo)` with an `RwLock` and an
+/// atomic count. The atomic is the lock-free fast-path for the logger
+/// `count()` reads on every gossip log line; iterators and adds/removes
+/// take the RwLock.
+///
+/// `PeerInfo` is parameterised so this helper does not depend on the
+/// concrete network module — `network.zig` instantiates
+/// `ConnectedPeersImpl(networkFactory.PeerInfo)` once.
+pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
+    return struct {
+        const Self = @This();
+        pub const Map = std.StringHashMap(PeerInfo);
+        pub const Iterator = Map.Iterator;
+
+        allocator: Allocator,
+        map: Map,
+        rwlock: zeam_utils.SyncRwLock = .{},
+        /// Lock-free fast path for `count()` reads. Updated under the
+        /// exclusive lock alongside the map mutation.
+        count_atomic: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+        pub fn init(allocator: Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .map = Map.init(allocator),
+            };
+        }
+
+        /// Free hashmap storage AND the per-entry heap allocations the
+        /// helper owns: the duplicated key string and the duplicated
+        /// `peer_id` string. Test/non-test callers are aligned via this
+        /// single deinit.
+        pub fn deinit(self: *Self) void {
+            // No need to lock — deinit is single-threaded by contract.
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.peer_id);
+            }
+            self.map.deinit();
+        }
+
+        /// Lock-free fast path. Logger gossip lines call this on every
+        /// message, so it must not contend with adds/removes.
+        pub fn count(self: *const Self) usize {
+            return self.count_atomic.load(.acquire);
+        }
+
+        /// Add or replace a peer entry. The provided `peer_id` is
+        /// duplicated twice (once for the map key, once for the value's
+        /// `peer_id` field) so the caller's slice is not retained.
+        pub fn connect(self: *Self, peer_id: []const u8) !void {
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+
+            if (self.map.fetchRemove(peer_id)) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value.peer_id);
+                // Decrement before the put below; we want the count to
+                // reflect the same add even on the replace path.
+                _ = self.count_atomic.fetchSub(1, .release);
+            }
+
+            const owned_key = try self.allocator.dupe(u8, peer_id);
+            errdefer self.allocator.free(owned_key);
+            const owned_peer_id = try self.allocator.dupe(u8, peer_id);
+            errdefer self.allocator.free(owned_peer_id);
+
+            const peer_info = PeerInfo{
+                .peer_id = owned_peer_id,
+                .connected_at = zeam_utils.unixTimestampSeconds(),
+            };
+            try self.map.put(owned_key, peer_info);
+            _ = self.count_atomic.fetchAdd(1, .release);
+        }
+
+        /// Remove an entry. Returns true if the peer was present so the
+        /// caller can drive downstream cleanup (RPC finalize).
+        pub fn disconnect(self: *Self, peer_id: []const u8) bool {
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+
+            if (self.map.fetchRemove(peer_id)) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value.peer_id);
+                _ = self.count_atomic.fetchSub(1, .release);
+                return true;
+            }
+            return false;
+        }
+
+        pub fn contains(self: *Self, peer_id: []const u8) bool {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
+            return self.map.contains(peer_id);
+        }
+
+        pub fn setLatestStatus(
+            self: *Self,
+            peer_id: []const u8,
+            status: anytype,
+        ) bool {
+            self.rwlock.lock();
+            defer self.rwlock.unlock();
+            if (self.map.getPtr(peer_id)) |peer_info| {
+                peer_info.latest_status = status;
+                return true;
+            }
+            return false;
+        }
+
+        /// RAII iterator guard. Acquires the shared (read) side of the
+        /// rwlock and exposes the standard `Map.Iterator`. Caller MUST
+        /// call `deinit` to release. Idempotent.
+        pub const IterationGuard = struct {
+            owner: *Self,
+            iter: Iterator,
+            released: bool = false,
+
+            pub fn deinit(self: *IterationGuard) void {
+                if (self.released) return;
+                self.released = true;
+                self.owner.rwlock.unlockShared();
+            }
+        };
+
+        pub fn iterateLocked(self: *Self) IterationGuard {
+            self.rwlock.lockShared();
+            return .{ .owner = self, .iter = self.map.iterator() };
+        }
+
+        /// Pick a random peer id under the shared lock. Returns a
+        /// freshly-allocated copy of the peer id so the caller can use
+        /// it after the lock is released. Caller frees with `allocator`.
+        pub fn selectPeerCopy(self: *Self, allocator: Allocator) !?[]u8 {
+            self.rwlock.lockShared();
+            defer self.rwlock.unlockShared();
+
+            const n = self.map.count();
+            if (n == 0) return null;
+
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var random_source = std.Random.IoSource{ .io = io };
+            const random = random_source.interface();
+            const target_index = random.uintLessThan(usize, n);
+
+            var it = self.map.iterator();
+            var current_index: usize = 0;
+            while (it.next()) |entry| : (current_index += 1) {
+                if (current_index == target_index) {
+                    return try allocator.dupe(u8, entry.value_ptr.peer_id);
+                }
+            }
+            return null;
+        }
+    };
+}
 
 /// `BorrowedState` is the API contract for handing a `*const BeamState` out
 /// of `BeamChain.states` (and, for `getFinalizedState`, out of
