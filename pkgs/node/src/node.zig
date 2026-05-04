@@ -2497,3 +2497,137 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         try std.testing.expect(std.mem.eql(u8, &stored_block.block.parent_root, &signed_block.block.parent_root));
     }
 }
+
+test "Network: BlockCache wiring smoke (slice a-3)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_a: types.Root = [_]u8{0x11} ** 32;
+    const root_b: types.Root = [_]u8{0x22} ** 32;
+    const root_c: types.Root = [_]u8{0x33} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
+
+    // insertBlockPtr path (via Network.cacheFetchedBlock).
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_a));
+
+    try std.testing.expectEqual(@as(usize, 3), node.network.getFetchedBlockCount());
+    try std.testing.expect(node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(node.network.hasFetchedBlock(root_c));
+
+    // Duplicate insert is silently absorbed (block_ptr is freed by
+    // cacheFetchedBlock).
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try std.testing.expectEqual(@as(usize, 3), node.network.getFetchedBlockCount());
+
+    // getChildrenOfBlock returns an owned slice with both children of A.
+    const children_of_a = try node.network.getChildrenOfBlock(root_a);
+    defer allocator.free(children_of_a);
+    try std.testing.expectEqual(@as(usize, 2), children_of_a.len);
+
+    // attachSsz works for cached blocks, errors for missing ones.
+    const ssz_buf = try allocator.dupe(u8, "abcdef");
+    try node.network.storeFetchedBlockSsz(root_a, ssz_buf);
+    try std.testing.expect(node.network.getFetchedBlockSsz(root_a) != null);
+    try std.testing.expect(node.network.getFetchedBlockSsz(root_b) == null);
+
+    // collectCachedBlocksAtOrBelowSlot picks up the slot-1 / slot-2 blocks.
+    const at_or_below_2 = try node.network.collectCachedBlocksAtOrBelowSlot(2);
+    defer allocator.free(at_or_below_2);
+    try std.testing.expect(at_or_below_2.len >= 2);
+
+    // collectReadyCachedBlocks returns block summaries for slot-≤-3 blocks.
+    const ready = try node.network.collectReadyCachedBlocks(3);
+    defer allocator.free(ready);
+    try std.testing.expectEqual(@as(usize, 3), ready.len);
+
+    // removeFetchedBlock walks the parent-link cleanly: remove B, A's
+    // children should drop to one.
+    try std.testing.expect(node.network.removeFetchedBlock(root_b));
+    const children_after = try node.network.getChildrenOfBlock(root_a);
+    defer allocator.free(children_after);
+    try std.testing.expectEqual(@as(usize, 1), children_after.len);
+}
+
+test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), node.network.getPeerCount());
+
+    try node.network.connectPeer("peer-aaa");
+    try node.network.connectPeer("peer-bbb");
+    try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
+    try std.testing.expect(node.network.hasPeer("peer-aaa"));
+
+    // selectPeer returns an owned copy.
+    if (try node.network.selectPeer()) |picked| {
+        defer allocator.free(picked);
+        try std.testing.expect(node.network.hasPeer(picked));
+    } else return error.NoPick;
+
+    try std.testing.expect(node.network.disconnectPeer("peer-aaa"));
+    try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
+}

@@ -1061,3 +1061,153 @@ test "tier5 depth counter increments and decrements" {
     leaveTier5();
     try testing.expectEqual(@as(u32, 0), tier5_depth);
 }
+
+// ---------------------------------------------------------------------
+// Slice (a-3) tests — LockedMap concurrency, ConnectedPeers smoke,
+// BlockCache wiring helpers exercised by the network shape.
+// ---------------------------------------------------------------------
+
+test "LockedMap: concurrent put/get/remove smoke" {
+    const LM = LockedMap(u32, u32);
+    var lm = LM.init(testing.allocator);
+    defer lm.deinit();
+
+    const N: u32 = 256;
+    const Worker = struct {
+        fn run(map: *LM, base: u32, count: u32) !void {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const k = base + i;
+                try map.put(k, k * 2);
+                _ = map.get(k);
+                if ((i % 3) == 0) {
+                    _ = map.remove(k);
+                } else if ((i % 5) == 0) {
+                    var guard = map.iterateLocked();
+                    defer guard.deinit();
+                    var visited: usize = 0;
+                    while (guard.iter.next()) |_| : (visited += 1) {
+                        if (visited > 10_000) break;
+                    }
+                }
+            }
+        }
+    };
+
+    var t1 = try std.Thread.spawn(.{}, Worker.run, .{ &lm, 0, N });
+    var t2 = try std.Thread.spawn(.{}, Worker.run, .{ &lm, N, N });
+    var t3 = try std.Thread.spawn(.{}, Worker.run, .{ &lm, 2 * N, N });
+    var t4 = try std.Thread.spawn(.{}, Worker.run, .{ &lm, 3 * N, N });
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    // No deadlock and no crash. Final count is bounded above by 4*N
+    // (some keys removed by the (i%3) branch).
+    try testing.expect(lm.count() <= 4 * N);
+}
+
+test "ConnectedPeers: connect / disconnect / count atomic" {
+    const FakePeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64,
+        latest_status: ?u32 = null,
+    };
+    const CP = ConnectedPeersImpl(FakePeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    try testing.expectEqual(@as(usize, 0), cp.count());
+    try cp.connect("peer-a");
+    try cp.connect("peer-b");
+    try cp.connect("peer-c");
+    try testing.expectEqual(@as(usize, 3), cp.count());
+    try testing.expect(cp.contains("peer-b"));
+
+    // Replace existing peer — count remains the same.
+    try cp.connect("peer-b");
+    try testing.expectEqual(@as(usize, 3), cp.count());
+
+    try testing.expect(cp.disconnect("peer-b"));
+    try testing.expectEqual(@as(usize, 2), cp.count());
+    try testing.expect(!cp.disconnect("peer-b"));
+
+    // setLatestStatus on present + missing.
+    try testing.expect(cp.setLatestStatus("peer-a", @as(u32, 42)));
+    try testing.expect(!cp.setLatestStatus("peer-z", @as(u32, 0)));
+
+    // Iteration sees the remaining two entries under the shared lock.
+    {
+        var guard = cp.iterateLocked();
+        defer guard.deinit();
+        var seen: usize = 0;
+        while (guard.iter.next()) |_| : (seen += 1) {}
+        try testing.expectEqual(@as(usize, 2), seen);
+    }
+
+    // selectPeerCopy returns an owned slice from the present set.
+    const picked = (try cp.selectPeerCopy(testing.allocator)) orelse return error.NoPick;
+    defer testing.allocator.free(picked);
+    try testing.expect(cp.contains(picked));
+}
+
+test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
+    const FakePeerInfo = struct {
+        peer_id: []const u8,
+        connected_at: i64,
+        latest_status: ?u32 = null,
+    };
+    const CP = ConnectedPeersImpl(FakePeerInfo);
+    var cp = CP.init(testing.allocator);
+    defer cp.deinit();
+
+    const N: u32 = 64;
+    const Worker = struct {
+        fn run(peers: *CP, prefix: u8, count: u32) !void {
+            var buf: [16]u8 = undefined;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const slice = std.fmt.bufPrint(&buf, "{c}{d}", .{ prefix, i }) catch return;
+                try peers.connect(slice);
+                _ = peers.contains(slice);
+                _ = peers.count();
+                if ((i % 2) == 0) _ = peers.disconnect(slice);
+            }
+        }
+    };
+
+    var t1 = try std.Thread.spawn(.{}, Worker.run, .{ &cp, 'A', N });
+    var t2 = try std.Thread.spawn(.{}, Worker.run, .{ &cp, 'B', N });
+    var t3 = try std.Thread.spawn(.{}, Worker.run, .{ &cp, 'C', N });
+    t1.join();
+    t2.join();
+    t3.join();
+
+    // Atomic count must equal the actual map size at quiescence.
+    var actual: usize = 0;
+    {
+        var guard = cp.iterateLocked();
+        defer guard.deinit();
+        while (guard.iter.next()) |_| : (actual += 1) {}
+    }
+    try testing.expectEqual(actual, cp.count());
+}
+
+// BlockCache integration tests with real SignedBlock values live in
+// `node.zig` next to the existing `makeTestSignedBlockWithParent`
+// helper — wiring them in `locking.zig` would force this file to depend
+// on the `node` test factory, which the existing comment in this file
+// flagged as a layering issue. The `BlockCache: removeChildrenOf is
+// bounded by MAX_CACHED_BLOCKS` test above + the dedicated
+// `Network: BlockCache wiring smoke` test in `node.zig` cover both the
+// internal bound + the network-shape semantics.
+
+// Stress test plan note (slice a-3): the design doc §"Stress test plan"
+// calls for a single-node ingestion harness that floods gossip + RPC
+// with a backed forkchoice. That harness lives outside the unit test
+// pkg — it would need a real Network backend / mock libp2p / forked
+// chain seed and is best run as a `pkgs/sim` scenario. The unit-tested
+// LockedMap / ConnectedPeers concurrency smokes above are the merge
+// gate for the lock-correctness side; a separate sim run is the merge
+// gate for the throughput side, tracked in #803.
