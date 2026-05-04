@@ -1,7 +1,6 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
 
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
@@ -293,7 +292,7 @@ pub const ForkChoice = struct {
     deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
     // Thread-safe access protection
-    mutex: Thread.RwLock,
+    mutex: zeam_utils.SyncRwLock,
     // Per-validator XMSS signatures learned from gossip, keyed by (AttestationData, ValidatorIndex).
     attestation_signatures: SignaturesMap,
     // Aggregated signature proofs pending processing.
@@ -303,7 +302,7 @@ pub const ForkChoice = struct {
     // Used for recursive signature aggregation when building blocks.
     latest_known_aggregated_payloads: AggregatedPayloadsMap,
     // Mutex to protect concurrent access to signature/payload maps
-    signatures_mutex: std.Thread.Mutex,
+    signatures_mutex: zeam_utils.SyncMutex,
     // Tracks whether FC has observed a real justified checkpoint via block processing.
     // Starts as `initing` for checkpoint-sync init (anchor slot > 0); transitions to
     // `ready` on the first block-driven justified update.  Validator duties (block
@@ -375,7 +374,7 @@ pub const ForkChoice = struct {
             .safeTarget = anchor_block,
             .deltas = deltas,
             .logger = opts.logger,
-            .mutex = Thread.RwLock{},
+            .mutex = zeam_utils.SyncRwLock{},
             .attestation_signatures = attestation_signatures,
             .latest_new_aggregated_payloads = latest_new_aggregated_payloads,
             .latest_known_aggregated_payloads = latest_known_aggregated_payloads,
@@ -830,7 +829,7 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
-        const time_now_ms: i64 = std.time.milliTimestamp();
+        const time_now_ms: i64 = zeam_utils.unixTimestampMillis();
         if (self.last_node_tick_time_ms) |last| {
             const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
             zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
@@ -1465,7 +1464,7 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
-        var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
+        var results: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
         errdefer {
             for (results.items) |*signed| {
                 signed.deinit();
@@ -1612,7 +1611,7 @@ pub const ForkChoice = struct {
         payloads: *AggregatedPayloadsMap,
         finalized_slot: types.Slot,
     ) !usize {
-        var keys_to_remove: std.ArrayList(types.AttestationData) = .{};
+        var keys_to_remove: std.ArrayList(types.AttestationData) = .empty;
         defer keys_to_remove.deinit(allocator);
 
         var removed_total: usize = 0;
@@ -2258,11 +2257,11 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
     };
@@ -2611,13 +2610,13 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = .{},
+        .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
     };
@@ -3599,11 +3598,11 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
         .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
         .last_node_tick_time_ms = null,
     };

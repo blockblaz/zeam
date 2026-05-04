@@ -5,7 +5,7 @@ const constants = @import("./constants.zig");
 
 /// Builds a tree visualization of the fork choice tree with optional depth limit
 pub fn buildTreeVisualization(allocator: Allocator, nodes: []const fcFactory.ProtoNode, max_depth: ?usize, max_branch: ?usize) ![]const u8 {
-    var tree_lines = std.ArrayListUnmanaged(u8){};
+    var tree_lines: std.ArrayListUnmanaged(u8) = .empty;
     defer tree_lines.deinit(allocator);
 
     // Find root nodes (nodes with no parent)
@@ -175,7 +175,10 @@ pub fn buildForkChoiceJSON(
     output: *std.ArrayList(u8),
     allocator: Allocator,
 ) !void {
-    const w = output.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
+
     try w.writeAll("{");
     try w.print(
         \\"head":"0x{x}","justified":{{"slot":{d},"root":"0x{x}"}},"finalized":{{"slot":{d},"root":"0x{x}"}},"safe_target":"0x{x}","validator_count":{d},"nodes":[
@@ -196,6 +199,8 @@ pub fn buildForkChoiceJSON(
         , .{ &node.blockRoot, node.slot, &node.parentRoot, node.proposer_index, node.weight });
     }
     try w.writeAll("]}");
+
+    try output.appendSlice(allocator, writer_alloc.writer.buffered());
 }
 
 /// Build fork choice graph in Grafana node-graph JSON format

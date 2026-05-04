@@ -44,11 +44,11 @@ test "LazyJson formats JSON and frees allocation" {
     const value: OkJson = .{};
     const lazy_json = LazyJson(OkJson).init(allocator, &value);
 
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
-    try lazy_json.format(buffer.writer(allocator));
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    try lazy_json.format(&writer_alloc.writer);
 
-    try std.testing.expectEqualStrings("{\"ok\":true}", buffer.items);
+    try std.testing.expectEqualStrings("{\"ok\":true}", writer_alloc.writer.buffered());
 }
 
 test "LazyJson formats error on toJsonString failure" {
@@ -65,9 +65,9 @@ test "LazyJson formats error on toJsonString failure" {
     const value: FailJson = .{};
     const lazy_json = LazyJson(FailJson).init(allocator, &value);
 
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
-    try lazy_json.format(buffer.writer(allocator));
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    try lazy_json.format(&writer_alloc.writer);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, buffer.items, 1, "<json error:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, writer_alloc.writer.buffered(), 1, "<json error:"));
 }

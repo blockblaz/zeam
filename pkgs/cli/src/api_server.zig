@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("@zeam/api");
+const net = std.Io.net;
 const constants = @import("constants.zig");
 const event_broadcaster = api.event_broadcaster;
 const types = @import("@zeam/types");
@@ -78,7 +79,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
 
     // Wait for thread to report startup result (success or failure)
     while (ctx.startup_status.load(.acquire) == .pending) {
-        std.Thread.sleep(STARTUP_POLL_NS);
+        utils_lib.sleepNs(STARTUP_POLL_NS);
     }
 
     // Check if startup failed
@@ -93,7 +94,7 @@ pub fn startAPIServer(allocator: std.mem.Allocator, port: u16, logger_config: *L
     return ctx;
 }
 
-fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.Allocator, ctx: *ApiServer) void {
+fn routeConnection(io: std.Io, connection: net.Stream, allocator: std.mem.Allocator, ctx: *ApiServer) void {
     const read_buffer = allocator.alloc(u8, 4096) catch {
         ctx.logger.err("failed to allocate read buffer", .{});
         return;
@@ -105,26 +106,26 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
     };
     defer allocator.free(write_buffer);
 
-    var stream_reader = connection.stream.reader(read_buffer);
-    var stream_writer = connection.stream.writer(write_buffer);
+    var stream_reader = connection.reader(io, read_buffer);
+    var stream_writer = connection.writer(io, write_buffer);
 
-    var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
+    var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
     var request = http_server.receiveHead() catch |err| {
         ctx.logger.warn("failed to receive HTTP head: {}", .{err});
-        connection.stream.close();
+        connection.close(io);
         return;
     };
 
     if (std.mem.eql(u8, request.head.target, "/events")) {
         if (!ctx.tryAcquireSSE()) {
             _ = request.respond("Service Unavailable\n", .{ .status = .service_unavailable }) catch {};
-            connection.stream.close();
+            connection.close(io);
             return;
         }
-        _ = std.Thread.spawn(.{}, ApiServer.handleSSEConnection, .{ connection.stream, ctx }) catch |err| {
+        _ = std.Thread.spawn(.{}, ApiServer.handleSSEConnection, .{ connection, ctx }) catch |err| {
             ctx.logger.warn("failed to spawn SSE handler: {}", .{err});
             ctx.releaseSSE();
-            connection.stream.close();
+            connection.close(io);
         };
         return;
     } else {
@@ -157,10 +158,10 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
         } else if (std.mem.startsWith(u8, request.head.target, "/api/forkchoice/graph")) {
             const chain = ctx.getChain() orelse {
                 _ = request.respond("Service Unavailable: Chain not initialized\n", .{ .status = .service_unavailable }) catch {};
-                connection.stream.close();
+                connection.close(io);
                 return;
             };
-            if (!ctx.rate_limiter.allow(connection.address) or !ctx.tryAcquireGraph()) {
+            if (!ctx.rate_limiter.allow(connection.socket.address) or !ctx.tryAcquireGraph()) {
                 _ = request.respond("Too Many Requests\n", .{ .status = .too_many_requests }) catch {};
             } else {
                 defer ctx.releaseGraph();
@@ -173,7 +174,7 @@ fn routeConnection(connection: std.net.Server.Connection, allocator: std.mem.All
             _ = request.respond("Not Found\n", .{ .status = .not_found }) catch {};
         }
     }
-    connection.stream.close();
+    connection.close(io);
 }
 
 /// API server context
@@ -187,8 +188,8 @@ pub const ApiServer = struct {
     sse_active: usize,
     graph_inflight: usize,
     rate_limiter: RateLimiter,
-    sse_mutex: std.Thread.Mutex = .{},
-    graph_mutex: std.Thread.Mutex = .{},
+    sse_mutex: utils_lib.SyncMutex = .{},
+    graph_mutex: utils_lib.SyncMutex = .{},
     thread: std.Thread,
 
     const Self = @This();
@@ -211,17 +212,18 @@ pub const ApiServer = struct {
     }
 
     fn run(self: *Self) void {
-        const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const address = net.IpAddress.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
             return;
         };
-        var server = address.listen(.{ .reuse_address = true, .force_nonblocking = true }) catch |err| {
+        var server = address.listen(io, .{ .reuse_address = true }) catch |err| {
             self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
             return;
         };
-        defer server.deinit();
+        defer server.deinit(io);
 
         // Signal successful startup to the spawning thread
         self.startup_status.store(.success, .release);
@@ -229,16 +231,16 @@ pub const ApiServer = struct {
 
         while (true) {
             if (self.stopped.load(.acquire)) break;
-            const connection = server.accept() catch |err| {
+            const connection = server.accept(io) catch |err| {
                 if (err == error.WouldBlock) {
-                    std.Thread.sleep(ACCEPT_POLL_NS);
+                    utils_lib.sleepNs(ACCEPT_POLL_NS);
                     continue;
                 }
                 self.logger.warn("failed to accept connection: {}", .{err});
                 continue;
             };
 
-            routeConnection(connection, self.allocator, self);
+            routeConnection(io, connection, self.allocator, self);
         }
 
         // Allow active SSE threads to drain before destroying context
@@ -247,7 +249,7 @@ pub const ApiServer = struct {
             defer self.sse_mutex.unlock();
             break :blk self.sse_active != 0;
         }) {
-            std.Thread.sleep(ACCEPT_POLL_NS);
+            utils_lib.sleepNs(ACCEPT_POLL_NS);
         }
     }
 
@@ -501,9 +503,10 @@ pub const ApiServer = struct {
     }
 
     /// Handle SSE events endpoint
-    fn handleSSEEvents(self: *Self, stream: std.net.Stream) !void {
+    fn handleSSEEvents(self: *Self, stream: net.Stream) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
         var registered = false;
-        errdefer if (!registered) stream.close();
+        errdefer if (!registered) stream.close(io);
         // Set SSE headers manually by writing HTTP response
         const sse_headers = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: text/event-stream\r\n" ++
@@ -514,7 +517,7 @@ pub const ApiServer = struct {
             "\r\n";
 
         var write_buf: [4096]u8 = undefined;
-        var stream_writer = stream.writer(&write_buf);
+        var stream_writer = stream.writer(io, &write_buf);
 
         // Send initial response with SSE headers
         try stream_writer.interface.writeAll(sse_headers);
@@ -541,11 +544,11 @@ pub const ApiServer = struct {
             };
 
             // Wait between SSE heartbeats
-            std.Thread.sleep(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
+            utils_lib.sleepNs(constants.SSE_HEARTBEAT_SECONDS * std.time.ns_per_s);
         }
     }
 
-    fn handleSSEConnection(stream: std.net.Stream, ctx: *Self) void {
+    fn handleSSEConnection(stream: net.Stream, ctx: *Self) void {
         ctx.handleSSEEvents(stream) catch |err| {
             ctx.logger.warn("SSE connection failed: {}", .{err});
         };
@@ -622,7 +625,7 @@ const RateLimitEntry = struct {
 const RateLimiter = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMap(RateLimitEntry),
-    mutex: std.Thread.Mutex = .{},
+    mutex: utils_lib.SyncMutex = .{},
     last_cleanup_ns: u64 = 0,
 
     fn init(allocator: std.mem.Allocator) !RateLimiter {
@@ -640,8 +643,8 @@ const RateLimiter = struct {
         self.entries.deinit();
     }
 
-    fn allow(self: *RateLimiter, addr: std.net.Address) bool {
-        const now_signed = std.time.nanoTimestamp();
+    fn allow(self: *RateLimiter, addr: net.IpAddress) bool {
+        const now_signed = utils_lib.monotonicTimestampNs();
         const now: u64 = if (now_signed > 0) @intCast(now_signed) else 0;
         var key_buf: [64]u8 = undefined;
         const key = addrToKey(&key_buf, addr) orelse return true;
@@ -700,28 +703,23 @@ inline fn boolToJson(b: bool) []const u8 {
     return if (b) "true" else "false";
 }
 
-fn addrToKey(buf: []u8, addr: std.net.Address) ?[]const u8 {
-    return switch (addr.any.family) {
-        std.posix.AF.INET => blk: {
-            const addr_in = addr.in;
-            // Use @ptrCast to get network-order bytes (big-endian) regardless of host endianness
-            const bytes = @as(*const [4]u8, @ptrCast(&addr_in.sa.addr));
-            break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch return null;
-        },
-        std.posix.AF.INET6 => blk: {
-            const addr_in6 = addr.in6;
-            const bytes = std.mem.asBytes(&addr_in6.sa.addr);
-            break :blk std.fmt.bufPrint(buf, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{
-                @as(u16, bytes[0]) << 8 | @as(u16, bytes[1]),
-                @as(u16, bytes[2]) << 8 | @as(u16, bytes[3]),
-                @as(u16, bytes[4]) << 8 | @as(u16, bytes[5]),
-                @as(u16, bytes[6]) << 8 | @as(u16, bytes[7]),
-                @as(u16, bytes[8]) << 8 | @as(u16, bytes[9]),
-                @as(u16, bytes[10]) << 8 | @as(u16, bytes[11]),
-                @as(u16, bytes[12]) << 8 | @as(u16, bytes[13]),
-                @as(u16, bytes[14]) << 8 | @as(u16, bytes[15]),
-            }) catch return null;
-        },
-        else => null,
+fn addrToKey(buf: []u8, addr: net.IpAddress) ?[]const u8 {
+    return switch (addr) {
+        .ip4 => |ip4| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            ip4.bytes[0],
+            ip4.bytes[1],
+            ip4.bytes[2],
+            ip4.bytes[3],
+        }) catch null,
+        .ip6 => |ip6| std.fmt.bufPrint(buf, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{
+            @as(u16, ip6.bytes[0]) << 8 | @as(u16, ip6.bytes[1]),
+            @as(u16, ip6.bytes[2]) << 8 | @as(u16, ip6.bytes[3]),
+            @as(u16, ip6.bytes[4]) << 8 | @as(u16, ip6.bytes[5]),
+            @as(u16, ip6.bytes[6]) << 8 | @as(u16, ip6.bytes[7]),
+            @as(u16, ip6.bytes[8]) << 8 | @as(u16, ip6.bytes[9]),
+            @as(u16, ip6.bytes[10]) << 8 | @as(u16, ip6.bytes[11]),
+            @as(u16, ip6.bytes[12]) << 8 | @as(u16, ip6.bytes[13]),
+            @as(u16, ip6.bytes[14]) << 8 | @as(u16, ip6.bytes[15]),
+        }) catch null,
     };
 }

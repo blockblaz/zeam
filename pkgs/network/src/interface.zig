@@ -37,6 +37,10 @@ const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
+fn unionPayloadType(comptime UnionType: type, comptime tag: anytype) type {
+    return @FieldType(UnionType, @tagName(tag));
+}
+
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
         .object => |*o| {
@@ -44,7 +48,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
             while (it.next()) |entry| {
                 freeJsonValue(&entry.value_ptr.*, allocator);
             }
-            o.deinit();
+            o.deinit(allocator);
         },
         .array => |*a| {
             for (a.items) |*item| {
@@ -294,7 +298,7 @@ pub const GossipMessage = union(GossipTopicKind) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 switch (tag) {
                     .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized, allocator),
                     else => try ssz.serialize(PayloadType, payload, &serialized, allocator),
@@ -427,7 +431,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -435,8 +439,8 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return serialized.toOwnedSlice(allocator);
     }
 
-    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
-        const PayloadType = std.meta.TagPayload(Self, tag);
+    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !unionPayloadType(Self, tag) {
+        const PayloadType = unionPayloadType(Self, tag);
         return switch (tag) {
             .blocks_by_root => PayloadType{
                 .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
@@ -445,7 +449,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         };
     }
 
-    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
+    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *unionPayloadType(Self, tag)) void {
         switch (tag) {
             .blocks_by_root => payload.roots.deinit(),
             inline else => {},
@@ -455,7 +459,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload = try initPayload(tag, allocator);
                 var succeeded = false;
                 defer if (!succeeded) deinitPayload(tag, &payload);
@@ -497,7 +501,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -508,7 +512,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload: PayloadType = undefined;
                 try ssz.deserialize(PayloadType, bytes, &payload, allocator);
                 return @unionInit(Self, @tagName(tag), payload);
