@@ -804,6 +804,12 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
 /// Backing-lock variants:
 ///   * `.states_shared_rwlock` — backed by `BeamChain.states_lock` (RwLock,
 ///     read side). Used by every borrow returned from `BeamChain.statesGet`.
+///   * `.states_exclusive_rwlock` — backed by `BeamChain.states_lock`
+///     (RwLock, write side). Used by `statesCommitKeepExisting` so that the
+///     caller in `onBlock` can deref the in-map pointer (DB write +
+///     forkchoice confirm) without racing `pruneStates` (which also takes
+///     the exclusive side) freeing the entry. See PR #820 / issue #803 for
+///     the UAF that motivated this variant.
 ///   * `.events_mutex` — backed by `BeamChain.events_lock` (Mutex). Used
 ///     only by the `cached_finalized_state` / DB-fallback paths inside
 ///     `BeamChain.getFinalizedState` when the state is NOT in the in-memory
@@ -816,6 +822,7 @@ pub const BorrowedState = struct {
 
     pub const Backing = union(enum) {
         states_shared_rwlock: *zeam_utils.SyncRwLock,
+        states_exclusive_rwlock: *zeam_utils.SyncRwLock,
         events_mutex: *zeam_utils.SyncMutex,
     };
 
@@ -826,6 +833,7 @@ pub const BorrowedState = struct {
         self.released = true;
         switch (self.backing) {
             .states_shared_rwlock => |rw| rw.unlockShared(),
+            .states_exclusive_rwlock => |rw| rw.unlock(),
             .events_mutex => |m| m.unlock(),
         }
     }
@@ -962,6 +970,94 @@ test "BorrowedState: events_mutex backing also releases" {
     // Lock is released — should be reacquirable.
     m.lock();
     m.unlock();
+}
+
+test "BorrowedState: states_exclusive_rwlock backing also releases" {
+    var rwl: zeam_utils.SyncRwLock = .{};
+    rwl.lock();
+
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .states_exclusive_rwlock = &rwl },
+    };
+    borrow.deinit();
+    try testing.expect(borrow.released);
+    // Lock is released — exclusive should be reacquirable, and the shared
+    // side too.
+    try testing.expect(rwl.tryLock());
+    rwl.unlock();
+    rwl.lockShared();
+    rwl.unlockShared();
+    // Idempotent second deinit is a no-op (would otherwise UB-unlock).
+    borrow.deinit();
+}
+
+test "BorrowedState: cloneAndRelease works for states_exclusive_rwlock backing" {
+    var rwl: zeam_utils.SyncRwLock = .{};
+    rwl.lock();
+
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .states_exclusive_rwlock = &rwl },
+    };
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const failing_allocator = failing.allocator();
+
+    try testing.expectError(error.OutOfMemory, borrow.cloneAndRelease(failing_allocator));
+    try testing.expect(borrow.released);
+
+    // Lock must be released — exclusive reacquire is the proof.
+    try testing.expect(rwl.tryLock());
+    rwl.unlock();
+}
+
+test "BorrowedState: states_exclusive_rwlock backing blocks pruner-shaped reacquire until deinit" {
+    // Smoke test for the PR #820 contract: while a BorrowedState backed by
+    // states_exclusive_rwlock is alive, an exclusive reacquire (the shape
+    // pruneStates uses on states_lock) must block. Once the borrow is
+    // released via deinit, the reacquire proceeds.
+    var rwl: zeam_utils.SyncRwLock = .{};
+    rwl.lock();
+
+    var dummy: types.BeamState = undefined;
+    var borrow = BorrowedState{
+        .state = &dummy,
+        .backing = .{ .states_exclusive_rwlock = &rwl },
+    };
+
+    // tryLock must report "contended" while the borrow holds the exclusive
+    // side. This is the cheapest, deterministic proof.
+    try testing.expect(!rwl.tryLock());
+
+    const Pruner = struct {
+        fn run(rw: *zeam_utils.SyncRwLock, acquired_flag: *std.atomic.Value(u8)) void {
+            // Mirror pruneStates: blocking exclusive acquire.
+            rw.lock();
+            acquired_flag.store(1, .release);
+            rw.unlock();
+        }
+    };
+
+    var acquired = std.atomic.Value(u8).init(0);
+    var pruner = try std.Thread.spawn(.{}, Pruner.run, .{ &rwl, &acquired });
+
+    // Give the pruner thread a moment to actually start blocking on
+    // states_lock.lock(). 50ms is generous; the assertion is that even
+    // after this nap the pruner has NOT acquired (because we still hold).
+    zeam_utils.sleepNs(50 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u8, 0), acquired.load(.acquire));
+
+    // Releasing the borrow lets the pruner-shaped acquire proceed.
+    borrow.deinit();
+    pruner.join();
+    try testing.expectEqual(@as(u8, 1), acquired.load(.acquire));
+
+    // Lock is back to fully free.
+    try testing.expect(rwl.tryLock());
+    rwl.unlock();
 }
 
 test "BorrowedState: assertReleased fires only when not released" {

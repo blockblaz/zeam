@@ -365,13 +365,32 @@ pub const BeamChain = struct {
     }
 
     /// Insert under `states_lock.exclusive` if the entry is not already in
-    /// the map; otherwise keep the existing pointer untouched. Returns:
-    ///   * `effective` — the pointer the caller should USE for any
-    ///     subsequent reads (DB writes, forkchoice updates, etc.). When
-    ///     the entry already existed this is the in-map pointer, NOT the
-    ///     `state_ptr` argument; the in-map pointer outlives the borrow
-    ///     handed out by `statesGet`, so other readers don't observe a
-    ///     freed pointer.
+    /// the map; otherwise keep the existing pointer untouched. The exclusive
+    /// lock is HANDED OFF to the returned `BorrowedState` and is held until
+    /// the caller invokes `borrow.deinit()` — callers MUST keep the borrow
+    /// alive across any subsequent deref of `borrow.state` (DB writes,
+    /// forkchoice updates, etc.).
+    ///
+    /// Why hold the exclusive lock across the borrow? See PR #820 / issue
+    /// #803: with `BeamNode.mutex` removed from the gossip / req-resp /
+    /// interval paths, two threads can be inside `chain.onBlock`
+    /// concurrently. Thread A's `onBlockFollowup -> processFinalizationAdvancement
+    /// -> pruneStates` (also exclusive on `states_lock`) can `fetchRemove`
+    /// + free the very entry Thread B is about to deref for the post-commit
+    /// DB write + `forkChoice.confirmBlock`. Holding the exclusive lock
+    /// across that whole window is the fix — we cannot downgrade-then-
+    /// reacquire-shared because the unlock/reacquire gap is exactly the UAF
+    /// race we are closing. (A native RwLock downgrade primitive would let
+    /// us hold shared instead; that is a separate change.)
+    ///
+    /// Returns:
+    ///   * `borrow` — RAII wrapper. `borrow.state` is the pointer the
+    ///     caller should USE for any subsequent reads. When the entry
+    ///     already existed this is the in-map pointer, NOT the `state_ptr`
+    ///     argument; the in-map pointer outlives the borrow handed out by
+    ///     `statesGet`, so other readers don't observe a freed pointer.
+    ///     Caller MUST keep `borrow` alive until done dereferencing
+    ///     `borrow.state`, then call `borrow.deinit()`.
     ///   * `kept_existing` — true when the entry already existed and
     ///     `state_ptr` was discarded (caller is responsible for freeing
     ///     `state_ptr` if it owns it). False when `state_ptr` was inserted.
@@ -380,24 +399,39 @@ pub const BeamChain = struct {
         comptime site: []const u8,
         root: types.Root,
         state_ptr: *types.BeamState,
-    ) !struct { effective: *types.BeamState, kept_existing: bool } {
+    ) !struct { borrow: BorrowedState, kept_existing: bool } {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
+        // NOTE: hold-time histogram closes here at function return; the
+        // borrow's deinit-site is responsible for any per-callsite
+        // observation of the extended hold window. Mirrors the pattern in
+        // `statesGet`.
         defer t.released();
-        defer self.states_lock.unlock();
+        // NOTE: NO `defer self.states_lock.unlock()` here — the exclusive
+        // lock is owned by the returned BorrowedState and released by its
+        // deinit. errdefer below covers the OOM path on `getOrPut`.
+        errdefer self.states_lock.unlock();
         const gop = try self.states.getOrPut(root);
-        if (gop.found_existing) {
+        const effective_ptr: *types.BeamState = if (gop.found_existing) blk: {
             // Decision policy: keep the existing pointer (it's referenced
             // elsewhere — e.g. produceBlock just inserted it before
             // publishBlock landed here) and tell the caller to free the
             // freshly-computed copy. We never want to invalidate a pointer
             // that other borrows might still observe through
             // `states_lock.shared`.
-            return .{ .effective = gop.value_ptr.*, .kept_existing = true };
-        }
-        gop.value_ptr.* = state_ptr;
-        return .{ .effective = state_ptr, .kept_existing = false };
+            break :blk gop.value_ptr.*;
+        } else blk: {
+            gop.value_ptr.* = state_ptr;
+            break :blk state_ptr;
+        };
+        return .{
+            .borrow = BorrowedState{
+                .state = effective_ptr,
+                .backing = .{ .states_exclusive_rwlock = &self.states_lock },
+            },
+            .kept_existing = gop.found_existing,
+        };
     }
 
     /// Take the exclusive side of `states_lock` and remove the entry.
@@ -1364,21 +1398,31 @@ pub const BeamChain = struct {
         // already exists (locally produced block path), keep the existing
         // pointer and free the freshly-computed one — borrows already
         // observe the existing pointer through `states_lock.shared`, so
-        // overwriting would create a UAF window. Returns the new pointer
-        // when the existing one was kept; null when it was inserted.
-        const commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
+        // overwriting would create a UAF window.
+        //
+        // The exclusive lock is HELD across the post-commit deref window
+        // (DB write + forkchoice confirm) via the returned BorrowedState.
+        // This blocks `pruneStates` (also exclusive on `states_lock`) from
+        // racing in via another thread's `onBlockFollowup` and freeing the
+        // entry under us. See PR #820 / issue #803.
+        var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
+        // Release the exclusive lock on every exit path (success or error).
+        defer commit.borrow.deinit();
         if (commit.kept_existing and post_state_owned) {
             // Existing entry kept — free the freshly-computed (and now
-            // redundant) post_state. Caller-supplied post-states (i.e.
-            // `post_state_owned == false`) belong to the caller; we don't
-            // touch them.
+            // redundant) post_state. The borrow points at the in-map
+            // pointer (a different allocation), so this free does not
+            // invalidate `commit.borrow.state`. Caller-supplied post-states
+            // (i.e. `post_state_owned == false`) belong to the caller; we
+            // don't touch them.
             post_state.deinit();
             self.allocator.destroy(post_state);
         }
-        // From here on use the effective pointer (the in-map one): if the
+        // From here on use the borrow's pointer (the in-map one): if the
         // commit kept an existing entry, our `post_state` is freed and
-        // unsafe to deref.
-        const effective_post_state: *types.BeamState = commit.effective;
+        // unsafe to deref. The borrow keeps the in-map pointer alive for
+        // the duration of this scope.
+        const effective_post_state: *const types.BeamState = commit.borrow.state;
         // Past this point post_state ownership is settled — either the
         // pointer is in the states map (insert path) or it was explicitly
         // freed above (existing-kept path). The top-level errdefer must
