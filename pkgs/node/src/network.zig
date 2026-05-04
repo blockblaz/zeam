@@ -655,31 +655,47 @@ pub const Network = struct {
     };
 
     pub fn snapshotPendingRequest(self: *Self, request_id: u64) !?PendingRequestSnapshot {
-        // O(1) lookup via the LockedMap's get() — the legacy
-        // iterateLocked + key compare was O(n) per call and turned the
-        // per-request timeout sweep into O(n²). PR #820 / issue #803.
-        const entry = self.pending_rpc_requests.get(request_id) orelse return null;
-        switch (entry.request) {
-            .status => |s| {
-                const peer_id_copy = try self.allocator.dupe(u8, s.peer_id);
-                return .{
-                    .request_kind = .status,
-                    .peer_id_copy = peer_id_copy,
-                    .created_at = entry.created_at,
-                };
-            },
-            .blocks_by_root => |b| {
-                const peer_id_copy = try self.allocator.dupe(u8, b.peer_id);
-                errdefer self.allocator.free(peer_id_copy);
-                const roots_copy = try self.allocator.dupe(types.Root, b.requested_roots);
-                return .{
-                    .request_kind = .blocks_by_root,
-                    .peer_id_copy = peer_id_copy,
-                    .requested_roots_copy = roots_copy,
-                    .created_at = entry.created_at,
-                };
-            },
-        }
+        // O(1) lookup but ALL slice dupes happen inside the callback so
+        // they run while the LockedMap mutex is still held. The previous
+        // shape (commit 60761c9 era) used `get()` + dupe-after-unlock,
+        // which returned the value by-value and dropped the lock; the
+        // returned struct's slice headers (`peer_id`, `requested_roots`)
+        // aliased the in-map allocator-owned bytes, and a concurrent
+        // `finalizePendingRequest` could `fetchRemove` + free the entry
+        // between the `get` returning and the dupes running — UAF.
+        // PR #820 / issue #803.
+        const Ctx = struct {
+            self: *Self,
+            out: ?PendingRequestSnapshot = null,
+
+            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                switch (entry.request) {
+                    .status => |s| {
+                        const peer_id_copy = try c.self.allocator.dupe(u8, s.peer_id);
+                        c.out = .{
+                            .request_kind = .status,
+                            .peer_id_copy = peer_id_copy,
+                            .created_at = entry.created_at,
+                        };
+                    },
+                    .blocks_by_root => |b| {
+                        const peer_id_copy = try c.self.allocator.dupe(u8, b.peer_id);
+                        errdefer c.self.allocator.free(peer_id_copy);
+                        const roots_copy = try c.self.allocator.dupe(types.Root, b.requested_roots);
+                        c.out = .{
+                            .request_kind = .blocks_by_root,
+                            .peer_id_copy = peer_id_copy,
+                            .requested_roots_copy = roots_copy,
+                            .created_at = entry.created_at,
+                        };
+                    },
+                }
+            }
+        };
+        var ctx = Ctx{ .self = self };
+        try self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each);
+        return ctx.out;
     }
 
     /// Returns the time-out request ids as an owned slice. Caller frees

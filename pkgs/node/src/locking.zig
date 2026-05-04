@@ -240,6 +240,40 @@ pub fn LockedMap(comptime K: type, comptime V: type) type {
             self.mutex.lock();
             return .{ .owner = self, .iter = self.map.iterator() };
         }
+
+        /// Run `each(ctx, value_ptr_or_null)` while holding the map's
+        /// mutex. The pointer is `null` when the key is missing,
+        /// otherwise it points at the value as it lives inside the
+        /// HashMap (stable for the duration of the lock — no rehash can
+        /// run while we hold the mutex).
+        ///
+        /// Use this when the value carries allocator-owned slices
+        /// (`[]const u8`, etc.) that the caller needs to copy out
+        /// (`allocator.dupe`, `allocator.alloc`) before the lock is
+        /// released. The legacy shape was `get(key)` then dupe — but
+        /// `get` returns the value BY VALUE and releases the lock, so
+        /// the slice headers in the returned struct still alias the
+        /// in-map storage; another thread can `fetchRemove` the entry
+        /// and free those slices between the `get` returning and the
+        /// caller's dupe, producing a UAF. Doing the dupes inside this
+        /// callback closes that window.
+        ///
+        /// `each` MUST NOT call back into `self` (would deadlock) and
+        /// MUST NOT retain `value_ptr` past its return.
+        pub fn withValueLocked(
+            self: *Self,
+            key: K,
+            ctx: anytype,
+            comptime each: fn (@TypeOf(ctx), ?*const V) anyerror!void,
+        ) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.map.getPtr(key)) |p| {
+                try each(ctx, p);
+            } else {
+                try each(ctx, null);
+            }
+        }
     };
 }
 
@@ -1503,6 +1537,91 @@ test "ConnectedPeers: concurrent connect/disconnect keeps count consistent" {
         while (guard.iter.next()) |_| : (actual += 1) {}
     }
     try testing.expectEqual(actual, cp.count());
+}
+
+test "LockedMap: withValueLocked holds the lock across the callback" {
+    // Contract: the callback runs while the map's mutex is held, so the
+    // caller can dupe out slice fields without racing a concurrent
+    // mutator. We assert this by spawning a second thread that tries to
+    // `tryLock` the underlying mutex while the callback is running
+    // (after a small barrier) — if the lock is held, tryLock must
+    // report contended. This is the same shape as the
+    // `BorrowedState: states_exclusive_rwlock backing blocks pruner-shaped
+    // reacquire until deinit` test above.
+    const LM = LockedMap(u64, u32);
+    var lm = LM.init(testing.allocator);
+    defer lm.deinit();
+    try lm.put(1, 42);
+
+    const Ctx = struct {
+        lm_ptr: *LM,
+        contended_observed: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        observed_value: ?u32 = null,
+
+        fn each(c: *@This(), value_ptr: ?*const u32) anyerror!void {
+            const v = value_ptr orelse return;
+            c.observed_value = v.*;
+            // Spawn a thread that tries the underlying mutex; while we
+            // are still inside this callback, the lock is held by us.
+            const Probe = struct {
+                fn run(map: *LM, flag: *std.atomic.Value(u8)) void {
+                    if (map.mutex.tryLock()) {
+                        // Should not get here — but unlock anyway so we
+                        // don't deadlock the test.
+                        map.mutex.unlock();
+                        flag.store(2, .release);
+                    } else {
+                        flag.store(1, .release);
+                    }
+                }
+            };
+            var probe = try std.Thread.spawn(.{}, Probe.run, .{ c.lm_ptr, &c.contended_observed });
+            probe.join();
+        }
+    };
+    var ctx = Ctx{ .lm_ptr = &lm };
+    try lm.withValueLocked(@as(u64, 1), &ctx, Ctx.each);
+    try testing.expectEqual(@as(?u32, 42), ctx.observed_value);
+    try testing.expectEqual(@as(u8, 1), ctx.contended_observed.load(.acquire));
+
+    // Lock is back to free post-callback (regular put proves the
+    // mutex-released path).
+    try lm.put(2, 7);
+    try testing.expectEqual(@as(?u32, 7), lm.get(2));
+}
+
+test "LockedMap: withValueLocked invokes callback with null on missing key" {
+    const LM = LockedMap(u64, u32);
+    var lm = LM.init(testing.allocator);
+    defer lm.deinit();
+
+    const Ctx = struct {
+        saw_null: bool = false,
+        fn each(c: *@This(), value_ptr: ?*const u32) anyerror!void {
+            if (value_ptr == null) c.saw_null = true;
+        }
+    };
+    var ctx = Ctx{};
+    try lm.withValueLocked(@as(u64, 999), &ctx, Ctx.each);
+    try testing.expect(ctx.saw_null);
+}
+
+test "LockedMap: withValueLocked propagates callback errors" {
+    const LM = LockedMap(u64, u32);
+    var lm = LM.init(testing.allocator);
+    defer lm.deinit();
+    try lm.put(1, 42);
+
+    const Ctx = struct {
+        fn each(_: *@This(), _: ?*const u32) anyerror!void {
+            return error.OutOfMemory;
+        }
+    };
+    var ctx = Ctx{};
+    try testing.expectError(error.OutOfMemory, lm.withValueLocked(@as(u64, 1), &ctx, Ctx.each));
+    // Lock must be released even on error — prove via a follow-up put.
+    try lm.put(2, 7);
+    try testing.expectEqual(@as(?u32, 7), lm.get(2));
 }
 
 // BlockCache integration tests with real SignedBlock values live in
