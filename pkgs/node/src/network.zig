@@ -305,7 +305,10 @@ pub const Network = struct {
     /// observable behavior as the legacy `cacheFetchedBlock`.
     pub fn cacheFetchedBlock(self: *Self, root: types.Root, block_ptr: *types.SignedBlock) !void {
         const parent_root = block_ptr.block.parent_root;
-        self.block_cache.insertBlockPtr(root, block_ptr, parent_root) catch |err| {
+        // SSZ is attached later via storeFetchedBlockSsz; readers that need
+        // both atomically must use `getFetchedBlockWithSsz` to avoid the
+        // partial-state window.
+        self.block_cache.insertBlockPtr(root, block_ptr, parent_root, null) catch |err| {
             if (err == error.AlreadyCached) {
                 // Duplicate: free the caller's pointer to match legacy
                 // semantics. Returning `void` here keeps callsites happy.
@@ -325,6 +328,16 @@ pub const Network = struct {
     /// Returns the pre-serialized SSZ bytes for a cached block, if stored.
     pub fn getFetchedBlockSsz(self: *Self, root: types.Root) ?[]const u8 {
         return self.block_cache.getSsz(root);
+    }
+
+    /// Returns the cached `SignedBlock` and its SSZ bytes (if attached) in
+    /// a single atomic lookup. Use this whenever a caller would otherwise
+    /// call `getFetchedBlock(root)` and `getFetchedBlockSsz(root)` back-to-
+    /// back — the two-call shape races against `attachSsz` and (after PR
+    /// #820) against the `cacheFetchedBlock` + `storeFetchedBlockSsz`
+    /// partial-state window.
+    pub fn getFetchedBlockWithSsz(self: *Self, root: types.Root) ?locking.BlockAndSsz {
+        return self.block_cache.getBlockAndSsz(root);
     }
 
     /// Store pre-serialized SSZ bytes alongside a cached block. Caller

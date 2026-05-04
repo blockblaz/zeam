@@ -500,7 +500,12 @@ pub const BeamNode = struct {
 
         // Try to process each descendant
         for (children) |descendant_root| {
-            if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+            // Atomic (block, ssz) lookup — the two-call dance
+            // (getFetchedBlock + getFetchedBlockSsz) races against
+            // attachSsz / cacheFetchedBlock partial-state windows. See
+            // PR #820 / issue #803.
+            if (self.network.getFetchedBlockWithSsz(descendant_root)) |cached| {
+                const cached_block = cached.block;
                 // Skip if already known to fork choice — same guard as processBlockByRootChunk
                 if (self.chain.forkChoice.hasBlock(descendant_root)) {
                     self.logger.debug(
@@ -517,7 +522,7 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
+                const block_ssz = cached.ssz;
                 const missing_roots = self.chain.onBlock(cached_block, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached

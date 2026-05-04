@@ -3323,3 +3323,82 @@ test "BlockCache: partial-state invariant (re-insert leaves no orphans)" {
     try std.testing.expect(got != null);
     try std.testing.expect(bc.count() == 1);
 }
+
+test "BlockCache: insertBlockPtr+ssz atomic visibility" {
+    // Triple-atomic invariant: a reader using getBlockAndSsz must observe
+    // either both-Some or both-null, never a partial state. With the
+    // ssz-arg variant of insertBlockPtr the atomic case is the new path.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var bc = locking.BlockCache.init(std.testing.allocator);
+    defer bc.deinit();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const root = mock_chain.blockRoots[1];
+
+    // Pre-allocate the heap pointer + ssz buffer the way Network does.
+    const block_ptr = try std.testing.allocator.create(types.SignedBlock);
+    errdefer std.testing.allocator.destroy(block_ptr);
+    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+
+    var ssz_buf: std.ArrayList(u8) = .empty;
+    defer ssz_buf.deinit(std.testing.allocator);
+    try ssz.serialize(types.SignedBlock, mock_chain.blocks[1], &ssz_buf, std.testing.allocator);
+    const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
+
+    // Before insert: both-null.
+    try std.testing.expect(bc.getBlockAndSsz(root) == null);
+
+    try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, ssz_bytes);
+    // Cache took the inner SignedBlock value (struct copy). Free the outer
+    // heap pointer; the inner allocations and ssz bytes are owned by the
+    // cache now.
+    std.testing.allocator.destroy(block_ptr);
+
+    // After atomic insert: both-Some.
+    const got = bc.getBlockAndSsz(root);
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.?.ssz != null);
+    try std.testing.expect(got.?.ssz.?.len > 0);
+}
+
+test "BlockCache: insertBlockPtr null-ssz then attachSsz still observable atomically" {
+    // The partial-state window between insertBlockPtr(ssz=null,...) and
+    // attachSsz is documented; readers must use getBlockAndSsz to safely
+    // observe whichever atomic snapshot is current. After both calls, the
+    // atomic accessor must report both-Some.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var bc = locking.BlockCache.init(std.testing.allocator);
+    defer bc.deinit();
+
+    const mock_chain = try stf.genMockChain(allocator, 2, null);
+    const root = mock_chain.blockRoots[1];
+
+    const block_ptr = try std.testing.allocator.create(types.SignedBlock);
+    try types.sszClone(std.testing.allocator, types.SignedBlock, mock_chain.blocks[1], block_ptr);
+
+    try bc.insertBlockPtr(root, block_ptr, mock_chain.blocks[1].block.parent_root, null);
+    std.testing.allocator.destroy(block_ptr);
+
+    // Block-only window: getBlockAndSsz reports block-Some, ssz-null.
+    const partial = bc.getBlockAndSsz(root);
+    try std.testing.expect(partial != null);
+    try std.testing.expect(partial.?.ssz == null);
+
+    var ssz_buf: std.ArrayList(u8) = .empty;
+    defer ssz_buf.deinit(std.testing.allocator);
+    try ssz.serialize(types.SignedBlock, mock_chain.blocks[1], &ssz_buf, std.testing.allocator);
+    const ssz_bytes = try ssz_buf.toOwnedSlice(std.testing.allocator);
+
+    try bc.attachSsz(root, ssz_bytes);
+
+    // Now both-Some.
+    const full = bc.getBlockAndSsz(root);
+    try std.testing.expect(full != null);
+    try std.testing.expect(full.?.ssz != null);
+}

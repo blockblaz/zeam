@@ -260,6 +260,14 @@ pub const CachedBlock = struct {
     parent_root: types.Root,
 };
 
+/// Result type for `BlockCache.getBlockAndSsz`. Nominal so the same struct
+/// is referenceable from network-layer wrappers (Zig anonymous-struct
+/// return types are not assignable across function boundaries).
+pub const BlockAndSsz = struct {
+    block: types.SignedBlock,
+    ssz: ?[]const u8,
+};
+
 pub const BlockCache = struct {
     const Self = @This();
 
@@ -310,32 +318,67 @@ pub const BlockCache = struct {
         self.children.deinit();
     }
 
-    /// Insert pointer-stored block + parent link atomically. Used by the
-    /// network cache where the block is owned via `*types.SignedBlock`
-    /// allocated on the cache's allocator. The cache takes ownership of the
-    /// pointer (deinit + destroy at removal). SSZ bytes are optional and
-    /// can be attached later via `attachSsz` — if a duplicate insert is
-    /// observed, the new pointer is freed (deinit + destroy) and
-    /// `error.AlreadyCached` is returned so the caller can react.
+    /// Insert pointer-stored block + parent link (and optionally SSZ bytes)
+    /// atomically. Used by the network cache where the block is owned via
+    /// `*types.SignedBlock` allocated on the cache's allocator. The cache
+    /// takes ownership of the pointer (deinit + destroy at removal).
+    ///
+    /// When `ssz` is non-null the SSZ bytes are inserted in the SAME
+    /// critical section as the block + parent link, preserving the
+    /// triple-atomic invariant: a concurrent reader using `getBlockAndSsz`
+    /// observes either both-null or both-Some, never a partial state.
+    /// (PR #820 / issue #803 — the legacy `insertBlockPtr` + later
+    /// `attachSsz` shape created a window where readers saw block-only.)
+    ///
+    /// When `ssz` is null the SSZ slot is left empty; callers can attach
+    /// the bytes later via `attachSsz`. Direct readers of `getBlock` and
+    /// `getSsz` (independently) MUST tolerate this brief partial-state
+    /// window; readers that need both atomically must call
+    /// `getBlockAndSsz`.
+    ///
+    /// On duplicate root: caller still owns `block_ptr` (and `ssz` if
+    /// passed); the call returns `error.AlreadyCached` so the caller can
+    /// free.
     pub fn insertBlockPtr(
         self: *Self,
         root: types.Root,
         block_ptr: *types.SignedBlock,
         parent_root: types.Root,
+        ssz: ?[]u8,
     ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.blocks.contains(root)) {
-            // Caller still owns block_ptr; signal duplicate so caller can
-            // free. Matches the legacy `cacheFetchedBlock` semantics where
-            // duplicates are deinit+destroyed by the call.
+            // Caller still owns block_ptr (and ssz); signal duplicate so
+            // caller can free. Matches the legacy `cacheFetchedBlock`
+            // semantics where duplicates are deinit+destroyed by the call.
             return error.AlreadyCached;
         }
 
         const block_gop = try self.blocks.getOrPut(root);
         errdefer _ = self.blocks.remove(root);
         block_gop.value_ptr.* = block_ptr.*;
+
+        // SSZ insert under the same critical section. Only roll back on
+        // partial failure of the children-list append below — if the SSZ
+        // insert itself fails (OOM in getOrPut), the block is also rolled
+        // back via the errdefer above and we leave ssz untouched (caller
+        // owns it).
+        var ssz_inserted = false;
+        if (ssz) |bytes| {
+            const ssz_gop = try self.ssz_bytes.getOrPut(root);
+            errdefer _ = self.ssz_bytes.remove(root);
+            // No prior entry possible — we already checked
+            // `blocks.contains(root)` above and the triple invariant means
+            // ssz_bytes can only carry an entry for a root that's in blocks.
+            std.debug.assert(!ssz_gop.found_existing);
+            ssz_gop.value_ptr.* = bytes;
+            ssz_inserted = true;
+        }
+        errdefer if (ssz_inserted) {
+            _ = self.ssz_bytes.remove(root);
+        };
 
         const child_gop = try self.children.getOrPut(parent_root);
         const created_new_entry = !child_gop.found_existing;
@@ -353,6 +396,11 @@ pub const BlockCache = struct {
     /// root has no cached block, the bytes are not stored and the caller's
     /// slice is left untouched (caller still owns it). Caller transfers
     /// ownership of `ssz` on success.
+    ///
+    /// NOTE: between `insertBlockPtr(ssz=null, ...)` and this call there is
+    /// a brief window where `getBlock(root)` returns Some but `getSsz(root)`
+    /// returns null. Readers that need both atomically must use
+    /// `getBlockAndSsz` instead of two independent calls.
     pub fn attachSsz(self: *Self, root: types.Root, ssz: []u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -414,17 +462,35 @@ pub const BlockCache = struct {
         try child_gop.value_ptr.append(self.allocator, root);
     }
 
-    /// Read the cached triple by root. Returns null when any of the three
-    /// underlying maps is missing the entry (defensive; should be impossible
-    /// once `insert` is the only mutator).
+    /// Read the cached (block, ssz) pair by root, atomically. Returns null
+    /// when no block is cached at `root`. The `ssz` field may itself be
+    /// null when the bytes have not yet been attached — single lock
+    /// acquisition guarantees the caller never observes a torn pair.
+    /// Callers that need both fields together MUST use this entry point
+    /// rather than `getBlock` + `getSsz` separately (those take two
+    /// independent locks and can race against `attachSsz`).
+    pub fn getBlockAndSsz(self: *Self, root: types.Root) ?BlockAndSsz {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const block = self.blocks.get(root) orelse return null;
+        const ssz_opt: ?[]const u8 = self.ssz_bytes.get(root);
+        return .{ .block = block, .ssz = ssz_opt };
+    }
+
+    /// Read the cached triple by root. Returns null when no block is
+    /// cached at `root` OR when the block is cached but the SSZ bytes
+    /// have not been attached yet (the brief partial-state window between
+    /// `insertBlockPtr(ssz=null, ...)` and `attachSsz(...)`). The
+    /// `parent_root` field is NOT populated by this helper — it returns
+    /// `std.mem.zeroes(types.Root)`. Callers that need the parent root
+    /// must consult the `children` map directly. Prefer `getBlockAndSsz`
+    /// or `getBlock`+`getSsz` at new callsites; this entry point exists
+    /// for legacy / test callers that took both fields together.
     pub fn get(self: *Self, root: types.Root) ?CachedBlock {
         self.mutex.lock();
         defer self.mutex.unlock();
         const block = self.blocks.get(root) orelse return null;
         const ssz = self.ssz_bytes.get(root) orelse return null;
-        // We don't carry parent_root in the helper structurally — return a
-        // synthetic CachedBlock with a zero parent root (callers that need
-        // the parent must consult `children` separately).
         return .{
             .block = block,
             .ssz = ssz,
