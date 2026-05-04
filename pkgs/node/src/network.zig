@@ -4,9 +4,9 @@ const types = @import("@zeam/types");
 const params = @import("@zeam/params");
 const zeam_utils = @import("@zeam/utils");
 const ssz = @import("ssz");
+const locking = @import("./locking.zig");
 
 const Allocator = std.mem.Allocator;
-const StringHashMap = std.StringHashMap;
 
 pub const PeerInfo = struct {
     peer_id: []const u8,
@@ -53,39 +53,61 @@ pub const PendingRPCEntry = struct {
     }
 };
 
-pub const PendingRPCMap = std.AutoHashMap(u64, PendingRPCEntry);
+pub const ConnectedPeers = locking.ConnectedPeersImpl(PeerInfo);
+
+/// Snapshot of a fetched block plus its (optional) SSZ bytes. The pointers
+/// are owned by the cache; callers must not free them. Returned by value
+/// so the caller can hold onto the immutable references after the cache
+/// lock is released — the SignedBlock value itself is the cache-stored
+/// instance whose internal allocations are stable until the entry is
+/// removed via `removeFetchedBlock` (or pruned via `pruneCachedBlocks`).
+pub const FetchedBlock = struct {
+    block: types.SignedBlock,
+    ssz: ?[]const u8 = null,
+};
+
+pub const PendingRPCMap = locking.LockedMap(u64, PendingRPCEntry);
 // key: block root, value: depth
-pub const PendingBlockRootMap = std.AutoHashMap(types.Root, u32);
-// key: block root, value: pointer to block
-pub const FetchedBlockMap = std.AutoHashMap(types.Root, *types.SignedBlock);
-// key: block root, value: pre-serialized SSZ bytes (captured at cache time)
-pub const FetchedBlockSszMap = std.AutoHashMap(types.Root, []u8);
-// key: parent root, value: list of child roots (for O(1) child lookup)
-pub const ChildrenMap = std.AutoHashMap(types.Root, std.ArrayList(types.Root));
+pub const PendingBlockRootMap = locking.LockedMap(types.Root, u32);
 
 pub const BlocksByRootRequestResult = struct {
-    peer_id: []const u8,
+    peer_id: []u8,
     request_id: u64,
+
+    /// Free the duplicated `peer_id` slice. The slice is owned by the
+    /// caller of `ensureBlocksByRootRequest` (allocated via `selectPeerCopy`
+    /// inside the network helper) so the caller is responsible for its
+    /// lifetime. Callers typically do `defer result.deinit(allocator)`.
+    pub fn deinit(self: *BlocksByRootRequestResult, allocator: Allocator) void {
+        allocator.free(self.peer_id);
+    }
 };
 
 pub const Network = struct {
     allocator: Allocator,
     backend: networks.NetworkInterface,
-    connected_peers: *StringHashMap(PeerInfo),
+    /// Heap-allocated so `*const ConnectedPeers` references handed to
+    /// `BeamChain` survive moves of the `Network` value.
+    connected_peers: *ConnectedPeers,
     pending_rpc_requests: PendingRPCMap,
     pending_block_roots: PendingBlockRootMap,
-    fetched_blocks: FetchedBlockMap,
-    fetched_block_ssz: FetchedBlockSszMap,
-    fetched_block_children: ChildrenMap,
-    timed_out_requests: std.ArrayList(u64),
+    /// Atomic block triple (block + ssz + parent link) under a single
+    /// `block_cache_lock`. Replaces the three independent maps from the
+    /// pre-slice-(a-3) shape.
+    block_cache: locking.BlockCache,
+    /// Buffer of timed-out RPC ids. Mutex-guarded because `getTimedOutRequests`
+    /// caps the buffer in place; the returned slice's lifetime ends at the
+    /// next `getTimedOutRequests` call (caller is the libxev tick loop and
+    /// no other thread reads it).
+    timed_out_requests: std.ArrayList(u64) = .empty,
+    timed_out_requests_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: networks.NetworkInterface) !Self {
-        const connected_peers = try allocator.create(StringHashMap(PeerInfo));
+        const connected_peers = try allocator.create(ConnectedPeers);
         errdefer allocator.destroy(connected_peers);
-
-        connected_peers.* = StringHashMap(PeerInfo).init(allocator);
+        connected_peers.* = ConnectedPeers.init(allocator);
         errdefer connected_peers.deinit();
 
         var pending_rpc_requests = PendingRPCMap.init(allocator);
@@ -94,14 +116,8 @@ pub const Network = struct {
         var pending_block_roots = PendingBlockRootMap.init(allocator);
         errdefer pending_block_roots.deinit();
 
-        var fetched_blocks = FetchedBlockMap.init(allocator);
-        errdefer fetched_blocks.deinit();
-
-        var fetched_block_ssz = FetchedBlockSszMap.init(allocator);
-        errdefer fetched_block_ssz.deinit();
-
-        var fetched_block_children = ChildrenMap.init(allocator);
-        errdefer fetched_block_children.deinit();
+        var block_cache = locking.BlockCache.init(allocator);
+        errdefer block_cache.deinit();
 
         return Self{
             .allocator = allocator,
@@ -109,49 +125,38 @@ pub const Network = struct {
             .connected_peers = connected_peers,
             .pending_rpc_requests = pending_rpc_requests,
             .pending_block_roots = pending_block_roots,
-            .fetched_blocks = fetched_blocks,
-            .fetched_block_ssz = fetched_block_ssz,
-            .fetched_block_children = fetched_block_children,
-            .timed_out_requests = .empty,
+            .block_cache = block_cache,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // timed_out_requests
+        self.timed_out_requests_lock.lock();
         self.timed_out_requests.deinit(self.allocator);
+        self.timed_out_requests_lock.unlock();
 
-        var rpc_it = self.pending_rpc_requests.iterator();
-        while (rpc_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+        // pending_rpc_requests — drain values to free their per-entry heap
+        // allocations before deinit.
+        {
+            var guard = self.pending_rpc_requests.iterateLocked();
+            defer guard.deinit();
+            while (guard.iter.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
         }
         self.pending_rpc_requests.deinit();
 
         self.pending_block_roots.deinit();
 
-        var fetched_it = self.fetched_blocks.iterator();
-        while (fetched_it.next()) |entry| {
-            var block_ptr = entry.value_ptr.*;
-            block_ptr.deinit();
-            self.allocator.destroy(block_ptr);
-        }
-        self.fetched_blocks.deinit();
+        // BlockCache: its deinit handles the heap-stored values and the
+        // children lists. NOTE the BlockCache here stores `SignedBlock`
+        // values (not pointers) — the network always cloned via
+        // `*types.SignedBlock` and stored the inner SignedBlock copy in the
+        // cache. With the migration we hold a SignedBlock value directly,
+        // so `BlockCache.deinit` (which iterates and calls `value.deinit()`
+        // on each SignedBlock) is the right cleanup path.
+        self.block_cache.deinit();
 
-        var ssz_it = self.fetched_block_ssz.iterator();
-        while (ssz_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.fetched_block_ssz.deinit();
-
-        var children_it = self.fetched_block_children.iterator();
-        while (children_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.fetched_block_children.deinit();
-
-        var peer_it = self.connected_peers.iterator();
-        while (peer_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.peer_id);
-        }
         self.connected_peers.deinit();
         self.allocator.destroy(self.connected_peers);
     }
@@ -201,24 +206,10 @@ pub const Network = struct {
         return request_id;
     }
 
-    pub fn selectPeer(self: *Self) ?[]const u8 {
-        const peer_count = self.connected_peers.count();
-        if (peer_count == 0) return null;
-
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var random_source = std.Random.IoSource{ .io = io };
-        const random = random_source.interface();
-        const target_index = random.uintLessThan(usize, peer_count);
-
-        var it = self.connected_peers.iterator();
-        var current_index: usize = 0;
-        while (it.next()) |entry| : (current_index += 1) {
-            if (current_index == target_index) {
-                return entry.value_ptr.peer_id;
-            }
-        }
-
-        return null;
+    /// Returns an owned copy of a randomly selected peer's id, or null when
+    /// no peers are connected. Caller frees with `self.allocator.free`.
+    pub fn selectPeer(self: *Self) !?[]u8 {
+        return self.connected_peers.selectPeerCopy(self.allocator);
     }
 
     pub fn getPeerCount(self: *Self) usize {
@@ -230,64 +221,41 @@ pub const Network = struct {
     }
 
     pub fn setPeerLatestStatus(self: *Self, peer_id: []const u8, status: types.Status) bool {
-        if (self.connected_peers.getPtr(peer_id)) |peer_info| {
-            peer_info.latest_status = status;
-            return true;
-        }
-        return false;
+        return self.connected_peers.setLatestStatus(peer_id, status);
     }
 
     pub fn connectPeer(self: *Self, peer_id: []const u8) !void {
-        if (self.connected_peers.fetchRemove(peer_id)) |entry| {
-            self.allocator.free(entry.key);
-            self.allocator.free(entry.value.peer_id);
-        }
-
-        const owned_key = try self.allocator.dupe(u8, peer_id);
-        errdefer self.allocator.free(owned_key);
-
-        const owned_peer_id = try self.allocator.dupe(u8, peer_id);
-        errdefer self.allocator.free(owned_peer_id);
-
-        const peer_info = PeerInfo{
-            .peer_id = owned_peer_id,
-            .connected_at = zeam_utils.unixTimestampSeconds(),
-        };
-
-        self.connected_peers.put(owned_key, peer_info) catch |err| {
-            self.allocator.free(owned_peer_id);
-            return err;
-        };
+        try self.connected_peers.connect(peer_id);
     }
 
     pub fn disconnectPeer(self: *Self, peer_id: []const u8) bool {
-        if (self.connected_peers.fetchRemove(peer_id)) |peer_entry| {
-            self.allocator.free(peer_entry.key);
-            self.allocator.free(peer_entry.value.peer_id);
+        if (!self.connected_peers.disconnect(peer_id)) return false;
 
-            // Finalize all pending RPC requests for this peer
-            var rpc_it = self.pending_rpc_requests.iterator();
-            var request_ids_to_remove: std.ArrayList(u64) = .empty;
-            defer request_ids_to_remove.deinit(self.allocator);
+        // Finalize all pending RPC requests for this peer. Snapshot the
+        // request ids under the pending_rpc_requests lock first (no nested
+        // chain locks; `finalizePendingRequest` re-acquires it for each id).
+        var request_ids_to_remove: std.ArrayList(u64) = .empty;
+        defer request_ids_to_remove.deinit(self.allocator);
 
-            while (rpc_it.next()) |rpc_entry| {
+        {
+            var guard = self.pending_rpc_requests.iterateLocked();
+            defer guard.deinit();
+            while (guard.iter.next()) |rpc_entry| {
                 const pending_peer_id = switch (rpc_entry.value_ptr.request) {
                     .status => |*ctx| ctx.peer_id,
                     .blocks_by_root => |*ctx| ctx.peer_id,
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
-                    // If we can't allocate, skip this request (should be rare)
                     request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
                 }
             }
-
-            for (request_ids_to_remove.items) |request_id| {
-                self.finalizePendingRequest(request_id);
-            }
-
-            return true;
         }
-        return false;
+
+        for (request_ids_to_remove.items) |request_id| {
+            self.finalizePendingRequest(request_id);
+        }
+
+        return true;
     }
 
     pub fn hasPendingBlockRoot(self: *Self, root: types.Root) bool {
@@ -316,98 +284,173 @@ pub const Network = struct {
     }
 
     pub fn hasFetchedBlock(self: *Self, root: types.Root) bool {
-        return self.fetched_blocks.get(root) != null;
+        return self.block_cache.contains(root);
     }
 
-    pub fn getFetchedBlock(self: *Self, root: types.Root) ?*types.SignedBlock {
-        return self.fetched_blocks.get(root);
+    pub fn getFetchedBlockCount(self: *Self) usize {
+        return self.block_cache.count();
     }
 
-    pub fn cacheFetchedBlock(self: *Self, root: types.Root, block: *types.SignedBlock) !void {
-        const block_gop = try self.fetched_blocks.getOrPut(root);
+    /// Returns a copy of the cached SignedBlock by root, or null when not
+    /// cached. The SignedBlock value is the cache-stored instance — its
+    /// internal storage stays alive until the entry is removed.
+    pub fn getFetchedBlock(self: *Self, root: types.Root) ?types.SignedBlock {
+        return self.block_cache.getBlock(root);
+    }
 
-        // If we already have this block cached, free the duplicate and return early
-        if (block_gop.found_existing) {
-            block.deinit();
-            self.allocator.destroy(block);
-            return;
-        }
-
-        block_gop.value_ptr.* = block;
-        errdefer {
-            _ = self.fetched_blocks.remove(root);
-            block.deinit();
-            self.allocator.destroy(block);
-        }
-
-        const parent_root = block.block.parent_root;
-        const gop = try self.fetched_block_children.getOrPut(parent_root);
-
-        const created_new_entry = !gop.found_existing;
-        if (created_new_entry) {
-            gop.value_ptr.* = .empty;
-        }
-        errdefer if (created_new_entry) {
-            gop.value_ptr.deinit(self.allocator);
-            _ = self.fetched_block_children.remove(parent_root);
+    /// Cache a fetched block. Takes ownership of `block_ptr`'s heap
+    /// allocations: the inner SignedBlock value is moved into the cache,
+    /// then the outer pointer is destroyed. On duplicate, the new pointer
+    /// is freed (deinit + destroy) and no error is propagated — same
+    /// observable behavior as the legacy `cacheFetchedBlock`.
+    pub fn cacheFetchedBlock(self: *Self, root: types.Root, block_ptr: *types.SignedBlock) !void {
+        const parent_root = block_ptr.block.parent_root;
+        // SSZ is attached later via storeFetchedBlockSsz; readers that need
+        // both atomically must use `cloneFetchedBlockAndSsz` to avoid the
+        // partial-state window.
+        self.block_cache.insertBlockPtr(root, block_ptr, parent_root, null) catch |err| {
+            if (err == error.AlreadyCached) {
+                // Duplicate: free the caller's pointer to match legacy
+                // semantics. Returning `void` here keeps callsites happy.
+                block_ptr.deinit();
+                self.allocator.destroy(block_ptr);
+                return;
+            }
+            return err;
         };
-        try gop.value_ptr.append(self.allocator, root);
+        // Cache took the inner SignedBlock value (struct copy). Free the
+        // outer heap pointer; the inner allocations are now owned by the
+        // cache and will be freed via `removeFetchedBlock` /
+        // `BlockCache.deinit`.
+        self.allocator.destroy(block_ptr);
     }
 
     /// Returns the pre-serialized SSZ bytes for a cached block, if stored.
     pub fn getFetchedBlockSsz(self: *Self, root: types.Root) ?[]const u8 {
-        return self.fetched_block_ssz.get(root);
+        return self.block_cache.getSsz(root);
     }
 
-    /// Store pre-serialized SSZ bytes alongside a cached block.
-    /// Caller transfers ownership of `ssz_bytes` to the map.
+    /// Atomically clone the cached `SignedBlock` + its SSZ bytes (if
+    /// attached) under the cache mutex and return owned copies. Returns
+    /// null when the root is not cached. Caller MUST call
+    /// `.deinit(allocator)` on the returned value to release the clones.
+    ///
+    /// This is the only safe shape for callers that need (block, ssz) to
+    /// outlive the cache mutex — in particular, anything that hands the
+    /// data into `chain.onBlock` (STF + XMSS verify, hundreds of ms
+    /// during which a concurrent `removeFetchedBlock` could free the
+    /// underlying storage). The borrow-shape `getFetchedBlockWithSsz`
+    /// was removed in PR #820 (slice a-3 follow-up); see the
+    /// `OwnedBlockAndSsz` docstring in `locking.zig` for the full UAF
+    /// rationale.
+    pub fn cloneFetchedBlockAndSsz(
+        self: *Self,
+        root: types.Root,
+        allocator: std.mem.Allocator,
+    ) !?locking.OwnedBlockAndSsz {
+        return self.block_cache.cloneBlockAndSsz(root, allocator);
+    }
+
+    /// Store pre-serialized SSZ bytes alongside a cached block. Caller
+    /// transfers ownership of `ssz_bytes` to the cache on success.
     pub fn storeFetchedBlockSsz(self: *Self, root: types.Root, ssz_bytes: []u8) !void {
-        const gop = try self.fetched_block_ssz.getOrPut(root);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.*);
-        }
-        gop.value_ptr.* = ssz_bytes;
+        try self.block_cache.attachSsz(root, ssz_bytes);
     }
 
+    /// Remove a fetched block (block + ssz + parent-link) from the cache.
+    /// Returns true if the block was present.
+    ///
+    /// All three updates happen under the cache's lock in one critical
+    /// section — the legacy two-step (getBlock then removeOne) leaked a
+    /// TOCTOU window where another thread could remove the entry or its
+    /// parent's children list, leaving the cache in a torn state. See
+    /// PR #820 / issue #803.
     pub fn removeFetchedBlock(self: *Self, root: types.Root) bool {
-        if (self.fetched_block_ssz.fetchRemove(root)) |ssz_entry| {
-            self.allocator.free(ssz_entry.value);
-        }
-
-        if (self.fetched_blocks.fetchRemove(root)) |entry| {
-            var block_ptr = entry.value;
-
-            // Remove this block from its parent's children list
-            const parent_root = block_ptr.block.parent_root;
-            if (self.fetched_block_children.getPtr(parent_root)) |children_list| {
-                // Find and remove this root from the parent's children list
-                for (children_list.items, 0..) |child_root, i| {
-                    if (std.mem.eql(u8, child_root[0..], root[0..])) {
-                        _ = children_list.swapRemove(i);
-                        break;
-                    }
-                }
-                // Clean up the parent entry if no children remain
-                if (children_list.items.len == 0) {
-                    children_list.deinit(self.allocator);
-                    _ = self.fetched_block_children.remove(parent_root);
-                }
-            }
-
-            block_ptr.deinit();
-            self.allocator.destroy(block_ptr);
-            return true;
-        }
-        return false;
+        return self.block_cache.removeFetchedBlock(root);
     }
 
-    /// Returns the cached children of the given parent block root.
-    /// This is O(1) lookup instead of iterating over all fetched blocks.
-    pub fn getChildrenOfBlock(self: *Self, parent_root: types.Root) []const types.Root {
-        if (self.fetched_block_children.get(parent_root)) |children_list| {
-            return children_list.items;
+    /// Returns the cached children of the given parent block root as a
+    /// freshly-allocated slice. Caller frees with `self.allocator.free`.
+    /// Empty slice when the parent has no cached children.
+    pub fn getChildrenOfBlock(self: *Self, parent_root: types.Root) ![]types.Root {
+        return self.block_cache.getChildrenCopy(parent_root, self.allocator);
+    }
+
+    /// Internal context used by `pruneCachedBlocks` to collect every
+    /// cached block whose slot is at or before `finalized.slot`. We avoid
+    /// holding the cache lock across mutation by snapshotting the roots of
+    /// candidates first.
+    const PruneAtOrBelowCtx = struct {
+        finalized_slot: types.Slot,
+        roots: *std.ArrayList(types.Root),
+        allocator: Allocator,
+    };
+
+    fn pruneAtOrBelowEach(ctx_ptr: *anyopaque, root: types.Root, block: types.SignedBlock) void {
+        const ctx: *PruneAtOrBelowCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (block.block.slot <= ctx.finalized_slot) {
+            ctx.roots.append(ctx.allocator, root) catch return;
         }
-        return &[_]types.Root{};
+    }
+
+    /// Collect every cached block whose slot is at or before
+    /// `finalized.slot`. Caller owns the returned slice.
+    pub fn collectCachedBlocksAtOrBelowSlot(
+        self: *Self,
+        finalized_slot: types.Slot,
+    ) ![]types.Root {
+        var roots: std.ArrayList(types.Root) = .empty;
+        errdefer roots.deinit(self.allocator);
+
+        var ctx = PruneAtOrBelowCtx{
+            .finalized_slot = finalized_slot,
+            .roots = &roots,
+            .allocator = self.allocator,
+        };
+        self.block_cache.forEachBlock(&ctx, pruneAtOrBelowEach);
+        return roots.toOwnedSlice(self.allocator);
+    }
+
+    /// Snapshot the set of (root, parent_root, slot) tuples for cached
+    /// blocks whose slot is at or below `current_slot`. Used by
+    /// `processReadyCachedBlocks`. Caller owns the returned slice.
+    pub const CachedBlockSummary = struct {
+        root: types.Root,
+        parent_root: types.Root,
+        slot: types.Slot,
+    };
+
+    const CollectReadyCtx = struct {
+        current_slot: types.Slot,
+        out: *std.ArrayList(CachedBlockSummary),
+        allocator: Allocator,
+    };
+
+    fn collectReadyEach(ctx_ptr: *anyopaque, root: types.Root, block: types.SignedBlock) void {
+        const ctx: *CollectReadyCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (block.block.slot <= ctx.current_slot) {
+            ctx.out.append(ctx.allocator, .{
+                .root = root,
+                .parent_root = block.block.parent_root,
+                .slot = block.block.slot,
+            }) catch return;
+        }
+    }
+
+    pub fn collectReadyCachedBlocks(
+        self: *Self,
+        current_slot: types.Slot,
+    ) ![]CachedBlockSummary {
+        var out: std.ArrayList(CachedBlockSummary) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        var ctx = CollectReadyCtx{
+            .current_slot = current_slot,
+            .out = &out,
+            .allocator = self.allocator,
+        };
+        self.block_cache.forEachBlock(&ctx, collectReadyEach);
+        return out.toOwnedSlice(self.allocator);
     }
 
     /// Remove a block and its entire chain: walk up to ancestors (parents)
@@ -435,8 +478,8 @@ pub const Network = struct {
 
         // Walk up: traverse parent chain and add all cached ancestors
         var current = root;
-        while (self.getFetchedBlock(current)) |block_ptr| {
-            const parent_root = block_ptr.block.parent_root;
+        while (self.getFetchedBlock(current)) |block| {
+            const parent_root = block.block.parent_root;
             if (self.hasFetchedBlock(parent_root)) {
                 const parent_gop = to_remove_set.getOrPut(parent_root) catch break;
                 if (!parent_gop.found_existing) {
@@ -455,7 +498,8 @@ pub const Network = struct {
             const current_root = to_remove_order.items[i];
 
             // Enqueue children before removing (since removal modifies the children map)
-            const children_slice = self.getChildrenOfBlock(current_root);
+            const children_slice = self.getChildrenOfBlock(current_root) catch &[_]types.Root{};
+            defer if (children_slice.len > 0) self.allocator.free(children_slice);
             for (children_slice) |child_root| {
                 // When pruning due to finalization, keep children that are on
                 // the finalized chain (matching root at or after finalized slot).
@@ -592,9 +636,12 @@ pub const Network = struct {
 
         if (!self.shouldRequestBlocksByRoot(roots)) return null;
 
-        const peer = self.selectPeer() orelse return error.NoPeersAvailable;
+        const peer = (try self.selectPeer()) orelse return error.NoPeersAvailable;
+        var peer_owned = true;
+        errdefer if (peer_owned) self.allocator.free(peer);
 
         const request_id = try self.sendBlocksByRootRequest(peer, roots, depth, handler);
+        peer_owned = false; // ownership transferred to result
 
         return BlocksByRootRequestResult{
             .peer_id = peer,
@@ -602,19 +649,82 @@ pub const Network = struct {
         };
     }
 
-    pub fn getPendingRequestPtr(self: *Self, request_id: u64) ?*PendingRPCEntry {
-        return self.pending_rpc_requests.getPtr(request_id);
+    /// Direct lock-protected access to a pending RPC entry. Callers that
+    /// need cross-call lifetime (the timeout sweep loop) must read the
+    /// fields they need under this snapshot — the returned struct carries
+    /// owned copies of any caller-visible strings.
+    pub const PendingRequestSnapshot = struct {
+        request_kind: enum { status, blocks_by_root },
+        peer_id_copy: []u8,
+        requested_roots_copy: []types.Root = &[_]types.Root{},
+        created_at: i64,
+
+        pub fn deinit(self: *PendingRequestSnapshot, allocator: Allocator) void {
+            allocator.free(self.peer_id_copy);
+            if (self.requested_roots_copy.len > 0) allocator.free(self.requested_roots_copy);
+        }
+    };
+
+    pub fn snapshotPendingRequest(self: *Self, request_id: u64) !?PendingRequestSnapshot {
+        // O(1) lookup but ALL slice dupes happen inside the callback so
+        // they run while the LockedMap mutex is still held. The previous
+        // shape (commit 60761c9 era) used `get()` + dupe-after-unlock,
+        // which returned the value by-value and dropped the lock; the
+        // returned struct's slice headers (`peer_id`, `requested_roots`)
+        // aliased the in-map allocator-owned bytes, and a concurrent
+        // `finalizePendingRequest` could `fetchRemove` + free the entry
+        // between the `get` returning and the dupes running — UAF.
+        // PR #820 / issue #803.
+        const Ctx = struct {
+            self: *Self,
+            out: ?PendingRequestSnapshot = null,
+
+            fn each(c: *@This(), value_ptr: ?*const PendingRPCEntry) anyerror!void {
+                const entry = value_ptr orelse return;
+                switch (entry.request) {
+                    .status => |s| {
+                        const peer_id_copy = try c.self.allocator.dupe(u8, s.peer_id);
+                        c.out = .{
+                            .request_kind = .status,
+                            .peer_id_copy = peer_id_copy,
+                            .created_at = entry.created_at,
+                        };
+                    },
+                    .blocks_by_root => |b| {
+                        const peer_id_copy = try c.self.allocator.dupe(u8, b.peer_id);
+                        errdefer c.self.allocator.free(peer_id_copy);
+                        const roots_copy = try c.self.allocator.dupe(types.Root, b.requested_roots);
+                        c.out = .{
+                            .request_kind = .blocks_by_root,
+                            .peer_id_copy = peer_id_copy,
+                            .requested_roots_copy = roots_copy,
+                            .created_at = entry.created_at,
+                        };
+                    },
+                }
+            }
+        };
+        var ctx = Ctx{ .self = self };
+        try self.pending_rpc_requests.withValueLocked(request_id, &ctx, Ctx.each);
+        return ctx.out;
     }
 
-    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]const u64 {
-        self.timed_out_requests.clearAndFree(self.allocator);
-        var it = self.pending_rpc_requests.iterator();
-        while (it.next()) |entry| {
-            if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
-                try self.timed_out_requests.append(self.allocator, entry.key_ptr.*);
+    /// Returns the time-out request ids as an owned slice. Caller frees
+    /// with `self.allocator.free`.
+    pub fn getTimedOutRequests(self: *Self, current_time: i64, timeout_seconds: i64) ![]u64 {
+        var ids: std.ArrayList(u64) = .empty;
+        errdefer ids.deinit(self.allocator);
+
+        {
+            var guard = self.pending_rpc_requests.iterateLocked();
+            defer guard.deinit();
+            while (guard.iter.next()) |entry| {
+                if (current_time - entry.value_ptr.created_at >= timeout_seconds) {
+                    try ids.append(self.allocator, entry.key_ptr.*);
+                }
             }
         }
-        return self.timed_out_requests.items;
+        return ids.toOwnedSlice(self.allocator);
     }
 
     pub fn finalizePendingRequest(self: *Self, request_id: u64) void {
