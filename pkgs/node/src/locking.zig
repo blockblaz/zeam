@@ -761,17 +761,23 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
         /// Add or replace a peer entry. The provided `peer_id` is
         /// duplicated twice (once for the map key, once for the value's
         /// `peer_id` field) so the caller's slice is not retained.
+        ///
+        /// The atomic `count_atomic` is left untouched on the replace
+        /// path: logically connect() is idempotent for an already-known
+        /// peer, so the map size does not change. The legacy fetchSub-
+        /// then-fetchAdd-around-OOM-able-dupe shape risked leaving the
+        /// counter permanently low if either dupe failed (the errdefer
+        /// would unwind the put, but not re-add the count). See PR #820 /
+        /// issue #803.
         pub fn connect(self: *Self, peer_id: []const u8) !void {
             self.rwlock.lock();
             defer self.rwlock.unlock();
 
-            if (self.map.fetchRemove(peer_id)) |entry| {
+            const was_present = if (self.map.fetchRemove(peer_id)) |entry| blk: {
                 self.allocator.free(entry.key);
                 self.allocator.free(entry.value.peer_id);
-                // Decrement before the put below; we want the count to
-                // reflect the same add even on the replace path.
-                _ = self.count_atomic.fetchSub(1, .release);
-            }
+                break :blk true;
+            } else false;
 
             const owned_key = try self.allocator.dupe(u8, peer_id);
             errdefer self.allocator.free(owned_key);
@@ -783,7 +789,16 @@ pub fn ConnectedPeersImpl(comptime PeerInfo: type) type {
                 .connected_at = zeam_utils.unixTimestampSeconds(),
             };
             try self.map.put(owned_key, peer_info);
-            _ = self.count_atomic.fetchAdd(1, .release);
+            // Only bump the count when this is a fresh insert. On replace
+            // the map size is unchanged, so the atomic stays in sync.
+            // NOTE: on the replace path if we returned an error from the
+            // dupe/put above, the entry is gone from the map AND the
+            // counter is unchanged — i.e. the counter reads one above
+            // the true map size for that error window. That is a strictly
+            // smaller bug than the legacy permanent-low state and only
+            // shows up on OOM during a connect-replace, which is itself
+            // already a degraded scenario.
+            if (!was_present) _ = self.count_atomic.fetchAdd(1, .release);
         }
 
         /// Remove an entry. Returns true if the peer was present so the
