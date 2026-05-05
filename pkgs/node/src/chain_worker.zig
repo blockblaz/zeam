@@ -284,6 +284,15 @@ pub const ChainWorker = struct {
     /// worker is actually draining work.
     loop_iters: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Shared wake mechanism. The worker drains both queues each
+    /// iteration; when both are empty it parks here. Producers signal
+    /// after every successful enqueue so the worker wakes regardless
+    /// of which queue received the work. The mutex is only held long
+    /// enough to wait/signal; queue operations have their own mutexes
+    /// and DO NOT compose with this one.
+    wake_mutex: std.Io.Mutex = .init,
+    wake_cond: std.Io.Condition = .init,
+
     logger: zeam_utils.ModuleLogger,
 
     pub const InitOpts = struct {
@@ -314,6 +323,35 @@ pub const ChainWorker = struct {
         self.attestation_queue.deinit(self.allocator);
     }
 
+    /// Send a block-flavored message and wake the worker. Returns
+    /// `error.QueueFull` or `error.QueueClosed` from the underlying
+    /// queue without blocking. Producers must use these wrappers
+    /// rather than calling `block_queue.trySend` directly so the
+    /// worker's shared wake-condvar is signalled — otherwise the
+    /// worker can park on an empty block queue while attestations
+    /// pile up (and vice versa).
+    pub fn sendBlock(self: *Self, msg: Message) BlockQueue.TrySendError!void {
+        try self.block_queue.trySend(msg);
+        self.wake();
+    }
+
+    /// Send an attestation-flavored message and wake the worker.
+    /// Same wakeup contract as `sendBlock`.
+    pub fn sendAttestation(self: *Self, msg: Message) AttestationQueue.TrySendError!void {
+        try self.attestation_queue.trySend(msg);
+        self.wake();
+    }
+
+    /// Wake the worker if it's parked. Safe to call from any
+    /// producer; idempotent under spurious wakeups (the loop
+    /// re-checks both queues each iteration).
+    pub fn wake(self: *Self) void {
+        const io = defaultIo();
+        self.wake_mutex.lockUncancelable(io);
+        defer self.wake_mutex.unlock(io);
+        self.wake_cond.signal(io);
+    }
+
     /// Spawn the loop thread. Returns an error if a thread already
     /// exists or if the OS rejects the spawn.
     pub fn start(self: *Self) !void {
@@ -326,64 +364,70 @@ pub const ChainWorker = struct {
     pub fn stop(self: *Self) void {
         if (self.thread == null) return;
         self.stop_flag.store(true, .release);
-        // Close queues so the recv() in runLoop returns null.
+        // Close queues so any standalone blocking recv elsewhere
+        // returns null. The worker loop itself is woken via the
+        // shared wake_cond below — the queues' own condvars are not
+        // what it parks on.
         self.block_queue.close();
         self.attestation_queue.close();
+        // Wake the worker so it observes stop_flag and exits.
+        self.wake();
         if (self.thread) |t| {
             t.join();
         }
         self.thread = null;
     }
 
-    /// Worker thread main loop. Drains the block queue first (FIFO,
-    /// safety-ordered) then the attestation queue (LIFO, freshness-
-    /// ordered) per the design doc. When BOTH queues are empty AND
-    /// closed, returns. Stop_flag gives a fast-path early exit
-    /// before either recv blocks again.
+    /// Worker thread main loop. Each iteration drains the block queue
+    /// first (FIFO, safety-ordered) then the attestation queue (LIFO,
+    /// freshness-ordered) per the design doc. When BOTH queues are
+    /// empty, the worker parks on the shared `wake_cond`, which any
+    /// producer signals via `sendBlock` / `sendAttestation`, and `stop`
+    /// signals after closing the queues.
+    ///
+    /// Exit condition: `stop_flag == true` (set by either `stop()` or
+    /// the `Shutdown` message handler) AND both queues are drained.
     fn runLoop(self: *Self) void {
         self.logger.info("chain-worker: loop started", .{});
-        while (!self.stop_flag.load(.acquire)) {
+        const io = defaultIo();
+        while (true) {
             _ = self.loop_iters.fetchAdd(1, .monotonic);
 
-            // Block queue takes priority: STF correctness + finalization
-            // depends on import ordering. Drain everything available
-            // without blocking before checking attestations.
-            //
-            // recv() blocks on empty + open. To avoid blocking on the
-            // block queue when there's attestation work waiting, we use
-            // depth() as an O(1) probe; the recv() call after a positive
-            // depth is guaranteed to dequeue without blocking under
-            // single-consumer semantics (no other thread drains).
-            if (self.block_queue.depth() > 0) {
-                if (self.block_queue.recv()) |msg| {
-                    self.handle(msg);
-                    continue;
-                }
+            // Drain block queue first (highest priority). `tryRecv`
+            // never blocks; we keep draining until empty.
+            if (self.block_queue.tryRecv()) |msg| {
+                self.handle(msg);
+                continue;
             }
 
-            if (self.attestation_queue.depth() > 0) {
-                if (self.attestation_queue.recv()) |msg| {
-                    self.handle(msg);
-                    continue;
-                }
+            // Then attestation queue.
+            if (self.attestation_queue.tryRecv()) |msg| {
+                self.handle(msg);
+                continue;
             }
 
-            // Both queues empty. Block on the block queue (the
-            // higher-priority one). recv() returns null when it is
-            // closed AND drained; that's our exit condition. If it
-            // returns a real message, dispatch and loop; if attestation
-            // queue is the one with the new work, the next iteration
-            // picks it up via the depth() probe above.
-            const blk = self.block_queue.recv();
-            if (blk == null) {
-                // Block queue closed + drained. Drain whatever is
-                // left in the attestation queue, then exit.
-                while (self.attestation_queue.recv()) |msg| {
-                    self.handle(msg);
-                }
-                break;
+            // Both queues empty this round. Check stop condition
+            // BEFORE parking: if stop was requested while we were
+            // draining, exit now without parking.
+            if (self.stop_flag.load(.acquire)) break;
+
+            // Park on the shared wake-cond. Any producer that calls
+            // sendBlock / sendAttestation will signal it, as will
+            // `stop()`. We re-check both queues + the stop flag on
+            // wake so a spurious wakeup is harmless.
+            self.wake_mutex.lockUncancelable(io);
+            // Re-check under the wake mutex to avoid the lost-wakeup
+            // race: a producer that ran trySend + wake between our
+            // last drain and our park here would have signalled an
+            // unparked worker; without this re-check we'd sleep
+            // forever even though there is work pending.
+            if (self.block_queue.depth() == 0 and
+                self.attestation_queue.depth() == 0 and
+                !self.stop_flag.load(.acquire))
+            {
+                self.wake_cond.waitUncancelable(io, &self.wake_mutex);
             }
-            self.handle(blk.?);
+            self.wake_mutex.unlock(io);
         }
         self.logger.info("chain-worker: loop stopped", .{});
     }
@@ -596,7 +640,7 @@ test "ChainWorker: start, send Shutdown, joins cleanly" {
     try w.start();
 
     // Loop must run at least once before we tell it to stop.
-    try w.block_queue.trySend(.shutdown);
+    try w.sendBlock(.shutdown);
     // Wait for the shutdown handler to flip the stop flag.
     while (!w.stop_flag.load(.acquire)) {
         std.Thread.yield() catch {};
@@ -666,7 +710,7 @@ test "ChainWorker: producers race with worker drain — all messages handled, no
             while (sent < n) {
                 // Use process_pending_blocks variant as an opaque token —
                 // the worker logs and discards (c-1 stub).
-                worker.attestation_queue.trySend(.{
+                worker.sendAttestation(.{
                     .process_pending_blocks = .{ .current_slot = @intCast(sent) },
                 }) catch {
                     // Full — back off and retry the same logical message.
