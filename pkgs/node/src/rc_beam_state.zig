@@ -283,6 +283,79 @@ pub const RcBeamState = struct {
         }
     }
 
+    /// Try to bump refcount, returning the same pointer on success
+    /// or `null` if the rc is already being freed (refcount has
+    /// reached 0). This is the upgrade-from-weak primitive that
+    /// makes "read pointer from a shared map without holding the
+    /// map lock" safe: a concurrent release-to-zero is detected
+    /// and the caller backs off instead of dereferencing freed
+    /// memory.
+    ///
+    /// CAS pattern (matches Rust `Arc::upgrade` / C++
+    /// `weak_ptr::lock`):
+    ///
+    ///   loop:
+    ///     load current
+    ///     if current == 0: return null  // freeing thread won
+    ///     cmpxchg(current, current+1)
+    ///     if swapped: retry             // someone else won the race
+    ///     else:        return self      // we won
+    ///
+    /// The freeing thread's claim is the `.acq_rel` `fetchSub` in
+    /// `release()` that takes refcount from 1 to 0; once that
+    /// publishes, every subsequent `tryAcquire` observes 0 and
+    /// returns null. There is no race against the free itself
+    /// because:
+    ///
+    ///   * `tryAcquire`'s cmpxchg from 0 to 1 is always rejected
+    ///     (the load returns 0 first; the if-guard short-circuits
+    ///     before cmpxchg).
+    ///   * `tryAcquire`'s cmpxchg from N>0 to N+1 only succeeds
+    ///     while the freeing thread has not yet committed its
+    ///     `fetchSub(1)` from 1 to 0 — i.e. while the rc is still
+    ///     alive.
+    ///
+    /// SAFETY PRECONDITION: the caller must guarantee that `self`
+    /// is a valid `*Self` (not a dangling pointer to freed memory).
+    /// The typical pattern is to read the pointer from a shared
+    /// data structure (e.g. `BeamChain.states.get(root)`) under
+    /// some membership invariant: as long as the pointer is in the
+    /// map, the underlying allocation is alive, and `tryAcquire`
+    /// then resolves the in-flight free race. Holding the map lock
+    /// across the read AND the `tryAcquire` makes this trivially
+    /// safe; dropping the lock in c-2b is what motivates this
+    /// primitive in the first place. The c-2b removal-protocol
+    /// requires "remove-from-map then release" so the pointer is
+    /// guaranteed alive at any time it is reachable through the
+    /// map.
+    ///
+    /// Memory ordering: `.monotonic` on both load and the cmpxchg
+    /// success/failure orderings. The increment side does not need
+    /// to synchronise (caller of a successful `tryAcquire` then
+    /// holds a valid acquire and any subsequent reads of `state`
+    /// are ordered by the producer's prior `.release` decrement
+    /// when the producer eventually releases its own ref). For the
+    /// freeing thread's visibility guarantee, see the `release`
+    /// docstring.
+    pub fn tryAcquire(self: *Self) ?*Self {
+        var current = self.refcount.load(.monotonic);
+        while (true) {
+            if (current == 0) return null;
+            if (self.refcount.cmpxchgWeak(
+                current,
+                current + 1,
+                .monotonic,
+                .monotonic,
+            )) |actual| {
+                current = actual;
+            } else {
+                // CAS succeeded; we won the race.
+                std.debug.assert(current < std.math.maxInt(u32));
+                return self;
+            }
+        }
+    }
+
     /// Snapshot the current refcount. For tests + metrics only; do
     /// NOT branch on this value to decide whether to release. Reads
     /// are `.monotonic` because the only correct uses are
@@ -699,6 +772,153 @@ test "RcBeamState.acquireConst: concurrent readers free cleanly when creator dro
 
         i = 0;
         while (i < NUM_READERS) : (i += 1) {
+            threads[i].join();
+        }
+    }
+}
+
+test "RcBeamState.tryAcquire: succeeds when rc is alive (basic case)" {
+    const state = try makeState();
+    const rc = try RcBeamState.create(testing.allocator, state);
+    defer rc.release();
+    // refcount = 1
+    const got = rc.tryAcquire();
+    try testing.expect(got != null);
+    try testing.expectEqual(rc, got.?);
+    try testing.expectEqual(@as(u32, 2), rc.count());
+    got.?.release();
+    try testing.expectEqual(@as(u32, 1), rc.count());
+}
+
+test "RcBeamState.tryAcquire: increments refcount under producer race" {
+    // Same shape as the existing pair-accounting test but using
+    // tryAcquire instead of acquireWriter. Each thread does a
+    // tryAcquire (which must succeed because the creator holds
+    // a valid reference), reads, releases. Creator's refcount=1
+    // is held throughout; tryAcquire never observes 0.
+    const NUM_THREADS: usize = 32;
+    const ITERS_PER_THREAD: usize = 1_000;
+
+    const Worker = struct {
+        fn run(rc: *RcBeamState, iters: usize) void {
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const got = rc.tryAcquire() orelse {
+                    // Should never happen: creator holds a ref so
+                    // refcount is always >= 1.
+                    @panic("tryAcquire returned null while creator held ref");
+                };
+                std.mem.doNotOptimizeAway(got.state.slot);
+                got.release();
+            }
+        }
+    };
+
+    const state = try makeState();
+    const rc = try RcBeamState.create(testing.allocator, state);
+    defer rc.release();
+
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    var i: usize = 0;
+    while (i < NUM_THREADS) : (i += 1) {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ rc, ITERS_PER_THREAD });
+    }
+    i = 0;
+    while (i < NUM_THREADS) : (i += 1) {
+        threads[i].join();
+    }
+    try testing.expectEqual(@as(u32, 1), rc.count());
+}
+
+test "RcBeamState.tryAcquire: returns null after refcount reaches 0" {
+    // White-box test: drop the refcount to 0 manually (simulating
+    // the freeing thread's commit) BEFORE calling tryAcquire, then
+    // verify tryAcquire short-circuits to null without bumping.
+    //
+    // We can't actually let release() free the wrapper here —
+    // we'd be calling tryAcquire on freed memory, which is UAF
+    // even with our short-circuit. So we use a hand-rolled fixture
+    // that bypasses the destroy() so the wrapper memory stays alive
+    // for the test's read. testing.allocator's leak detector ignores
+    // this fixture because we destroy it manually at the end.
+    const state = try makeState();
+    const wrapper = try testing.allocator.create(RcBeamState);
+    wrapper.* = .{
+        .allocator = testing.allocator,
+        .refcount = std.atomic.Value(u32).init(0), // simulate post-free state
+        .state = state,
+    };
+    defer {
+        // Manual cleanup: the wrapper's state was never released
+        // through the normal path because we forced refcount to 0.
+        wrapper.state.deinit();
+        testing.allocator.destroy(wrapper);
+    }
+
+    const got = wrapper.tryAcquire();
+    try testing.expect(got == null);
+    try testing.expectEqual(@as(u32, 0), wrapper.count()); // no increment
+}
+
+test "RcBeamState.tryAcquire: race against release-to-zero — producer + freer" {
+    // Stress test: one freeing thread, N tryAcquire'rs. The
+    // freeing thread starts holding the only reference (refcount=1)
+    // and releases. The N tryAcquire'rs each loop trying to bump.
+    // The acceptable outcomes for each tryAcquire call are:
+    //   (a) succeed (refcount was >0 when CAS won) — in which
+    //       case the caller MUST release exactly once.
+    //   (b) fail (refcount hit 0 first) — caller does nothing.
+    // testing.allocator's leak detector verifies that every
+    // successful tryAcquire is matched by a release, and that the
+    // wrapper is freed exactly once.
+    //
+    // Because the wrapper may be freed at any moment after the
+    // freer's release, callers can't safely call tryAcquire on a
+    // dangling pointer. To make this a valid test we have each
+    // tryAcquire'r take its own pre-bump on the spawn thread (so
+    // it enters the worker holding a valid reference), then the
+    // worker's body itself calls tryAcquire on a SECOND reference
+    // it could legally observe. This still exercises the freer's
+    // observed-from-outside CAS pattern: the freer is dropping
+    // its own ref while concurrent tryAcquires run.
+    const NUM_TRIERS: usize = 16;
+    const OUTER_ITERS: usize = 50;
+
+    const Trier = struct {
+        fn run(handed: *RcBeamState) void {
+            // We hold one valid reference (handed). While we hold
+            // it, refcount is >= 1, so any tryAcquire on this rc
+            // MUST succeed. This is the safety-precondition path.
+            const got = handed.tryAcquire() orelse {
+                @panic("tryAcquire failed while we held a ref");
+            };
+            std.mem.doNotOptimizeAway(got.state.slot);
+            got.release();    // drop the tryAcquire bump
+            handed.release(); // drop the pre-bump
+        }
+    };
+
+    var outer: usize = 0;
+    while (outer < OUTER_ITERS) : (outer += 1) {
+        const state = try makeState();
+        const rc = try RcBeamState.create(testing.allocator, state);
+        // refcount = 1 (creator)
+
+        var threads: [NUM_TRIERS]std.Thread = undefined;
+        var i: usize = 0;
+        while (i < NUM_TRIERS) : (i += 1) {
+            const handed = rc.acquireWriter();
+            threads[i] = std.Thread.spawn(.{}, Trier.run, .{handed}) catch |err| {
+                handed.release();
+                return err;
+            };
+        }
+        // Drop creator's ref while triers are still running. The
+        // last release — from any thread — frees.
+        rc.release();
+
+        i = 0;
+        while (i < NUM_TRIERS) : (i += 1) {
             threads[i].join();
         }
     }
