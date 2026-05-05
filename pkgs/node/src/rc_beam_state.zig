@@ -77,9 +77,17 @@ const types = @import("@zeam/types");
 ///     const rc = try RcBeamState.create(allocator, state);
 ///     defer rc.release();              // initial reference
 ///
-///     // Reader path: existing rc, take a fresh acquire.
-///     const reader_rc = rc.acquire();
+///     // Cross-thread reader path (HTTP, metrics, broadcaster):
+///     // use acquireConst() so the type system enforces that
+///     // the holder cannot mutate state.<field>. release()
+///     // accepts *const Self, no cast needed at the call site.
+///     const reader_rc = rc.acquireConst();
 ///     defer reader_rc.release();       // independent of creator
+///
+///     // Chain-worker (writer) path: use acquireWriter() to get
+///     // *Self when the follow-up handler may mutate state.
+///     const writer_rc = rc.acquireWriter();
+///     defer writer_rc.release();
 ///
 /// Concurrent acquire/release is safe; the underlying refcount is an
 /// atomic and the freeing thread wins exactly one cmpxchg.
@@ -139,18 +147,24 @@ pub const RcBeamState = struct {
     /// state. Safe to call from any thread that holds a valid
     /// acquire.
     ///
-    /// Cross-thread readers (HTTP API, metrics scrape, event
-    /// broadcaster) MUST use `acquireConst()` instead so the type
-    /// system enforces the sole-writer invariant: only the chain
-    /// worker can obtain a `*Self` (mutable) pointer; everyone else
-    /// gets `*const Self`.
+    /// Convention, NOT compile-time enforcement: the type system
+    /// does not gate `acquireWriter` to a particular thread —
+    /// anyone can call it and get `*Self`. What the type system
+    /// DOES enforce is the consequence: a holder of `*const Self`
+    /// (from `acquireConst`) cannot mutate `state`. The asymmetric
+    /// names (`acquireWriter` vs `acquireConst`) make the
+    /// convention loud at every call site, and code review (not
+    /// the compiler) keeps non-worker code paths off this entry
+    /// point. If convention proves leaky in c-2b, the next step
+    /// is two distinct types (`RcBeamStateWriter` /
+    /// `RcBeamStateReader`).
     ///
     /// Memory ordering: `.monotonic` on the increment per the
     /// standard refcount pattern. The caller already holds a valid
     /// acquire so there is no race against a free; incrementing
     /// requires no fence. (Rust `Arc::clone`, C++
     /// `shared_ptr::shared_ptr(const &)` use the same ordering.)
-    pub fn acquire(self: *Self) *Self {
+    pub fn acquireWriter(self: *Self) *Self {
         const prev = self.refcount.fetchAdd(1, .monotonic);
         // Overflow check: u32 max is 4 billion; we should never get
         // anywhere near this in practice, but a wraparound would be
@@ -163,15 +177,18 @@ pub const RcBeamState = struct {
     /// call site that does NOT need to mutate the state — i.e. all
     /// cross-thread readers (HTTP API, metrics scrape, event
     /// broadcaster). The c-2b design has the chain worker as the
-    /// sole writer; readers using `acquireConst` makes that
-    /// invariant compile-checked rather than convention-only.
+    /// sole writer; what `acquireConst` actually provides is a
+    /// compile-checked guarantee that the holder cannot mutate
+    /// `state.<field>` through this reference. The choice of which
+    /// entry point to call (`acquireWriter` vs `acquireConst`)
+    /// remains a convention enforced by code review.
     ///
-    /// Refcount semantics are identical to `acquire`: matched by a
-    /// `release()` call on the same pointer (cast away the const if
-    /// needed at the release site — release is logically a
-    /// destructor and is allowed to mutate even on a `const` view).
+    /// Refcount semantics are identical to `acquireWriter`:
+    /// matched by a `release()` call on the same pointer.
+    /// `release` takes `*const Self` so the reader path doesn't
+    /// need a cast at the call site.
     pub fn acquireConst(self: *Self) *const Self {
-        return self.acquire();
+        return self.acquireWriter();
     }
 
     /// Decrement refcount. When refcount reaches 0, calls
@@ -183,7 +200,20 @@ pub const RcBeamState = struct {
     /// at the call site. The function itself uses `@constCast`
     /// internally because release IS a destructive operation —
     /// const-ness on the reader's view is about preventing
-    /// state-field mutation, not about the refcount itself.
+    /// `state.<field>` mutation, not about the refcount itself.
+    ///
+    /// MUST NOT be called on a `*const Self` derived from a true
+    /// const value (a global `const RcBeamState`, or a stack-local
+    /// declared `const`). The `@constCast` is only safe because
+    /// every `RcBeamState` is heap-allocated by `create()` — the
+    /// underlying memory is mutable, the `*const` qualifier is
+    /// purely a view restriction. Mutating through a pointer
+    /// derived from a true-const value is undefined behaviour in
+    /// optimised builds (the compiler is allowed to assume the
+    /// memory does not change). Future contributors writing test
+    /// fixtures or examples MUST go through `create()`; do not
+    /// fabricate an `RcBeamState` value as a `const` decl and
+    /// release it.
     ///
     /// Memory ordering: `.acq_rel` on the decrement. The freeing
     /// thread (`prev == 1`) needs the `.acquire` half to
@@ -271,7 +301,7 @@ test "RcBeamState: acquire + release pair is balanced" {
     const rc = try RcBeamState.create(testing.allocator, state);
     defer rc.release(); // creator's reference
 
-    const reader = rc.acquire();
+    const reader = rc.acquireWriter();
     try testing.expectEqual(@as(u32, 2), rc.count());
     reader.release();
     try testing.expectEqual(@as(u32, 1), rc.count());
@@ -282,9 +312,9 @@ test "RcBeamState: multiple acquires and releases keep state alive until last" {
     const rc = try RcBeamState.create(testing.allocator, state);
     // creator's release happens last (at the bottom of this test)
 
-    const r1 = rc.acquire();
-    const r2 = rc.acquire();
-    const r3 = rc.acquire();
+    const r1 = rc.acquireWriter();
+    const r2 = rc.acquireWriter();
+    const r3 = rc.acquireWriter();
     try testing.expectEqual(@as(u32, 4), rc.count());
 
     r1.release();
@@ -303,7 +333,7 @@ test "RcBeamState: acquire returns the same pointer (cheap to chain)" {
     const rc = try RcBeamState.create(testing.allocator, state);
     defer rc.release();
 
-    const reader = rc.acquire();
+    const reader = rc.acquireWriter();
     try testing.expect(reader == rc);
     reader.release();
 }
@@ -334,7 +364,7 @@ test "RcBeamState: acquire/release pair accounting under producer race (40 threa
         fn run(target: *RcBeamState, n: usize) void {
             var k: usize = 0;
             while (k < n) : (k += 1) {
-                const reader = target.acquire();
+                const reader = target.acquireWriter();
                 // Touch the state to keep the compiler honest about
                 // ordering: the load must happen between acquire
                 // and release, otherwise the refcount semantics are
@@ -419,7 +449,7 @@ test "RcBeamState: freeing race — last release wins under contention" {
         while (i < NUM_WORKERS) : (i += 1) {
             // Pre-bump on the spawning thread (we still hold
             // the creator's reference here, so this is safe).
-            const handed = rc.acquire();
+            const handed = rc.acquireWriter();
             threads[i] = std.Thread.spawn(
                 .{},
                 Worker.run,
@@ -465,7 +495,7 @@ test "RcBeamState: freeing race — worker takes the final release" {
     //
     // Sequence on the test thread:
     //   1. create(state)            → refcount = 1 (creator)
-    //   2. handed = rc.acquire()    → refcount = 2 (creator + handed)
+    //   2. handed = rc.acquireWriter()    → refcount = 2 (creator + handed)
     //   3. rc.release()             → refcount = 1 (handed only)
     //   4. spawn(worker, handed)
     //   5. join
@@ -479,7 +509,7 @@ test "RcBeamState: freeing race — worker takes the final release" {
         const state = try makeState();
         const rc = try RcBeamState.create(testing.allocator, state);
         // refcount = 1 (creator)
-        const handed = rc.acquire();
+        const handed = rc.acquireWriter();
         // refcount = 2 (creator + handed)
         rc.release();
         // refcount = 1 (handed only)
@@ -507,7 +537,7 @@ test "RcBeamState: release order doesn't matter (acquire-then-release vs release
 
     const Worker = struct {
         fn run(target: *RcBeamState) void {
-            const reader = target.acquire();
+            const reader = target.acquireWriter();
             std.Thread.yield() catch {};
             reader.release();
         }
