@@ -183,6 +183,43 @@ pub const RcBeamState = struct {
     /// entry point to call (`acquireWriter` vs `acquireConst`)
     /// remains a convention enforced by code review.
     ///
+    /// ## Lifetime contract (READ THIS BEFORE c-2b)
+    ///
+    /// The `*const Self` you hold keeps the underlying `state`
+    /// alive ONLY until you call `release()` on it. The freeing
+    /// thread is whichever thread brings refcount to 0 — it could
+    /// be a *different* thread (e.g. the chain worker dropping its
+    /// last reference while you still hold yours), and that thread
+    /// will call `state.deinit()` the moment YOUR `release()`
+    /// returns if you happen to be the last reference holder.
+    ///
+    /// Implications:
+    ///
+    ///   * Drop the borrow as soon as the read is done. Acquire,
+    ///     read what you need (snapshot fields, copy slices), call
+    ///     release. Treat it like a Rust scoped borrow, not a
+    ///     cached handle.
+    ///
+    ///   * Do NOT cache the `*const Self` in a long-lived struct
+    ///     field. That is the obvious footgun; it pins the state
+    ///     across STF advances and blocks the freeing path on
+    ///     stale heads. Each consumer takes a fresh acquire per
+    ///     unit of work.
+    ///
+    ///   * Do NOT hold the borrow across an STF FFI window or any
+    ///     long-running call. The chain worker (sole writer) may
+    ///     be ready to retire that state; pinning it serialises
+    ///     the worker against the slowest reader.
+    ///
+    ///   * The borrow does NOT pin `state.<field>` against in-place
+    ///     mutation. The chain-worker's `acquireWriter` view of
+    ///     the same `RcBeamState` can mutate `state.<field>`
+    ///     concurrently. Today this is fine because the c-2b
+    ///     design promotes-then-releases (writer never mutates
+    ///     a state that has live readers), but the type system
+    ///     does NOT enforce that — see the `acquireWriter`
+    ///     docstring on the convention vs enforcement point.
+    ///
     /// Refcount semantics are identical to `acquireWriter`:
     /// matched by a `release()` call on the same pointer.
     /// `release` takes `*const Self` so the reader path doesn't
@@ -601,8 +638,19 @@ test "RcBeamState.acquireConst: returns *const Self that releases cleanly" {
     defer rc.release(); // creator's reference
 
     const reader: *const RcBeamState = rc.acquireConst();
-    // Read-only deref: this would not compile if `state` weren't
-    // const-friendly. (BeamState's read methods all take `*const`.)
+    // Read-only deref through the const view. The negative case
+    // — the line that would fail to compile if a contributor
+    // tried to mutate — is shown explicitly below as a comment
+    // (uncommenting it surfaces the type-system guarantee at
+    // build time):
+    //
+    //     reader.state.slot = 5;
+    //     // error: cannot assign to constant
+    //
+    // We don't actually compile-fail in this test (Zig has no
+    // stable in-source @compileError fixture for negative tests),
+    // but the commented line documents what the type system
+    // catches. The positive case is below: a plain read.
     std.mem.doNotOptimizeAway(reader.state.slot);
     try testing.expectEqual(@as(u32, 2), rc.count());
     reader.release();
