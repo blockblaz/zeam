@@ -19,15 +19,28 @@
 //! Slice c-1 (this file) ships the **scaffold only**:
 //!
 //!   * `Message` tagged union covering every chain-mutation entry point.
-//!   * `BoundedQueue(Message, capacity)` — a bounded ring with a single
+//!   * `BoundedQueue(Message, mode)` — a bounded ring with a single
 //!     consumer, multi-producer mutex+condvar protocol. Producers call
 //!     `trySend` (wait-free fail-on-full) so the libp2p bridge thread
-//!     never blocks on a full queue. The drain side wakes on push and
-//!     is woken on shutdown.
-//!   * `ChainWorker` — owns the thread, stop signal, and the two queues
-//!     (block-FIFO, attestation-LIFO per the design doc §"Bounded queue,
-//!     backpressure, and starvation"). The worker loop is a stub —
-//!     handlers return `unreachable`-tagged TODOs; slice c-2 wires them.
+//!     never blocks on a full queue. Two consumer APIs: blocking
+//!     `recv` (used by tests + any single-queue consumer) and
+//!     non-blocking `tryRecv` (used by the chain-worker loop, which
+//!     multiplexes two queues).
+//!   * `ChainWorker` — owns the thread, two queues (block-FIFO,
+//!     attestation-LIFO per the design doc §"Bounded queue,
+//!     backpressure, and starvation"), stop flag, and a shared
+//!     `wake_cond` so the worker wakes regardless of which queue a
+//!     producer pushed into. Producers MUST send via
+//!     `sendBlock`/`sendAttestation` so the wake signal is emitted.
+//!     Shutdown is signalled out-of-band: `stop()` flips `stop_flag`,
+//!     closes both queues, and signals `wake_cond`; the loop drains
+//!     remaining messages (calling `Message.deinit` so producer-
+//!     allocated heap is not leaked) and returns. There is
+//!     deliberately no `Message.shutdown` variant — the queues
+//!     transport real work, not control signals.
+//!     The c-1 dispatch handler is a stub that logs unhandled
+//!     variants and frees them via `Message.deinit`; slice c-2
+//!     replaces the stub with per-variant chain-method calls.
 //!
 //! Behavioral changes are deferred to slice c-2:
 //!
@@ -61,40 +74,103 @@ fn defaultIo() std.Io {
 /// Tagged union covering every chain-mutation entry point.
 ///
 /// Each variant carries the data the chain-worker needs to run the
-/// equivalent synchronous call as it exists today (slice b). The
-/// `Shutdown` variant is the worker's only sentinel for graceful exit;
-/// `ChainWorker.stop()` enqueues it on the block queue (highest-priority
-/// queue, drained first) so the worker exits cleanly even mid-attestation
-/// burst.
+/// equivalent synchronous call as it exists today (slice b). Worker
+/// shutdown is NOT modelled as a message variant — it is signalled
+/// out-of-band via `ChainWorker.stop_flag` plus closing the queues plus
+/// signalling the worker's wake condvar. See `ChainWorker.stop()` and
+/// `ChainWorker.runLoop()`.
 ///
-/// Ownership: every payload allocated by a producer (e.g. the
-/// `signed_block` SSZ buffer on `OnBlock`) is the worker's responsibility
-/// to free after handling. c-1 does not yet exercise this — c-2 wires
-/// the producers and writes the matching ownership tests.
+/// ## Ownership contract (the part c-2 producers MUST get right)
+///
+/// Every variant whose payload contains heap-owned data transfers
+/// ownership of that data to the queue at `sendBlock`/`sendAttestation`
+/// time. Producers MUST NOT call `deinit` on the payload after a
+/// successful send: the queue holds the only valid handle to the
+/// underlying allocations until the worker pops the message and calls
+/// `Message.deinit` on it.
+///
+/// On `error.QueueFull` / `error.QueueClosed` the producer retains
+/// ownership and is responsible for cleaning up. The wrapper helpers
+/// (`ChainWorker.sendBlock`/`sendAttestation`) preserve this: they
+/// only consume on success.
+///
+/// The worker is responsible for calling `Message.deinit` on every
+/// message it pops (whether handled, skipped, or hit during the
+/// stop drain), including in error paths from the dispatch handlers
+/// it will land in c-2. `Message.deinit` switches on tag and calls the
+/// appropriate per-variant cleanup; variants whose payloads are
+/// plain-old-data are no-ops.
+///
+/// This locks the contract in code (rather than just prose) so a c-2
+/// producer that calls `signed_block.deinit()` after `sendBlock` will
+/// fail review (the type's API documents that the value has moved),
+/// and a c-2 worker that forgets to deinit will leak audibly under
+/// the standard test allocator's leak detector.
 pub const Message = union(enum) {
     /// Full block import. Producer is libxev (replay path), libp2p
     /// gossip handler (after gossipsub validation), or req/resp.
+    /// Owns: `signed_block` (transitively the block body's
+    /// attestations + signatures slices).
     on_block: struct {
         signed_block: types.SignedBlock,
         prune_forkchoice: bool,
     },
     /// Single attestation gossip. Producer is libp2p gossip handler.
+    /// `SignedAttestation` is plain-old-data (fixed-size validator id,
+    /// embedded data + signature) so this variant is heap-free.
     on_gossip_attestation: networks.AttestationGossip,
     /// Aggregated-attestation gossip. Producer is libp2p gossip handler.
+    /// Owns: `proof` slices inside the aggregated attestation.
     on_gossip_aggregated_attestation: types.SignedAggregatedAttestation,
     /// `processPendingBlocks` drain trigger. Producer is libxev clock
-    /// (`onInterval`).
+    /// (`onInterval`). Heap-free (slot is a value type).
     process_pending_blocks: struct {
         current_slot: types.Slot,
     },
     /// `processFinalizationFollowup` move-off path (slice c-2 will
-    /// dispatch this; c-1 just defines the variant).
+    /// dispatch this; c-1 just defines the shape).
+    ///
+    /// Carries the producer's snapshot of `(previous_finalized,
+    /// latest_finalized)` rather than letting the worker re-read from
+    /// `forkChoice.fcStore` on dispatch. Rationale: the producer
+    /// (typically `onBlockFollowup`) sees the exact finalization edge
+    /// that just advanced; if the worker re-reads, another mutation
+    /// could have moved the value forward and the worker would emit
+    /// SSE events with the wrong `prev` checkpoint, or skip an
+    /// intermediate finalization the producer was responsible for
+    /// announcing. Matches the parameter shape of
+    /// `BeamChain.processFinalizationAdvancement` (chain.zig:1660).
+    ///
+    /// Heap-free: `Checkpoint` is `(Root, Slot)`, a value type.
     process_finalization_followup: struct {
-        emit_events: bool,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
     },
-    /// Sentinel — drains the worker loop. Only `ChainWorker.stop` emits
-    /// it; producers must not.
-    shutdown: void,
+
+    /// Free any heap-owned data on this message. The worker must call
+    /// this on every message it pops, including in error paths from
+    /// the c-2 dispatch handlers and during the stop-drain in
+    /// `runLoop`. Idempotent against POD variants.
+    pub fn deinit(self: *Message) void {
+        switch (self.*) {
+            .on_block => |*payload| {
+                payload.signed_block.deinit();
+            },
+            .on_gossip_aggregated_attestation => |*payload| {
+                payload.deinit();
+            },
+            .on_gossip_attestation,
+            .process_pending_blocks,
+            .process_finalization_followup,
+            => {
+                // Plain-old-data; nothing to free. Listed explicitly
+                // so that a future variant added with heap fields
+                // becomes a compile-time exhaustiveness error in this
+                // switch and gets its cleanup wired correctly.
+            },
+        }
+    }
 };
 
 /// Bounded ring queue, multi-producer / single-consumer.
@@ -385,8 +461,10 @@ pub const ChainWorker = struct {
     /// producer signals via `sendBlock` / `sendAttestation`, and `stop`
     /// signals after closing the queues.
     ///
-    /// Exit condition: `stop_flag == true` (set by either `stop()` or
-    /// the `Shutdown` message handler) AND both queues are drained.
+    /// Exit condition: `stop_flag == true` AND both queues are
+    /// drained. On exit, any messages still in the queues are popped
+    /// and freed via `Message.deinit` so producer-allocated heap is
+    /// not leaked when shutdown races a partial enqueue burst.
     fn runLoop(self: *Self) void {
         self.logger.info("chain-worker: loop started", .{});
         const io = defaultIo();
@@ -396,20 +474,24 @@ pub const ChainWorker = struct {
             // Drain block queue first (highest priority). `tryRecv`
             // never blocks; we keep draining until empty.
             if (self.block_queue.tryRecv()) |msg| {
-                self.handle(msg);
+                self.dispatch(msg);
                 continue;
             }
 
             // Then attestation queue.
             if (self.attestation_queue.tryRecv()) |msg| {
-                self.handle(msg);
+                self.dispatch(msg);
                 continue;
             }
 
             // Both queues empty this round. Check stop condition
             // BEFORE parking: if stop was requested while we were
-            // draining, exit now without parking.
-            if (self.stop_flag.load(.acquire)) break;
+            // draining, drain anything that arrived after the last
+            // probe and exit.
+            if (self.stop_flag.load(.acquire)) {
+                self.drainOnStop();
+                break;
+            }
 
             // Park on the shared wake-cond. Any producer that calls
             // sendBlock / sendAttestation will signal it, as will
@@ -432,16 +514,39 @@ pub const ChainWorker = struct {
         self.logger.info("chain-worker: loop stopped", .{});
     }
 
-    /// Slice c-1 stub. Real handlers land in c-2 alongside the
-    /// per-callsite migration. Until then, this is unreachable in
-    /// production — only tests exercise the worker, and they enqueue
-    /// `Shutdown` only.
-    fn handle(self: *Self, msg: Message) void {
-        switch (msg) {
-            .shutdown => {
-                self.logger.debug("chain-worker: shutdown message received", .{});
-                self.stop_flag.store(true, .release);
-            },
+    /// Pop and free every remaining message in both queues without
+    /// running their handler logic. Called from `runLoop` once the
+    /// stop flag is observed; ensures producer-allocated heap is not
+    /// leaked when stop races a partial enqueue burst.
+    fn drainOnStop(self: *Self) void {
+        var freed: usize = 0;
+        while (self.block_queue.tryRecv()) |popped| {
+            var m = popped;
+            m.deinit();
+            freed += 1;
+        }
+        while (self.attestation_queue.tryRecv()) |popped| {
+            var m = popped;
+            m.deinit();
+            freed += 1;
+        }
+        if (freed > 0) {
+            self.logger.info(
+                "chain-worker: stop drain freed {d} unprocessed message(s)",
+                .{freed},
+            );
+        }
+    }
+
+    /// c-1 stub: log the popped variant and free its heap. c-2 will
+    /// replace this with a per-variant dispatch into the chain
+    /// methods. Even after c-2 lands, the `Message.deinit` call must
+    /// remain at the bottom of every dispatch path — the worker is
+    /// the sole owner from `tryRecv` to handler return.
+    fn dispatch(self: *Self, msg: Message) void {
+        var m = msg;
+        defer m.deinit();
+        switch (m) {
             .on_block,
             .on_gossip_attestation,
             .on_gossip_aggregated_attestation,
@@ -454,7 +559,7 @@ pub const ChainWorker = struct {
                 // log so test failures are debuggable.
                 self.logger.warn(
                     "chain-worker: unhandled message variant in c-1 scaffold: {s}",
-                    .{@tagName(msg)},
+                    .{@tagName(m)},
                 );
             },
         }
@@ -628,7 +733,7 @@ test "BoundedQueue: multi-producer trySend race — counters are exact" {
     );
 }
 
-test "ChainWorker: start, send Shutdown, joins cleanly" {
+test "ChainWorker: start, send a message, stop() drains and joins cleanly" {
     var logger_config = zeam_utils.getTestLoggerConfig();
     var w = try ChainWorker.init(testing.allocator, .{
         .logger = logger_config.logger(.chain),
@@ -639,10 +744,13 @@ test "ChainWorker: start, send Shutdown, joins cleanly" {
 
     try w.start();
 
-    // Loop must run at least once before we tell it to stop.
-    try w.sendBlock(.shutdown);
-    // Wait for the shutdown handler to flip the stop flag.
-    while (!w.stop_flag.load(.acquire)) {
+    // Send a POD message (no heap to manage) and wait until the
+    // worker has dispatched it. process_pending_blocks is heap-free
+    // so the dispatcher's `Message.deinit` is a no-op — the test
+    // observes wake-then-handle without the test allocator's leak
+    // detector seeing anything.
+    try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = 7 } });
+    while (w.block_queue.recv_total.load(.monotonic) < 1) {
         std.Thread.yield() catch {};
     }
     w.stop();
@@ -745,5 +853,108 @@ test "ChainWorker: producers race with worker drain — all messages handled, no
         w.attestation_queue.recv_total.load(.monotonic),
     );
 
+    w.stop();
+}
+
+test "Message.deinit: on_block frees the SignedBlock heap (no leak under testing.allocator)" {
+    // Build a SignedBlock that owns heap (attestations + signatures
+    // lists), wrap it in a Message, and verify deinit cleans up.
+    // testing.allocator panics on leak so the assertion is implicit.
+    const attestations = try types.AggregatedAttestations.init(testing.allocator);
+    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+
+    var msg: Message = .{
+        .on_block = .{
+            .signed_block = .{
+                .block = .{
+                    .slot = 9,
+                    .proposer_index = 3,
+                    .parent_root = std.mem.zeroes(types.Root),
+                    .state_root = std.mem.zeroes(types.Root),
+                    .body = .{ .attestations = attestations },
+                },
+                .signature = signatures,
+            },
+            .prune_forkchoice = false,
+        },
+    };
+    msg.deinit();
+}
+
+test "Message.deinit: POD variants are no-ops" {
+    // process_pending_blocks, on_gossip_attestation, and
+    // process_finalization_followup carry no heap. deinit must
+    // succeed without freeing anything (and without compiler errors
+    // from the exhaustiveness switch).
+    var pending: Message = .{ .process_pending_blocks = .{ .current_slot = 42 } };
+    pending.deinit();
+
+    var attn: Message = .{
+        .on_gossip_attestation = .{
+            .subnet_id = 0,
+            .message = .{
+                .validator_id = 0,
+                .message = std.mem.zeroes(types.AttestationData),
+                .signature = std.mem.zeroes(types.SIGBYTES),
+            },
+        },
+    };
+    attn.deinit();
+
+    var fin: Message = .{
+        .process_finalization_followup = .{
+            .previous_finalized = .{ .root = std.mem.zeroes(types.Root), .slot = 0 },
+            .latest_finalized = .{ .root = std.mem.zeroes(types.Root), .slot = 8 },
+            .prune_forkchoice = true,
+        },
+    };
+    fin.deinit();
+}
+
+test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
+    // Enqueue a heap-owning Message, then immediately stop the worker
+    // BEFORE it has a chance to dispatch. The drainOnStop path must
+    // pop the message and call Message.deinit, otherwise testing.
+    // allocator's leak detector trips when the queue's storage is
+    // freed and the inner allocations are still live.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    var w = try ChainWorker.init(testing.allocator, .{
+        .logger = logger_config.logger(.chain),
+        .block_queue_capacity = 4,
+        .attestation_queue_capacity = 4,
+    });
+    defer w.deinit();
+
+    // Build the heap-owning payload before starting the worker so the
+    // race against dispatch is deterministic: we never start it.
+    // Without start(), runLoop never runs; instead we exercise
+    // drainOnStop via stop() directly. stop() is safe to call with no
+    // running thread (it returns early), so we instead call the
+    // private drain by way of: start, immediate stop, deinit. The
+    // worker may or may not have popped the message before stop;
+    // either way, no heap should leak.
+    const attestations = try types.AggregatedAttestations.init(testing.allocator);
+    const signatures = try types.createBlockSignatures(testing.allocator, attestations.len());
+    const msg: Message = .{
+        .on_block = .{
+            .signed_block = .{
+                .block = .{
+                    .slot = 1,
+                    .proposer_index = 0,
+                    .parent_root = std.mem.zeroes(types.Root),
+                    .state_root = std.mem.zeroes(types.Root),
+                    .body = .{ .attestations = attestations },
+                },
+                .signature = signatures,
+            },
+            .prune_forkchoice = false,
+        },
+    };
+
+    try w.start();
+    try w.sendBlock(msg);
+    // Don't wait for the worker to dispatch — race the stop. Either
+    // dispatch() runs deinit first, or drainOnStop runs it. Both
+    // paths must free.
     w.stop();
 }
