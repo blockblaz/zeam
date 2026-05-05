@@ -18,6 +18,10 @@ pub const BorrowedState = locking.BorrowedState;
 pub const LockedMap = locking.LockedMap;
 pub const BlockCache = locking.BlockCache;
 
+pub const chain_worker = @import("./chain_worker.zig");
+pub const ChainWorker = chain_worker.ChainWorker;
+pub const ChainWorkerMessage = chain_worker.Message;
+
 const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
@@ -26,5 +30,6 @@ test "get tests" {
     _ = @import("./chain.zig");
     _ = @import("./utils.zig");
     _ = @import("./locking.zig");
+    _ = @import("./chain_worker.zig");
     @import("std").testing.refAllDecls(@This());
 }
