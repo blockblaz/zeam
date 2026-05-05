@@ -22,6 +22,9 @@ pub const chain_worker = @import("./chain_worker.zig");
 pub const ChainWorker = chain_worker.ChainWorker;
 pub const ChainWorkerMessage = chain_worker.Message;
 
+pub const rc_beam_state = @import("./rc_beam_state.zig");
+pub const RcBeamState = rc_beam_state.RcBeamState;
+
 const networks = @import("@zeam/network");
 pub const NodeNameRegistry = networks.NodeNameRegistry;
 
@@ -31,5 +34,6 @@ test "get tests" {
     _ = @import("./utils.zig");
     _ = @import("./locking.zig");
     _ = @import("./chain_worker.zig");
+    _ = @import("./rc_beam_state.zig");
     @import("std").testing.refAllDecls(@This());
 }
