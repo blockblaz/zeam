@@ -25,6 +25,8 @@ const tree_visualizer = @import("./tree_visualizer.zig");
 const locking = @import("./locking.zig");
 const BorrowedState = locking.BorrowedState;
 const LockTimer = locking.LockTimer;
+const rc_beam_state = @import("./rc_beam_state.zig");
+const RcBeamState = rc_beam_state.RcBeamState;
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -101,7 +103,15 @@ pub const BeamChain = struct {
     forkChoice: fcFactory.ForkChoice,
     allocator: Allocator,
     // from finalized onwards to recent
-    states: std.AutoHashMap(types.Root, *types.BeamState),
+    /// Cached post-states keyed by block root. Migrated to
+    /// `*RcBeamState` in slice c-2b (#803): refcounted state
+    /// pointers let the chain worker (sole writer under c-2b) and
+    /// cross-thread readers (HTTP API, metrics, broadcaster)
+    /// share state without copying. Until commit 4 of this PR
+    /// drops the rwlock, `states_lock` continues to gate
+    /// concurrent map mutation — the rc handles only address
+    /// state-pointer lifetime, not map-shape mutation.
+    states: std.AutoHashMap(types.Root, *RcBeamState),
     nodeId: u32,
     // This struct needs to contain the zeam_logger_config to be able to call `maybeRotate`
     // For all other modules, we just need logger
@@ -219,14 +229,24 @@ pub const BeamChain = struct {
             .thread_pool = opts.thread_pool,
         });
 
-        var states = std.AutoHashMap(types.Root, *types.BeamState).init(allocator);
-        const cloned_anchor_state = try allocator.create(types.BeamState);
-        // Destroy outer allocation if sszClone fails (interior not yet allocated).
-        errdefer allocator.destroy(cloned_anchor_state);
-        try types.sszClone(allocator, types.BeamState, opts.anchorState.*, cloned_anchor_state);
-        // Interior fields are now allocated; deinit them if states.put fails (LIFO order).
-        errdefer cloned_anchor_state.deinit();
-        try states.put(fork_choice.head.blockRoot, cloned_anchor_state);
+        var states = std.AutoHashMap(types.Root, *RcBeamState).init(allocator);
+        // Build the anchor state on the stack via sszClone, then
+        // hand it to RcBeamState.create which embeds it into the
+        // heap allocation (and consumes it on either success or
+        // OOM — always-consume contract per c-2a).
+        var cloned_anchor_state: types.BeamState = undefined;
+        try types.sszClone(
+            allocator,
+            types.BeamState,
+            opts.anchorState.*,
+            &cloned_anchor_state,
+        );
+        // Past this line, `cloned_anchor_state` owns interior
+        // allocations. RcBeamState.create takes ownership; on OOM
+        // it will deinit them for us.
+        const anchor_rc = try RcBeamState.create(allocator, cloned_anchor_state);
+        errdefer anchor_rc.release();
+        try states.put(fork_choice.head.blockRoot, anchor_rc);
 
         var chain = Self{
             .nodeId = opts.nodeId,
@@ -274,10 +294,14 @@ pub const BeamChain = struct {
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
 
+        // Each entry holds an RcBeamState we own a reference on.
+        // release() drops the count and frees the wrapper +
+        // interior state when refcount reaches 0. Under c-2b
+        // commit 2 nothing else takes acquires on map-resident
+        // states yet, so refcount is always 1 at deinit time.
         var it = self.states.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
+            entry.value_ptr.*.release();
         }
         self.states.deinit();
 
@@ -345,13 +369,16 @@ pub const BeamChain = struct {
         var t = LockTimer.start("states", "statesGet");
         self.states_lock.lockShared();
         t.acquired();
-        if (self.states.get(root)) |state| {
-            // Hand the lock off to the borrow. The borrow's deinit calls
-            // states_lock.unlockShared() AND closes the LockTimer
-            // observation — so the hold-span histogram correctly
-            // attributes the entire borrow lifetime to this site.
+        if (self.states.get(root)) |rc| {
+            // Hand the lock off to the borrow. Under c-2b commit 2
+            // the rwlock still gates lifetime: the rc lives as long
+            // as the entry is in the map AND the lock is held, so
+            // it's safe to expose `&rc.state` directly without
+            // taking an acquire. Commit 4 of this PR will drop the
+            // rwlock entirely and switch this path to
+            // `acquireConst()` + `tryAcquire()`.
             return BorrowedState{
-                .state = state,
+                .state = &rc.state,
                 .backing = .{ .states_shared_rwlock = &self.states_lock },
                 .timer = t,
             };
@@ -363,15 +390,24 @@ pub const BeamChain = struct {
         return null;
     }
 
-    /// Take the exclusive side of `states_lock` and `put` the entry. Used
-    /// by produceBlock / onBlock STF commit and similar single-key writes.
-    fn statesPutExclusive(self: *Self, comptime site: []const u8, root: types.Root, state_ptr: *types.BeamState) !void {
+    /// Take the exclusive side of `states_lock` and `put` the entry.
+    /// Used by produceBlock / onBlock STF commit and similar
+    /// single-key writes.
+    ///
+    /// Under c-2b commit 2 the helper takes `*RcBeamState` directly
+    /// (callers wrap their `*BeamState` via `RcBeamState.create`
+    /// before calling). Map ownership transfers in: on success the
+    /// map holds the rc and will release it on `deinit`. On
+    /// `map.put` OOM the helper releases `rc` so the caller never
+    /// has to clean up.
+    fn statesPutExclusive(self: *Self, comptime site: []const u8, root: types.Root, rc: *RcBeamState) !void {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
         defer t.released();
         defer self.states_lock.unlock();
-        try self.states.put(root, state_ptr);
+        errdefer rc.release();
+        try self.states.put(root, rc);
     }
 
     /// Insert under `states_lock.exclusive` if the entry is not already in
@@ -408,39 +444,42 @@ pub const BeamChain = struct {
         self: *Self,
         comptime site: []const u8,
         root: types.Root,
-        state_ptr: *types.BeamState,
+        rc: *RcBeamState,
     ) !struct { borrow: BorrowedState, kept_existing: bool } {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
-        // NOTE: NO `defer self.states_lock.unlock()` here — the exclusive
-        // lock is owned by the returned BorrowedState and released by its
-        // deinit. errdefer below covers the OOM path on `getOrPut`. The
-        // LockTimer is moved into the borrow as well so the hold-span
-        // observation closes at the deinit site, not here. PR #820.
+        // NOTE: NO `defer self.states_lock.unlock()` here — the
+        // exclusive lock is owned by the returned BorrowedState and
+        // released by its deinit. errdefer below covers the OOM path
+        // on `getOrPut`. The LockTimer is moved into the borrow as
+        // well so the hold-span observation closes at the deinit
+        // site, not here. PR #820.
         errdefer {
             self.states_lock.unlock();
             t.released();
         }
         const gop = try self.states.getOrPut(root);
-        const effective_ptr: *types.BeamState = if (gop.found_existing) blk: {
-            // Decision policy: keep the existing pointer (it's referenced
-            // elsewhere — e.g. produceBlock just inserted it before
-            // publishBlock landed here) and tell the caller to free the
-            // freshly-computed copy. We never want to invalidate a pointer
-            // that other borrows might still observe through
-            // `states_lock.shared`.
+        // After this point getOrPut succeeded; on subsequent failure
+        // we still own `rc` if not inserted, so handle both paths.
+        const effective_rc: *RcBeamState = if (gop.found_existing) blk: {
+            // Decision policy: keep the existing rc (other readers
+            // may still hold acquires on it) and release the
+            // freshly-computed copy the caller handed us. The
+            // "kept_existing" return tells the caller their rc was
+            // dropped so they don't double-release.
+            rc.release();
             break :blk gop.value_ptr.*;
         } else blk: {
-            gop.value_ptr.* = state_ptr;
-            break :blk state_ptr;
+            gop.value_ptr.* = rc;
+            break :blk rc;
         };
         if (gop.found_existing) {
             _ = self.states_kept_existing_count.fetchAdd(1, .monotonic);
         }
         return .{
             .borrow = BorrowedState{
-                .state = effective_ptr,
+                .state = &effective_rc.state,
                 .backing = .{ .states_exclusive_rwlock = &self.states_lock },
                 .timer = t,
             },
@@ -449,8 +488,12 @@ pub const BeamChain = struct {
     }
 
     /// Take the exclusive side of `states_lock` and remove the entry.
-    /// Returns the removed pointer (or null) so the caller can free it.
-    fn statesFetchRemoveExclusivePtr(self: *Self, comptime site: []const u8, root: types.Root) ?*types.BeamState {
+    /// Returns the removed `*RcBeamState` (or null) so the caller can
+    /// release it. Under c-2b the caller MUST call `.release()` on
+    /// the returned rc to drop the map's reference; if other readers
+    /// hold acquires the underlying state stays alive until the last
+    /// release.
+    fn statesFetchRemoveExclusivePtr(self: *Self, comptime site: []const u8, root: types.Root) ?*RcBeamState {
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
@@ -791,14 +834,32 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        try self.statesPutExclusive("produceBlock.commit", block_root, post_state);
-        post_state_opt = null;
+        // c-2b: wrap the heap-allocated post_state into an
+        // RcBeamState. RcBeamState.create takes BeamState by value
+        // and embeds it; the old heap wrapper is no longer needed,
+        // so destroy() it after the value-copy. Always-consume
+        // contract: on RcBeamState.create OOM the BeamState's
+        // interior is freed by create's own errdefer; we still
+        // need to free the old wrapper allocation that held the
+        // (now-moved-from) value.
+        const post_state_rc = blk: {
+            const value_copy = post_state.*;
+            // The wrapper allocation is no longer needed; the
+            // interior is owned by `value_copy` (struct copy is
+            // shallow but the slices/lists inside are pointers we
+            // are transferring) until create() consumes it.
+            self.allocator.destroy(post_state);
+            post_state_opt = null;
+            break :blk try RcBeamState.create(self.allocator, value_copy);
+        };
+        // statesPutExclusive takes ownership of the rc on success;
+        // releases on its own OOM path.
+        try self.statesPutExclusive("produceBlock.commit", block_root, post_state_rc);
 
         var forkchoice_added = false;
         errdefer if (!forkchoice_added) {
-            if (self.statesFetchRemoveExclusivePtr("produceBlock.errdefer", block_root)) |entry_ptr| {
-                entry_ptr.deinit();
-                self.allocator.destroy(entry_ptr);
+            if (self.statesFetchRemoveExclusivePtr("produceBlock.errdefer", block_root)) |rc_ptr| {
+                rc_ptr.release();
             }
         };
 
@@ -1425,20 +1486,51 @@ pub const BeamChain = struct {
         // This blocks `pruneStates` (also exclusive on `states_lock`) from
         // racing in via another thread's `onBlockFollowup` and freeing the
         // entry under us. See PR #820 / issue #803.
-        var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state);
+        // c-2b: wrap post_state in an RcBeamState before commit.
+        // If we own post_state, the rc takes its value and we must
+        // free the now-empty wrapper. If the caller supplied it,
+        // we sszClone into a fresh value and let create() consume
+        // that, leaving the caller's allocation untouched.
+        //
+        // After the rc is created, the rc owns the state value
+        // (success path) or the value's interior was deinit'd by
+        // create's OOM path. Either way the original wrapper
+        // memory is no longer needed when post_state_owned. Flip
+        // post_state_settled BEFORE destroying the wrapper so the
+        // upstream errdefer at line ~1317 does not deref freed
+        // memory if a later step fails.
+        var post_state_rc: *RcBeamState = undefined;
+        if (post_state_owned) {
+            const value = post_state.*;
+            // post_state's value has been moved into `value`; the
+            // wrapper allocation is now stale. Free it BEFORE
+            // attempting the create so that an OOM in create does
+            // not leave a wrapper-allocator leak. The interior
+            // owned by `value` is consumed by create on either
+            // path.
+            self.allocator.destroy(post_state);
+            post_state_settled = true;
+            post_state_rc = try RcBeamState.create(self.allocator, value);
+        } else {
+            // Caller owns post_state; clone its value into a fresh
+            // BeamState, then wrap. errdefer below covers the
+            // sszClone OOM path (interior cleanup before returning).
+            var value: types.BeamState = undefined;
+            try types.sszClone(self.allocator, types.BeamState, post_state.*, &value);
+            // Past sszClone success, value owns interior
+            // allocations. RcBeamState.create's always-consume
+            // contract handles cleanup on OOM.
+            post_state_rc = try RcBeamState.create(self.allocator, value);
+        }
+        // statesCommitKeepExisting takes the rc on either path:
+        //   kept-existing: helper releases our rc, returns a
+        //     borrow on the in-map rc;
+        //   new-insert:    helper transfers our rc into the map.
+        // On the helper's own OOM path it releases the rc for us.
+        var commit = try self.statesCommitKeepExisting("onBlock.commit", fcBlock.blockRoot, post_state_rc);
         // Release the exclusive lock on every exit path (success or error).
         defer commit.borrow.assertReleasedOrPanic();
         defer commit.borrow.deinit();
-        if (commit.kept_existing and post_state_owned) {
-            // Existing entry kept — free the freshly-computed (and now
-            // redundant) post_state. The borrow points at the in-map
-            // pointer (a different allocation), so this free does not
-            // invalidate `commit.borrow.state`. Caller-supplied post-states
-            // (i.e. `post_state_owned == false`) belong to the caller; we
-            // don't touch them.
-            post_state.deinit();
-            self.allocator.destroy(post_state);
-        }
         // From here on use the borrow's pointer (the in-map one): if the
         // commit kept an existing entry, our `post_state` is freed and
         // unsafe to deref. The borrow keeps the in-map pointer alive for
@@ -1633,12 +1725,13 @@ pub const BeamChain = struct {
         });
 
         // We keep the canonical chain from finalized to head, so we can safely prune all non-canonical states
-        // Actually remove and deallocate the pruned states
+        // Actually remove and deallocate the pruned states (under
+        // c-2b: release the rc — the underlying state may stay
+        // alive if other readers hold acquires; freed when last
+        // release runs).
         for (roots) |root| {
             if (self.states.fetchRemove(root)) |entry| {
-                const state_ptr = entry.value;
-                state_ptr.deinit();
-                self.allocator.destroy(state_ptr);
+                entry.value.release();
                 self.logger.debug("pruned state for root 0x{x}", .{
                     &root,
                 });
@@ -2441,9 +2534,9 @@ test "process and add mock blocks into a node's chain" {
         // should have matching states in the state
         // SAFETY: test-only, single-threaded — no states_lock acquisition
         // needed (the chain under test has no concurrent mutators).
-        const block_state = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
+        const block_state_rc = beam_chain.states.get(block_root) orelse @panic("state root should have been found");
         var state_root: [32]u8 = undefined;
-        try zeam_utils.hashTreeRoot(*types.BeamState, block_state, &state_root, allocator);
+        try zeam_utils.hashTreeRoot(types.BeamState, block_state_rc.state, &state_root, allocator);
         try std.testing.expect(std.mem.eql(u8, &state_root, &block.state_root));
 
         // fcstore checkpoints should match
@@ -3227,8 +3320,8 @@ test "produceBlock - greedy selection by latest slot is suboptimal when attestat
     // (att_data_known at slot=1) is the one that actually matters.
     // SAFETY: test-only, single-threaded — no states_lock acquisition
     // needed (the chain under test has no concurrent mutators).
-    const post_state = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
-    try std.testing.expect(post_state.latest_justified.slot >= 1);
+    const post_state_rc = beam_chain.states.get(produced.blockRoot) orelse @panic("post state should exist");
+    try std.testing.expect(post_state_rc.state.latest_justified.slot >= 1);
 
     // Count how many attestation entries reference the unseen vs known block
     var unseen_count: usize = 0;
@@ -3734,11 +3827,12 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         // The 0-keyed root would alias genesis (zeroes); we offset by +1.
         unrelated_roots[k] = r;
 
-        const cloned_state = try std.testing.allocator.create(types.BeamState);
-        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, cloned_state);
+        var cloned_value: types.BeamState = undefined;
+        try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+        const cloned_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
         // Insert directly under exclusive lock (test-internal access).
         beam_chain.states_lock.lock();
-        try beam_chain.states.put(r, cloned_state);
+        try beam_chain.states.put(r, cloned_rc);
         beam_chain.states_lock.unlock();
     }
 
@@ -3786,9 +3880,8 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
         fn pruner(ctx: *TestCtx) void {
             ctx.waitForStart();
             for (ctx.unrelated) |r| {
-                if (ctx.chain.statesFetchRemoveExclusivePtr("test.pruner", r)) |state_ptr| {
-                    state_ptr.deinit();
-                    std.testing.allocator.destroy(state_ptr);
+                if (ctx.chain.statesFetchRemoveExclusivePtr("test.pruner", r)) |rc_ptr| {
+                    rc_ptr.release();
                     _ = ctx.b_done.fetchAdd(1, .monotonic);
                 }
             }
