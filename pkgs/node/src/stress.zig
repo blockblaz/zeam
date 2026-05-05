@@ -170,6 +170,10 @@ const StressCtx = struct {
     /// Configured stall threshold echoed back in seconds for log/fatal
     /// messages. Stored separately so we don't divide an i128 in the hot path.
     watchdog_stall_secs: u64,
+    /// Highest block slot in the pre-imported chain. Used by
+    /// `borrowReaderWorker` for an O(1) coherence bound on observed
+    /// post-state slots; see the worker for rationale.
+    last_imported_slot: types.Slot,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // op counters
@@ -387,19 +391,24 @@ fn borrowReaderWorker(ctx: *StressCtx, thread_id: usize) void {
             _ = ctx.borrow_ops.fetchAdd(1, .monotonic);
             continue;
         };
-        // Coherence sanity: owned slot must be one of the known slots
-        // OR genesis slot 0. Anything else flags a torn read.
-        var coherent = owned.slot == 0;
-        if (!coherent) {
-            for (ctx.blocks) |b| {
-                if (b.block.slot == owned.slot) {
-                    coherent = true;
-                    break;
-                }
-            }
-        }
-        if (!coherent) {
-            ctx.recordFatal("borrow reader: incoherent slot={d}", .{owned.slot});
+        // Coherence sanity: O(1) bound check. The post-state's slot
+        // must lie within `[0, last_imported_slot]` — the chain has
+        // never advanced past the last block we pre-imported, and a
+        // negative / wraparound slot would indicate a torn read.
+        //
+        // Earlier versions of this check linear-scanned `ctx.blocks`
+        // for an exact slot match per iteration. That had two
+        // problems: O(N) per check, and a false-positive risk on
+        // future fixtures with skipped slots (where a legitimate
+        // post-state slot need not equal any block.slot). The
+        // bounded invariant catches torn reads (the ones that
+        // matter — slot field corrupted by a writer mid-clone)
+        // without depending on slot-to-block bijection.
+        if (owned.slot > ctx.last_imported_slot) {
+            ctx.recordFatal(
+                "borrow reader: incoherent slot={d} (last_imported={d})",
+                .{ owned.slot, ctx.last_imported_slot },
+            );
         }
         owned.deinit();
         allocator.destroy(owned);
@@ -650,6 +659,7 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
         .watchdog_stall_ns = @as(i128, @intCast(cfg.watchdog_stall_secs)) *
             std.time.ns_per_s,
         .watchdog_stall_secs = cfg.watchdog_stall_secs,
+        .last_imported_slot = mock_chain.blocks[mock_chain.blocks.len - 1].block.slot,
     };
 
     const total_threads = cfg.gossip_threads + cfg.rpc_threads + cfg.attestation_threads +

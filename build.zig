@@ -484,6 +484,31 @@ pub fn build(b: *Builder) !void {
     const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
     stress_step.dependOn(&run_stress.step);
 
+    // -----------------------------------------------------------------
+    // `stress-quick`: short-form stress harness wired into `zig build
+    // test`. The full 30-min run is operator-driven; this 30s run is
+    // what CI executes on every PR so the slice-(a)/(b) merge gate
+    // actually has automated enforcement, not just a PR-comment
+    // attestation. The quick run uses the same code paths as the full
+    // run and will fail CI on:
+    //   * any `MissingPreState` (states-map race),
+    //   * any unexpected `chain.onBlock` error in gossip-flood,
+    //   * any `recordFatal` from coherence checks (BlockCache,
+    //     borrow-reader, watchdog),
+    //   * worker error counters non-zero in the summary epilogue.
+    // 30s is long enough for several thousand ops on each worker
+    // without putting the test job over budget.
+    //
+    // Override knobs are intentionally NOT wired here — CI exercises
+    // the same defaults a developer sees with `zig build stress-quick`,
+    // which is the point.
+    const run_stress_quick = b.addRunArtifact(stress_exe);
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    stress_quick_step.dependOn(&run_stress_quick.step);
+    test_step.dependOn(&run_stress_quick.step);
+
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{

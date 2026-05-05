@@ -1136,6 +1136,77 @@ pub const BorrowedState = struct {
 
 const testing = std.testing;
 
+test "LockTimer: acquired+released emit zeam_lock_{wait,hold}_seconds in /metrics output" {
+    // Locks in the contract that LockTimer.acquired/released actually
+    // wire through to the per-resource histogram families exposed at
+    // /metrics. Slice-(a) review point: the file:line audit of the
+    // metric wiring is reviewable by humans but regresses silently if
+    // someone removes the `.observe(...)` call. This test calls
+    // `start().acquired().released()` once and then asserts the
+    // serialized scrape body contains both histogram series names plus
+    // at least one observed-bucket line tagged with the lock + site
+    // labels we used.
+    //
+    // The metrics module is process-global (`g_initialized` guard); we
+    // call `init` here unconditionally because it is a no-op on the
+    // second call. Other tests in this binary may have already
+    // populated counters — we therefore search for our specific
+    // (lock, site) label tuple, not just the bare metric name, so we
+    // don't depend on the test-order or mistake an unrelated
+    // observation for ours.
+    //
+    // We pass `std.heap.page_allocator` rather than
+    // `testing.allocator` so the (process-global) metrics state
+    // outlives this test. If we used the test allocator, every
+    // subsequent test in the binary that triggers a histogram
+    // hashmap grow (e.g. via `LockTimer.released()` from a chain
+    // test) would free the old buckets through an allocator whose
+    // arena has already been torn down — the DebugAllocator catches
+    // this as `reached unreachable` in its bucket-free assertion.
+    // The page allocator has no per-test lifetime, so the metrics
+    // hashmap can grow safely from any later test. The trade-off is
+    // that this test's allocator footprint is not tracked by the
+    // testing harness; that footprint is bounded by the histogram
+    // bucket we add (single (lock, site) pair) so it is acceptable.
+    try zeam_metrics.init(std.heap.page_allocator);
+
+    var t = LockTimer.start("locktimer_test_lock", "locktimer_test_site");
+    t.acquired();
+    t.released();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // The histogram families themselves must be advertised.
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_wait_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_hold_seconds") != null);
+
+    // And at least one bucket line for our specific (lock, site)
+    // label tuple must be present — proving the histogram was
+    // *observed*, not just declared.
+    //
+    // The Prometheus exposition format from the metrics library
+    // emits HistogramVec lines as e.g.:
+    //
+    //   zeam_lock_wait_seconds_bucket{le="0.001",lock="...",site="..."} N
+    //   zeam_lock_wait_seconds_count{lock="...",site="..."} N
+    //   zeam_lock_wait_seconds_sum{lock="...",site="..."} f
+    //
+    // The `_count` line is the most direct proof the histogram was
+    // observed at all (it is incremented once per `observe()` call),
+    // and it does not include the `le=` bucket attribute, which keeps
+    // this assertion robust to bucket-set changes. We additionally
+    // search for the (lock, site) label pair as a substring to verify
+    // those labels reached the output — their order may differ from
+    // call site to call site so we do separate substring checks.
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_wait_seconds_count") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_hold_seconds_count") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lock=\"locktimer_test_lock\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"locktimer_test_site\"") != null);
+}
+
 test "LockedMap: ctor + get/put/remove + count" {
     var lm = LockedMap(u32, u32).init(testing.allocator);
     defer lm.deinit();
