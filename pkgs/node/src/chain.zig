@@ -27,6 +27,7 @@ const BorrowedState = locking.BorrowedState;
 const LockTimer = locking.LockTimer;
 const rc_beam_state = @import("./rc_beam_state.zig");
 const RcBeamState = rc_beam_state.RcBeamState;
+const chain_worker = @import("./chain_worker.zig");
 
 const networkFactory = @import("./network.zig");
 const PeerInfo = networkFactory.PeerInfo;
@@ -212,6 +213,22 @@ pub const BeamChain = struct {
     root_to_slot_lock: zeam_utils.SyncMutex = .{},
     events_lock: zeam_utils.SyncMutex = .{},
 
+    /// Optional chain-worker thread (slice c-2b commit 3 of #803).
+    /// When non-null, `BeamChain` exposes the `submit*` family of
+    /// methods which enqueue work onto the worker's queues; the
+    /// worker thread serialises the actual chain mutations.
+    /// When null, callers fall through to the synchronous path
+    /// (current behavior). Surface flipped by
+    /// `ChainOpts.chain_worker_enabled`; CLI flag
+    /// `--chain-worker=on|off`.
+    ///
+    /// Lifecycle: allocated + started in `init` when
+    /// `chain_worker_enabled` is true; stopped + freed in `deinit`.
+    /// The worker borrows `*BeamChain` as its handler ctx, so the
+    /// chain MUST outlive the worker — hence the strict
+    /// stop/deinit/destroy ordering at the top of `BeamChain.deinit`.
+    chain_worker: ?*chain_worker.ChainWorker = null,
+
     pub const PruneCachedBlocksFn = *const fn (ptr: *anyopaque, finalized: types.Checkpoint) usize;
 
     const Self = @This();
@@ -278,11 +295,246 @@ pub const BeamChain = struct {
             .pubkey_cache_lock = .{},
             .root_to_slot_lock = .{},
             .events_lock = .{},
+            // chain_worker is started below (after the chain value is
+            // at its final heap location), so the worker's ctx pointer
+            // remains stable for its entire lifetime.
+            .chain_worker = null,
         };
         // Initialize cache with anchor block root and any post-finalized entries from state
         try chain.root_to_slot_cache.put(fork_choice.head.blockRoot, opts.anchorState.slot);
         try chain.anchor_state.initRootToSlotCache(&chain.root_to_slot_cache);
         return chain;
+    }
+
+    /// Allocate, initialise, and start a `chain_worker.ChainWorker`
+    /// against this chain. Called from `BeamNode.init` after the
+    /// chain is at its final heap address — the worker stores `self`
+    /// as its handler ctx, so the chain pointer must NOT move
+    /// afterwards.
+    ///
+    /// On error the partially-allocated worker is freed before
+    /// returning so the caller can treat init as all-or-nothing.
+    /// On success the worker thread is running and ready to drain;
+    /// calling code can now invoke `submit*` to route producer-side
+    /// work through the queue.
+    pub fn startChainWorker(self: *Self) !void {
+        std.debug.assert(self.chain_worker == null);
+        const w = try self.allocator.create(chain_worker.ChainWorker);
+        errdefer self.allocator.destroy(w);
+        w.* = try chain_worker.ChainWorker.init(self.allocator, .{
+            .logger = self.zeam_logger_config.logger(.chain),
+            .handlers = .{
+                .ctx = self,
+                .on_block = chainWorkerOnBlockThunk,
+                .on_gossip_attestation = chainWorkerOnGossipAttestationThunk,
+                .on_gossip_aggregated_attestation = chainWorkerOnGossipAggregatedAttestationThunk,
+                .process_pending_blocks = chainWorkerProcessPendingBlocksThunk,
+                .process_finalization_followup = chainWorkerProcessFinalizationFollowupThunk,
+            },
+        });
+        errdefer w.deinit();
+        try w.start();
+        self.chain_worker = w;
+        self.logger.info("chain-worker: started (block_q={d}, att_q={d})", .{
+            chain_worker.DEFAULT_BLOCK_QUEUE_CAPACITY,
+            chain_worker.DEFAULT_ATTESTATION_QUEUE_CAPACITY,
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // chain_worker handler thunks (slice c-2b commit 3)
+    // ------------------------------------------------------------------
+    //
+    // These thunks adapt the worker's type-erased vtable shape
+    // (`*anyopaque` ctx + value-typed payloads) to the real
+    // `BeamChain` methods. Each one:
+    //
+    //   1. Casts ctx back to `*BeamChain` (debug-build alignment
+    //      asserts via `@alignCast`).
+    //   2. Calls the synchronous chain method.
+    //   3. Catches and logs any error — the producer side already
+    //      fired-and-forgot, so there is no upstream error channel.
+    //   4. Frees any heap returned by the method (e.g. the
+    //      `missing_roots` slice from `onBlock` /
+    //      `processPendingBlocks`). In the chain-worker path, the
+    //      missing-attestation-roots feedback loop into the gossip
+    //      layer's RPC fetch is intentionally dropped — a follow-up
+    //      commit can plumb a back-channel if it proves necessary
+    //      on devnet, but for c-2b's narrow gossip-block-and-
+    //      attestation migration the loss is the same as a dropped
+    //      gossip message.
+    //
+    // The thunks live in `chain.zig` (not `chain_worker.zig`)
+    // because they need access to `BeamChain` and its private
+    // method `processFinalizationAdvancement`. Putting them here
+    // also keeps `chain_worker.zig` free of any `chain.zig`
+    // import — the layering this whole vtable design exists to
+    // preserve.
+
+    fn chainWorkerOnBlockThunk(
+        ctx: *anyopaque,
+        signed_block: types.SignedBlock,
+        prune_forkchoice: bool,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const missing_roots = self.onBlock(signed_block, .{
+            .pruneForkchoice = prune_forkchoice,
+        }) catch |err| {
+            self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
+                signed_block.block.slot,
+                err,
+            });
+            return;
+        };
+        defer self.allocator.free(missing_roots);
+        // Mirror the gossip path: followup runs after a successful
+        // import. We pass the (immutable) signed_block by reference
+        // for symmetry with chain.onGossip; current onBlockFollowup
+        // ignores the parameter (see the explicit `_ = signedBlock`
+        // at its top), so the value is functionally unused here.
+        self.onBlockFollowup(prune_forkchoice, &signed_block);
+    }
+
+    fn chainWorkerOnGossipAttestationThunk(
+        ctx: *anyopaque,
+        gossip: networks.AttestationGossip,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.onGossipAttestation(gossip) catch |err| {
+            self.logger.warn(
+                "chain-worker: onGossipAttestation failed slot={d} validator={d}: {any}",
+                .{ gossip.message.message.slot, gossip.message.validator_id, err },
+            );
+        };
+    }
+
+    fn chainWorkerOnGossipAggregatedAttestationThunk(
+        ctx: *anyopaque,
+        agg: types.SignedAggregatedAttestation,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.onGossipAggregatedAttestation(agg) catch |err| {
+            self.logger.warn(
+                "chain-worker: onGossipAggregatedAttestation failed slot={d}: {any}",
+                .{ agg.data.slot, err },
+            );
+        };
+    }
+
+    fn chainWorkerProcessPendingBlocksThunk(
+        ctx: *anyopaque,
+        current_slot: types.Slot,
+    ) void {
+        // current_slot is unused by the current `processPendingBlocks`
+        // implementation (it consults `forkChoice.fcStore.slot_clock`
+        // directly), but kept on the message so a future refactor
+        // that wants the producer's view of the slot doesn't need
+        // a Message-shape change.
+        _ = current_slot;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const missing_roots = self.processPendingBlocks();
+        self.allocator.free(missing_roots);
+    }
+
+    fn chainWorkerProcessFinalizationFollowupThunk(
+        ctx: *anyopaque,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
+    ) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.processFinalizationAdvancement(
+            previous_finalized,
+            latest_finalized,
+            prune_forkchoice,
+        ) catch |err| {
+            self.logger.err(
+                "chain-worker: processFinalizationAdvancement failed prev={d} latest={d}: {any}",
+                .{ previous_finalized.slot, latest_finalized.slot, err },
+            );
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // submit* family (slice c-2b commit 3)
+    // ------------------------------------------------------------------
+    //
+    // These wrappers route producer-side work through the
+    // chain_worker queues. They are ALWAYS available (the chain
+    // exposes them regardless of whether the worker is running);
+    // when the worker is disabled they return
+    // `error.ChainWorkerDisabled` so the caller can fall back to
+    // the direct synchronous path. This keeps the off-mode
+    // semantics identical to slice (b) — the call site decides
+    // which path to take, the submit* wrappers never silently
+    // change behaviour.
+    //
+    // Ownership contract on success: the caller transfers ownership
+    // of any heap-bearing payload (currently `signed_block` and
+    // `signed_aggregation`) to the worker. The worker calls
+    // `Message.deinit` after dispatch. On `error.QueueFull`,
+    // `error.QueueClosed`, or `error.ChainWorkerDisabled` the
+    // caller retains ownership and is responsible for cleanup
+    // (including calling `.deinit()` on the payload).
+
+    pub const SubmitError = chain_worker.BlockQueue.TrySendError || error{ChainWorkerDisabled};
+
+    /// Route a block import through the chain-worker queue.
+    pub fn submitBlock(
+        self: *Self,
+        signed_block: types.SignedBlock,
+        prune_forkchoice: bool,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .on_block = .{
+            .signed_block = signed_block,
+            .prune_forkchoice = prune_forkchoice,
+        } });
+    }
+
+    /// Route a gossip-attestation through the chain-worker queue.
+    pub fn submitGossipAttestation(
+        self: *Self,
+        gossip: networks.AttestationGossip,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendAttestation(.{ .on_gossip_attestation = gossip });
+    }
+
+    /// Route a gossip aggregated-attestation through the worker queue.
+    pub fn submitGossipAggregatedAttestation(
+        self: *Self,
+        agg: types.SignedAggregatedAttestation,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendAttestation(.{ .on_gossip_aggregated_attestation = agg });
+    }
+
+    /// Route a `processPendingBlocks` tick through the worker queue.
+    /// (Not migrated by any caller in commit 3 — included so the
+    /// vtable + queue plumbing is exercised end-to-end and the API
+    /// shape is stable for the follow-up commit that migrates the
+    /// libxev tick path.)
+    pub fn submitProcessPendingBlocks(self: *Self, current_slot: types.Slot) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = current_slot } });
+    }
+
+    /// Route a `processFinalizationFollowup` move-off through the worker queue.
+    /// (Not migrated by any caller in commit 3; see
+    /// `submitProcessPendingBlocks` for the rationale.)
+    pub fn submitProcessFinalizationFollowup(
+        self: *Self,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
+    ) SubmitError!void {
+        const w = self.chain_worker orelse return error.ChainWorkerDisabled;
+        try w.sendBlock(.{ .process_finalization_followup = .{
+            .previous_finalized = previous_finalized,
+            .latest_finalized = latest_finalized,
+            .prune_forkchoice = prune_forkchoice,
+        } });
     }
 
     pub fn setPruneCachedBlocksCallback(self: *Self, ctx: *anyopaque, func: PruneCachedBlocksFn) void {
@@ -291,6 +543,18 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop and free the chain-worker FIRST (before any chain
+        // state the worker's handler thunks may touch is freed).
+        // `stop()` is idempotent and joins the worker thread; after
+        // it returns no handler can re-enter `self`. Only then is
+        // it safe to tear down `forkChoice`, `states`, etc.
+        if (self.chain_worker) |w| {
+            w.stop();
+            w.deinit();
+            self.allocator.destroy(w);
+            self.chain_worker = null;
+        }
+
         // Clean up forkchoice resources (attestation_signatures, aggregated_payloads)
         self.forkChoice.deinit();
 
@@ -1075,6 +1339,56 @@ pub const BeamChain = struct {
                         }
                     }
 
+                    // Slice c-2b commit 3 of #803: route through the
+                    // chain-worker queue when enabled. We clone
+                    // `signed_block` here — the gossip layer owns the
+                    // borrowed copy for the duration of this callback,
+                    // but the worker takes ownership and runs
+                    // asynchronously, so it needs an independent
+                    // allocation. On `submitBlock` success the worker
+                    // owns the clone (and will deinit it after
+                    // dispatch); on failure the errdefer frees it.
+                    //
+                    // Trade-offs of the worker path:
+                    //   * `missing_attestation_roots` feedback is
+                    //     dropped — the worker thunk swallows the
+                    //     return value because there is no upstream
+                    //     channel to surface it on. The same dataset
+                    //     is rediscovered on the next attestation
+                    //     gossip whose `head/source/target` is still
+                    //     unknown (gossip clients re-broadcast
+                    //     liberally), so this is observably equivalent
+                    //     to a dropped first attempt.
+                    //   * `processed_block_root` is returned
+                    //     immediately so `BeamNode.onGossip` can still
+                    //     fan out `processCachedDescendants(root)` and
+                    //     give cached children a retry chance.
+                    if (self.chain_worker != null) {
+                        var cloned: types.SignedBlock = undefined;
+                        try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                        var cloned_consumed = false;
+                        errdefer if (!cloned_consumed) cloned.deinit();
+                        self.submitBlock(cloned, true) catch |err| switch (err) {
+                            error.QueueFull => {
+                                self.logger.warn(
+                                    "chain-worker: block queue full, dropping slot={d} root=0x{x}",
+                                    .{ block.slot, &block_root },
+                                );
+                                return .{};
+                            },
+                            error.QueueClosed => {
+                                self.logger.warn(
+                                    "chain-worker: block queue closed, dropping slot={d} root=0x{x}",
+                                    .{ block.slot, &block_root },
+                                );
+                                return .{};
+                            },
+                            error.ChainWorkerDisabled => unreachable,
+                        };
+                        cloned_consumed = true;
+                        return .{ .processed_block_root = block_root };
+                    }
+
                     const missing_roots = self.onBlock(signed_block, .{
                         .blockRoot = block_root,
                     }) catch |err| {
@@ -1149,12 +1463,39 @@ pub const BeamChain = struct {
                 };
 
                 if (self.is_aggregator_enabled.load(.acquire)) {
-                    // Process validated attestation
-                    self.onGossipAttestation(signed_attestation) catch |err| {
-                        zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
-                        self.logger.err("attestation processing error: {any}", .{err});
-                        return err;
-                    };
+                    // Slice c-2b commit 3 of #803: when the chain-worker
+                    // is enabled, route the validated attestation
+                    // through its queue. `AttestationGossip` is plain-
+                    // old-data (see `Message.deinit` in chain_worker.zig),
+                    // so no clone is required — the value is copied into
+                    // the `Message` enum at queue push time.
+                    if (self.chain_worker != null) {
+                        self.submitGossipAttestation(signed_attestation) catch |err| switch (err) {
+                            error.QueueFull => {
+                                zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                                self.logger.warn(
+                                    "chain-worker: attestation queue full, dropping slot={d} validator={d}",
+                                    .{ slot, validator_id },
+                                );
+                                return .{};
+                            },
+                            error.QueueClosed => {
+                                self.logger.warn(
+                                    "chain-worker: attestation queue closed, dropping slot={d} validator={d}",
+                                    .{ slot, validator_id },
+                                );
+                                return .{};
+                            },
+                            error.ChainWorkerDisabled => unreachable,
+                        };
+                    } else {
+                        // Process validated attestation synchronously.
+                        self.onGossipAttestation(signed_attestation) catch |err| {
+                            zeam_metrics.metrics.lean_attestations_invalid_total.incr(.{ .source = "gossip" }) catch {};
+                            self.logger.err("attestation processing error: {any}", .{err});
+                            return err;
+                        };
+                    }
                     self.logger.info("processed gossip attestation for slot={d} validator={d}{f}", .{
                         slot,
                         validator_id,
@@ -4528,4 +4869,216 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     // failed to finalize — the no-torn-read + no-regression checks
     // would still trivially hold on a chain stuck at genesis.
     try std.testing.expect(ctx.max_observed_finalized_slot.load(.monotonic) > 0);
+}
+
+test "chain-worker: end-to-end submitBlock advances state via the worker thread" {
+    // Slice c-2b commit 3 of #803 integration test.
+    //
+    // Boots a BeamChain with the chain-worker started, submits a real
+    // block via `submitBlock` (the worker-routed producer wrapper),
+    // waits for the worker to drain its queue, and asserts the chain
+    // state advanced as if the synchronous path had been taken:
+    //
+    //   * `states` map gains an entry for the imported block root.
+    //   * `forkChoice.hasBlock(root)` is true.
+    //   * The post-state's slot matches the imported block.
+    //
+    // This exercises every layer the commit touches end-to-end:
+    //
+    //   producer thread (this test) ──submitBlock──▶ BlockQueue
+    //   ChainWorker.runLoop ──tryRecv──▶ dispatch ──vtable──▶
+    //   chainWorkerOnBlockThunk ──▶ BeamChain.onBlock + onBlockFollowup
+    //
+    // We deliberately do NOT use the BeamChain ctor's auto-start path
+    // (there is none), instead calling `startChainWorker()` after the
+    // chain is at its final stack address. This mirrors the production
+    // call site in `BeamNode.init` which does the same after the chain
+    // is at its heap address. (The chain in this test is on the test
+    // function's stack, but doesn't move once allocated, which is
+    // sufficient for the worker's lifetime here.)
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 3, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    // spec_name + fork_digest live as long as the chain (BeamChain.deinit
+    // frees them via self.allocator).
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 0,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Start the chain-worker. After this point any submit* call may
+    // race with the worker thread; deinit (via defer above) calls
+    // `chain_worker.stop()` first which is the only safe shutdown
+    // ordering.
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    // Advance forkchoice clock past the imported block's slot so the
+    // worker's onBlock call doesn't reject with FutureSlot.
+    const signed_block = mock_chain.blocks[1];
+    const block_root = mock_chain.blockRoots[1];
+    try beam_chain.forkChoice.onInterval(
+        signed_block.block.slot * constants.INTERVALS_PER_SLOT,
+        false,
+    );
+
+    // The worker takes ownership of the SignedBlock on a successful
+    // send, so we must clone the mock-chain block (which is owned by
+    // the arena and will be freed when the arena deinits, NOT by the
+    // worker after dispatch).
+    var cloned: types.SignedBlock = undefined;
+    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &cloned);
+    var cloned_consumed = false;
+    errdefer if (!cloned_consumed) cloned.deinit();
+
+    try beam_chain.submitBlock(cloned, false);
+    cloned_consumed = true;
+
+    // Wait for the worker to drain the queue. We poll on the
+    // states map (the post-condition we actually care about); the
+    // forkchoice insert happens synchronously inside onBlock and
+    // states is populated by `statesCommitKeepExisting` shortly
+    // after, so observing the entry is the strongest single signal
+    // that the message was processed end-to-end.
+    //
+    // 5s timeout is generous: a single STF on this 9-validator
+    // mock chain is well under 100 ms in Debug.
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    const deadline_ns: i128 = start_ns + 5 * std.time.ns_per_s;
+    var observed = false;
+    while (zeam_utils.monotonicTimestampNs() < deadline_ns) {
+        beam_chain.states_lock.lockShared();
+        const present = beam_chain.states.get(block_root) != null;
+        beam_chain.states_lock.unlockShared();
+        if (present) {
+            observed = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(observed);
+
+    // Forkchoice must have observed the import.
+    try std.testing.expect(beam_chain.forkChoice.hasBlock(block_root));
+
+    // Post-state slot must match the imported block.
+    var borrow = beam_chain.statesGet(block_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    defer borrow.deinit();
+    try std.testing.expectEqual(signed_block.block.slot, borrow.state.slot);
+
+    // Disabled-mode contract: with no worker, the submit* family
+    // returns ChainWorkerDisabled rather than silently doing the
+    // synchronous path. We can't test that on this chain (the
+    // worker is started), so spot-check it on a fresh chain.
+    var beam_state_2: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state_2);
+    defer beam_state_2.deinit();
+
+    const spec_name_2 = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest_2 = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config_2 = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name_2,
+            .fork_digest = fork_digest_2,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var tmp_dir_2 = std.testing.tmpDir(.{});
+    defer tmp_dir_2.cleanup();
+    var path_buf_2: [128]u8 = undefined;
+    const data_dir_2 = try std.fmt.bufPrint(&path_buf_2, ".zig-cache/tmp/{s}", .{tmp_dir_2.sub_path});
+    var db2 = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir_2,
+    );
+    defer db2.deinit();
+
+    const connected_peers_2 = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers_2);
+    connected_peers_2.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers_2.deinit();
+
+    const registry_2 = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(registry_2);
+    registry_2.* = NodeNameRegistry.init(std.testing.allocator);
+    defer registry_2.deinit();
+
+    var beam_chain_off = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config_2,
+        .anchorState = &beam_state_2,
+        .nodeId = 1,
+        .logger_config = &zeam_logger_config,
+        .db = db2,
+        .node_registry = registry_2,
+    }, connected_peers_2);
+    defer beam_chain_off.deinit();
+
+    try std.testing.expect(beam_chain_off.chain_worker == null);
+    // Caller still owns this clone (errdefer below frees it after the
+    // expected ChainWorkerDisabled comes back).
+    var off_cloned: types.SignedBlock = undefined;
+    try types.sszClone(std.testing.allocator, types.SignedBlock, signed_block, &off_cloned);
+    defer off_cloned.deinit();
+    try std.testing.expectError(
+        error.ChainWorkerDisabled,
+        beam_chain_off.submitBlock(off_cloned, false),
+    );
 }

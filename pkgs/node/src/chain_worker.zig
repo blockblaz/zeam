@@ -349,6 +349,41 @@ pub fn BoundedQueue(comptime T: type) type {
 pub const BlockQueue = BoundedQueue(Message);
 pub const AttestationQueue = BoundedQueue(Message);
 
+/// Per-variant dispatch vtable.
+///
+/// The chain-worker is intentionally decoupled from `chain.zig` to
+/// avoid a circular dependency (`chain.zig` already imports this
+/// module for the queue types). Instead of `@import`-ing the chain,
+/// the worker dispatches via this vtable, which the chain wires up
+/// in `BeamChain.init` using `&self` as `ctx`.
+///
+/// All function pointers return `void`: producers fire-and-forget
+/// onto the queue (see `sendBlock` / `sendAttestation`), so there
+/// is no error channel back to them. Each handler is responsible
+/// for catching and logging its own errors. Returning anything
+/// other than `void` would force the worker to invent a
+/// reply-channel for results that nobody on the producer side
+/// is positioned to consume — gossipsub validation has already
+/// happened upstream by the time these messages are enqueued.
+///
+/// `ctx` is type-erased to `*anyopaque` so that this header has no
+/// dependency on `BeamChain`. The handler thunks in `chain.zig`
+/// `@ptrCast` the ctx back to `*BeamChain` and invoke the real
+/// chain method.
+pub const Handlers = struct {
+    ctx: *anyopaque,
+    on_block: *const fn (ctx: *anyopaque, signed_block: types.SignedBlock, prune_forkchoice: bool) void,
+    on_gossip_attestation: *const fn (ctx: *anyopaque, gossip: networks.AttestationGossip) void,
+    on_gossip_aggregated_attestation: *const fn (ctx: *anyopaque, agg: types.SignedAggregatedAttestation) void,
+    process_pending_blocks: *const fn (ctx: *anyopaque, current_slot: types.Slot) void,
+    process_finalization_followup: *const fn (
+        ctx: *anyopaque,
+        previous_finalized: types.Checkpoint,
+        latest_finalized: types.Checkpoint,
+        prune_forkchoice: bool,
+    ) void,
+};
+
 /// Default capacities. Generous enough that a 30s gossip burst on
 /// devnet4 (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
 /// not saturate. Tuned by the slice c-2 stress harness.
@@ -438,10 +473,20 @@ pub const ChainWorker = struct {
 
     logger: zeam_utils.ModuleLogger,
 
+    /// Optional dispatch vtable. `null` (the default) preserves the
+    /// c-1 stub behavior: every popped message is logged-and-freed.
+    /// Tests that only exercise the queue / wake / shutdown contracts
+    /// leave this null. Production callers in `BeamChain.init` build
+    /// a `Handlers` value using the chain as `ctx` and pass it via
+    /// `InitOpts.handlers`.
+    handlers: ?Handlers = null,
+
     pub const InitOpts = struct {
         block_queue_capacity: usize = DEFAULT_BLOCK_QUEUE_CAPACITY,
         attestation_queue_capacity: usize = DEFAULT_ATTESTATION_QUEUE_CAPACITY,
         logger: zeam_utils.ModuleLogger,
+        /// Optional dispatch vtable; see `ChainWorker.handlers`.
+        handlers: ?Handlers = null,
     };
 
     pub fn init(allocator: Allocator, opts: InitOpts) !Self {
@@ -470,6 +515,7 @@ pub const ChainWorker = struct {
             .block_queue = BlockQueue.init(block_buf, io),
             .attestation_queue = AttestationQueue.init(att_buf, io),
             .logger = opts.logger,
+            .handlers = opts.handlers,
         };
     }
 
@@ -671,30 +717,44 @@ pub const ChainWorker = struct {
         }
     }
 
-    /// c-1 stub: log the popped variant and free its heap. c-2 will
-    /// replace this with a per-variant dispatch into the chain
-    /// methods. Even after c-2 lands, the `Message.deinit` call must
-    /// remain at the bottom of every dispatch path — the worker is
-    /// the sole owner from `tryRecv` to handler return.
+    /// Per-variant dispatch into the chain (c-2b commit 3). When
+    /// `handlers` is null we fall back to the c-1 stub semantics —
+    /// log the variant and free it. This keeps the unit tests in
+    /// this module (which only stress the queue / wake / shutdown
+    /// contracts) working unchanged: they leave `handlers = null`,
+    /// so popping any message simply logs and frees.
+    ///
+    /// When `handlers` is set, we route by tag into the supplied
+    /// function pointers. Handlers are responsible for their own
+    /// error logging (the producer side fired-and-forgot the
+    /// message at queue-push time and is no longer in a position
+    /// to react). After the handler returns, `defer m.deinit()`
+    /// frees any heap-owned payload — the worker remains the sole
+    /// owner from `tryRecv` through handler return, regardless of
+    /// whether the handler succeeded or threw internally.
     fn dispatch(self: *Self, msg: Message) void {
         var m = msg;
         defer m.deinit();
+        const h = self.handlers orelse {
+            // No vtable wired (c-1 stub / queue-only tests). Log and
+            // drop: the message will be deinit'd by the defer above.
+            self.logger.warn(
+                "chain-worker: dropping message (no handlers wired): {s}",
+                .{@tagName(m)},
+            );
+            return;
+        };
         switch (m) {
-            .on_block,
-            .on_gossip_attestation,
-            .on_gossip_aggregated_attestation,
-            .process_pending_blocks,
-            .process_finalization_followup,
-            => {
-                // c-2 wires these. Until then, the worker should never
-                // receive them in production (no producer is wired).
-                // In tests we may exercise the shape; do not panic, just
-                // log so test failures are debuggable.
-                self.logger.warn(
-                    "chain-worker: unhandled message variant in c-1 scaffold: {s}",
-                    .{@tagName(m)},
-                );
-            },
+            .on_block => |payload| h.on_block(h.ctx, payload.signed_block, payload.prune_forkchoice),
+            .on_gossip_attestation => |gossip| h.on_gossip_attestation(h.ctx, gossip),
+            .on_gossip_aggregated_attestation => |agg| h.on_gossip_aggregated_attestation(h.ctx, agg),
+            .process_pending_blocks => |payload| h.process_pending_blocks(h.ctx, payload.current_slot),
+            .process_finalization_followup => |payload| h.process_finalization_followup(
+                h.ctx,
+                payload.previous_finalized,
+                payload.latest_finalized,
+                payload.prune_forkchoice,
+            ),
         }
     }
 };

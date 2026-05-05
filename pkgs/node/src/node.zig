@@ -46,6 +46,13 @@ const NodeOpts = struct {
     /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
     /// When non-null it is shared across all nodes in the same process.
     thread_pool: ?*ThreadPool = null,
+    /// Slice c-2b commit 3 of #803: when true, the chain spawns a
+    /// dedicated worker thread and producer-side handlers for
+    /// gossip blocks / attestations route through its bounded
+    /// queues instead of running synchronously on the libp2p
+    /// thread. Default `false` preserves slice-(b) behavior.
+    /// Surfaced to the CLI as `--chain-worker=on|off` (bool).
+    chain_worker_enabled: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -110,6 +117,17 @@ pub const BeamNode = struct {
         errdefer {
             chain.deinit();
             allocator.destroy(chain);
+        }
+
+        // Slice c-2b commit 3 of #803: start the chain-worker AFTER
+        // the chain is at its final heap address (allocator.create +
+        // assignment-via-deref above), because the worker stores
+        // `chain` as its handler ctx and that pointer must remain
+        // stable for the worker's entire lifetime. `chain.deinit()`
+        // (above errdefer + the deinit method) tears the worker
+        // down before any chain state it might touch.
+        if (opts.chain_worker_enabled) {
+            try chain.startChainWorker();
         }
         // Now that the chain is at its final heap location, point the logger config
         // at the forkchoice slot clock so every log line carries slot/interval context.

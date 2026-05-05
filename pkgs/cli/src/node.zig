@@ -94,6 +94,11 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    /// Slice c-2b commit 3 of #803: route producer-side gossip
+    /// handlers through the chain-worker queue. Default `false`
+    /// preserves slice-(b) synchronous behavior. Surfaced as
+    /// `--chain-worker` on the `zeam node` CLI.
+    chain_worker_enabled: bool = false,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -360,6 +365,7 @@ pub const Node = struct {
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
+            .chain_worker_enabled = options.chain_worker_enabled,
         });
         errdefer self.beam_node.deinit();
 
@@ -755,6 +761,7 @@ pub fn buildStartOptions(
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+    opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
     // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.
