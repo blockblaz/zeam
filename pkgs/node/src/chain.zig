@@ -131,6 +131,16 @@ pub const BeamChain = struct {
     // and aggregation duties for subnets the node is already subscribed to,
     // matching the hot-standby model documented in leanEthereum/leanSpec#636.
     is_aggregator_enabled: std.atomic.Value(bool),
+    /// Counter incremented every time `statesCommitKeepExisting` lands
+    /// on the duplicate / kept-existing branch (i.e. the entry was
+    /// already in `states` when the second writer arrived). Used by the
+    /// concurrent re-import test to assert that the race surface was
+    /// actually exercised — without this, a test that imports the same
+    /// blocks twice would silently pass even if one importer was
+    /// completely starved.
+    ///
+    /// Lock-free monotonic counter; safe to read from any thread.
+    states_kept_existing_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
     cached_finalized_state: ?*types.BeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
@@ -425,6 +435,9 @@ pub const BeamChain = struct {
             gop.value_ptr.* = state_ptr;
             break :blk state_ptr;
         };
+        if (gop.found_existing) {
+            _ = self.states_kept_existing_count.fetchAdd(1, .monotonic);
+        }
         return .{
             .borrow = BorrowedState{
                 .state = effective_ptr,
@@ -3969,17 +3982,29 @@ test "chain.onBlock: two-thread concurrent import of same block — no UAF, cohe
     }
 }
 
-test "chain: reorg under attestation pressure — forkchoice settles, no duplicate work" {
-    // Slice (b) cross-thread test scenario: two onBlock threads race the
-    // import of overlapping forks while an attestation thread spams
-    // mixed-validity attestations targeting both forks. The contract
-    // under test:
+test "chain: concurrent re-import pressure — kept_existing path race + attestation spam" {
+    // Slice (b) cross-thread test scenario: two onBlock threads race
+    // the import of the SAME block sequence in opposite orders
+    // (forward 1..N, reverse N..1) while an attestation thread spams
+    // mixed-validity attestations. This is NOT a reorg test — we
+    // never build a divergent fork. What we exercise is the
+    // statesCommitKeepExisting / kept_existing path under contention:
+    // whichever importer wins the race for a given block populates
+    // `states`; the loser then takes the kept_existing branch and
+    // frees its redundantly-computed post-state. (A real reorg test
+    // would need genMockChain to expose a fork-from-shared-parent
+    // helper; not in scope for slice (b).)
     //
-    //   * Forkchoice settles on a single head after all imports complete.
-    //   * No panic / UAF in the attestation pool (events_lock + forkchoice
-    //     attestation map are concurrently mutated).
-    //   * statesGet on the eventual head root succeeds and the slot is
-    //     coherent with one of the imported chain tips.
+    // The contract under test:
+    //
+    //   * Forkchoice settles on a single head after all imports finish.
+    //   * No panic / UAF in the attestation pool (events_lock +
+    //     forkchoice attestation map are concurrently mutated).
+    //   * statesGet on the eventual head root succeeds and the slot
+    //     is coherent with one of the imported chain tips.
+    //   * The kept_existing branch is actually exercised
+    //     (`states_kept_existing_count` strictly increases) — without
+    //     this, the test would silently pass on a serialized run.
     //
     // Iteration count is modest (50) so the whole test stays under ~30s
     // in Debug. Each iteration builds a fresh BeamChain, imports the
@@ -3991,11 +4016,7 @@ test "chain: reorg under attestation pressure — forkchoice settles, no duplica
     const arena = arena_allocator.allocator();
 
     // 4-block mock chain shared across all iterations as the import
-    // template. We don't actually fork — the "reorg pressure" comes from
-    // both onBlock threads racing to import the SAME blocks (kept_existing
-    // path), which exercises the same statesCommitKeepExisting +
-    // forkchoice-confirm interleaving as a true reorg without the
-    // scaffolding cost of building a real divergent chain.
+    // template. We don't fork — see the test header for the rationale.
     const mock_chain = try stf.genMockChain(arena, 4, null);
     var zeam_logger_config = zeam_utils.getTestLoggerConfig();
 
@@ -4163,10 +4184,24 @@ test "chain: reorg under attestation pressure — forkchoice settles, no duplica
         for (mock_chain.blockRoots[1..]) |r| {
             try std.testing.expect(beam_chain.forkChoice.hasBlock(r));
         }
-        // Both importers must have made at least 1 successful import
-        // each (pre-imports happen on a fresh chain so kept_existing
-        // splits between the two threads).
-        try std.testing.expect(ctx.imports_a.load(.monotonic) + ctx.imports_b.load(.monotonic) >= mock_chain.blocks.len - 1);
+        // The forward importer is deterministic on a fresh chain (each
+        // parent is in `states` by the time we reach the next block),
+        // so it MUST contribute every block. Use strict equality so a
+        // future regression that breaks the forward path can't be
+        // masked by the reverse importer's contributions.
+        try std.testing.expectEqual(
+            @as(u32, @intCast(mock_chain.blocks.len - 1)),
+            ctx.imports_a.load(.monotonic),
+        );
+        // The kept_existing race surface MUST have been exercised at
+        // least once during this iteration. This is the actual
+        // assertion that distinguishes "two threads ran in parallel"
+        // from "two threads serialized". The reverse importer's
+        // success count is inherently racy (it depends on whether the
+        // forward importer has populated states[block-1] yet) so we
+        // assert via the kept_existing counter rather than
+        // imports_b.
+        try std.testing.expect(beam_chain.states_kept_existing_count.load(.monotonic) > 0);
         // Head's slot is finite and not in the future relative to last
         // imported slot.
         try std.testing.expect(head.slot <= last_slot);
@@ -4185,8 +4220,21 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     // Slice (b) cross-thread test scenario: while a writer thread imports
     // blocks and advances finalization (via onBlockFollowup), an
     // HTTP-API-shaped reader thread loops over chain.statesGet +
-    // cloneAndRelease for both finalized and non-finalized roots. The
-    // contract under test:
+    // cloneAndRelease for both finalized and non-finalized roots.
+    //
+    // NOTE on iteration semantics: the writer's first pass over
+    // blocks 1..N is the only pass that actually advances
+    // finalization. Subsequent passes hit `kept_existing` in
+    // statesCommitKeepExisting and onBlockFollowup is then a no-op
+    // for finalization. The outer `iters` loop therefore exists to
+    // give the readers enough wall-clock to race against the *first*
+    // pass and to exercise the kept_existing-vs-statesGet contention
+    // afterwards — it is NOT 20 independent finalization advances.
+    // The `>0` finalized-observation assertion below ensures we
+    // actually hit the racing window at least once; otherwise the
+    // test would pass even if finalization never advanced.
+    //
+    // The contract under test:
     //
     //   * No UAF in the reader: every cloneAndRelease either returns a
     //     coherent state or null (entry pruned away during the borrow
@@ -4196,6 +4244,9 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     //   * No deadlock: the test must complete in well under 30s.
     //   * latest_finalized as observed via forkChoice.getLatestFinalized
     //     never goes backwards across reader observations.
+    //   * At least one reader observation saw `latest_finalized.slot > 0`
+    //     (proves finalization actually advanced during the race window;
+    //     guards against a regression that silently never finalizes).
     var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
@@ -4261,6 +4312,11 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
         reader_null: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         reader_torn: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
         finalized_regression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// Maximum `latest_finalized.slot` observed by any reader
+        /// across the whole run. Asserting this is `>0` guards
+        /// against a regression where finalization silently never
+        /// advances during the race window.
+        max_observed_finalized_slot: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         start: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
         ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     };
@@ -4331,6 +4387,20 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
                     _ = ctx.finalized_regression.fetchAdd(1, .monotonic);
                 }
                 last_finalized_slot = lf.slot;
+                // Track the highest finalized slot any reader has
+                // observed (compare-and-swap loop; `max` is not yet
+                // a built-in atomic op).
+                var prev_max = ctx.max_observed_finalized_slot.load(.monotonic);
+                while (lf.slot > prev_max) {
+                    if (ctx.max_observed_finalized_slot.cmpxchgWeak(
+                        prev_max,
+                        lf.slot,
+                        .monotonic,
+                        .monotonic,
+                    )) |actual| {
+                        prev_max = actual;
+                    } else break;
+                }
             }
         }
     };
@@ -4359,4 +4429,10 @@ test "chain: finalization race — onBlockFollowup + statesGet from API-shaped r
     // Sanity: at least some successful reads happened (otherwise the
     // race window collapsed and the test proves nothing).
     try std.testing.expect(ctx.reader_ok.load(.monotonic) > 100);
+    // Critical: the readers must have actually observed finalization
+    // advance to a non-zero slot during the race window. Without this
+    // assertion the test would pass on a regression that silently
+    // failed to finalize — the no-torn-read + no-regression checks
+    // would still trivially hold on a chain stuck at genesis.
+    try std.testing.expect(ctx.max_observed_finalized_slot.load(.monotonic) > 0);
 }
