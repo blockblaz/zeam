@@ -56,8 +56,11 @@ const types = @import("@zeam/types");
 ///
 /// Lifecycle:
 ///
-///     // Creator path: takes ownership of `state` (which must be
-///     // a freshly-allocated, fully-initialised BeamState).
+///     // Creator path: `create` takes ownership of `state`
+///     // unconditionally. On success, the heap allocation embeds
+///     // `state` and the matching `release` frees it; on OOM,
+///     // `state.deinit()` runs before the error returns. Either
+///     // way the caller does NOT call `state.deinit()` after.
 ///     const rc = try RcBeamState.create(allocator, state);
 ///     defer rc.release();              // initial reference
 ///
@@ -81,16 +84,33 @@ pub const RcBeamState = struct {
 
     const Self = @This();
 
-    /// Create a new refcounted state wrapping `state` (transferred by
-    /// value into the heap allocation; caller must not retain a
+    /// Create a new refcounted state wrapping `state` (transferred
+    /// by value into the heap allocation; caller must not retain a
     /// pointer to the old `state` location). Initial refcount is 1
     /// — the creator is responsible for the matching `release`.
     ///
-    /// Returns `error.OutOfMemory` if the allocation fails. On
-    /// failure, `state` is NOT consumed — the caller still owns it
-    /// and is responsible for its cleanup.
+    /// **Always-consume contract.** This function takes ownership of
+    /// `state` unconditionally. On the success path, `state` is
+    /// embedded into the heap allocation and the matching `release`
+    /// frees it. On `error.OutOfMemory`, `state.deinit()` is called
+    /// before the error is returned, so the caller never has to
+    /// remember an `errdefer state.deinit()` between
+    /// `buildState(...)` and `RcBeamState.create(...)`.
+    ///
+    /// Earlier versions of this function returned without consuming
+    /// `state` on the OOM path. That asymmetry forced every caller
+    /// to write a fragile cleanup pattern; symmetric ownership is
+    /// the lower-footgun shape for an API used at every chain.zig
+    /// state-write site.
     pub fn create(allocator: Allocator, state: types.BeamState) !*Self {
-        const self = try allocator.create(Self);
+        const self = allocator.create(Self) catch |err| {
+            // OOM on the wrapper allocation — we still consumed
+            // `state` per the always-consume contract, so drop its
+            // owned interior allocations before returning.
+            var consumed = state;
+            consumed.deinit();
+            return err;
+        };
         self.* = .{
             .allocator = allocator,
             .refcount = std.atomic.Value(u32).init(1),
@@ -219,12 +239,22 @@ test "RcBeamState: acquire returns the same pointer (cheap to chain)" {
     reader.release();
 }
 
-test "RcBeamState: concurrent acquire/release stress (40 threads × 10k iters)" {
-    // High-contention test: 40 threads each take an acquire, do a
+test "RcBeamState: acquire/release pair accounting under producer race (40 threads × 10k iters)" {
+    // Pair-accounting test: 40 threads each take an acquire, do a
     // tiny no-op load, then release. The creator's refcount stays
     // at 1 throughout (each thread's acquire/release pair is
     // balanced). At the end, refcount must be exactly 1, then the
     // creator's release frees.
+    //
+    // What this test does NOT prove: the freeing race. Because the
+    // creator's reference is held throughout, every fetchSub call
+    // observes `prev > 1` and the freeing branch is never taken
+    // under contention — the acq_rel ordering on the freeing
+    // thread is not exercised. The next test
+    // ("freeing race — last release wins under contention") fills
+    // that gap by dropping the creator's reference partway and
+    // verifying that whichever thread brings refcount to 0 frees
+    // cleanly under testing.allocator's leak detection.
     const state = try makeState();
     const rc = try RcBeamState.create(testing.allocator, state);
 
@@ -263,6 +293,143 @@ test "RcBeamState: concurrent acquire/release stress (40 threads × 10k iters)" 
     rc.release();
 }
 
+test "RcBeamState: freeing race — last release wins under contention" {
+    // The pair-accounting test above never exercises the freeing
+    // branch (creator's reference is held throughout). This test
+    // does the opposite: pre-bump the refcount once per worker
+    // BEFORE spawning, hand each worker its own pre-acquired
+    // reference, then drop the creator's reference WHILE the
+    // workers are still running. Whichever thread brings
+    // refcount to 0 — worker or creator depending on
+    // interleaving — must free cleanly.
+    //
+    // The pre-bump matters: `acquire()`'s contract is "safe to
+    // call from any thread that holds a valid acquire." A worker
+    // that's just been spawned does NOT yet hold one (spawn
+    // doesn't bump for it). If we let the worker call acquire()
+    // as its first action, the rc may already have been freed
+    // by another worker that finished first — that's UAF on the
+    // acquire itself. Pre-bumping on the spawning thread closes
+    // that hole because the spawning thread DOES hold the
+    // creator's reference at the time of the bump.
+    //
+    // Repeat the whole shape `OUTER_ITERS` times so we sweep the
+    // interleaving space and don't depend on a single lucky
+    // schedule. testing.allocator's leak/UAF detector is the
+    // assertion.
+    const NUM_WORKERS: usize = 16;
+    const WORK_ITERS_PER_WORKER: usize = 200;
+    const OUTER_ITERS: usize = 50;
+
+    const Worker = struct {
+        // Receives a pre-acquired reference. Worker is
+        // responsible for releasing it exactly once.
+        fn run(reader: *RcBeamState, iters: usize) void {
+            defer reader.release();
+            // Touch the state inside the acquire window. The
+            // doNotOptimizeAway barrier ensures the load is not
+            // hoisted out by the compiler — we need the
+            // .acq_rel-ordered fetchSub on release to order
+            // every prior load before the freeing thread's free.
+            var k: usize = 0;
+            while (k < iters) : (k += 1) {
+                std.mem.doNotOptimizeAway(reader.state.slot);
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    var outer: usize = 0;
+    while (outer < OUTER_ITERS) : (outer += 1) {
+        const state = try makeState();
+        const rc = try RcBeamState.create(testing.allocator, state);
+        // refcount = 1 (creator)
+
+        var threads: [NUM_WORKERS]std.Thread = undefined;
+        var i: usize = 0;
+        while (i < NUM_WORKERS) : (i += 1) {
+            // Pre-bump on the spawning thread (we still hold
+            // the creator's reference here, so this is safe).
+            const handed = rc.acquire();
+            threads[i] = std.Thread.spawn(
+                .{},
+                Worker.run,
+                .{ handed, WORK_ITERS_PER_WORKER },
+            ) catch |err| {
+                // Spawn failed AFTER we bumped — release the
+                // pre-acquired reference so we don't leak.
+                handed.release();
+                return err;
+            };
+        }
+        // refcount = 1 + NUM_WORKERS here.
+
+        // Drop the creator's reference while workers are still
+        // alive. Now refcount is somewhere in
+        // [0, NUM_WORKERS] depending on how many workers have
+        // already released. When the LAST release happens (the
+        // last worker, or this very call if every worker has
+        // already finished), refcount reaches 0 and the freeing
+        // thread — worker or creator, we don't know which —
+        // calls state.deinit() + allocator.destroy(self).
+        rc.release();
+
+        i = 0;
+        while (i < NUM_WORKERS) : (i += 1) {
+            threads[i].join();
+        }
+        // After every worker has joined, refcount must have
+        // reached 0 and rc must have been freed. We MUST NOT
+        // read rc.count() or any rc field here — rc is freed
+        // memory by now, so touching it would be UAF.
+        // testing.allocator's leak detector catches both the
+        // leak case (refcount never reached 0) and the
+        // double-free case (refcount underflow on a fetchSub).
+    }
+}
+
+test "RcBeamState: freeing race — worker takes the final release" {
+    // Stronger variant of the previous test: deterministically
+    // ensure the WORKER (not the creator) brings refcount to 0,
+    // so we exercise the path where a non-creator thread observes
+    // prev == 1 on fetchSub and frees.
+    //
+    // Sequence on the test thread:
+    //   1. create(state)            → refcount = 1 (creator)
+    //   2. handed = rc.acquire()    → refcount = 2 (creator + handed)
+    //   3. rc.release()             → refcount = 1 (handed only)
+    //   4. spawn(worker, handed)
+    //   5. join
+    // The worker is now the sole reference holder; its release
+    // brings refcount to 0 and frees. The .acq_rel ordering on
+    // fetchSub is what makes this safe: any prior writes to
+    // `state` (none in this test, but the contract covers them)
+    // are observed by the worker before its free.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const state = try makeState();
+        const rc = try RcBeamState.create(testing.allocator, state);
+        // refcount = 1 (creator)
+        const handed = rc.acquire();
+        // refcount = 2 (creator + handed)
+        rc.release();
+        // refcount = 1 (handed only)
+
+        const Worker = struct {
+            fn run(target: *RcBeamState) void {
+                // We are the sole reference holder. Touch the
+                // state, then release.
+                std.mem.doNotOptimizeAway(target.state.slot);
+                target.release();
+            }
+        };
+
+        var t = try std.Thread.spawn(.{}, Worker.run, .{handed});
+        t.join();
+        // rc is freed by the worker; we must not touch it.
+    }
+}
+
 test "RcBeamState: release order doesn't matter (acquire-then-release vs release-then-acquire)" {
     // T1 acquires then releases. T2 acquires then releases. Result
     // refcount must be the creator's 1, regardless of interleaving.
@@ -284,4 +451,36 @@ test "RcBeamState: release order doesn't matter (acquire-then-release vs release
 
     try testing.expectEqual(@as(u32, 1), rc.count());
     rc.release();
+}
+
+test "RcBeamState.create: OOM path consumes state (no leak under FailingAllocator)" {
+    // Locks the always-consume contract in code: when the wrapper
+    // allocation fails, `create` MUST call state.deinit() before
+    // returning the error so the caller never has to remember an
+    // errdefer state.deinit() between buildState() and create().
+    //
+    // Mechanism: FailingAllocator with fail_index=0 fails the very
+    // first allocator.create() call (the wrapper allocation inside
+    // RcBeamState.create). The state passed in was built with
+    // testing.allocator and has owned interior allocations
+    // (validators list etc.). If create() returned the error
+    // without consuming, the caller (this test) would not call
+    // state.deinit() and testing.allocator's leak detector would
+    // flag the leak. This test passes ONLY if create() consumes
+    // on the OOM path.
+    const state = try makeState();
+
+    // FailingAllocator wrapping an always-failing inner allocator.
+    // We give it `fail_index = 0` so the first create() fails;
+    // the deinit() inside create() then runs against
+    // testing.allocator (the state's interior was allocated with
+    // testing.allocator, which is what makeState() uses).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const failing_allocator = failing.allocator();
+
+    const result = RcBeamState.create(failing_allocator, state);
+    try testing.expectError(error.OutOfMemory, result);
+    // The caller does NOT call state.deinit() here. If create()
+    // failed to consume, testing.allocator's leak detector trips
+    // when this test scope exits.
 }
