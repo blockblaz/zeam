@@ -61,22 +61,22 @@ const networks = @import("@zeam/network");
 const zeam_metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
 
-/// Resolve the project's default `std.Io` instance. Mirrors the pattern
-/// in `pkgs/utils/src/sync.zig`: the chain-worker queue is purely a
-/// thread-blocking primitive (no async fiber semantics required), so
-/// the global single-threaded io is the right choice.
-///
-/// Hot-path optimisation: `BoundedQueue` and `ChainWorker` cache the
-/// resolved `std.Io` once at init and reuse the cached value on every
-/// trySend/recv/close/depth/wake. `Io` construction is cheap (vtable
-/// pointer + userdata struct) but at the c-2 target rate of ~1k
-/// attestations/sec it shows up in profiles; caching is free
-/// correctness-wise and visibly cheaper. Only the `*.init()` calls
-/// below go through this function; everything else dereferences the
-/// cached `self.io` field.
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
+// `std.Io.Threaded` is owned per-`ChainWorker`, not borrowed from
+// `std.Io.Threaded.global_single_threaded`.
+//
+// Per @GrapeBaBa's review on PR #826: the global single-threaded
+// instance is example-only — it has `.allocator = .failing` and
+// `.async_limit = .nothing`, which is fine for example/test code but
+// not the right shape for a real worker thread that may need to
+// schedule futexes / signal blocked condvars. Production code must
+// own its `Threaded` instance.
+//
+// `ChainWorker.init` allocates a `Threaded` on the heap (stable
+// address — `Threaded.io()` stores `userdata = self` so moving the
+// value after calling `io()` would dangle the pointer) and threads
+// the resolved `std.Io` through `BoundedQueue.init` so every queue
+// operation uses the worker's own io instance. `ChainWorker.deinit`
+// calls `Threaded.deinit()` and frees the heap allocation.
 
 /// Tagged union covering every chain-mutation entry point.
 ///
@@ -238,8 +238,9 @@ pub fn BoundedQueue(comptime T: type) type {
         /// memory; the owner (typically `ChainWorker`) frees it.
         buf: []T,
         inner: std.Io.Queue(T),
-        /// Cached `std.Io` resolved once at init via `defaultIo()`.
-        /// See the `defaultIo()` doc for the hot-path rationale.
+        /// Cached `std.Io` from the owning `ChainWorker`'s
+        /// `std.Io.Threaded` instance. Set once at `init` and reused
+        /// on every hot-path call.
         io: std.Io,
 
         // Producer-observable counters. Updated outside the queue's
@@ -251,14 +252,17 @@ pub fn BoundedQueue(comptime T: type) type {
 
         pub const TrySendError = error{ QueueFull, QueueClosed };
 
-        /// Initialise from a caller-provided buffer. The caller owns the
-        /// memory; `BoundedQueue.deinit` does not free it.
-        pub fn init(buf: []T) Self {
+        /// Initialise from a caller-provided buffer + `std.Io`. The
+        /// caller owns both; `BoundedQueue.deinit` does not free
+        /// either. The `io` instance MUST outlive the queue (in
+        /// practice it comes from `ChainWorker.threaded.io()` and
+        /// has the same lifetime as the worker).
+        pub fn init(buf: []T, io: std.Io) Self {
             std.debug.assert(buf.len > 0);
             return .{
                 .buf = buf,
                 .inner = std.Io.Queue(T).init(buf),
-                .io = defaultIo(),
+                .io = io,
             };
         }
 
@@ -421,11 +425,15 @@ pub const ChainWorker = struct {
     wake_mutex: std.Io.Mutex = .init,
     wake_cond: std.Io.Condition = .init,
 
-    /// Cached `std.Io` resolved once at init via `defaultIo()`. Same
-    /// instance the queues hold; ChainWorker carries its own copy so
-    /// `wake()` and `runLoop` don't have to reach into
-    /// `block_queue.io` (which would couple the worker to the block
-    /// queue's identity). See `defaultIo()` for the hot-path rationale.
+    /// Owned `std.Io.Threaded` instance. Heap-allocated for pointer
+    /// stability — `Threaded.io()` stores `userdata = self`, so
+    /// moving the value after calling `io()` would dangle the
+    /// pointer. Initialised in `init`, deinitialised in `deinit`.
+    threaded: *std.Io.Threaded,
+    /// Cached `std.Io` resolved once from `threaded.io()` at init.
+    /// Same instance the queues hold; ChainWorker carries its own
+    /// copy so `wake()` and `runLoop` don't have to reach into
+    /// `block_queue.io`.
     io: std.Io,
 
     logger: zeam_utils.ModuleLogger,
@@ -437,23 +445,37 @@ pub const ChainWorker = struct {
     };
 
     pub fn init(allocator: Allocator, opts: InitOpts) !Self {
+        const threaded = try allocator.create(std.Io.Threaded);
+        errdefer allocator.destroy(threaded);
+        // We never call the async/concurrent VTable functions, so
+        // `Threaded.init`'s `gpa` is only consulted in those code
+        // paths. Pass the caller's allocator anyway — it's already
+        // thread-safe in production (GeneralPurposeAllocator) so
+        // there's no downside.
+        threaded.* = std.Io.Threaded.init(allocator, .{});
+        errdefer threaded.deinit();
+        const io = threaded.io();
+
         const block_buf = try allocator.alloc(Message, opts.block_queue_capacity);
         errdefer allocator.free(block_buf);
         const att_buf = try allocator.alloc(Message, opts.attestation_queue_capacity);
         errdefer allocator.free(att_buf);
+
         return .{
             .allocator = allocator,
+            .threaded = threaded,
+            .io = io,
             .block_queue_buf = block_buf,
             .attestation_queue_buf = att_buf,
-            .block_queue = BlockQueue.init(block_buf),
-            .attestation_queue = AttestationQueue.init(att_buf),
-            .io = defaultIo(),
+            .block_queue = BlockQueue.init(block_buf, io),
+            .attestation_queue = AttestationQueue.init(att_buf, io),
             .logger = opts.logger,
         };
     }
 
-    /// Stops (if running) and frees all queue storage. Safe to call
-    /// after `stop()`; no-op on an unstarted worker.
+    /// Stops (if running), frees all queue storage, and tears down
+    /// the owned `Threaded` instance. Safe to call after `stop()`;
+    /// no-op on an unstarted worker.
     pub fn deinit(self: *Self) void {
         if (self.thread != null) {
             self.stop();
@@ -462,6 +484,8 @@ pub const ChainWorker = struct {
         self.attestation_queue.deinit();
         self.allocator.free(self.block_queue_buf);
         self.allocator.free(self.attestation_queue_buf);
+        self.threaded.deinit();
+        self.allocator.destroy(self.threaded);
     }
 
     /// Send a block-flavored message and wake the worker. Returns
@@ -681,10 +705,25 @@ pub const ChainWorker = struct {
 
 const testing = std.testing;
 
+/// Helper for standalone-queue tests: build a `std.Io.Threaded` on the
+/// stack, return its `io()`. The Threaded MUST outlive every queue
+/// operation that uses the returned io — callers keep a `var threaded`
+/// adjacent to the queue and `defer threaded.deinit()`.
+///
+/// The `init_single_threaded` static would also work for the
+/// non-async/non-concurrent paths these tests exercise, but mirroring
+/// production usage (each owner builds its own Threaded) keeps the
+/// test surface honest about the dependency.
+fn testThreadedInit() std.Io.Threaded {
+    return std.Io.Threaded.init(testing.allocator, .{});
+}
+
 test "BoundedQueue: trySend / recv preserves FIFO order" {
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, 4);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
@@ -715,9 +754,11 @@ test "BoundedQueue: another FIFO ordering check (head walk)" {
     // Sanity that ordering is preserved across send/recv
     // interleaving — distinct from the wraparound test below which
     // hits the ring boundaries explicitly.
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, 4);
     defer testing.allocator.free(buf);
-    var q = AttestationQueue.init(buf);
+    var q = AttestationQueue.init(buf, threaded.io());
     defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
@@ -736,9 +777,11 @@ test "BoundedQueue: another FIFO ordering check (head walk)" {
 }
 
 test "BoundedQueue: trySend returns QueueFull at capacity, increments dropped_total" {
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, 2);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
@@ -758,9 +801,11 @@ test "BoundedQueue: trySend returns QueueFull at capacity, increments dropped_to
 }
 
 test "BoundedQueue: trySend returns QueueClosed after close()" {
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, 4);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
     q.close();
     try testing.expectError(
@@ -770,9 +815,11 @@ test "BoundedQueue: trySend returns QueueClosed after close()" {
 }
 
 test "BoundedQueue: recv returns null when closed and drained" {
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, 4);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
     q.close();
@@ -791,9 +838,11 @@ test "BoundedQueue: ring wraparound — head walks past capacity-1 with items li
     // past every position in [0, capacity) while at least one item
     // is always live; FIFO sequence asserted on every pop.
     const cap: usize = 4;
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, cap);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
 
     var next_send: u64 = 0;
@@ -858,9 +907,11 @@ test "BoundedQueue: multi-producer trySend race — counters are exact" {
     const SENDS_PER_PRODUCER: usize = 1000;
     const QUEUE_CAPACITY: usize = 16;
 
+    var threaded = testThreadedInit();
+    defer threaded.deinit();
     const buf = try testing.allocator.alloc(Message, QUEUE_CAPACITY);
     defer testing.allocator.free(buf);
-    var q = BlockQueue.init(buf);
+    var q = BlockQueue.init(buf, threaded.io());
     defer q.deinit();
 
     const Producer = struct {
