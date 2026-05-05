@@ -235,38 +235,43 @@ fn gossipFloodWorker(ctx: *StressCtx, thread_id: usize) void {
             //   * no assertion failures / panics
             //   * no UAF / deadlock
             //
-            // `MissingPreState` here means a writer mutated `chain.states`
-            // while another thread was mid-import — exactly the race the
-            // per-resource-locks slice is meant to eliminate. Treat it as
-            // fatal so CI can fail the run.
+            // This worker re-imports a pre-imported clean chain in a
+            // tight loop. The expected outcome of every call is either
+            //   * success (the `kept_existing` path in
+            //     `statesCommitKeepExisting` returns an empty slice), or
+            //   * `MissingPreState`, which means a writer mutated
+            //     `chain.states` mid-import — the exact race the
+            //     per-resource-locks slice is meant to eliminate.
             //
-            // The other declared `BlockProcessingError` tags
-            // (`InvalidSignatureGroups`, `DuplicateAttestationData`,
-            // `TooManyAttestationData`) are deterministic data errors on a
-            // pre-imported clean chain and would also indicate a state
-            // corruption race rather than a benign retry — count them and
-            // surface them in the summary, but bump `gossip_errs` so an
-            // operator inspecting the run notices.
+            // ANY error — `MissingPreState`, the other declared
+            // `BlockProcessingError` tags (`InvalidSignatureGroups`,
+            // `DuplicateAttestationData`, `TooManyAttestationData`), or
+            // an unexpected error tag introduced by future changes — is
+            // a regression on this codepath. Fail the run inline so CI
+            // catches it, mirroring the recommendation in the
+            // slice-(b) review.
             //
-            // (`BlockAlreadyKnown` is intentionally NOT handled — duplicate
-            // imports go through the `kept_existing` success path and
-            // return an empty slice, never an error tag. See chain.zig
-            // `statesCommitKeepExisting`.)
+            // (`BlockAlreadyKnown` is intentionally NOT special-cased
+            // — duplicate imports go through the `kept_existing`
+            // success path and return an empty slice, never an error
+            // tag. See chain.zig `statesCommitKeepExisting`.)
             switch (err) {
                 error.MissingPreState => {
                     ctx.recordFatal(
                         "gossip-flood (thread {d}): MissingPreState — design-doc gate violation (states-map race)",
                         .{thread_id},
                     );
-                    return;
                 },
                 else => {
-                    _ = ctx.gossip_errs.fetchAdd(1, .monotonic);
+                    ctx.recordFatal(
+                        "gossip-flood (thread {d}): unexpected error from chain.onBlock on pre-imported chain: {s}",
+                        .{ thread_id, @errorName(err) },
+                    );
                 },
             }
+            _ = ctx.gossip_errs.fetchAdd(1, .monotonic);
             _ = ctx.gossip_ops.fetchAdd(1, .monotonic);
-            i += 1;
-            continue;
+            return;
         };
         ctx.chain.allocator.free(missing);
         _ = ctx.gossip_ops.fetchAdd(1, .monotonic);
