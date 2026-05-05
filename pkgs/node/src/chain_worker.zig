@@ -64,9 +64,16 @@ const zeam_utils = @import("@zeam/utils");
 /// Resolve the project's default `std.Io` instance. Mirrors the pattern
 /// in `pkgs/utils/src/sync.zig`: the chain-worker queue is purely a
 /// thread-blocking primitive (no async fiber semantics required), so
-/// the global single-threaded io is the right choice. If a future change
-/// switches the threading model, every callsite here can be retargeted
-/// to a different `Io` instance.
+/// the global single-threaded io is the right choice.
+///
+/// Hot-path optimisation: `BoundedQueue` and `ChainWorker` cache the
+/// resolved `std.Io` once at init and reuse the cached value on every
+/// trySend/recv/close/depth/wake. `Io` construction is cheap (vtable
+/// pointer + userdata struct) but at the c-2 target rate of ~1k
+/// attestations/sec it shows up in profiles; caching is free
+/// correctness-wise and visibly cheaper. Only the `*.init()` calls
+/// below go through this function; everything else dereferences the
+/// cached `self.io` field.
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -208,6 +215,9 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         closed: bool = false,
         mutex: std.Io.Mutex = .init,
         not_empty: std.Io.Condition = .init,
+        /// Cached `std.Io` resolved once at init via `defaultIo()`.
+        /// See the `defaultIo()` doc for the hot-path rationale.
+        io: std.Io,
 
         // Producer-observable counters. Read with `.monotonic` from the
         // metrics layer; writers serialize under `mutex` so the
@@ -221,7 +231,11 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         pub fn init(allocator: Allocator, capacity: usize) !Self {
             std.debug.assert(capacity > 0);
             const items = try allocator.alloc(T, capacity);
-            return .{ .items = items, .capacity = capacity };
+            return .{
+                .items = items,
+                .capacity = capacity,
+                .io = defaultIo(),
+            };
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
@@ -234,7 +248,7 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         /// success, the message is enqueued and a waiting consumer is
         /// woken.
         pub fn trySend(self: *Self, msg: T) TrySendError!void {
-            const io = defaultIo();
+            const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.closed) return error.QueueClosed;
@@ -262,7 +276,7 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         /// when EITHER queue has work — see `tryRecv` + the worker's
         /// shared condvar in `ChainWorker`.
         pub fn recv(self: *Self) ?T {
-            const io = defaultIo();
+            const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             while (self.len == 0 and !self.closed) {
@@ -276,7 +290,7 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         /// chain-worker loop, which multiplexes two queues and uses a
         /// shared condvar at the worker level for wakeup.
         pub fn tryRecv(self: *Self) ?T {
-            const io = defaultIo();
+            const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             return self.popLocked();
@@ -307,7 +321,7 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
 
         /// Mark the queue closed and wake any waiting consumer. Idempotent.
         pub fn close(self: *Self) void {
-            const io = defaultIo();
+            const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             self.closed = true;
@@ -317,7 +331,7 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
         /// Snapshot of the current length, for metrics. Acquires the
         /// mutex briefly so reads do not race a partial enqueue/dequeue.
         pub fn depth(self: *Self) usize {
-            const io = defaultIo();
+            const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             return self.len;
@@ -354,20 +368,57 @@ pub const ChainWorker = struct {
     block_queue: BlockQueue,
     attestation_queue: AttestationQueue,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Single-shot guard so concurrent `stop()` callers don't both
+    /// reach `t.join()` (which is UB on the second caller — the
+    /// first sets `thread = null` after join, but the read at the
+    /// top of `stop()` is racy). Whichever caller wins the
+    /// compare-and-set runs the close+join sequence; the loser
+    /// returns immediately. Same pattern as `recordFatal` in
+    /// stress.zig (single-fire flag swap on entry).
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
     /// Liveness counter: incremented on every loop iteration. Exposed
-    /// via metrics so an external watchdog can observe whether the
-    /// worker is actually draining work.
+    /// via the `lean_chain_worker_loop_iters_total` metric (bumped
+    /// from `runLoop` directly) so an external watchdog can compare
+    /// scrape deltas to detect a stalled worker without touching
+    /// queue state.
     loop_iters: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Shared wake mechanism. The worker drains both queues each
     /// iteration; when both are empty it parks here. Producers signal
     /// after every successful enqueue so the worker wakes regardless
     /// of which queue received the work. The mutex is only held long
-    /// enough to wait/signal; queue operations have their own mutexes
-    /// and DO NOT compose with this one.
+    /// enough to wait/signal.
+    ///
+    /// ## Lock ordering with the queue mutexes
+    ///
+    /// `wake_mutex` and the per-queue mutexes ARE composed in one
+    /// place: the worker's lost-wakeup re-check in `runLoop` holds
+    /// `wake_mutex` while calling `block_queue.depth()` and
+    /// `attestation_queue.depth()` (which take their own internal
+    /// mutexes). The composition is safe under the rule
+    ///
+    ///   ORDER: wake_mutex → queue_mutex (never reverse)
+    ///
+    /// Producers respect this trivially: `sendBlock`/`sendAttestation`
+    /// take queue_mutex (inside trySend) FIRST and release it BEFORE
+    /// taking wake_mutex (inside `wake()`). The worker is the only
+    /// thread that holds wake_mutex while reaching for a queue
+    /// mutex, and only via `depth()` (read-only, immediately
+    /// released).
+    ///
+    /// Future contributors who add new wake-mutex-protected paths
+    /// must preserve this ordering or the lost-wakeup re-check
+    /// becomes a deadlock surface.
     wake_mutex: std.Io.Mutex = .init,
     wake_cond: std.Io.Condition = .init,
+
+    /// Cached `std.Io` resolved once at init via `defaultIo()`. Same
+    /// instance the queues hold; ChainWorker carries its own copy so
+    /// `wake()` and `runLoop` don't have to reach into
+    /// `block_queue.io` (which would couple the worker to the block
+    /// queue's identity). See `defaultIo()` for the hot-path rationale.
+    io: std.Io,
 
     logger: zeam_utils.ModuleLogger,
 
@@ -385,6 +436,7 @@ pub const ChainWorker = struct {
                 allocator,
                 opts.attestation_queue_capacity,
             ),
+            .io = defaultIo(),
             .logger = opts.logger,
         };
     }
@@ -407,14 +459,33 @@ pub const ChainWorker = struct {
     /// worker can park on an empty block queue while attestations
     /// pile up (and vice versa).
     pub fn sendBlock(self: *Self, msg: Message) BlockQueue.TrySendError!void {
-        try self.block_queue.trySend(msg);
+        self.block_queue.trySend(msg) catch |err| {
+            if (err == error.QueueFull) {
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "block" }) catch {};
+            }
+            return err;
+        };
+        zeam_metrics.metrics.lean_chain_queue_depth.set(
+            .{ .queue = "block" },
+            self.block_queue.depth(),
+        ) catch {};
         self.wake();
     }
 
     /// Send an attestation-flavored message and wake the worker.
-    /// Same wakeup contract as `sendBlock`.
+    /// Same wakeup contract as `sendBlock`. Bumps the same metrics
+    /// family with `queue="attestation"`.
     pub fn sendAttestation(self: *Self, msg: Message) AttestationQueue.TrySendError!void {
-        try self.attestation_queue.trySend(msg);
+        self.attestation_queue.trySend(msg) catch |err| {
+            if (err == error.QueueFull) {
+                zeam_metrics.metrics.lean_chain_queue_dropped_total.incr(.{ .queue = "attestation" }) catch {};
+            }
+            return err;
+        };
+        zeam_metrics.metrics.lean_chain_queue_depth.set(
+            .{ .queue = "attestation" },
+            self.attestation_queue.depth(),
+        ) catch {};
         self.wake();
     }
 
@@ -422,7 +493,7 @@ pub const ChainWorker = struct {
     /// producer; idempotent under spurious wakeups (the loop
     /// re-checks both queues each iteration).
     pub fn wake(self: *Self) void {
-        const io = defaultIo();
+        const io = self.io;
         self.wake_mutex.lockUncancelable(io);
         defer self.wake_mutex.unlock(io);
         self.wake_cond.signal(io);
@@ -435,18 +506,42 @@ pub const ChainWorker = struct {
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
-    /// Signal stop, close both queues so any blocked recv returns,
-    /// then join the worker thread. Idempotent.
+    /// Idempotent and concurrent-safe shutdown.
+    ///
+    /// Actual semantics (NOT a "Shutdown sentinel rides the block
+    /// queue" framing — there is no Shutdown variant):
+    ///
+    ///   1. Single-shot CAS on `stopping`: only the first caller
+    ///      proceeds; concurrent callers return immediately. Closes
+    ///      the race where two threads both saw `thread != null`
+    ///      and both reached `t.join()` (UB on the second).
+    ///   2. Set `stop_flag` so the loop's drain-then-park guard
+    ///      observes it.
+    ///   3. Close both queues so any blocked standalone `recv`
+    ///      returns null. The worker loop itself is woken via
+    ///      the shared `wake_cond` in step 4; the queues' own
+    ///      condvars are not what it parks on.
+    ///   4. Signal `wake_cond` so the worker, if parked, observes
+    ///      `stop_flag` and exits its drain loop.
+    ///   5. `t.join()` blocks until the worker returns from its
+    ///      current `dispatch()` call. If the worker is mid-handler
+    ///      on a long-running message (a c-2 `on_block` doing full
+    ///      STF can take hundreds of ms), `stop()` blocks for that
+    ///      duration before returning. There is NO mid-handle
+    ///      cancellation — dispatch handlers run to completion.
+    ///
+    /// On exit, any messages still in the queues at stop time are
+    /// popped and freed via `Message.deinit` in `runLoop`'s post-
+    /// stop drain (see `drainOnStop`), so producer-allocated heap
+    /// is not leaked.
     pub fn stop(self: *Self) void {
+        // CAS-on-set: only the winner runs the close+join sequence.
+        // Losers return immediately.
+        if (self.stopping.swap(true, .acq_rel)) return;
         if (self.thread == null) return;
         self.stop_flag.store(true, .release);
-        // Close queues so any standalone blocking recv elsewhere
-        // returns null. The worker loop itself is woken via the
-        // shared wake_cond below — the queues' own condvars are not
-        // what it parks on.
         self.block_queue.close();
         self.attestation_queue.close();
-        // Wake the worker so it observes stop_flag and exits.
         self.wake();
         if (self.thread) |t| {
             t.join();
@@ -467,9 +562,10 @@ pub const ChainWorker = struct {
     /// not leaked when shutdown races a partial enqueue burst.
     fn runLoop(self: *Self) void {
         self.logger.info("chain-worker: loop started", .{});
-        const io = defaultIo();
+        const io = self.io;
         while (true) {
             _ = self.loop_iters.fetchAdd(1, .monotonic);
+            zeam_metrics.metrics.lean_chain_worker_loop_iters_total.incr();
 
             // Drain block queue first (highest priority). `tryRecv`
             // never blocks; we keep draining until empty.
@@ -653,19 +749,71 @@ test "BoundedQueue: recv returns null when closed and drained" {
     try testing.expect(q.recv() == null);
 }
 
-test "BoundedQueue: ring wraparound — repeated send/recv past capacity" {
-    var q = try BlockQueue.init(testing.allocator, 3);
+test "BoundedQueue: ring wraparound — head walks past capacity-1 with items live" {
+    // Earlier shape was send-1 / recv-1 × 32, which kept depth=1
+    // throughout. The head index DID still advance through the
+    // modular arithmetic, but a regression like "on wrap, drop the
+    // tail item" or "on wrap with non-empty queue, mis-index the
+    // popLocked switch" would NOT be caught. The present test forces
+    // head to walk past every position in [0, capacity) while at
+    // least one item is always live in the queue, by alternating
+    // fill-to-capacity / drain-all-but-one cycles and verifying
+    // every popped value matches the expected FIFO sequence.
+    const cap: usize = 4;
+    var q = try BlockQueue.init(testing.allocator, cap);
     defer q.deinit(testing.allocator);
 
-    var i: u64 = 0;
-    while (i < 32) : (i += 1) {
-        try q.trySend(.{ .process_pending_blocks = .{ .current_slot = @intCast(i) } });
-        const m = q.recv() orelse return error.UnexpectedNull;
-        try testing.expectEqual(@as(types.Slot, @intCast(i)), m.process_pending_blocks.current_slot);
+    var next_send: u64 = 0;
+    var next_recv: u64 = 0;
+
+    // Outer loop: enough iterations that head wraps the ring at
+    // least 4 times.
+    var round: usize = 0;
+    while (round < 16) : (round += 1) {
+        // Fill to capacity.
+        while (q.depth() < cap) {
+            try q.trySend(.{ .process_pending_blocks = .{ .current_slot = @intCast(next_send) } });
+            next_send += 1;
+        }
+        try testing.expectEqual(cap, q.depth());
+
+        // Drain all-but-one. The remaining item sits at
+        // (head + len - 1) % cap which, as head walks the ring,
+        // exercises every slot of `items[]`.
+        var keep: usize = 0;
+        while (q.depth() > 1) {
+            const m = q.recv() orelse return error.UnexpectedNull;
+            try testing.expectEqual(
+                @as(types.Slot, @intCast(next_recv)),
+                m.process_pending_blocks.current_slot,
+            );
+            next_recv += 1;
+            keep += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), q.depth());
+        try testing.expect(keep == cap - 1);
     }
-    try testing.expectEqual(@as(u64, 32), q.sent_total.load(.monotonic));
-    try testing.expectEqual(@as(u64, 32), q.recv_total.load(.monotonic));
+
+    // Final drain. Every value popped must still match the FIFO
+    // sequence — if any wraparound mishandling silently re-ordered
+    // the ring, this assertion fires.
+    while (q.depth() > 0) {
+        const m = q.recv() orelse return error.UnexpectedNull;
+        try testing.expectEqual(
+            @as(types.Slot, @intCast(next_recv)),
+            m.process_pending_blocks.current_slot,
+        );
+        next_recv += 1;
+    }
+
+    try testing.expectEqual(next_send, next_recv);
+    try testing.expectEqual(next_send, q.sent_total.load(.monotonic));
+    try testing.expectEqual(next_send, q.recv_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), q.dropped_total.load(.monotonic));
+
+    // Sanity: head must have wrapped at least once (next_send / cap
+    // ≥ round count) so the test name is honest.
+    try testing.expect(next_send / cap >= 4);
 }
 
 test "BoundedQueue: multi-producer trySend race — counters are exact" {
@@ -789,11 +937,34 @@ test "ChainWorker: cannot start twice" {
     w.stop();
 }
 
-test "ChainWorker: producers race with worker drain — all messages handled, no UAF" {
-    // 4 producer threads each enqueue 50 attestation-flavored messages
-    // onto the attestation queue (LIFO). The worker is started before
-    // any producer so it's actively draining. We assert recv_total
-    // matches sent_total at the end and the worker shuts down clean.
+test "ChainWorker: queue accounting under producer race — sent_total and recv_total agree" {
+    // 4 producer threads each enqueue 50 attestation-flavored
+    // messages. The worker is started before any producer so it's
+    // actively draining. We assert recv_total matches sent_total
+    // at the end and the worker shuts down clean.
+    //
+    // What this test does prove:
+    //   * Producer-side mutex never loses a sent_total increment
+    //     under contention.
+    //   * Worker-side single-consumer never loses a recv_total
+    //     increment under contention.
+    //   * The wake_cond chain (sendAttestation → wake → worker park
+    //     re-check) eventually drains every produced message.
+    //   * stop()+drainOnStop completes without deadlock.
+    //
+    // What this test does NOT prove (despite an earlier name that
+    // implied it):
+    //   * That the dispatch handler ran any business logic. The
+    //     c-1 stub for `process_pending_blocks` logs and returns;
+    //     `recv_total` is bumped inside `tryRecv` regardless of
+    //     what `dispatch` does. A c-2 handler that did real work
+    //     could still pass this test even if its STF was a no-op.
+    //   * That there's no UAF on the message payload. The variant
+    //     used here (`process_pending_blocks`) is heap-free, so
+    //     there is no UAF surface to exercise. The Message.deinit
+    //     leak tests above cover the heap-bearing variants; a
+    //     genuine UAF assertion would land alongside c-2's real
+    //     handlers.
     const NUM_PRODUCERS: usize = 4;
     const MSGS_PER_PRODUCER: usize = 50;
 
@@ -956,5 +1127,120 @@ test "ChainWorker.drainOnStop: pending messages freed on shutdown (no leak)" {
     // Don't wait for the worker to dispatch — race the stop. Either
     // dispatch() runs deinit first, or drainOnStop runs it. Both
     // paths must free.
+    w.stop();
+}
+
+test "ChainWorker: metrics — sendBlock/sendAttestation/runLoop bump lean_chain_* and appear in /metrics output" {
+    // Slice-(b) lesson (locking.zig LockTimer test): manual metric-
+    // wiring audits regress silently. This test exercises the three
+    // chain-worker metrics end-to-end:
+    //
+    //   * lean_chain_queue_dropped_total{queue=...}  (from a forced
+    //     QueueFull on a capacity-1 queue),
+    //   * lean_chain_queue_depth{queue=...}  (set on every successful
+    //     send),
+    //   * lean_chain_worker_loop_iters_total  (incremented on every
+    //     runLoop iteration).
+    //
+    // It then scrapes the rendered Prometheus body via
+    // zeam_metrics.writeMetrics and asserts each name + label appears,
+    // mirroring the LockTimer test pattern. Uses page_allocator for
+    // the metrics init so the (process-global) hashmap survives test
+    // teardown — see locking.zig comment on the same trap.
+    try zeam_metrics.init(std.heap.page_allocator);
+
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    var w = try ChainWorker.init(testing.allocator, .{
+        .logger = logger_config.logger(.chain),
+        // capacity 1 so the second sendBlock below is guaranteed to
+        // hit QueueFull and bump lean_chain_queue_dropped_total.
+        .block_queue_capacity = 1,
+        .attestation_queue_capacity = 1,
+    });
+    defer w.deinit();
+
+    // 1) Send one block successfully → bumps lean_chain_queue_depth.
+    try w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = 1 } });
+
+    // 2) Force a drop on the block queue. The worker isn't started, so
+    //    the queue stays at capacity. The 2nd sendBlock returns
+    //    QueueFull and bumps lean_chain_queue_dropped_total{queue=block}.
+    try testing.expectError(
+        error.QueueFull,
+        w.sendBlock(.{ .process_pending_blocks = .{ .current_slot = 2 } }),
+    );
+
+    // 3) Same shape on the attestation queue.
+    try w.sendAttestation(.{ .process_pending_blocks = .{ .current_slot = 3 } });
+    try testing.expectError(
+        error.QueueFull,
+        w.sendAttestation(.{ .process_pending_blocks = .{ .current_slot = 4 } }),
+    );
+
+    // 4) Start the worker briefly so runLoop runs at least once and
+    //    bumps lean_chain_worker_loop_iters_total.
+    try w.start();
+    while (w.loop_iters.load(.monotonic) < 1) {
+        std.Thread.yield() catch {};
+    }
+    w.stop();
+
+    // 5) Scrape /metrics via writeMetrics and assert each metric +
+    //    label is in the rendered body.
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, body, "lean_chain_queue_dropped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_chain_queue_depth") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_chain_worker_loop_iters_total") != null);
+
+    try testing.expect(std.mem.indexOf(u8, body, "queue=\"block\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "queue=\"attestation\"") != null);
+}
+
+test "ChainWorker.stop: idempotent under concurrent callers (no double-join UB)" {
+    // Three threads race stop() against each other on a started worker.
+    // Without the `stopping` CAS guard, all three would observe
+    // `thread != null`, all three would proceed past the early return,
+    // and at least two would call `t.join()` on the same handle —
+    // UB on the second join.
+    //
+    // With the guard, exactly one caller wins the CAS and runs the
+    // close+join sequence; the other two return immediately. The test
+    // asserts the worker shut down (loop_iters > 0, thread null) and
+    // that no thread crashed.
+    var logger_config = zeam_utils.getTestLoggerConfig();
+    var w = try ChainWorker.init(testing.allocator, .{
+        .logger = logger_config.logger(.chain),
+        .block_queue_capacity = 4,
+        .attestation_queue_capacity = 4,
+    });
+    defer w.deinit();
+
+    try w.start();
+    // Let the worker reach its parked state.
+    zeam_utils.sleepNs(2 * std.time.ns_per_ms);
+
+    const Stopper = struct {
+        fn run(worker: *ChainWorker) void {
+            worker.stop();
+        }
+    };
+
+    var threads: [3]std.Thread = undefined;
+    var i: usize = 0;
+    while (i < threads.len) : (i += 1) {
+        threads[i] = try std.Thread.spawn(.{}, Stopper.run, .{&w});
+    }
+    i = 0;
+    while (i < threads.len) : (i += 1) {
+        threads[i].join();
+    }
+
+    try testing.expect(w.thread == null);
+    try testing.expect(w.loop_iters.load(.monotonic) > 0);
+    // Calling stop again from the test thread must also be safe.
     w.stop();
 }
