@@ -38,8 +38,21 @@
 //! `init` returns a refcount of 1 (the creator's reference). Every
 //! `acquire` bumps; every `release` decrements. The thread that brings
 //! refcount to 0 frees the state and the wrapper. Acquire/release are
-//! `acq_rel`-ordered atomic ops so the freeing thread observes all
-//! prior writes to the state.
+//! Memory ordering follows the standard refcount pattern (Rust
+//! `Arc`, C++ `shared_ptr`):
+//!
+//!   * `acquire`: `.monotonic` fetchAdd. The caller already holds
+//!     a valid acquire (that's the contract); incrementing the
+//!     count cannot race with a free because no thread can free
+//!     until refcount reaches 0, which can't happen while we hold
+//!     a reference. No fence needed on this side.
+//!   * `release`: `.acq_rel` fetchSub. The freeing thread (the one
+//!     that observes `prev == 1`) needs `.acquire` to synchronise
+//!     with all prior `.release` decrements from other threads, so
+//!     it observes every prior write to the state before calling
+//!     `state.deinit()`. The `.release` half ensures non-freeing
+//!     decrements publish their writes before the count drop is
+//!     visible. `.acq_rel` is the union.
 //!
 //! Double-release is a debug-build panic (the refcount underflows).
 //! Release after a refcount has already been freed is undefined; the
@@ -73,10 +86,11 @@ const types = @import("@zeam/types");
 pub const RcBeamState = struct {
     /// Owning allocator. Final release frees `self` via this allocator.
     allocator: Allocator,
-    /// Refcount. `acq_rel` orderings on bumps and decrements ensure the
-    /// thread that observes 0 also observes all prior writes to `state`
-    /// (and that the freeing thread's writes are not reordered before
-    /// the decrement).
+    /// Refcount. See the file header for the memory-ordering rules:
+    /// `.monotonic` on bump (caller holds a valid acquire so there
+    /// is nothing to synchronise against), `.acq_rel` on decrement
+    /// (the freeing thread synchronises with every prior
+    /// non-freeing decrement via the `.acquire` half).
     refcount: std.atomic.Value(u32),
     /// The wrapped state. Heap-owned; `release` calls `state.deinit()`
     /// when refcount hits 0.
@@ -119,31 +133,86 @@ pub const RcBeamState = struct {
         return self;
     }
 
-    /// Bump refcount. Returns the same pointer for chained call sites
-    /// (e.g. `const reader = rc.acquire();`). Safe to call from any
-    /// thread that holds a valid acquire.
+    /// Bump refcount, returning a mutable pointer. Used by the
+    /// chain worker (the sole writer under c-2b) when handing a
+    /// reference to a follow-up handler that may itself mutate the
+    /// state. Safe to call from any thread that holds a valid
+    /// acquire.
+    ///
+    /// Cross-thread readers (HTTP API, metrics scrape, event
+    /// broadcaster) MUST use `acquireConst()` instead so the type
+    /// system enforces the sole-writer invariant: only the chain
+    /// worker can obtain a `*Self` (mutable) pointer; everyone else
+    /// gets `*const Self`.
+    ///
+    /// Memory ordering: `.monotonic` on the increment per the
+    /// standard refcount pattern. The caller already holds a valid
+    /// acquire so there is no race against a free; incrementing
+    /// requires no fence. (Rust `Arc::clone`, C++
+    /// `shared_ptr::shared_ptr(const &)` use the same ordering.)
     pub fn acquire(self: *Self) *Self {
-        const prev = self.refcount.fetchAdd(1, .acq_rel);
+        const prev = self.refcount.fetchAdd(1, .monotonic);
         // Overflow check: u32 max is 4 billion; we should never get
-        // anywhere near this in practice, but a wraparound would be a
-        // silent UAF. Debug-build assert.
+        // anywhere near this in practice, but a wraparound would be
+        // a silent UAF. Debug-build assert.
         std.debug.assert(prev < std.math.maxInt(u32));
         return self;
     }
 
+    /// Bump refcount, returning a const pointer. Use this for every
+    /// call site that does NOT need to mutate the state — i.e. all
+    /// cross-thread readers (HTTP API, metrics scrape, event
+    /// broadcaster). The c-2b design has the chain worker as the
+    /// sole writer; readers using `acquireConst` makes that
+    /// invariant compile-checked rather than convention-only.
+    ///
+    /// Refcount semantics are identical to `acquire`: matched by a
+    /// `release()` call on the same pointer (cast away the const if
+    /// needed at the release site — release is logically a
+    /// destructor and is allowed to mutate even on a `const` view).
+    pub fn acquireConst(self: *Self) *const Self {
+        return self.acquire();
+    }
+
     /// Decrement refcount. When refcount reaches 0, calls
-    /// `state.deinit()` and frees `self`. After `release`, the caller
-    /// MUST NOT use `self` again.
+    /// `state.deinit()` and frees `self`. After `release`, the
+    /// caller MUST NOT use `self` again.
+    ///
+    /// Takes `*const Self` so a reader that holds a `*const Self`
+    /// (from `acquireConst`) can release directly without casting
+    /// at the call site. The function itself uses `@constCast`
+    /// internally because release IS a destructive operation —
+    /// const-ness on the reader's view is about preventing
+    /// state-field mutation, not about the refcount itself.
+    ///
+    /// Memory ordering: `.acq_rel` on the decrement. The freeing
+    /// thread (`prev == 1`) needs the `.acquire` half to
+    /// synchronise with every prior non-freeing decrement so it
+    /// observes all prior writes to the state before calling
+    /// `state.deinit()`. The `.release` half ensures non-freeing
+    /// decrements publish their writes before the count drop is
+    /// visible. (Cf. Rust `Arc::drop`, C++ `~shared_ptr`.)
     ///
     /// Underflow (double-release without a matching acquire) is a
-    /// debug-build panic; release-build behaviour is silent UB.
-    pub fn release(self: *Self) void {
-        const prev = self.refcount.fetchSub(1, .acq_rel);
+    /// debug-build panic when caught — but only when the freed
+    /// memory's first 4 bytes happen to read 0 by the time the
+    /// stale release runs. The assert is best-effort, NOT a
+    /// guaranteed safety net; it catches some double-releases but
+    /// release-build / racy-stale-pointer behaviour is silent UB.
+    /// Slice c-2b will need the `tryAcquire` upgrade-from-weak
+    /// pattern to make stale-pointer acquires safe; see the
+    /// follow-up note in #803.
+    pub fn release(self: *const Self) void {
+        // Cast: refcount is logically internal mutable state even
+        // on a const view, and the freeing branch needs to call
+        // mutating methods (state.deinit, allocator.destroy).
+        const mut = @constCast(self);
+        const prev = mut.refcount.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0); // catch double-release
         if (prev == 1) {
             // Last reference — we own the free.
-            self.state.deinit();
-            self.allocator.destroy(self);
+            mut.state.deinit();
+            mut.allocator.destroy(mut);
         }
     }
 
@@ -483,4 +552,76 @@ test "RcBeamState.create: OOM path consumes state (no leak under FailingAllocato
     // The caller does NOT call state.deinit() here. If create()
     // failed to consume, testing.allocator's leak detector trips
     // when this test scope exits.
+}
+
+test "RcBeamState.acquireConst: returns *const Self that releases cleanly" {
+    // Locks the c-2b sole-writer invariant in the type system: the
+    // chain worker uses `acquire()` to get `*Self` (mutable);
+    // every cross-thread reader uses `acquireConst()` to get
+    // `*const Self`. Both are released via the same `release()`
+    // entry point, which takes `*const Self` so the reader path
+    // doesn't need a cast at the call site.
+    //
+    // This test exercises the reader path end-to-end: take a
+    // const reference, dereference state.slot through the const
+    // pointer, release. testing.allocator's leak detector verifies
+    // clean teardown.
+    const state = try makeState();
+    const rc = try RcBeamState.create(testing.allocator, state);
+    defer rc.release(); // creator's reference
+
+    const reader: *const RcBeamState = rc.acquireConst();
+    // Read-only deref: this would not compile if `state` weren't
+    // const-friendly. (BeamState's read methods all take `*const`.)
+    std.mem.doNotOptimizeAway(reader.state.slot);
+    try testing.expectEqual(@as(u32, 2), rc.count());
+    reader.release();
+    try testing.expectEqual(@as(u32, 1), rc.count());
+}
+
+test "RcBeamState.acquireConst: concurrent readers free cleanly when creator drops" {
+    // Same shape as the freeing-race test, but every reader uses
+    // acquireConst() — the c-2b cross-thread reader pattern. The
+    // freeing path is identical; this test exists to confirm the
+    // const-pointer + release(*const Self) path is exercised at
+    // least once under contention.
+    const NUM_READERS: usize = 8;
+    const ITERS_PER_READER: usize = 100;
+
+    const Reader = struct {
+        fn run(reader: *const RcBeamState, iters: usize) void {
+            defer reader.release();
+            var k: usize = 0;
+            while (k < iters) : (k += 1) {
+                std.mem.doNotOptimizeAway(reader.state.slot);
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    var outer: usize = 0;
+    while (outer < 25) : (outer += 1) {
+        const state = try makeState();
+        const rc = try RcBeamState.create(testing.allocator, state);
+
+        var threads: [NUM_READERS]std.Thread = undefined;
+        var i: usize = 0;
+        while (i < NUM_READERS) : (i += 1) {
+            const handed = rc.acquireConst();
+            threads[i] = std.Thread.spawn(
+                .{},
+                Reader.run,
+                .{ handed, ITERS_PER_READER },
+            ) catch |err| {
+                handed.release();
+                return err;
+            };
+        }
+        rc.release(); // creator drops; some reader will be the freer
+
+        i = 0;
+        while (i < NUM_READERS) : (i += 1) {
+            threads[i].join();
+        }
+    }
 }
