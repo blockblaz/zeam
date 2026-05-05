@@ -173,10 +173,18 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
             self.not_empty.signal(io);
         }
 
-        /// Single-consumer recv. Blocks until an item is available, or
-        /// returns `null` if the queue is closed AND drained. The
-        /// caller is responsible for any per-item cleanup (e.g.
-        /// freeing payload buffers) since this returns `T` by value.
+        /// Single-consumer blocking recv. Blocks until an item is
+        /// available, or returns `null` if the queue is closed AND
+        /// drained. The caller is responsible for any per-item cleanup
+        /// (e.g. freeing payload buffers) since this returns `T` by
+        /// value.
+        ///
+        /// Used by tests in c-1 and by the chain worker in c-2 when a
+        /// queue is the only legitimate work source. The chain-worker
+        /// loop in c-1 (`ChainWorker.runLoop`) does NOT use this on the
+        /// hot path because the worker draining two queues must wake
+        /// when EITHER queue has work — see `tryRecv` + the worker's
+        /// shared condvar in `ChainWorker`.
         pub fn recv(self: *Self) ?T {
             const io = defaultIo();
             self.mutex.lockUncancelable(io);
@@ -184,7 +192,25 @@ pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
             while (self.len == 0 and !self.closed) {
                 self.not_empty.waitUncancelable(io, &self.mutex);
             }
-            if (self.len == 0) return null; // closed + drained
+            return self.popLocked();
+        }
+
+        /// Single-consumer non-blocking recv. Returns `null` immediately
+        /// when the queue is empty (whether closed or not). Used by the
+        /// chain-worker loop, which multiplexes two queues and uses a
+        /// shared condvar at the worker level for wakeup.
+        pub fn tryRecv(self: *Self) ?T {
+            const io = defaultIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return self.popLocked();
+        }
+
+        /// Internal: drop one item under a held mutex. Returns null if
+        /// no item is available. Updates `recv_total` only on a real
+        /// pop.
+        fn popLocked(self: *Self) ?T {
+            if (self.len == 0) return null;
             const idx = switch (mode) {
                 .fifo => self.head,
                 .lifo => (self.head + self.len - 1) % self.capacity,
@@ -631,18 +657,23 @@ test "ChainWorker: producers race with worker drain — all messages handled, no
 
     const Producer = struct {
         fn run(worker: *ChainWorker, n: usize) void {
-            var k: usize = 0;
-            while (k < n) : (k += 1) {
+            // We track `sent` rather than the loop-induction variable so a
+            // backoff-on-QueueFull retry never underflows. Earlier shape
+            // (`while (k < n) : (k += 1) { ... catch { k -= 1; }; }`) hit
+            // a usize underflow when the very first send raced the worker
+            // before it could drain anything.
+            var sent: usize = 0;
+            while (sent < n) {
                 // Use process_pending_blocks variant as an opaque token —
                 // the worker logs and discards (c-1 stub).
                 worker.attestation_queue.trySend(.{
-                    .process_pending_blocks = .{ .current_slot = @intCast(k) },
+                    .process_pending_blocks = .{ .current_slot = @intCast(sent) },
                 }) catch {
-                    // Full — retry with backoff so the test eventually
-                    // succeeds rather than dropping silently.
+                    // Full — back off and retry the same logical message.
                     zeam_utils.sleepNs(100 * std.time.ns_per_us);
-                    k -= 1;
+                    continue;
                 };
+                sent += 1;
             }
         }
     };
