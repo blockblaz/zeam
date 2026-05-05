@@ -1217,6 +1217,24 @@ pub const BlockByRootRequest = struct {
     }
 };
 
+pub const BlocksByRangeRequest = struct {
+    start_slot: Slot,
+    count: u64,
+
+    pub fn toJson(self: *const BlocksByRangeRequest, allocator: Allocator) !json.Value {
+        var obj = json.ObjectMap.empty;
+        try obj.put(allocator, "start_slot", json.Value{ .integer = @as(i64, @intCast(self.start_slot)) });
+        try obj.put(allocator, "count", json.Value{ .integer = @as(i64, @intCast(self.count)) });
+        return json.Value{ .object = obj };
+    }
+
+    pub fn toJsonString(self: *const BlocksByRangeRequest, allocator: Allocator) ![]const u8 {
+        var json_value = try self.toJson(allocator);
+        defer freeJsonValue(&json_value, allocator);
+        return utils.jsonToString(allocator, json_value);
+    }
+};
+
 /// Canonical lightweight forkchoice proto block used across modules
 pub const ProtoBlock = struct {
     slot: Slot,

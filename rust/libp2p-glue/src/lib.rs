@@ -1827,6 +1827,7 @@ impl Behaviour {
         let reqresp = ReqResp::new(vec![
             LeanSupportedProtocol::StatusV1.into(),
             LeanSupportedProtocol::BlocksByRootV1.into(),
+            LeanSupportedProtocol::BlocksByRangeV1.into(),
         ]);
 
         Self {

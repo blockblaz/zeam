@@ -35,6 +35,7 @@ pub const DisconnectionReason = enum(u32) {
 
 const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+const lean_blocks_by_range_protocol = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
 
 fn unionPayloadType(comptime UnionType: type, comptime tag: anytype) type {
@@ -363,13 +364,16 @@ pub const GossipMessage = union(GossipTopicKind) {
     }
 };
 
-pub const LeanSupportedProtocol = enum {
-    blocks_by_root,
-    status,
+pub const LeanSupportedProtocol = enum(u32) {
+    // Ordinals must match `rust/libp2p-glue/src/req_resp/protocol_id.rs::TryFrom<u32>`.
+    blocks_by_root = 0,
+    status = 1,
+    blocks_by_range = 2,
 
     pub fn protocolId(self: LeanSupportedProtocol) []const u8 {
         return switch (self) {
             .blocks_by_root => lean_blocks_by_root_protocol,
+            .blocks_by_range => lean_blocks_by_range_protocol,
             .status => lean_status_protocol,
         };
     }
@@ -395,6 +399,10 @@ pub const LeanSupportedProtocol = enum {
             return .blocks_by_root;
         }
 
+        if (std.mem.eql(u8, protocol_id, lean_blocks_by_range_protocol)) {
+            return .blocks_by_range;
+        }
+
         return error.UnsupportedProtocol;
     }
 };
@@ -402,12 +410,14 @@ pub const LeanSupportedProtocol = enum {
 pub const ReqRespRequest = union(LeanSupportedProtocol) {
     blocks_by_root: types.BlockByRootRequest,
     status: types.Status,
+    blocks_by_range: types.BlocksByRangeRequest,
 
     const Self = @This();
 
     pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
+            .blocks_by_range => try writer.writeAll("ReqRespRequest{ blocks_by_range }"),
             .status => try writer.writeAll("ReqRespRequest{ status }"),
         }
     }
@@ -416,6 +426,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |request| request.toJson(allocator),
+            .blocks_by_range => |request| request.toJson(allocator),
         };
     }
 
@@ -452,6 +463,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *unionPayloadType(Self, tag)) void {
         switch (tag) {
             .blocks_by_root => payload.roots.deinit(),
+            .blocks_by_range => {},
             inline else => {},
         }
     }
@@ -479,6 +491,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 pub const ReqRespResponse = union(LeanSupportedProtocol) {
     blocks_by_root: types.SignedBlock,
     status: types.Status,
+    blocks_by_range: types.SignedBlock,
 
     const Self = @This();
 
@@ -486,6 +499,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |block| block.toJson(allocator),
+            .blocks_by_range => |block| block.toJson(allocator),
         };
     }
 
@@ -524,6 +538,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         switch (self.*) {
             .status => {},
             .blocks_by_root => |*block| block.deinit(),
+            .blocks_by_range => |*block| block.deinit(),
         }
     }
 };

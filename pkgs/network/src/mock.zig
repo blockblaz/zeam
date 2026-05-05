@@ -103,6 +103,9 @@ pub const Mock = struct {
                 .blocks_by_root => {
                     task.payload = .{ .failure = .{ .code = 1, .message = "mock peer has no block data" } };
                 },
+                .blocks_by_range => {
+                    task.payload = .{ .failure = .{ .code = 1, .message = "mock peer has no block data" } };
+                },
             }
             return task;
         }
@@ -455,6 +458,11 @@ pub const Mock = struct {
                 try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
                 break :blk interface.ReqRespResponse{ .blocks_by_root = cloned_block };
             },
+            .blocks_by_range => |block_resp| blk: {
+                var cloned_block: types.SignedBlock = undefined;
+                try types.sszClone(self.allocator, types.SignedBlock, block_resp, &cloned_block);
+                break :blk interface.ReqRespResponse{ .blocks_by_range = cloned_block };
+            },
         };
     }
 
@@ -466,6 +474,7 @@ pub const Mock = struct {
                 try types.sszClone(self.allocator, types.BlockByRootRequest, block_req, &cloned_request);
                 break :blk interface.ReqRespRequest{ .blocks_by_root = cloned_request };
             },
+            .blocks_by_range => |block_req| interface.ReqRespRequest{ .blocks_by_range = block_req },
         };
     }
 
@@ -935,6 +944,9 @@ test "Mock status RPC between peers" {
                 .blocks_by_root => {
                     try stream.sendError(1, "unsupported");
                 },
+                .blocks_by_range => {
+                    try stream.sendError(1, "unsupported");
+                },
             }
         }
 
@@ -944,6 +956,9 @@ test "Mock status RPC between peers" {
                 .success => |resp| switch (resp) {
                     .status => |status_resp| self.received_status = status_resp,
                     .blocks_by_root => {
+                        self.failures += 1;
+                    },
+                    .blocks_by_range => {
                         self.failures += 1;
                     },
                 },

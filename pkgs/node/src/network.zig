@@ -32,14 +32,26 @@ pub const BlockByRootContext = struct {
     }
 };
 
+pub const BlockByRangeContext = struct {
+    peer_id: []const u8,
+    start_slot: types.Slot,
+    count: u64,
+
+    pub fn deinit(self: *BlockByRangeContext, allocator: Allocator) void {
+        allocator.free(self.peer_id);
+    }
+};
+
 pub const PendingRPC = union(enum) {
     status: StatusRequestContext,
     blocks_by_root: BlockByRootContext,
+    blocks_by_range: BlockByRangeContext,
 
     pub fn deinit(self: *PendingRPC, allocator: Allocator) void {
         switch (self.*) {
             .status => |*ctx| ctx.deinit(allocator),
             .blocks_by_root => |*ctx| ctx.deinit(allocator),
+            .blocks_by_range => |*ctx| ctx.deinit(allocator),
         }
     }
 };
@@ -206,6 +218,25 @@ pub const Network = struct {
         return request_id;
     }
 
+    pub fn requestBlocksByRange(
+        self: *Self,
+        peer_id: []const u8,
+        start_slot: types.Slot,
+        count: u64,
+        callback: ?networks.OnReqRespResponseCbHandler,
+    ) !u64 {
+        if (count == 0) return error.NoBlocksRequested;
+
+        var request = networks.ReqRespRequest{
+            .blocks_by_range = .{ .start_slot = start_slot, .count = count },
+        };
+        errdefer request.deinit();
+
+        const request_id = try self.backend.reqresp.sendRequest(peer_id, &request, callback);
+        request.deinit();
+        return request_id;
+    }
+
     /// Returns an owned copy of a randomly selected peer's id, or null when
     /// no peers are connected. Caller frees with `self.allocator.free`.
     pub fn selectPeer(self: *Self) !?[]u8 {
@@ -244,6 +275,7 @@ pub const Network = struct {
                 const pending_peer_id = switch (rpc_entry.value_ptr.request) {
                     .status => |*ctx| ctx.peer_id,
                     .blocks_by_root => |*ctx| ctx.peer_id,
+                    .blocks_by_range => |*ctx| ctx.peer_id,
                 };
                 if (std.mem.eql(u8, pending_peer_id, peer_id)) {
                     request_ids_to_remove.append(self.allocator, rpc_entry.key_ptr.*) catch continue;
@@ -626,6 +658,47 @@ pub const Network = struct {
         return request_id;
     }
 
+    pub fn sendBlocksByRangeRequest(
+        self: *Self,
+        peer_id: []const u8,
+        start_slot: types.Slot,
+        count: u64,
+        handler: networks.OnReqRespResponseCbHandler,
+    ) !u64 {
+        if (count == 0) return error.NoBlocksRequested;
+
+        const peer_copy = try self.allocator.dupe(u8, peer_id);
+        var peer_copy_owned = true;
+        errdefer if (peer_copy_owned) self.allocator.free(peer_copy);
+
+        var pending = PendingRPC{ .blocks_by_range = .{
+            .peer_id = peer_copy,
+            .start_slot = start_slot,
+            .count = count,
+        } };
+        var pending_owned = false;
+        errdefer if (!pending_owned) pending.deinit(self.allocator);
+
+        // ownership transferred to pending
+        peer_copy_owned = false;
+
+        const request_id = self.requestBlocksByRange(peer_id, start_slot, count, handler) catch |err| {
+            return err;
+        };
+
+        self.pending_rpc_requests.put(request_id, PendingRPCEntry{
+            .request = pending,
+            .created_at = zeam_utils.unixTimestampSeconds(),
+        }) catch |err| {
+            pending.deinit(self.allocator);
+            return err;
+        };
+
+        pending_owned = true;
+
+        return request_id;
+    }
+
     pub fn ensureBlocksByRootRequest(
         self: *Self,
         roots: []const types.Root,
@@ -654,9 +727,11 @@ pub const Network = struct {
     /// fields they need under this snapshot — the returned struct carries
     /// owned copies of any caller-visible strings.
     pub const PendingRequestSnapshot = struct {
-        request_kind: enum { status, blocks_by_root },
+        request_kind: enum { status, blocks_by_root, blocks_by_range },
         peer_id_copy: []u8,
         requested_roots_copy: []types.Root = &[_]types.Root{},
+        start_slot: types.Slot = 0,
+        count: u64 = 0,
         created_at: i64,
 
         pub fn deinit(self: *PendingRequestSnapshot, allocator: Allocator) void {
@@ -701,6 +776,16 @@ pub const Network = struct {
                             .created_at = entry.created_at,
                         };
                     },
+                    .blocks_by_range => |r| {
+                        const peer_id_copy = try c.self.allocator.dupe(u8, r.peer_id);
+                        c.out = .{
+                            .request_kind = .blocks_by_range,
+                            .peer_id_copy = peer_id_copy,
+                            .start_slot = r.start_slot,
+                            .count = r.count,
+                            .created_at = entry.created_at,
+                        };
+                    },
                 }
             }
         };
@@ -736,6 +821,7 @@ pub const Network = struct {
                         _ = self.removePendingBlockRoot(root);
                     }
                 },
+                .blocks_by_range => {},
                 .status => {},
             }
             rpc_entry.deinit(self.allocator);

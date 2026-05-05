@@ -5,11 +5,13 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 const LEAN_BLOCKS_BY_ROOT_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+const LEAN_BLOCKS_BY_RANGE_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 const LEAN_STATUS_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeanSupportedProtocol {
     BlocksByRootV1,
+    BlocksByRangeV1,
     StatusV1,
 }
 
@@ -17,6 +19,7 @@ impl LeanSupportedProtocol {
     pub fn message_name(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => "blocks_by_root",
+            LeanSupportedProtocol::BlocksByRangeV1 => "blocks_by_range",
             LeanSupportedProtocol::StatusV1 => "status",
         }
     }
@@ -24,6 +27,7 @@ impl LeanSupportedProtocol {
     pub fn schema_version(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => "1",
+            LeanSupportedProtocol::BlocksByRangeV1 => "1",
             LeanSupportedProtocol::StatusV1 => "1",
         }
     }
@@ -31,6 +35,7 @@ impl LeanSupportedProtocol {
     pub fn has_context_bytes(&self) -> bool {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => false,
+            LeanSupportedProtocol::BlocksByRangeV1 => false,
             LeanSupportedProtocol::StatusV1 => false,
         }
     }
@@ -38,6 +43,7 @@ impl LeanSupportedProtocol {
     pub fn protocol_id(&self) -> &'static str {
         match self {
             LeanSupportedProtocol::BlocksByRootV1 => LEAN_BLOCKS_BY_ROOT_V1,
+            LeanSupportedProtocol::BlocksByRangeV1 => LEAN_BLOCKS_BY_RANGE_V1,
             LeanSupportedProtocol::StatusV1 => LEAN_STATUS_V1,
         }
     }
@@ -50,6 +56,7 @@ impl TryFrom<u32> for LeanSupportedProtocol {
         match value {
             0 => Ok(LeanSupportedProtocol::BlocksByRootV1),
             1 => Ok(LeanSupportedProtocol::StatusV1),
+            2 => Ok(LeanSupportedProtocol::BlocksByRangeV1),
             _ => Err(()),
         }
     }
