@@ -19,7 +19,7 @@
 //! Slice c-1 (this file) ships the **scaffold only**:
 //!
 //!   * `Message` tagged union covering every chain-mutation entry point.
-//!   * `BoundedQueue(Message, mode)` — a bounded ring with a single
+//!   * `BoundedQueue(Message)` — a thin wrapper around the stdlib
 //!     consumer, multi-producer mutex+condvar protocol. Producers call
 //!     `trySend` (wait-free fail-on-full) so the libp2p bridge thread
 //!     never blocks on a full queue. Two consumer APIs: blocking
@@ -200,147 +200,150 @@ pub const Message = union(enum) {
 /// `not_empty`. `recv` returns `null` once the queue is drained AND
 /// closed; otherwise it keeps blocking. Producers that `trySend` after
 /// close get `error.QueueClosed`.
-/// Ordering policy for `BoundedQueue`. Public so callers can name the
-/// mode explicitly when instantiating.
-pub const QueueMode = enum { fifo, lifo };
-
-pub fn BoundedQueue(comptime T: type, comptime mode: QueueMode) type {
+/// Bounded MPSC queue — thin wrapper around `std.Io.Queue(T)`.
+///
+/// Per @GrapeBaBa's review on PR #826, c-1 uses the stdlib's built-in
+/// queue rather than a hand-rolled mutex+condvar bounded ring. This
+/// gives us:
+///
+///   * Wait-free producer via `put(io, &.{msg}, min=0)` (returns 0
+///     when full, 1 on success, `error.Closed` after close).
+///   * Wait-free single-consumer via `get(io, &buf, min=0)` (returns
+///     0 when empty, 1 on success, `error.Closed` when closed AND
+///     drained).
+///   * Blocking single-consumer via `getOneUncancelable` for the
+///     standalone-queue case (used in tests; production uses
+///     `tryRecv` from `ChainWorker.runLoop`).
+///
+/// Ordering: FIFO. The c-1 design treats both block and attestation
+/// queues as FIFO. Slice c-2 will swap the attestation queue for the
+/// 1024cores intrusive lock-free MPSC node-based queue (
+/// https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue
+/// ) to recover LIFO/freshness-ordered dispatch — the design doc
+/// §"Bounded queue, backpressure, and starvation" mandates LIFO for
+/// attestations. The block queue stays FIFO (safety-ordered).
+///
+/// Counters (`dropped_total`, `sent_total`, `recv_total`) are kept
+/// outside the stdlib queue so the metrics layer can scrape them
+/// without depending on private internals. They are updated on every
+/// successful put / failed put / successful get; race-free for the
+/// metric's purposes (Prometheus gauges/counters are inherently
+/// approximate snapshots).
+pub fn BoundedQueue(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        items: []T,
-        head: usize = 0,
-        len: usize = 0,
-        capacity: usize,
-        closed: bool = false,
-        mutex: std.Io.Mutex = .init,
-        not_empty: std.Io.Condition = .init,
+        /// Caller-owned backing buffer. Lifetime is the caller's
+        /// responsibility — `BoundedQueue.deinit` is a no-op for
+        /// memory; the owner (typically `ChainWorker`) frees it.
+        buf: []T,
+        inner: std.Io.Queue(T),
         /// Cached `std.Io` resolved once at init via `defaultIo()`.
         /// See the `defaultIo()` doc for the hot-path rationale.
         io: std.Io,
 
-        // Producer-observable counters. Read with `.monotonic` from the
-        // metrics layer; writers serialize under `mutex` so the
-        // consistency between `len` and `dropped_total` is exact.
+        // Producer-observable counters. Updated outside the queue's
+        // internal mutex; safe because each is monotonic and the
+        // metrics layer reads with `.monotonic`.
         dropped_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         sent_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         recv_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
         pub const TrySendError = error{ QueueFull, QueueClosed };
 
-        pub fn init(allocator: Allocator, capacity: usize) !Self {
-            std.debug.assert(capacity > 0);
-            const items = try allocator.alloc(T, capacity);
+        /// Initialise from a caller-provided buffer. The caller owns the
+        /// memory; `BoundedQueue.deinit` does not free it.
+        pub fn init(buf: []T) Self {
+            std.debug.assert(buf.len > 0);
             return .{
-                .items = items,
-                .capacity = capacity,
+                .buf = buf,
+                .inner = std.Io.Queue(T).init(buf),
                 .io = defaultIo(),
             };
         }
 
-        pub fn deinit(self: *Self, allocator: Allocator) void {
-            allocator.free(self.items);
-            self.* = undefined;
+        /// No-op for memory; the buffer is caller-owned. Closes the
+        /// queue if not already closed so any blocked getter wakes
+        /// up.
+        pub fn deinit(self: *Self) void {
+            self.close();
         }
 
-        /// Wait-free producer: returns `error.QueueFull` immediately if
-        /// `len == capacity`, `error.QueueClosed` if `close()` ran. On
-        /// success, the message is enqueued and a waiting consumer is
-        /// woken.
+        /// Wait-free producer. Returns `error.QueueFull` if the queue
+        /// is at capacity, `error.QueueClosed` if `close()` ran. On
+        /// success, the message is enqueued and `std.Io.Queue` wakes
+        /// any blocked consumer.
         pub fn trySend(self: *Self, msg: T) TrySendError!void {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.closed) return error.QueueClosed;
-            if (self.len == self.capacity) {
+            const n = self.inner.putUncancelable(self.io, &.{msg}, 0) catch |err| switch (err) {
+                error.Closed => return error.QueueClosed,
+            };
+            if (n == 0) {
                 _ = self.dropped_total.fetchAdd(1, .monotonic);
                 return error.QueueFull;
             }
-            const slot = (self.head + self.len) % self.capacity;
-            self.items[slot] = msg;
-            self.len += 1;
             _ = self.sent_total.fetchAdd(1, .monotonic);
-            self.not_empty.signal(io);
         }
 
         /// Single-consumer blocking recv. Blocks until an item is
         /// available, or returns `null` if the queue is closed AND
-        /// drained. The caller is responsible for any per-item cleanup
-        /// (e.g. freeing payload buffers) since this returns `T` by
-        /// value.
+        /// drained. The caller is responsible for any per-item
+        /// cleanup (e.g. freeing payload buffers) since this returns
+        /// `T` by value.
         ///
-        /// Used by tests in c-1 and by the chain worker in c-2 when a
-        /// queue is the only legitimate work source. The chain-worker
-        /// loop in c-1 (`ChainWorker.runLoop`) does NOT use this on the
-        /// hot path because the worker draining two queues must wake
-        /// when EITHER queue has work — see `tryRecv` + the worker's
-        /// shared condvar in `ChainWorker`.
+        /// Used by tests in c-1 and by any single-queue consumer.
+        /// The chain-worker loop in c-1 (`ChainWorker.runLoop`) does
+        /// NOT use this on the hot path because the worker draining
+        /// two queues must wake when EITHER queue has work — see
+        /// `tryRecv` + the worker's shared condvar in `ChainWorker`.
         pub fn recv(self: *Self) ?T {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            while (self.len == 0 and !self.closed) {
-                self.not_empty.waitUncancelable(io, &self.mutex);
-            }
-            return self.popLocked();
+            const item = self.inner.getOneUncancelable(self.io) catch |err| switch (err) {
+                error.Closed => return null,
+            };
+            _ = self.recv_total.fetchAdd(1, .monotonic);
+            return item;
         }
 
-        /// Single-consumer non-blocking recv. Returns `null` immediately
-        /// when the queue is empty (whether closed or not). Used by the
+        /// Single-consumer non-blocking recv. Returns `null` when the
+        /// queue is empty (whether closed or not). Used by the
         /// chain-worker loop, which multiplexes two queues and uses a
         /// shared condvar at the worker level for wakeup.
         pub fn tryRecv(self: *Self) ?T {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            return self.popLocked();
-        }
-
-        /// Internal: drop one item under a held mutex. Returns null if
-        /// no item is available. Updates `recv_total` only on a real
-        /// pop.
-        fn popLocked(self: *Self) ?T {
-            if (self.len == 0) return null;
-            const idx = switch (mode) {
-                .fifo => self.head,
-                .lifo => (self.head + self.len - 1) % self.capacity,
+            var buf: [1]T = undefined;
+            const n = self.inner.getUncancelable(self.io, &buf, 0) catch |err| switch (err) {
+                error.Closed => return null,
             };
-            const msg = self.items[idx];
-            switch (mode) {
-                .fifo => {
-                    self.head = (self.head + 1) % self.capacity;
-                },
-                .lifo => {
-                    // tail removal: head/anchor unchanged, len shrinks.
-                },
-            }
-            self.len -= 1;
+            if (n == 0) return null;
             _ = self.recv_total.fetchAdd(1, .monotonic);
-            return msg;
+            return buf[0];
         }
 
         /// Mark the queue closed and wake any waiting consumer. Idempotent.
         pub fn close(self: *Self) void {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            self.closed = true;
-            self.not_empty.broadcast(io);
+            self.inner.close(self.io);
         }
 
-        /// Snapshot of the current length, for metrics. Acquires the
-        /// mutex briefly so reads do not race a partial enqueue/dequeue.
+        /// Snapshot of the current depth (`sent_total - recv_total`).
+        /// Race-free for the metric's purposes — a brief stale read
+        /// is acceptable since Prometheus gauges are sampled values.
+        ///
+        /// Note: under heavy contention this can briefly read 0 even
+        /// when the queue is non-empty (producer has bumped
+        /// `sent_total` but not yet entered the queue's internal
+        /// mutex; or, symmetrically, consumer has dequeued but not
+        /// yet bumped `recv_total`). For the lost-wakeup re-check in
+        /// `ChainWorker.runLoop`, this is fine: the worker re-runs
+        /// its drain loop on the next iteration and will pick up any
+        /// item that was in flight.
         pub fn depth(self: *Self) usize {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            return self.len;
+            const sent_n = self.sent_total.load(.monotonic);
+            const recv_n = self.recv_total.load(.monotonic);
+            return @intCast(sent_n -| recv_n);
         }
     };
 }
 
-pub const BlockQueue = BoundedQueue(Message, .fifo);
-pub const AttestationQueue = BoundedQueue(Message, .lifo);
+pub const BlockQueue = BoundedQueue(Message);
+pub const AttestationQueue = BoundedQueue(Message);
 
 /// Default capacities. Generous enough that a 30s gossip burst on
 /// devnet4 (~3 attestations/slot × 32 validators × 8 slots ≈ 800) does
@@ -365,6 +368,11 @@ pub const ChainWorker = struct {
     const Self = @This();
 
     allocator: Allocator,
+    /// Backing storage for the two queues — allocated in `init`,
+    /// freed in `deinit`. Owned by ChainWorker; the queues hold
+    /// non-owning references via `std.Io.Queue.init(buf)`.
+    block_queue_buf: []Message,
+    attestation_queue_buf: []Message,
     block_queue: BlockQueue,
     attestation_queue: AttestationQueue,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -429,13 +437,16 @@ pub const ChainWorker = struct {
     };
 
     pub fn init(allocator: Allocator, opts: InitOpts) !Self {
+        const block_buf = try allocator.alloc(Message, opts.block_queue_capacity);
+        errdefer allocator.free(block_buf);
+        const att_buf = try allocator.alloc(Message, opts.attestation_queue_capacity);
+        errdefer allocator.free(att_buf);
         return .{
             .allocator = allocator,
-            .block_queue = try BlockQueue.init(allocator, opts.block_queue_capacity),
-            .attestation_queue = try AttestationQueue.init(
-                allocator,
-                opts.attestation_queue_capacity,
-            ),
+            .block_queue_buf = block_buf,
+            .attestation_queue_buf = att_buf,
+            .block_queue = BlockQueue.init(block_buf),
+            .attestation_queue = AttestationQueue.init(att_buf),
             .io = defaultIo(),
             .logger = opts.logger,
         };
@@ -447,8 +458,10 @@ pub const ChainWorker = struct {
         if (self.thread != null) {
             self.stop();
         }
-        self.block_queue.deinit(self.allocator);
-        self.attestation_queue.deinit(self.allocator);
+        self.block_queue.deinit();
+        self.attestation_queue.deinit();
+        self.allocator.free(self.block_queue_buf);
+        self.allocator.free(self.attestation_queue_buf);
     }
 
     /// Send a block-flavored message and wake the worker. Returns
@@ -668,9 +681,11 @@ pub const ChainWorker = struct {
 
 const testing = std.testing;
 
-test "BoundedQueue.fifo: trySend / recv preserves insertion order" {
-    var q = try BlockQueue.init(testing.allocator, 4);
-    defer q.deinit(testing.allocator);
+test "BoundedQueue: trySend / recv preserves FIFO order" {
+    const buf = try testing.allocator.alloc(Message, 4);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 2 } });
@@ -690,28 +705,41 @@ test "BoundedQueue.fifo: trySend / recv preserves insertion order" {
     try testing.expect(q.recv() == null);
 }
 
-test "BoundedQueue.lifo: trySend / recv returns newest first" {
-    var q = try AttestationQueue.init(testing.allocator, 4);
-    defer q.deinit(testing.allocator);
+// Note: c-1 dropped LIFO mode — both queues are FIFO until c-2
+// swaps the attestation queue for a 1024cores intrusive MPSC node
+// queue (per @GrapeBaBa's review). The previous LIFO test is
+// removed; the FIFO test above covers the only ordering surface
+// that exists in c-1.
+
+test "BoundedQueue: another FIFO ordering check (head walk)" {
+    // Sanity that ordering is preserved across send/recv
+    // interleaving — distinct from the wraparound test below which
+    // hits the ring boundaries explicitly.
+    const buf = try testing.allocator.alloc(Message, 4);
+    defer testing.allocator.free(buf);
+    var q = AttestationQueue.init(buf);
+    defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 2 } });
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 3 } });
 
-    const m3 = q.recv() orelse return error.UnexpectedNull;
-    try testing.expectEqual(@as(types.Slot, 3), m3.process_pending_blocks.current_slot);
-    const m2 = q.recv() orelse return error.UnexpectedNull;
-    try testing.expectEqual(@as(types.Slot, 2), m2.process_pending_blocks.current_slot);
     const m1 = q.recv() orelse return error.UnexpectedNull;
     try testing.expectEqual(@as(types.Slot, 1), m1.process_pending_blocks.current_slot);
+    const m2 = q.recv() orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(types.Slot, 2), m2.process_pending_blocks.current_slot);
+    const m3 = q.recv() orelse return error.UnexpectedNull;
+    try testing.expectEqual(@as(types.Slot, 3), m3.process_pending_blocks.current_slot);
 
     q.close();
     try testing.expect(q.recv() == null);
 }
 
 test "BoundedQueue: trySend returns QueueFull at capacity, increments dropped_total" {
-    var q = try BlockQueue.init(testing.allocator, 2);
-    defer q.deinit(testing.allocator);
+    const buf = try testing.allocator.alloc(Message, 2);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
 
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 2 } });
@@ -730,8 +758,10 @@ test "BoundedQueue: trySend returns QueueFull at capacity, increments dropped_to
 }
 
 test "BoundedQueue: trySend returns QueueClosed after close()" {
-    var q = try BlockQueue.init(testing.allocator, 4);
-    defer q.deinit(testing.allocator);
+    const buf = try testing.allocator.alloc(Message, 4);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
     q.close();
     try testing.expectError(
         error.QueueClosed,
@@ -740,8 +770,10 @@ test "BoundedQueue: trySend returns QueueClosed after close()" {
 }
 
 test "BoundedQueue: recv returns null when closed and drained" {
-    var q = try BlockQueue.init(testing.allocator, 4);
-    defer q.deinit(testing.allocator);
+    const buf = try testing.allocator.alloc(Message, 4);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
     try q.trySend(.{ .process_pending_blocks = .{ .current_slot = 1 } });
     q.close();
     // Items already enqueued must still drain after close.
@@ -750,18 +782,19 @@ test "BoundedQueue: recv returns null when closed and drained" {
 }
 
 test "BoundedQueue: ring wraparound — head walks past capacity-1 with items live" {
-    // Earlier shape was send-1 / recv-1 × 32, which kept depth=1
-    // throughout. The head index DID still advance through the
-    // modular arithmetic, but a regression like "on wrap, drop the
-    // tail item" or "on wrap with non-empty queue, mis-index the
-    // popLocked switch" would NOT be caught. The present test forces
-    // head to walk past every position in [0, capacity) while at
-    // least one item is always live in the queue, by alternating
-    // fill-to-capacity / drain-all-but-one cycles and verifying
-    // every popped value matches the expected FIFO sequence.
+    // The wrapped `std.Io.Queue` does its own ring-buffer index
+    // management; this test asserts FIFO sequence holds across many
+    // wrap cycles. Earlier (hand-rolled queue) shape was send-1 /
+    // recv-1 × 32 with depth=1 throughout, which only proved the
+    // modular index math doesn't trip on head=0. Present pattern
+    // alternates fill-to-capacity / drain-all-but-one so head walks
+    // past every position in [0, capacity) while at least one item
+    // is always live; FIFO sequence asserted on every pop.
     const cap: usize = 4;
-    var q = try BlockQueue.init(testing.allocator, cap);
-    defer q.deinit(testing.allocator);
+    const buf = try testing.allocator.alloc(Message, cap);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
 
     var next_send: u64 = 0;
     var next_recv: u64 = 0;
@@ -825,8 +858,10 @@ test "BoundedQueue: multi-producer trySend race — counters are exact" {
     const SENDS_PER_PRODUCER: usize = 1000;
     const QUEUE_CAPACITY: usize = 16;
 
-    var q = try BlockQueue.init(testing.allocator, QUEUE_CAPACITY);
-    defer q.deinit(testing.allocator);
+    const buf = try testing.allocator.alloc(Message, QUEUE_CAPACITY);
+    defer testing.allocator.free(buf);
+    var q = BlockQueue.init(buf);
+    defer q.deinit();
 
     const Producer = struct {
         fn run(queue: *BlockQueue, n: usize) void {
