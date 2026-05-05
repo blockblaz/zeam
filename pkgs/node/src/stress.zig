@@ -163,6 +163,13 @@ const StressCtx = struct {
     template_parent: types.Root,
     key_manager: *keymanager.KeyManager,
     deadline_ns: i128,
+    /// Configured stall threshold (ns). Driven by `ZEAM_STRESS_WATCHDOG_SECS`
+    /// via `StressConfig.watchdog_stall_secs`; the watchdog reads this rather
+    /// than a hardcoded constant so dev runs can shorten the deadlock window.
+    watchdog_stall_ns: i128,
+    /// Configured stall threshold echoed back in seconds for log/fatal
+    /// messages. Stored separately so we don't divide an i128 in the hot path.
+    watchdog_stall_secs: u64,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // op counters
@@ -222,12 +229,37 @@ fn gossipFloodWorker(ctx: *StressCtx, thread_id: usize) void {
         const block = ctx.blocks[block_idx];
 
         const missing = ctx.chain.onBlock(block, .{ .pruneForkchoice = false }) catch |err| {
-            // BlockAlreadyKnown is fine and expected. Anything else
-            // we count but do not treat as fatal — the harness's job
-            // is to discover races, not enforce a no-error invariant
-            // on a pre-imported chain.
+            // The design doc (`docs/threading_refactor_slice_a.md`
+            // §Stress test plan) names the merge-gate invariants:
+            //   * no `MissingPreState` (state-map race)
+            //   * no assertion failures / panics
+            //   * no UAF / deadlock
+            //
+            // `MissingPreState` here means a writer mutated `chain.states`
+            // while another thread was mid-import — exactly the race the
+            // per-resource-locks slice is meant to eliminate. Treat it as
+            // fatal so CI can fail the run.
+            //
+            // The other declared `BlockProcessingError` tags
+            // (`InvalidSignatureGroups`, `DuplicateAttestationData`,
+            // `TooManyAttestationData`) are deterministic data errors on a
+            // pre-imported clean chain and would also indicate a state
+            // corruption race rather than a benign retry — count them and
+            // surface them in the summary, but bump `gossip_errs` so an
+            // operator inspecting the run notices.
+            //
+            // (`BlockAlreadyKnown` is intentionally NOT handled — duplicate
+            // imports go through the `kept_existing` success path and
+            // return an empty slice, never an error tag. See chain.zig
+            // `statesCommitKeepExisting`.)
             switch (err) {
-                error.BlockAlreadyKnown => {},
+                error.MissingPreState => {
+                    ctx.recordFatal(
+                        "gossip-flood (thread {d}): MissingPreState — design-doc gate violation (states-map race)",
+                        .{thread_id},
+                    );
+                    return;
+                },
                 else => {
                     _ = ctx.gossip_errs.fetchAdd(1, .monotonic);
                 },
@@ -240,7 +272,6 @@ fn gossipFloodWorker(ctx: *StressCtx, thread_id: usize) void {
         _ = ctx.gossip_ops.fetchAdd(1, .monotonic);
         i += 1;
     }
-    _ = thread_id;
 }
 
 fn rpcReaderWorker(ctx: *StressCtx, thread_id: usize) void {
@@ -452,8 +483,6 @@ fn cacheChurnWorker(ctx: *StressCtx, thread_id: usize) void {
 fn watchdogWorker(ctx: *StressCtx) void {
     var last_ops: u64 = 0;
     var last_progress_ns: i128 = zeam_utils.monotonicTimestampNs();
-    const stall_ns: i128 = @as(i128, @intCast(ctx.deadline_ns - last_progress_ns)); // capped below
-    _ = stall_ns;
 
     while (!ctx.shouldStop()) {
         sleepSecs(2);
@@ -464,13 +493,14 @@ fn watchdogWorker(ctx: *StressCtx) void {
             last_progress_ns = now;
             continue;
         }
-        // Read the configured stall threshold dynamically — set on ctx
-        // by the caller in `runStress`. We stash it in deadline_ns? No,
-        // pass via a ctx field. Simplest: hardcode 60s here matching
-        // default; main thread overrides via signaling stop.
-        // For now, follow design doc default of 60s.
-        if (now - last_progress_ns > 60 * std.time.ns_per_s) {
-            ctx.recordFatal("watchdog: no progress for 60s — likely deadlock", .{});
+        // Configured stall threshold is set by `runStress` on `ctx` from
+        // `StressConfig.watchdog_stall_secs` (env: ZEAM_STRESS_WATCHDOG_SECS,
+        // default 60s).
+        if (now - last_progress_ns > ctx.watchdog_stall_ns) {
+            ctx.recordFatal(
+                "watchdog: no progress for {d}s — likely deadlock",
+                .{ctx.watchdog_stall_secs},
+            );
             return;
         }
     }
@@ -612,6 +642,9 @@ fn runStress(allocator: Allocator, cfg: StressConfig) !StressSummary {
         .template_parent = mock_chain.blocks[1].block.parent_root,
         .key_manager = &attn_keymanager,
         .deadline_ns = deadline_ns,
+        .watchdog_stall_ns = @as(i128, @intCast(cfg.watchdog_stall_secs)) *
+            std.time.ns_per_s,
+        .watchdog_stall_secs = cfg.watchdog_stall_secs,
     };
 
     const total_threads = cfg.gossip_threads + cfg.rpc_threads + cfg.attestation_threads +
@@ -746,6 +779,20 @@ pub fn main() !void {
     });
     if (summary.fatal) {
         std.debug.print("\nFATAL: {s}\n", .{summary.fatal_msg});
+        std.process.exit(1);
+    }
+    // Soft errors collected by the workers (e.g. unexpected
+    // `BlockProcessingError` variants in gossip-flood, attestation- or
+    // borrow-reader errors) are not panics, but on a pre-imported clean
+    // chain they still indicate a regression worth failing CI on. The
+    // design-doc gate says "assert no MissingPreState" — that is already
+    // fatal above; any *other* unexpected error from these workers is
+    // treated as a softer-but-still-CI-blocking signal here.
+    if (summary.gossip_errs > 0 or summary.attn_errs > 0 or summary.borrow_errs > 0) {
+        std.debug.print(
+            "\nFATAL: worker error counters non-zero (g={d} a={d} b={d}) — see per-worker counts above\n",
+            .{ summary.gossip_errs, summary.attn_errs, summary.borrow_errs },
+        );
         std.process.exit(1);
     }
     std.debug.print("\nclean exit — no panics, no UAFs, no deadlocks observed\n", .{});
