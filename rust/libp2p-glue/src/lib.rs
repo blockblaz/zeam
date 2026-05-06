@@ -197,6 +197,16 @@ unsafe fn clear_network_state(network_id: u32) {
 }
 
 enum SwarmCommand {
+    /// Join the gossipsub mesh for `topic` (full wire topic string).
+    ///
+    /// Issued from Zig when `EthLibp2p.subscribe` runs. The swarm is created
+    /// with no topic joins (`new_swarm` does not subscribe anything itself);
+    /// every mesh subscription flows through this command, keeping
+    /// `gossip.subscribe` on the Zig side as the single source of truth for
+    /// what subnets a node joins.
+    SubscribeGossip {
+        topic: String,
+    },
     Publish {
         topic: String,
         data: Vec<u8>,
@@ -397,13 +407,14 @@ pub struct CreateNetworkParams {
     pub local_private_key: *const c_char,
     pub listen_addresses: *const c_char,
     pub connect_addresses: *const c_char,
-    pub topics_str: *const c_char,
 }
 
 /// # Safety
 ///
 /// `params` must be non-null and valid until this function returns. String pointers must point to valid
-/// null-terminated C strings for `listen_addresses`, `connect_addresses`, `topics_str`, and `local_private_key`.
+/// null-terminated C strings for `listen_addresses`, `connect_addresses`, and `local_private_key`.
+/// Gossipsub topic subscriptions are no longer passed here; Zig drives them
+/// via `subscribe_gossip_topic_to_rust_bridge` after the network is up.
 #[no_mangle]
 pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkParams) {
     if params.is_null() {
@@ -415,7 +426,6 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
     let local_private_key = p.local_private_key;
     let listen_addresses = p.listen_addresses;
     let connect_addresses = p.connect_addresses;
-    let topics_str = p.topics_str;
 
     // Register the handler early so any logs emitted from the parse/validation
     // path below are routed through the Zig logger.
@@ -429,7 +439,6 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
             local_private_key,
             listen_addresses,
             connect_addresses,
-            topics_str,
         );
     };
 
@@ -467,13 +476,6 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
             return;
         }
     };
-
-    let topics = CStr::from_ptr(topics_str)
-        .to_string_lossy()
-        .split(",")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
 
     let local_private_key_hex = CStr::from_ptr(local_private_key)
         .to_string_lossy()
@@ -515,12 +517,7 @@ pub unsafe extern "C" fn create_and_run_network(params: *const CreateNetworkPara
     rt.block_on(async move {
         let mut p2p_net = Network::new(network_id, zig_handler);
         p2p_net
-            .start_network(
-                local_key_pair,
-                listen_multiaddrs,
-                connect_multiaddrs,
-                topics,
-            )
+            .start_network(local_key_pair, listen_multiaddrs, connect_multiaddrs)
             .await;
         p2p_net.run_eventloop().await;
     });
@@ -607,6 +604,37 @@ pub unsafe extern "C" fn publish_msg_to_rust_bridge(
             data: message_data,
         },
     )
+}
+
+/// Enqueue a gossipsub mesh subscription for `topic` (full wire topic string).
+///
+/// Returns `true` when the subscribe command was successfully enqueued onto
+/// the per-network swarm command channel, `false` when it was dropped (network
+/// not initialized, channel full / closed, or null `topic`). The Zig side
+/// treats `false` as a hard subscribe failure so a missed mesh join is
+/// surfaced rather than silently leaving the node with an incomplete topic
+/// set. Idempotency: gossipsub is fine with re-subscribing to the same topic
+/// (the underlying call is a no-op for already-joined topics) so callers do
+/// not need to dedupe.
+///
+/// # Safety
+///
+/// The caller must ensure that `topic` points to a valid null-terminated C string.
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn subscribe_gossip_topic_to_rust_bridge(
+    network_id: u32,
+    topic: *const c_char,
+) -> bool {
+    if topic.is_null() {
+        logger::rustLogger.error(
+            network_id,
+            "null pointer passed for `topic` in subscribe_gossip_topic_to_rust_bridge",
+        );
+        return false;
+    }
+    let topic = CStr::from_ptr(topic).to_string_lossy().to_string();
+    send_swarm_command(network_id, SwarmCommand::SubscribeGossip { topic })
 }
 
 /// # Safety
@@ -886,7 +914,6 @@ extern "C" {
         local_private_key: *const c_char,
         listen_addresses: *const c_char,
         connect_addresses: *const c_char,
-        topics: *const c_char,
     );
 }
 
@@ -979,9 +1006,8 @@ impl Network {
         key_pair: Keypair,
         listen_addresses: Vec<Multiaddr>,
         connect_addresses: Vec<Multiaddr>,
-        topics: Vec<String>,
     ) {
-        let mut swarm = new_swarm(key_pair, topics, self.network_id);
+        let mut swarm = new_swarm(key_pair, self.network_id);
         logger::rustLogger.info(self.network_id, "starting listener");
 
         let mut listen_success = false;
@@ -1677,6 +1703,22 @@ impl Network {
                 let mut drained = 0usize;
                 loop {
                     match cmd {
+                    SwarmCommand::SubscribeGossip { topic } => {
+                        let gossipsub_topic = gossipsub::IdentTopic::new(topic.clone());
+                        if let Err(e) =
+                            swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic)
+                        {
+                            logger::rustLogger.error(
+                                self.network_id,
+                                &format!("SubscribeGossip error for topic {topic}: {e:?}"),
+                            );
+                        } else {
+                            logger::rustLogger.debug(
+                                self.network_id,
+                                &format!("Subscribed gossipsub mesh: {topic}"),
+                            );
+                        }
+                    }
                     SwarmCommand::Publish { topic, data } => {
                         let t = gossipsub::IdentTopic::new(topic);
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, data) {
@@ -1841,37 +1883,22 @@ impl Behaviour {
     }
 }
 
-fn new_swarm(
-    local_keypair: Keypair,
-    topics: Vec<String>,
-    network_id: u32,
-) -> libp2p::swarm::Swarm<Behaviour> {
+fn new_swarm(local_keypair: Keypair, network_id: u32) -> libp2p::swarm::Swarm<Behaviour> {
     let transport = build_transport(local_keypair.clone(), true).unwrap();
     logger::rustLogger.debug(network_id, "build the transport");
 
-    let builder = SwarmBuilder::with_existing_identity(local_keypair)
+    // No gossipsub topics joined here. Mesh subscriptions are driven from
+    // Zig via `SwarmCommand::SubscribeGossip` after `start_network` makes
+    // the swarm command channel available; that keeps `gossip.subscribe` on
+    // the Zig side as the single source of truth for joined subnets.
+    SwarmBuilder::with_existing_identity(local_keypair)
         .with_tokio()
         .with_other_transport(|_key| transport)
-        .expect("infalible");
-
-    let mut swarm = builder
+        .expect("infalible")
         .with_behaviour(|key| Behaviour::new(key.clone()))
         .unwrap()
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
-        .build();
-
-    // subscribe all the topics
-    for topic in topics {
-        let gossipsub_topic = gossipsub::IdentTopic::new(topic.clone());
-        if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&gossipsub_topic) {
-            logger::rustLogger.error(
-                network_id,
-                &format!("Failed to subscribe to topic {}: {:?}", topic, e),
-            );
-        }
-    }
-
-    swarm
+        .build()
 }
 
 fn build_transport(
@@ -2086,6 +2113,30 @@ mod tests {
         assert!(
             !ok,
             "publish_msg_to_rust_bridge must return false when topic pointer is null"
+        );
+    }
+
+    #[test]
+    fn test_subscribe_gossip_topic_to_rust_bridge_returns_false_when_uninitialized() {
+        // The Zig side treats `false` as a hard failure (mesh join did not
+        // happen), so a missing per-network command channel must surface as
+        // `false` rather than panicking or silently succeeding.
+        let network_id = 104;
+        let topic = std::ffi::CString::new("leanconsensus/foo/ssz_snappy").unwrap();
+        let ok = unsafe { subscribe_gossip_topic_to_rust_bridge(network_id, topic.as_ptr()) };
+        assert!(
+            !ok,
+            "subscribe_gossip_topic_to_rust_bridge must return false when the network is not initialized"
+        );
+    }
+
+    #[test]
+    fn test_subscribe_gossip_topic_to_rust_bridge_returns_false_on_null_topic() {
+        let network_id = 105;
+        let ok = unsafe { subscribe_gossip_topic_to_rust_bridge(network_id, std::ptr::null()) };
+        assert!(
+            !ok,
+            "subscribe_gossip_topic_to_rust_bridge must return false when topic pointer is null"
         );
     }
 
