@@ -365,7 +365,14 @@ pub const GossipMessage = union(GossipTopicKind) {
 };
 
 pub const LeanSupportedProtocol = enum(u32) {
-    // Ordinals must match `rust/libp2p-glue/src/req_resp/protocol_id.rs::TryFrom<u32>`.
+    // Ordinals must match the Rust side's `#[repr(u32)]` discriminants
+    // AND `TryFrom<u32>` mapping in
+    // `rust/libp2p-glue/src/req_resp/protocol_id.rs::LeanSupportedProtocol`.
+    // The cross-FFI invariant runs in BOTH directions: Zig u32 → Rust
+    // try_from (incoming RPC tag) AND Rust enum → u32 (outgoing tag).
+    // The Rust side pins both via `#[repr(u32)]` + explicit discriminants;
+    // a unit test (`try_from_round_trip_matches_repr` in the Rust file)
+    // guards against future drift. Reported by @ch4r10t33r on PR #824.
     blocks_by_root = 0,
     status = 1,
     blocks_by_range = 2,
