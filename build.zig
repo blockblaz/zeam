@@ -441,6 +441,74 @@ pub fn build(b: *Builder) !void {
 
     const test_step = b.step("test", "Run zeam core tests");
 
+    // ---------------------------------------------------------------
+    // Single-node ingestion stress harness (issue #803 slice b).
+    //
+    // Run with `zig build stress` (or `zig build stress -Doptimize=Debug`).
+    // Configurable via env vars:
+    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, design-doc r3 merge gate)
+    //   ZEAM_STRESS_NUM_BLOCKS     default 6
+    //   ZEAM_STRESS_GOSSIP_THREADS default 3
+    //   ZEAM_STRESS_RPC_THREADS    default 4
+    //   ZEAM_STRESS_ATTN_THREADS   default 2
+    //   ZEAM_STRESS_BORROW_THREADS default 2
+    //   ZEAM_STRESS_CACHE_THREADS  default 1
+    //   ZEAM_STRESS_WATCHDOG_SECS  default 60
+    // ---------------------------------------------------------------
+    const stress_exe = b.addExecutable(.{
+        .name = "zeam-stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/node/src/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    stress_exe.root_module.addImport("xev", xev);
+    stress_exe.root_module.addImport("ssz", ssz);
+    stress_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    stress_exe.root_module.addImport("@zeam/params", zeam_params);
+    stress_exe.root_module.addImport("@zeam/types", zeam_types);
+    stress_exe.root_module.addImport("@zeam/configs", zeam_configs);
+    stress_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    stress_exe.root_module.addImport("@zeam/network", zeam_network);
+    stress_exe.root_module.addImport("@zeam/database", zeam_database);
+    stress_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    stress_exe.root_module.addImport("@zeam/api", zeam_api);
+    stress_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    stress_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    stress_exe.root_module.addImport("@zeam/thread-pool", zeam_thread_pool);
+    addRustGlueLib(b, stress_exe, target, prover);
+    stress_exe.step.dependOn(&build_rust_lib_steps.step);
+    const run_stress = b.addRunArtifact(stress_exe);
+    if (b.args) |args| run_stress.addArgs(args);
+    const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
+    stress_step.dependOn(&run_stress.step);
+
+    // -----------------------------------------------------------------
+    // `stress-quick`: short-form stress harness wired into `zig build
+    // test`. The full 30-min run is operator-driven; this 30s run is
+    // what CI executes on every PR so the slice-(a)/(b) merge gate
+    // actually has automated enforcement, not just a PR-comment
+    // attestation. The quick run uses the same code paths as the full
+    // run and will fail CI on:
+    //   * any `MissingPreState` (states-map race),
+    //   * any unexpected `chain.onBlock` error in gossip-flood,
+    //   * any `recordFatal` from coherence checks (BlockCache,
+    //     borrow-reader, watchdog),
+    //   * worker error counters non-zero in the summary epilogue.
+    // 30s is long enough for several thousand ops on each worker
+    // without putting the test job over budget.
+    //
+    // Override knobs are intentionally NOT wired here — CI exercises
+    // the same defaults a developer sees with `zig build stress-quick`,
+    // which is the point.
+    const run_stress_quick = b.addRunArtifact(stress_exe);
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    stress_quick_step.dependOn(&run_stress_quick.step);
+    test_step.dependOn(&run_stress_quick.step);
+
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
