@@ -46,6 +46,13 @@ const NodeOpts = struct {
     /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
     /// When non-null it is shared across all nodes in the same process.
     thread_pool: ?*ThreadPool = null,
+    /// Slice c-2b commit 3 of #803: when true, the chain spawns a
+    /// dedicated worker thread and producer-side handlers for
+    /// gossip blocks / attestations route through its bounded
+    /// queues instead of running synchronously on the libp2p
+    /// thread. Default `false` preserves slice-(b) behavior.
+    /// Surfaced to the CLI as `--chain-worker=on|off` (bool).
+    chain_worker_enabled: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -111,6 +118,28 @@ pub const BeamNode = struct {
             chain.deinit();
             allocator.destroy(chain);
         }
+
+        // Slice c-2b commit 3 of #803: start the chain-worker AFTER
+        // the chain is at its final heap address (allocator.create +
+        // assignment-via-deref above), because the worker stores
+        // `chain` as its handler ctx and that pointer must remain
+        // stable for the worker's entire lifetime. `chain.deinit()`
+        // (above errdefer + the deinit method) tears the worker
+        // down before any chain state it might touch.
+        if (opts.chain_worker_enabled) {
+            try chain.startChainWorker();
+        }
+
+        // Slice c-2b commit 5 of #803: register the
+        // `lean_chain_state_refcount_distribution` scrape refresher
+        // with the chain at its final heap address. The refresher
+        // iterates `chain.states` under the shared lock and samples
+        // `rc.count()` for each entry; surfaces leaked acquires (any
+        // entry stuck >16) on the /metrics endpoint. Cleared in
+        // `chain.deinit` so the metrics module never calls back into
+        // freed chain memory.
+        chain.startChainStateRefcountObserver();
+
         // Now that the chain is at its final heap location, point the logger config
         // at the forkchoice slot clock so every log line carries slot/interval context.
         opts.logger_config.slot_clock = &chain.forkChoice.fcStore.slot_clock;
@@ -1923,6 +1952,34 @@ pub const BeamNode = struct {
 
         const topics_slice = try topics_list.toOwnedSlice(self.allocator);
         defer self.allocator.free(topics_slice);
+
+        // Report the selective gossip subscription set so operators can verify
+        // (and so subnet-routing regressions are visible in logs). Mirrors the
+        // leanSpec behaviour at src/lean_spec/__main__.py:541-549.
+        var attestation_subnet_count: usize = 0;
+        for (topics_slice) |topic| {
+            if (topic.kind == .attestation) attestation_subnet_count += 1;
+        }
+        if (attestation_subnet_count == 0) {
+            self.logger.info("gossip subscriptions: block + aggregation only (no attestation subnets — non-aggregator node with no registered validators)", .{});
+        } else {
+            // Format the attestation subnet IDs into a comma-separated list for a single
+            // human-readable log line.
+            var subnet_ids_buf: std.ArrayList(u8) = .empty;
+            defer subnet_ids_buf.deinit(self.allocator);
+            var first = true;
+            var id_buf: [32]u8 = undefined;
+            for (topics_slice) |topic| {
+                if (topic.kind != .attestation) continue;
+                const subnet_id = topic.subnet_id orelse continue;
+                if (!first) try subnet_ids_buf.appendSlice(self.allocator, ",");
+                first = false;
+                const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{subnet_id});
+                try subnet_ids_buf.appendSlice(self.allocator, id_str);
+            }
+            self.logger.info("gossip subscriptions: block + aggregation + {d} attestation subnet(s) [{s}]", .{ attestation_subnet_count, subnet_ids_buf.items });
+        }
+
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 
         const peer_handler = self.getPeerEventHandler();

@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("@zeam/types");
 const zeam_metrics = @import("@zeam/metrics");
 const zeam_utils = @import("@zeam/utils");
+const rc_beam_state = @import("./rc_beam_state.zig");
 
 /// Thread-local depth counter for tier-5 sibling locks (5a/5b/5c). The design
 /// doc forbids co-holding any two of them; this counter is the runtime check
@@ -1034,15 +1035,43 @@ pub const BorrowedState = struct {
     /// long-lived borrows (especially the new states_exclusive borrow)
     /// had their hold span systematically under-reported.
     timer: ?LockTimer = null,
+    /// Optional RcBeamState refcount that gates the borrow's lifetime.
+    /// Set by the lock-free read path (slice c-2b commit 4 of #803):
+    /// when chain-worker is the sole writer to `BeamChain.states`,
+    /// `statesGet` / `getFinalizedState` cache-hit may take an
+    /// `rc.tryAcquire()` and drop the backing lock immediately,
+    /// returning a `Backing.none` borrow whose `state` pointer is
+    /// kept alive purely by this acquired refcount. `deinit` calls
+    /// `release()` on the rc AFTER any backing lock unlock so the
+    /// (potentially expensive) freeing path runs OUTSIDE the critical
+    /// section.
+    ///
+    /// Held as `*const` because the reader does not need to mutate
+    /// `state.<field>` through this borrow; the chain-worker path
+    /// takes a separate `acquireWriter` view when it needs to mutate.
+    acquired_rc: ?*const rc_beam_state.RcBeamState = null,
 
     pub const Backing = union(enum) {
         states_shared_rwlock: *zeam_utils.SyncRwLock,
         states_exclusive_rwlock: *zeam_utils.SyncRwLock,
         events_mutex: *zeam_utils.SyncMutex,
+        /// Lock-free borrow: lifetime is gated entirely by
+        /// `acquired_rc` (which MUST be non-null). Used by the
+        /// chain-worker-enabled paths in `statesGet` and
+        /// `getFinalizedState` cache-hit. `deinit` performs no lock
+        /// release on this variant — only the rc release runs.
+        none,
     };
 
-    /// Idempotent. Releases the backing lock. After a successful release
-    /// the `state` pointer must not be touched.
+    /// Idempotent. Releases the backing lock (when present) and the
+    /// acquired rc (when present). After a successful release the
+    /// `state` pointer must not be touched.
+    ///
+    /// Order: backing-lock unlock → tier-5 leave → LockTimer close →
+    /// rc release. The rc release runs LAST and OUTSIDE any backing
+    /// critical section so a refcount→0 free (which calls
+    /// `state.deinit()` + `allocator.destroy(rc)`) does not extend the
+    /// lock hold span.
     pub fn deinit(self: *BorrowedState) void {
         if (self.released) return;
         self.released = true;
@@ -1050,6 +1079,7 @@ pub const BorrowedState = struct {
             .states_shared_rwlock => |rw| rw.unlockShared(),
             .states_exclusive_rwlock => |rw| rw.unlock(),
             .events_mutex => |m| m.unlock(),
+            .none => {},
         }
         // Decrement tier-5 depth AFTER unlocking so the sibling-rule
         // assertion at the next acquire site sees the correct depth.
@@ -1065,6 +1095,13 @@ pub const BorrowedState = struct {
         // actually released. Idempotent inside LockTimer.released().
         if (self.timer) |*t| {
             t.released();
+        }
+        // Release the rc AFTER everything else so the freeing path
+        // (state.deinit + allocator.destroy when refcount→0) runs
+        // outside the critical section.
+        if (self.acquired_rc) |rc| {
+            self.acquired_rc = null;
+            rc.release();
         }
     }
 
@@ -1135,6 +1172,77 @@ pub const BorrowedState = struct {
 // =====================================================================
 
 const testing = std.testing;
+
+test "LockTimer: acquired+released emit zeam_lock_{wait,hold}_seconds in /metrics output" {
+    // Locks in the contract that LockTimer.acquired/released actually
+    // wire through to the per-resource histogram families exposed at
+    // /metrics. Slice-(a) review point: the file:line audit of the
+    // metric wiring is reviewable by humans but regresses silently if
+    // someone removes the `.observe(...)` call. This test calls
+    // `start().acquired().released()` once and then asserts the
+    // serialized scrape body contains both histogram series names plus
+    // at least one observed-bucket line tagged with the lock + site
+    // labels we used.
+    //
+    // The metrics module is process-global (`g_initialized` guard); we
+    // call `init` here unconditionally because it is a no-op on the
+    // second call. Other tests in this binary may have already
+    // populated counters — we therefore search for our specific
+    // (lock, site) label tuple, not just the bare metric name, so we
+    // don't depend on the test-order or mistake an unrelated
+    // observation for ours.
+    //
+    // We pass `std.heap.page_allocator` rather than
+    // `testing.allocator` so the (process-global) metrics state
+    // outlives this test. If we used the test allocator, every
+    // subsequent test in the binary that triggers a histogram
+    // hashmap grow (e.g. via `LockTimer.released()` from a chain
+    // test) would free the old buckets through an allocator whose
+    // arena has already been torn down — the DebugAllocator catches
+    // this as `reached unreachable` in its bucket-free assertion.
+    // The page allocator has no per-test lifetime, so the metrics
+    // hashmap can grow safely from any later test. The trade-off is
+    // that this test's allocator footprint is not tracked by the
+    // testing harness; that footprint is bounded by the histogram
+    // bucket we add (single (lock, site) pair) so it is acceptable.
+    try zeam_metrics.init(std.heap.page_allocator);
+
+    var t = LockTimer.start("locktimer_test_lock", "locktimer_test_site");
+    t.acquired();
+    t.released();
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // The histogram families themselves must be advertised.
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_wait_seconds") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_hold_seconds") != null);
+
+    // And at least one bucket line for our specific (lock, site)
+    // label tuple must be present — proving the histogram was
+    // *observed*, not just declared.
+    //
+    // The Prometheus exposition format from the metrics library
+    // emits HistogramVec lines as e.g.:
+    //
+    //   zeam_lock_wait_seconds_bucket{le="0.001",lock="...",site="..."} N
+    //   zeam_lock_wait_seconds_count{lock="...",site="..."} N
+    //   zeam_lock_wait_seconds_sum{lock="...",site="..."} f
+    //
+    // The `_count` line is the most direct proof the histogram was
+    // observed at all (it is incremented once per `observe()` call),
+    // and it does not include the `le=` bucket attribute, which keeps
+    // this assertion robust to bucket-set changes. We additionally
+    // search for the (lock, site) label pair as a substring to verify
+    // those labels reached the output — their order may differ from
+    // call site to call site so we do separate substring checks.
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_wait_seconds_count") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "zeam_lock_hold_seconds_count") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lock=\"locktimer_test_lock\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "site=\"locktimer_test_site\"") != null);
+}
 
 test "LockedMap: ctor + get/put/remove + count" {
     var lm = LockedMap(u32, u32).init(testing.allocator);
@@ -1391,6 +1499,236 @@ test "BorrowedState: assertReleased fires only when not released" {
     borrow.deinit();
     // Should not panic — borrow is released.
     borrow.assertReleased();
+}
+
+/// Build a minimal genesis BeamState for tests in this file. Uses the
+/// canonical `BeamState.genGenesisState` constructor with a tiny
+/// validator set so the test allocator's leak detector can verify
+/// clean teardown via `BeamState.deinit`. Mirrors the helper inside
+/// `rc_beam_state.zig` (kept private to that file to avoid leaking
+/// test-only API surface).
+fn makeTestStateForBorrowed() !types.BeamState {
+    const validator_count: usize = 1;
+    const attestation_pubkeys = try testing.allocator.alloc(types.Bytes52, validator_count);
+    defer testing.allocator.free(attestation_pubkeys);
+    const proposal_pubkeys = try testing.allocator.alloc(types.Bytes52, validator_count);
+    defer testing.allocator.free(proposal_pubkeys);
+    for (attestation_pubkeys, proposal_pubkeys, 0..) |*apk, *ppk, i| {
+        @memset(apk, @intCast(i + 1));
+        @memset(ppk, @intCast(i + 1));
+    }
+    var state: types.BeamState = undefined;
+    try state.genGenesisState(testing.allocator, .{
+        .genesis_time = 0,
+        .validator_attestation_pubkeys = attestation_pubkeys,
+        .validator_proposal_pubkeys = proposal_pubkeys,
+    });
+    return state;
+}
+
+test "BorrowedState: Backing.none + acquired_rc deinit releases the rc" {
+    // Slice c-2b commit 4 of #803: the lock-free read path returns a
+    // Backing.none borrow whose lifetime is gated entirely by an
+    // RcBeamState refcount. deinit must release the rc; testing.allocator
+    // catches a leak if it does not.
+    const state = try makeTestStateForBorrowed();
+    const rc = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    // Initial refcount is 1 (matches the create contract). Bump to 2 so
+    // we can simulate the "reader holds an acquire" view; the borrow's
+    // deinit will drop one reference, and we explicitly release the
+    // remaining one ourselves to free.
+    _ = rc.acquireWriter();
+    try testing.expectEqual(@as(u32, 2), rc.count());
+
+    var borrow = BorrowedState{
+        .state = &rc.state,
+        .backing = .none,
+        .acquired_rc = rc,
+    };
+    borrow.deinit();
+    try testing.expect(borrow.released);
+    // Borrow released ONE acquire — our outer acquireWriter still holds
+    // refcount=1.
+    try testing.expectEqual(@as(u32, 1), rc.count());
+    // Idempotent: second deinit must NOT re-release.
+    borrow.deinit();
+    try testing.expectEqual(@as(u32, 1), rc.count());
+
+    // Drop the last reference — frees state + rc wrapper.
+    rc.release();
+}
+
+test "BorrowedState: Backing.none + acquired_rc deinit drives final free" {
+    // Variant: the borrow's deinit IS the final release (refcount→0).
+    // testing.allocator catches a leak if state.deinit + destroy are
+    // not run.
+    const state = try makeTestStateForBorrowed();
+    const rc = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    try testing.expectEqual(@as(u32, 1), rc.count());
+
+    var borrow = BorrowedState{
+        .state = &rc.state,
+        .backing = .none,
+        .acquired_rc = rc,
+    };
+    borrow.deinit();
+    // After this point `rc` and its wrapped state are FREED — do not
+    // touch them. (Reading `rc.count()` here would be UAF.)
+    try testing.expect(borrow.released);
+}
+
+test "BorrowedState: cloneAndRelease against Backing.none + acquired_rc releases rc on OOM" {
+    // The cloneAndRelease errdefer must run self.deinit(), which for a
+    // Backing.none borrow MUST release the acquired_rc. testing.allocator
+    // catches the leak if the errdefer doesn't fire correctly.
+    const state = try makeTestStateForBorrowed();
+    const rc = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    _ = rc.acquireWriter();
+    try testing.expectEqual(@as(u32, 2), rc.count());
+
+    var borrow = BorrowedState{
+        .state = &rc.state,
+        .backing = .none,
+        .acquired_rc = rc,
+    };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const failing_allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, borrow.cloneAndRelease(failing_allocator));
+    try testing.expect(borrow.released);
+    // One reference released by deinit-via-errdefer; outer acquire still holds refcount=1.
+    try testing.expectEqual(@as(u32, 1), rc.count());
+
+    rc.release();
+}
+
+test "lean_chain_state_refcount_distribution: writer + N readers shape (slice c-2b commit 5)" {
+    // Slice c-2b commit 5 of #803: the
+    // `lean_chain_state_refcount_distribution` histogram is updated by
+    // a scrape-time observer that samples `rc.count()` for every
+    // map-resident BeamState. This audit-pattern test verifies the
+    // distribution shape end-to-end without spinning a full BeamChain:
+    //   1. Create N RcBeamStates (writer-only — each refcount=1).
+    //   2. Observe each into the histogram — simulates the
+    //      scrape-time observer's per-entry observe call.
+    //   3. Have N readers acquireConst on each rc (refcount=2) and
+    //      observe again — simulates a scrape during reader
+    //      concurrency.
+    //   4. Drop all reader acquires (refcount=1) and observe again.
+    //   5. Release writer copies (refcount=0 — frees).
+    //   6. Scrape /metrics: the histogram series MUST be present, the
+    //      `_count` line MUST equal 3*N (three observation rounds of N
+    //      samples each).
+    //
+    // Test uses page_allocator for the same reason
+    // `LockTimer: ... metrics output` does — the histogram bucket
+    // backing storage outlives this test.
+    try zeam_metrics.init(std.heap.page_allocator);
+
+    const N: usize = 4;
+    var rcs: [N]*rc_beam_state.RcBeamState = undefined;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const state = try makeTestStateForBorrowed();
+        rcs[i] = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    }
+    defer {
+        for (rcs) |rc| rc.release();
+    }
+
+    // Snapshot the histogram count BEFORE we observe anything so we
+    // can assert the delta. The histogram series may already have
+    // observations from earlier tests in this binary.
+    var alloc_writer1 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer1.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer1.writer);
+    const body_pre = alloc_writer1.writer.buffered();
+    const count_before = parseHistogramCount(body_pre, "lean_chain_state_refcount_distribution");
+
+    // Round 1: writer-only (refcount=1 for every entry).
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 1), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+
+    // Round 2: each rc has one reader acquire (refcount=2).
+    var reader_views: [N]*const rc_beam_state.RcBeamState = undefined;
+    for (rcs, 0..) |rc, k| reader_views[k] = rc.acquireConst();
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 2), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+    // Drop the reader acquires.
+    for (reader_views) |v| v.release();
+
+    // Round 3: back to writer-only (refcount=1).
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 1), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+
+    // Scrape and verify the histogram count grew by exactly 3*N.
+    var alloc_writer2 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer2.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer2.writer);
+    const body_post = alloc_writer2.writer.buffered();
+
+    // Series MUST be advertised.
+    try testing.expect(std.mem.indexOf(u8, body_post, "lean_chain_state_refcount_distribution") != null);
+    // `_count` line MUST be present.
+    try testing.expect(std.mem.indexOf(u8, body_post, "lean_chain_state_refcount_distribution_count") != null);
+
+    const count_after = parseHistogramCount(body_post, "lean_chain_state_refcount_distribution");
+    try testing.expectEqual(count_before + 3 * @as(u64, @intCast(N)), count_after);
+}
+
+/// Tiny Prometheus-text parser: locate the `_count` line for a series
+/// name and return its u64 value, or 0 if not found. Tolerates labeled
+/// and unlabeled forms (the histogram in question is unlabeled).
+fn parseHistogramCount(body: []const u8, comptime series: []const u8) u64 {
+    const needle = series ++ "_count";
+    const idx = std.mem.indexOf(u8, body, needle) orelse return 0;
+    // Find the end of the line.
+    const end = std.mem.indexOfScalarPos(u8, body, idx, '\n') orelse body.len;
+    const line = body[idx..end];
+    // The count is the last whitespace-separated token on the line.
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    var last: []const u8 = "";
+    while (it.next()) |tok| last = tok;
+    return std.fmt.parseInt(u64, last, 10) catch 0;
+}
+
+test "BorrowedState: cloneAndRelease against Backing.none + acquired_rc returns owned state and releases rc" {
+    // Success path: cloneAndRelease must return an owned BeamState
+    // copy AND release the acquired_rc as part of self.deinit() on
+    // the success branch (the second `self.deinit()` after the last
+    // `try`). testing.allocator catches a leak in either the cloned
+    // BeamState or the rc release.
+    const state = try makeTestStateForBorrowed();
+    const rc = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    _ = rc.acquireWriter();
+    try testing.expectEqual(@as(u32, 2), rc.count());
+
+    var borrow = BorrowedState{
+        .state = &rc.state,
+        .backing = .none,
+        .acquired_rc = rc,
+    };
+    const owned = try borrow.cloneAndRelease(testing.allocator);
+    try testing.expect(borrow.released);
+    // Borrow released ONE acquire; outer acquire still alive.
+    try testing.expectEqual(@as(u32, 1), rc.count());
+    // Owned clone's slot must match.
+    try testing.expectEqual(rc.state.slot, owned.slot);
+
+    owned.deinit();
+    testing.allocator.destroy(owned);
+    rc.release();
 }
 
 test "BorrowedState: cloneAndRelease releases lock on OOM-mid-clone" {
