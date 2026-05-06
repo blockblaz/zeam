@@ -719,19 +719,73 @@ pub const BeamChain = struct {
         // on `getOrPut`. The LockTimer is moved into the borrow as
         // well so the hold-span observation closes at the deinit
         // site, not here. PR #820.
+        //
+        // Ownership: the helper takes responsibility for `rc` cleanup
+        // on every error path (mirroring `statesPutExclusive`). The
+        // `rc_owned` flag is cleared before each path that explicitly
+        // disposes of `rc` (the kept-existing release, the new-insert
+        // hand-off into the map) so the errdefer below cannot
+        // double-release. After the function returns successfully,
+        // ownership has either been transferred into the map
+        // (new-insert path) or dropped via `rc.release()`
+        // (kept-existing path) — `rc_owned` is false in both cases.
+        // Without this flag, an OOM in `states.getOrPut` would leak
+        // the freshly-`create`d rc + its heap-owned BeamState
+        // interior; the caller has no way to recover the pointer
+        // because the helper consumes it on success.
+        var rc_owned = true;
         errdefer {
             self.states_lock.unlock();
             t.released();
+            if (rc_owned) rc.release();
         }
         const gop = try self.states.getOrPut(root);
-        // After this point getOrPut succeeded; on subsequent failure
-        // we still own `rc` if not inserted, so handle both paths.
+        // After this point getOrPut succeeded; on either branch the
+        // helper now disposes of `rc` (release-or-transfer), so the
+        // errdefer must NOT double-act on it. Clear `rc_owned`
+        // BEFORE the synchronous release / map write so the cleared
+        // flag is observed even if the map write itself were ever
+        // changed to be fallible (currently `value_ptr.* = rc;` is
+        // infallible, but pinning the invariant here keeps the
+        // pattern safe under future edits).
+        rc_owned = false;
         const effective_rc: *RcBeamState = if (gop.found_existing) blk: {
             // Decision policy: keep the existing rc (other readers
             // may still hold acquires on it) and release the
             // freshly-computed copy the caller handed us. The
             // "kept_existing" return tells the caller their rc was
             // dropped so they don't double-release.
+            //
+            // Lock-hold note: when this release drops the refcount
+            // to 0 (the common case under c-2b commit 2 — the only
+            // acquires today come from the chain worker thread
+            // itself, which is the SAME thread executing this
+            // helper, so no concurrent acquire holds the rc alive),
+            // `release()` synchronously runs `state.deinit()` +
+            // `allocator.destroy(rc)` while holding
+            // `states_lock.exclusive`. For production-sized states
+            // BeamState.deinit walks every interior list/slice and
+            // is non-trivial work. Pre-c-2b the equivalent free was
+            // done by the CALLER outside the lock.
+            //
+            // The hold span is observable via
+            // `zeam_lock_hold_seconds{lock="states", site=...}` —
+            // the `site` argument differentiates `onBlock.commit`
+            // from `produceBlock.commit`, so a regression vs slice
+            // (b) baselines is visible per call site without any
+            // new instrumentation. Devnet should watch the
+            // `onBlock.commit` p99 across the slice (b)→(c-2b) cut.
+            //
+            // TODO(slice-c-2c): if the kept-existing free shows up
+            // as a hold-span regression on devnet, switch the
+            // helper to return the to-be-released rc alongside the
+            // borrow and have the caller release after dropping the
+            // lock (option (b) in the PR #828 review thread). Adds
+            // API surface but moves deinit work out of the critical
+            // section. Tracking-only until devnet has data; the
+            // single-writer assumption above means the cost is
+            // entirely allocator work, not contention with other
+            // chain mutators.
             rc.release();
             break :blk gop.value_ptr.*;
         } else blk: {
@@ -4256,6 +4310,165 @@ test "BorrowedState: cloneAndRelease vs concurrent statesFetchRemoveExclusivePtr
     const still_present = beam_chain.states.get(target_root) != null;
     beam_chain.states_lock.unlockShared();
     try std.testing.expect(still_present);
+}
+
+test "chain.statesCommitKeepExisting: getOrPut OOM releases caller rc (no leak)" {
+    // Regression for the post_state_rc leak Partha caught on PR #828:
+    // statesCommitKeepExisting flips its rc-ownership-transfer at the
+    // `getOrPut` step; if `getOrPut` itself OOMs, the helper is the
+    // ONLY place that knows about the rc (the upstream caller in
+    // onBlock has already flipped `post_state_settled = true` to keep
+    // the outer errdefer from double-freeing the now-Rc-wrapped
+    // BeamState). Without an `errdefer rc.release()` covering the
+    // OOM path, the freshly-`create`d rc + its heap-owned BeamState
+    // interior leak permanently. testing.allocator's leak detector
+    // catches the regression: this test passes ONLY when the helper
+    // releases the rc on its own OOM path.
+    //
+    // Mechanism:
+    //   1. Build a real BeamChain with testing.allocator so the chain
+    //      is fully functional and tear-down works.
+    //   2. Swap the chain's `states` map allocator with a
+    //      FailingAllocator that fails its very first allocation.
+    //      AutoHashMap exposes its allocator as a public field, so
+    //      this is a one-line swap.
+    //   3. Build a BeamState + RcBeamState the same way `onBlock`
+    //      does (sszClone the genesis state, wrap with
+    //      RcBeamState.create — both via testing.allocator so the
+    //      FailingAllocator only affects the map).
+    //   4. Pick a fresh root that is NOT already in the map (so the
+    //      getOrPut triggers a backing-array grow that fails — the
+    //      genesis root would hit the found_existing branch and not
+    //      reach the OOM site).
+    //   5. Call statesCommitKeepExisting and expect OutOfMemory. The
+    //      helper must release the caller's rc; testing.allocator
+    //      then verifies no leak at scope exit.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+
+    var db = try database.Db.open(std.testing.allocator, zeam_logger_config.logger(.database_test), data_dir);
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 12,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // To make `getOrPut` actually fail under the FailingAllocator we
+    // need to FORCE a grow. After init, the states map has spare
+    // capacity (only genesis is in it), so a single insert would just
+    // land in the existing buffer with no allocation — bypassing the
+    // FailingAllocator entirely.
+    //
+    // The hash map's `unmanaged.available` field tracks remaining
+    // slots before a grow is triggered (see std/hash_map.zig
+    // `growIfNeeded`: `new_count > self.available` → grow). Set it
+    // to 0 so the very next insert MUST grow. This is white-box but
+    // it's the cleanest deterministic way to put the map in the
+    // "next insert grows" state without poking real-data invariants:
+    // we never call any other map method between this poke and the
+    // helper-under-test call, so the only thing observing
+    // `available == 0` is `growIfNeeded` itself — exactly the path
+    // we want to fail. Restore the original `available` before
+    // deinit so the chain's teardown path doesn't trip on a stale
+    // value (deinit only iterates and releases; it shouldn't matter
+    // for the iteration walk, but defensive restoration is cheap).
+    const original_available = beam_chain.states.unmanaged.available;
+    beam_chain.states.unmanaged.available = 0;
+    defer beam_chain.states.unmanaged.available = original_available;
+
+    // Now swap the states map allocator with a FailingAllocator.
+    // The next `getOrPut` of a NEW key will need to grow the backing
+    // array; the very first allocation through the FailingAllocator
+    // returns null → OutOfMemory. Restore before deinit so the chain's
+    // own teardown path uses the real allocator.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_states_allocator = beam_chain.states.allocator;
+    beam_chain.states.allocator = failing.allocator();
+    defer beam_chain.states.allocator = original_states_allocator;
+
+    // Build the rc the way onBlock does: clone genesis state into a
+    // fresh value, hand to RcBeamState.create. Both via
+    // testing.allocator so the FailingAllocator above only affects
+    // the states map.
+    var cloned_value: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &cloned_value);
+    const post_state_rc = try RcBeamState.create(std.testing.allocator, cloned_value);
+    // No errdefer post_state_rc.release() here — the helper under
+    // test is responsible for releasing it on its own OOM path.
+    // That IS the contract this test pins.
+
+    // A root that is NOT already in the map (genesis root WOULD be
+    // there, which would hit the found_existing branch and never
+    // reach the OOM site). Use a synthetic non-zero root distinct
+    // from any filler key.
+    var fresh_root = std.mem.zeroes(types.Root);
+    std.mem.writeInt(u64, fresh_root[0..8], 0xDEAD_BEEF_CAFE_BABE, .little);
+
+    const result = beam_chain.statesCommitKeepExisting(
+        "test.oom_regression",
+        fresh_root,
+        post_state_rc,
+    );
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // states_lock must be released — try a quick exclusive
+    // lock+unlock to prove no thread is hung on it. tryLock would be
+    // ideal but SyncRwLock doesn't expose one; a successful
+    // lock()/unlock() pair after the failed call is the same proof
+    // (any leak of the lock would deadlock here forever; CI timeout
+    // would catch that, but in practice the lock IS released by the
+    // helper's errdefer). Doing a real lock here also means the
+    // chain's deinit path doesn't have to fight a held lock.
+    beam_chain.states_lock.lock();
+    beam_chain.states_lock.unlock();
+
+    // The freshly-created rc must NOT have made it into the map
+    // (getOrPut failed before insertion). Genesis must still be the
+    // sole entry under the genesis root.
+    try std.testing.expect(beam_chain.states.get(fresh_root) == null);
 }
 
 test "chain.onBlock: two-thread concurrent import of same block — no UAF, coherent state" {
