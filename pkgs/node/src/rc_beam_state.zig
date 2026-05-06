@@ -893,7 +893,7 @@ test "RcBeamState.tryAcquire: race against release-to-zero — producer + freer"
                 @panic("tryAcquire failed while we held a ref");
             };
             std.mem.doNotOptimizeAway(got.state.slot);
-            got.release();    // drop the tryAcquire bump
+            got.release(); // drop the tryAcquire bump
             handed.release(); // drop the pre-bump
         }
     };
