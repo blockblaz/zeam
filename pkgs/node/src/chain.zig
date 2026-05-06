@@ -152,8 +152,15 @@ pub const BeamChain = struct {
     ///
     /// Lock-free monotonic counter; safe to read from any thread.
     states_kept_existing_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    // Cached finalized state loaded from database (separate from states map to avoid affecting pruning)
-    cached_finalized_state: ?*types.BeamState = null,
+    // Cached finalized state loaded from database (separate from states
+    // map to avoid affecting pruning).
+    //
+    // Slice c-2b commit 4 of #803: migrated from raw `*types.BeamState`
+    // to `*RcBeamState` (Option B from the PR #828 review thread) so the
+    // cache-hit path in `getFinalizedState` can use the same
+    // tryAcquire-then-drop-lock dance as `statesGet` when chain-worker
+    // is enabled. Mutation is still gated by `events_lock`.
+    cached_finalized_state: ?*RcBeamState = null,
     // Cache for validator public keys to avoid repeated SSZ deserialization during signature verification.
     // Significantly reduces CPU overhead when processing blocks with many attestations.
     public_key_cache: xmss.PublicKeyCache,
@@ -569,10 +576,16 @@ pub const BeamChain = struct {
         }
         self.states.deinit();
 
-        // Clean up cached finalized state if present
-        if (self.cached_finalized_state) |cached_state| {
-            cached_state.deinit();
-            self.allocator.destroy(cached_state);
+        // Clean up cached finalized state if present.
+        // Slice c-2b commit 4: cached_finalized_state is an
+        // RcBeamState now — release drives state.deinit + destroy when
+        // refcount reaches 0. Under chain_worker_enabled the cache may
+        // have outstanding reader acquires; the rc keeps the underlying
+        // allocation alive until the last reader releases. (At deinit
+        // time we are single-threaded by contract, so refcount=1 in
+        // practice.)
+        if (self.cached_finalized_state) |cached_rc| {
+            cached_rc.release();
         }
 
         // Clean up public key cache
@@ -623,24 +636,65 @@ pub const BeamChain = struct {
     // release.
     // ------------------------------------------------------------------
 
-    /// Acquire the shared (read) side of `states_lock` and return a
-    /// `BorrowedState` for the requested root, or null if the state is not
-    /// in the in-memory map. Caller MUST call either `borrow.deinit()` or
-    /// `borrow.cloneAndRelease(allocator)` exactly once before the borrow
-    /// goes out of scope. Debug builds enforce one-release via
-    /// `BorrowedState.released`.
+    /// Return a `BorrowedState` for the requested root, or null if the
+    /// state is not in the in-memory map. Caller MUST call either
+    /// `borrow.deinit()` or `borrow.cloneAndRelease(allocator)` exactly
+    /// once before the borrow goes out of scope. Debug builds enforce
+    /// one-release via `BorrowedState.released`.
+    ///
+    /// Two paths, gated by chain-worker mode (slice c-2b commit 4 of #803):
+    ///
+    ///   * `chain_worker != null` (chain-worker is the sole writer to
+    ///     `BeamChain.states`): take the shared lock for the lookup,
+    ///     `tryAcquire` the rc, drop the lock, and return a
+    ///     `Backing.none` borrow whose lifetime is gated by the rc
+    ///     refcount. Cross-thread readers (HTTP API, metrics scrape,
+    ///     event broadcaster) NO LONGER hold `states_lock.shared` for
+    ///     the borrow lifetime, so a long-lived read does not block the
+    ///     chain worker's next exclusive-side mutation. This is the
+    ///     entire point of the c-2b migration.
+    ///
+    ///   * `chain_worker == null` (kill-switch / backward-compat under
+    ///     `--chain-worker=off`): keep the legacy lock-based borrow.
+    ///     The shared lock is held for the borrow lifetime; map mutation
+    ///     by the gossip/req-resp paths is gated by the exclusive side
+    ///     as before. Slice (b) semantics are preserved exactly.
     pub fn statesGet(self: *Self, root: types.Root) ?BorrowedState {
         var t = LockTimer.start("states", "statesGet");
         self.states_lock.lockShared();
         t.acquired();
         if (self.states.get(root)) |rc| {
-            // Hand the lock off to the borrow. Under c-2b commit 2
-            // the rwlock still gates lifetime: the rc lives as long
-            // as the entry is in the map AND the lock is held, so
-            // it's safe to expose `&rc.state` directly without
-            // taking an acquire. Commit 4 of this PR will drop the
-            // rwlock entirely and switch this path to
-            // `acquireConst()` + `tryAcquire()`.
+            if (self.chain_worker != null) {
+                // Lock-free read path: tryAcquire under the shared
+                // lock to defeat any concurrent free race, then drop
+                // the lock so the borrow lifetime no longer pins
+                // `states_lock`. The LockTimer ends HERE because the
+                // hold span is over; we do not hand it off to the
+                // borrow.
+                const acq = rc.tryAcquire();
+                self.states_lock.unlockShared();
+                t.released();
+                if (acq) |acquired_rc| {
+                    return BorrowedState{
+                        .state = &acquired_rc.state,
+                        .backing = .none,
+                        .acquired_rc = acquired_rc,
+                    };
+                }
+                // tryAcquire returned null: rc is in the freeing
+                // process (refcount→0 elsewhere). Today this should
+                // never happen because the only acquires today come
+                // from the worker thread itself, but the safe-by-
+                // default behavior is to report the entry as missing
+                // rather than dereference a dying allocation. The
+                // c-2b removal protocol ("remove-from-map then
+                // release") is what makes this branch theoretically
+                // reachable in the future without a UAF.
+                return null;
+            }
+            // Legacy lock-based path: hand the shared lock off to the
+            // borrow.  Backward-compat with --chain-worker=off; PR
+            // #820 / #803 kill-switch.
             return BorrowedState{
                 .state = &rc.state,
                 .backing = .{ .states_shared_rwlock = &self.states_lock },
@@ -782,6 +836,23 @@ pub const BeamChain = struct {
         root: types.Root,
         rc: *RcBeamState,
     ) !struct { borrow: BorrowedState, kept_existing: bool } {
+        // INTENTIONAL: this helper holds the EXCLUSIVE side of
+        // `states_lock` across the returned borrow even when chain-
+        // worker mode is enabled. Slice c-2b commit 4 of #803 dropped
+        // the rwlock for `statesGet` / `getFinalizedState` cache-hit
+        // borrows, but the cross-call write barrier rationale from
+        // PR #820 / #803 still applies here: the borrow lifetime
+        // spans (DB write → forkChoice.confirmBlock); both must
+        // observe the in-map pointer atomically, so unlock/reacquire
+        // is exactly the UAF race we are closing. The chain-worker
+        // is the only writer to `states` under c-2b, but that does
+        // NOT make the cross-call barrier redundant — the worker
+        // executes its own helpers serially, and the barrier is
+        // about ordering against `pruneStates` (also exclusive),
+        // which can run from the same worker between this helper's
+        // borrow handoff and the caller's last deref. Switching to
+        // a Backing.none / tryAcquire shape here would re-open
+        // exactly the issue PR #820 fixed.
         var t = LockTimer.start("states", site);
         self.states_lock.lock();
         t.acquired();
@@ -2712,12 +2783,18 @@ pub const BeamChain = struct {
     /// borrowed from the in-memory map under `BeamNode.mutex`. After (a-2)
     /// it returns a `BorrowedState` whose backing lock depends on which
     /// path produced the result:
-    ///   * In-memory map hit  → backed by `states_lock` (shared).
-    ///   * Cache hit / DB load → backed by `events_lock` (mutex), since
-    ///     `cached_finalized_state` is mutated under `events_lock` (the
-    ///     DB-load path also writes the cache field, and that write is
-    ///     guarded by the mutex). Callers MUST release the borrow exactly
-    ///     once via `deinit()` or `cloneAndRelease(allocator)`.
+    ///   * In-memory map hit  → backed by `states_lock` (shared) when
+    ///     `--chain-worker=off`; `Backing.none` (rc-only lifetime)
+    ///     when `--chain-worker=on` (slice c-2b commit 4 of #803).
+    ///   * Cache hit / DB load → backed by `events_lock` (mutex) when
+    ///     `--chain-worker=off`, since `cached_finalized_state` is
+    ///     mutated under `events_lock` (the DB-load path also writes
+    ///     the cache field, and that write is guarded by the mutex).
+    ///     When `--chain-worker=on`, the cache hit path tryAcquires the
+    ///     RcBeamState refcount and drops `events_lock` before
+    ///     returning, mirroring the lock-free path in `statesGet`.
+    /// Callers MUST release the borrow exactly once via `deinit()` or
+    /// `cloneAndRelease(allocator)`.
     ///
     /// PR description (a-2) enumerates every caller migrated under this
     /// API change — grepping `states.get` will not find them.
@@ -2760,14 +2837,42 @@ pub const BeamChain = struct {
         // the current finalized checkpoint (can happen if the cache was
         // seeded from the DB at startup before any in-memory finalization
         // happened).
-        if (self.cached_finalized_state) |cached_state| {
-            if (std.mem.eql(u8, &cached_state.latest_finalized.root, &finalized_checkpoint.root)) {
+        if (self.cached_finalized_state) |cached_rc| {
+            if (std.mem.eql(u8, &cached_rc.state.latest_finalized.root, &finalized_checkpoint.root)) {
+                if (self.chain_worker != null) {
+                    // Lock-free read path: tryAcquire under the events
+                    // lock to defeat any concurrent free race, then drop
+                    // the lock so the borrow lifetime no longer pins
+                    // `events_lock`. Tier-5 depth must be decremented
+                    // BEFORE we return because we are NOT handing off
+                    // the lock to the borrow; the next tier-5 acquire
+                    // on this thread should see depth=0.
+                    const acq = cached_rc.tryAcquire();
+                    self.events_lock.unlock();
+                    locking.leaveTier5();
+                    t_ev.released();
+                    lock_held = false;
+                    if (acq) |acquired_rc| {
+                        return BorrowedState{
+                            .state = &acquired_rc.state,
+                            .backing = .none,
+                            .acquired_rc = acquired_rc,
+                        };
+                    }
+                    // tryAcquire returned null — freeing thread won.
+                    // Today this should never happen (refcount stays
+                    // at 1 in production), but the safe-by-default
+                    // behavior is to report no entry.
+                    return null;
+                }
+                // Legacy lock-based path: hand the events_lock off to
+                // the borrow.  Backward-compat with --chain-worker=off.
                 lock_held = false; // ownership of the lock moves into the borrow
                 // tier-5 depth and LockTimer are HANDED OFF to the borrow:
                 // BorrowedState.deinit calls leaveTier5() and t.released()
                 // after unlocking. Do NOT close them here.
                 return BorrowedState{
-                    .state = cached_state,
+                    .state = &cached_rc.state,
                     .backing = .{ .events_mutex = &self.events_lock },
                     .tier5_held = true,
                     .timer = t_ev,
@@ -2776,37 +2881,61 @@ pub const BeamChain = struct {
             // Stale — fall through to DB load below.
         }
 
-        // Fallback: try to load from database. Allocate the cache slot, load,
-        // store in `cached_finalized_state`, return a borrow over it.
-        const state_ptr = self.allocator.create(types.BeamState) catch |err| {
-            self.logger.warn("failed to allocate memory for finalized state: {any}", .{err});
-            return null;
-        };
-
-        self.db.loadLatestFinalizedState(state_ptr) catch |err| {
-            self.allocator.destroy(state_ptr);
+        // Fallback: try to load from database. Allocate a BeamState
+        // value on the stack (well — a local), load into it, then
+        // hand it to RcBeamState.create which embeds it into the heap
+        // allocation (always-consume contract per c-2a).
+        var loaded_state: types.BeamState = undefined;
+        self.db.loadLatestFinalizedState(&loaded_state) catch |err| {
             self.logger.warn("finalized state not available in database: {any}", .{err});
             return null;
         };
+        // Past this line `loaded_state` owns interior allocations.
+        // RcBeamState.create takes ownership; on OOM it deinits the
+        // interior for us.
+        const new_rc = RcBeamState.create(self.allocator, loaded_state) catch |err| {
+            self.logger.warn("failed to allocate RcBeamState for finalized state: {any}", .{err});
+            return null;
+        };
 
-        // If a previous cached state is being replaced, free it now (we
-        // hold events_lock so no concurrent borrow of the old pointer can
-        // exist past this critical section).
-        if (self.cached_finalized_state) |old_cached| {
-            old_cached.deinit();
-            self.allocator.destroy(old_cached);
+        // If a previous cached state is being replaced, release the old
+        // rc now (we hold events_lock so any concurrent reader either
+        // tryAcquired before this critical section — in which case its
+        // acquire keeps the underlying allocation alive past our release
+        // — or will look it up after our store below and observe the
+        // new rc).
+        if (self.cached_finalized_state) |old_cached_rc| {
+            old_cached_rc.release();
         }
 
         // Cache in separate field (not in states map to avoid affecting pruning)
-        self.cached_finalized_state = state_ptr;
+        self.cached_finalized_state = new_rc;
 
-        self.logger.info("loaded finalized state from database at slot {d}", .{state_ptr.slot});
+        self.logger.info("loaded finalized state from database at slot {d}", .{new_rc.state.slot});
 
+        if (self.chain_worker != null) {
+            // Lock-free read path: bump the refcount we just stored and
+            // drop the lock so the borrow lifetime is gated by the
+            // refcount alone. The cache field holds one reference, the
+            // borrow holds another. tryAcquire is guaranteed to succeed
+            // here — we own the only reference and we hold events_lock.
+            const acq = new_rc.tryAcquire() orelse unreachable;
+            self.events_lock.unlock();
+            locking.leaveTier5();
+            t_ev.released();
+            lock_held = false;
+            return BorrowedState{
+                .state = &acq.state,
+                .backing = .none,
+                .acquired_rc = acq,
+            };
+        }
+        // Legacy lock-based path: hand the events_lock off to the borrow.
         lock_held = false;
         // tier-5 depth + LockTimer handed off to the borrow; deinit will
         // leaveTier5() and t.released() after unlocking.
         return BorrowedState{
-            .state = state_ptr,
+            .state = &new_rc.state,
             .backing = .{ .events_mutex = &self.events_lock },
             .tier5_held = true,
             .timer = t_ev,
@@ -5360,4 +5489,234 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
         error.ChainWorkerDisabled,
         beam_chain_off.submitBlock(off_cloned, false),
     );
+}
+
+test "chain.statesGet under chain_worker enabled returns Backing.none + acquired_rc (slice c-2b commit 4)" {
+    // Slice c-2b commit 4 of #803: when chain_worker != null, statesGet
+    // takes the lock-free path — it tryAcquires the rc under the shared
+    // lock, drops the lock, and returns a Backing.none borrow. This
+    // test verifies the contract: the borrow is Backing.none, has a
+    // non-null acquired_rc, and the rc refcount tracks acquire/release.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 42,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    // Start the worker so chain_worker != null (this is the
+    // --chain-worker=on runtime indicator).
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    const target_root = mock_chain.blockRoots[0]; // genesis root, populated by init
+
+    // Snapshot refcount before the borrow.
+    beam_chain.states_lock.lockShared();
+    const rc_before = beam_chain.states.get(target_root).?;
+    const refcount_before = rc_before.count();
+    beam_chain.states_lock.unlockShared();
+    try std.testing.expectEqual(@as(u32, 1), refcount_before);
+
+    // Take a borrow.
+    var borrow = beam_chain.statesGet(target_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+
+    // Verify lock-free shape: Backing.none + non-null acquired_rc.
+    try std.testing.expect(borrow.backing == .none);
+    try std.testing.expect(borrow.acquired_rc != null);
+    try std.testing.expect(borrow.acquired_rc.? == rc_before);
+
+    // Refcount must have bumped to 2 (map=1 + borrow=1).
+    try std.testing.expectEqual(@as(u32, 2), rc_before.count());
+
+    // Drop the borrow — refcount returns to 1 (map only).
+    borrow.deinit();
+    try std.testing.expectEqual(@as(u32, 1), rc_before.count());
+}
+
+test "chain.statesGet under chain_worker enabled does not block exclusive writers (slice c-2b commit 4)" {
+    // The whole point of slice c-2b commit 4: a long-lived reader borrow
+    // must NOT block an exclusive-side mutation by the chain worker
+    // path. We hold a Backing.none borrow open across the lifetime of
+    // a writer thread that takes the exclusive lock and inserts an
+    // unrelated entry; under the old shared-held-for-borrow behavior
+    // the writer would deadlock against the reader (or rather, block
+    // until the reader released). A 1-second watchdog asserts the
+    // writer completed within bound; a regression hangs CI rather
+    // than silently passing.
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const mock_chain = try stf.genMockChain(arena, 2, null);
+    var zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+    const spec_name = try std.testing.allocator.dupe(u8, "beamdev");
+    const fork_digest = try std.testing.allocator.dupe(u8, "12345678");
+    const chain_config = configs.ChainConfig{
+        .id = configs.Chain.custom,
+        .genesis = mock_chain.genesis_config,
+        .spec = .{
+            .preset = params.Preset.mainnet,
+            .name = spec_name,
+            .fork_digest = fork_digest,
+            .attestation_committee_count = 1,
+            .max_attestations_data = 16,
+        },
+    };
+
+    var beam_state: types.BeamState = undefined;
+    try types.sszClone(std.testing.allocator, types.BeamState, mock_chain.genesis_state, &beam_state);
+    defer beam_state.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
+    var db = try database.Db.open(
+        std.testing.allocator,
+        zeam_logger_config.logger(.database_test),
+        data_dir,
+    );
+    defer db.deinit();
+
+    const connected_peers = try std.testing.allocator.create(ConnectedPeers);
+    defer std.testing.allocator.destroy(connected_peers);
+    connected_peers.* = ConnectedPeers.init(std.testing.allocator);
+    defer connected_peers.deinit();
+
+    const test_registry = try std.testing.allocator.create(NodeNameRegistry);
+    defer std.testing.allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(std.testing.allocator);
+    defer test_registry.deinit();
+
+    var beam_chain = try BeamChain.init(std.testing.allocator, ChainOpts{
+        .config = chain_config,
+        .anchorState = &beam_state,
+        .nodeId = 43,
+        .logger_config = &zeam_logger_config,
+        .db = db,
+        .node_registry = test_registry,
+    }, connected_peers);
+    defer beam_chain.deinit();
+
+    try beam_chain.startChainWorker();
+    try std.testing.expect(beam_chain.chain_worker != null);
+
+    const target_root = mock_chain.blockRoots[0];
+
+    // Reader: take a long-lived borrow.
+    var borrow = beam_chain.statesGet(target_root) orelse {
+        try std.testing.expect(false);
+        unreachable;
+    };
+    defer borrow.deinit();
+    try std.testing.expect(borrow.backing == .none);
+
+    // Writer: take the exclusive lock + insert an unrelated entry.
+    // Under the OLD shared-held-for-borrow behavior this would block
+    // until the reader released; under c-2b commit 4 the reader's
+    // borrow does NOT hold the lock, so the writer completes
+    // immediately.
+    const WriterCtx = struct {
+        chain: *BeamChain,
+        genesis_state: *const types.BeamState,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            // Synthetic root distinct from genesis (zeroes); first byte 0xab.
+            var fake_root: types.Root = std.mem.zeroes(types.Root);
+            fake_root[0] = 0xab;
+
+            var cloned_value: types.BeamState = undefined;
+            types.sszClone(std.testing.allocator, types.BeamState, ctx.genesis_state.*, &cloned_value) catch return;
+            const new_rc = RcBeamState.create(std.testing.allocator, cloned_value) catch return;
+
+            // Take the exclusive side. With the lock-free reader this
+            // returns immediately even though a borrow is alive in the
+            // main thread.
+            ctx.chain.states_lock.lock();
+            ctx.chain.states.put(fake_root, new_rc) catch {
+                ctx.chain.states_lock.unlock();
+                new_rc.release();
+                return;
+            };
+            ctx.chain.states_lock.unlock();
+            ctx.done.store(true, .release);
+        }
+    };
+    var writer_ctx = WriterCtx{
+        .chain = &beam_chain,
+        .genesis_state = &mock_chain.genesis_state,
+    };
+    var writer_thread = try std.Thread.spawn(.{}, WriterCtx.run, .{&writer_ctx});
+
+    // Watchdog: spin for at most 1 second waiting for the writer.
+    // Under a regression (e.g. a future change re-imposing the
+    // shared-held-for-borrow shape) the writer would block on the
+    // reader's borrow and this would time out.
+    const start_ns = zeam_utils.monotonicTimestampNs();
+    const deadline_ns: i128 = start_ns + 1 * std.time.ns_per_s;
+    while (zeam_utils.monotonicTimestampNs() < deadline_ns) {
+        if (writer_ctx.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    writer_thread.join();
+    try std.testing.expect(writer_ctx.done.load(.acquire));
+
+    // The reader's borrow is still valid even after the writer mutated
+    // the map: refcount kept the underlying state alive.
+    try std.testing.expectEqual(mock_chain.genesis_state.slot, borrow.state.slot);
 }
