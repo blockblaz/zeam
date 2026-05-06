@@ -535,7 +535,6 @@ fn mainInner(init: std.process.Init) !void {
                     .listen_addresses = listen_addresses1,
                     .connect_peers = null,
                     .node_registry = test_registry1,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger1_config.logger(.network));
                 backend1 = network1.getNetworkInterface();
 
@@ -560,7 +559,6 @@ fn mainInner(init: std.process.Init) !void {
                     .listen_addresses = listen_addresses2,
                     .connect_peers = connect_peers,
                     .node_registry = test_registry2,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger2_config.logger(.network));
                 backend2 = network2.getNetworkInterface();
 
@@ -584,7 +582,6 @@ fn mainInner(init: std.process.Init) !void {
                     .listen_addresses = listen_addresses3,
                     .connect_peers = connect_peers3,
                     .node_registry = test_registry3,
-                    .attestation_committee_count = chain_config.spec.attestation_committee_count,
                 }, logger3_config.logger(.network));
                 backend3 = network3.getNetworkInterface();
                 logger1_config.logger(null).debug("--- ethlibp2p gossip {f}", .{backend1.gossip});
@@ -748,19 +745,25 @@ fn mainInner(init: std.process.Init) !void {
                 .onIntervalCb = DelayedNodeRunner.onInterval,
             };
 
-            // Start nodes 1, 2 immediately (node 3 starts delayed after finalization)
-            try beam_node_1.run();
-            try beam_node_2.run();
-
-            // Register delayed runner callback with clock
-            try clock.subscribeOnSlot(delayed_cb);
-
+            // Start the rust libp2p networks BEFORE the beam nodes:
+            // `BeamNode.run()` calls `gossip.subscribe(...)`, which now
+            // enqueues `SwarmCommand::SubscribeGossip` on the per-network
+            // command channel. That channel only exists after
+            // `EthLibp2p.run()` returns from `wait_for_network_ready`, so
+            // any earlier subscribe would be dropped with a hard error.
             if (!mock_network) {
                 try network1.run();
                 try network2.run();
                 // network3.run() is called in DelayedNodeRunner.onInterval
                 // to ensure node3 joins fresh without pre-cached gossip blocks
             }
+
+            // Start nodes 1, 2 immediately (node 3 starts delayed after finalization)
+            try beam_node_1.run();
+            try beam_node_2.run();
+
+            // Register delayed runner callback with clock
+            try clock.subscribeOnSlot(delayed_cb);
 
             try clock.run();
         },
