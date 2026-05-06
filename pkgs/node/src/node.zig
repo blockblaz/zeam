@@ -1702,12 +1702,14 @@ pub const BeamNode = struct {
             var subnet_ids_buf: std.ArrayList(u8) = .empty;
             defer subnet_ids_buf.deinit(self.allocator);
             var first = true;
+            var id_buf: [32]u8 = undefined;
             for (topics_slice) |topic| {
                 if (topic.kind != .attestation) continue;
                 const subnet_id = topic.subnet_id orelse continue;
                 if (!first) try subnet_ids_buf.appendSlice(self.allocator, ",");
                 first = false;
-                try subnet_ids_buf.writer(self.allocator).print("{d}", .{subnet_id});
+                const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{subnet_id});
+                try subnet_ids_buf.appendSlice(self.allocator, id_str);
             }
             self.logger.info("gossip subscriptions: block + aggregation + {d} attestation subnet(s) [{s}]", .{ attestation_subnet_count, subnet_ids_buf.items });
         }
