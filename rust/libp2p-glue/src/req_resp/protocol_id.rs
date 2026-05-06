@@ -187,7 +187,11 @@ mod tests {
             let raw = p as u32;
             let decoded = LeanSupportedProtocol::try_from(raw)
                 .unwrap_or_else(|_| panic!("variant {:?} (raw {}) failed try_from", p, raw));
-            assert_eq!(decoded, p, "round-trip mismatch for variant {:?}: as u32 = {} but try_from({}) = {:?}", p, raw, raw, decoded);
+            assert_eq!(
+                decoded, p,
+                "round-trip mismatch for variant {:?}: as u32 = {} but try_from({}) = {:?}",
+                p, raw, raw, decoded
+            );
         }
     }
 
