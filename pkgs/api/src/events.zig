@@ -44,21 +44,21 @@ pub const NewHeadEvent = struct {
     }
 
     pub fn toJson(self: *const NewHeadEvent, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("block_root", json.Value{ .string = self.block_root });
-        try obj.put("parent_root", json.Value{ .string = self.parent_root });
-        try obj.put("state_root", json.Value{ .string = self.state_root });
-        try obj.put("timely", json.Value{ .bool = self.timely });
+        var obj = try json.ObjectMap.init(allocator, &.{}, &.{});
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "block_root", json.Value{ .string = self.block_root });
+        try obj.put(allocator, "parent_root", json.Value{ .string = self.parent_root });
+        try obj.put(allocator, "state_root", json.Value{ .string = self.state_root });
+        try obj.put(allocator, "timely", json.Value{ .bool = self.timely });
         if (self.node_id) |node_id| {
-            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+            try obj.put(allocator, "node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
         }
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const NewHeadEvent, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
-        defer json_value.object.deinit();
+        defer json_value.object.deinit(allocator);
         return jsonToString(allocator, json_value);
     }
 
@@ -88,19 +88,19 @@ pub const NewJustificationEvent = struct {
     }
 
     pub fn toJson(self: *const NewJustificationEvent, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("root", json.Value{ .string = self.root });
-        try obj.put("justified_slot", json.Value{ .integer = @as(i64, @intCast(self.justified_slot)) });
+        var obj = try json.ObjectMap.init(allocator, &.{}, &.{});
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "root", json.Value{ .string = self.root });
+        try obj.put(allocator, "justified_slot", json.Value{ .integer = @as(i64, @intCast(self.justified_slot)) });
         if (self.node_id) |node_id| {
-            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+            try obj.put(allocator, "node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
         }
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const NewJustificationEvent, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
-        defer json_value.object.deinit();
+        defer json_value.object.deinit(allocator);
         return jsonToString(allocator, json_value);
     }
 
@@ -128,19 +128,19 @@ pub const NewFinalizationEvent = struct {
     }
 
     pub fn toJson(self: *const NewFinalizationEvent, allocator: Allocator) !json.Value {
-        var obj = json.ObjectMap.init(allocator);
-        try obj.put("slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
-        try obj.put("root", json.Value{ .string = self.root });
-        try obj.put("finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
+        var obj = try json.ObjectMap.init(allocator, &.{}, &.{});
+        try obj.put(allocator, "slot", json.Value{ .integer = @as(i64, @intCast(self.slot)) });
+        try obj.put(allocator, "root", json.Value{ .string = self.root });
+        try obj.put(allocator, "finalized_slot", json.Value{ .integer = @as(i64, @intCast(self.finalized_slot)) });
         if (self.node_id) |node_id| {
-            try obj.put("node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
+            try obj.put(allocator, "node_id", json.Value{ .integer = @as(i64, @intCast(node_id)) });
         }
         return json.Value{ .object = obj };
     }
 
     pub fn toJsonString(self: *const NewFinalizationEvent, allocator: Allocator) ![]const u8 {
         var json_value = try self.toJson(allocator);
-        defer json_value.object.deinit();
+        defer json_value.object.deinit(allocator);
         return jsonToString(allocator, json_value);
     }
 

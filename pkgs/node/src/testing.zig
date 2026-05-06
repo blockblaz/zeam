@@ -23,7 +23,7 @@ pub const NodeTestOptions = struct {
     /// Returns the effective genesis time, using current time if genesis_time is 0.
     pub fn getEffectiveGenesisTime(self: NodeTestOptions) u64 {
         if (self.genesis_time == 0) {
-            return @intCast(std.time.timestamp());
+            return @intCast(zeam_utils.unixTimestampSeconds());
         }
         return self.genesis_time;
     }
@@ -85,7 +85,7 @@ pub const NodeTestContext = struct {
         var tmp_dir = std.testing.tmpDir(.{});
         errdefer tmp_dir.cleanup();
 
-        const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+        const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
         errdefer allocator.free(data_dir);
 
         var db = try database.Db.open(allocator, logger_config.logger(.database), data_dir);

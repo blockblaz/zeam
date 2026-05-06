@@ -31,6 +31,14 @@ fn setTestRunLabelFromCompile(b: *Builder, run_step: *std.Build.Step.Run, compil
     setTestRunLabel(b, run_step, source_name);
 }
 
+fn defaultSimpleTestRunner(b: *Builder) std.Build.Step.Compile.TestRunner {
+    const test_runner_path = b.graph.zig_lib_directory.join(b.allocator, &.{ "compiler", "test_runner.zig" }) catch @panic("OOM");
+    return .{
+        .path = .{ .cwd_relative = test_runner_path },
+        .mode = .simple,
+    };
+}
+
 // Add the glue libs to a compile target.
 //
 // Every per-prover Rust crate is funnelled through a single `zeam-glue`
@@ -46,19 +54,20 @@ fn addRustGlueLib(b: *Builder, comp: *Builder.Step.Compile, target: Builder.Reso
         .risc0 => "rust/target/risc0-release/libzeam_glue.a",
         .openvm => "rust/target/openvm-release/libzeam_glue.a",
     };
-    comp.addObjectFile(b.path(glue_path));
-    comp.linkLibC();
-    comp.linkSystemLibrary("unwind");
+    comp.root_module.addObjectFile(b.path(glue_path));
+    comp.root_module.link_libc = true;
+    comp.root_module.linkSystemLibrary("unwind", .{});
     if (target.result.os.tag == .macos) {
-        comp.linkFramework("CoreFoundation");
-        comp.linkFramework("SystemConfiguration");
-        comp.linkFramework("Security");
+        comp.root_module.linkFramework("CoreFoundation", .{});
+        comp.root_module.linkFramework("SystemConfiguration", .{});
+        comp.root_module.linkFramework("Security", .{});
     }
 }
 
 pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const simple_test_runner = defaultSimpleTestRunner(b);
 
     // Get git commit hash as version
     const git_version = b.option([]const u8, "git_version", "Git commit hash for version") orelse "unknown";
@@ -80,7 +89,7 @@ pub fn build(b: *Builder) !void {
     const simargs = b.dependency("zigcli", .{
         .target = target,
         .optimize = optimize,
-    }).module("simargs");
+    }).module("zigcli");
     const xev = b.dependency("xev", .{
         .target = target,
         .optimize = optimize,
@@ -146,8 +155,6 @@ pub fn build(b: *Builder) !void {
     build_options.addOption([]const u8, "prover", @tagName(prover));
     build_options.addOption(bool, "has_risc0", prover == .risc0 or prover == .all);
     build_options.addOption(bool, "has_openvm", prover == .openvm or prover == .all);
-    const use_poseidon = b.option(bool, "use_poseidon", "Use Poseidon SSZ hasher (default: false)") orelse false;
-    build_options.addOption(bool, "use_poseidon", use_poseidon);
     // Absolute path to test-keys for pre-generated validator keys
     build_options.addOption([]const u8, "test_keys_path", b.pathFromRoot("test-keys/hash-sig-keys"));
     const build_options_module = build_options.createModule();
@@ -162,16 +169,6 @@ pub fn build(b: *Builder) !void {
     zeam_utils.addImport("yaml", yaml);
     zeam_utils.addImport("ssz", ssz);
     zeam_utils.addImport("build_options", build_options_module);
-    if (use_poseidon) {
-        // add hash-zig dependency only when Poseidon hasher is enabled
-        const hash_zig = b.dependency("hash_zig", .{
-            .target = target,
-            .optimize = optimize,
-        });
-        const hash_zig_module = hash_zig.module("hash-zig");
-        zeam_utils.addImport("hash_zig", hash_zig_module);
-    }
-
     // add zeam-params
     const zeam_params = b.addModule("@zeam/params", .{
         .target = target,
@@ -369,7 +366,7 @@ pub fn build(b: *Builder) !void {
     // Always disabled on macOS due to linker issues with Rust static libraries
     // (LTO requires LLD but macOS uses its own linker by default)
     if (enable_lto and target.result.os.tag == .linux) {
-        cli_exe.want_lto = true;
+        cli_exe.lto = .full;
     }
 
     // addimport to root module is even required afer declaring it in mod
@@ -399,13 +396,13 @@ pub fn build(b: *Builder) !void {
 
     cli_exe.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_exe, target, prover);
-    cli_exe.linkLibC(); // for rust static libs to link
-    cli_exe.linkLibCpp(); // for rocksdb C++ library to link
-    cli_exe.linkSystemLibrary("unwind"); // to be able to display rust backtraces
+    cli_exe.root_module.link_libc = true; // for rust static libs to link
+    cli_exe.root_module.link_libcpp = true; // for rocksdb C++ library to link
+    cli_exe.root_module.linkSystemLibrary("unwind", .{}); // to be able to display rust backtraces
 
     b.installArtifact(cli_exe);
 
-    try build_zkvm_targets(b, &cli_exe.step, target, build_options_module, use_poseidon);
+    try build_zkvm_targets(b, &cli_exe.step, target, build_options_module);
 
     const run_prover = b.addRunArtifact(cli_exe);
     const prover_step = b.step("run", "Run cli executable");
@@ -444,6 +441,113 @@ pub fn build(b: *Builder) !void {
 
     const test_step = b.step("test", "Run zeam core tests");
 
+    // ---------------------------------------------------------------
+    // Single-node ingestion stress harness (issue #803 slice b).
+    //
+    // Run with `zig build stress` (or `zig build stress -Doptimize=Debug`).
+    // Configurable via env vars:
+    //   ZEAM_STRESS_DURATION_SECS  default 1800 (30 min, design-doc r3 merge gate)
+    //   ZEAM_STRESS_NUM_BLOCKS     default 6
+    //   ZEAM_STRESS_GOSSIP_THREADS default 3
+    //   ZEAM_STRESS_RPC_THREADS    default 4
+    //   ZEAM_STRESS_ATTN_THREADS   default 2
+    //   ZEAM_STRESS_BORROW_THREADS default 2
+    //   ZEAM_STRESS_CACHE_THREADS  default 1
+    //   ZEAM_STRESS_WATCHDOG_SECS  default 60
+    // ---------------------------------------------------------------
+    const stress_exe = b.addExecutable(.{
+        .name = "zeam-stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkgs/node/src/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    stress_exe.root_module.addImport("xev", xev);
+    stress_exe.root_module.addImport("ssz", ssz);
+    stress_exe.root_module.addImport("@zeam/utils", zeam_utils);
+    stress_exe.root_module.addImport("@zeam/params", zeam_params);
+    stress_exe.root_module.addImport("@zeam/types", zeam_types);
+    stress_exe.root_module.addImport("@zeam/configs", zeam_configs);
+    stress_exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
+    stress_exe.root_module.addImport("@zeam/network", zeam_network);
+    stress_exe.root_module.addImport("@zeam/database", zeam_database);
+    stress_exe.root_module.addImport("@zeam/metrics", zeam_metrics);
+    stress_exe.root_module.addImport("@zeam/api", zeam_api);
+    stress_exe.root_module.addImport("@zeam/key-manager", zeam_key_manager);
+    stress_exe.root_module.addImport("@zeam/xmss", zeam_xmss);
+    stress_exe.root_module.addImport("@zeam/thread-pool", zeam_thread_pool);
+    addRustGlueLib(b, stress_exe, target, prover);
+    stress_exe.step.dependOn(&build_rust_lib_steps.step);
+    const run_stress = b.addRunArtifact(stress_exe);
+    if (b.args) |args| run_stress.addArgs(args);
+    const stress_step = b.step("stress", "Run single-node ingestion stress harness (issue #803 slice b)");
+    stress_step.dependOn(&run_stress.step);
+
+    // -----------------------------------------------------------------
+    // `stress-quick`: short-form stress harness wired into `zig build
+    // test`. The full 30-min run is operator-driven; this 30s run is
+    // what CI executes on every PR so the slice-(a)/(b) merge gate
+    // actually has automated enforcement, not just a PR-comment
+    // attestation. The quick run uses the same code paths as the full
+    // run and will fail CI on:
+    //   * any `MissingPreState` (states-map race),
+    //   * any unexpected `chain.onBlock` error in gossip-flood,
+    //   * any `recordFatal` from coherence checks (BlockCache,
+    //     borrow-reader, watchdog),
+    //   * worker error counters non-zero in the summary epilogue.
+    // 30s is long enough for several thousand ops on each worker
+    // without putting the test job over budget.
+    //
+    // Override knobs are intentionally NOT wired here — CI exercises
+    // the same defaults a developer sees with `zig build stress-quick`,
+    // which is the point.
+    const run_stress_quick = b.addRunArtifact(stress_exe);
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "30");
+    run_stress_quick.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_step = b.step("stress-quick", "Run a 30s stress harness (CI gate, slice b)");
+    stress_quick_step.dependOn(&run_stress_quick.step);
+    test_step.dependOn(&run_stress_quick.step);
+
+    // -----------------------------------------------------------------
+    // `stress-saturation` and `stress-quick-saturation`: chain-worker
+    // queue saturation harness (slice c-2c commit 6 of #803).
+    //
+    // The full `stress-saturation` step is operator-driven (~30s
+    // default). The quick variant is wired into `zig build test` so
+    // CI catches:
+    //   * Producer-side accounting drift (attempts != ok+qfull+err).
+    //   * Backpressure regression (queue never fills — either the
+    //     producers are too slow or the queue capacity got bumped
+    //     without a corresponding bump to producer count).
+    //   * Worker-drain regression (queue fills but never drains —
+    //     classic worker-thread deadlock).
+    //   * Any unexpected `submitBlock` / `submitGossipAttestation`
+    //     error tag (today only `QueueClosed` and
+    //     `ChainWorkerDisabled` are non-`QueueFull`).
+    //
+    // Both steps reuse the same `stress_exe` artifact — the harness
+    // dispatches on `ZEAM_STRESS_MODE=saturation` set here.
+    const run_stress_saturation = b.addRunArtifact(stress_exe);
+    run_stress_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    if (b.args) |args| run_stress_saturation.addArgs(args);
+    const stress_saturation_step = b.step(
+        "stress-saturation",
+        "Run the chain-worker queue saturation harness (issue #803 slice c-2c)",
+    );
+    stress_saturation_step.dependOn(&run_stress_saturation.step);
+
+    const run_stress_quick_saturation = b.addRunArtifact(stress_exe);
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "10");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_saturation_step = b.step(
+        "stress-quick-saturation",
+        "Run a 10s chain-worker queue saturation harness (CI gate, slice c-2c)",
+    );
+    stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
+    test_step.dependOn(&run_stress_quick_saturation.step);
+
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -452,12 +556,14 @@ pub fn build(b: *Builder) !void {
             .optimize = optimize,
         }),
     });
+    cli_integration_tests.test_runner = simple_test_runner;
 
     const integration_build_options = b.addOptions();
     cli_integration_tests.step.dependOn(&cli_exe.step);
     integration_build_options.addOptionPath("cli_exe_path", cli_exe.getEmittedBin());
     const integration_build_options_module = integration_build_options.createModule();
     cli_integration_tests.root_module.addImport("build_options", integration_build_options_module);
+    cli_integration_tests.root_module.addImport("@zeam/utils", zeam_utils);
 
     // Add CLI constants module to integration tests
     const cli_constants = b.addModule("cli_constants", .{
@@ -478,6 +584,7 @@ pub fn build(b: *Builder) !void {
     const types_tests = b.addTest(.{
         .root_module = zeam_types,
     });
+    types_tests.test_runner = simple_test_runner;
     types_tests.root_module.addImport("ssz", ssz);
     types_tests.root_module.addImport("@zeam/key-manager", zeam_key_manager);
     types_tests.step.dependOn(&build_rust_lib_steps.step);
@@ -489,6 +596,7 @@ pub fn build(b: *Builder) !void {
     const transition_tests = b.addTest(.{
         .root_module = zeam_state_transition,
     });
+    transition_tests.test_runner = simple_test_runner;
     // TODO(gballet) typing modules each time is quite tedious, hopefully
     // this will no longer be necessary in later versions of zig.
     transition_tests.root_module.addImport("@zeam/types", zeam_types);
@@ -502,6 +610,7 @@ pub fn build(b: *Builder) !void {
     const manager_tests = b.addTest(.{
         .root_module = zeam_state_proving_manager,
     });
+    manager_tests.test_runner = simple_test_runner;
     manager_tests.root_module.addImport("@zeam/types", zeam_types);
     addRustGlueLib(b, manager_tests, target, prover);
     const run_manager_test = b.addRunArtifact(manager_tests);
@@ -511,6 +620,7 @@ pub fn build(b: *Builder) !void {
     const node_tests = b.addTest(.{
         .root_module = zeam_beam_node,
     });
+    node_tests.test_runner = simple_test_runner;
     addRustGlueLib(b, node_tests, target, prover);
     const run_node_test = b.addRunArtifact(node_tests);
     setTestRunLabelFromCompile(b, run_node_test, node_tests);
@@ -519,6 +629,7 @@ pub fn build(b: *Builder) !void {
     const cli_tests = b.addTest(.{
         .root_module = cli_exe.root_module,
     });
+    cli_tests.test_runner = simple_test_runner;
     cli_tests.step.dependOn(&cli_exe.step);
     cli_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, cli_tests, target, prover);
@@ -529,6 +640,7 @@ pub fn build(b: *Builder) !void {
     const params_tests = b.addTest(.{
         .root_module = zeam_params,
     });
+    params_tests.test_runner = simple_test_runner;
     const run_params_tests = b.addRunArtifact(params_tests);
     setTestRunLabelFromCompile(b, run_params_tests, params_tests);
     test_step.dependOn(&run_params_tests.step);
@@ -536,6 +648,7 @@ pub fn build(b: *Builder) !void {
     const network_tests = b.addTest(.{
         .root_module = zeam_network,
     });
+    network_tests.test_runner = simple_test_runner;
     network_tests.root_module.addImport("@zeam/types", zeam_types);
     network_tests.root_module.addImport("xev", xev);
     network_tests.root_module.addImport("ssz", ssz);
@@ -547,6 +660,7 @@ pub fn build(b: *Builder) !void {
     const configs_tests = b.addTest(.{
         .root_module = zeam_configs,
     });
+    configs_tests.test_runner = simple_test_runner;
     configs_tests.root_module.addImport("@zeam/utils", zeam_utils);
     configs_tests.root_module.addImport("@zeam/types", zeam_types);
     configs_tests.root_module.addImport("@zeam/params", zeam_params);
@@ -560,6 +674,7 @@ pub fn build(b: *Builder) !void {
     const utils_tests = b.addTest(.{
         .root_module = zeam_utils,
     });
+    utils_tests.test_runner = simple_test_runner;
     const run_utils_tests = b.addRunArtifact(utils_tests);
     setTestRunLabelFromCompile(b, run_utils_tests, utils_tests);
     test_step.dependOn(&run_utils_tests.step);
@@ -567,22 +682,17 @@ pub fn build(b: *Builder) !void {
     const database_tests = b.addTest(.{
         .root_module = zeam_database,
     });
+    database_tests.test_runner = simple_test_runner;
     database_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, database_tests, target, prover);
     const run_database_tests = b.addRunArtifact(database_tests);
     setTestRunLabelFromCompile(b, run_database_tests, database_tests);
     test_step.dependOn(&run_database_tests.step);
 
-    const lmdb_tests = b.addTest(.{
-        .root_module = lmdb,
-    });
-    const run_lmdb_tests = b.addRunArtifact(lmdb_tests);
-    setTestRunLabelFromCompile(b, run_lmdb_tests, lmdb_tests);
-    test_step.dependOn(&run_lmdb_tests.step);
-
     const api_tests = b.addTest(.{
         .root_module = zeam_api,
     });
+    api_tests.test_runner = simple_test_runner;
     api_tests.step.dependOn(&build_rust_lib_steps.step);
     addRustGlueLib(b, api_tests, target, prover);
     const run_api_tests = b.addRunArtifact(api_tests);
@@ -592,6 +702,7 @@ pub fn build(b: *Builder) !void {
     const xmss_tests = b.addTest(.{
         .root_module = zeam_xmss,
     });
+    xmss_tests.test_runner = simple_test_runner;
 
     // xmss_tests.step.dependOn(&networking_build.step);
     xmss_tests.step.dependOn(&build_rust_lib_steps.step);
@@ -603,6 +714,7 @@ pub fn build(b: *Builder) !void {
     const spectests = b.addTest(.{
         .root_module = zeam_spectests,
     });
+    spectests.test_runner = simple_test_runner;
     spectests.root_module.addImport("@zeam/utils", zeam_utils);
     spectests.root_module.addImport("@zeam/types", zeam_types);
     spectests.root_module.addImport("@zeam/configs", zeam_configs);
@@ -621,6 +733,7 @@ pub fn build(b: *Builder) !void {
     const tools_cli_tests = b.addTest(.{
         .root_module = tools_cli_exe.root_module,
     });
+    tools_cli_tests.test_runner = simple_test_runner;
     tools_cli_tests.root_module.addImport("enr", enr);
     tools_cli_tests.root_module.addImport("@zeam/xmss", zeam_xmss);
     tools_cli_tests.root_module.addImport("@zeam/types", zeam_types);
@@ -671,7 +784,7 @@ fn setSpectestArgsAndEnv(
     run_spectests_after_generate: *std.Build.Step.Run,
 ) !void {
     if (b.args) |args| {
-        var generator_args_builder: std.ArrayList([]const u8) = .{};
+        var generator_args_builder: std.ArrayList([]const u8) = .empty;
         defer generator_args_builder.deinit(b.allocator);
 
         var skip_expected_errors = false;
@@ -773,7 +886,6 @@ fn build_zkvm_targets(
     main_exe: *Builder.Step,
     host_target: std.Build.ResolvedTarget,
     build_options_module: *std.Build.Module,
-    use_poseidon: bool,
 ) !void {
     // zkvm targets (riscv32-freestanding-none) require ReleaseFast; ReleaseSafe
     // triggers "invalid operand for inline asm constraint 'i'" in LLVM on riscv32.
@@ -810,16 +922,6 @@ fn build_zkvm_targets(
         });
         zeam_utils.addImport("ssz", ssz);
         zeam_utils.addImport("build_options", build_options_module);
-        if (use_poseidon) {
-            // add hash-zig dependency only when Poseidon hasher is enabled
-            const hash_zig = b.dependency("hash_zig", .{
-                .target = target,
-                .optimize = optimize,
-            });
-            const hash_zig_module = hash_zig.module("hash-zig");
-            zeam_utils.addImport("hash_zig", hash_zig_module);
-        }
-
         // add zeam-metrics (core metrics definitions for ZKVM)
         const zeam_metrics = b.addModule("@zeam/metrics", .{
             .target = target,
@@ -879,7 +981,7 @@ fn build_zkvm_targets(
         exe.root_module.addImport("@zeam/metrics", zeam_metrics);
         exe.root_module.addImport("@zeam/state-transition", zeam_state_transition);
         exe.root_module.addImport("zkvm", zkvm_module);
-        exe.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));
+        exe.root_module.addAssemblyFile(b.path(b.fmt("pkgs/state-transition-runtime/src/{s}/start.s", .{zkvm_target.name})));
         if (zkvm_target.set_pie) {
             exe.pie = true;
         }

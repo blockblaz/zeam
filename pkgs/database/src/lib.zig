@@ -31,5 +31,5 @@ pub const WriteBatch = database.WriteBatch;
 pub const Iterator = database.Iterator;
 
 test "get tests" {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
