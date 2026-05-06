@@ -145,6 +145,11 @@ const Metrics = struct {
     lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
     lean_chain_queue_depth: LeanChainQueueDepthGauge,
     lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    // Slice c-2b commit 5 of #803: distribution of refcount values across
+    // map-resident BeamState entries at scrape time. Sampled by the chain
+    // via `recordChainStateRefcountDistribution` registered as a
+    // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
+    lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -193,6 +198,14 @@ const Metrics = struct {
     const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
     const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
     const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
+    // value is 1 (writer-only); transient 2-4 under reader concurrency;
+    // values >16 indicate leaked acquires (a reader forgot to release
+    // its borrow). The +Inf bucket is implicit in the Histogram's tail.
+    const LeanChainStateRefcountDistributionHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 4, 8, 16, 32 },
+    );
     // Fork-choice store gauge types
     const LeanGossipSignaturesGauge = metrics_lib.Gauge(u64);
     const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
@@ -609,6 +622,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -669,6 +683,29 @@ pub fn registerScrapeRefresher(refresher: ?*const fn () void) void {
     g_scrape_refresher = refresher;
 }
 
+/// Optional context-bearing pre-scrape refresher. Slice c-2b commit 5 of
+/// #803 (lean_chain_state_refcount_distribution) needed a callback that
+/// receives a `*BeamChain` so the observer could iterate the chain's
+/// in-memory states map under its shared lock and sample each rc's
+/// refcount. The first-form `g_scrape_refresher` slot above is
+/// `void → void` (used for FFI-backed atomic counters that need no
+/// context); rather than coerce the chain into a global, we expose a
+/// parallel slot that takes an opaque pointer back to the caller. The
+/// two slots are independent and both run on every scrape (the FFI
+/// refresher first, then the context-bearing one).
+var g_scrape_refresher_ctx: ?*const fn (?*anyopaque) void = null;
+var g_scrape_refresher_ctx_ptr: ?*anyopaque = null;
+
+/// Register (or replace) a context-bearing scrape refresher. Pass `null`
+/// for `refresher` to clear (the ctx pointer is also cleared).
+pub fn registerScrapeRefresherCtx(
+    ctx: ?*anyopaque,
+    refresher: ?*const fn (?*anyopaque) void,
+) void {
+    g_scrape_refresher_ctx = refresher;
+    g_scrape_refresher_ctx_ptr = if (refresher == null) null else ctx;
+}
+
 /// Writes metrics to a writer (for Prometheus endpoint).
 pub fn writeMetrics(writer: *std.Io.Writer) !void {
     if (!g_initialized) return error.NotInitialized;
@@ -682,6 +719,10 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     // Pull in any externally-owned counters (e.g. Rust-side libp2p drops)
     // before serializing so each scrape returns up-to-date values.
     if (g_scrape_refresher) |refresher| refresher();
+    // Context-bearing refresher (slice c-2b commit 5 of #803): runs
+    // after the void-refresher so a future contributor can rely on
+    // ordering when the two refreshers' outputs share buckets/labels.
+    if (g_scrape_refresher_ctx) |refresher| refresher(g_scrape_refresher_ctx_ptr);
 
     try metrics_lib.write(&metrics, writer);
 }

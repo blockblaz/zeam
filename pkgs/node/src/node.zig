@@ -129,6 +129,17 @@ pub const BeamNode = struct {
         if (opts.chain_worker_enabled) {
             try chain.startChainWorker();
         }
+
+        // Slice c-2b commit 5 of #803: register the
+        // `lean_chain_state_refcount_distribution` scrape refresher
+        // with the chain at its final heap address. The refresher
+        // iterates `chain.states` under the shared lock and samples
+        // `rc.count()` for each entry; surfaces leaked acquires (any
+        // entry stuck >16) on the /metrics endpoint. Cleared in
+        // `chain.deinit` so the metrics module never calls back into
+        // freed chain memory.
+        chain.startChainStateRefcountObserver();
+
         // Now that the chain is at its final heap location, point the logger config
         // at the forkchoice slot clock so every log line carries slot/interval context.
         opts.logger_config.slot_clock = &chain.forkChoice.fcStore.slot_clock;

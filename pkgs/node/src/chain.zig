@@ -550,6 +550,13 @@ pub const BeamChain = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clear the refcount-distribution scrape refresher BEFORE any
+        // chain state is torn down so the metrics endpoint cannot call
+        // back into freed memory between deinit phases. (Idempotent:
+        // safe to call even if startChainStateRefcountObserver was
+        // never called.)
+        self.stopChainStateRefcountObserver();
+
         // Stop and free the chain-worker FIRST (before any chain
         // state the worker's handler thunks may touch is freed).
         // `stop()` is idempotent and joins the worker thread; after
@@ -964,6 +971,108 @@ pub const BeamChain = struct {
             return entry.value;
         }
         return null;
+    }
+
+    /// Sample `rc.count()` for every entry in `BeamChain.states` and
+    /// emit one observation per entry into the
+    /// `lean_chain_state_refcount_distribution` histogram. Slice c-2b
+    /// commit 5 of #803.
+    ///
+    /// Pattern: take `states_lock.shared` for the iteration only, drop
+    /// the lock before observing values (no allocations or fallible
+    /// ops happen inside the critical section). The lock hold span is
+    /// O(N) in the number of map entries; under c-2b this stays small
+    /// (≤ the un-pruned post-finalized state set, typically O(1) to O(10)).
+    ///
+    /// Infallible: any iteration failure path would silently drop the
+    /// scrape sample rather than crash the metrics endpoint. The
+    /// histogram observe() call is itself infallible (the metrics-lib
+    /// histogram type is non-vector, so no labels-allocation).
+    ///
+    /// Wired into the `/metrics` pre-scrape path via a context-bearing
+    /// scrape refresher: `BeamChain.startChainStateRefcountObserver()`
+    /// (called from `init` after the chain is at its final heap
+    /// address) registers this method against `zeam_metrics`'s
+    /// `g_scrape_refresher_ctx` slot.
+    pub fn recordChainStateRefcountDistribution(self: *Self) void {
+        // Snapshot the per-entry counts under the shared lock into a
+        // small stack buffer when possible. For larger maps we fall
+        // back to observing under the lock; the observe call is just
+        // an atomic-ish bucket increment, no allocations, no IO.
+        //
+        // The buffered-snapshot path is the safer shape: it minimizes
+        // the lock hold span. The on-stack buffer is sized for the
+        // expected upper bound on devnet (un-pruned post-finalized
+        // states + cached anchor) plus headroom.
+        var buf: [128]u32 = undefined;
+        var n: usize = 0;
+        var overflow = false;
+
+        self.states_lock.lockShared();
+        var it = self.states.valueIterator();
+        while (it.next()) |rc_ptr| {
+            const rc: *RcBeamState = rc_ptr.*;
+            if (n < buf.len) {
+                buf[n] = rc.count();
+                n += 1;
+            } else {
+                // Map has more entries than the stack buffer can
+                // hold; emit the rest under the lock. This is a
+                // graceful degradation — the lock hold span grows
+                // with map size, but since we don't allocate or do
+                // IO it stays bounded by the map size.
+                overflow = true;
+                zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+                    @floatFromInt(rc.count()),
+                );
+            }
+        }
+        self.states_lock.unlockShared();
+
+        // Observe the buffered samples outside the critical section.
+        for (buf[0..n]) |c| {
+            zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+                @floatFromInt(c),
+            );
+        }
+        // Log the overflow case once per scrape so devnet operators
+        // notice maps growing past the buffer; not fatal.
+        if (overflow) {
+            self.logger.debug(
+                "recordChainStateRefcountDistribution: map size exceeded stack buffer ({d}), emitted overflow samples under lock",
+                .{buf.len},
+            );
+        }
+    }
+
+    /// Trampoline for the context-bearing scrape refresher. The opaque
+    /// `ctx` pointer is the `*BeamChain` registered in `init`.
+    fn chainStateRefcountScrapeRefresher(ctx: ?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx orelse return));
+        self.recordChainStateRefcountDistribution();
+    }
+
+    /// Register this chain as the source for the
+    /// `lean_chain_state_refcount_distribution` scrape refresher.
+    /// Called from `init` after the chain is at its final heap address
+    /// so the refresher's ctx pointer is stable.
+    ///
+    /// Idempotent across init/deinit cycles within a single process:
+    /// `deinit` clears the refresher slot. Note that the metrics
+    /// module holds a single context-bearing refresher slot; if a
+    /// second BeamChain is initialized in the same process (e.g. test
+    /// harnesses spinning multiple chains) the second init silently
+    /// replaces the first registration. Today only one chain is alive
+    /// per process; revisit if that changes.
+    pub fn startChainStateRefcountObserver(self: *Self) void {
+        zeam_metrics.registerScrapeRefresherCtx(self, &chainStateRefcountScrapeRefresher);
+    }
+
+    /// Clear this chain's refcount-distribution scrape refresher. Idempotent.
+    /// Called from `deinit` so the metrics module does not call back into
+    /// freed chain memory after teardown.
+    pub fn stopChainStateRefcountObserver(_: *Self) void {
+        zeam_metrics.registerScrapeRefresherCtx(null, null);
     }
 
     pub fn registerValidatorIds(self: *Self, validator_ids: []usize) void {

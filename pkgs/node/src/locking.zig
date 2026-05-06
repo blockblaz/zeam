@@ -1601,6 +1601,108 @@ test "BorrowedState: cloneAndRelease against Backing.none + acquired_rc releases
     rc.release();
 }
 
+test "lean_chain_state_refcount_distribution: writer + N readers shape (slice c-2b commit 5)" {
+    // Slice c-2b commit 5 of #803: the
+    // `lean_chain_state_refcount_distribution` histogram is updated by
+    // a scrape-time observer that samples `rc.count()` for every
+    // map-resident BeamState. This audit-pattern test verifies the
+    // distribution shape end-to-end without spinning a full BeamChain:
+    //   1. Create N RcBeamStates (writer-only — each refcount=1).
+    //   2. Observe each into the histogram — simulates the
+    //      scrape-time observer's per-entry observe call.
+    //   3. Have N readers acquireConst on each rc (refcount=2) and
+    //      observe again — simulates a scrape during reader
+    //      concurrency.
+    //   4. Drop all reader acquires (refcount=1) and observe again.
+    //   5. Release writer copies (refcount=0 — frees).
+    //   6. Scrape /metrics: the histogram series MUST be present, the
+    //      `_count` line MUST equal 3*N (three observation rounds of N
+    //      samples each).
+    //
+    // Test uses page_allocator for the same reason
+    // `LockTimer: ... metrics output` does — the histogram bucket
+    // backing storage outlives this test.
+    try zeam_metrics.init(std.heap.page_allocator);
+
+    const N: usize = 4;
+    var rcs: [N]*rc_beam_state.RcBeamState = undefined;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const state = try makeTestStateForBorrowed();
+        rcs[i] = try rc_beam_state.RcBeamState.create(testing.allocator, state);
+    }
+    defer {
+        for (rcs) |rc| rc.release();
+    }
+
+    // Snapshot the histogram count BEFORE we observe anything so we
+    // can assert the delta. The histogram series may already have
+    // observations from earlier tests in this binary.
+    var alloc_writer1 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer1.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer1.writer);
+    const body_pre = alloc_writer1.writer.buffered();
+    const count_before = parseHistogramCount(body_pre, "lean_chain_state_refcount_distribution");
+
+    // Round 1: writer-only (refcount=1 for every entry).
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 1), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+
+    // Round 2: each rc has one reader acquire (refcount=2).
+    var reader_views: [N]*const rc_beam_state.RcBeamState = undefined;
+    for (rcs, 0..) |rc, k| reader_views[k] = rc.acquireConst();
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 2), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+    // Drop the reader acquires.
+    for (reader_views) |v| v.release();
+
+    // Round 3: back to writer-only (refcount=1).
+    for (rcs) |rc| {
+        try testing.expectEqual(@as(u32, 1), rc.count());
+        zeam_metrics.metrics.lean_chain_state_refcount_distribution.observe(
+            @floatFromInt(rc.count()),
+        );
+    }
+
+    // Scrape and verify the histogram count grew by exactly 3*N.
+    var alloc_writer2 = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer2.deinit();
+    try zeam_metrics.writeMetrics(&alloc_writer2.writer);
+    const body_post = alloc_writer2.writer.buffered();
+
+    // Series MUST be advertised.
+    try testing.expect(std.mem.indexOf(u8, body_post, "lean_chain_state_refcount_distribution") != null);
+    // `_count` line MUST be present.
+    try testing.expect(std.mem.indexOf(u8, body_post, "lean_chain_state_refcount_distribution_count") != null);
+
+    const count_after = parseHistogramCount(body_post, "lean_chain_state_refcount_distribution");
+    try testing.expectEqual(count_before + 3 * @as(u64, @intCast(N)), count_after);
+}
+
+/// Tiny Prometheus-text parser: locate the `_count` line for a series
+/// name and return its u64 value, or 0 if not found. Tolerates labeled
+/// and unlabeled forms (the histogram in question is unlabeled).
+fn parseHistogramCount(body: []const u8, comptime series: []const u8) u64 {
+    const needle = series ++ "_count";
+    const idx = std.mem.indexOf(u8, body, needle) orelse return 0;
+    // Find the end of the line.
+    const end = std.mem.indexOfScalarPos(u8, body, idx, '\n') orelse body.len;
+    const line = body[idx..end];
+    // The count is the last whitespace-separated token on the line.
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    var last: []const u8 = "";
+    while (it.next()) |tok| last = tok;
+    return std.fmt.parseInt(u64, last, 10) catch 0;
+}
+
 test "BorrowedState: cloneAndRelease against Backing.none + acquired_rc returns owned state and releases rc" {
     // Success path: cloneAndRelease must return an owned BeamState
     // copy AND release the acquired_rc as part of self.deinit() on
