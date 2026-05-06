@@ -206,7 +206,20 @@ pub const Node = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
-        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+        // `parseFromSlice` allocates string fields inside the `Parsed` arena.
+        // The slice headers it returns alias arena memory; `chain_config` later
+        // owns these fields and `ChainSpec.deinit(allocator)` calls
+        // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
+        // must move both fields out of the arena onto the top-level allocator
+        // before dropping the arena, otherwise shutdown panics with
+        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
+        defer parsed.deinit();
+        var chain_options = parsed.value;
+        chain_options.name = try allocator.dupe(u8, chain_options.name.?);
+        errdefer if (chain_options.name) |n| allocator.free(n);
+        chain_options.fork_digest = try allocator.dupe(u8, chain_options.fork_digest.?);
+        errdefer if (chain_options.fork_digest) |d| allocator.free(d);
         chain_options.genesis_time = options.genesis_spec.genesis_time;
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
