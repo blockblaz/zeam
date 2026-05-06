@@ -94,6 +94,11 @@ pub const NodeOptions = struct {
     attestation_committee_count: ?u64 = null,
     max_attestations_data: ?u8 = null,
     db_backend: database.Backend = .rocksdb,
+    /// Slice c-2b commit 3 of #803: route producer-side gossip
+    /// handlers through the chain-worker queue. Default `false`
+    /// preserves slice-(b) synchronous behavior. Surfaced as
+    /// `--chain-worker` on the `zeam node` CLI.
+    chain_worker_enabled: bool = false,
 
     pub fn deinit(self: *NodeOptions, allocator: std.mem.Allocator) void {
         for (self.bootnodes) |b| allocator.free(b);
@@ -237,7 +242,6 @@ pub const Node = struct {
             .connect_peers = addresses.connect_peers,
             .local_private_key = options.local_priv_key,
             .node_registry = options.node_registry,
-            .attestation_committee_count = chain_config.spec.attestation_committee_count,
         }, options.logger_config.logger(.network));
         errdefer self.network.deinit();
         self.clock = try Clock.init(allocator, chain_config.genesis.genesis_time, &self.loop, options.logger_config);
@@ -360,6 +364,7 @@ pub const Node = struct {
             .is_aggregator = options.is_aggregator,
             .aggregation_subnet_ids = options.aggregation_subnet_ids,
             .thread_pool = self.thread_pool,
+            .chain_worker_enabled = options.chain_worker_enabled,
         });
         errdefer self.beam_node.deinit();
 
@@ -431,8 +436,14 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        try self.network.run();
+        // Order matters: BeamNode.run() registers gossip handlers (and thereby
+        // declares which subnets we want to be on). EthLibp2p.run() reads that
+        // set to decide which gossipsub topics to subscribe to. Reversing the
+        // order would either subscribe to an empty topic set or — historically
+        // — fall back to subscribing to *all* subnets, defeating the bandwidth
+        // savings of attestation subnets.
         try self.beam_node.run();
+        try self.network.run();
 
         const ascii_art =
             \\  ███████████████████████████████████████████████████████
@@ -755,6 +766,7 @@ pub fn buildStartOptions(
     opts.hash_sig_key_dir = hash_sig_key_dir;
     opts.checkpoint_sync_url = node_cmd.@"checkpoint-sync-url";
     opts.is_aggregator = node_cmd.@"is-aggregator";
+    opts.chain_worker_enabled = node_cmd.@"chain-worker";
 
     // Parse --aggregate-subnet-ids (comma-separated list of subnet ids, e.g. "0,1,2")
     // Require --is-aggregator to be set when --aggregate-subnet-ids is provided.

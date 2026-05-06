@@ -122,8 +122,42 @@ const Metrics = struct {
     // Wait time = how long a callsite blocked before acquiring BeamNode.mutex.
     // Hold time = how long the callsite kept the mutex locked.
     // Labeled by callsite so we can attribute stalls to onInterval vs onGossip vs req-resp paths.
+    //
+    // Slice (a-2) of the threading refactor double-emits into these two
+    // histograms via a code-side derived shim (see `pkgs/node/src/locking.zig`
+    // LockTimer). The shim keeps existing dashboards working for one release
+    // while operators migrate to `zeam_lock_{wait,hold}_seconds{lock,site}`.
+    // Drop these two series in the release after slice (a) lands.
     zeam_node_mutex_wait_time_seconds: NodeMutexWaitTimeHistogram,
     zeam_node_mutex_hold_time_seconds: NodeMutexHoldTimeHistogram,
+    // Per-resource lock contention metrics (slice a-2 of #803). Wait/hold
+    // time labeled by both `lock` (states, pending_blocks, pubkey_cache,
+    // root_to_slot, events, block_cache, ...) and `site` (callsite). The
+    // legacy `zeam_node_mutex_*` series above is double-emitted into for one
+    // release.
+    zeam_lock_wait_seconds: LockWaitTimeHistogram,
+    zeam_lock_hold_seconds: LockHoldTimeHistogram,
+    // Histogram of how many iterations `chain.processPendingBlocks` ran
+    // through (slice a-2 doc §Worst-case complexity note). Provides the
+    // measurement floor before deciding whether to bound the queue or add
+    // a cursor optimisation.
+    lean_pending_blocks_drain_iters: PendingBlocksDrainItersHistogram,
+    // Chain-worker queue + loop metrics (slice c-1 of #803).
+    //   * `_dropped_total{queue="block"|"attestation"}` — producer
+    //     `trySend` rejections when the queue was full.
+    //   * `_depth{queue="..."}` — instantaneous queue depth, set on
+    //     successful sends; for backlog visibility on devnet stress.
+    //   * `lean_chain_worker_loop_iters_total` — worker-loop liveness
+    //     counter; external watchdogs use the delta between scrapes
+    //     to detect stalls without touching queue state.
+    lean_chain_queue_dropped_total: LeanChainQueueDroppedCounter,
+    lean_chain_queue_depth: LeanChainQueueDepthGauge,
+    lean_chain_worker_loop_iters_total: LeanChainWorkerLoopItersCounter,
+    // Slice c-2b commit 5 of #803: distribution of refcount values across
+    // map-resident BeamState entries at scrape time. Sampled by the chain
+    // via `recordChainStateRefcountDistribution` registered as a
+    // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
+    lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -169,6 +203,18 @@ const Metrics = struct {
     const LeanForkChoiceReorgDepthHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 });
     // Finalization metric types
     const LeanFinalizationsTotalCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    // Chain-worker queue + loop metric types (slice c-1 of #803).
+    const LeanChainQueueDroppedCounter = metrics_lib.CounterVec(u64, struct { queue: []const u8 });
+    const LeanChainQueueDepthGauge = metrics_lib.GaugeVec(u64, struct { queue: []const u8 });
+    const LeanChainWorkerLoopItersCounter = metrics_lib.Counter(u64);
+    // Refcount-distribution buckets [1, 2, 4, 8, 16, 32, +Inf]. Typical
+    // value is 1 (writer-only); transient 2-4 under reader concurrency;
+    // values >16 indicate leaked acquires (a reader forgot to release
+    // its borrow). The +Inf bucket is implicit in the Histogram's tail.
+    const LeanChainStateRefcountDistributionHistogram = metrics_lib.Histogram(
+        f32,
+        &[_]f32{ 1, 2, 4, 8, 16, 32 },
+    );
     // Fork-choice store gauge types
     const LeanGossipSignaturesGauge = metrics_lib.Gauge(u64);
     const LeanLatestNewAggregatedPayloadsGauge = metrics_lib.Gauge(u64);
@@ -202,6 +248,12 @@ const Metrics = struct {
     const NODE_MUTEX_BUCKETS = [_]f32{ 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2 };
     const NodeMutexWaitTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
     const NodeMutexHoldTimeHistogram = metrics_lib.HistogramVec(f32, NodeMutexLabel, &NODE_MUTEX_BUCKETS);
+    // Per-resource lock contention histograms (slice a-2)
+    const LockLabel = struct { lock: []const u8, site: []const u8 };
+    const LockWaitTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
+    const LockHoldTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
+    // pending_blocks drain iteration histogram type (slice a-2)
+    const PendingBlocksDrainItersHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -379,6 +431,12 @@ fn observeForkChoiceTickIntervalDuration(ctx: ?*anyopaque, value: f32) void {
     histogram.observe(value);
 }
 
+fn observePendingBlocksDrainIters(ctx: ?*anyopaque, value: f32) void {
+    const histogram_ptr = ctx orelse return;
+    const histogram: *Metrics.PendingBlocksDrainItersHistogram = @ptrCast(@alignCast(histogram_ptr));
+    histogram.observe(value);
+}
+
 /// The public variables the application interacts with.
 /// Calling `.start()` on these will start a new timer.
 pub var zeam_chain_onblock_duration_seconds: Histogram = .{
@@ -471,6 +529,10 @@ pub var zeam_fork_choice_tick_interval_duration_seconds: Histogram = .{
     .context = null,
     .observe = &observeForkChoiceTickIntervalDuration,
 };
+pub var lean_pending_blocks_drain_iters: Histogram = .{
+    .context = null,
+    .observe = &observePendingBlocksDrainIters,
+};
 
 /// Initializes the metrics system. Must be called once at startup.
 pub fn init(allocator: std.mem.Allocator) !void {
@@ -560,8 +622,17 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_tick_interval_duration_seconds = Metrics.TickIntervalDurationHistogram.init("lean_tick_interval_duration_seconds", .{ .help = "Elapsed time between clock ticks in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         .zeam_fork_choice_tick_interval_duration_seconds = Metrics.ForkChoiceTickIntervalDurationHistogram.init("zeam_fork_choice_tick_interval_duration_seconds", .{ .help = "Elapsed time between forkchoice tick calls in seconds (nominal 0.8s = 4s slot / 5 intervals)" }, .{}),
         // BeamNode mutex contention metrics (issue #786)
-        .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite" }, .{}),
-        .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite" }, .{}),
+        .zeam_node_mutex_wait_time_seconds = try Metrics.NodeMutexWaitTimeHistogram.init(allocator, io, "zeam_node_mutex_wait_time_seconds", .{ .help = "Time spent waiting to acquire BeamNode.mutex, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
+        .zeam_node_mutex_hold_time_seconds = try Metrics.NodeMutexHoldTimeHistogram.init(allocator, io, "zeam_node_mutex_hold_time_seconds", .{ .help = "Time BeamNode.mutex was held, labeled by callsite (LEGACY — double-emitted from per-resource locks; will be removed after one release)." }, .{}),
+        // Per-resource lock contention metrics (slice a-2 of #803).
+        .zeam_lock_wait_seconds = try Metrics.LockWaitTimeHistogram.init(allocator, io, "zeam_lock_wait_seconds", .{ .help = "Time spent waiting to acquire a per-resource lock, labeled by lock and callsite." }, .{}),
+        .zeam_lock_hold_seconds = try Metrics.LockHoldTimeHistogram.init(allocator, io, "zeam_lock_hold_seconds", .{ .help = "Time a per-resource lock was held, labeled by lock and callsite." }, .{}),
+        .lean_pending_blocks_drain_iters = Metrics.PendingBlocksDrainItersHistogram.init("lean_pending_blocks_drain_iters", .{ .help = "Number of iterations chain.processPendingBlocks ran through before draining the queue or finding nothing ready." }, .{}),
+        // Chain-worker queue + loop metrics (slice c-1 of #803).
+        .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
+        .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
+        .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
+        .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -600,6 +671,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
     zeam_compact_attestations_time_seconds.context = @ptrCast(&metrics.zeam_compact_attestations_time_seconds);
     lean_tick_interval_duration_seconds.context = @ptrCast(&metrics.lean_tick_interval_duration_seconds);
     zeam_fork_choice_tick_interval_duration_seconds.context = @ptrCast(&metrics.zeam_fork_choice_tick_interval_duration_seconds);
+    lean_pending_blocks_drain_iters.context = @ptrCast(&metrics.lean_pending_blocks_drain_iters);
     // Initialize sync status to idle at startup
     try metrics.lean_node_sync_status.set(.{ .status = "idle" }, 1);
     try metrics.lean_node_sync_status.set(.{ .status = "syncing" }, 0);
@@ -621,6 +693,29 @@ pub fn registerScrapeRefresher(refresher: ?*const fn () void) void {
     g_scrape_refresher = refresher;
 }
 
+/// Optional context-bearing pre-scrape refresher. Slice c-2b commit 5 of
+/// #803 (lean_chain_state_refcount_distribution) needed a callback that
+/// receives a `*BeamChain` so the observer could iterate the chain's
+/// in-memory states map under its shared lock and sample each rc's
+/// refcount. The first-form `g_scrape_refresher` slot above is
+/// `void → void` (used for FFI-backed atomic counters that need no
+/// context); rather than coerce the chain into a global, we expose a
+/// parallel slot that takes an opaque pointer back to the caller. The
+/// two slots are independent and both run on every scrape (the FFI
+/// refresher first, then the context-bearing one).
+var g_scrape_refresher_ctx: ?*const fn (?*anyopaque) void = null;
+var g_scrape_refresher_ctx_ptr: ?*anyopaque = null;
+
+/// Register (or replace) a context-bearing scrape refresher. Pass `null`
+/// for `refresher` to clear (the ctx pointer is also cleared).
+pub fn registerScrapeRefresherCtx(
+    ctx: ?*anyopaque,
+    refresher: ?*const fn (?*anyopaque) void,
+) void {
+    g_scrape_refresher_ctx = refresher;
+    g_scrape_refresher_ctx_ptr = if (refresher == null) null else ctx;
+}
+
 /// Writes metrics to a writer (for Prometheus endpoint).
 pub fn writeMetrics(writer: *std.Io.Writer) !void {
     if (!g_initialized) return error.NotInitialized;
@@ -634,6 +729,10 @@ pub fn writeMetrics(writer: *std.Io.Writer) !void {
     // Pull in any externally-owned counters (e.g. Rust-side libp2p drops)
     // before serializing so each scrape returns up-to-date values.
     if (g_scrape_refresher) |refresher| refresher();
+    // Context-bearing refresher (slice c-2b commit 5 of #803): runs
+    // after the void-refresher so a future contributor can rely on
+    // ordering when the two refreshers' outputs share buckets/labels.
+    if (g_scrape_refresher_ctx) |refresher| refresher(g_scrape_refresher_ctx_ptr);
 
     try metrics_lib.write(&metrics, writer);
 }
