@@ -206,7 +206,20 @@ pub const Node = struct {
             .ignore_unknown_fields = true,
             .allocate = .alloc_if_needed,
         };
-        var chain_options = (try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options)).value;
+        // `parseFromSlice` allocates string fields inside the `Parsed` arena.
+        // The slice headers it returns alias arena memory; `chain_config` later
+        // owns these fields and `ChainSpec.deinit(allocator)` calls
+        // `allocator.free(self.name)` / `allocator.free(self.fork_digest)`. We
+        // must move both fields out of the arena onto the top-level allocator
+        // before dropping the arena, otherwise shutdown panics with
+        // "Invalid free" once `chain.deinit -> config.deinit` runs (see #831).
+        const parsed = try json.parseFromSlice(ChainOptions, allocator, chain_spec, json_options);
+        defer parsed.deinit();
+        var chain_options = parsed.value;
+        chain_options.name = try allocator.dupe(u8, chain_options.name.?);
+        errdefer if (chain_options.name) |n| allocator.free(n);
+        chain_options.fork_digest = try allocator.dupe(u8, chain_options.fork_digest.?);
+        errdefer if (chain_options.fork_digest) |d| allocator.free(d);
         chain_options.genesis_time = options.genesis_spec.genesis_time;
 
         // Set validator pubkeys from genesis_spec (read from config.yaml via genesisConfigFromYAML)
@@ -436,14 +449,16 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        // Order matters: BeamNode.run() registers gossip handlers (and thereby
-        // declares which subnets we want to be on). EthLibp2p.run() reads that
-        // set to decide which gossipsub topics to subscribe to. Reversing the
-        // order would either subscribe to an empty topic set or — historically
-        // — fall back to subscribing to *all* subnets, defeating the bandwidth
-        // savings of attestation subnets.
-        try self.beam_node.run();
+        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
+        // `SwarmCommand::SubscribeGossip` on the per-network command channel.
+        // That channel only exists after `EthLibp2p.run()` returns from
+        // `wait_for_network_ready`. Reversing the order drops every subscribe
+        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // command already does network-first; this is the matching swap for
+        // the production node path.
         try self.network.run();
+        try self.beam_node.run();
 
         const ascii_art =
             \\  ███████████████████████████████████████████████████████

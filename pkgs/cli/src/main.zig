@@ -418,7 +418,17 @@ fn mainInner(init: std.process.Init) !void {
                 .ignore_unknown_fields = true,
                 .allocate = .alloc_if_needed,
             };
-            var chain_options = (try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options)).value;
+            // See pkgs/cli/src/node.zig (and #831): `parseFromSlice` returns
+            // string fields aliased into the `Parsed` arena. `ChainSpec.deinit`
+            // later calls `allocator.free` on `name` / `fork_digest`, so move
+            // both fields onto the top-level allocator before the arena dies.
+            const parsed = try json.parseFromSlice(ChainOptions, gpa.allocator(), chain_spec, options);
+            defer parsed.deinit();
+            var chain_options = parsed.value;
+            chain_options.name = try gpa.allocator().dupe(u8, chain_options.name.?);
+            errdefer if (chain_options.name) |n| gpa.allocator().free(n);
+            chain_options.fork_digest = try gpa.allocator().dupe(u8, chain_options.fork_digest.?);
+            errdefer if (chain_options.fork_digest) |d| gpa.allocator().free(d);
 
             // Create key manager FIRST to get validator pubkeys for genesis
             // Using 3 validators for 3-node setup with initial sync testing
