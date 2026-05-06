@@ -509,6 +509,45 @@ pub fn build(b: *Builder) !void {
     stress_quick_step.dependOn(&run_stress_quick.step);
     test_step.dependOn(&run_stress_quick.step);
 
+    // -----------------------------------------------------------------
+    // `stress-saturation` and `stress-quick-saturation`: chain-worker
+    // queue saturation harness (slice c-2c commit 6 of #803).
+    //
+    // The full `stress-saturation` step is operator-driven (~30s
+    // default). The quick variant is wired into `zig build test` so
+    // CI catches:
+    //   * Producer-side accounting drift (attempts != ok+qfull+err).
+    //   * Backpressure regression (queue never fills — either the
+    //     producers are too slow or the queue capacity got bumped
+    //     without a corresponding bump to producer count).
+    //   * Worker-drain regression (queue fills but never drains —
+    //     classic worker-thread deadlock).
+    //   * Any unexpected `submitBlock` / `submitGossipAttestation`
+    //     error tag (today only `QueueClosed` and
+    //     `ChainWorkerDisabled` are non-`QueueFull`).
+    //
+    // Both steps reuse the same `stress_exe` artifact — the harness
+    // dispatches on `ZEAM_STRESS_MODE=saturation` set here.
+    const run_stress_saturation = b.addRunArtifact(stress_exe);
+    run_stress_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    if (b.args) |args| run_stress_saturation.addArgs(args);
+    const stress_saturation_step = b.step(
+        "stress-saturation",
+        "Run the chain-worker queue saturation harness (issue #803 slice c-2c)",
+    );
+    stress_saturation_step.dependOn(&run_stress_saturation.step);
+
+    const run_stress_quick_saturation = b.addRunArtifact(stress_exe);
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_MODE", "saturation");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_DURATION_SECS", "10");
+    run_stress_quick_saturation.setEnvironmentVariable("ZEAM_STRESS_WATCHDOG_SECS", "15");
+    const stress_quick_saturation_step = b.step(
+        "stress-quick-saturation",
+        "Run a 10s chain-worker queue saturation harness (CI gate, slice c-2c)",
+    );
+    stress_quick_saturation_step.dependOn(&run_stress_quick_saturation.step);
+    test_step.dependOn(&run_stress_quick_saturation.step);
+
     // CLI integration tests (separate target) - always create this test target
     const cli_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
