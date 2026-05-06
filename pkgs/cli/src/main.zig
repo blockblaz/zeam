@@ -76,9 +76,16 @@ pub const NodeCommand = struct {
     @"aggregate-subnet-ids": ?[]const u8 = null,
     @"db-backend": database.Backend = .rocksdb,
     /// Slice c-2b commit 3 of #803: route producer-side gossip
-    /// handlers through the chain-worker queue. Default `false`
-    /// preserves slice-(b) synchronous behavior.
-    @"chain-worker": bool = false,
+    /// handlers through the chain-worker queue. Default `.on`
+    /// post-c-2b/c-2c merge (PR #828 follow-up): the chain-worker
+    /// is the prod path; `.off` is the kill-switch.
+    ///
+    /// Value-taking flag: `--chain-worker on|off`. NOT a
+    /// presence-only bool, NOT `--chain-worker=on` syntax — the
+    /// simargs parser uses enum tag names verbatim, identical to
+    /// the `--db-backend rocksdb|lmdb` shape. See
+    /// `node_lib.ChainWorkerMode`.
+    @"chain-worker": node_lib.ChainWorkerMode = .on,
 
     pub const __shorts__ = .{
         .help = .h,
@@ -102,7 +109,7 @@ pub const NodeCommand = struct {
         .@"attestation-committee-count" = "Number of attestation committees (subnets); overrides config.yaml ATTESTATION_COMMITTEE_COUNT",
         .@"aggregate-subnet-ids" = "Comma-separated list of subnet ids to additionally subscribe and aggregate gossip attestations (e.g. '0,1,2'); adds to automatic computation from validator ids",
         .@"db-backend" = "Database backend to use for on-disk state: 'rocksdb' (default) or 'lmdb'",
-        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread. Off by default; the synchronous path stays in place when disabled.",
+        .@"chain-worker" = "Route gossip block + attestation handlers through the dedicated chain-worker thread (slice c-2b/c-2c, zeam #803). Values: 'on' (default, prod path) or 'off' (kill-switch / legacy synchronous path).",
         .help = "Show help information for the node command",
     };
 };

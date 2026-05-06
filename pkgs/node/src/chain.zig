@@ -226,11 +226,12 @@ pub const BeamChain = struct {
     /// worker thread serialises the actual chain mutations.
     /// When null, callers fall through to the synchronous path
     /// (current behavior). Surface flipped by
-    /// `ChainOpts.chain_worker_enabled`; CLI flag
-    /// `--chain-worker=on|off`.
+    /// `BeamNodeOpts.chain_worker` (mode `.on` / `.off`); CLI flag
+    /// `--chain-worker on|off`.
     ///
-    /// Lifecycle: allocated + started in `init` when
-    /// `chain_worker_enabled` is true; stopped + freed in `deinit`.
+    /// Lifecycle: allocated + started in `BeamNode.init` when
+    /// `BeamNodeOpts.chain_worker.isEnabled()` is true; stopped
+    /// + freed in `deinit`.
     /// The worker borrows `*BeamChain` as its handler ctx, so the
     /// chain MUST outlive the worker — hence the strict
     /// stop/deinit/destroy ordering at the top of `BeamChain.deinit`.
@@ -586,7 +587,7 @@ pub const BeamChain = struct {
         // Clean up cached finalized state if present.
         // Slice c-2b commit 4: cached_finalized_state is an
         // RcBeamState now — release drives state.deinit + destroy when
-        // refcount reaches 0. Under chain_worker_enabled the cache may
+        // refcount reaches 0. Under chain_worker mode `.on` the cache may
         // have outstanding reader acquires; the rc keeps the underlying
         // allocation alive until the last reader releases. (At deinit
         // time we are single-threaded by contract, so refcount=1 in
@@ -662,7 +663,7 @@ pub const BeamChain = struct {
     ///     entire point of the c-2b migration.
     ///
     ///   * `chain_worker == null` (kill-switch / backward-compat under
-    ///     `--chain-worker=off`): keep the legacy lock-based borrow.
+    ///     `--chain-worker off`): keep the legacy lock-based borrow.
     ///     The shared lock is held for the borrow lifetime; map mutation
     ///     by the gossip/req-resp paths is gated by the exclusive side
     ///     as before. Slice (b) semantics are preserved exactly.

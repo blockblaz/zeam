@@ -46,13 +46,40 @@ const NodeOpts = struct {
     /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
     /// When non-null it is shared across all nodes in the same process.
     thread_pool: ?*ThreadPool = null,
-    /// Slice c-2b commit 3 of #803: when true, the chain spawns a
+    /// Slice c-2b commit 3 of #803: when `.on`, the chain spawns a
     /// dedicated worker thread and producer-side handlers for
     /// gossip blocks / attestations route through its bounded
     /// queues instead of running synchronously on the libp2p
-    /// thread. Default `false` preserves slice-(b) behavior.
-    /// Surfaced to the CLI as `--chain-worker=on|off` (bool).
-    chain_worker_enabled: bool = false,
+    /// thread. When `.off`, the legacy slice-(b) synchronous path
+    /// is in effect (kill-switch).
+    ///
+    /// Default flipped from `.off` to `.on` post-merge of PR #828
+    /// (the c-2b/c-2c migration) per @ch4r10t33r's call: shipping
+    /// the chain-worker default-off would mean the burn-in is
+    /// exactly testing the path nobody actually runs in prod. The
+    /// kill-switch survives via `--chain-worker off`.
+    ///
+    /// Surfaced to the CLI as `--chain-worker on|off`. Note this
+    /// is a value-taking flag; the parser accepts the enum tag
+    /// names verbatim, so the CLI shape is `--chain-worker on`
+    /// (NOT `--chain-worker=on` and NOT bare `--chain-worker`).
+    chain_worker: ChainWorkerMode = .on,
+};
+
+/// Chain-worker thread routing mode. Surfaced to the CLI as the
+/// `--chain-worker on|off` flag and threaded through `BeamNodeOpts`.
+/// Slice c-2b commit 3 of #803.
+pub const ChainWorkerMode = enum {
+    on,
+    off,
+
+    /// True when the chain-worker thread should be started and
+    /// gossip-block / gossip-attestation handlers should route
+    /// through its bounded queues. False when the legacy synchronous
+    /// path (slice-(b) behavior) is in effect.
+    pub inline fn isEnabled(self: ChainWorkerMode) bool {
+        return self == .on;
+    }
 };
 
 pub const BeamNode = struct {
@@ -126,7 +153,7 @@ pub const BeamNode = struct {
         // stable for the worker's entire lifetime. `chain.deinit()`
         // (above errdefer + the deinit method) tears the worker
         // down before any chain state it might touch.
-        if (opts.chain_worker_enabled) {
+        if (opts.chain_worker.isEnabled()) {
             try chain.startChainWorker();
         }
 

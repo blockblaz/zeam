@@ -3,6 +3,7 @@ pub const Clock = clockFactory.Clock;
 
 const nodeFactory = @import("./node.zig");
 pub const BeamNode = nodeFactory.BeamNode;
+pub const ChainWorkerMode = nodeFactory.ChainWorkerMode;
 
 const chainFactory = @import("./chain.zig");
 pub const BeamChain = chainFactory.BeamChain;
