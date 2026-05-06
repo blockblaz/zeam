@@ -654,6 +654,78 @@ pub const BeamChain = struct {
         return null;
     }
 
+    /// Move the value out of a heap-allocated `*BeamState` wrapper
+    /// into a freshly-`create`d `RcBeamState`, freeing the now-empty
+    /// wrapper. Centralises the value-copy + destroy + create dance
+    /// shared by `produceBlock` and `onBlock`'s owned-post_state path.
+    ///
+    /// Ownership story (single, identical at every call site):
+    ///
+    ///   * Pre-call: caller owns `post_state` (a `*BeamState`
+    ///     pointing at heap memory). The interior of the BeamState
+    ///     value (lists, slices, etc.) is also caller-owned. Caller
+    ///     has an upstream errdefer gated by `gate_consumed.* == false`
+    ///     that frees both the wrapper and the interior on early
+    ///     return.
+    ///
+    ///   * Post-call (success): the BeamState value has been moved
+    ///     into the rc; the wrapper has been freed. `gate_consumed`
+    ///     has been set to `true` so the caller's upstream errdefer
+    ///     does not fire. The caller now owns the returned
+    ///     `*RcBeamState` and must transfer it (e.g. via
+    ///     `statesPutExclusive` / `statesCommitKeepExisting`) or
+    ///     release it.
+    ///
+    ///   * Post-call (error): the wrapper has been freed (we
+    ///     destroyed it BEFORE the create attempt so an OOM cannot
+    ///     leave a wrapper-allocator leak); the BeamState value's
+    ///     interior has been consumed by `RcBeamState.create`'s
+    ///     always-consume contract. `gate_consumed` has still been
+    ///     set to `true` (BEFORE the create call) so the caller's
+    ///     upstream errdefer does NOT run — it would deref the
+    ///     freed wrapper. Net: nothing leaks, the caller's gate
+    ///     correctly suppresses the upstream cleanup, and the
+    ///     caller propagates the error.
+    ///
+    /// Why a `*bool` gate parameter rather than nulling an
+    /// `?*BeamState` (the original `produceBlock` shape)? The
+    /// `onBlock` path also distinguishes a NOT-OWNED case (caller
+    /// supplied `post_state` and we sszClone before wrapping) where
+    /// the upstream errdefer is gated by an additional
+    /// `post_state_owned` flag, not by an optional. A bool gate
+    /// matches both call sites; the optional gate did not. Pre-c-2b
+    /// the two sites used different mechanisms for identical work
+    /// (PR #828 review by @ch4r10t33r) — this helper unifies them.
+    ///
+    /// NOTE: the helper is for the OWNED case only. `onBlock`'s
+    /// caller-supplied path still does its own `sszClone` +
+    /// `RcBeamState.create` inline because the value-source there
+    /// is not a heap wrapper to free.
+    fn wrapOwnedStateIntoRc(
+        self: *Self,
+        post_state: *types.BeamState,
+        gate_consumed: *bool,
+    ) !*RcBeamState {
+        // Move the BeamState value out of the heap wrapper into a
+        // local. After this point the wrapper memory holds a stale
+        // shallow copy whose interior pointers have been logically
+        // transferred to `value`.
+        const value = post_state.*;
+        // Free the wrapper BEFORE attempting create so an OOM in
+        // create does not leave a wrapper-allocator leak. The
+        // value's interior is consumed by create's always-consume
+        // contract on either success or its own OOM path.
+        self.allocator.destroy(post_state);
+        // Set the gate BEFORE the (fallible) create call: on
+        // failure the upstream errdefer must not run (it would
+        // deref the now-freed wrapper); on success the gate stays
+        // true forever. Either way the caller's gate is correctly
+        // false ONLY for the window between heap-wrapper-allocation
+        // and this helper call.
+        gate_consumed.* = true;
+        return RcBeamState.create(self.allocator, value);
+    }
+
     /// Take the exclusive side of `states_lock` and `put` the entry.
     /// Used by produceBlock / onBlock STF commit and similar
     /// single-key writes.
@@ -1051,12 +1123,19 @@ pub const BeamChain = struct {
             self.allocator.destroy(pre_snapshot);
         }
 
-        var post_state_opt: ?*types.BeamState = try self.allocator.create(types.BeamState);
-        errdefer if (post_state_opt) |post_state_ptr| {
-            post_state_ptr.deinit();
-            self.allocator.destroy(post_state_ptr);
+        const post_state = try self.allocator.create(types.BeamState);
+        // c-2b: switched from `?*BeamState` (nulled on consume) to a
+        // bool gate to match `onBlock`'s post_state_settled shape.
+        // `wrapOwnedStateIntoRc` flips this on consume; the upstream
+        // errdefer below covers every early-return path before the
+        // wrap, including a partial sszClone that left interior
+        // allocations behind (BeamState.deinit is tolerant of
+        // partial init by design).
+        var post_state_consumed = false;
+        errdefer if (!post_state_consumed) {
+            post_state.deinit();
+            self.allocator.destroy(post_state);
         };
-        const post_state = post_state_opt.?;
         try types.sszClone(self.allocator, types.BeamState, pre_snapshot.*, post_state);
 
         const payload_agg_timer = zeam_metrics.lean_block_building_payload_aggregation_time_seconds.start();
@@ -1152,24 +1231,14 @@ pub const BeamChain = struct {
         var block_root: [32]u8 = undefined;
         try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
 
-        // c-2b: wrap the heap-allocated post_state into an
-        // RcBeamState. RcBeamState.create takes BeamState by value
-        // and embeds it; the old heap wrapper is no longer needed,
-        // so destroy() it after the value-copy. Always-consume
-        // contract: on RcBeamState.create OOM the BeamState's
-        // interior is freed by create's own errdefer; we still
-        // need to free the old wrapper allocation that held the
-        // (now-moved-from) value.
-        const post_state_rc = blk: {
-            const value_copy = post_state.*;
-            // The wrapper allocation is no longer needed; the
-            // interior is owned by `value_copy` (struct copy is
-            // shallow but the slices/lists inside are pointers we
-            // are transferring) until create() consumes it.
-            self.allocator.destroy(post_state);
-            post_state_opt = null;
-            break :blk try RcBeamState.create(self.allocator, value_copy);
-        };
+        // c-2b: move the heap-allocated post_state into a freshly-
+        // `create`d RcBeamState via the shared helper that
+        // centralises the value-copy + destroy + create dance.
+        // Helper sets `post_state_consumed = true` BEFORE its
+        // (fallible) create call, so the upstream errdefer does
+        // not deref freed memory on OOM and does not double-free
+        // on success. PR #828 review by @ch4r10t33r.
+        const post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_consumed);
         // statesPutExclusive takes ownership of the rc on success;
         // releases on its own OOM path.
         try self.statesPutExclusive("produceBlock.commit", block_root, post_state_rc);
@@ -1882,39 +1951,36 @@ pub const BeamChain = struct {
         // racing in via another thread's `onBlockFollowup` and freeing the
         // entry under us. See PR #820 / issue #803.
         // c-2b: wrap post_state in an RcBeamState before commit.
-        // If we own post_state, the rc takes its value and we must
-        // free the now-empty wrapper. If the caller supplied it,
-        // we sszClone into a fresh value and let create() consume
-        // that, leaving the caller's allocation untouched.
+        // Two paths depending on ownership:
+        //   * post_state_owned (we allocated it locally above):
+        //     route through `wrapOwnedStateIntoRc` — it does the
+        //     value-move + wrapper-destroy + create + gate-flip
+        //     dance, identical to `produceBlock`'s commit path.
+        //   * !post_state_owned (caller supplied a *BeamState we
+        //     don't own): sszClone into a fresh value, then
+        //     `RcBeamState.create` consumes that. The caller's
+        //     allocation is left untouched; nothing to free, no
+        //     gate to flip (post_state_settled stays false here
+        //     and is flipped after the commit succeeds because the
+        //     gate's errdefer is gated on `post_state_owned` too).
         //
-        // After the rc is created, the rc owns the state value
-        // (success path) or the value's interior was deinit'd by
-        // create's OOM path. Either way the original wrapper
-        // memory is no longer needed when post_state_owned. Flip
-        // post_state_settled BEFORE destroying the wrapper so the
-        // upstream errdefer at line ~1317 does not deref freed
-        // memory if a later step fails.
+        // PR #828 review by @ch4r10t33r: pre-c-2b the owned path
+        // used a different gate mechanism than `produceBlock`
+        // (post_state_settled bool vs ?*BeamState nulling); the
+        // helper unifies them.
         var post_state_rc: *RcBeamState = undefined;
         if (post_state_owned) {
-            const value = post_state.*;
-            // post_state's value has been moved into `value`; the
-            // wrapper allocation is now stale. Free it BEFORE
-            // attempting the create so that an OOM in create does
-            // not leave a wrapper-allocator leak. The interior
-            // owned by `value` is consumed by create on either
-            // path.
-            self.allocator.destroy(post_state);
-            post_state_settled = true;
-            post_state_rc = try RcBeamState.create(self.allocator, value);
+            // Helper flips `post_state_settled = true` BEFORE the
+            // create call so the upstream errdefer at line ~1712
+            // does not deref the freed wrapper if create OOMs.
+            post_state_rc = try self.wrapOwnedStateIntoRc(post_state, &post_state_settled);
         } else {
             // Caller owns post_state; clone its value into a fresh
-            // BeamState, then wrap. errdefer below covers the
-            // sszClone OOM path (interior cleanup before returning).
+            // BeamState, then wrap. Past sszClone success, `value`
+            // owns interior allocations; `RcBeamState.create`'s
+            // always-consume contract handles cleanup on OOM.
             var value: types.BeamState = undefined;
             try types.sszClone(self.allocator, types.BeamState, post_state.*, &value);
-            // Past sszClone success, value owns interior
-            // allocations. RcBeamState.create's always-consume
-            // contract handles cleanup on OOM.
             post_state_rc = try RcBeamState.create(self.allocator, value);
         }
         // statesCommitKeepExisting takes the rc on either path:

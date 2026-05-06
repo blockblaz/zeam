@@ -860,27 +860,45 @@ test "RcBeamState.tryAcquire: returns null after refcount reaches 0" {
     try testing.expectEqual(@as(u32, 0), wrapper.count()); // no increment
 }
 
-test "RcBeamState.tryAcquire: race against release-to-zero — producer + freer" {
-    // Stress test: one freeing thread, N tryAcquire'rs. The
-    // freeing thread starts holding the only reference (refcount=1)
-    // and releases. The N tryAcquire'rs each loop trying to bump.
-    // The acceptable outcomes for each tryAcquire call are:
-    //   (a) succeed (refcount was >0 when CAS won) — in which
-    //       case the caller MUST release exactly once.
-    //   (b) fail (refcount hit 0 first) — caller does nothing.
-    // testing.allocator's leak detector verifies that every
-    // successful tryAcquire is matched by a release, and that the
-    // wrapper is freed exactly once.
+test "RcBeamState.tryAcquire: succeeds while caller holds a pre-bump (no UAF under release-to-zero of separate ref)" {
+    // Renamed from "race against release-to-zero — producer + freer"
+    // because that title oversold what the test actually exercises
+    // (PR #828 review by @ch4r10t33r):
     //
-    // Because the wrapper may be freed at any moment after the
-    // freer's release, callers can't safely call tryAcquire on a
-    // dangling pointer. To make this a valid test we have each
-    // tryAcquire'r take its own pre-bump on the spawn thread (so
-    // it enters the worker holding a valid reference), then the
-    // worker's body itself calls tryAcquire on a SECOND reference
-    // it could legally observe. This still exercises the freer's
-    // observed-from-outside CAS pattern: the freer is dropping
-    // its own ref while concurrent tryAcquires run.
+    // Each Trier thread is HANDED its own pre-bumped reference by
+    // the spawning thread (`rc.acquireWriter()` before spawn). So
+    // for the entire body of `Trier.run`, refcount is >= 1 — the
+    // Trier itself is one of the holders. `tryAcquire` on that rc
+    // MUST therefore succeed (the panic-on-null in the body proves
+    // the test ASSUMES success). The freeing thread (the spawning
+    // thread, after dropping the creator ref) is racing the Triers'
+    // releases, but it never races a tryAcquire-vs-zero observation
+    // because every tryAcquire-caller is itself a refcount holder.
+    //
+    // What the test DOES prove (which is still useful):
+    //   * No UAF: the wrapper is freed exactly once, by whichever
+    //     thread observes the last release — testing.allocator's
+    //     leak detector + double-free detector are the witnesses.
+    //   * Refcount accounting under contention: every successful
+    //     tryAcquire is matched by exactly one release, regardless
+    //     of interleaving.
+    //   * The CAS loop in tryAcquire is safe under concurrent
+    //     release pressure on a SEPARATE reference (the creator's
+    //     ref being dropped while Triers are running).
+    //
+    // What the test CANNOT prove (and why no test can):
+    //   tryAcquire returning null in a multi-threaded race against
+    //   release-to-zero is unreachable by safe code, because
+    //   tryAcquire's SAFETY PRECONDITION (lines 318–330) requires
+    //   the caller to hold a reference (or otherwise know the rc
+    //   wrapper is alive) at the moment of the call. Calling
+    //   tryAcquire on a freed wrapper IS a UAF. The null-return
+    //   path is exercised by the white-box test above
+    //   (`returns null after refcount reaches 0`) which manually
+    //   sets refcount=0 on a wrapper whose destroy() it skips.
+    //   That is the only safe shape, and it's the right one
+    //   because the docstring's safety preconditions ARE the
+    //   contract surface tryAcquire offers.
     const NUM_TRIERS: usize = 16;
     const OUTER_ITERS: usize = 50;
 
