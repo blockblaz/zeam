@@ -449,14 +449,16 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node) !void {
-        // Order matters: BeamNode.run() registers gossip handlers (and thereby
-        // declares which subnets we want to be on). EthLibp2p.run() reads that
-        // set to decide which gossipsub topics to subscribe to. Reversing the
-        // order would either subscribe to an empty topic set or — historically
-        // — fall back to subscribing to *all* subnets, defeating the bandwidth
-        // savings of attestation subnets.
-        try self.beam_node.run();
+        // Start the Rust libp2p network BEFORE BeamNode: since #812,
+        // `BeamNode.run()` calls `gossip.subscribe(...)`, which enqueues
+        // `SwarmCommand::SubscribeGossip` on the per-network command channel.
+        // That channel only exists after `EthLibp2p.run()` returns from
+        // `wait_for_network_ready`. Reversing the order drops every subscribe
+        // with `error.GossipMeshSubscribeFailed` (see #831). The dev `beam`
+        // command already does network-first; this is the matching swap for
+        // the production node path.
         try self.network.run();
+        try self.beam_node.run();
 
         const ascii_art =
             \\  ███████████████████████████████████████████████████████
