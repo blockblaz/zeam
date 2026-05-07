@@ -593,6 +593,21 @@ pub fn build(b: *Builder) !void {
     setTestRunLabelFromCompile(b, run_types_test, types_tests);
     test_step.dependOn(&run_types_test.step);
 
+    // leanMetrics PR #35: lock the gauge↑scrape contract for
+    // `lean_gossip_mesh_peers` (and the append-only behaviour of the
+    // `registerScrapeRefresher` registry) in code so doc-only audits
+    // cannot regress silently — the same lesson as slice (b)
+    // (LockTimer → /metrics test) and slice c-2b
+    // (`lean_chain_state_refcount_distribution`).
+    const metrics_tests = b.addTest(.{
+        .root_module = zeam_metrics,
+    });
+    metrics_tests.test_runner = simple_test_runner;
+    metrics_tests.root_module.addImport("metrics", metrics);
+    const run_metrics_tests = b.addRunArtifact(metrics_tests);
+    setTestRunLabelFromCompile(b, run_metrics_tests, metrics_tests);
+    test_step.dependOn(&run_metrics_tests.step);
+
     const transition_tests = b.addTest(.{
         .root_module = zeam_state_transition,
     });

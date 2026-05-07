@@ -1049,10 +1049,18 @@ fn refreshMeshPeersMetric() void {
     zeam_metrics.metrics.lean_gossip_mesh_peers.set(count);
 }
 
-/// Combined scrape refresher: `registerScrapeRefresher` currently stores a
-/// single callback, so we chain all network-layer refreshers from one entry
-/// point. Add new refreshers here; do NOT register them individually or you
-/// will overwrite the previous registration.
+/// Combined scrape refresher for all network-layer metrics. Historically
+/// `registerScrapeRefresher` stored a single callback, so this fan-out
+/// existed because registering each refresher individually would silently
+/// overwrite the previous one. The metrics module now keeps an append-only
+/// list of refreshers (see `pkgs/metrics/src/lib.zig`), so individual
+/// registration would also be safe — but we keep the fan-out for two
+/// reasons:
+///   * one callback per module makes the registration site (below) easier
+///     to audit;
+///   * adding a new network-layer refresher is a one-liner here without
+///     touching the metrics-module registry capacity.
+/// Add new network-layer refreshers here.
 fn refreshNetworkMetrics() void {
     refreshSwarmCommandDropMetric();
     refreshMeshPeersMetric();
@@ -1118,9 +1126,10 @@ pub const EthLibp2p = struct {
         // Counts are global; registering once is enough even with multiple
         // EthLibp2p instances (the call is idempotent).
         // leanMetrics PR #35: stash the network_id for the mesh-peers
-        // refresher. `registerScrapeRefresher` only stores a single callback,
-        // so we register `refreshNetworkMetrics` (a fan-out) that calls both
-        // the swarm-drop and mesh-peers refreshers — see its definition.
+        // refresher. `registerScrapeRefresher` is now append-only (the
+        // metrics module keeps a bounded list); we still register a single
+        // network-layer fan-out (`refreshNetworkMetrics`) for the reasons
+        // documented at its definition above.
         mesh_peers_network_id = params.networkId;
         zeam_metrics.registerScrapeRefresher(refreshNetworkMetrics);
 

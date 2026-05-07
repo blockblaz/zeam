@@ -291,8 +291,21 @@ fn record_swarm_command_drop(reason: SwarmCommandDropReason) {
 
 /// Returns the per-network mesh-peers atomic, creating it on first use.
 /// See `MESH_PEERS_TOTAL` for ordering / lifecycle notes.
+///
+/// Both this write path and `get_mesh_peers_total` (read path) recover
+/// from a poisoned mutex by taking the inner guard rather than
+/// panicking. `MESH_PEERS_TOTAL` protects only an `HashMap<u32,
+/// Arc<AtomicU64>>` with no internal invariants — a previous panic
+/// mid-update cannot leave it in a state worse than "missing or stale
+/// entry for some network id", which the per-call `entry().or_insert`
+/// repairs on the next access. Asymmetric handling (read recovers,
+/// write panics) would otherwise let a metric-side issue escalate into
+/// a swarm-task crash via the 1s mesh-peers tick.
 fn mesh_peers_slot(network_id: u32) -> Arc<AtomicU64> {
-    let mut map = MESH_PEERS_TOTAL.lock().unwrap();
+    let mut map = match MESH_PEERS_TOTAL.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     map.entry(network_id)
         .or_insert_with(|| Arc::new(AtomicU64::new(0)))
         .clone()
@@ -401,7 +414,16 @@ pub unsafe extern "C" fn stop_network(network_id: u32) {
     COMMAND_RECEIVERS.lock().unwrap().remove(&network_id);
     // Drop the mesh-peers slot too so repeated start/stop cycles don't leak
     // entries; `get_mesh_peers_total` returns 0 for unknown ids by design.
-    MESH_PEERS_TOTAL.lock().unwrap().remove(&network_id);
+    // Recover from a poisoned mutex (see `mesh_peers_slot` for rationale)
+    // rather than panicking on shutdown — a poisoned MESH_PEERS_TOTAL on
+    // the way out should not turn `stop_network` into a process abort.
+    {
+        let mut map = match MESH_PEERS_TOTAL.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.remove(&network_id);
+    }
 }
 
 /// Wait for a network to be fully initialized and ready to accept messages.
