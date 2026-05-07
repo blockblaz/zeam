@@ -177,8 +177,10 @@ fn get_zig_handler(network_id: u32) -> Option<u64> {
 }
 
 /// Install a fresh shutdown signal for the given network and return a handle
-/// to it. Called by the event loop owner so a subsequent `stop_network` call
-/// has somewhere to post its wake-up permit.
+/// to it. Called by `start_network` *before* `mark_network_ready` so that the
+/// invariant "any observer that sees `ready == true` can also `notify_one`
+/// the shutdown handle" holds atomically across the start→eventloop handoff.
+/// `run_eventloop` later picks the handle up via `get_shutdown_notify`.
 fn install_shutdown_notify(network_id: u32) -> Arc<Notify> {
     let notify = Arc::new(Notify::new());
     with_slot_mut(network_id, |slot| {
@@ -1350,6 +1352,20 @@ impl Network {
         // the Subscribed/ConnectionClosed paths handle transitions in
         // between.
 
+        // Install the shutdown signal *before* publishing readiness. Without
+        // this, there is a window after `mark_network_ready` returns and
+        // before `run_eventloop` runs where the slot reports `ready = true`
+        // but `shutdown_notify` is still `None`. A `stop_network` issued in
+        // that window would silently no-op its `notify_one()` call (because
+        // `get_shutdown_notify` returns `None`), and the permit would be
+        // lost. Installing here makes "ready ⇒ shutdown_notify present" a
+        // hard invariant from any concurrent observer's point of view; the
+        // event loop just looks up the already-installed handle on entry.
+        // `notify_one` stores a permit if no waiter is parked yet, so a
+        // `stop_network` that lands between this line and the first
+        // `.notified().await` is still observed on the first poll.
+        let _ = install_shutdown_notify(self.network_id);
+
         // Signal that this network is now ready
         mark_network_ready(self.network_id);
 
@@ -1374,11 +1390,23 @@ impl Network {
             }
         };
 
-        // Install the shutdown signal before entering the loop so `stop_network`
-        // calls issued between here and the first `.notified().await` land on
-        // this slot. `notify_one` stores a permit if no waiter is parked yet,
-        // so the first iteration's shutdown arm will see the permit and break.
-        let shutdown = install_shutdown_notify(self.network_id);
+        // The shutdown signal is installed by `start_network` *before* it
+        // marks the network ready, so any `stop_network` racing the
+        // start→eventloop handoff has a `Notify` to post on. Here we just
+        // pick up the handle that was placed on the slot. If it is somehow
+        // missing the slot has been torn down out from under us — bail
+        // rather than silently install a fresh one and lose any permit
+        // already posted on the original.
+        let shutdown = match get_shutdown_notify(self.network_id) {
+            Some(n) => n,
+            None => {
+                logger::rustLogger.error(
+                    self.network_id,
+                    "run_eventloop: shutdown_notify not installed by start_network; aborting",
+                );
+                return;
+            }
+        };
 
         // leanMetrics PR #35: 1s liveness tick that recomputes the gossipsub
         // mesh-peer count even when no swarm/gossipsub events are firing.
@@ -2455,6 +2483,60 @@ mod tests {
             before, after,
             "REQUEST_ID_COUNTER must not advance when send_rpc_request fails"
         );
+    }
+
+    #[test]
+    fn test_shutdown_notify_installed_before_mark_ready() {
+        // Regression test for the review comment on PR #819: previously
+        // `start_network` called `mark_network_ready` *before* the event loop
+        // had installed `shutdown_notify` on the slot. Any `stop_network`
+        // racing the start→eventloop handoff therefore saw `ready == true`
+        // but `get_shutdown_notify == None`, silently dropping its
+        // `notify_one()` permit. After the fix `start_network` installs the
+        // notify first, so the invariant "ready ⇒ shutdown_notify present"
+        // holds atomically from any concurrent observer's point of view.
+        //
+        // We can't call `start_network` from a unit test (it needs a real
+        // libp2p swarm + tokio runtime), but the fix lives in the ordering
+        // of two free functions, so we exercise that ordering directly:
+        // `install_shutdown_notify` then `mark_network_ready`, then assert
+        // `get_shutdown_notify` returns the *same* `Arc<Notify>` and that a
+        // `notify_one` posted on it is observed by a subsequent
+        // `notified().await`.
+        let network_id = 110;
+        clear_network_slot(network_id);
+
+        let installed = install_shutdown_notify(network_id);
+        mark_network_ready(network_id);
+
+        assert!(
+            is_network_ready(network_id),
+            "network must be marked ready after mark_network_ready"
+        );
+        let observed = get_shutdown_notify(network_id)
+            .expect("shutdown_notify must be present once the network is marked ready");
+        assert!(
+            Arc::ptr_eq(&installed, &observed),
+            "get_shutdown_notify must return the handle install_shutdown_notify just placed"
+        );
+
+        observed.notify_one();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let woke = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), installed.notified())
+                .await
+                .is_ok()
+        });
+        assert!(
+            woke,
+            "notify_one posted before any waiter must be observed by the first notified().await — \
+             this is the property stop_network depends on across the start→eventloop handoff"
+        );
+
+        clear_network_slot(network_id);
     }
 
     #[test]
