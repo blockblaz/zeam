@@ -142,6 +142,29 @@ const Metrics = struct {
     // measurement floor before deciding whether to bound the queue or add
     // a cursor optimisation.
     lean_pending_blocks_drain_iters: PendingBlocksDrainItersHistogram,
+    // Issue #788: visibility into the future-block queueing path.
+    //   * `lean_pending_blocks_depth` — instantaneous queue depth, set on
+    //     every successful enqueue and every `processPendingBlocks` drain.
+    //     Combined with `_evicted_total{reason="cap"}` it tells operators
+    //     when the queue cap is being hit (which would silently drop
+    //     legitimate near-future gossip blocks).
+    //   * `lean_pending_blocks_evicted_total{reason}` — cumulative count of
+    //     blocks dropped from the queue, by reason: `cap` (capacity hit),
+    //     `pre_finalized` (slot < finalized), `too_far_future` (slot >
+    //     current_slot + MAX_FUTURE_SLOT_QUEUE_TOLERANCE; drain-side
+    //     eviction added in PR #841 review #8), `duplicate` (same root
+    //     already queued), `append_oom` (allocator failure on capacity
+    //     reservation; the new block is dropped, the queue is unchanged).
+    //   * `lean_pending_blocks_replayed_total{result}` — cumulative count
+    //     of replays attempted from `processPendingBlocks`, by
+    //     terminal result: `accepted` / `rejected` / `error`.
+    //   * `lean_blocks_future_slot_dropped_total` — cumulative count of
+    //     gossip blocks hard-rejected as `FutureSlot` (beyond the
+    //     queueable window), the symptom #788 was tracking.
+    lean_pending_blocks_depth: LeanPendingBlocksDepthGauge,
+    lean_pending_blocks_evicted_total: LeanPendingBlocksEvictedCounter,
+    lean_pending_blocks_replayed_total: LeanPendingBlocksReplayedCounter,
+    lean_blocks_future_slot_dropped_total: LeanBlocksFutureSlotDroppedCounter,
     // Chain-worker queue + loop metrics (slice c-1 of #803).
     //   * `_dropped_total{queue="block"|"attestation"}` — producer
     //     `trySend` rejections when the queue was full.
@@ -254,6 +277,11 @@ const Metrics = struct {
     const LockHoldTimeHistogram = metrics_lib.HistogramVec(f32, LockLabel, &NODE_MUTEX_BUCKETS);
     // pending_blocks drain iteration histogram type (slice a-2)
     const PendingBlocksDrainItersHistogram = metrics_lib.Histogram(f32, &[_]f32{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 });
+    // Issue #788: future-block queue visibility.
+    const LeanPendingBlocksDepthGauge = metrics_lib.Gauge(u64);
+    const LeanPendingBlocksEvictedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
+    const LeanPendingBlocksReplayedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
+    const LeanBlocksFutureSlotDroppedCounter = metrics_lib.Counter(u64);
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -628,6 +656,10 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .zeam_lock_wait_seconds = try Metrics.LockWaitTimeHistogram.init(allocator, io, "zeam_lock_wait_seconds", .{ .help = "Time spent waiting to acquire a per-resource lock, labeled by lock and callsite." }, .{}),
         .zeam_lock_hold_seconds = try Metrics.LockHoldTimeHistogram.init(allocator, io, "zeam_lock_hold_seconds", .{ .help = "Time a per-resource lock was held, labeled by lock and callsite." }, .{}),
         .lean_pending_blocks_drain_iters = Metrics.PendingBlocksDrainItersHistogram.init("lean_pending_blocks_drain_iters", .{ .help = "Number of iterations chain.processPendingBlocks ran through before draining the queue or finding nothing ready." }, .{}),
+        .lean_pending_blocks_depth = Metrics.LeanPendingBlocksDepthGauge.init("lean_pending_blocks_depth", .{ .help = "Instantaneous depth of the future-block pending queue (issue #788)." }, .{}),
+        .lean_pending_blocks_evicted_total = try Metrics.LeanPendingBlocksEvictedCounter.init(allocator, io, "lean_pending_blocks_evicted_total", .{ .help = "Total number of blocks evicted from the pending-blocks queue, by reason (issue #788)." }, .{}),
+        .lean_pending_blocks_replayed_total = try Metrics.LeanPendingBlocksReplayedCounter.init(allocator, io, "lean_pending_blocks_replayed_total", .{ .help = "Total number of replays from pending_blocks, by terminal result (issue #788)." }, .{}),
+        .lean_blocks_future_slot_dropped_total = Metrics.LeanBlocksFutureSlotDroppedCounter.init("lean_blocks_future_slot_dropped_total", .{ .help = "Total number of gossip blocks hard-rejected as FutureSlot beyond the queueable window (issue #788)." }, .{}),
         // Chain-worker queue + loop metrics (slice c-1 of #803).
         .lean_chain_queue_dropped_total = try Metrics.LeanChainQueueDroppedCounter.init(allocator, io, "lean_chain_queue_dropped_total", .{ .help = "Producer trySend rejections on the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
