@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Zig 0.15.2 based on architecture
+# Install Zig 0.16.0 based on architecture
 ARG TARGETARCH
-RUN ZIG_VERSION="0.15.2" && \
+RUN ZIG_VERSION="0.16.0" && \
     case "$TARGETARCH" in \
         amd64) ZIG_ARCH="x86_64" ;; \
         arm64) ZIG_ARCH="aarch64" ;; \
@@ -98,7 +98,7 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     else \
         GIT_VERSION=$(echo "$GIT_VERSION" | head -c 7); \
     fi && \
-    zig build -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
+    zig build --seed 0 -Doptimize=ReleaseSafe -Dgit_version="$GIT_VERSION" $EXTRA_ZIG_FLAGS
 
 # rec_aggregation's compilation.rs reads .py source files at runtime to verify
 # a bytecode fingerprint (via env!("CARGO_MANIFEST_DIR") baked at compile time).

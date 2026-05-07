@@ -14,5 +14,7 @@ ssz = { package = "ethereum_ssz", version = "0.10" }
 test-config = []
 
 [lib]
-crate-type = ["staticlib"]
+# Built as an rlib so its `#[no_mangle] pub extern "C"` symbols can be funnelled
+# through the `zeam-glue` staticlib shim. See blockblaz/zeam#773.
+crate-type = ["rlib"]
 name = "hashsig_glue"

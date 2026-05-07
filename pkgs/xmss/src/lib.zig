@@ -76,7 +76,7 @@ pub const PublicKeyCache = struct {
 };
 
 test "get tests" {
-    @import("std").testing.refAllDeclsRecursive(@This());
+    @import("std").testing.refAllDecls(@This());
 }
 
 test "PublicKeyCache basic operations" {

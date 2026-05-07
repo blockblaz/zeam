@@ -35,7 +35,12 @@ pub const DisconnectionReason = enum(u32) {
 
 const topic_prefix = "leanconsensus";
 const lean_blocks_by_root_protocol = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+const lean_blocks_by_range_protocol = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 const lean_status_protocol = "/leanconsensus/req/status/1/ssz_snappy";
+
+fn unionPayloadType(comptime UnionType: type, comptime tag: anytype) type {
+    return @FieldType(UnionType, @tagName(tag));
+}
 
 fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
     switch (val.*) {
@@ -44,7 +49,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
             while (it.next()) |entry| {
                 freeJsonValue(&entry.value_ptr.*, allocator);
             }
-            o.deinit();
+            o.deinit(allocator);
         },
         .array => |*a| {
             for (a.items) |*item| {
@@ -60,7 +65,7 @@ fn freeJsonValue(val: *json.Value, allocator: Allocator) void {
 pub const GossipSub = struct {
     // ptr to the implementation
     ptr: *anyopaque,
-    publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!void,
+    publishFn: *const fn (ptr: *anyopaque, obj: *const GossipMessage) anyerror!bool,
     subscribeFn: *const fn (ptr: *anyopaque, topics: []GossipTopic, handler: OnGossipCbHandler) anyerror!void,
     onGossipFn: *const fn (ptr: *anyopaque, data: *GossipMessage, sender_peer_id: []const u8) anyerror!void,
 
@@ -73,7 +78,12 @@ pub const GossipSub = struct {
         return self.subscribeFn(self.ptr, topics, handler);
     }
 
-    pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!void {
+    /// Publish a gossip message. Returns `true` if the message was successfully
+    /// handed off to the underlying transport (and is therefore expected to
+    /// reach the network), `false` if the publish was dropped (e.g. backend
+    /// command channel full, see issue #808). Callers should not log the
+    /// publish as successful when this returns `false`.
+    pub fn publish(self: GossipSub, obj: *const GossipMessage) anyerror!bool {
         return self.publishFn(self.ptr, obj);
     }
 };
@@ -289,7 +299,7 @@ pub const GossipMessage = union(GossipTopicKind) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 switch (tag) {
                     .attestation => try ssz.serialize(types.SignedAttestation, payload.message, &serialized, allocator),
                     else => try ssz.serialize(PayloadType, payload, &serialized, allocator),
@@ -354,13 +364,23 @@ pub const GossipMessage = union(GossipTopicKind) {
     }
 };
 
-pub const LeanSupportedProtocol = enum {
-    blocks_by_root,
-    status,
+pub const LeanSupportedProtocol = enum(u32) {
+    // Ordinals must match the Rust side's `#[repr(u32)]` discriminants
+    // AND `TryFrom<u32>` mapping in
+    // `rust/libp2p-glue/src/req_resp/protocol_id.rs::LeanSupportedProtocol`.
+    // The cross-FFI invariant runs in BOTH directions: Zig u32 → Rust
+    // try_from (incoming RPC tag) AND Rust enum → u32 (outgoing tag).
+    // The Rust side pins both via `#[repr(u32)]` + explicit discriminants;
+    // a unit test (`try_from_round_trip_matches_repr` in the Rust file)
+    // guards against future drift. Reported by @ch4r10t33r on PR #824.
+    blocks_by_root = 0,
+    status = 1,
+    blocks_by_range = 2,
 
     pub fn protocolId(self: LeanSupportedProtocol) []const u8 {
         return switch (self) {
             .blocks_by_root => lean_blocks_by_root_protocol,
+            .blocks_by_range => lean_blocks_by_range_protocol,
             .status => lean_status_protocol,
         };
     }
@@ -386,6 +406,10 @@ pub const LeanSupportedProtocol = enum {
             return .blocks_by_root;
         }
 
+        if (std.mem.eql(u8, protocol_id, lean_blocks_by_range_protocol)) {
+            return .blocks_by_range;
+        }
+
         return error.UnsupportedProtocol;
     }
 };
@@ -393,12 +417,14 @@ pub const LeanSupportedProtocol = enum {
 pub const ReqRespRequest = union(LeanSupportedProtocol) {
     blocks_by_root: types.BlockByRootRequest,
     status: types.Status,
+    blocks_by_range: types.BlocksByRangeRequest,
 
     const Self = @This();
 
     pub fn format(self: Self, writer: anytype) !void {
         switch (self) {
             .blocks_by_root => try writer.writeAll("ReqRespRequest{ blocks_by_root }"),
+            .blocks_by_range => try writer.writeAll("ReqRespRequest{ blocks_by_range }"),
             .status => try writer.writeAll("ReqRespRequest{ status }"),
         }
     }
@@ -407,6 +433,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |request| request.toJson(allocator),
+            .blocks_by_range => |request| request.toJson(allocator),
         };
     }
 
@@ -422,7 +449,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -430,8 +457,8 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         return serialized.toOwnedSlice(allocator);
     }
 
-    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !std.meta.TagPayload(Self, tag) {
-        const PayloadType = std.meta.TagPayload(Self, tag);
+    fn initPayload(comptime tag: LeanSupportedProtocol, allocator: Allocator) !unionPayloadType(Self, tag) {
+        const PayloadType = unionPayloadType(Self, tag);
         return switch (tag) {
             .blocks_by_root => PayloadType{
                 .roots = try ssz.utils.List(types.Root, consensus_params.MAX_REQUEST_BLOCKS).init(allocator),
@@ -440,9 +467,10 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
         };
     }
 
-    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *std.meta.TagPayload(Self, tag)) void {
+    fn deinitPayload(comptime tag: LeanSupportedProtocol, payload: *unionPayloadType(Self, tag)) void {
         switch (tag) {
             .blocks_by_root => payload.roots.deinit(),
+            .blocks_by_range => {},
             inline else => {},
         }
     }
@@ -450,7 +478,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !Self {
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload = try initPayload(tag, allocator);
                 var succeeded = false;
                 defer if (!succeeded) deinitPayload(tag, &payload);
@@ -470,6 +498,7 @@ pub const ReqRespRequest = union(LeanSupportedProtocol) {
 pub const ReqRespResponse = union(LeanSupportedProtocol) {
     blocks_by_root: types.SignedBlock,
     status: types.Status,
+    blocks_by_range: types.SignedBlock,
 
     const Self = @This();
 
@@ -477,6 +506,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         return switch (self.*) {
             .status => |status| status.toJson(allocator),
             .blocks_by_root => |block| block.toJson(allocator),
+            .blocks_by_range => |block| block.toJson(allocator),
         };
     }
 
@@ -492,7 +522,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
 
         switch (self.*) {
             inline else => |payload, tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 try ssz.serialize(PayloadType, payload, &serialized, allocator);
             },
         }
@@ -503,7 +533,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
     pub fn deserialize(allocator: Allocator, method: LeanSupportedProtocol, bytes: []const u8) !ReqRespResponse {
         return switch (method) {
             inline else => |tag| {
-                const PayloadType = std.meta.TagPayload(Self, tag);
+                const PayloadType = unionPayloadType(Self, tag);
                 var payload: PayloadType = undefined;
                 try ssz.deserialize(PayloadType, bytes, &payload, allocator);
                 return @unionInit(Self, @tagName(tag), payload);
@@ -515,6 +545,7 @@ pub const ReqRespResponse = union(LeanSupportedProtocol) {
         switch (self.*) {
             .status => {},
             .blocks_by_root => |*block| block.deinit(),
+            .blocks_by_range => |*block| block.deinit(),
         }
     }
 };

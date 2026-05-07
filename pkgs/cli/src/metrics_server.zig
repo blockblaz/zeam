@@ -1,6 +1,7 @@
 const std = @import("std");
 const api = @import("@zeam/api");
 const utils_lib = @import("@zeam/utils");
+const net = std.Io.net;
 const LoggerConfig = utils_lib.ZeamLoggerConfig;
 const ModuleLogger = utils_lib.ModuleLogger;
 
@@ -34,7 +35,7 @@ pub fn startMetricsServer(
 
     // Wait for thread to report startup result (success or failure)
     while (ctx.startup_status.load(.acquire) == .pending) {
-        std.Thread.sleep(STARTUP_POLL_NS);
+        utils_lib.sleepNs(STARTUP_POLL_NS);
     }
 
     // Check if startup failed
@@ -75,17 +76,18 @@ pub const MetricsServer = struct {
     }
 
     fn run(self: *Self) void {
-        const address = std.net.Address.parseIp4("0.0.0.0", self.port) catch |err| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const address = net.IpAddress.parseIp4("0.0.0.0", self.port) catch |err| {
             self.logger.err("failed to parse server address 0.0.0.0:{d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
             return;
         };
-        var server = address.listen(.{ .reuse_address = true, .force_nonblocking = true }) catch |err| {
+        var server = address.listen(io, .{ .reuse_address = true }) catch |err| {
             self.logger.err("failed to listen on port {d}: {}", .{ self.port, err });
             self.startup_status.store(.failed, .release);
             return;
         };
-        defer server.deinit();
+        defer server.deinit(io);
 
         // Signal successful startup to the spawning thread
         self.startup_status.store(.success, .release);
@@ -93,21 +95,21 @@ pub const MetricsServer = struct {
 
         while (true) {
             if (self.stopped.load(.acquire)) break;
-            const connection = server.accept() catch |err| {
+            const connection = server.accept(io) catch |err| {
                 if (err == error.WouldBlock) {
-                    std.Thread.sleep(ACCEPT_POLL_NS);
+                    utils_lib.sleepNs(ACCEPT_POLL_NS);
                     continue;
                 }
                 self.logger.warn("failed to accept connection: {}", .{err});
                 continue;
             };
 
-            self.handleConnection(connection);
+            self.handleConnection(io, connection);
         }
     }
 
-    fn handleConnection(self: *Self, connection: std.net.Server.Connection) void {
-        defer connection.stream.close();
+    fn handleConnection(self: *Self, io: std.Io, connection: net.Stream) void {
+        defer connection.close(io);
 
         const read_buffer = self.allocator.alloc(u8, 4096) catch {
             self.logger.err("failed to allocate read buffer", .{});
@@ -120,10 +122,10 @@ pub const MetricsServer = struct {
         };
         defer self.allocator.free(write_buffer);
 
-        var stream_reader = connection.stream.reader(read_buffer);
-        var stream_writer = connection.stream.writer(write_buffer);
+        var stream_reader = connection.reader(io, read_buffer);
+        var stream_writer = connection.writer(io, write_buffer);
 
-        var http_server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
+        var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
         var request = http_server.receiveHead() catch |err| {
             self.logger.warn("failed to receive HTTP head: {}", .{err});
             return;

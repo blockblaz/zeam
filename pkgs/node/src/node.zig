@@ -11,6 +11,7 @@ const ssz = @import("ssz");
 const key_manager_lib = @import("@zeam/key-manager");
 const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const utils = @import("./utils.zig");
 const OnIntervalCbWrapper = utils.OnIntervalCbWrapper;
@@ -42,6 +43,16 @@ const NodeOpts = struct {
     is_aggregator: bool = false,
     /// Explicit subnet ids to subscribe and import gossip attestations for aggregation
     aggregation_subnet_ids: ?[]const u32 = null,
+    /// Optional worker pool for parallelizing CPU-bound chain work (signature verification).
+    /// When non-null it is shared across all nodes in the same process.
+    thread_pool: ?*ThreadPool = null,
+    /// Slice c-2b commit 3 of #803: when true, the chain spawns a
+    /// dedicated worker thread and producer-side handlers for
+    /// gossip blocks / attestations route through its bounded
+    /// queues instead of running synchronously on the libp2p
+    /// thread. Default `false` preserves slice-(b) behavior.
+    /// Surfaced to the CLI as `--chain-worker=on|off` (bool).
+    chain_worker_enabled: bool = false,
 };
 
 pub const BeamNode = struct {
@@ -56,9 +67,26 @@ pub const BeamNode = struct {
     node_registry: *const NodeNameRegistry,
     /// Explicitly configured subnet ids for attestation import (adds to validator-derived subnets).
     aggregation_subnet_ids: ?[]const u32 = null,
-    /// Serializes BeamNode work between the libxev main thread (onInterval) and
-    /// the libp2p worker thread (onGossip / onReqRespResponse / onReqRespRequest).
-    mutex: std.Thread.Mutex = .{},
+    /// NOTE: the previous coarse outer `BeamNode.mutex` was dropped in this
+    /// slice (a-3). The gossip / interval / req-resp call paths now take
+    /// per-resource locks via the helpers in `pkgs/node/src/locking.zig`.
+    /// Slice (c) (chain-worker / `processFinalizationFollowup` move-off-IO-
+    /// thread) will reintroduce a multi-resource lock here when its first
+    /// real user lands; until then there is no placeholder field, per
+    /// slice discipline (no dead code without callers).
+    ///
+    /// Pending parent roots deferred for batched fetching.
+    /// Maps block root → fetch depth. Collected during gossip/RPC processing
+    /// and flushed as a single batched blocks_by_root request, avoiding the
+    /// 300+ individual round-trips caused by sequential parent-chain walking.
+    ///
+    /// Now guarded by its own mutex (slice a-3): with the global
+    /// `BeamNode.mutex` dropped, both the libxev tick path
+    /// (`flushPendingParentFetches` after `processPendingBlocks`) and the
+    /// libp2p bridge path (gossip / req-resp → `cacheBlockAndFetchParent`)
+    /// can touch this map concurrently.
+    batch_pending_parent_roots: std.AutoHashMap(types.Root, u32),
+    batch_pending_parent_roots_lock: zeam_utils.SyncMutex = .{},
 
     const Self = @This();
 
@@ -82,6 +110,7 @@ pub const BeamNode = struct {
                 .logger_config = opts.logger_config,
                 .node_registry = opts.node_registry,
                 .is_aggregator = opts.is_aggregator,
+                .thread_pool = opts.thread_pool,
             },
             network.connected_peers,
         );
@@ -89,6 +118,28 @@ pub const BeamNode = struct {
             chain.deinit();
             allocator.destroy(chain);
         }
+
+        // Slice c-2b commit 3 of #803: start the chain-worker AFTER
+        // the chain is at its final heap address (allocator.create +
+        // assignment-via-deref above), because the worker stores
+        // `chain` as its handler ctx and that pointer must remain
+        // stable for the worker's entire lifetime. `chain.deinit()`
+        // (above errdefer + the deinit method) tears the worker
+        // down before any chain state it might touch.
+        if (opts.chain_worker_enabled) {
+            try chain.startChainWorker();
+        }
+
+        // Slice c-2b commit 5 of #803: register the
+        // `lean_chain_state_refcount_distribution` scrape refresher
+        // with the chain at its final heap address. The refresher
+        // iterates `chain.states` under the shared lock and samples
+        // `rc.count()` for each entry; surfaces leaked acquires (any
+        // entry stuck >16) on the /metrics endpoint. Cleared in
+        // `chain.deinit` so the metrics module never calls back into
+        // freed chain memory.
+        chain.startChainStateRefcountObserver();
+
         // Now that the chain is at its final heap location, point the logger config
         // at the forkchoice slot clock so every log line carries slot/interval context.
         opts.logger_config.slot_clock = &chain.forkChoice.fcStore.slot_clock;
@@ -116,6 +167,7 @@ pub const BeamNode = struct {
             .logger = opts.logger_config.logger(.node),
             .node_registry = opts.node_registry,
             .aggregation_subnet_ids = opts.aggregation_subnet_ids,
+            .batch_pending_parent_roots = std.AutoHashMap(types.Root, u32).init(allocator),
         };
 
         chain.setPruneCachedBlocksCallback(self, pruneCachedBlocksCallback);
@@ -124,6 +176,7 @@ pub const BeamNode = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.batch_pending_parent_roots.deinit();
         self.network.deinit();
         self.chain.deinit();
         self.allocator.destroy(self.chain);
@@ -132,8 +185,45 @@ pub const BeamNode = struct {
     pub fn onGossip(ptr: *anyopaque, data: *const networks.GossipMessage, sender_peer_id: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Lifetime invariant for `data`:
+        //   The gossip subsystem (see `pkgs/network/src/ethlibp2p.zig`) owns the
+        //   `GossipMessage` for the entire duration of this callback. It is the
+        //   standard libp2p callback contract: the buffer is not recycled, freed
+        //   or mutated until `onGossip` returns. We rely on this twice — once
+        //   for the pre-lock `hashTreeRoot` read of `data.block.block` and again
+        //   inside the locked section for the same field. If a future refactor
+        //   ever changes that contract (e.g. arena-pooled message buffers), the
+        //   pre-lock read becomes a use-after-free and this comment must be the
+        //   place to revisit. Do NOT cache or stash `data` past this scope.
+        //
+        // Pre-lock work (issue #786): hashTreeRoot over a BeamBlock is pure CPU
+        // work that does not touch any shared state, but it can be expensive on
+        // large blocks (up to MAX_ATTESTATIONS_DATA aggregated XMSS proofs ⇒
+        // hundreds of KB to MBs of tree-hashing). Computing it before locking
+        // shrinks the critical section and lets `onInterval` make progress on
+        // the libxev thread in parallel. The computed root is reused in every
+        // downstream branch (success path + error paths) so we never recompute
+        // under the lock.
+        //
+        // `precomputed_block_root` stays `undefined` for non-block gossip
+        // messages and is read only inside the `.block` arm of the switch
+        // below (and its error sub-branches). Any future code path that reads
+        // it outside that arm will hit Zig's `undefined` poison in debug
+        // builds — intentional defensive behavior.
+        var precomputed_block_root: types.Root = undefined;
+        if (data.* == .block) {
+            zeam_utils.hashTreeRoot(types.BeamBlock, data.block.block, &precomputed_block_root, self.allocator) catch |err| {
+                self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
+                return;
+            };
+        }
+
+        // Slice (a-3): the outer BeamNode.mutex is gone. Each chain entry
+        // point inside the switch arms takes its own per-resource locks
+        // (chain.{states_lock, pending_blocks_lock, pubkey_cache_lock,
+        // root_to_slot_lock, events_lock, forkChoice}); network state
+        // mutations go through `Network`'s LockedMap / BlockCache /
+        // ConnectedPeers helpers. See docs/threading_refactor_slice_a.md.
 
         switch (data.*) {
             .block => |signed_block| {
@@ -151,12 +241,8 @@ pub const BeamNode = struct {
                     self.node_registry.getNodeNameFromPeerId(sender_peer_id),
                 });
 
-                // Compute block root first - needed for both caching and pending tracking
-                var block_root: types.Root = undefined;
-                zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
-                    self.logger.warn("failed to compute block root for incoming gossip block: {any}", .{err});
-                    return;
-                };
+                // Reuse the root we computed before taking the lock.
+                const block_root = precomputed_block_root;
 
                 _ = self.network.removePendingBlockRoot(block_root);
 
@@ -189,6 +275,8 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    // Flush any pending parent root fetches accumulated during caching.
+                    self.flushPendingParentFetches();
                     // Return early - don't pass to chain until parent arrives
                     return;
                 }
@@ -223,15 +311,13 @@ pub const BeamNode = struct {
                 // descendants we might still be holding onto.
                 error.PreFinalizedSlot => {
                     if (data.* == .block) {
-                        const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            self.logger.info(
-                                "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
-                                .{&block_root},
-                            );
-                            _ = self.network.pruneCachedBlocks(block_root, null);
-                        } else |_| {}
+                        // Reuse the root we computed before taking the lock (issue #786).
+                        const block_root = precomputed_block_root;
+                        self.logger.info(
+                            "gossip block 0x{x} rejected as pre-finalized; pruning cached descendants",
+                            .{&block_root},
+                        );
+                        _ = self.network.pruneCachedBlocks(block_root, null);
                     }
                     return;
                 },
@@ -259,28 +345,27 @@ pub const BeamNode = struct {
                 error.FutureSlot => {
                     if (data.* == .block) {
                         const signed_block = data.block;
-                        var block_root: types.Root = undefined;
-                        if (zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator)) |_| {
-                            if (self.cacheFutureBlock(block_root, signed_block)) |_| {
-                                self.logger.debug(
-                                    "cached future gossip block 0x{s} at slot {d}",
+                        // Reuse the root we computed before taking the lock (issue #786).
+                        const block_root = precomputed_block_root;
+                        if (self.cacheFutureBlock(block_root, signed_block)) |_| {
+                            self.logger.debug(
+                                "cached future gossip block 0x{s} at slot {d}",
+                                .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
+                            );
+                        } else |cache_err| {
+                            if (cache_err == CacheBlockError.PreFinalized) {
+                                self.logger.info(
+                                    "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
                                     .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
                                 );
-                            } else |cache_err| {
-                                if (cache_err == CacheBlockError.PreFinalized) {
-                                    self.logger.info(
-                                        "future gossip block 0x{s} is pre-finalized (slot={d}), pruning cached descendants",
-                                        .{ std.fmt.bytesToHex(block_root, .lower)[0..], signed_block.block.slot },
-                                    );
-                                    _ = self.network.pruneCachedBlocks(block_root, null);
-                                } else {
-                                    self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
-                                        std.fmt.bytesToHex(block_root, .lower)[0..],
-                                        cache_err,
-                                    });
-                                }
+                                _ = self.network.pruneCachedBlocks(block_root, null);
+                            } else {
+                                self.logger.warn("failed to cache future gossip block 0x{s}: {any}", .{
+                                    std.fmt.bytesToHex(block_root, .lower)[0..],
+                                    cache_err,
+                                });
                             }
-                        } else |_| {}
+                        }
                     }
                     return;
                 },
@@ -346,27 +431,25 @@ pub const BeamNode = struct {
                 );
             };
         }
+
+        // Flush any parent roots accumulated during block/descendant processing.
+        self.flushPendingParentFetches();
     }
 
     fn pruneCachedBlocksCallback(ptr: *anyopaque, finalized: types.Checkpoint) usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Collect roots of blocks at or before finalized slot
-        var roots_to_prune: std.ArrayList(types.Root) = .empty;
-        defer roots_to_prune.deinit(self.allocator);
+        // Collect roots of blocks at or before finalized slot from the
+        // network's BlockCache helper. We snapshot under the cache lock
+        // and then mutate via `pruneCachedBlocks` outside the iteration.
+        const roots_to_prune = self.network.collectCachedBlocksAtOrBelowSlot(finalized.slot) catch |err| {
+            self.logger.warn("failed to collect cached blocks for pruning: {any}", .{err});
+            return 0;
+        };
+        defer self.allocator.free(roots_to_prune);
 
-        var it = self.network.fetched_blocks.iterator();
-        while (it.next()) |entry| {
-            const block_slot = entry.value_ptr.*.block.slot;
-            if (block_slot <= finalized.slot) {
-                roots_to_prune.append(self.allocator, entry.key_ptr.*) catch continue;
-            }
-        }
-
-        // Remove each root and its full chain (parents + descendants),
-        // but preserve the finalized chain's descendants.
         var pruned: usize = 0;
-        for (roots_to_prune.items) |root| {
+        for (roots_to_prune) |root| {
             pruned += self.network.pruneCachedBlocks(root, finalized);
         }
         return pruned;
@@ -380,29 +463,54 @@ pub const BeamNode = struct {
     }
 
     fn processCachedDescendants(self: *Self, parent_root: types.Root) void {
-        // Get cached children of this parent using O(1) lookup
-        const children = self.network.getChildrenOfBlock(parent_root);
+        // Get cached children of this parent (helper returns an owned
+        // copy under the cache lock so we can iterate after release).
+        const children = self.network.getChildrenOfBlock(parent_root) catch |err| {
+            self.logger.warn("Failed to copy children for processing: {any}", .{err});
+            return;
+        };
+        defer self.allocator.free(children);
 
         if (children.len == 0) {
             return;
         }
 
-        // Copy the children roots since we'll be modifying the children map during processing
-        var descendants_to_process: std.ArrayList(types.Root) = .empty;
-        defer descendants_to_process.deinit(self.allocator);
-        descendants_to_process.appendSlice(self.allocator, children) catch |err| {
-            self.logger.warn("Failed to copy children for processing: {any}", .{err});
-            return;
-        };
-
         self.logger.debug(
             "Found {d} cached descendant(s) of block 0x{x}",
-            .{ descendants_to_process.items.len, &parent_root },
+            .{ children.len, &parent_root },
         );
 
         // Try to process each descendant
-        for (descendants_to_process.items) |descendant_root| {
-            if (self.network.getFetchedBlock(descendant_root)) |cached_block| {
+        for (children) |descendant_root| {
+            // Atomic (block, ssz) clone under the cache mutex. The
+            // legacy borrow-shape `getFetchedBlockWithSsz` was removed in
+            // PR #820 (slice a-3 follow-up): its returned slice headers
+            // pointed into cache-owned storage that a concurrent
+            // `removeFetchedBlock` could free mid-`chain.onBlock`
+            // (UAF — bug 14, surfaced by macOS CI on the new N3 stress
+            // test). The clone-then-release shape transfers ownership to
+            // this caller so the data outlives any cache mutation.
+            const cached_opt = self.network.cloneFetchedBlockAndSsz(
+                descendant_root,
+                self.allocator,
+            ) catch |clone_err| {
+                self.logger.warn(
+                    "Failed to clone cached block 0x{x} for processing: {any}",
+                    .{ &descendant_root, clone_err },
+                );
+                continue;
+            };
+            if (cached_opt) |cached_const| {
+                var cached = cached_const;
+                // Free the clone on every exit path from this branch —
+                // including the early-continue paths below and the
+                // chain.onBlock error handlers. The clone is owned by
+                // `self.allocator` (matches `cloneFetchedBlockAndSsz`'s
+                // signature); deinit frees both `block` interior heap
+                // fields and the `ssz` slice.
+                defer cached.deinit(self.allocator);
+
+                const cached_block = cached.block;
                 // Skip if already known to fork choice — same guard as processBlockByRootChunk
                 if (self.chain.forkChoice.hasBlock(descendant_root)) {
                     self.logger.debug(
@@ -419,8 +527,8 @@ pub const BeamNode = struct {
                     .{&descendant_root},
                 );
 
-                const block_ssz = self.network.getFetchedBlockSsz(descendant_root);
-                const missing_roots = self.chain.onBlock(cached_block.*, .{ .sszBytes = block_ssz }) catch |err| {
+                const block_ssz = cached.ssz;
+                const missing_roots = self.chain.onBlock(cached_block, .{ .sszBytes = block_ssz }) catch |err| {
                     if (err == chainFactory.BlockProcessingError.MissingPreState) {
                         // Parent still missing, keep it cached
                         self.logger.debug(
@@ -466,9 +574,12 @@ pub const BeamNode = struct {
                 // Note: pruneForkchoice=true means processFinalizationAdvancement may fire on every
                 // iteration of a deep cached-block chain. Correct semantically; a future optimisation
                 // could pass false during catch-up and prune once at the end.
-                self.chain.onBlockFollowup(true, cached_block);
+                self.chain.onBlockFollowup(true, &cached_block);
 
-                // Remove from cache now that it's been processed
+                // Remove from cache now that it's been processed. Note:
+                // we own `cached` (clone), so this `removeFetchedBlock`
+                // freeing the cache's copy doesn't affect us — the
+                // `defer cached.deinit(...)` above frees our clone.
                 _ = self.network.removeFetchedBlock(descendant_root);
 
                 // Recursively check for this block's descendants
@@ -486,14 +597,18 @@ pub const BeamNode = struct {
         var parent_roots = std.AutoHashMap(types.Root, void).init(self.allocator);
         defer parent_roots.deinit();
 
-        var it = self.network.fetched_blocks.iterator();
-        while (it.next()) |entry| {
-            const block = entry.value_ptr.*.block;
-            if (block.slot <= current_slot) {
-                const parent_root = block.parent_root;
-                if (self.chain.forkChoice.hasBlock(parent_root)) {
-                    parent_roots.put(parent_root, {}) catch {};
-                }
+        // Snapshot ready blocks under the cache lock, then resolve
+        // forkchoice membership outside it.
+        const ready = self.network.collectReadyCachedBlocks(current_slot) catch |err| {
+            self.logger.warn("failed to collect ready cached blocks: {any}", .{err});
+            return;
+        };
+        defer self.allocator.free(ready);
+
+        for (ready) |entry| {
+            const parent_root = entry.parent_root;
+            if (self.chain.forkChoice.hasBlock(parent_root)) {
+                parent_roots.put(parent_root, {}) catch {};
             }
         }
 
@@ -510,7 +625,6 @@ pub const BeamNode = struct {
         AllocationFailed,
         CloneFailed,
         CachingFailed,
-        FetchFailed,
     };
 
     /// Cache a block and fetch its parent. Common logic used by both gossip and req-resp handlers.
@@ -527,7 +641,11 @@ pub const BeamNode = struct {
         signed_block: types.SignedBlock,
         depth: u32,
     ) CacheBlockError!types.Root {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        // Snapshot under the forkchoice shared lock — latest_finalized is
+        // a multi-field struct (Checkpoint) written under exclusive; a raw
+        // field read can tear (slot, blockRoot) pairs across concurrent
+        // updates now that BeamNode.mutex no longer serialises us.
+        const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
         const block_slot = signed_block.block.slot;
 
         // Early rejection: don't cache blocks at or before finalized slot
@@ -542,9 +660,9 @@ pub const BeamNode = struct {
         }
 
         // If cache is full, reject - proactive pruning on finalization keeps the cache bounded
-        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
+        if (self.network.getFetchedBlockCount() >= constants.MAX_CACHED_BLOCKS) {
             self.logger.warn("Cache full ({d} blocks), rejecting block 0x{x} at slot {d}", .{
-                self.network.fetched_blocks.count(),
+                self.network.getFetchedBlockCount(),
                 &block_root,
                 block_slot,
             });
@@ -569,14 +687,20 @@ pub const BeamNode = struct {
         // Ownership transferred to the network cache — disable errdefers
         block_owned = false;
 
-        // Fetch the parent block
+        // Enqueue the parent root for batched fetching rather than firing an individual
+        // request immediately. All accumulated roots are sent as one blocks_by_root
+        // request at the flush point, avoiding 300+ sequential round-trips when a
+        // syncing peer walks a long parent chain one block at a time.
         const parent_root = signed_block.block.parent_root;
-        const roots = [_]types.Root{parent_root};
-        self.fetchBlockByRoots(&roots, depth) catch {
-            // Parent fetch failed - drop the cached block so we don't keep dangling entries.
-            _ = self.network.removeFetchedBlock(block_root);
-            return CacheBlockError.FetchFailed;
-        };
+        {
+            self.batch_pending_parent_roots_lock.lock();
+            defer self.batch_pending_parent_roots_lock.unlock();
+            self.batch_pending_parent_roots.put(parent_root, depth) catch {
+                // Evict the cached block if we can't enqueue — otherwise it dangles forever.
+                _ = self.network.removeFetchedBlock(block_root);
+                return CacheBlockError.CachingFailed;
+            };
+        }
 
         return parent_root;
     }
@@ -586,7 +710,9 @@ pub const BeamNode = struct {
         block_root: types.Root,
         signed_block: types.SignedBlock,
     ) CacheBlockError!void {
-        const finalized_slot = self.chain.forkChoice.fcStore.latest_finalized.slot;
+        // See cacheBlockAndFetchParent: take the shared lock via the
+        // accessor so we don't tear-read latest_finalized.
+        const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
         const block_slot = signed_block.block.slot;
 
         if (block_slot <= finalized_slot) {
@@ -597,9 +723,9 @@ pub const BeamNode = struct {
             return CacheBlockError.AlreadyCached;
         }
 
-        if (self.network.fetched_blocks.count() >= constants.MAX_CACHED_BLOCKS) {
+        if (self.network.getFetchedBlockCount() >= constants.MAX_CACHED_BLOCKS) {
             self.logger.warn("Cache full ({d} blocks), rejecting future block 0x{s} at slot {d}", .{
-                self.network.fetched_blocks.count(),
+                self.network.getFetchedBlockCount(),
                 std.fmt.bytesToHex(block_root, .lower)[0..],
                 block_slot,
             });
@@ -702,6 +828,7 @@ pub const BeamNode = struct {
                             });
                         }
                     }
+                    self.flushPendingParentFetches();
                     return;
                 }
 
@@ -747,47 +874,155 @@ pub const BeamNode = struct {
         } else |err| {
             self.logger.warn("failed to compute block root from RPC response from peer={s}{f}: {any}", .{ block_ctx.peer_id, self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id), err });
         }
+
+        // Flush any parent roots queued during this RPC block's processing. When a syncing peer
+        // walks a long parent chain one block at a time, each response triggers one more parent
+        // fetch. Batching them here consolidates concurrent parent requests into one round-trip.
+        self.flushPendingParentFetches();
+    }
+
+    /// Process a single block chunk received in response to a blocks_by_range request.
+    /// Reuses onBlock for STF + forkchoice integration; on missing-parent we cache the block
+    /// and queue a parent fetch (same as the by-root path), but we don't track per-root
+    /// pending state since the original request was slot-based.
+    fn processBlockByRangeChunk(self: *Self, peer_id: []const u8, signed_block: *const types.SignedBlock) !void {
+        var block_root: types.Root = undefined;
+        zeam_utils.hashTreeRoot(types.BeamBlock, signed_block.block, &block_root, self.allocator) catch |err| {
+            self.logger.warn("failed to compute block root from blocks_by_range response from peer={s}{f}: {any}", .{
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
+            return;
+        };
+
+        // Skip if already known to fork choice — same guard as processBlockByRootChunk.
+        if (self.chain.forkChoice.hasBlock(block_root)) {
+            self.logger.debug(
+                "blocks_by_range: block 0x{x} already known to fork choice, skipping",
+                .{&block_root},
+            );
+            self.processCachedDescendants(block_root);
+            return;
+        }
+
+        const missing_roots = self.chain.onBlock(signed_block.*, .{}) catch |err| {
+            if (err == chainFactory.BlockProcessingError.MissingPreState) {
+                // Cache and try to fetch parent. Range responses arrive ordered by slot,
+                // but the first chunk in a batch may still need its parent fetched.
+                if (self.cacheBlockAndFetchParent(block_root, signed_block.*, 1)) |parent_root| {
+                    self.logger.debug(
+                        "blocks_by_range: cached block 0x{x}, fetching parent 0x{x}",
+                        .{ &block_root, &parent_root },
+                    );
+                } else |cache_err| {
+                    if (cache_err == CacheBlockError.PreFinalized) {
+                        _ = self.network.pruneCachedBlocks(block_root, null);
+                    } else {
+                        self.logger.warn("blocks_by_range: failed to cache block 0x{x}: {any}", .{ &block_root, cache_err });
+                    }
+                }
+                self.flushPendingParentFetches();
+                return;
+            }
+            if (err == forkchoice.ForkChoiceError.PreFinalizedSlot) {
+                _ = self.network.pruneCachedBlocks(block_root, null);
+                return;
+            }
+            self.logger.warn("blocks_by_range: failed to import block 0x{x} from peer={s}{f}: {any}", .{
+                &block_root,
+                peer_id,
+                self.node_registry.getNodeNameFromPeerId(peer_id),
+                err,
+            });
+            return;
+        };
+        defer self.allocator.free(missing_roots);
+
+        self.chain.onBlockFollowup(true, signed_block);
+        self.processCachedDescendants(block_root);
+        self.fetchBlockByRoots(missing_roots, 0) catch |err| {
+            self.logger.warn("blocks_by_range: failed to fetch {d} missing block(s): {any}", .{ missing_roots.len, err });
+        };
+        self.flushPendingParentFetches();
     }
 
     fn handleReqRespResponse(self: *Self, event: *const networks.ReqRespResponseEvent) !void {
         const request_id = event.request_id;
-        const entry_ptr = self.network.getPendingRequestPtr(request_id) orelse {
+        // Snapshot the pending entry so we don't hold the
+        // pending_rpc_requests lock across the chain calls below.
+        var snap = (self.network.snapshotPendingRequest(request_id) catch |err| {
+            self.logger.warn("failed to snapshot pending request_id={d}: {any}", .{ request_id, err });
+            return;
+        }) orelse {
             self.logger.warn("received RPC response for unknown request_id={d}", .{request_id});
             return;
         };
-        const ctx_ptr = &entry_ptr.request;
-        const peer_id = switch (ctx_ptr.*) {
-            .status => |*ctx| ctx.peer_id,
-            .blocks_by_root => |*ctx| ctx.peer_id,
-        };
+        defer snap.deinit(self.allocator);
+
+        const peer_id = snap.peer_id_copy;
         const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
 
         switch (event.payload) {
             .success => |resp| switch (resp) {
-                .status => |status_resp| {
-                    switch (ctx_ptr.*) {
-                        .status => |*status_ctx| {
-                            self.logger.info("received status response from peer {s}{f} head_slot={d}, finalized_slot={d}", .{
+                .status => |status_resp| switch (snap.request_kind) {
+                    .status => blk: {
+                        const status_ctx = .{ .peer_id = peer_id };
+                        self.logger.info("received status response from peer {s}{f} head_slot={d}, finalized_slot={d}", .{
+                            status_ctx.peer_id,
+                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                            status_resp.head_slot,
+                            status_resp.finalized_slot,
+                        });
+                        if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
+                            self.logger.warn("status response received for unknown peer {s}{f}", .{
                                 status_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                status_resp.head_slot,
-                                status_resp.finalized_slot,
                             });
-                            if (!self.network.setPeerLatestStatus(status_ctx.peer_id, status_resp)) {
-                                self.logger.warn("status response received for unknown peer {s}{f}", .{
-                                    status_ctx.peer_id,
-                                    self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                });
-                            }
+                        }
 
-                            // Proactive initial sync: if peer's finalized slot is ahead of us, request their head block
-                            // This triggers parent syncing which will fetch all blocks back to our current state
-                            // We compare finalized slots (not head slots) because finalized is more reliable for sync decisions
-                            const sync_status = self.chain.getSyncStatus();
-                            switch (sync_status) {
-                                .behind_peers => |info| {
-                                    // Only sync from this peer if their finalized slot is ahead of ours
-                                    if (status_resp.finalized_slot > self.chain.forkChoice.fcStore.latest_finalized.slot) {
+                        // Proactive initial sync: if peer's finalized slot is ahead of us, request their head block
+                        // This triggers parent syncing which will fetch all blocks back to our current state
+                        // We compare finalized slots (not head slots) because finalized is more reliable for sync decisions
+                        const sync_status = self.chain.getSyncStatus();
+                        switch (sync_status) {
+                            .behind_peers => |info| {
+                                // Only sync from this peer if their finalized slot is ahead of ours
+                                const our_finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+                                if (status_resp.finalized_slot > our_finalized_slot) {
+                                    // If the peer is far ahead, prefer a blocks_by_range bulk fetch
+                                    // for efficient catch-up. The head-block-by-root path walks parents
+                                    // one round-trip at a time which is too slow for large gaps.
+                                    const gap: u64 = if (status_resp.head_slot > info.head_slot)
+                                        status_resp.head_slot - info.head_slot
+                                    else
+                                        0;
+                                    if (gap > constants.BLOCKS_BY_RANGE_SYNC_THRESHOLD) {
+                                        const start_slot: types.Slot = info.head_slot + 1;
+                                        const requested_count: u64 = @min(gap, params.MAX_REQUEST_BLOCKS);
+                                        self.logger.info("peer {s}{f} is far ahead (gap={d} slots), initiating bulk sync via blocks_by_range start_slot={d} count={d}", .{
+                                            status_ctx.peer_id,
+                                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                            gap,
+                                            start_slot,
+                                            requested_count,
+                                        });
+                                        const handler = networks.OnReqRespResponseCbHandler{
+                                            .ptr = self,
+                                            .onReqRespResponseCb = onReqRespResponse,
+                                        };
+                                        _ = self.network.sendBlocksByRangeRequest(status_ctx.peer_id, start_slot, requested_count, handler) catch |err| {
+                                            self.logger.warn("failed to initiate blocks_by_range sync from peer {s}{f}: {any}; falling back to head-by-root", .{
+                                                status_ctx.peer_id,
+                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                                err,
+                                            });
+                                            const roots = [_]types.Root{status_resp.head_root};
+                                            self.fetchBlockByRoots(&roots, 0) catch |fetch_err| {
+                                                self.logger.warn("fallback head-by-root fetch also failed: {any}", .{fetch_err});
+                                            };
+                                        };
+                                    } else {
                                         self.logger.info("peer {s}{f} is ahead (peer_finalized_slot={d} > our_head_slot={d}), initiating sync by requesting head block 0x{x}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
@@ -804,71 +1039,103 @@ pub const BeamNode = struct {
                                             });
                                         };
                                     }
-                                },
-                                .fc_initing => {
-                                    // Forkchoice is still initializing (checkpoint-sync or DB restore).
-                                    // We need blocks to reach the first justified checkpoint and exit
-                                    // fc_initing. Without this branch the node deadlocks: it stays in
-                                    // fc_initing because no blocks arrive, and no blocks arrive because
-                                    // the sync code skips fc_initing.
-                                    // Treat this exactly like behind_peers: if the peer's head is ahead
-                                    // of our anchor, request their head block to start the parent chain.
-                                    if (status_resp.head_slot > self.chain.forkChoice.head.slot) {
-                                        self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                }
+                            },
+                            .fc_initing => {
+                                // Forkchoice is still initializing (checkpoint-sync or DB restore).
+                                // We need blocks to reach the first justified checkpoint and exit
+                                // fc_initing. Without this branch the node deadlocks: it stays in
+                                // fc_initing because no blocks arrive, and no blocks arrive because
+                                // the sync code skips fc_initing.
+                                // Treat this exactly like behind_peers: if the peer's head is ahead
+                                // of our anchor, request their head block to start the parent chain.
+                                // Snapshot once: forkChoice.head is a
+                                // multi-field ProtoBlock written under
+                                // exclusive. A second raw read in the log
+                                // call could pair this slot with a
+                                // different update's blockRoot.
+                                const head_snapshot = self.chain.forkChoice.getHead();
+                                if (status_resp.head_slot > head_snapshot.slot) {
+                                    self.logger.info("peer {s}{f} is ahead during fc init (peer_head={d} > our_head={d}), requesting head block 0x{x}", .{
+                                        status_ctx.peer_id,
+                                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                                        status_resp.head_slot,
+                                        head_snapshot.slot,
+                                        &status_resp.head_root,
+                                    });
+                                    const roots = [_]types.Root{status_resp.head_root};
+                                    self.fetchBlockByRoots(&roots, 0) catch |err| {
+                                        self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
                                             status_ctx.peer_id,
                                             self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                            status_resp.head_slot,
-                                            self.chain.forkChoice.head.slot,
-                                            &status_resp.head_root,
+                                            err,
                                         });
-                                        const roots = [_]types.Root{status_resp.head_root};
-                                        self.fetchBlockByRoots(&roots, 0) catch |err| {
-                                            self.logger.warn("failed to initiate sync from peer {s}{f} during fc init: {any}", .{
-                                                status_ctx.peer_id,
-                                                self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
-                                                err,
-                                            });
-                                        };
-                                    }
-                                },
-                                .synced, .no_peers => {},
-                            }
-                        },
-                        else => {
-                            self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
-                        },
-                    }
+                                    };
+                                }
+                            },
+                            .synced, .no_peers => {},
+                        }
+                        break :blk;
+                    },
+                    .blocks_by_root, .blocks_by_range => self.logger.warn("status response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name }),
                 },
                 .blocks_by_root => |block_resp| {
-                    switch (ctx_ptr.*) {
-                        .blocks_by_root => |*block_ctx| {
+                    switch (snap.request_kind) {
+                        .blocks_by_root => {
+                            const block_ctx = BlockByRootContext{
+                                .peer_id = peer_id,
+                                .requested_roots = snap.requested_roots_copy,
+                            };
                             self.logger.info("received blocks-by-root chunk from peer {s}{f}", .{
                                 block_ctx.peer_id,
                                 self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
                             });
 
-                            try self.processBlockByRootChunk(block_ctx, &block_resp);
+                            try self.processBlockByRootChunk(&block_ctx, &block_resp);
                         },
                         else => {
                             self.logger.warn("blocks-by-root response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
                         },
                     }
                 },
+                .blocks_by_range => |block_resp| {
+                    switch (snap.request_kind) {
+                        .blocks_by_range => {
+                            self.logger.info("received blocks-by-range chunk from peer {s}{f} slot={d}", .{
+                                peer_id,
+                                node_name,
+                                block_resp.block.slot,
+                            });
+                            try self.processBlockByRangeChunk(peer_id, &block_resp);
+                        },
+                        else => {
+                            self.logger.warn("blocks-by-range response did not match tracked request_id={d} from peer={s}{f}", .{ request_id, peer_id, node_name });
+                        },
+                    }
+                },
             },
             .failure => |err_payload| {
-                switch (ctx_ptr.*) {
-                    .status => |status_ctx| {
+                switch (snap.request_kind) {
+                    .status => {
                         self.logger.warn("status request to peer {s}{f} failed ({d}): {s}", .{
-                            status_ctx.peer_id,
-                            self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                            peer_id,
+                            node_name,
                             err_payload.code,
                             err_payload.message,
                         });
                     },
-                    .blocks_by_root => |block_ctx| {
+                    .blocks_by_root => {
                         self.logger.warn("blocks-by-root request to peer {s}{f} failed ({d}): {s}", .{
-                            block_ctx.peer_id,
-                            self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                            peer_id,
+                            node_name,
+                            err_payload.code,
+                            err_payload.message,
+                        });
+                    },
+                    .blocks_by_range => {
+                        self.logger.warn("blocks-by-range request to peer {s}{f} failed ({d}): {s}", .{
+                            peer_id,
+                            node_name,
                             err_payload.code,
                             err_payload.message,
                         });
@@ -884,8 +1151,11 @@ pub const BeamNode = struct {
 
     pub fn onReqRespResponse(ptr: *anyopaque, event: *const networks.ReqRespResponseEvent) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Slice (a-3): no outer mutex. `handleReqRespResponse` snapshots
+        // the pending request entry under the pending_rpc_requests lock,
+        // then calls `chain.onBlock` (per-resource locks) for the
+        // blocks_by_root branch. Network mutations go through
+        // `Network`'s LockedMap / BlockCache helpers.
         try self.handleReqRespResponse(event);
     }
 
@@ -899,11 +1169,16 @@ pub const BeamNode = struct {
     pub fn onReqRespRequest(ptr: *anyopaque, data: *const networks.ReqRespRequest, responder: networks.ReqRespServerStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // Slice (a-3): fully lock-free. The two arms below only:
+        //   * `chain.db.loadBlock` — the DB has its own internal
+        //     synchronisation (rocksdb / lmdb backends are thread-safe for
+        //     concurrent reads).
+        //   * `chain.getStatus()` — reads forkchoice via its own RwLock
+        //     shared path; no other chain state touched.
+        // Neither arm mutates `chain` or `network` state, so no caller
+        // synchronisation is required.
         switch (data.*) {
             .blocks_by_root => |request| {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
                 const roots = request.roots.constSlice();
 
                 self.logger.debug(
@@ -931,6 +1206,112 @@ pub const BeamNode = struct {
 
                 try responder.finish();
             },
+            .blocks_by_range => |request| {
+                const start_slot = request.start_slot;
+                const requested_count = request.count;
+                // Cap count at MAX_REQUEST_BLOCKS to bound work per request
+                const count = @min(requested_count, params.MAX_REQUEST_BLOCKS);
+
+                self.logger.debug(
+                    "node-{d}:: Handling blocks_by_range request start_slot={d} count={d} (capped from {d})",
+                    .{ self.nodeId, start_slot, count, requested_count },
+                );
+
+                // Enforce MIN_SLOTS_FOR_BLOCK_REQUESTS history window.
+                // Responders MUST keep at least MIN_SLOTS_FOR_BLOCK_REQUESTS recent slots
+                // available. Requests whose start_slot falls before that window get
+                // RESOURCE_UNAVAILABLE (code 3) so callers can skip to a better peer.
+                const head = self.chain.forkChoice.getHead();
+                if (head.slot >= constants.MIN_SLOTS_FOR_BLOCK_REQUESTS) {
+                    const history_start = head.slot - constants.MIN_SLOTS_FOR_BLOCK_REQUESTS;
+                    if (start_slot < history_start) {
+                        self.logger.warn(
+                            "node-{d}:: blocks_by_range: start_slot={d} is before history window start={d} (head={d}), sending RESOURCE_UNAVAILABLE",
+                            .{ self.nodeId, start_slot, history_start, head.slot },
+                        );
+                        try responder.sendError(constants.RPC_ERR_RESOURCE_UNAVAILABLE, "requested range is outside history window");
+                        return;
+                    }
+                }
+
+                const end_slot_exclusive: types.Slot = start_slot + count;
+                const finalized_slot = self.chain.forkChoice.getLatestFinalized().slot;
+
+                // ---- Finalized range: use DB slot index ----
+                // Slots <= finalized_slot are indexed in DbFinalizedSlotsNamespace (slot → root).
+                // This works even after forkChoice has been rebased and those nodes pruned.
+                if (start_slot <= finalized_slot) {
+                    const fin_end = @min(end_slot_exclusive, finalized_slot + 1);
+                    var slot: types.Slot = start_slot;
+                    while (slot < fin_end) : (slot += 1) {
+                        const root = self.chain.db.loadFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, slot) orelse {
+                            // Slot may be empty (no block produced that slot) — skip silently.
+                            continue;
+                        };
+                        if (self.chain.db.loadBlock(database.DbBlocksNamespace, root)) |signed_block_value| {
+                            var signed_block = signed_block_value;
+                            defer signed_block.deinit();
+
+                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            defer response.deinit();
+
+                            try responder.sendResponse(&response);
+                        } else {
+                            self.logger.warn(
+                                "node-{d}:: blocks_by_range: finalized block root=0x{x} at slot={d} not found in DB",
+                                .{ self.nodeId, &root, slot },
+                            );
+                        }
+                    }
+                }
+
+                // ---- Unfinalized range: walk forkChoice from head ----
+                // For slots above the finalized checkpoint the canonical chain is still
+                // tracked in the in-memory forkChoice ProtoArray.
+                if (end_slot_exclusive > finalized_slot + 1) {
+                    const unfin_start = @max(start_slot, finalized_slot + 1);
+
+                    var collected: std.ArrayList(types.Root) = .empty;
+                    defer collected.deinit(self.allocator);
+
+                    var current_opt: ?types.Root = head.blockRoot;
+                    while (current_opt) |current_root| {
+                        const node = self.chain.forkChoice.getBlock(current_root) orelse break;
+                        if (node.slot < unfin_start) break;
+                        if (node.slot < end_slot_exclusive) {
+                            collected.append(self.allocator, current_root) catch break;
+                        }
+                        // Step to parent. Genesis / anchor has parentRoot == zero.
+                        if (std.mem.eql(u8, &node.parentRoot, &ZERO_HASH)) break;
+                        if (std.mem.eql(u8, &node.parentRoot, &current_root)) break;
+                        current_opt = node.parentRoot;
+                    }
+
+                    // Collected in reverse-chronological order; reverse to send ascending by slot.
+                    std.mem.reverse(types.Root, collected.items);
+
+                    for (collected.items) |root| {
+                        if (self.chain.db.loadBlock(database.DbBlocksNamespace, root)) |signed_block_value| {
+                            var signed_block = signed_block_value;
+                            defer signed_block.deinit();
+
+                            var response = networks.ReqRespResponse{ .blocks_by_range = undefined };
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &response.blocks_by_range);
+                            defer response.deinit();
+
+                            try responder.sendResponse(&response);
+                        } else {
+                            self.logger.warn(
+                                "node-{d}:: blocks_by_range: unfinalized block root=0x{x} not found in DB",
+                                .{ self.nodeId, &root },
+                            );
+                        }
+                    }
+                }
+
+                try responder.finish();
+            },
             .status => {
                 var response = networks.ReqRespResponse{ .status = self.chain.getStatus() };
                 try responder.sendResponse(&response);
@@ -942,6 +1323,47 @@ pub const BeamNode = struct {
         return .{
             .ptr = self,
             .onReqRespRequestCb = onReqRespRequest,
+        };
+    }
+
+    /// Send all accumulated pending parent roots as a single batched blocks_by_root request.
+    ///
+    /// Multiple gossip blocks or RPC responses received close together may each need a
+    /// different parent block fetched. Without batching, each one opens its own libp2p
+    /// stream, causing 300+ sequential round-trips when a peer walks a long parent chain.
+    /// Collecting roots here and flushing them in one request reduces that to a single
+    /// round-trip for the same burst of missing parents.
+    fn flushPendingParentFetches(self: *Self) void {
+        // Drain under the dedicated lock so the gossip / req-resp paths
+        // can keep enqueueing while we issue the batched fetch.
+        var roots: std.ArrayList(types.Root) = .empty;
+        defer roots.deinit(self.allocator);
+        var max_depth: u32 = 0;
+        {
+            self.batch_pending_parent_roots_lock.lock();
+            defer self.batch_pending_parent_roots_lock.unlock();
+
+            const count = self.batch_pending_parent_roots.count();
+            if (count == 0) return;
+
+            roots.ensureTotalCapacityPrecise(self.allocator, count) catch {
+                self.logger.warn("failed to allocate roots list for pending parent fetch flush", .{});
+                return;
+            };
+
+            var it = self.batch_pending_parent_roots.iterator();
+            while (it.next()) |entry| {
+                roots.appendAssumeCapacity(entry.key_ptr.*);
+                if (entry.value_ptr.* > max_depth) max_depth = entry.value_ptr.*;
+            }
+            self.batch_pending_parent_roots.clearRetainingCapacity();
+        }
+
+        if (roots.items.len == 0) return;
+        self.logger.debug("flushing {d} pending parent root(s) as one batched blocks_by_root request", .{roots.items.len});
+
+        self.fetchBlockByRoots(roots.items, max_depth) catch |err| {
+            self.logger.warn("failed to batch-fetch {d} pending parent root(s): {any}", .{ roots.items.len, err });
         };
     }
 
@@ -993,6 +1415,15 @@ pub const BeamNode = struct {
         }
     }
 
+    /// Extract client type prefix from a node name like "zeam_0" -> "zeam", fallback "unknown".
+    fn clientTypeFromName(name: ?[]const u8) []const u8 {
+        const n = name orelse return "unknown";
+        if (std.mem.indexOfScalar(u8, n, '_')) |sep| {
+            if (sep > 0) return n[0..sep];
+        }
+        return if (n.len > 0) n else "unknown";
+    }
+
     pub fn onPeerConnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -1007,7 +1438,9 @@ pub const BeamNode = struct {
 
         // Record metrics
         zeam_metrics.metrics.lean_peer_connection_events_total.incr(.{ .direction = @tagName(direction), .result = "success" }) catch {};
-        zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+        const client_name = node_name.name orelse "unknown";
+        const client_type = clientTypeFromName(node_name.name);
+        zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 1) catch {};
 
         const handler = self.getReqRespResponseHandler();
         const status = self.chain.getStatus();
@@ -1033,10 +1466,12 @@ pub const BeamNode = struct {
     pub fn onPeerDisconnected(ptr: *anyopaque, peer_id: []const u8, direction: networks.PeerDirection, reason: networks.DisconnectionReason) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        const node_name = self.node_registry.getNodeNameFromPeerId(peer_id);
+
         if (self.network.disconnectPeer(peer_id)) {
             self.logger.info("peer disconnected: {s}{f}, direction={s}, reason={s}, total peers: {d}", .{
                 peer_id,
-                self.node_registry.getNodeNameFromPeerId(peer_id),
+                node_name,
                 @tagName(direction),
                 @tagName(reason),
                 self.network.getPeerCount(),
@@ -1044,7 +1479,9 @@ pub const BeamNode = struct {
 
             // Record metrics
             zeam_metrics.metrics.lean_peer_disconnection_events_total.incr(.{ .direction = @tagName(direction), .reason = @tagName(reason) }) catch {};
-            zeam_metrics.metrics.lean_connected_peers.set(@intCast(self.network.getPeerCount()));
+            const client_name = node_name.name orelse "unknown";
+            const client_type = clientTypeFromName(node_name.name);
+            zeam_metrics.metrics.lean_connected_peers.set(.{ .client = client_name, .client_type = client_type }, 0) catch {};
         }
     }
 
@@ -1115,8 +1552,12 @@ pub const BeamNode = struct {
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                // Slice (a-3): no outer mutex. `chain.onInterval` /
+                // `chain.processPendingBlocks` take their own per-resource
+                // locks (forkchoice RwLock, pending_blocks_lock,
+                // states_lock, events_lock) and `sweepTimedOutRequests` /
+                // `processReadyCachedBlocks` go through
+                // network/block_cache helpers.
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
@@ -1216,11 +1657,29 @@ pub const BeamNode = struct {
     /// (e.g., after a restart or while stuck in fc_initing) get another
     /// chance to report their head and trigger block fetching.
     fn refreshSyncFromPeers(self: *Self) void {
+        // Snapshot the connected peer ids under the shared lock so we can
+        // call `sendStatusToPeer` (which takes its own locks) without
+        // holding the connected_peers lock across nested locks.
+        var peer_ids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (peer_ids.items) |p| self.allocator.free(p);
+            peer_ids.deinit(self.allocator);
+        }
+        {
+            var guard = self.network.connected_peers.iterateLocked();
+            defer guard.deinit();
+            while (guard.iter.next()) |entry| {
+                const owned = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                peer_ids.append(self.allocator, owned) catch {
+                    self.allocator.free(owned);
+                    continue;
+                };
+            }
+        }
+
         const status = self.chain.getStatus();
         const handler = self.getReqRespResponseHandler();
-        var it = self.network.connected_peers.iterator();
-        while (it.next()) |entry| {
-            const peer_id = entry.key_ptr.*;
+        for (peer_ids.items) |peer_id| {
             _ = self.network.sendStatusToPeer(peer_id, status, handler) catch |err| {
                 self.logger.warn("failed to refresh status to peer {s}{f}: {any}", .{
                     peer_id,
@@ -1232,30 +1691,38 @@ pub const BeamNode = struct {
     }
 
     fn sweepTimedOutRequests(self: *Self) void {
-        const current_time = std.time.timestamp();
+        const current_time = zeam_utils.unixTimestampSeconds();
         const timed_out = self.network.getTimedOutRequests(current_time, constants.RPC_REQUEST_TIMEOUT_SECONDS) catch |err| {
             self.logger.warn("failed to check for timed-out RPC requests: {any}", .{err});
             return;
         };
+        defer self.allocator.free(timed_out);
 
         for (timed_out) |request_id| {
-            const entry_ptr = self.network.getPendingRequestPtr(request_id) orelse continue;
+            // Snapshot the entry so we can `finalizePendingRequest` (which
+            // takes the pending_rpc_requests lock for write) without
+            // racing the snapshot's read.
+            var snap = (self.network.snapshotPendingRequest(request_id) catch |err| {
+                self.logger.warn("failed to snapshot timed-out request_id={d}: {any}", .{ request_id, err });
+                continue;
+            }) orelse continue;
+            defer snap.deinit(self.allocator);
 
-            switch (entry_ptr.request) {
-                .blocks_by_root => |block_ctx| {
+            switch (snap.request_kind) {
+                .blocks_by_root => {
                     // Copy roots + depths BEFORE finalize frees them
                     var roots_to_retry = std.ArrayList(struct { root: types.Root, depth: u32 }).empty;
                     defer roots_to_retry.deinit(self.allocator);
 
-                    for (block_ctx.requested_roots) |root| {
+                    for (snap.requested_roots_copy) |root| {
                         const depth = self.network.getPendingBlockRootDepth(root) orelse 0;
                         roots_to_retry.append(self.allocator, .{ .root = root, .depth = depth }) catch continue;
                     }
 
                     self.logger.warn("RPC request_id={d} to peer {s}{f} timed out after {d}s, retrying {d} roots", .{
                         request_id,
-                        block_ctx.peer_id,
-                        self.node_registry.getNodeNameFromPeerId(block_ctx.peer_id),
+                        snap.peer_id_copy,
+                        self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
                         constants.RPC_REQUEST_TIMEOUT_SECONDS,
                         roots_to_retry.items.len,
                     });
@@ -1271,11 +1738,19 @@ pub const BeamNode = struct {
                         };
                     }
                 },
-                .status => |status_ctx| {
+                .status => {
                     self.logger.warn("status RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
                         request_id,
-                        status_ctx.peer_id,
-                        self.node_registry.getNodeNameFromPeerId(status_ctx.peer_id),
+                        snap.peer_id_copy,
+                        self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
+                    });
+                    self.network.finalizePendingRequest(request_id);
+                },
+                .blocks_by_range => {
+                    self.logger.warn("blocks_by_range RPC request_id={d} to peer {s}{f} timed out, finalizing", .{
+                        request_id,
+                        snap.peer_id_copy,
+                        self.node_registry.getNodeNameFromPeerId(snap.peer_id_copy),
                     });
                     self.network.finalizePendingRequest(request_id);
                 },
@@ -1305,8 +1780,20 @@ pub const BeamNode = struct {
             });
         }
 
+        // Slice (a-2) migration: the previous `states.get(block_root)`
+        // shortcut handed `chain.onBlock` the cached post-state pointer to
+        // skip recomputation when the block was already produced locally.
+        // Under the new per-resource locking model that pointer would have
+        // to be carried as a `BorrowedState`, but `chain.onBlock` itself
+        // takes `states_lock.exclusive` to commit — holding the read side
+        // across that call would deadlock. The post-state recompute path
+        // is now the single source of truth for both produced-locally and
+        // received-from-gossip blocks; the `statesPutOrSwap` helper inside
+        // `onBlock` keeps the original in-map pointer intact when the
+        // entry already exists, so locally produced blocks no longer leak
+        // their initial post-state on the publish hop. See the design doc
+        // §Resource-by-resource design / `BeamChain.states` for context.
         const missing_roots = try self.chain.onBlock(signed_block, .{
-            .postState = self.chain.states.get(block_root),
             .blockRoot = block_root,
         });
         defer self.allocator.free(missing_roots);
@@ -1317,12 +1804,23 @@ pub const BeamNode = struct {
 
         // 3. Publish gossip message to the network.
         const gossip_msg = networks.GossipMessage{ .block = signed_block };
-        try self.network.publish(&gossip_msg);
-        self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
-            block.slot,
-            block.proposer_index,
-            self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
-        });
+        const block_published = try self.network.publish(&gossip_msg);
+        if (block_published) {
+            self.logger.info("published block to network: slot={d} proposer={d}{f}", .{
+                block.slot,
+                block.proposer_index,
+                self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+            });
+        } else {
+            // Issue #808: backend dropped the publish (e.g. rust-libp2p command
+            // channel full). The block is in our local chain but never reached
+            // the network — surface it instead of logging "published".
+            self.logger.warn("failed to publish block to network (backend dropped publish): slot={d} proposer={d}{f}", .{
+                block.slot,
+                block.proposer_index,
+                self.node_registry.getNodeNameFromValidatorIndex(block.proposer_index),
+            });
+        }
 
         // 4. Followup with additional housekeeping tasks.
         self.chain.onBlockFollowup(true, &signed_block);
@@ -1342,13 +1840,23 @@ pub const BeamNode = struct {
 
         // 2. publish gossip message
         const gossip_msg = networks.GossipMessage{ .attestation = signed_attestation };
-        try self.network.publish(&gossip_msg);
+        const attestation_published = try self.network.publish(&gossip_msg);
 
-        self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
-            data.slot,
-            validator_id,
-            self.node_registry.getNodeNameFromValidatorIndex(validator_id),
-        });
+        if (attestation_published) {
+            self.logger.info("published attestation to network: slot={d} validator={d}{f}", .{
+                data.slot,
+                validator_id,
+                self.node_registry.getNodeNameFromValidatorIndex(validator_id),
+            });
+        } else {
+            // Issue #808: backend dropped the publish. The attestation is in
+            // our local chain but never reached gossip — don't log "published".
+            self.logger.warn("failed to publish attestation to network (backend dropped publish): slot={d} validator={d}{f}", .{
+                data.slot,
+                validator_id,
+                self.node_registry.getNodeNameFromValidatorIndex(validator_id),
+            });
+        }
     }
 
     pub fn publishAggregation(self: *Self, signed_aggregation: types.SignedAggregatedAttestation) !void {
@@ -1356,9 +1864,14 @@ pub const BeamNode = struct {
         try self.chain.onGossipAggregatedAttestation(signed_aggregation);
 
         const gossip_msg = networks.GossipMessage{ .aggregation = signed_aggregation };
-        try self.network.publish(&gossip_msg);
+        const aggregation_published = try self.network.publish(&gossip_msg);
 
-        self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+        if (aggregation_published) {
+            self.logger.info("published aggregation to network: slot={d}", .{signed_aggregation.data.slot});
+        } else {
+            // Issue #808: backend dropped the publish.
+            self.logger.warn("failed to publish aggregation to network (backend dropped publish): slot={d}", .{signed_aggregation.data.slot});
+        }
     }
 
     fn publishProducedAggregations(self: *Self, aggregations: []types.SignedAggregatedAttestation) !void {
@@ -1439,6 +1952,34 @@ pub const BeamNode = struct {
 
         const topics_slice = try topics_list.toOwnedSlice(self.allocator);
         defer self.allocator.free(topics_slice);
+
+        // Report the selective gossip subscription set so operators can verify
+        // (and so subnet-routing regressions are visible in logs). Mirrors the
+        // leanSpec behaviour at src/lean_spec/__main__.py:541-549.
+        var attestation_subnet_count: usize = 0;
+        for (topics_slice) |topic| {
+            if (topic.kind == .attestation) attestation_subnet_count += 1;
+        }
+        if (attestation_subnet_count == 0) {
+            self.logger.info("gossip subscriptions: block + aggregation only (no attestation subnets — non-aggregator node with no registered validators)", .{});
+        } else {
+            // Format the attestation subnet IDs into a comma-separated list for a single
+            // human-readable log line.
+            var subnet_ids_buf: std.ArrayList(u8) = .empty;
+            defer subnet_ids_buf.deinit(self.allocator);
+            var first = true;
+            var id_buf: [32]u8 = undefined;
+            for (topics_slice) |topic| {
+                if (topic.kind != .attestation) continue;
+                const subnet_id = topic.subnet_id orelse continue;
+                if (!first) try subnet_ids_buf.appendSlice(self.allocator, ",");
+                first = false;
+                const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{subnet_id});
+                try subnet_ids_buf.appendSlice(self.allocator, id_str);
+            }
+            self.logger.info("gossip subscriptions: block + aggregation + {d} attestation subnet(s) [{s}]", .{ attestation_subnet_count, subnet_ids_buf.items });
+        }
+
         try self.network.backend.gossip.subscribe(topics_slice, handler);
 
         const peer_handler = self.getPeerEventHandler();
@@ -1483,7 +2024,7 @@ test "Node peer tracking on connect/disconnect" {
     defer allocator.free(all_pubkeys.proposal_pubkeys);
 
     const genesis_config = types.GenesisSpec{
-        .genesis_time = @intCast(std.time.timestamp()),
+        .genesis_time = @intCast(zeam_utils.unixTimestampSeconds()),
         .validator_attestation_pubkeys = all_pubkeys.attestation_pubkeys,
         .validator_proposal_pubkeys = all_pubkeys.proposal_pubkeys,
     };
@@ -1494,7 +2035,7 @@ test "Node peer tracking on connect/disconnect" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, ctx.loggerConfig().logger(.database), data_dir);
@@ -1517,7 +2058,7 @@ test "Node peer tracking on connect/disconnect" {
         },
     };
 
-    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr());
+    var clock = try clockFactory.Clock.init(allocator, genesis_config.genesis_time, ctx.loopPtr(), ctx.loggerConfig());
     defer clock.deinit(allocator);
 
     var node: BeamNode = undefined;
@@ -1579,7 +2120,7 @@ test "Node peer tracking on connect/disconnect" {
     // Process pending async operations (status request timer callbacks and their responses)
     var iterations: u32 = 0;
     while (iterations < 5) : (iterations += 1) {
-        std.Thread.sleep(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
+        zeam_utils.sleepNs(2 * std.time.ns_per_ms); // Wait 2ms for timers to fire
         try ctx.loopPtr().run(.until_done);
     }
 }
@@ -1901,9 +2442,11 @@ test "Node: pruneCachedBlocks removes entire chain including ancestors" {
 
     // Verify initial children map state:
     // A -> {B, D}, B -> {C}
-    const children_of_a = node.network.getChildrenOfBlock(root_a);
+    const children_of_a = try node.network.getChildrenOfBlock(root_a);
+    defer allocator.free(children_of_a);
     try std.testing.expectEqual(@as(usize, 2), children_of_a.len);
-    const children_of_b = node.network.getChildrenOfBlock(root_b);
+    const children_of_b = try node.network.getChildrenOfBlock(root_b);
+    defer allocator.free(children_of_b);
     try std.testing.expectEqual(@as(usize, 1), children_of_b.len);
 
     try node.network.trackPendingBlockRoot(root_a, 0);
@@ -1922,8 +2465,8 @@ test "Node: pruneCachedBlocks removes entire chain including ancestors" {
     try std.testing.expect(!node.network.hasFetchedBlock(root_d));
 
     // ChildrenMap cleanup: all entries removed
-    try std.testing.expect(node.network.fetched_block_children.get(root_a) == null);
-    try std.testing.expect(node.network.fetched_block_children.get(root_b) == null);
+    try std.testing.expect(!node.network.block_cache.hasChildren(root_a));
+    try std.testing.expect(!node.network.block_cache.hasChildren(root_b));
 
     // Pending cleared for entire chain
     try std.testing.expect(!node.network.hasPendingBlockRoot(root_a));
@@ -2154,7 +2697,8 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
     try std.testing.expect(node.network.hasFetchedBlock(child_root));
 
     // Verify the children list has exactly one entry (no duplicates)
-    const children = node.network.getChildrenOfBlock(parent_root);
+    const children = try node.network.getChildrenOfBlock(parent_root);
+    defer allocator.free(children);
     try std.testing.expectEqual(@as(usize, 1), children.len);
     try std.testing.expect(std.mem.eql(u8, children[0][0..], child_root[0..]));
 
@@ -2162,11 +2706,12 @@ test "Node: cacheFetchedBlock deduplicates children entries on repeated caching"
     try std.testing.expect(node.network.removeFetchedBlock(child_root));
 
     // After removal, no children should remain for this parent
-    const children_after = node.network.getChildrenOfBlock(parent_root);
+    const children_after = try node.network.getChildrenOfBlock(parent_root);
+    defer allocator.free(children_after);
     try std.testing.expectEqual(@as(usize, 0), children_after.len);
 
     // The parent entry should be fully cleaned up from the children map
-    try std.testing.expect(node.network.fetched_block_children.get(parent_root) == null);
+    try std.testing.expect(!node.network.block_cache.hasChildren(parent_root));
 }
 
 test "Node: publishBlock persists locally produced blocks for blocks-by-root sync" {
@@ -2242,4 +2787,138 @@ test "Node: publishBlock persists locally produced blocks for blocks-by-root syn
         try std.testing.expectEqual(@as(usize, slot), stored_block.block.slot);
         try std.testing.expect(std.mem.eql(u8, &stored_block.block.parent_root, &signed_block.block.parent_root));
     }
+}
+
+test "Network: BlockCache wiring smoke (slice a-3)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    const root_a: types.Root = [_]u8{0x11} ** 32;
+    const root_b: types.Root = [_]u8{0x22} ** 32;
+    const root_c: types.Root = [_]u8{0x33} ** 32;
+    const zero_root: types.Root = ZERO_HASH;
+
+    // insertBlockPtr path (via Network.cacheFetchedBlock).
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try node.network.cacheFetchedBlock(root_b, try makeTestSignedBlockWithParent(allocator, 2, root_a));
+    try node.network.cacheFetchedBlock(root_c, try makeTestSignedBlockWithParent(allocator, 3, root_a));
+
+    try std.testing.expectEqual(@as(usize, 3), node.network.getFetchedBlockCount());
+    try std.testing.expect(node.network.hasFetchedBlock(root_a));
+    try std.testing.expect(node.network.hasFetchedBlock(root_b));
+    try std.testing.expect(node.network.hasFetchedBlock(root_c));
+
+    // Duplicate insert is silently absorbed (block_ptr is freed by
+    // cacheFetchedBlock).
+    try node.network.cacheFetchedBlock(root_a, try makeTestSignedBlockWithParent(allocator, 1, zero_root));
+    try std.testing.expectEqual(@as(usize, 3), node.network.getFetchedBlockCount());
+
+    // getChildrenOfBlock returns an owned slice with both children of A.
+    const children_of_a = try node.network.getChildrenOfBlock(root_a);
+    defer allocator.free(children_of_a);
+    try std.testing.expectEqual(@as(usize, 2), children_of_a.len);
+
+    // attachSsz works for cached blocks, errors for missing ones.
+    const ssz_buf = try allocator.dupe(u8, "abcdef");
+    try node.network.storeFetchedBlockSsz(root_a, ssz_buf);
+    try std.testing.expect(node.network.getFetchedBlockSsz(root_a) != null);
+    try std.testing.expect(node.network.getFetchedBlockSsz(root_b) == null);
+
+    // collectCachedBlocksAtOrBelowSlot picks up the slot-1 / slot-2 blocks.
+    const at_or_below_2 = try node.network.collectCachedBlocksAtOrBelowSlot(2);
+    defer allocator.free(at_or_below_2);
+    try std.testing.expect(at_or_below_2.len >= 2);
+
+    // collectReadyCachedBlocks returns block summaries for slot-≤-3 blocks.
+    const ready = try node.network.collectReadyCachedBlocks(3);
+    defer allocator.free(ready);
+    try std.testing.expectEqual(@as(usize, 3), ready.len);
+
+    // removeFetchedBlock walks the parent-link cleanly: remove B, A's
+    // children should drop to one.
+    try std.testing.expect(node.network.removeFetchedBlock(root_b));
+    const children_after = try node.network.getChildrenOfBlock(root_a);
+    defer allocator.free(children_after);
+    try std.testing.expectEqual(@as(usize, 1), children_after.len);
+}
+
+test "Network: ConnectedPeers integration with selectPeer (slice a-3)" {
+    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_allocator.deinit();
+    const allocator = arena_allocator.allocator();
+
+    var ctx = try testing.NodeTestContext.init(allocator, .{});
+    defer ctx.deinit();
+
+    var mock = try networks.Mock.init(allocator, ctx.loopPtr(), ctx.loggerConfig().logger(.mock), null);
+    defer mock.deinit();
+    const backend = mock.getNetworkInterface();
+
+    const chain_config = ctx.takeChainConfig();
+    const anchor_state = ctx.takeAnchorState();
+
+    const test_registry = try allocator.create(NodeNameRegistry);
+    defer allocator.destroy(test_registry);
+    test_registry.* = NodeNameRegistry.init(allocator);
+    defer test_registry.deinit();
+
+    var node: BeamNode = undefined;
+    try node.init(allocator, .{
+        .config = chain_config,
+        .anchorState = anchor_state,
+        .backend = backend,
+        .clock = ctx.clockPtr(),
+        .validator_ids = null,
+        .nodeId = 0,
+        .db = ctx.dbInstance(),
+        .logger_config = ctx.loggerConfig(),
+        .node_registry = test_registry,
+    });
+    defer node.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), node.network.getPeerCount());
+
+    try node.network.connectPeer("peer-aaa");
+    try node.network.connectPeer("peer-bbb");
+    try std.testing.expectEqual(@as(usize, 2), node.network.getPeerCount());
+    try std.testing.expect(node.network.hasPeer("peer-aaa"));
+
+    // selectPeer returns an owned copy.
+    if (try node.network.selectPeer()) |picked| {
+        defer allocator.free(picked);
+        try std.testing.expect(node.network.hasPeer(picked));
+    } else return error.NoPick;
+
+    try std.testing.expect(node.network.disconnectPeer("peer-aaa"));
+    try std.testing.expectEqual(@as(usize, 1), node.network.getPeerCount());
 }

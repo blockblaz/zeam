@@ -1,7 +1,6 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
 
 const ssz = @import("ssz");
 const types = @import("@zeam/types");
@@ -11,6 +10,7 @@ const stf = @import("@zeam/state-transition");
 const zeam_metrics = @import("@zeam/metrics");
 const params = @import("@zeam/params");
 const keymanager = @import("@zeam/key-manager");
+const ThreadPool = @import("@zeam/thread-pool").ThreadPool;
 
 const constants = @import("./constants.zig");
 
@@ -261,6 +261,7 @@ pub const ForkChoiceParams = struct {
     config: configs.ChainConfig,
     anchorState: *const types.BeamState,
     logger: zeam_utils.ModuleLogger,
+    thread_pool: ?*ThreadPool = null,
 };
 
 // Use shared signature map types from types package
@@ -291,7 +292,7 @@ pub const ForkChoice = struct {
     deltas: std.ArrayList(isize),
     logger: zeam_utils.ModuleLogger,
     // Thread-safe access protection
-    mutex: Thread.RwLock,
+    mutex: zeam_utils.SyncRwLock,
     // Per-validator XMSS signatures learned from gossip, keyed by (AttestationData, ValidatorIndex).
     attestation_signatures: SignaturesMap,
     // Aggregated signature proofs pending processing.
@@ -301,12 +302,15 @@ pub const ForkChoice = struct {
     // Used for recursive signature aggregation when building blocks.
     latest_known_aggregated_payloads: AggregatedPayloadsMap,
     // Mutex to protect concurrent access to signature/payload maps
-    signatures_mutex: std.Thread.Mutex,
+    signatures_mutex: zeam_utils.SyncMutex,
     // Tracks whether FC has observed a real justified checkpoint via block processing.
     // Starts as `initing` for checkpoint-sync init (anchor slot > 0); transitions to
     // `ready` on the first block-driven justified update.  Validator duties (block
     // production, attestation) must not run while status == .initing.
     status: ForkChoiceStatus,
+    // Optional shared worker pool used for CPU-heavy attestation compaction.
+    thread_pool: ?*ThreadPool = null,
+    last_node_tick_time_ms: ?i64,
 
     const Self = @This();
 
@@ -370,7 +374,7 @@ pub const ForkChoice = struct {
             .safeTarget = anchor_block,
             .deltas = deltas,
             .logger = opts.logger,
-            .mutex = Thread.RwLock{},
+            .mutex = zeam_utils.SyncRwLock{},
             .attestation_signatures = attestation_signatures,
             .latest_new_aggregated_payloads = latest_new_aggregated_payloads,
             .latest_known_aggregated_payloads = latest_known_aggregated_payloads,
@@ -379,6 +383,8 @@ pub const ForkChoice = struct {
             // (slot > 0) start in `initing` and become `ready` once the first real justified
             // checkpoint is observed through block processing.
             .status = if (opts.anchorState.slot == 0) .ready else .initing,
+            .thread_pool = opts.thread_pool,
+            .last_node_tick_time_ms = null,
         };
         if (fc.status == .initing) {
             fc.logger.info("[forkchoice] init: checkpoint-sync anchor at slot={d} — status=initing; awaiting first justified update before enabling validator duties", .{opts.anchorState.slot});
@@ -823,6 +829,14 @@ pub const ForkChoice = struct {
 
     // Internal unlocked version - assumes caller holds lock
     fn tickIntervalUnlocked(self: *Self, hasProposal: bool) !void {
+        const time_now_ms: i64 = zeam_utils.unixTimestampMillis();
+        if (self.last_node_tick_time_ms) |last| {
+            const elapsed_s: f32 = @as(f32, @floatFromInt(time_now_ms - last)) / 1000.0;
+            zeam_metrics.zeam_fork_choice_tick_interval_duration_seconds.record(elapsed_s);
+            self.logger.info("slot_interval={d} duration={d:.3}s", .{ self.fcStore.slot_clock.slotInterval.load(.monotonic), elapsed_s });
+        }
+        self.last_node_tick_time_ms = time_now_ms;
+
         const new_time = self.fcStore.slot_clock.time.fetchAdd(1, .monotonic) + 1;
         const currentInterval = new_time % constants.INTERVALS_PER_SLOT;
         self.fcStore.slot_clock.slotInterval.store(currentInterval, .monotonic);
@@ -1063,14 +1077,19 @@ pub const ForkChoice = struct {
             // Compact: merge proofs sharing the same AttestationData into one
             // using recursive children aggregation, so each AttestationData
             // appears at most once.
+            const compact_timer = zeam_metrics.zeam_compact_attestations_time_seconds.start();
             const compacted = try types.compactAttestations(
                 self.allocator,
                 &agg_attestations,
                 &attestation_signatures,
                 &pre_state.validators,
+                self.thread_pool,
             );
+            _ = compact_timer.observe();
+            zeam_metrics.metrics.zeam_compact_attestations_input_total.incrBy(@intCast(agg_attestations.constSlice().len));
             agg_attestations = compacted.attestations;
             attestation_signatures = compacted.signatures;
+            zeam_metrics.metrics.zeam_compact_attestations_output_total.incrBy(@intCast(agg_attestations.constSlice().len));
 
             // Build candidate block with all accumulated attestations and apply STF
             // to check if justification changed.
@@ -1245,17 +1264,23 @@ pub const ForkChoice = struct {
         const cutoff_weight = try std.math.divCeil(u64, 2 * self.config.genesis.numValidators(), 3);
         const safe_target = try self.computeFCHeadUnlocked(false, cutoff_weight);
 
-        // Can't regress on safe target
+        // Safe target regression is a legitimate fork-choice outcome, not a
+        // bug: the deepest 2/3-supported descendant of `latest_justified` can
+        // move to a shallower slot when attestation weights shift across
+        // branches or when `latest_justified` itself advances to a different
+        // subtree. Previously this returned `InvalidSafeTargetCompute`, which
+        // aborted the interval-3 tick and wedged the node's time loop on
+        // devnet-4 whenever target divergence produced a shallower
+        // 2/3-supermajority subtree. Accept the new value and surface the
+        // regression via a warn-level log so operators retain visibility.
         if (safe_target.slot < self.safeTarget.slot) {
-            self.logger.err("invalid safe target compute regression  new={d} < current={d} ", .{
+            self.logger.warn("safe target regressed new={d} < current={d}; accepting new value", .{
                 safe_target.slot,
                 self.safeTarget.slot,
             });
-            return ForkChoiceError.InvalidSafeTargetCompute;
         }
 
         self.safeTarget = safe_target;
-        // Update safe target slot metric
         zeam_metrics.metrics.lean_safe_target_slot.set(self.safeTarget.slot);
         return self.safeTarget;
     }
@@ -1416,6 +1441,8 @@ pub const ForkChoice = struct {
     /// via two-pass greedy selection. Replaces new_payloads with fresh results.
     fn aggregateUnlocked(self: *Self, state_opt: ?*const types.BeamState) ![]types.SignedAggregatedAttestation {
         const state = state_opt orelse return try self.allocator.alloc(types.SignedAggregatedAttestation, 0);
+        const agg_timer = zeam_metrics.lean_committee_signatures_aggregation_time_seconds.start();
+        defer _ = agg_timer.observe();
 
         // Capture counts for metrics update outside lock scope
         var new_payloads_count: usize = 0;
@@ -1437,7 +1464,7 @@ pub const ForkChoice = struct {
             agg.attestation_signatures.deinit();
         };
 
-        var results: std.ArrayList(types.SignedAggregatedAttestation) = .{};
+        var results: std.ArrayList(types.SignedAggregatedAttestation) = .empty;
         errdefer {
             for (results.items) |*signed| {
                 signed.deinit();
@@ -1584,7 +1611,7 @@ pub const ForkChoice = struct {
         payloads: *AggregatedPayloadsMap,
         finalized_slot: types.Slot,
     ) !usize {
-        var keys_to_remove: std.ArrayList(types.AttestationData) = .{};
+        var keys_to_remove: std.ArrayList(types.AttestationData) = .empty;
         defer keys_to_remove.deinit(allocator);
 
         var removed_total: usize = 0;
@@ -2230,12 +2257,13 @@ test "getCanonicalAncestorAtDepth and getCanonicalityAnalysis" {
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
         .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     defer fork_choice.attestations.deinit();
     defer fork_choice.deltas.deinit(fork_choice.allocator);
@@ -2582,14 +2610,15 @@ fn buildTestTreeWithMockChain(allocator: Allocator, mock_chain: anytype) !struct
         .attestations = std.AutoHashMap(usize, AttestationTracker).init(allocator),
         .head = createTestProtoBlock(8, 0xFF, 0xEE), // Head is F
         .safeTarget = createTestProtoBlock(8, 0xFF, 0xEE),
-        .deltas = .{},
+        .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
 
     return .{
@@ -3569,12 +3598,13 @@ test "rebase: heavy attestation load - all validators tracked correctly" {
         .safeTarget = createTestProtoBlock(3, 0xDD, 0xCC),
         .deltas = .empty,
         .logger = module_logger,
-        .mutex = Thread.RwLock{},
+        .mutex = zeam_utils.SyncRwLock{},
         .attestation_signatures = SignaturesMap.init(allocator),
         .latest_new_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
         .latest_known_aggregated_payloads = AggregatedPayloadsMap.init(allocator),
-        .signatures_mutex = std.Thread.Mutex{},
+        .signatures_mutex = zeam_utils.SyncMutex{},
         .status = .ready,
+        .last_node_tick_time_ms = null,
     };
     // Note: We don't defer proto_array.nodes/indices.deinit() here because they're
     // moved into fork_choice and will be deinitialized separately

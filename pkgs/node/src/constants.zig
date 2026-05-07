@@ -37,3 +37,18 @@ pub const RPC_REQUEST_TIMEOUT_SECONDS: i64 = 8;
 // a node stuck in fc_initing can recover without waiting for new peer connections.
 // 8 slots = 32 seconds at 4s/slot.
 pub const SYNC_STATUS_REFRESH_INTERVAL_SLOTS: u64 = 8;
+
+// Threshold (in slots) above which we prefer a `blocks_by_range` bulk sync over the
+// recursive head-by-root walk. When the peer's head is more than this many slots
+// ahead of ours, we issue a single ranged request to catch up efficiently rather
+// than chasing the parent chain one block at a time.
+pub const BLOCKS_BY_RANGE_SYNC_THRESHOLD: u64 = 64;
+
+// Minimum number of recent slots that a blocksByRange responder MUST keep available.
+// Derived from leanSpec networking/config.py MIN_SLOTS_FOR_BLOCK_REQUESTS.
+// Requests whose start_slot falls before (head_slot - MIN_SLOTS_FOR_BLOCK_REQUESTS)
+// receive a RESOURCE_UNAVAILABLE error (code 3).
+pub const MIN_SLOTS_FOR_BLOCK_REQUESTS: u64 = 3600;
+
+// RPC error code for RESOURCE_UNAVAILABLE (per the ReqResp spec).
+pub const RPC_ERR_RESOURCE_UNAVAILABLE: u32 = 3;

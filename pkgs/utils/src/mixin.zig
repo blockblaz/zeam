@@ -1,29 +1,24 @@
 const std = @import("std");
-/// Constant which represents an empty structure field
-pub const Empty = std.builtin.Type.StructField{
-    .name = "",
-    .type = undefined,
-    .default_value_ptr = null,
-    .is_comptime = false,
-    .alignment = 0,
-};
+pub const Empty = struct {};
 
-/// Ensures the type matches the wanted type kind
-inline fn ensure(comptime T: type, comptime kind: std.builtin.TypeId) ?std.meta.TagPayload(std.builtin.Type, kind) {
-    return if (@typeInfo(T) == kind) @field(@typeInfo(T), @tagName(kind)) else null;
+inline fn ensureStruct(comptime T: type) ?std.builtin.Type.Struct {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => null,
+    };
 }
 
-fn indexByName(comptime fields: []const std.builtin.Type.StructField, name: []const u8) ?usize {
-    for (fields, 0..) |field, i| {
-        if (std.mem.eql(u8, field.name, name)) return i;
+fn indexByName(comptime names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |field_name, i| {
+        if (std.mem.eql(u8, field_name, name)) return i;
     }
     return null;
 }
 
 /// Mixes fields from structure extend into structure super
 pub fn MixIn(comptime Super: type, comptime Extend: type) type {
-    const superInfo = ensure(Super, .@"struct") orelse @panic("Super type must be a struct");
-    const extendInfo = ensure(Extend, .@"struct") orelse @panic("Extend type must be a struct");
+    const superInfo = ensureStruct(Super) orelse @panic("Super type must be a struct");
+    const extendInfo = ensureStruct(Extend) orelse @panic("Extend type must be a struct");
 
     if (extendInfo.layout != superInfo.layout) @compileError("Super and extend struct layouts must be the same");
     if (extendInfo.backing_integer != superInfo.backing_integer) @compileError("Super and extend struct backing integers must be the same");
@@ -31,34 +26,48 @@ pub fn MixIn(comptime Super: type, comptime Extend: type) type {
     var totalFields = superInfo.fields.len;
 
     for (extendInfo.fields) |field| {
-        if (indexByName(superInfo.fields, field.name) == null) totalFields += 1;
+        var found = false;
+        for (superInfo.fields) |super_field| {
+            if (std.mem.eql(u8, super_field.name, field.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) totalFields += 1;
     }
 
-    var fields: [totalFields]std.builtin.Type.StructField = [_]std.builtin.Type.StructField{Empty} ** totalFields;
+    var field_names: [totalFields][]const u8 = undefined;
+    var field_types: [totalFields]type = undefined;
+    var field_attrs: [totalFields]std.builtin.Type.StructField.Attributes = undefined;
 
     for (superInfo.fields, 0..) |src, i| {
-        fields[i] = src;
+        field_names[i] = src.name;
+        field_types[i] = src.type;
+        field_attrs[i] = .{
+            .@"comptime" = src.is_comptime,
+            .@"align" = src.alignment,
+            .default_value_ptr = src.default_value_ptr,
+        };
     }
 
-    var i: usize = 0;
+    var next_index: usize = superInfo.fields.len;
     for (extendInfo.fields) |src| {
-        const index = indexByName(&fields, src.name) orelse blk: {
-            i += 1;
-            break :blk (i + superInfo.fields.len - 1);
+        const index = indexByName(field_names[0..next_index], src.name) orelse blk: {
+            const idx = next_index;
+            next_index += 1;
+            break :blk idx;
         };
 
-        fields[index] = src;
+        field_names[index] = src.name;
+        field_types[index] = src.type;
+        field_attrs[index] = .{
+            .@"comptime" = src.is_comptime,
+            .@"align" = src.alignment,
+            .default_value_ptr = src.default_value_ptr,
+        };
     }
 
-    return @Type(.{
-        .@"struct" = .{
-            .layout = superInfo.layout,
-            .backing_integer = superInfo.backing_integer,
-            .fields = &fields,
-            .decls = &.{},
-            .is_tuple = false,
-        },
-    });
+    return @Struct(superInfo.layout, superInfo.backing_integer, &field_names, &field_types, &field_attrs);
 }
 
 test "mixin" {

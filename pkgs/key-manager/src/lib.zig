@@ -267,6 +267,23 @@ pub const MAX_SK_SIZE = 1024 * 1024 * 20;
 /// Maximum size of a serialized XMSS public key (256 bytes).
 pub const MAX_PK_SIZE = 256;
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn readFileAllocAtPath(allocator: Allocator, path: []const u8, max_size: usize) ![]u8 {
+    const io = defaultIo();
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var reader = file.reader(io, &read_buf);
+        return reader.interface.allocRemaining(allocator, .limited(max_size));
+    }
+
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_size));
+}
+
 /// Load an XMSS keypair from SSZ files on disk.
 ///
 /// `sk_path` must point to the secret key SSZ file (`*_sk.ssz`).
@@ -279,20 +296,16 @@ pub fn loadKeypairFromFiles(
     sk_path: []const u8,
     pk_path: []const u8,
 ) !xmss.KeyPair {
-    var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+    const sk_data = readFileAllocAtPath(allocator, sk_path, MAX_SK_SIZE) catch |err| switch (err) {
         error.FileNotFound => return error.SecretKeyFileNotFound,
         else => return err,
     };
-    defer sk_file.close();
-    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
     defer allocator.free(sk_data);
 
-    var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+    const pk_data = readFileAllocAtPath(allocator, pk_path, MAX_PK_SIZE) catch |err| switch (err) {
         error.FileNotFound => return error.PublicKeyFileNotFound,
         else => return err,
     };
-    defer pk_file.close();
-    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
     defer allocator.free(pk_data);
 
     return xmss.KeyPair.fromSsz(allocator, sk_data, pk_data);
@@ -309,9 +322,14 @@ fn findTestKeysDir() ?[]const u8 {
     if (keys_path.len == 0) return null;
 
     // Verify it actually exists at runtime
-    if (std.fs.cwd().openDir(keys_path, .{})) |dir| {
+    const io = defaultIo();
+    const open_result = if (std.fs.path.isAbsolute(keys_path))
+        std.Io.Dir.openDirAbsolute(io, keys_path, .{})
+    else
+        std.Io.Dir.cwd().openDir(io, keys_path, .{});
+    if (open_result) |dir| {
         var d = dir;
-        d.close();
+        d.close(io);
         return keys_path;
     } else |_| {}
 
@@ -328,20 +346,16 @@ pub fn loadValidatorKeysFromFiles(
     pk_path: []const u8,
 ) !ValidatorKeys {
     // Read files once
-    var sk_file = std.fs.cwd().openFile(sk_path, .{}) catch |err| switch (err) {
+    const sk_data = readFileAllocAtPath(allocator, sk_path, MAX_SK_SIZE) catch |err| switch (err) {
         error.FileNotFound => return error.SecretKeyFileNotFound,
         else => return err,
     };
-    defer sk_file.close();
-    const sk_data = try sk_file.readToEndAlloc(allocator, MAX_SK_SIZE);
     defer allocator.free(sk_data);
 
-    var pk_file = std.fs.cwd().openFile(pk_path, .{}) catch |err| switch (err) {
+    const pk_data = readFileAllocAtPath(allocator, pk_path, MAX_PK_SIZE) catch |err| switch (err) {
         error.FileNotFound => return error.PublicKeyFileNotFound,
         else => return err,
     };
-    defer pk_file.close();
-    const pk_data = try pk_file.readToEndAlloc(allocator, MAX_PK_SIZE);
     defer allocator.free(pk_data);
 
     // Construct two independent keypairs from the same bytes

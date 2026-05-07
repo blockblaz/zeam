@@ -22,7 +22,7 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
 
         const Self = @This();
 
-        const OpenError = Error || std.posix.MakeDirError || std.fs.Dir.StatFileError;
+        const OpenError = Error || std.Io.Dir.CreateDirPathError;
 
         pub fn open(allocator: Allocator, logger: zeam_utils.ModuleLogger, path: []const u8) OpenError!Self {
             logger.info("initializing RocksDB", .{});
@@ -30,7 +30,8 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             const owned_path = try std.fmt.allocPrintSentinel(allocator, "{s}/rocksdb", .{path}, 0);
             errdefer allocator.free(owned_path);
 
-            try std.fs.cwd().makePath(owned_path);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            try std.Io.Dir.cwd().createDirPath(io, owned_path);
 
             // Ideally this should be configurable via cli args
             const options = rocksdb.DBOptions{
@@ -132,11 +133,11 @@ pub fn RocksDB(comptime column_namespaces: []const ColumnNamespace) type {
             };
         }
 
-        pub fn commit(self: *Self, batch: *WriteBatch) void {
-            callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner }) catch |err| {
-                self.logger.err("failed to commit write batch: {any}", .{err});
-                return;
-            };
+        pub fn commit(self: *Self, batch: *WriteBatch) !void {
+            // callRocksDB already logs on failure; rethrow so callers
+            // (and consensus-critical writes) can detect the miss
+            // rather than assuming success.
+            try callRocksDB(self.logger, rocksdb.DB.write, .{ &self.db, batch.inner });
         }
 
         /// A write batch is a sequence of operations that execute atomically.
@@ -708,14 +709,14 @@ test "test_column_namespaces" {
 }
 
 test "test_rocksdb_with_default_cn" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespaces = [_]ColumnNamespace{
@@ -748,14 +749,14 @@ test "test_rocksdb_with_default_cn" {
 }
 
 test "test_column_families_with_multiple_cns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     // Default column family is necessary for the RocksDB API to work
@@ -802,14 +803,14 @@ test "test_column_families_with_multiple_cns" {
 }
 
 test "test_count_function" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -838,14 +839,14 @@ test "test_count_function" {
 }
 
 test "test_batch_write_function" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -869,7 +870,7 @@ test "test_batch_write_function" {
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 
     // Commit the batch to make changes visible
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify entry is now visible in database
     const value1 = try db.get(column_namespace[0], "default_key1");
@@ -889,21 +890,21 @@ test "test_batch_write_function" {
     }
 
     // Commit the delete operation
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify entry is now deleted from database
     try std.testing.expect((try db.get(column_namespace[0], "default_key1")) == null);
 }
 
 test "test_iterator_functionality" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     const column_namespace = [_]ColumnNamespace{
@@ -1001,7 +1002,7 @@ test "save and load block" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1062,7 +1063,7 @@ test "save and load state" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1107,7 +1108,7 @@ test "batch write and commit" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1135,7 +1136,7 @@ test "batch write and commit" {
     defer test_state.deinit();
 
     // Test batch write and commit
-    var batch = db.initWriteBatch();
+    var batch = try db.initWriteBatch();
     defer batch.deinit();
 
     // Verify block doesn't exist before batch commit
@@ -1151,7 +1152,7 @@ test "batch write and commit" {
     batch.putState(database.DbStatesNamespace, test_state_root, test_state);
 
     // Commit the batch
-    db.commit(&batch);
+    try db.commit(&batch);
 
     // Verify block was saved and can be loaded
     const loaded_block = db.loadBlock(database.DbBlocksNamespace, test_block_root);
@@ -1189,7 +1190,7 @@ test "loadLatestFinalizedState" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const data_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const data_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp_dir.sub_path});
     defer allocator.free(data_dir);
 
     var db = try database.Db.open(allocator, zeam_logger_config.logger(.database_test), data_dir);
@@ -1203,12 +1204,12 @@ test "loadLatestFinalizedState" {
 
     // Metadata present but slot index missing -> error
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 7;
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var out_state: types.BeamState = undefined;
         try std.testing.expectError(error.FinalizedSlotNotFoundInIndex, db.loadLatestFinalizedState(&out_state));
@@ -1216,14 +1217,14 @@ test "loadLatestFinalizedState" {
 
     // Slot index present but state missing -> error
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 9;
         const block_root = test_helpers.createDummyRoot(0xAA);
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
         batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var out_state: types.BeamState = undefined;
         try std.testing.expectError(error.FinalizedStateNotFoundInDatabase, db.loadLatestFinalizedState(&out_state));
@@ -1231,7 +1232,7 @@ test "loadLatestFinalizedState" {
 
     // Happy path: metadata + slot index + state all present
     {
-        var batch = db.initWriteBatch();
+        var batch = try db.initWriteBatch();
         defer batch.deinit();
 
         const finalized_slot: types.Slot = 11;
@@ -1243,7 +1244,7 @@ test "loadLatestFinalizedState" {
         batch.putLatestFinalizedSlot(database.DbDefaultNamespace, finalized_slot);
         batch.putFinalizedSlotIndex(database.DbFinalizedSlotsNamespace, finalized_slot, block_root);
         batch.putState(database.DbStatesNamespace, block_root, expected_state);
-        db.commit(&batch);
+        try db.commit(&batch);
 
         var loaded_state: types.BeamState = undefined;
         try db.loadLatestFinalizedState(&loaded_state);

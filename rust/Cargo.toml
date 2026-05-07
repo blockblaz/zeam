@@ -6,8 +6,9 @@ members = [
   "risc0-glue",
   "hashsig-glue",
   "multisig-glue",
+  "zeam-glue",
 ]
-default-members = ["libp2p-glue", "openvm-glue", "risc0-glue", "hashsig-glue", "multisig-glue"]
+default-members = ["zeam-glue"]
 
 [profile.release]
 # LTO (Link Time Optimization) is disabled to avoid symbol conflicts between risc0 and openvm.

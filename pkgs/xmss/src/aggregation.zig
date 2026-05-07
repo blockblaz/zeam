@@ -15,9 +15,9 @@ pub const AggregatedXMSS = opaque {};
 // External C functions from multisig-glue (uses leanMultisig devnet4 with recursive aggregation)
 /// Returns 0 on success, -1 if the prover bytecode file is missing or initialisation failed.
 /// Never panics — the Rust side wraps the body in catch_unwind (fix for #722).
-extern fn xmss_setup_prover() c_int;
+extern fn xmss_setup_prover() callconv(.c) c_int;
 /// Returns 0 on success, -1 on failure.
-extern fn xmss_setup_verifier() c_int;
+extern fn xmss_setup_verifier() callconv(.c) c_int;
 
 extern fn xmss_aggregate(
     // Raw XMSS signatures
@@ -34,7 +34,7 @@ extern fn xmss_aggregate(
     message_hash_ptr: [*]const u8,
     slot: u32,
     log_inv_rate: usize,
-) ?*AggregatedXMSS;
+) callconv(.c) ?*AggregatedXMSS;
 
 extern fn xmss_verify_aggregated(
     public_keys: [*]const *const hashsig.HashSigPublicKey,
@@ -43,21 +43,21 @@ extern fn xmss_verify_aggregated(
     agg_sig_bytes: [*]const u8,
     agg_sig_len: usize,
     slot: u32,
-) bool;
+) callconv(.c) bool;
 
-extern fn xmss_free_aggregate_signature(agg_sig: *AggregatedXMSS) void;
+extern fn xmss_free_aggregate_signature(agg_sig: *AggregatedXMSS) callconv(.c) void;
 
 // Serialization FFI functions
 extern fn xmss_aggregate_signature_to_bytes(
     agg_sig: *const AggregatedXMSS,
     buffer: [*]u8,
     buffer_len: usize,
-) usize;
+) callconv(.c) usize;
 
 extern fn xmss_aggregate_signature_from_bytes(
     bytes: [*]const u8,
     bytes_len: usize,
-) ?*AggregatedXMSS;
+) callconv(.c) ?*AggregatedXMSS;
 
 /// Initialize the XMSS prover (idempotent — only runs once).
 /// Returns error.ProverSetupFailed when the prover bytecode file is missing or the
