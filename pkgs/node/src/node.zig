@@ -1685,6 +1685,17 @@ pub const BeamNode = struct {
             const interval: usize = @intCast(current_interval);
             const slot: types.Slot = @intCast(@divFloor(interval, constants.INTERVALS_PER_SLOT));
 
+            // Mark this interval as attempted *before* doing any per-interval
+            // work. This decouples the slot-tick advance from any inner failure
+            // (chain tick, validator duty, aggregation publish) so a transient
+            // error on slot N interval K cannot wedge the loop into replaying
+            // the same interval forever, freezing the clock for the
+            // aggregator (#847). Per-interval duties (block/attestation/
+            // aggregation production) are not idempotent and must not run
+            // twice for the same `current_interval`; this advance guarantees
+            // exactly-once even when a later step in the iteration errors out.
+            self.last_interval = current_interval;
+
             {
                 // Slice (a-3): no outer mutex. `chain.onInterval` /
                 // `chain.processPendingBlocks` take their own per-resource
@@ -1695,8 +1706,10 @@ pub const BeamNode = struct {
 
                 self.chain.onInterval(interval) catch |e| {
                     self.logger.err("error ticking chain to time(intervals)={d} err={any}", .{ interval, e });
-                    // no point going further if chain is not ticked properly
-                    return e;
+                    // forkchoice tick is idempotent: subsequent intervals will
+                    // re-try the underlying tick. Skip the rest of this
+                    // interval's work and let the loop advance (#847).
+                    continue;
                 };
 
                 // Replay blocks that were queued waiting for the forkchoice clock to advance,
@@ -1721,32 +1734,36 @@ pub const BeamNode = struct {
             if (self.validator) |*validator| {
                 // we also tick validator per interval in case it would
                 // need to sync its future duties when its an independent validator
-                var validator_output = validator.onInterval(interval) catch |e| {
+                //
+                // Validator duty failures (proposal, attestation construction)
+                // are local to this slot — drop them and keep the clock
+                // moving rather than wedge the tick loop on a transient
+                // state-lookup failure (#847).
+                var validator_output = validator.onInterval(interval) catch |e| blk: {
                     self.logger.err("error ticking validator to time(intervals)={d} err={any}", .{ interval, e });
-                    return e;
+                    break :blk null;
                 };
 
                 if (validator_output) |*output| {
                     defer output.deinit();
                     for (output.gossip_messages.items) |gossip_msg| {
-                        // Process based on message type
+                        // Publish failures are best-effort: logging and moving on
+                        // keeps the slot-tick advancing instead of stalling on a
+                        // transient gossip / state lookup error (#847).
                         switch (gossip_msg) {
                             .block => |signed_block| {
                                 self.publishBlock(signed_block) catch |e| {
                                     self.logger.err("error publishing block from validator: err={any}", .{e});
-                                    return e;
                                 };
                             },
                             .attestation => |signed_attestation| {
                                 self.publishAttestation(signed_attestation) catch |e| {
                                     self.logger.err("error publishing attestation from validator: err={any}", .{e});
-                                    return e;
                                 };
                             },
                             .aggregation => |signed_aggregation| {
                                 self.publishAggregation(signed_aggregation) catch |e| {
                                     self.logger.err("error publishing aggregation from validator: err={any}", .{e});
-                                    return e;
                                 };
                             },
                         }
@@ -1768,20 +1785,24 @@ pub const BeamNode = struct {
             }
 
             if (interval_in_slot == 2) {
-                if (self.chain.maybeAggregateOnInterval(interval) catch |e| {
+                // Aggregator-only path: building or publishing an aggregation
+                // can fail with `MissingState` / `UnknownSourceBlock` /
+                // `UnknownHeadBlock` when the local store has gaps from a
+                // prior STF reject cascade. Skip this slot's aggregation
+                // and keep ticking — the next slot's aggregation will
+                // re-derive from current state (#847).
+                const maybe_aggregations = self.chain.maybeAggregateOnInterval(interval) catch |e| blk: {
                     self.logger.err("error producing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
-                    return e;
-                }) |aggregations| {
+                    break :blk null;
+                };
+                if (maybe_aggregations) |aggregations| {
                     defer self.allocator.free(aggregations);
                     self.publishProducedAggregations(aggregations) catch |e| {
                         self.logger.err("error producing/publishing aggregations at slot={d} interval={d}: {any}", .{ slot, interval, e });
-                        return e;
                     };
                 }
             }
         }
-
-        self.last_interval = itime_intervals;
     }
 
     /// Re-send our status to every connected peer.
