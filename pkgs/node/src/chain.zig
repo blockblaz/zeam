@@ -1447,67 +1447,108 @@ pub const BeamChain = struct {
             has_proposal,
         });
 
+        // Issue #837 review #2: only the forkchoice tick itself
+        // truly means "clock advanced". Everything below this line
+        // is observability + periodic maintenance — a partial
+        // failure there must NOT signal "chain didn't tick" to the
+        // outer `BeamNode.onInterval` cursor commit, otherwise an
+        // observability bug wedges the slot prefix the same way the
+        // pre-fix application-layer bubble-up did. The forkchoice
+        // tick stays fatal-on-error (its own internal failure is the
+        // only legitimate "clock didn't tick" signal).
         try self.forkChoice.onInterval(time_intervals, has_proposal);
+
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
             self.printSlot(islot, constants.MAX_FC_CHAIN_PRINT_DEPTH, self.connected_peers.count());
 
-            // Periodic pruning: prune old non-canonical states every N slots
-            // This ensures we prune even when finalization doesn't advance
+            // Periodic pruning: prune old non-canonical states every N slots.
+            // This ensures we prune even when finalization doesn't advance.
+            //
+            // Issue #837 review #2: pruning failures (e.g. an FFI
+            // hiccup in `getCanonicalAncestorAtDepth` /
+            // `getCanonicalityAnalysis` / a transient state-map
+            // contention surfacing as `error.MissingState`) must NOT
+            // bubble out of `chain.onInterval`. The forkchoice
+            // clock has already ticked above; failing the pruning
+            // step would force the caller to treat "clock ticked"
+            // as "clock didn't tick" and recreate the wedge
+            // symptom one layer up. Wrap the entire pruning
+            // sub-block in a log-and-continue so the next interval
+            // gets a fresh chance and a sustained non-zero error
+            // rate is the alarm signal instead of a permanent freeze.
             if (slot > 0 and slot % constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS == 0) {
-                const finalized = self.forkChoice.getLatestFinalized();
-                // no need to work extra if finalization is not far behind
-                if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
-                    self.logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
-                    const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
-
-                    // prune if finalization hasn't happened since a long time
-                    if (pruningAnchor.slot > finalized.slot) {
-                        self.logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(pruningAnchor.blockRoot, finalized.root, null);
-                        const depth_confirmed_roots = analysis_result[0];
-                        const non_finalized_descendants = analysis_result[1];
-                        const non_canonical_roots = analysis_result[2];
-                        defer self.allocator.free(depth_confirmed_roots);
-                        defer self.allocator.free(non_finalized_descendants);
-                        defer self.allocator.free(non_canonical_roots);
-
-                        const states_count_before: isize = self.states.count();
-                        _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
-                        _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
-                        const pruned_count = states_count_before - self.states.count();
-                        self.logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
-                            //
-                            pruned_count,
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                    } else {
-                        self.logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                    }
-                } else {
-                    self.logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
-                        slot,
-                        finalized.slot,
-                    });
-                }
+                self.runPeriodicPruning(slot) catch |err| {
+                    self.logger.err(
+                        "periodic pruning failed at slot={d}: {any} (continuing tick)",
+                        .{ slot, err },
+                    );
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                        .{ .site = "chain.runPeriodicPruning" },
+                    ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                };
             }
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
             self.logger.err("error rotating log file: {any}", .{err});
         };
+    }
+
+    /// Periodic pruning helper extracted from `chain.onInterval`
+    /// (issue #837 review #2). Errors here log + bump the
+    /// `chain.runPeriodicPruning` site of the interval-error
+    /// counter so the outer `chain.onInterval` can swallow them
+    /// without freezing the slot tick.
+    fn runPeriodicPruning(self: *Self, slot: types.Slot) !void {
+        const finalized = self.forkChoice.getLatestFinalized();
+        // no need to work extra if finalization is not far behind
+        if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS >= slot) {
+            self.logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
+                slot,
+                finalized.slot,
+            });
+            return;
+        }
+
+        self.logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
+        const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
+
+        // prune if finalization hasn't happened since a long time
+        if (pruningAnchor.slot <= finalized.slot) {
+            self.logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
+                slot,
+                finalized.slot,
+                pruningAnchor.slot,
+            });
+            return;
+        }
+
+        self.logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
+            slot,
+            finalized.slot,
+            pruningAnchor.slot,
+        });
+        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(pruningAnchor.blockRoot, finalized.root, null);
+        const depth_confirmed_roots = analysis_result[0];
+        const non_finalized_descendants = analysis_result[1];
+        const non_canonical_roots = analysis_result[2];
+        defer self.allocator.free(depth_confirmed_roots);
+        defer self.allocator.free(non_finalized_descendants);
+        defer self.allocator.free(non_canonical_roots);
+
+        const states_count_before: isize = self.states.count();
+        _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
+        _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
+        const pruned_count = states_count_before - self.states.count();
+        self.logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
+            pruned_count,
+            slot,
+            finalized.slot,
+            pruningAnchor.slot,
+        });
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
@@ -2361,42 +2402,18 @@ pub const BeamChain = struct {
             }
 
             // Each unique AttestationData must appear at most once per block.
-            //
-            // Issue #837 ask #5: log the duplicate's distinguishing
-            // fields (slot + checkpoint roots) so the next reproduction
-            // has enough on-the-wire context to diagnose without
-            // pulling block bytes from a peer. Two `AttestationData`
-            // values are equal iff every field (slot, head, target,
-            // source) matches; logging the slot + roots tells
-            // operators which validators voted on the same
-            // checkpoint pair.
             {
-                var att_data_set = std.AutoHashMap(types.AttestationData, usize).init(self.allocator);
+                var att_data_set = std.AutoHashMap(types.AttestationData, void).init(self.allocator);
                 defer att_data_set.deinit();
-                for (aggregated_attestations, 0..) |agg_att, idx| {
+                for (aggregated_attestations) |agg_att| {
                     const result = try att_data_set.getOrPut(agg_att.data);
                     if (result.found_existing) {
-                        const first_idx = result.value_ptr.*;
                         self.logger.err(
-                            "block contains duplicate AttestationData entries for block root=0x{x} slot={d} proposer={d}: indices [{d}, {d}] both have data={{ slot={d}, head={{ root=0x{x}, slot={d} }}, target={{ root=0x{x}, slot={d} }}, source={{ root=0x{x}, slot={d} }} }}",
-                            .{
-                                &freshFcBlock.blockRoot,
-                                block.slot,
-                                block.proposer_index,
-                                first_idx,
-                                idx,
-                                agg_att.data.slot,
-                                &agg_att.data.head.root,
-                                agg_att.data.head.slot,
-                                &agg_att.data.target.root,
-                                agg_att.data.target.slot,
-                                &agg_att.data.source.root,
-                                agg_att.data.source.slot,
-                            },
+                            "block contains duplicate AttestationData entries for block root=0x{x}",
+                            .{&freshFcBlock.blockRoot},
                         );
                         return BlockProcessingError.DuplicateAttestationData;
                     }
-                    result.value_ptr.* = idx;
                 }
                 if (att_data_set.count() > self.config.spec.max_attestations_data) {
                     self.logger.err(

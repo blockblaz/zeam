@@ -221,11 +221,34 @@ const Metrics = struct {
     // failures inside `BeamNode.onInterval`. The slot tick is
     // decoupled from these failures (a failure here logs + bumps
     // this counter and the loop continues; the chain clock advances
-    // either way). Sustained non-zero rate per site is what should
-    // alarm operators — a single bump per scrape is normal
-    // background noise from gossip races.
+    // either way). A single bump per scrape is normal background
+    // noise from gossip races / sync transitions.
+    //
+    // ALERTING CONTRACT: a sustained non-zero rate on this metric
+    // — with the wall-clock slot/interval cursor still advancing in
+    // logs — means "node alive, validator/aggregator/publish layer
+    // silently failing". Operators MUST alert on this. Pre-#848 the
+    // same failure would have wedged the node and produced a flat
+    // `lean_current_slot` / `lean_head_slot`, which is what monitors
+    // historically detected. Post-#848 the node keeps ticking, so
+    // the wedge-class signal moves here. Suggested rule:
+    //
+    //   sum(rate(lean_node_interval_error_total[5m])) by (site)
+    //     > 0.05  // i.e. >= one failure every 20s for 5 minutes
+    //
+    // tuned per-site if necessary. The `validator.onInterval` /
+    // `maybeAggregateOnInterval` sites are the most operator-
+    // visible because they fire every slot a validator is meant to
+    // be active; gossip-publish sites tend to be noisier (libp2p
+    // backend can drop publishes under peer churn).
     //
     // Sites:
+    //   * `chain.onInterval` — chain clock tick failed (rare; the
+    //     forkchoice slot_clock guard makes this a no-op on retry).
+    //   * `chain.runPeriodicPruning` — periodic state pruning
+    //     (issue #837 review #2) failed inside `chain.onInterval`;
+    //     the forkchoice clock has already advanced for this
+    //     interval, only the housekeeping step failed.
     //   * `validator.onInterval` — validator client failed to
     //     produce duties for this interval.
     //   * `publishBlock` / `publishAttestation` /
@@ -234,8 +257,9 @@ const Metrics = struct {
     //     produce aggregations (the wedge site in #837 —
     //     `UnknownSourceBlock` from a stale aggregator vote
     //     against a missing canonical-chain block).
-    //   * `publishProducedAggregations` — aggregations produced
-    //     but failed to publish.
+    //   * `publishProducedAggregations` — aggregation produced
+    //     but failed to publish (one increment per failing
+    //     aggregation, post-#848 review #4 fanout).
     lean_node_interval_error_total: LeanNodeIntervalErrorCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
@@ -730,7 +754,7 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
         .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race." }, .{}),
         // Issue #837 — see field doc for label semantics.
-        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site indicates a wedge-class bug. Labeled by site: validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
+        .lean_node_interval_error_total = try Metrics.LeanNodeIntervalErrorCounter.init(allocator, io, "lean_node_interval_error_total", .{ .help = "Total number of application-layer failures inside `BeamNode.onInterval` that were logged-and-continued (issue #837). Sustained non-zero rate per site means 'node alive, validator/aggregator silently failing' — ALERT ON THIS, the slot/interval cursor itself no longer wedges. Labeled by site: chain.onInterval, chain.runPeriodicPruning, validator.onInterval, publishBlock, publishAttestation, publishAggregation, maybeAggregateOnInterval, publishProducedAggregations." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
