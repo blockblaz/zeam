@@ -2337,6 +2337,27 @@ mod tests {
         // Mock: do nothing
     }
 
+    /// Per-test `network_id` allocator.
+    ///
+    /// `cargo test` runs tests in parallel within the same process, so any
+    /// state keyed by `network_id` (the `COMMAND_SENDERS` map, the
+    /// `NETWORK_SLOTS` map, the `MESH_PEERS_TOTAL` array) is shared. Tests
+    /// that install a sender for a given id can otherwise race tests that
+    /// assume that same id is uninitialized — the failure mode is a flaky
+    /// "should return false when not initialized" assertion that depends on
+    /// scheduler order. Every test that touches per-network state must pull
+    /// its id from this counter so collisions are structurally impossible.
+    ///
+    /// Starts at 1000 to stay well above any id a hypothetical Zig caller
+    /// might use during a future integration test, and below `MAX_NETWORKS`
+    /// (so `MESH_PEERS_TOTAL` indexing remains valid).
+    static TEST_NETWORK_ID_COUNTER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(1000);
+
+    fn next_test_network_id() -> u32 {
+        TEST_NETWORK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
     #[test]
     fn test_message_id_computation_with_snappy() {
         let compressed_data = {
@@ -2373,16 +2394,16 @@ mod tests {
 
     #[test]
     fn test_wait_for_network_ready_timeout() {
-        // Test that wait_for_network_ready times out when network is not initialized
-        // Use network_id 99 which we won't initialize
-        let result = unsafe { wait_for_network_ready(99, 100) }; // 100ms timeout
+        // Test that wait_for_network_ready times out when network is not initialized.
+        let network_id = next_test_network_id();
+        let result = unsafe { wait_for_network_ready(network_id, 100) }; // 100ms timeout
         assert!(!result, "Should timeout when network is not initialized");
     }
 
     #[test]
     fn test_send_rpc_request_before_initialization_returns_zero() {
         // Test that sending RPC request before initialization returns 0
-        let network_id = 99;
+        let network_id = next_test_network_id();
         let peer_id = std::ffi::CString::new("12D3KooWTest").unwrap();
         let request_data = b"test request";
 
@@ -2419,7 +2440,7 @@ mod tests {
         // OS thread that is guaranteed to have no Tokio context attached.
         // The fix moves both delay-map inserts to the event-loop side, so
         // this call must now succeed (non-zero id, no panic).
-        let network_id = 101;
+        let network_id = next_test_network_id();
         let (tx, mut rx) = mpsc::channel::<SwarmCommand>(8);
         COMMAND_SENDERS.lock_recover().insert(network_id, tx);
 
@@ -2458,7 +2479,7 @@ mod tests {
         // command channel is missing, `send_rpc_request` must not advance
         // `REQUEST_ID_COUNTER`. Otherwise every failed FFI call permanently
         // leaks a request id and successive ids skip values.
-        let network_id = 100; // unused network slot
+        let network_id = next_test_network_id();
         let peer_id = std::ffi::CString::new("12D3KooWTest").unwrap();
         let request_data = b"test request";
 
@@ -2503,7 +2524,7 @@ mod tests {
         // `get_shutdown_notify` returns the *same* `Arc<Notify>` and that a
         // `notify_one` posted on it is observed by a subsequent
         // `notified().await`.
-        let network_id = 110;
+        let network_id = next_test_network_id();
         clear_network_slot(network_id);
 
         let installed = install_shutdown_notify(network_id);
@@ -2546,7 +2567,7 @@ mod tests {
         // exist (i.e. the network was never started or has been torn down),
         // so the Zig-side caller can stop logging "published" for messages
         // that never actually reached the wire.
-        let network_id = 101; // unused network slot
+        let network_id = next_test_network_id();
         let topic = std::ffi::CString::new("test/topic").unwrap();
         let payload = b"hello";
 
@@ -2564,7 +2585,7 @@ mod tests {
         // Defensive check: the FFI guard against a null topic pointer must
         // also surface as `false` so the Zig caller treats it as a dropped
         // publish (issue #808).
-        let network_id = 102;
+        let network_id = next_test_network_id();
         let payload = b"hello";
         let ok = unsafe {
             publish_msg_to_rust_bridge(
@@ -2585,7 +2606,7 @@ mod tests {
         // The Zig side treats `false` as a hard failure (mesh join did not
         // happen), so a missing per-network command channel must surface as
         // `false` rather than panicking or silently succeeding.
-        let network_id = 104;
+        let network_id = next_test_network_id();
         let topic = std::ffi::CString::new("leanconsensus/foo/ssz_snappy").unwrap();
         let ok = unsafe { subscribe_gossip_topic_to_rust_bridge(network_id, topic.as_ptr()) };
         assert!(
@@ -2596,7 +2617,7 @@ mod tests {
 
     #[test]
     fn test_subscribe_gossip_topic_to_rust_bridge_returns_false_on_null_topic() {
-        let network_id = 105;
+        let network_id = next_test_network_id();
         let ok = unsafe { subscribe_gossip_topic_to_rust_bridge(network_id, std::ptr::null()) };
         assert!(
             !ok,
@@ -2613,7 +2634,7 @@ mod tests {
         let before = get_swarm_command_dropped_total(SwarmCommandDropReason::Uninitialized as u32);
 
         // Send to a network slot that was never initialized: must return false.
-        let network_id = 103;
+        let network_id = next_test_network_id();
         let topic = std::ffi::CString::new("test/topic").unwrap();
         let payload = b"hello";
         for _ in 0..3 {
@@ -2652,7 +2673,7 @@ mod tests {
         // We use a small dedicated network_id and a tiny channel so the test
         // runs in microseconds instead of allocating SWARM_COMMAND_CHANNEL_CAPACITY
         // commands.
-        let network_id = 104;
+        let network_id = next_test_network_id();
         let cap: usize = 4;
         let (tx, _rx) = mpsc::channel::<SwarmCommand>(cap);
         // Keep _rx alive (no drainer => first `cap` sends fill the channel,
