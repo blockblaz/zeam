@@ -1082,6 +1082,113 @@ pub const BeamChain = struct {
         zeam_metrics.metrics.lean_validators_count.set(self.registered_validator_ids.len);
     }
 
+    /// Append a block to `pending_blocks` for later replay.
+    ///
+    /// Issue #788: under mutex contention the forkchoice clock can lag
+    /// wall-time by tens of slots; gossip blocks for those slots arrive at
+    /// the wall-clock time and would otherwise be rejected as `FutureSlot`,
+    /// causing the forkchoice head to fall back to `latest_finalized` (no
+    /// descendants exist in protoArray). Buffering them here lets
+    /// `processPendingBlocks` replay them once the clock catches up.
+    ///
+    /// Bounded by `MAX_PENDING_BLOCKS`. When the cap is hit we evict the
+    /// oldest entry by *receive order* (front of queue) rather than the
+    /// lowest slot, because:
+    ///   * a peer flooding with high-slot fake-future blocks should not
+    ///     starve a legitimate near-future block out of the queue;
+    ///   * receive-order eviction is FIFO-fair and trivial to reason about.
+    /// In practice the queue is drained on every `onInterval` tick so the
+    /// cap is only hit during a sustained large clock lag, and the lost
+    /// block can always be re-fetched via `blocks_by_range` once the node
+    /// catches up.
+    ///
+    /// Dedup: if a block with the same root is already queued (a peer can
+    /// gossip the same block multiple times during the lag window), the
+    /// duplicate is discarded so we do not pay the cost of re-running it.
+    ///
+    /// Pre-finalized eviction: drop any queued block with
+    /// `slot < latest_finalized.slot` opportunistically while we're under
+    /// the lock — these can never become canonical and would be rejected
+    /// by `validateBlock` on replay anyway.
+    ///
+    /// Returns `true` if the block was queued, `false` if it was dropped
+    /// (cap-hit-after-eviction-failed, or duplicate).
+    fn enqueuePendingBlock(
+        self: *Self,
+        cloned: types.SignedBlock,
+        block_root: types.Root,
+    ) bool {
+        const finalized_slot = self.forkChoice.getLatestFinalized().slot;
+
+        var t = LockTimer.start("pending_blocks", "enqueuePendingBlock");
+        self.pending_blocks_lock.lock();
+        t.acquired();
+        defer t.released();
+        defer self.pending_blocks_lock.unlock();
+
+        // Pre-finalized opportunistic eviction. Cheap (single linear scan,
+        // queue is bounded at MAX_PENDING_BLOCKS = 1024) and amortises the
+        // cost of pruning across the gossip path so `processPendingBlocks`
+        // doesn't need to re-walk a queue full of dead entries.
+        var i: usize = 0;
+        while (i < self.pending_blocks.items.len) {
+            if (self.pending_blocks.items[i].block.slot < finalized_slot) {
+                var dropped = self.pending_blocks.orderedRemove(i);
+                dropped.deinit();
+                zeam_metrics.metrics.lean_pending_blocks_evicted_total.incr(.{ .reason = "pre_finalized" }) catch {};
+                continue;
+            }
+            i += 1;
+        }
+
+        // Dedup by root. Linear scan is fine at this size; if the queue
+        // ever grows we can switch to an auxiliary HashMap.
+        for (self.pending_blocks.items) |existing| {
+            var existing_root: [32]u8 = undefined;
+            // Re-hashing on every dedup check is wasteful but the queue is
+            // bounded and the gossip path is not the hot loop. Avoiding a
+            // second per-entry root field keeps the SignedBlock storage
+            // slim. If profiling ever shows this dominating, add a
+            // `roots: ArrayList([32]u8)` parallel array.
+            zeam_utils.hashTreeRoot(types.BeamBlock, existing.block, &existing_root, self.allocator) catch continue;
+            if (std.mem.eql(u8, &existing_root, &block_root)) {
+                self.logger.debug(
+                    "pending_blocks: duplicate slot={d} root=0x{x} dropped",
+                    .{ cloned.block.slot, &block_root },
+                );
+                var dup = cloned;
+                dup.deinit();
+                zeam_metrics.metrics.lean_pending_blocks_evicted_total.incr(.{ .reason = "duplicate" }) catch {};
+                return false;
+            }
+        }
+
+        // Cap eviction: drop the oldest by receive order if at capacity.
+        if (self.pending_blocks.items.len >= constants.MAX_PENDING_BLOCKS) {
+            var oldest = self.pending_blocks.orderedRemove(0);
+            self.logger.warn(
+                "pending_blocks: cap={d} hit; evicting oldest slot={d} to make room for slot={d}",
+                .{ constants.MAX_PENDING_BLOCKS, oldest.block.slot, cloned.block.slot },
+            );
+            oldest.deinit();
+            zeam_metrics.metrics.lean_pending_blocks_evicted_total.incr(.{ .reason = "cap" }) catch {};
+        }
+
+        self.pending_blocks.append(self.allocator, cloned) catch |err| {
+            self.logger.err(
+                "pending_blocks: append failed for slot={d} root=0x{x}: {any}",
+                .{ cloned.block.slot, &block_root, err },
+            );
+            var failed = cloned;
+            failed.deinit();
+            zeam_metrics.metrics.lean_pending_blocks_evicted_total.incr(.{ .reason = "append_oom" }) catch {};
+            return false;
+        };
+
+        zeam_metrics.metrics.lean_pending_blocks_depth.set(self.pending_blocks.items.len);
+        return true;
+    }
+
     /// Replay blocks that were queued because the forkchoice clock hadn't yet
     /// reached their slot.  Called from onInterval after advancing the clock.
     /// Returns a slice of all missing attestation roots encountered while
@@ -1101,13 +1208,29 @@ pub const BeamChain = struct {
         defer {
             const iter_f: f32 = @floatFromInt(iter_count);
             zeam_metrics.lean_pending_blocks_drain_iters.record(iter_f);
+            // Refresh the depth gauge so a busy drain leaves the gauge
+            // accurate for the next scrape (avoids "queue stayed at depth
+            // N forever" reads when the drain actually emptied it).
+            self.pending_blocks_lock.lock();
+            const depth = self.pending_blocks.items.len;
+            self.pending_blocks_lock.unlock();
+            zeam_metrics.metrics.lean_pending_blocks_depth.set(depth);
         }
 
         while (true) {
             const fc_time = self.forkChoice.fcStore.slot_clock.time.load(.monotonic);
+            const finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
             // Pop the first ready block under the lock; release before any
             // heavy work so gossip-thread appends can proceed.
+            //
+            // While scanning we opportunistically evict pre-finalized
+            // blocks that have aged out (their slot is now below the
+            // latest_finalized). This keeps the queue self-cleaning even
+            // for a long-running clock-lag burst whose tail entries
+            // would otherwise never be "ready" by the
+            // `slot * INTERVALS_PER_SLOT <= fc_time` rule but also never
+            // become canonical.
             var ready: ?types.SignedBlock = null;
             {
                 var t = LockTimer.start("pending_blocks", "processPendingBlocks.scan");
@@ -1116,11 +1239,22 @@ pub const BeamChain = struct {
                 defer t.released();
                 defer self.pending_blocks_lock.unlock();
 
-                for (self.pending_blocks.items, 0..) |b, i| {
+                var i: usize = 0;
+                while (i < self.pending_blocks.items.len) {
+                    const b = self.pending_blocks.items[i];
+                    if (b.block.slot < finalized_slot) {
+                        var dropped = self.pending_blocks.orderedRemove(i);
+                        dropped.deinit();
+                        zeam_metrics.metrics.lean_pending_blocks_evicted_total.incr(.{ .reason = "pre_finalized" }) catch {};
+                        // do NOT increment i — we just shifted the next
+                        // entry down into slot i.
+                        continue;
+                    }
                     if (b.block.slot * constants.INTERVALS_PER_SLOT <= fc_time) {
                         ready = self.pending_blocks.orderedRemove(i);
                         break;
                     }
+                    i += 1;
                 }
             }
 
@@ -1133,6 +1267,7 @@ pub const BeamChain = struct {
                 var block_root: types.Root = undefined;
                 zeam_utils.hashTreeRoot(types.BeamBlock, queued_block.block, &block_root, self.allocator) catch |err| {
                     self.logger.err("queued block slot={d}: failed to compute block root: {any}", .{ queued_slot, err });
+                    zeam_metrics.metrics.lean_pending_blocks_replayed_total.incr(.{ .result = "error" }) catch {};
                     continue;
                 };
 
@@ -1145,10 +1280,12 @@ pub const BeamChain = struct {
                     .blockRoot = block_root,
                 }) catch |err| {
                     self.logger.err("queued block slot={d} root=0x{x}: processing failed: {any}", .{ queued_slot, &block_root, err });
+                    zeam_metrics.metrics.lean_pending_blocks_replayed_total.incr(.{ .result = "rejected" }) catch {};
                     continue;
                 };
                 defer self.allocator.free(missing_roots);
 
+                zeam_metrics.metrics.lean_pending_blocks_replayed_total.incr(.{ .result = "accepted" }) catch {};
                 self.onBlockFollowup(true, &queued_block);
 
                 // Accumulate missing roots so the caller can fetch them.
@@ -1598,8 +1735,40 @@ pub const BeamChain = struct {
                 });
 
                 if (!hasBlock) {
-                    // Validation errors propagate to node.zig for context-aware logging
-                    try self.validateBlock(block, true);
+                    // Validate the block. `validateBlock` distinguishes
+                    // three future-slot cases (issue #788):
+                    //   * within `MAX_FUTURE_SLOT_TOLERANCE` — fall through
+                    //     to the existing per-interval pending-queue check
+                    //     and either queue or process now.
+                    //   * within `MAX_FUTURE_SLOT_QUEUE_TOLERANCE` (but not
+                    //     the small immediate tolerance) — surfaced as
+                    //     `FutureSlotQueueable`; we clone + queue and exit.
+                    //   * beyond `MAX_FUTURE_SLOT_QUEUE_TOLERANCE` —
+                    //     surfaced as `FutureSlot`; hard-rejected with a
+                    //     metric bump for visibility.
+                    self.validateBlock(block, true) catch |err| switch (err) {
+                        error.FutureSlotQueueable => {
+                            var cloned: types.SignedBlock = undefined;
+                            try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
+                            const queued = self.enqueuePendingBlock(cloned, block_root);
+                            if (queued) {
+                                self.logger.info(
+                                    "queued future-slot gossip block slot={d} blockroot=0x{x}: current_slot={d}",
+                                    .{
+                                        block.slot,
+                                        &block_root,
+                                        self.forkChoice.fcStore.slot_clock.timeSlots.load(.monotonic),
+                                    },
+                                );
+                            }
+                            return .{};
+                        },
+                        error.FutureSlot => {
+                            zeam_metrics.metrics.lean_blocks_future_slot_dropped_total.incr();
+                            return err;
+                        },
+                        else => return err,
+                    };
 
                     // If the forkchoice clock hasn't yet ticked to this block's slot,
                     // onBlock would reject it with FutureSlot.  Queue the block and
@@ -1612,24 +1781,18 @@ pub const BeamChain = struct {
                         var cloned: types.SignedBlock = undefined;
                         try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
 
-                        // TODO: in beam sim, it seems to have queued after the oninterval fires even if block arrives pre on interval
-                        // because of race conditions between competing threads as the above sszClone aparently takes too much time
-                        // currently managing this by checking condition again but ideally fix it by identifying chain entrypoints and
-                        // holding mutex between then for chain modification sections
+                        // Re-check after the clone in case `onInterval`
+                        // ticked the clock past this block's slot while
+                        // we were cloning. If it did, fall through and
+                        // process the block directly; otherwise enqueue.
                         if (block.slot * constants.INTERVALS_PER_SLOT > self.forkChoice.fcStore.slot_clock.time.load(.monotonic)) {
-                            {
-                                var t = LockTimer.start("pending_blocks", "onGossip.append");
-                                self.pending_blocks_lock.lock();
-                                t.acquired();
-                                defer t.released();
-                                defer self.pending_blocks_lock.unlock();
-                                try self.pending_blocks.append(self.allocator, cloned);
+                            const queued = self.enqueuePendingBlock(cloned, block_root);
+                            if (queued) {
+                                self.logger.info(
+                                    "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
+                                    .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
+                                );
                             }
-
-                            self.logger.info(
-                                "queued gossip block slot={d} blockroot=0x{x}: forkchoice time={d} < slot_start={d}",
-                                .{ block.slot, &block_root, self.forkChoice.fcStore.slot_clock.time.load(.monotonic), block.slot * constants.INTERVALS_PER_SLOT },
-                            );
                             return .{};
                         } else {
                             self.logger.debug(
@@ -2554,14 +2717,52 @@ pub const BeamChain = struct {
         // accessor to avoid a torn (slot, root) pair. PR #820 / #803.
         const finalized_slot = self.forkChoice.getLatestFinalized().slot;
 
-        // 1. Future slot check - reject blocks too far in the future
-        // Allow a small tolerance for clock skew, but reject clearly invalid future slots
-        // this can also happen because of race conditions between oninterval and block arrival
+        // 1. Future slot check.
+        //
+        // Issue #788: under heavy mutex contention (#786) the forkchoice's
+        // local clock (`timeSlots`) can lag wall-time by tens of slots.
+        // Gossip blocks for those slots arrive at wall-time and would
+        // otherwise be rejected as `FutureSlot`, causing the head to fall
+        // back to the latest finalized checkpoint (no descendants in
+        // protoArray). We split the future-slot range into two windows:
+        //
+        //   * `block.slot <= current_slot + MAX_FUTURE_SLOT_TOLERANCE` is
+        //     immediately processable; the existing per-interval
+        //     `pending_blocks` boundary handler will queue it if the
+        //     interval-level clock isn't quite caught up.
+        //   * `block.slot <= current_slot + MAX_FUTURE_SLOT_QUEUE_TOLERANCE`
+        //     is queueable in `pending_blocks` for replay once the
+        //     forkchoice clock catches up. The caller (`onGossip` block
+        //     branch) is responsible for the actual queuing; we surface
+        //     this case as `FutureSlotQueueable` so the caller can
+        //     distinguish it from a hard `FutureSlot` reject.
+        //   * Anything beyond `MAX_FUTURE_SLOT_QUEUE_TOLERANCE` is almost
+        //     certainly malicious/buggy and is hard-rejected with
+        //     `FutureSlot`.
+        //
+        // Note: the queueable window deliberately includes blocks already
+        // covered by the small `MAX_FUTURE_SLOT_TOLERANCE`; the call site
+        // queues only when `onBlock` would actually reject (i.e. when the
+        // forkchoice's interval-level clock disagrees), so this is just an
+        // upper bound, not a routing decision.
         const max_future_tolerance: types.Slot = constants.MAX_FUTURE_SLOT_TOLERANCE;
+        const max_future_queue: types.Slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
         if (block.slot > current_slot + max_future_tolerance) {
+            if (block.slot <= current_slot + max_future_queue) {
+                self.logger.debug(
+                    "block queueable as future-slot: slot={d} current_slot={d} queue_tolerance={d} time(intervals)={d}",
+                    .{
+                        block.slot,
+                        current_slot,
+                        max_future_queue,
+                        self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
+                    },
+                );
+                return BlockValidationError.FutureSlotQueueable;
+            }
             self.logger.debug("block validation failed: future slot {d} > max allowed {d} time(intervals)={d}", .{
                 block.slot,
-                current_slot + max_future_tolerance,
+                current_slot + max_future_queue,
                 self.forkChoice.fcStore.slot_clock.time.load(.monotonic),
             });
             return BlockValidationError.FutureSlot;
@@ -3151,8 +3352,15 @@ const AttestationValidationError = error{
 };
 pub const BlockValidationError = error{
     UnknownParentBlock,
-    /// Block slot is too far in the future
+    /// Block slot is too far in the future and cannot be reasonably queued
+    /// (beyond `MAX_FUTURE_SLOT_QUEUE_TOLERANCE`). Hard reject.
     FutureSlot,
+    /// Block slot is in the future but within the `pending_blocks`
+    /// queueing window. The caller should clone + queue the block for
+    /// later replay rather than treating it as an error. See #788 for
+    /// the rationale (forkchoice clock can lag wall-time under mutex
+    /// contention; we should not drop otherwise-valid gossip).
+    FutureSlotQueueable,
     /// Block slot is before the finalized slot
     PreFinalizedSlot,
     /// Block proposer_index exceeds validator count
@@ -3806,6 +4014,287 @@ test "attestation validation - gossip vs block future slot handling" {
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, false));
     try std.testing.expectError(error.AttestationTooFarInFuture, beam_chain.validateAttestationData(too_far_attestation.message, true));
 }
+
+// ----------------------------------------------------------------------
+// Issue #788 — future-slot block queueing tests
+//
+// Cover the FutureSlot/FutureSlotQueueable distinction added by
+// `validateBlock` and the `enqueuePendingBlock` helper that backs the
+// gossip path. The actual `onGossip` integration is exercised by the
+// chain-worker / node tests; here we focus on the boundary conditions
+// of the new logic so a regression that re-introduces the
+// drop-on-future-slot pathway (#788) lights up immediately.
+// ----------------------------------------------------------------------
+
+const FutureSlotTestFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    allocator: std.mem.Allocator,
+    mock_chain: stf.MockChainData,
+    chain_config: configs.ChainConfig,
+    beam_state: types.BeamState,
+    zeam_logger_config: zeam_utils.ZeamLoggerConfig,
+    tmp_dir: std.testing.TmpDir,
+    db: database.Db,
+    connected_peers: *ConnectedPeers,
+    test_registry: *NodeNameRegistry,
+    beam_chain: *BeamChain,
+
+    fn init(parent_allocator: std.mem.Allocator) !*FutureSlotTestFixture {
+        const fx = try parent_allocator.create(FutureSlotTestFixture);
+        fx.arena = std.heap.ArenaAllocator.init(parent_allocator);
+        fx.allocator = fx.arena.allocator();
+
+        fx.mock_chain = try stf.genMockChain(fx.allocator, 4, null);
+        const spec_name = try fx.allocator.dupe(u8, "beamdev");
+        const fork_digest = try fx.allocator.dupe(u8, "12345678");
+        fx.chain_config = configs.ChainConfig{
+            .id = configs.Chain.custom,
+            .genesis = fx.mock_chain.genesis_config,
+            .spec = .{
+                .preset = params.Preset.mainnet,
+                .name = spec_name,
+                .fork_digest = fork_digest,
+                .attestation_committee_count = 1,
+                .max_attestations_data = 16,
+            },
+        };
+        fx.beam_state = fx.mock_chain.genesis_state;
+        fx.zeam_logger_config = zeam_utils.getTestLoggerConfig();
+
+        fx.tmp_dir = std.testing.tmpDir(.{});
+        const data_dir = try std.fmt.allocPrint(fx.allocator, ".zig-cache/tmp/{s}", .{fx.tmp_dir.sub_path});
+        fx.db = try database.Db.open(fx.allocator, fx.zeam_logger_config.logger(.database_test), data_dir);
+
+        fx.connected_peers = try fx.allocator.create(ConnectedPeers);
+        fx.connected_peers.* = ConnectedPeers.init(fx.allocator);
+
+        fx.test_registry = try fx.allocator.create(NodeNameRegistry);
+        fx.test_registry.* = NodeNameRegistry.init(fx.allocator);
+
+        fx.beam_chain = try fx.allocator.create(BeamChain);
+        fx.beam_chain.* = try BeamChain.init(fx.allocator, ChainOpts{
+            .config = fx.chain_config,
+            .anchorState = &fx.beam_state,
+            .nodeId = 0,
+            .logger_config = &fx.zeam_logger_config,
+            .db = fx.db,
+            .node_registry = fx.test_registry,
+        }, fx.connected_peers);
+        return fx;
+    }
+
+    fn deinit(fx: *FutureSlotTestFixture, parent_allocator: std.mem.Allocator) void {
+        fx.beam_chain.deinit();
+        fx.test_registry.deinit();
+        fx.db.deinit();
+        fx.tmp_dir.cleanup();
+        fx.arena.deinit();
+        parent_allocator.destroy(fx);
+    }
+};
+
+test "validateBlock #788: FutureSlotQueueable for block within queue tolerance" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    // Forkchoice clock starts at slot 0. A block at slot
+    // MAX_FUTURE_SLOT_TOLERANCE + 1 (=2) is queueable but not immediately
+    // processable; validateBlock should surface FutureSlotQueueable.
+    var block = fx.mock_chain.blocks[1].block;
+    block.slot = constants.MAX_FUTURE_SLOT_TOLERANCE + 1;
+
+    try std.testing.expectError(
+        error.FutureSlotQueueable,
+        fx.beam_chain.validateBlock(block, true),
+    );
+}
+
+test "validateBlock #788: FutureSlot hard-reject for block beyond queue tolerance" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    // Anything beyond MAX_FUTURE_SLOT_QUEUE_TOLERANCE is rejected as
+    // FutureSlot — the hard reject that pre-#788 behaviour applied to
+    // every future-slot block, now narrowed to the truly-bogus range.
+    var block = fx.mock_chain.blocks[1].block;
+    block.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE + 10;
+
+    try std.testing.expectError(
+        error.FutureSlot,
+        fx.beam_chain.validateBlock(block, true),
+    );
+}
+
+test "validateBlock #788: queue-tolerance boundary is inclusive" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    // current_slot=0 + MAX_FUTURE_SLOT_QUEUE_TOLERANCE is the highest
+    // slot that should still be FutureSlotQueueable, not FutureSlot.
+    // One slot beyond that flips to FutureSlot. Lock both sides of the
+    // boundary so a future contributor cannot accidentally drop it by
+    // one and silently re-introduce the #788 reset symptom.
+    var block_at_boundary = fx.mock_chain.blocks[1].block;
+    block_at_boundary.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
+    try std.testing.expectError(
+        error.FutureSlotQueueable,
+        fx.beam_chain.validateBlock(block_at_boundary, true),
+    );
+
+    var block_just_past = fx.mock_chain.blocks[1].block;
+    block_just_past.slot = constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE + 1;
+    try std.testing.expectError(
+        error.FutureSlot,
+        fx.beam_chain.validateBlock(block_just_past, true),
+    );
+}
+
+test "enqueuePendingBlock #788: deduplicates by root" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    const allocator = std.testing.allocator;
+
+    // Clone the same block twice and enqueue both. Second enqueue
+    // should be deduped — a peer can re-gossip the same block several
+    // times during a clock-lag window and we must not pay the cost
+    // (or memory) of re-running it.
+    const signed = fx.mock_chain.blocks[1];
+    var root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, signed.block, &root, allocator);
+
+    var clone1: types.SignedBlock = undefined;
+    try types.sszClone(allocator, types.SignedBlock, signed, &clone1);
+    var clone2: types.SignedBlock = undefined;
+    try types.sszClone(allocator, types.SignedBlock, signed, &clone2);
+
+    // Stash the chain's allocator so we hand the clones to it (matches
+    // how `onGossip` does it via `self.allocator`). Use that here too.
+    const chain_allocator = fx.beam_chain.allocator;
+    var clone1_in_chain: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, signed, &clone1_in_chain);
+    var clone2_in_chain: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, signed, &clone2_in_chain);
+    clone1.deinit();
+    clone2.deinit();
+
+    const first = fx.beam_chain.enqueuePendingBlock(clone1_in_chain, root);
+    try std.testing.expect(first);
+    try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
+
+    const second = fx.beam_chain.enqueuePendingBlock(clone2_in_chain, root);
+    try std.testing.expect(!second);
+    try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
+}
+
+test "enqueuePendingBlock #788: cap eviction drops oldest by receive order" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    const chain_allocator = fx.beam_chain.allocator;
+
+    // Fill the queue to capacity with synthetic distinct blocks (we
+    // re-use the same block but bump `slot` to give each a distinct
+    // root, since dedup is by root). Then push one more and verify
+    // the queue stays at MAX_PENDING_BLOCKS and the new block is at
+    // the tail.
+    const base = fx.mock_chain.blocks[1];
+    var i: usize = 0;
+    while (i < constants.MAX_PENDING_BLOCKS) : (i += 1) {
+        var clone: types.SignedBlock = undefined;
+        try types.sszClone(chain_allocator, types.SignedBlock, base, &clone);
+        // Distinct slot → distinct root after re-hash.
+        clone.block.slot = @intCast(i + 100);
+        var root: types.Root = undefined;
+        try zeam_utils.hashTreeRoot(types.BeamBlock, clone.block, &root, chain_allocator);
+        const ok = fx.beam_chain.enqueuePendingBlock(clone, root);
+        try std.testing.expect(ok);
+    }
+    try std.testing.expectEqual(constants.MAX_PENDING_BLOCKS, fx.beam_chain.pending_blocks.items.len);
+
+    // The first slot in the queue is currently 100 (the oldest by
+    // receive order). Enqueue one more; the cap-evictor must drop
+    // slot=100 and leave a length-MAX queue with slot=200..MAX+99.
+    var newest: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, base, &newest);
+    newest.block.slot = constants.MAX_PENDING_BLOCKS + 200;
+    var newest_root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, newest.block, &newest_root, chain_allocator);
+
+    const ok = fx.beam_chain.enqueuePendingBlock(newest, newest_root);
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(constants.MAX_PENDING_BLOCKS, fx.beam_chain.pending_blocks.items.len);
+    // Front is no longer slot=100 (it was evicted).
+    try std.testing.expect(fx.beam_chain.pending_blocks.items[0].block.slot != 100);
+    // Tail is the newly-inserted block.
+    const last = fx.beam_chain.pending_blocks.items[constants.MAX_PENDING_BLOCKS - 1];
+    try std.testing.expectEqual(@as(types.Slot, constants.MAX_PENDING_BLOCKS + 200), last.block.slot);
+}
+
+test "enqueuePendingBlock #788: drops blocks before latest_finalized" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    const chain_allocator = fx.beam_chain.allocator;
+
+    // Seed the queue with one fresh-slot entry, then artificially
+    // raise `latest_finalized.slot` to a higher value to simulate the
+    // case where queued entries fall behind finalization between
+    // arrival and the next drain. enqueueing a new block triggers the
+    // pre-finalized eviction sweep.
+    var stale: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &stale);
+    stale.block.slot = 5;
+    var stale_root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, stale.block, &stale_root, chain_allocator);
+    try std.testing.expect(fx.beam_chain.enqueuePendingBlock(stale, stale_root));
+    try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
+
+    // Move finalization forward past the queued entry (test-only
+    // mutation; under the forkchoice's RwLock for the same reasons
+    // the production path uses it).
+    fx.beam_chain.forkChoice.mutex.lock();
+    fx.beam_chain.forkChoice.fcStore.latest_finalized.slot = 100;
+    fx.beam_chain.forkChoice.mutex.unlock();
+
+    // Enqueue a fresh future block; the helper's pre-finalized sweep
+    // should drop the stale entry and accept the fresh one, leaving
+    // a length-1 queue with the newer block.
+    var fresh: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &fresh);
+    fresh.block.slot = 200;
+    var fresh_root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, fresh.block, &fresh_root, chain_allocator);
+    try std.testing.expect(fx.beam_chain.enqueuePendingBlock(fresh, fresh_root));
+    try std.testing.expectEqual(@as(usize, 1), fx.beam_chain.pending_blocks.items.len);
+    try std.testing.expectEqual(@as(types.Slot, 200), fx.beam_chain.pending_blocks.items[0].block.slot);
+}
+
+test "processPendingBlocks #788: evicts pre-finalized entries during scan" {
+    var fx = try FutureSlotTestFixture.init(std.testing.allocator);
+    defer fx.deinit(std.testing.allocator);
+
+    const chain_allocator = fx.beam_chain.allocator;
+
+    // Queue an entry, then move finalization past it without going
+    // through enqueue (so the gossip-path sweep doesn't get a chance).
+    // processPendingBlocks must still drop it during its own scan.
+    var stale: types.SignedBlock = undefined;
+    try types.sszClone(chain_allocator, types.SignedBlock, fx.mock_chain.blocks[1], &stale);
+    stale.block.slot = 5;
+    var stale_root: types.Root = undefined;
+    try zeam_utils.hashTreeRoot(types.BeamBlock, stale.block, &stale_root, chain_allocator);
+    try std.testing.expect(fx.beam_chain.enqueuePendingBlock(stale, stale_root));
+
+    fx.beam_chain.forkChoice.mutex.lock();
+    fx.beam_chain.forkChoice.fcStore.latest_finalized.slot = 100;
+    fx.beam_chain.forkChoice.mutex.unlock();
+
+    const missing = fx.beam_chain.processPendingBlocks();
+    defer chain_allocator.free(missing);
+    try std.testing.expectEqual(@as(usize, 0), fx.beam_chain.pending_blocks.items.len);
+}
+
 // TODO: Enable and update this test once the keymanager file-reading PR is added
 // JSON parsing for chain config needs to support validator_attestation_pubkeys instead of num_validators
 test "attestation processing - valid block attestation" {
